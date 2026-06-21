@@ -42,6 +42,7 @@ Apply options:
   --source-port PORT              MariaDB source port. Defaults to 3306.
   --source-user USER              MariaDB replication user.
   --source-password-env ENV       Environment variable containing source password.
+  --source-database DB            Limit source binlog statements to this database.
   --binlog-file FILE              Source binlog file.
   --start-position POSITION       Source binlog start position.
   --stop-position POSITION        Stop reading at source binlog position.
@@ -212,6 +213,7 @@ fn apply_source_option(
         "--source-port" => source.port = parse_u16(flag, value)?,
         "--source-user" => source.user = value.to_string(),
         "--source-password-env" => source.password = read_env_password(value)?,
+        "--source-database" => source.database = Some(value.to_string()),
         "--binlog-file" => source.binlog_file = value.to_string(),
         "--start-position" => source.start_position = parse_u64(flag, value)?,
         "--stop-position" => source.stop_position = Some(parse_u64(flag, value)?),

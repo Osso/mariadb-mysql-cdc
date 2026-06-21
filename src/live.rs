@@ -54,6 +54,7 @@ pub struct SourceBinlogConfig {
     pub port: u16,
     pub user: String,
     pub password: String,
+    pub database: Option<String>,
     pub binlog_file: String,
     pub start_position: u64,
     pub stop_position: Option<u64>,
@@ -66,6 +67,7 @@ impl Default for SourceBinlogConfig {
             port: 3306,
             user: String::new(),
             password: String::new(),
+            database: None,
             binlog_file: String::new(),
             start_position: 4,
             stop_position: None,
@@ -228,6 +230,7 @@ pub struct MysqlCliExecutor {
 
 impl TargetExecutor for MysqlCliExecutor {
     fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
+        let password_arg = format!("--password={}", self.target.password);
         let output = Command::new(&self.mariadb)
             .args([
                 "--batch",
@@ -239,11 +242,13 @@ impl TargetExecutor for MysqlCliExecutor {
                 &self.target.port.to_string(),
                 "--user",
                 &self.target.user,
+                &password_arg,
+                "--ssl",
+                "--ssl-verify-server-cert=0",
                 &self.target.database,
                 "-e",
                 &statement.sql,
             ])
-            .env("MYSQL_PWD", &self.target.password)
             .output()
             .map_err(|error| TargetExecuteError::new(format!("failed to run mariadb: {error}")))?;
 
@@ -300,7 +305,6 @@ fn read_remote_binlog(config: &ApplyBinlogConfig) -> Result<String, ApplyBinlogE
     let args = binlog_args(&config.source);
     let output = Command::new(&config.mariadb_binlog)
         .args(args)
-        .env("MYSQL_PWD", &config.source.password)
         .output()
         .map_err(|error| {
             ApplyBinlogError::SourceCommand(format!("failed to run mariadb-binlog: {error}"))
@@ -329,9 +333,15 @@ fn binlog_args(source: &SourceBinlogConfig) -> Vec<String> {
         source.port.to_string(),
         "--user".to_string(),
         source.user.clone(),
+        format!("--password={}", source.password),
         "--start-position".to_string(),
         source.start_position.to_string(),
     ];
+
+    if let Some(database) = &source.database {
+        args.push("--database".to_string());
+        args.push(database.clone());
+    }
 
     if let Some(stop_position) = source.stop_position {
         args.push("--stop-position".to_string());
