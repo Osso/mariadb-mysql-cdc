@@ -83,3 +83,7 @@ checks, and paged row-level divergence reports. See `docs/validation.md`.
 The rehearsal workflow runs snapshot, CDC apply, and validation against a target
 that is explicitly guarded from serving application traffic. See
 `docs/rehearsal.md`.
+
+Cutover stops writes, drains CDC lag, validates again, switches the application
+endpoint, and resumes writes. Failed pre-switch cutovers attempt to resume
+writes without switching traffic. See `docs/cutover.md`.

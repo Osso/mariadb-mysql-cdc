@@ -1,4 +1,5 @@
 pub mod checkpoint;
+pub mod cutover;
 pub mod inventory;
 mod probe;
 pub mod rehearsal;
