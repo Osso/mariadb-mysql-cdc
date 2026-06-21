@@ -19,12 +19,15 @@ Usage:
   mariadb-mysql-cdc plan
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
+  mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
 
 Commands:
   plan    Print the current migration tool design.
   probe   Read source binlog coordinates and classify MariaDB binlog events.
   apply-binlog
           Read remote MariaDB binlog text and apply compatible statements.
+  stream-binlog
+          Continuously stream remote MariaDB binlog text and apply compatible statements.
 
 Probe options:
   --host HOST                 MariaDB source host.
@@ -64,11 +67,27 @@ fn main() {
         Some("plan") => print_plan(),
         Some("probe") => run_probe_command(args.collect()),
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),
+        Some("stream-binlog") => run_stream_binlog_command(args.collect()),
         Some("-h" | "--help") | None => print!("{USAGE}"),
         Some(other) => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
             std::process::exit(2);
         }
+    }
+}
+
+fn run_stream_binlog_command(args: Vec<String>) {
+    let config = match parse_apply_binlog_config(args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+
+    if let Err(error) = live::stream_remote_binlog(&config) {
+        eprintln!("{error}");
+        std::process::exit(1);
     }
 }
 

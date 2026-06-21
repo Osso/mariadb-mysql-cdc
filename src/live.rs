@@ -6,7 +6,8 @@ use crate::statement::{
 use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
 use std::cell::RefCell;
 use std::fmt;
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 
 #[derive(Clone, Debug)]
 pub struct ApplyBinlogConfig {
@@ -169,6 +170,18 @@ pub fn apply_remote_binlog(
     apply_statement_events(events, executor, RecordingQuarantine::default())
 }
 
+pub fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
+    config.validate()?;
+    let executor = MysqlCliExecutor {
+        mariadb: config.mariadb.clone(),
+        target: config.target.clone(),
+    };
+    let quarantine = RecordingQuarantine::default();
+    let applier = StatementApplier::new(executor, quarantine);
+
+    stream_statement_events(config, &applier)
+}
+
 pub fn apply_statement_events<E, Q>(
     events: Vec<StatementEvent>,
     executor: E,
@@ -266,39 +279,85 @@ impl TargetExecutor for MysqlCliExecutor {
 }
 
 pub fn extract_statement_events(output: &str, start: &BinlogCoordinate) -> Vec<StatementEvent> {
-    let mut current_file = start.file.clone();
-    let mut current_position = start.position;
-    let mut default_database = None;
+    let mut extractor = StatementEventExtractor::new(start.clone());
     let mut events = Vec::new();
 
     for line in output.lines() {
-        let line = line.trim();
-
-        if let Some(position) = parse_at_position(line) {
-            current_position = position;
-            continue;
-        }
-        if let Some(file) = parse_rotate_file(line) {
-            current_file = file;
-            continue;
-        }
-        if let Some(database) = parse_use_database(line) {
-            default_database = Some(database);
-            continue;
-        }
-        if let Some(sql) = parse_sql_statement(line) {
-            events.push(StatementEvent {
-                coordinate: BinlogCoordinate {
-                    file: current_file.clone(),
-                    position: current_position,
-                },
-                default_database: default_database.clone(),
-                sql,
-            });
+        if let Some(event) = extractor.accept_line(line) {
+            events.push(event);
         }
     }
 
     events
+}
+
+fn stream_statement_events<E, Q>(
+    config: &ApplyBinlogConfig,
+    applier: &StatementApplier<E, Q>,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TargetExecutor,
+    Q: StatementQuarantine + QuarantineRecorder,
+{
+    let mut child = Command::new(&config.mariadb_binlog)
+        .args(stop_never_args(&config.source))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| {
+            ApplyBinlogError::SourceCommand(format!("failed to run mariadb-binlog: {error}"))
+        })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ApplyBinlogError::SourceCommand("mariadb-binlog stdout was not captured".to_string())
+    })?;
+    let start = BinlogCoordinate {
+        file: config.source.binlog_file.clone(),
+        position: config.source.start_position,
+    };
+    let mut extractor = StatementEventExtractor::new(start);
+
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|error| {
+            ApplyBinlogError::SourceCommand(format!("failed reading mariadb-binlog: {error}"))
+        })?;
+        if let Some(event) = extractor.accept_line(&line) {
+            apply_stream_event(applier, &event)?;
+        }
+    }
+
+    let status = child.wait().map_err(|error| {
+        ApplyBinlogError::SourceCommand(format!("failed waiting for mariadb-binlog: {error}"))
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(ApplyBinlogError::SourceCommand(format!(
+            "mariadb-binlog exited with {status}"
+        )))
+    }
+}
+
+fn apply_stream_event<E, Q>(
+    applier: &StatementApplier<E, Q>,
+    event: &StatementEvent,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TargetExecutor,
+    Q: StatementQuarantine + QuarantineRecorder,
+{
+    match applier.apply(event) {
+        Ok(StatementOutcome::Replayed) => {
+            println!(
+                "applied statement at {}:{}",
+                event.coordinate.file, event.coordinate.position
+            );
+            Ok(())
+        }
+        Ok(StatementOutcome::Quarantined(_)) => Err(ApplyBinlogError::Quarantined(
+            applier.quarantine_recorder().recorded_statements(),
+        )),
+        Err(error) => Err(ApplyBinlogError::Statement(error.to_string())),
+    }
 }
 
 fn read_remote_binlog(config: &ApplyBinlogConfig) -> Result<String, ApplyBinlogError> {
@@ -350,6 +409,55 @@ fn binlog_args(source: &SourceBinlogConfig) -> Vec<String> {
 
     args.push(source.binlog_file.clone());
     args
+}
+
+fn stop_never_args(source: &SourceBinlogConfig) -> Vec<String> {
+    let mut args = binlog_args(source);
+    let binlog_file_index = args.len().saturating_sub(1);
+    args.insert(binlog_file_index, "--stop-never".to_string());
+    args
+}
+
+struct StatementEventExtractor {
+    current_file: String,
+    current_position: u64,
+    default_database: Option<String>,
+}
+
+impl StatementEventExtractor {
+    fn new(start: BinlogCoordinate) -> Self {
+        Self {
+            current_file: start.file,
+            current_position: start.position,
+            default_database: None,
+        }
+    }
+
+    fn accept_line(&mut self, line: &str) -> Option<StatementEvent> {
+        let line = line.trim();
+
+        if let Some(position) = parse_at_position(line) {
+            self.current_position = position;
+            return None;
+        }
+        if let Some(file) = parse_rotate_file(line) {
+            self.current_file = file;
+            return None;
+        }
+        if let Some(database) = parse_use_database(line) {
+            self.default_database = Some(database);
+            return None;
+        }
+
+        parse_sql_statement(line).map(|sql| StatementEvent {
+            coordinate: BinlogCoordinate {
+                file: self.current_file.clone(),
+                position: self.current_position,
+            },
+            default_database: self.default_database.clone(),
+            sql,
+        })
+    }
 }
 
 fn parse_at_position(line: &str) -> Option<u64> {
@@ -487,6 +595,24 @@ DELETE FROM accounts WHERE id = 1/*!*/;
             .to_string();
 
         assert!(error.contains("quarantined"));
+    }
+
+    #[test]
+    fn stop_never_args_keep_binlog_file_last() {
+        let source = SourceBinlogConfig {
+            host: "10.0.0.1".to_string(),
+            user: "cdc".to_string(),
+            password: "secret".to_string(),
+            database: Some("test".to_string()),
+            binlog_file: "mysqld-bin.000001".to_string(),
+            start_position: 4,
+            ..SourceBinlogConfig::default()
+        };
+
+        let args = stop_never_args(&source);
+
+        assert!(args.contains(&"--stop-never".to_string()));
+        assert_eq!(args.last(), Some(&"mysqld-bin.000001".to_string()));
     }
 
     #[derive(Default)]
