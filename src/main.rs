@@ -2,6 +2,7 @@ pub mod checkpoint;
 pub mod inventory;
 mod probe;
 pub mod snapshot;
+pub mod statement;
 pub mod target;
 
 use std::env;

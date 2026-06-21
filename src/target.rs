@@ -279,8 +279,7 @@ mod tests {
     #[test]
     fn writes_updates_and_deletes_with_primary_key_predicates() {
         let executor = RecordingExecutor::default();
-        let mut writer =
-            TargetMySqlWriter::new("accounts", vec!["id"], vec!["id", "name"], executor);
+        let writer = TargetMySqlWriter::new("accounts", vec!["id"], vec!["id", "name"], executor);
 
         writer.update_row(&row("7", "updated")).expect("update row");
         writer

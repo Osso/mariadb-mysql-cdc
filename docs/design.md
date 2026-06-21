@@ -66,3 +66,8 @@ filled in. See `docs/snapshot.md`.
 Target writes are generated as parameterized MySQL statements and executed
 through a trait-backed writer. Snapshot rows use batched upserts, while CDC
 updates/deletes use primary-key predicates. See `docs/target-writer.md`.
+
+Statement events pass through a conservative allowlist before replay. Narrow
+DML is replayed; DDL, MariaDB-only syntax, unsafe file/definer patterns, and
+unknown statement types are quarantined with source coordinates. See
+`docs/statement-events.md`.
