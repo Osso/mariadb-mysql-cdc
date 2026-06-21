@@ -107,6 +107,10 @@ where
         }
     }
 
+    pub fn quarantine_recorder(&self) -> &Q {
+        &self.quarantine
+    }
+
     pub fn apply(&self, event: &StatementEvent) -> Result<StatementOutcome, StatementApplyError> {
         let normalized_sql = normalize_statement(&event.sql);
         let decision = classify_statement(&normalized_sql);
