@@ -62,3 +62,7 @@ Snapshot export/import is modeled as deterministic primary-key chunks with
 per-table progress. The source and target I/O are traits so the chunking and
 resume semantics can be tested before database-specific readers/writers are
 filled in. See `docs/snapshot.md`.
+
+Target writes are generated as parameterized MySQL statements and executed
+through a trait-backed writer. Snapshot rows use batched upserts, while CDC
+updates/deletes use primary-key predicates. See `docs/target-writer.md`.
