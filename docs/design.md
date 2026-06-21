@@ -71,3 +71,8 @@ Statement events pass through a conservative allowlist before replay. Narrow
 DML is replayed; DDL, MariaDB-only syntax, unsafe file/definer patterns, and
 unknown statement types are quarantined with source coordinates. See
 `docs/statement-events.md`.
+
+Row events are applied from table-map metadata. Inserts are batched as target
+upserts, updates use after images, and deletes use primary-key values from
+before images. Missing table maps or primary-key values fail with source
+coordinates. See `docs/row-events.md`.
