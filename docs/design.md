@@ -53,3 +53,7 @@ tool starts applying anything to a target.
 Checkpoint state is stored as JSON with source file/position, GTID, event
 timestamp, and the last successfully processed event. See
 `docs/checkpoints.md`.
+
+Schema inventory is captured before snapshot/apply work so the migrator knows
+primary keys, generated columns, object definitions, and source-side objects
+that may need compatibility review. See `docs/schema-inventory.md`.

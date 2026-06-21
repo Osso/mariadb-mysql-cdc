@@ -1,4 +1,5 @@
 pub mod checkpoint;
+pub mod inventory;
 mod probe;
 
 use std::env;
