@@ -57,3 +57,8 @@ timestamp, and the last successfully processed event. See
 Schema inventory is captured before snapshot/apply work so the migrator knows
 primary keys, generated columns, object definitions, and source-side objects
 that may need compatibility review. See `docs/schema-inventory.md`.
+
+Snapshot export/import is modeled as deterministic primary-key chunks with
+per-table progress. The source and target I/O are traits so the chunking and
+resume semantics can be tested before database-specific readers/writers are
+filled in. See `docs/snapshot.md`.
