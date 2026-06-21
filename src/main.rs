@@ -1,3 +1,4 @@
+pub mod catchup;
 pub mod checkpoint;
 pub mod cutover;
 pub mod inventory;
@@ -54,6 +55,7 @@ Apply options:
   --target-user USER              MySQL target user.
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
+  --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
   --mariadb PATH                  mariadb client path. Defaults to mariadb.
   --mariadb-binlog PATH           mariadb-binlog path. Defaults to mariadb-binlog.
 ";
@@ -253,10 +255,19 @@ fn apply_target_option(
         "--target-user" => target.user = value.to_string(),
         "--target-password-env" => target.password = read_env_password(value)?,
         "--target-database" => target.database = value.to_string(),
+        "--insert-conflict-policy" => target.insert_conflict_policy = parse_insert_policy(value)?,
         _ => return Ok(false),
     }
 
     Ok(true)
+}
+
+fn parse_insert_policy(value: &str) -> Result<live::InsertConflictPolicy, String> {
+    match value {
+        "error" => Ok(live::InsertConflictPolicy::Error),
+        "ignore-duplicate" => Ok(live::InsertConflictPolicy::IgnoreDuplicate),
+        other => Err(format!("unknown insert conflict policy: {other}")),
+    }
 }
 
 fn read_env_password(name: &str) -> Result<String, String> {

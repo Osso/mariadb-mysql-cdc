@@ -9,6 +9,9 @@ use std::fmt;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
+mod insert_conflict;
+pub use insert_conflict::{InsertConflictPolicy, should_ignore_duplicate_insert};
+
 #[derive(Clone, Debug)]
 pub struct ApplyBinlogConfig {
     pub source: SourceBinlogConfig,
@@ -83,6 +86,7 @@ pub struct TargetMySqlConfig {
     pub user: String,
     pub password: String,
     pub database: String,
+    pub insert_conflict_policy: InsertConflictPolicy,
 }
 
 impl Default for TargetMySqlConfig {
@@ -93,6 +97,7 @@ impl Default for TargetMySqlConfig {
             user: String::new(),
             password: String::new(),
             database: String::new(),
+            insert_conflict_policy: InsertConflictPolicy::Error,
         }
     }
 }
@@ -243,8 +248,23 @@ pub struct MysqlCliExecutor {
 
 impl TargetExecutor for MysqlCliExecutor {
     fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
+        let output = self.run_statement(statement)?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        self.handle_failed_statement(statement, &output)
+    }
+}
+
+impl MysqlCliExecutor {
+    fn run_statement(
+        &self,
+        statement: &SqlStatement,
+    ) -> Result<std::process::Output, TargetExecuteError> {
         let password_arg = format!("--password={}", self.target.password);
-        let output = Command::new(&self.mariadb)
+        Command::new(&self.mariadb)
             .args([
                 "--batch",
                 "--raw",
@@ -263,18 +283,28 @@ impl TargetExecutor for MysqlCliExecutor {
                 &statement.sql,
             ])
             .output()
-            .map_err(|error| TargetExecuteError::new(format!("failed to run mariadb: {error}")))?;
+            .map_err(|error| TargetExecuteError::new(format!("failed to run mariadb: {error}")))
+    }
 
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(TargetExecuteError::new(format!(
-                "mariadb exited with {}: {}",
-                output.status,
-                stderr.trim()
-            )))
+    fn handle_failed_statement(
+        &self,
+        statement: &SqlStatement,
+        output: &std::process::Output,
+    ) -> Result<(), TargetExecuteError> {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if self.can_ignore_duplicate_insert(&statement.sql, &stderr) {
+            return Ok(());
         }
+
+        Err(TargetExecuteError::new(format!(
+            "mariadb exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )))
+    }
+
+    fn can_ignore_duplicate_insert(&self, sql: &str, stderr: &str) -> bool {
+        should_ignore_duplicate_insert(self.target.insert_conflict_policy, sql, stderr)
     }
 }
 
