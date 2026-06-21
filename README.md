@@ -20,13 +20,14 @@ a standalone migration/CDC tool.
 
 ## Current Status
 
-Skeleton only. The first real milestone is a read-only probe that connects to a
-MariaDB source, records binlog coordinates, and classifies event types without
-writing to a target.
+The first read-only probe is available. It connects to a MariaDB source, records
+the current binlog coordinates with `SHOW MASTER STATUS`, then uses
+`mariadb-binlog` to read and classify events without writing to a target.
 
 ## Commands
 
 ```bash
 cargo run -- plan
+cargo run -- probe --host 127.0.0.1 --user repl --password-env SOURCE_PASSWORD \
+  --start-position 4 --stop-position 1000 --binlog-file mysql-bin.000001
 ```
-

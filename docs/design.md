@@ -35,8 +35,13 @@ Start with the smallest reliable reader that can handle MariaDB mixed binlogs.
 Candidates:
 
 - `mysql_cdc` as a pure Rust replication client.
-- `mariadb-binlog` as a reference decoder and fallback subprocess.
+- `mariadb-binlog` as the initial read-only decoder and fallback subprocess.
 - Captured binlog files as fixtures for parser compatibility tests.
+
+The first probe uses `mariadb` for `SHOW MASTER STATUS` and `mariadb-binlog`
+for read-only remote binlog streaming. It classifies event text into broad
+categories so rehearsals can show which MariaDB event types appear before the
+tool starts applying anything to a target.
 
 ## Safety
 
