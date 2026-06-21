@@ -1,3 +1,4 @@
+pub mod checkpoint;
 mod probe;
 
 use std::env;

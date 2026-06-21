@@ -49,3 +49,7 @@ tool starts applying anything to a target.
 - Make writes idempotent where possible.
 - Validate table counts and sampled checksums during rehearsal.
 - Keep exact binlog coordinates in every error.
+
+Checkpoint state is stored as JSON with source file/position, GTID, event
+timestamp, and the last successfully processed event. See
+`docs/checkpoints.md`.
