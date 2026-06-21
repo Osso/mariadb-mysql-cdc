@@ -1,0 +1,30 @@
+# at 955857729
+#260621 17:00:38 server id 3  end_log_pos 0 CRC32 0x00000000  Query thread_id=1 exec_time=0 error_code=0 xid=0
+SET TIMESTAMP=1782079238/*!*/;
+UPDATE `guests` `g`
+SET `supports_cookies` = 1
+WHERE `g`.`guest_id` = 1001
+/*!*/;
+# at 957812859
+#260621 17:01:06 server id 3  end_log_pos 0 CRC32 0x00000000  Query thread_id=2 exec_time=0 error_code=0 xid=0
+SET TIMESTAMP=1782079266/*!*/;
+UPDATE phrases p set `p`.`text` = "Publisher SLA", `p`.`updater_id` = 0, `p`.`update_time` = "2026-06-21 22:01:06"
+             WHERE `p`.`id` = "template.global.footer.publisher-terms" and `p`.`lang` = "en"
+/*!*/;
+# at 957812400
+#260621 17:01:06 server id 3  end_log_pos 0 CRC32 0x00000000  Query thread_id=3 exec_time=0 error_code=0 xid=0
+SET TIMESTAMP=1782079266.580868/*!*/;
+INSERT INTO `users_search_queries_history` (`query`,`user_id`,`guest_id`,`session_id`,`comic_results_count`,`artist_results_count`,`comic_releases_results_count`,`ref`,`page`,`data`) VALUES ("sample query",100,200,300,10,10,10,"https://example.test/search?q=sample",1,"{\"comics\":[1,2],\"artists\":[3,4],\"semantic\":true}")
+/*!*/;
+# at 957700000
+#260621 17:01:00 server id 3  end_log_pos 0 CRC32 0x00000000  Table_map: `globalcomix`.`devices_properties` mapped to number 99
+# at 957700040
+#260621 17:01:00 server id 3  end_log_pos 0 CRC32 0x00000000  Update_rows: table id 99 flags: STMT_END_F
+### UPDATE `globalcomix`.`devices_properties`
+### WHERE
+###   @1=10
+###   @2='old-value'
+### SET
+###   @1=10
+###   @2='new-value'
+# Number of rows: 1

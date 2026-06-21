@@ -422,6 +422,7 @@ struct StatementEventExtractor {
     current_file: String,
     current_position: u64,
     default_database: Option<String>,
+    pending_statement: Vec<String>,
 }
 
 impl StatementEventExtractor {
@@ -430,11 +431,16 @@ impl StatementEventExtractor {
             current_file: start.file,
             current_position: start.position,
             default_database: None,
+            pending_statement: Vec::new(),
         }
     }
 
     fn accept_line(&mut self, line: &str) -> Option<StatementEvent> {
         let line = line.trim();
+
+        if self.is_collecting_statement() {
+            return self.collect_statement_line(line);
+        }
 
         if let Some(position) = parse_at_position(line) {
             self.current_position = position;
@@ -449,14 +455,51 @@ impl StatementEventExtractor {
             return None;
         }
 
-        parse_sql_statement(line).map(|sql| StatementEvent {
+        if starts_sql_statement(line) {
+            return self.start_statement(line);
+        }
+
+        None
+    }
+
+    fn is_collecting_statement(&self) -> bool {
+        !self.pending_statement.is_empty()
+    }
+
+    fn collect_statement_line(&mut self, line: &str) -> Option<StatementEvent> {
+        if is_statement_terminator(line) {
+            return Some(self.finish_statement());
+        }
+
+        self.push_statement_line(line)
+    }
+
+    fn start_statement(&mut self, line: &str) -> Option<StatementEvent> {
+        self.push_statement_line(line)
+    }
+
+    fn push_statement_line(&mut self, line: &str) -> Option<StatementEvent> {
+        self.pending_statement.push(line.to_string());
+
+        if line_has_statement_terminator(line) {
+            Some(self.finish_statement())
+        } else {
+            None
+        }
+    }
+
+    fn finish_statement(&mut self) -> StatementEvent {
+        let sql = cleanup_binlog_sql_line(&self.pending_statement.join("\n"));
+        self.pending_statement.clear();
+
+        StatementEvent {
             coordinate: BinlogCoordinate {
                 file: self.current_file.clone(),
                 position: self.current_position,
             },
             default_database: self.default_database.clone(),
             sql,
-        })
+        }
     }
 }
 
@@ -487,23 +530,25 @@ fn parse_use_database(line: &str) -> Option<String> {
     }
 }
 
-fn parse_sql_statement(line: &str) -> Option<String> {
+fn starts_sql_statement(line: &str) -> bool {
     let cleaned = cleanup_binlog_sql_line(line);
     let upper = cleaned.to_ascii_uppercase();
-    let is_dml = upper.starts_with("INSERT INTO ")
+    upper.starts_with("INSERT INTO ")
         || upper.starts_with("UPDATE ")
         || upper.starts_with("DELETE FROM ")
-        || upper.starts_with("REPLACE INTO ");
-    let is_ddl = upper.starts_with("CREATE ")
+        || upper.starts_with("REPLACE INTO ")
+        || upper.starts_with("CREATE ")
         || upper.starts_with("ALTER ")
         || upper.starts_with("DROP ")
-        || upper.starts_with("TRUNCATE ");
+        || upper.starts_with("TRUNCATE ")
+}
 
-    if is_dml || is_ddl {
-        Some(cleaned)
-    } else {
-        None
-    }
+fn is_statement_terminator(line: &str) -> bool {
+    line == "/*!*/;" || line == "/*!*/"
+}
+
+fn line_has_statement_terminator(line: &str) -> bool {
+    line.ends_with("/*!*/;") || line.ends_with(';')
 }
 
 fn cleanup_binlog_sql_line(line: &str) -> String {
@@ -613,6 +658,35 @@ DELETE FROM accounts WHERE id = 1/*!*/;
 
         assert!(args.contains(&"--stop-never".to_string()));
         assert_eq!(args.last(), Some(&"mysqld-bin.000001".to_string()));
+    }
+
+    #[test]
+    fn extracts_sanitized_production_query_shapes() {
+        let fixture = include_str!("../fixtures/prod-derived/sanitized-query-events.txt");
+        let events = extract_statement_events(
+            fixture,
+            &BinlogCoordinate {
+                file: "mysqld-bin.002523".to_string(),
+                position: 955857729,
+            },
+        );
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].coordinate.position, 955857729);
+        assert_eq!(
+            events[0].sql,
+            "UPDATE `guests` `g`\nSET `supports_cookies` = 1\nWHERE `g`.`guest_id` = 1001"
+        );
+        assert_eq!(events[1].coordinate.position, 957812859);
+        assert!(events[1].sql.contains("UPDATE phrases p set"));
+        assert!(events[1].sql.contains("WHERE `p`.`id`"));
+        assert_eq!(events[2].coordinate.position, 957812400);
+        assert!(
+            events[2]
+                .sql
+                .contains("INSERT INTO `users_search_queries_history`")
+        );
+        assert!(events[2].sql.contains("\\\"semantic\\\":true"));
     }
 
     #[derive(Default)]
