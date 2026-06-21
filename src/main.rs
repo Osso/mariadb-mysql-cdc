@@ -5,6 +5,7 @@ pub mod row;
 pub mod snapshot;
 pub mod statement;
 pub mod target;
+pub mod validation;
 
 use std::env;
 

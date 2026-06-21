@@ -76,3 +76,6 @@ Row events are applied from table-map metadata. Inserts are batched as target
 upserts, updates use after images, and deletes use primary-key values from
 before images. Missing table maps or primary-key values fail with source
 coordinates. See `docs/row-events.md`.
+
+Validation is split into read-only count checks, deterministic sampled checksum
+checks, and paged row-level divergence reports. See `docs/validation.md`.
