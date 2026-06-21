@@ -79,3 +79,7 @@ coordinates. See `docs/row-events.md`.
 
 Validation is split into read-only count checks, deterministic sampled checksum
 checks, and paged row-level divergence reports. See `docs/validation.md`.
+
+The rehearsal workflow runs snapshot, CDC apply, and validation against a target
+that is explicitly guarded from serving application traffic. See
+`docs/rehearsal.md`.

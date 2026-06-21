@@ -1,6 +1,7 @@
 pub mod checkpoint;
 pub mod inventory;
 mod probe;
+pub mod rehearsal;
 pub mod row;
 pub mod snapshot;
 pub mod statement;
