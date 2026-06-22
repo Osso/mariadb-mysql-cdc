@@ -254,6 +254,16 @@ fn builds_progress_table_lookup_for_qualified_and_default_schema_tables() {
     assert!(sql.contains("table_name = 'table_sync_progress'"));
 }
 
+#[test]
+fn builds_total_rows_column_lookup_for_progress_table() {
+    let sql = build_progress_total_rows_exists_query("globalcomix", "cdc.table_sync_progress");
+
+    assert!(sql.contains("information_schema.columns"));
+    assert!(sql.contains("table_schema = 'cdc'"));
+    assert!(sql.contains("table_name = 'table_sync_progress'"));
+    assert!(sql.contains("column_name = 'total_rows'"));
+}
+
 fn args<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.into_iter().map(str::to_string).collect()
 }

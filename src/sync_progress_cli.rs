@@ -312,13 +312,25 @@ fn query_progress_rows(
     if !progress_table_exists(config)? {
         return Ok(None);
     }
-    let sql = build_progress_query(&config.progress_table, config.table.as_deref());
+    let has_total_rows = progress_table_has_total_rows(config)?;
+    let sql = build_progress_query(
+        &config.progress_table,
+        config.table.as_deref(),
+        has_total_rows,
+    );
     let output = run_mysql_query(&config.mariadb, &config.target, &sql)?;
     parse_progress_rows(&output).map(Some)
 }
 
 fn progress_table_exists(config: &SyncProgressConfig) -> Result<bool, String> {
     let sql = build_progress_table_exists_query(&config.target.database, &config.progress_table);
+    let output = run_mysql_query(&config.mariadb, &config.target, &sql)?;
+    Ok(output.trim() == "1")
+}
+
+fn progress_table_has_total_rows(config: &SyncProgressConfig) -> Result<bool, String> {
+    let sql =
+        build_progress_total_rows_exists_query(&config.target.database, &config.progress_table);
     let output = run_mysql_query(&config.mariadb, &config.target, &sql)?;
     Ok(output.trim() == "1")
 }
@@ -376,14 +388,28 @@ fn format_progress_row(config: &SyncProgressConfig, row: &SyncProgressRow) -> St
     )
 }
 
-fn build_progress_query(progress_table: &str, table: Option<&str>) -> String {
+fn build_progress_query(progress_table: &str, table: Option<&str>, has_total_rows: bool) -> String {
     let table_filter = table
         .map(|table| format!(" WHERE table_name = {}", quote_sql_literal(table)))
         .unwrap_or_default();
+    let total_rows_expression = if has_total_rows {
+        "COALESCE(total_rows, '')"
+    } else {
+        "''"
+    };
     format!(
-        "SELECT table_name, rows_scanned, COALESCE(total_rows, ''), inserts_applied, updates_applied, extra_target_rows, status, COALESCE(last_primary_key_json,''), GREATEST(1,TIMESTAMPDIFF(SECOND,created_at,IF(status='running',NOW(),updated_at))), COALESCE(last_error,'') FROM {}{} ORDER BY FIELD(status,'running','error','complete'), updated_at DESC, table_name",
+        "SELECT table_name, rows_scanned, {total_rows_expression}, inserts_applied, updates_applied, extra_target_rows, status, COALESCE(last_primary_key_json,''), GREATEST(1,TIMESTAMPDIFF(SECOND,created_at,IF(status='running',NOW(),updated_at))), COALESCE(last_error,'') FROM {}{} ORDER BY FIELD(status,'running','error','complete'), updated_at DESC, table_name",
         quote_identifier_path(progress_table),
         table_filter
+    )
+}
+
+fn build_progress_total_rows_exists_query(default_schema: &str, progress_table: &str) -> String {
+    let (schema, table) = qualified_table_parts(default_schema, progress_table);
+    format!(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = {} AND table_name = {} AND column_name = 'total_rows'",
+        quote_sql_literal(&schema),
+        quote_sql_literal(&table)
     )
 }
 
