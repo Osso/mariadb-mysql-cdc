@@ -87,3 +87,7 @@ that is explicitly guarded from serving application traffic. See
 Cutover stops writes, drains CDC lag, validates again, switches the application
 endpoint, and resumes writes. Failed pre-switch cutovers attempt to resume
 writes without switching traffic. See `docs/cutover.md`.
+
+Live streaming must reconnect after transient source connection loss and resume
+from durable checkpoints instead of static startup coordinates. See
+`docs/specs/live-stream-reconnect.md`.
