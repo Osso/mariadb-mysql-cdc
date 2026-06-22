@@ -10,6 +10,7 @@ pub mod row;
 pub mod snapshot;
 pub mod statement;
 mod sync_cli;
+mod sync_progress_cli;
 pub mod table_sync;
 pub mod target;
 pub mod validation;
@@ -25,6 +26,7 @@ Usage:
   mariadb-mysql-cdc catchup-snapshot --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --progress-file PATH [options]
   mariadb-mysql-cdc catchup-progress --progress-file PATH
   mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS [options]
+  mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
 
@@ -37,6 +39,8 @@ Commands:
           Print catchup checkpoint progress.
   sync-table
           Compare one source/target table by primary-key chunks and optionally repair target gaps.
+  sync-progress
+          Print table sync progress, stream checkpoint, rates, and ETA when source counts are supplied.
   apply-binlog
           Read remote MariaDB binlog text and apply compatible statements.
   stream-binlog
@@ -69,9 +73,6 @@ Apply options:
   --target-database DB            MySQL target database.
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
   --checkpoint-file PATH          Durable stream checkpoint file used by stream-binlog.
-  --max-reconnects N              Transient stream reconnect attempts. Defaults to 12.
-  --mariadb PATH                  mariadb client path. Defaults to mariadb.
-  --mariadb-binlog PATH           mariadb-binlog path. Defaults to mariadb-binlog.
 
 Catchup snapshot options:
   --source-host HOST              MariaDB source host.
@@ -86,12 +87,6 @@ Catchup snapshot options:
   --target-database DB            MySQL target database.
   --progress-file PATH            Durable JSON progress file.
   --chunk-size N                  Rows per chunk. Defaults to 1000.
-  --table TABLE                   Restrict catchup to one table.
-  --mariadb PATH                  mariadb client path. Defaults to mariadb.
-
-Catchup progress options:
-  --progress-file PATH            Durable JSON progress file.
-
 Sync table options:
   Uses the catchup source/target options plus --table, --primary-key, --columns,
   --chunk-size, --mode dry-run|apply, --progress-table, and --mariadb.
@@ -108,6 +103,9 @@ fn main() {
         Some("catchup-snapshot") => run_catchup_snapshot_command(args.collect()),
         Some("catchup-progress") => run_catchup_progress_command(args.collect()),
         Some("sync-table") => sync_cli::run_sync_table_command(args.collect(), USAGE),
+        Some("sync-progress") => {
+            sync_progress_cli::run_sync_progress_command(args.collect(), USAGE)
+        }
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),
         Some("stream-binlog") => run_stream_binlog_command(args.collect()),
         Some("-h" | "--help") | None => print!("{USAGE}"),
