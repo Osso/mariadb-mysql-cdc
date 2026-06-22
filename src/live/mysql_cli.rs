@@ -380,6 +380,11 @@ pub(super) fn target_client_character_set_arg() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::InsertConflictPolicy;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn strips_generated_column_from_insert_values() {
@@ -413,5 +418,162 @@ mod tests {
             generated_column_from_error(stderr),
             Some("public_time".to_string())
         );
+    }
+
+    #[test]
+    fn execute_retries_insert_without_generated_column() {
+        let fixture = FakeMariadb::new(
+            "ERROR 3105 (HY000): The value specified for generated column 'public_time' in table 'releases' is not allowed.",
+            1,
+        );
+        let executor = MysqlCliExecutor::new(fixture.script_path(), target_config());
+        let statement = SqlStatement {
+            sql: "INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES (\"a,b\",NULL,\"hello (world)\")"
+                .to_string(),
+            params: Vec::new(),
+        };
+
+        executor.execute(&statement).expect("generated column retry");
+
+        assert_eq!(fixture.call_count(), 2);
+        let replay_sql = fixture.replay_sql();
+        assert!(replay_sql.contains(target_session_init_command()));
+        assert!(replay_sql.contains(
+            "INSERT INTO `releases` (`slug`,`title`) VALUES(\"a,b\",\"hello (world)\")"
+        ));
+        assert!(!replay_sql.contains("`public_time`"));
+    }
+
+    #[test]
+    fn execute_does_not_retry_unrelated_target_error() {
+        let fixture = FakeMariadb::new("ERROR 1064 (42000): syntax error", 99);
+        let executor = MysqlCliExecutor::new(fixture.script_path(), target_config());
+        let statement = SqlStatement {
+            sql: "INSERT INTO `releases` (`slug`) VALUES (\"alpha\")".to_string(),
+            params: Vec::new(),
+        };
+
+        let error = executor.execute(&statement).expect_err("target failure");
+
+        assert!(error.to_string().contains("ERROR 1064"));
+        assert_eq!(fixture.call_count(), 1);
+    }
+
+    fn target_config() -> TargetMySqlConfig {
+        TargetMySqlConfig {
+            host: "target.db".to_string(),
+            port: 25060,
+            user: "target_user".to_string(),
+            password: "secret".to_string(),
+            database: "globalcomix".to_string(),
+            insert_conflict_policy: InsertConflictPolicy::Error,
+        }
+    }
+
+    struct FakeMariadb {
+        dir: PathBuf,
+        script: PathBuf,
+        count_file: PathBuf,
+        replay_sql_file: PathBuf,
+    }
+
+    impl FakeMariadb {
+        fn new(first_error: &str, success_after_failures: usize) -> Self {
+            let dir = temp_fixture_dir();
+            fs::create_dir_all(&dir).expect("fixture dir");
+            let script = dir.join("mariadb");
+            let count_file = dir.join("count");
+            let replay_sql_file = dir.join("replay.sql");
+            let script_body = fake_mariadb_script(
+                &count_file,
+                &replay_sql_file,
+                first_error,
+                success_after_failures,
+            );
+            fs::write(&script, script_body).expect("fake mariadb script");
+            let mut permissions = fs::metadata(&script).expect("script metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).expect("script permissions");
+            Self {
+                dir,
+                script,
+                count_file,
+                replay_sql_file,
+            }
+        }
+
+        fn script_path(&self) -> String {
+            self.script.to_string_lossy().into_owned()
+        }
+
+        fn call_count(&self) -> usize {
+            fs::read_to_string(&self.count_file)
+                .expect("call count")
+                .trim()
+                .parse()
+                .expect("numeric call count")
+        }
+
+        fn replay_sql(&self) -> String {
+            fs::read_to_string(&self.replay_sql_file).expect("replay sql")
+        }
+    }
+
+    impl Drop for FakeMariadb {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fake_mariadb_script(
+        count_file: &Path,
+        replay_sql_file: &Path,
+        first_error: &str,
+        success_after_failures: usize,
+    ) -> String {
+        format!(
+            r#"#!/bin/sh
+count_file={count_file}
+replay_sql_file={replay_sql_file}
+count="$(cat "$count_file" 2>/dev/null || echo 0)"
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-e" ]; then
+    shift
+    printf '%s' "$1" > "$replay_sql_file"
+    break
+  fi
+  shift
+done
+if [ "$count" -le {success_after_failures} ]; then
+  printf '%s\n' {first_error} >&2
+  exit 1
+fi
+exit 0
+"#,
+            count_file = shell_quote_path(count_file),
+            replay_sql_file = shell_quote_path(replay_sql_file),
+            first_error = shell_quote(first_error),
+        )
+    }
+
+    fn shell_quote_path(path: &Path) -> String {
+        shell_quote(&path.to_string_lossy())
+    }
+
+    fn shell_quote(value: impl AsRef<str>) -> String {
+        format!("'{}'", value.as_ref().replace('\'', "'\\''"))
+    }
+
+    fn temp_fixture_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "mariadb-mysql-cdc-test-{}-{nanos}",
+            std::process::id()
+        ))
     }
 }
