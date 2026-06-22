@@ -1,6 +1,8 @@
 use crate::snapshot::{SnapshotRow, SnapshotTarget};
 use std::fmt;
 
+const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlStatement {
     pub sql: String,
@@ -75,6 +77,13 @@ where
             return Ok(());
         }
 
+        for batch in rows.chunks(max_insert_rows_per_statement(self.columns.len())) {
+            self.insert_row_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn insert_row_batch(&self, rows: &[SnapshotRow]) -> Result<(), TargetWriteError> {
         let statement = build_insert_statement(
             &self.table,
             &self.primary_key,
@@ -232,6 +241,11 @@ fn build_insert_statement(
     SqlStatement { sql, params }
 }
 
+fn max_insert_rows_per_statement(column_count: usize) -> usize {
+    let divisor = column_count.max(1);
+    (MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS / divisor).max(1)
+}
+
 fn build_update_statement(
     table: &str,
     primary_key: &[String],
@@ -386,6 +400,28 @@ mod tests {
     }
 
     #[test]
+    fn splits_insert_batches_under_mysql_placeholder_limit() {
+        let executor = RecordingExecutor::default();
+        let columns = numbered_columns(21);
+        let rows = (0..3121)
+            .map(|row_number| wide_row(row_number, &columns))
+            .collect::<Vec<_>>();
+        let writer = TargetMySqlWriter::new(
+            "wide_accounts",
+            vec!["c0"],
+            columns.iter().map(String::as_str).collect(),
+            executor,
+        );
+
+        writer.insert_rows(&rows).expect("insert rows");
+
+        let executed = writer.executor.statements.borrow();
+        assert_eq!(executed.len(), 2);
+        assert_eq!(executed[0].params.len(), 65_520);
+        assert_eq!(executed[1].params.len(), 21);
+    }
+
+    #[test]
     fn renders_sql_statement_params_as_literals() {
         let rendered = render_sql_statement(&SqlStatement {
             sql: "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?)".to_string(),
@@ -452,6 +488,22 @@ mod tests {
 
         SnapshotRow {
             primary_key: vec![id.to_string()],
+            values,
+        }
+    }
+
+    fn numbered_columns(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("c{index}")).collect()
+    }
+
+    fn wide_row(row_number: usize, columns: &[String]) -> SnapshotRow {
+        let values = columns
+            .iter()
+            .map(|column| (column.clone(), format!("{column}-{row_number}")))
+            .collect();
+
+        SnapshotRow {
+            primary_key: vec![row_number.to_string()],
             values,
         }
     }
