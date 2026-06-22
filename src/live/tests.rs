@@ -157,6 +157,14 @@ fn target_session_init_removes_ansi_quotes() {
     assert!(!target_session_init_command().contains("ANSI_QUOTES"));
 }
 
+#[test]
+fn target_client_uses_utf8mb4_connection_charset() {
+    assert_eq!(
+        target_client_character_set_arg(),
+        "--default-character-set=utf8mb4"
+    );
+}
+
 #[derive(Default)]
 struct RecordingExecutor {
     statements: RefCell<Vec<String>>,

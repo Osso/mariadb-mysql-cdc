@@ -273,6 +273,7 @@ impl MysqlCliExecutor {
                 "--batch",
                 "--raw",
                 "--skip-column-names",
+                target_client_character_set_arg(),
                 "--host",
                 &self.target.host,
                 "--port",
@@ -318,6 +319,10 @@ fn target_session_init_command() -> &'static str {
 
 fn target_replay_sql(sql: &str) -> String {
     format!("{}; {}", target_session_init_command(), sql)
+}
+
+fn target_client_character_set_arg() -> &'static str {
+    "--default-character-set=utf8mb4"
 }
 
 pub fn extract_statement_events(output: &str, start: &BinlogCoordinate) -> Vec<StatementEvent> {
