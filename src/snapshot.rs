@@ -3,6 +3,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
+
+const SNAPSHOT_RETRY_ATTEMPTS: u32 = 3;
+const SNAPSHOT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnapshotTable {
@@ -132,6 +137,13 @@ pub enum SnapshotError {
         path: PathBuf,
         source: io::Error,
     },
+    Retry {
+        operation: String,
+        table: String,
+        attempts: u32,
+        start_after: String,
+        source: Box<SnapshotError>,
+    },
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -156,6 +168,16 @@ impl std::fmt::Display for SnapshotError {
             Self::Write { path, source } => {
                 write!(formatter, "failed to write {}: {source}", path.display())
             }
+            Self::Retry {
+                operation,
+                table,
+                attempts,
+                start_after,
+                source,
+            } => write!(
+                formatter,
+                "snapshot {operation} failed table={table} attempts={attempts} start_after={start_after}: {source}"
+            ),
         }
     }
 }
@@ -234,26 +256,110 @@ fn copy_table_chunks(
 ) -> Result<(), SnapshotError> {
     loop {
         let request = build_chunk_request(table, chunk_size, progress)?;
-        let rows = source.read_chunk(&request)?;
+        let rows = read_chunk_with_retry(source, &request)?;
 
         if rows.is_empty() {
             progress.mark_complete(&table.name);
-            progress_store.save(progress)?;
+            save_progress_with_retry(progress_store, progress, &request)?;
             return Ok(());
         }
 
-        target.write_rows(&rows)?;
+        write_rows_with_retry(target, &request, &rows)?;
         let last_primary_key = last_primary_key(&rows)?;
         progress.mark_chunk(&table.name, last_primary_key, rows.len() as u64);
 
         if rows.len() < chunk_size {
             progress.mark_complete(&table.name);
-            progress_store.save(progress)?;
+            save_progress_with_retry(progress_store, progress, &request)?;
             return Ok(());
         }
 
-        progress_store.save(progress)?;
+        save_progress_with_retry(progress_store, progress, &request)?;
     }
+}
+
+fn read_chunk_with_retry(
+    source: &impl SnapshotSource,
+    request: &ChunkRequest,
+) -> Result<Vec<SnapshotRow>, SnapshotError> {
+    retry_snapshot_operation("source_read", request, || source.read_chunk(request))
+}
+
+fn write_rows_with_retry(
+    target: &mut impl SnapshotTarget,
+    request: &ChunkRequest,
+    rows: &[SnapshotRow],
+) -> Result<(), SnapshotError> {
+    retry_snapshot_operation("target_write", request, || target.write_rows(rows))
+}
+
+fn save_progress_with_retry(
+    progress_store: &impl SnapshotProgressStore,
+    progress: &SnapshotProgress,
+    request: &ChunkRequest,
+) -> Result<(), SnapshotError> {
+    retry_snapshot_operation("progress_save", request, || progress_store.save(progress))
+}
+
+fn retry_snapshot_operation<T>(
+    operation: &str,
+    request: &ChunkRequest,
+    mut attempt_operation: impl FnMut() -> Result<T, SnapshotError>,
+) -> Result<T, SnapshotError> {
+    let mut last_error = None;
+    for attempt in 1..=SNAPSHOT_RETRY_ATTEMPTS {
+        match attempt_operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                log_snapshot_retry(operation, request, attempt, &error);
+                last_error = Some(error);
+            }
+        }
+
+        if attempt < SNAPSHOT_RETRY_ATTEMPTS {
+            thread::sleep(SNAPSHOT_RETRY_BACKOFF);
+        }
+    }
+
+    Err(retry_error(
+        operation,
+        request,
+        last_error.expect("retry error"),
+    ))
+}
+
+fn log_snapshot_retry(
+    operation: &str,
+    request: &ChunkRequest,
+    attempt: u32,
+    error: &SnapshotError,
+) {
+    eprintln!(
+        "snapshot_retry operation={} table={} attempt={} attempts={} start_after={} error={}",
+        operation,
+        request.table,
+        attempt,
+        SNAPSHOT_RETRY_ATTEMPTS,
+        format_start_after(&request.start_after),
+        error
+    );
+}
+
+fn retry_error(operation: &str, request: &ChunkRequest, source: SnapshotError) -> SnapshotError {
+    SnapshotError::Retry {
+        operation: operation.to_string(),
+        table: request.table.clone(),
+        attempts: SNAPSHOT_RETRY_ATTEMPTS,
+        start_after: format_start_after(&request.start_after),
+        source: Box::new(source),
+    }
+}
+
+fn format_start_after(start_after: &Option<Vec<String>>) -> String {
+    start_after
+        .as_ref()
+        .map(|values| values.join(","))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn is_table_complete(progress: &SnapshotProgress, table: &str) -> bool {
@@ -339,220 +445,4 @@ fn temp_progress_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::RefCell;
-    use std::collections::{BTreeMap, VecDeque};
-
-    #[test]
-    fn builds_first_chunk_request_from_table_metadata() {
-        let table = accounts_table();
-        let progress = SnapshotProgress::default();
-
-        let request = build_chunk_request(&table, 500, &progress).expect("request");
-
-        assert_eq!(request.table, "accounts");
-        assert_eq!(request.primary_key, vec!["id"]);
-        assert_eq!(request.selected_columns, vec!["id", "name"]);
-        assert_eq!(request.start_after, None);
-        assert_eq!(request.limit, 500);
-    }
-
-    #[test]
-    fn resumes_chunk_request_after_last_primary_key() {
-        let table = accounts_table();
-        let mut progress = SnapshotProgress::default();
-        progress.mark_chunk("accounts", vec!["42".to_string()], 42);
-
-        let request = build_chunk_request(&table, 100, &progress).expect("request");
-
-        assert_eq!(request.start_after, Some(vec!["42".to_string()]));
-    }
-
-    #[test]
-    fn snapshots_table_in_chunks_and_saves_progress() {
-        let table = accounts_table();
-        let progress_store = MemoryProgressStore::default();
-        let source = FakeSnapshotSource::new(vec![
-            vec![row("1", "alpha"), row("2", "beta")],
-            vec![row("3", "gamma")],
-        ]);
-        let mut target = FakeSnapshotTarget::default();
-
-        let result =
-            snapshot_table(&table, 2, &progress_store, &source, &mut target).expect("snapshot");
-
-        assert_eq!(result.rows_copied, 3);
-        assert_eq!(target.rows.len(), 3);
-
-        let saved = progress_store.load().expect("load progress");
-        let table_progress = saved.table("accounts").expect("table progress");
-        assert_eq!(table_progress.last_primary_key, Some(vec!["3".to_string()]));
-        assert_eq!(table_progress.rows_copied, 3);
-        assert!(table_progress.complete);
-    }
-
-    #[test]
-    fn skips_completed_table_on_rerun() {
-        let table = accounts_table();
-        let progress_store = MemoryProgressStore::default();
-        let mut progress = SnapshotProgress::default();
-        progress.mark_chunk("accounts", vec!["3".to_string()], 3);
-        progress.mark_complete("accounts");
-        progress_store.save(&progress).expect("save progress");
-        let source = FakeSnapshotSource::new(vec![vec![row("4", "delta")]]);
-        let mut target = FakeSnapshotTarget::default();
-
-        let result =
-            snapshot_table(&table, 2, &progress_store, &source, &mut target).expect("snapshot");
-
-        assert_eq!(result.rows_copied, 0);
-        assert!(target.rows.is_empty());
-    }
-
-    #[test]
-    fn formats_snapshot_progress_for_operators() {
-        let mut progress = SnapshotProgress::default();
-        progress.mark_chunk("accounts", vec!["42".to_string()], 42);
-
-        assert_eq!(
-            format_progress(&progress),
-            "snapshot_progress tables=1\nsnapshot_table_progress table=accounts rows_copied=42 complete=false last_primary_key=42"
-        );
-    }
-
-    #[test]
-    fn file_progress_store_round_trips_table_progress() {
-        let path = unique_path("snapshot-progress.json");
-        let store = FileSnapshotProgressStore::new(path.clone());
-        let mut progress = SnapshotProgress::default();
-        progress.mark_chunk("accounts", vec!["9".to_string()], 9);
-
-        store.save(&progress).expect("save progress");
-        let loaded = store.load().expect("load progress");
-
-        assert_eq!(loaded, progress);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn builds_snapshot_table_from_inventory_table() {
-        let inventory_table = crate::inventory::TableInventory {
-            name: "accounts".to_string(),
-            table_type: "BASE TABLE".to_string(),
-            engine: Some("InnoDB".to_string()),
-            collation: None,
-            primary_key: vec!["id".to_string()],
-            columns: vec![
-                inventory_column("id"),
-                inventory_column("name"),
-                generated_inventory_column("name_length"),
-            ],
-        };
-
-        let table = SnapshotTable::from(&inventory_table);
-
-        assert_eq!(table.name, "accounts");
-        assert_eq!(table.primary_key, vec!["id"]);
-        assert_eq!(table.columns, vec!["id", "name"]);
-    }
-
-    fn accounts_table() -> SnapshotTable {
-        SnapshotTable {
-            name: "accounts".to_string(),
-            primary_key: vec!["id".to_string()],
-            columns: vec!["id".to_string(), "name".to_string()],
-        }
-    }
-
-    fn row(id: &str, name: &str) -> SnapshotRow {
-        let mut values = BTreeMap::new();
-        values.insert("id".to_string(), id.to_string());
-        values.insert("name".to_string(), name.to_string());
-
-        SnapshotRow {
-            primary_key: vec![id.to_string()],
-            values,
-        }
-    }
-
-    fn inventory_column(name: &str) -> crate::inventory::ColumnInventory {
-        crate::inventory::ColumnInventory {
-            name: name.to_string(),
-            ordinal_position: 1,
-            column_type: "varchar(64)".to_string(),
-            data_type: "varchar".to_string(),
-            is_nullable: false,
-            default_value: None,
-            extra: String::new(),
-            generated: None,
-        }
-    }
-
-    fn generated_inventory_column(name: &str) -> crate::inventory::ColumnInventory {
-        crate::inventory::ColumnInventory {
-            generated: Some(crate::inventory::GeneratedColumn {
-                expression: "`name`".to_string(),
-                generation_kind: "VIRTUAL".to_string(),
-            }),
-            ..inventory_column(name)
-        }
-    }
-
-    fn unique_path(file_name: &str) -> std::path::PathBuf {
-        let mut path = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        path.push(format!("mariadb-mysql-cdc-{nanos}-{file_name}"));
-        path
-    }
-
-    #[derive(Default)]
-    struct MemoryProgressStore {
-        progress: RefCell<SnapshotProgress>,
-    }
-
-    impl SnapshotProgressStore for MemoryProgressStore {
-        fn load(&self) -> Result<SnapshotProgress, SnapshotError> {
-            Ok(self.progress.borrow().clone())
-        }
-
-        fn save(&self, progress: &SnapshotProgress) -> Result<(), SnapshotError> {
-            *self.progress.borrow_mut() = progress.clone();
-            Ok(())
-        }
-    }
-
-    struct FakeSnapshotSource {
-        chunks: RefCell<VecDeque<Vec<SnapshotRow>>>,
-    }
-
-    impl FakeSnapshotSource {
-        fn new(chunks: Vec<Vec<SnapshotRow>>) -> Self {
-            Self {
-                chunks: RefCell::new(chunks.into()),
-            }
-        }
-    }
-
-    impl SnapshotSource for FakeSnapshotSource {
-        fn read_chunk(&self, _request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError> {
-            Ok(self.chunks.borrow_mut().pop_front().unwrap_or_default())
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeSnapshotTarget {
-        rows: Vec<SnapshotRow>,
-    }
-
-    impl SnapshotTarget for FakeSnapshotTarget {
-        fn write_rows(&mut self, rows: &[SnapshotRow]) -> Result<(), SnapshotError> {
-            self.rows.extend_from_slice(rows);
-            Ok(())
-        }
-    }
-}
+mod tests;
