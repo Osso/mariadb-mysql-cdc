@@ -171,6 +171,10 @@ impl fmt::Display for TargetWriteError {
 impl std::error::Error for TargetWriteError {}
 
 pub fn render_sql_statement(statement: &SqlStatement) -> Result<String, TargetExecuteError> {
+    if statement.params.is_empty() {
+        return Ok(statement.sql.clone());
+    }
+
     let placeholder_count = statement.sql.matches('?').count();
     if placeholder_count != statement.params.len() {
         return Err(TargetExecuteError::new(format!(
@@ -396,16 +400,30 @@ mod tests {
     }
 
     #[test]
+    fn leaves_raw_sql_with_question_marks_unchanged_when_there_are_no_params() {
+        let rendered = render_sql_statement(&SqlStatement {
+            sql: "INSERT INTO `guests` (`reason`) VALUES (\"no guest cookies?\")".to_string(),
+            params: Vec::new(),
+        })
+        .expect("render raw statement");
+
+        assert_eq!(
+            rendered,
+            "INSERT INTO `guests` (`reason`) VALUES (\"no guest cookies?\")"
+        );
+    }
+
+    #[test]
     fn rejects_sql_statement_placeholder_param_mismatch() {
         let error = render_sql_statement(&SqlStatement {
-            sql: "SELECT ?".to_string(),
-            params: Vec::new(),
+            sql: "SELECT ?, ?".to_string(),
+            params: vec!["one".to_string()],
         })
         .expect_err("placeholder mismatch");
 
         assert_eq!(
             error.to_string(),
-            "statement has 1 placeholders and 0 params"
+            "statement has 2 placeholders and 1 params"
         );
     }
 
