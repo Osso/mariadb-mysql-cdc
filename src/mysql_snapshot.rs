@@ -48,6 +48,7 @@ pub struct CatchupSnapshotConfig {
     pub progress_file: PathBuf,
     pub progress_table: String,
     pub chunk_size: usize,
+    pub throttle: Duration,
     pub table: Option<String>,
 }
 
@@ -179,7 +180,12 @@ fn copy_catchup_table(
     completed_tables: usize,
 ) -> Result<crate::snapshot::SnapshotResult, CatchupSnapshotError> {
     let mut target = snapshot_target_for_table(config, table)?;
-    let observer = CatchupSnapshotLogger::new(table_number, total_tables, completed_tables);
+    let observer = CatchupSnapshotLogger::new(
+        table_number,
+        total_tables,
+        completed_tables,
+        config.throttle,
+    );
     let result = snapshot_table_with_observer(
         table,
         config.chunk_size,
@@ -350,15 +356,22 @@ struct CatchupSnapshotLogger {
     total_tables: usize,
     completed_tables: usize,
     started_at: Instant,
+    throttle: Duration,
 }
 
 impl CatchupSnapshotLogger {
-    fn new(table_number: usize, total_tables: usize, completed_tables: usize) -> Self {
+    fn new(
+        table_number: usize,
+        total_tables: usize,
+        completed_tables: usize,
+        throttle: Duration,
+    ) -> Self {
         Self {
             table_number,
             total_tables,
             completed_tables,
             started_at: Instant::now(),
+            throttle,
         }
     }
 
@@ -379,7 +392,16 @@ impl SnapshotObserver for CatchupSnapshotLogger {
                 self.elapsed_seconds(),
             )
         );
+        throttle_after_chunk(self.throttle);
     }
+}
+
+fn throttle_after_chunk(throttle: Duration) {
+    if throttle.is_zero() {
+        return;
+    }
+
+    std::thread::sleep(throttle);
 }
 
 fn format_catchup_table_start(
