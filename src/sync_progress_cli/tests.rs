@@ -238,6 +238,23 @@ fn formats_progress_from_stored_total_rows_without_source_config() {
 }
 
 #[test]
+fn formats_running_progress_at_bottom_under_header() {
+    let config = default_sync_progress_config();
+    let rows = vec![
+        progress_row("running_table", "running"),
+        progress_row("complete_table", "complete"),
+        progress_row("error_table", "error"),
+    ];
+
+    let lines = format_progress_rows(&config, &rows);
+
+    assert_eq!(lines[0], format_progress_row(&config, &rows[1]));
+    assert_eq!(lines[1], format_progress_row(&config, &rows[2]));
+    assert_eq!(lines[2], "sync_progress_section name=in_progress");
+    assert_eq!(lines[3], format_progress_row(&config, &rows[0]));
+}
+
+#[test]
 fn builds_progress_table_lookup_for_qualified_and_default_schema_tables() {
     assert_eq!(
         qualified_table_parts("globalcomix", "cdc.table_sync_progress"),
@@ -262,6 +279,21 @@ fn builds_total_rows_column_lookup_for_progress_table() {
     assert!(sql.contains("table_schema = 'cdc'"));
     assert!(sql.contains("table_name = 'table_sync_progress'"));
     assert!(sql.contains("column_name = 'total_rows'"));
+}
+
+fn progress_row(table: &str, status: &str) -> SyncProgressRow {
+    SyncProgressRow {
+        table: table.to_string(),
+        rows_scanned: 10,
+        total_rows: Some(100),
+        inserts: 10,
+        updates: 0,
+        extra_target_rows: 0,
+        status: status.to_string(),
+        last_primary_key: String::new(),
+        elapsed_seconds: 5,
+        last_error: String::new(),
+    }
 }
 
 fn args<const N: usize>(values: [&str; N]) -> Vec<String> {

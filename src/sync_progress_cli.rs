@@ -293,7 +293,7 @@ fn read_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
             &config.progress_table,
             "empty",
         )),
-        Some(rows) => lines.extend(rows.iter().map(|row| format_progress_row(config, row))),
+        Some(rows) => lines.extend(format_progress_rows(config, &rows)),
         None => lines.push(format_progress_table_status(
             &config.progress_table,
             "missing",
@@ -359,6 +359,25 @@ fn read_stream_checkpoint(
         config.checkpoint_table.clone(),
     )
     .load()
+}
+
+fn format_progress_rows(config: &SyncProgressConfig, rows: &[SyncProgressRow]) -> Vec<String> {
+    let (running_rows, other_rows): (Vec<_>, Vec<_>) = rows
+        .iter()
+        .partition(|row| row.status.eq_ignore_ascii_case("running"));
+    let mut lines = other_rows
+        .iter()
+        .map(|row| format_progress_row(config, row))
+        .collect::<Vec<_>>();
+    if !running_rows.is_empty() {
+        lines.push("sync_progress_section name=in_progress".to_string());
+        lines.extend(
+            running_rows
+                .iter()
+                .map(|row| format_progress_row(config, row)),
+        );
+    }
+    lines
 }
 
 fn format_progress_row(config: &SyncProgressConfig, row: &SyncProgressRow) -> String {
