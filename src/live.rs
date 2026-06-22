@@ -267,14 +267,12 @@ impl MysqlCliExecutor {
         statement: &SqlStatement,
     ) -> Result<std::process::Output, TargetExecuteError> {
         let password_arg = format!("--password={}", self.target.password);
-        let init_command = target_session_init_command();
+        let replay_sql = target_replay_sql(&statement.sql);
         Command::new(&self.mariadb)
             .args([
                 "--batch",
                 "--raw",
                 "--skip-column-names",
-                "--init-command",
-                init_command,
                 "--host",
                 &self.target.host,
                 "--port",
@@ -286,7 +284,7 @@ impl MysqlCliExecutor {
                 "--ssl-verify-server-cert=0",
                 &self.target.database,
                 "-e",
-                &statement.sql,
+                &replay_sql,
             ])
             .output()
             .map_err(|error| TargetExecuteError::new(format!("failed to run mariadb: {error}")))
@@ -315,7 +313,11 @@ impl MysqlCliExecutor {
 }
 
 fn target_session_init_command() -> &'static str {
-    "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',ANSI_QUOTES,', ','), ',,', ','), ',,', ','))"
+    "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'"
+}
+
+fn target_replay_sql(sql: &str) -> String {
+    format!("{}; {}", target_session_init_command(), sql)
 }
 
 pub fn extract_statement_events(output: &str, start: &BinlogCoordinate) -> Vec<StatementEvent> {
@@ -719,7 +721,11 @@ DELETE FROM accounts WHERE id = 1/*!*/;
 
     #[test]
     fn target_session_init_removes_ansi_quotes() {
-        assert!(target_session_init_command().contains("ANSI_QUOTES"));
+        assert_eq!(
+            target_session_init_command(),
+            "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'"
+        );
+        assert!(!target_session_init_command().contains("ANSI_QUOTES"));
     }
 
     #[derive(Default)]
