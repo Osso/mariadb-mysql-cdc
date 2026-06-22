@@ -3,7 +3,7 @@ use crate::mysql_support::qualified_table_parts;
 use std::env;
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -281,6 +281,53 @@ fn builds_total_rows_column_lookup_for_progress_table() {
     assert!(sql.contains("column_name = 'total_rows'"));
 }
 
+#[test]
+fn target_progress_connection_has_short_io_timeouts() {
+    let target = live::TargetMySqlConfig {
+        host: "target-db".to_string(),
+        port: 3306,
+        user: "cdc".to_string(),
+        password: "secret".to_string(),
+        database: "globalcomix".to_string(),
+        insert_conflict_policy: live::InsertConflictPolicy::Error,
+    };
+
+    let opts = target_opts(&target);
+
+    assert_eq!(opts.get_tcp_connect_timeout(), Some(Duration::from_secs(2)));
+    assert_eq!(opts.get_read_timeout(), Some(&Duration::from_secs(2)));
+    assert_eq!(opts.get_write_timeout(), Some(&Duration::from_secs(2)));
+}
+
+#[test]
+fn sync_progress_cache_timeout_defaults_and_accepts_override() {
+    let _guard = env_lock();
+    remove_env("MARIADB_MYSQL_CDC_SYNC_PROGRESS_TIMEOUT_MS");
+    assert_eq!(
+        cache::sync_progress_cache_timeout(),
+        Duration::from_millis(1500)
+    );
+
+    set_env("MARIADB_MYSQL_CDC_SYNC_PROGRESS_TIMEOUT_MS", "9000");
+
+    assert_eq!(cache::sync_progress_cache_timeout(), Duration::from_secs(9));
+}
+
+#[test]
+fn formats_stale_sync_progress_cache_with_age_and_reason() {
+    let cache = cache::CachedSyncProgress {
+        report: "sync_progress_table table=cdc.table_sync_progress status=empty\n".to_string(),
+        modified: SystemTime::now() - Duration::from_secs(42),
+    };
+
+    let output = cache::format_cached_sync_progress(&cache, "live read exceeded 1500ms");
+
+    assert!(output.starts_with(
+        "sync_progress_cache status=stale age_seconds=42 reason=live_read_exceeded_1500ms\n"
+    ));
+    assert!(output.contains("sync_progress_table table=cdc.table_sync_progress status=empty"));
+}
+
 fn progress_row(table: &str, status: &str) -> SyncProgressRow {
     SyncProgressRow {
         table: table.to_string(),
@@ -303,6 +350,12 @@ fn args<const N: usize>(values: [&str; N]) -> Vec<String> {
 fn set_env(name: &str, value: &str) {
     unsafe {
         env::set_var(name, value);
+    }
+}
+
+fn remove_env(name: &str) {
+    unsafe {
+        env::remove_var(name);
     }
 }
 

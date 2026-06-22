@@ -34,6 +34,9 @@ in [catchup.md](../catchup.md).
   elapsed seconds.
 - [x] Store catchup progress in the target CDC progress table so progress can be
   read without source database credentials.
+- [x] Return `sync-progress` output in 1-2 seconds during active catchup by
+  bounding live target reads and using a clearly marked stale cache fallback
+  when the target read exceeds 1500ms.
 
 ## How it works
 

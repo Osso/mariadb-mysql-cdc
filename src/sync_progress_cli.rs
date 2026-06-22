@@ -1,12 +1,21 @@
 use crate::checkpoint::FileCheckpointStore;
 use crate::mysql_support::qualified_table_parts;
-use crate::stream_checkpoint::{MySqlStreamCheckpointStore, default_stream_checkpoint_table};
+use crate::stream_checkpoint::default_stream_checkpoint_table;
 use crate::{live, mysql_snapshot};
+use mysql::prelude::Queryable;
+use mysql::{Conn, Opts, OptsBuilder, SslOpts};
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
+mod cache;
+mod output;
+
+const SYNC_PROGRESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 pub fn run_sync_progress_command(args: Vec<String>, usage: &str) {
     let config = match parse_sync_progress_config(args) {
         Ok(config) => config,
@@ -17,7 +26,7 @@ pub fn run_sync_progress_command(args: Vec<String>, usage: &str) {
     };
 
     match read_sync_progress(&config) {
-        Ok(report) => print!("{report}"),
+        Ok(report) => output::write_report_or_exit(&report),
         Err(error) => {
             eprintln!("{error}");
             std::process::exit(1);
@@ -282,8 +291,36 @@ fn has_source_count_config(config: &SyncProgressConfig) -> bool {
 }
 
 fn read_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
-    let rows = query_progress_rows(config)?;
-    let checkpoint = read_checkpoint_line(config)?;
+    let (sender, receiver) = mpsc::channel();
+    let cache_key = config.table.as_deref().unwrap_or("all").to_string();
+    let live_config = config.clone();
+    thread::spawn(move || {
+        let _ = sender.send(read_live_sync_progress(&live_config));
+    });
+
+    match receiver.recv_timeout(cache::sync_progress_cache_timeout()) {
+        Ok(Ok(report)) => {
+            cache::write_sync_progress_cache(&cache_key, &report);
+            Ok(report)
+        }
+        Ok(Err(error)) => cache::read_sync_progress_cache(&cache_key)
+            .map(|cached| cache::format_cached_sync_progress(&cached, &error))
+            .ok_or(error),
+        Err(mpsc::RecvTimeoutError::Timeout) => cache::read_sync_progress_cache(&cache_key)
+            .map(|cached| cache::format_cached_sync_progress(&cached, "live read exceeded 1500ms"))
+            .ok_or_else(|| {
+                "sync-progress live read exceeded 1500ms and no cache exists".to_string()
+            }),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("sync-progress worker exited without a result".to_string())
+        }
+    }
+}
+
+fn read_live_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
+    let mut reader = TargetProgressReader::new(&config.target)?;
+    let rows = query_progress_rows(config, &mut reader)?;
+    let checkpoint = read_checkpoint_line(config, &mut reader)?;
     let mut lines = Vec::new();
     if let Some(checkpoint) = checkpoint {
         lines.push(checkpoint);
@@ -308,35 +345,25 @@ fn format_progress_table_status(table: &str, status: &str) -> String {
 
 fn query_progress_rows(
     config: &SyncProgressConfig,
+    reader: &mut TargetProgressReader,
 ) -> Result<Option<Vec<SyncProgressRow>>, String> {
-    if !progress_table_exists(config)? {
+    if !reader.progress_table_exists(&config.progress_table)? {
         return Ok(None);
     }
-    let has_total_rows = progress_table_has_total_rows(config)?;
+    let has_total_rows = reader.progress_table_has_total_rows(&config.progress_table)?;
     let sql = build_progress_query(
         &config.progress_table,
         config.table.as_deref(),
         has_total_rows,
     );
-    let output = run_mysql_query(&config.mariadb, &config.target, &sql)?;
-    parse_progress_rows(&output).map(Some)
+    reader.query_progress_rows(&sql).map(Some)
 }
 
-fn progress_table_exists(config: &SyncProgressConfig) -> Result<bool, String> {
-    let sql = build_progress_table_exists_query(&config.target.database, &config.progress_table);
-    let output = run_mysql_query(&config.mariadb, &config.target, &sql)?;
-    Ok(output.trim() == "1")
-}
-
-fn progress_table_has_total_rows(config: &SyncProgressConfig) -> Result<bool, String> {
-    let sql =
-        build_progress_total_rows_exists_query(&config.target.database, &config.progress_table);
-    let output = run_mysql_query(&config.mariadb, &config.target, &sql)?;
-    Ok(output.trim() == "1")
-}
-
-fn read_checkpoint_line(config: &SyncProgressConfig) -> Result<Option<String>, String> {
-    let checkpoint = read_stream_checkpoint(config)?;
+fn read_checkpoint_line(
+    config: &SyncProgressConfig,
+    reader: &mut TargetProgressReader,
+) -> Result<Option<String>, String> {
+    let checkpoint = read_stream_checkpoint(config, reader)?;
     Ok(checkpoint.map(|checkpoint| {
         format!(
             "stream_checkpoint file={} position={} event_type={}",
@@ -347,18 +374,14 @@ fn read_checkpoint_line(config: &SyncProgressConfig) -> Result<Option<String>, S
 
 fn read_stream_checkpoint(
     config: &SyncProgressConfig,
+    reader: &mut TargetProgressReader,
 ) -> Result<Option<crate::checkpoint::Checkpoint>, String> {
     if let Some(path) = &config.checkpoint_file {
         return FileCheckpointStore::new(path)
             .load()
             .map_err(|error| error.to_string());
     }
-    MySqlStreamCheckpointStore::new(
-        config.mariadb.clone(),
-        config.target.clone(),
-        config.checkpoint_table.clone(),
-    )
-    .load()
+    reader.read_stream_checkpoint(&config.checkpoint_table)
 }
 
 fn format_progress_rows(config: &SyncProgressConfig, rows: &[SyncProgressRow]) -> Vec<String> {
@@ -441,6 +464,7 @@ fn build_progress_table_exists_query(default_schema: &str, progress_table: &str)
     )
 }
 
+#[cfg(test)]
 fn parse_progress_rows(output: &str) -> Result<Vec<SyncProgressRow>, String> {
     output
         .lines()
@@ -449,6 +473,7 @@ fn parse_progress_rows(output: &str) -> Result<Vec<SyncProgressRow>, String> {
         .collect()
 }
 
+#[cfg(test)]
 fn parse_progress_row(line: &str) -> Result<SyncProgressRow, String> {
     let fields = line.split('\t').collect::<Vec<_>>();
     if fields.len() != 10 {
@@ -472,6 +497,101 @@ fn parse_progress_row(line: &str) -> Result<SyncProgressRow, String> {
     })
 }
 
+type ProgressDbRow = (
+    String,
+    u64,
+    String,
+    u64,
+    u64,
+    u64,
+    String,
+    String,
+    u64,
+    String,
+);
+
+struct TargetProgressReader {
+    conn: Conn,
+    default_database: String,
+}
+
+impl TargetProgressReader {
+    fn new(target: &live::TargetMySqlConfig) -> Result<Self, String> {
+        let opts = target_opts(target);
+        let mut conn = Conn::new(opts).map_err(mysql_error)?;
+        conn.query_drop(live::target_session_init_command())
+            .map_err(mysql_error)?;
+        Ok(Self {
+            conn,
+            default_database: target.database.clone(),
+        })
+    }
+
+    fn progress_table_exists(&mut self, progress_table: &str) -> Result<bool, String> {
+        let sql = build_progress_table_exists_query(&self.default_database, progress_table);
+        self.query_count(&sql).map(|count| count == 1)
+    }
+
+    fn progress_table_has_total_rows(&mut self, progress_table: &str) -> Result<bool, String> {
+        let sql = build_progress_total_rows_exists_query(&self.default_database, progress_table);
+        self.query_count(&sql).map(|count| count == 1)
+    }
+
+    fn query_progress_rows(&mut self, sql: &str) -> Result<Vec<SyncProgressRow>, String> {
+        let rows = self
+            .conn
+            .query::<ProgressDbRow, _>(sql)
+            .map_err(mysql_error)?;
+        rows.into_iter()
+            .map(sync_progress_row_from_db)
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn read_stream_checkpoint(
+        &mut self,
+        checkpoint_table: &str,
+    ) -> Result<Option<crate::checkpoint::Checkpoint>, String> {
+        let sql = build_checkpoint_json_select_sql(checkpoint_table);
+        let json = match self.conn.query_first::<String, _>(sql) {
+            Ok(json) => json,
+            Err(error) if is_missing_table_error(&error) => return Ok(None),
+            Err(error) => return Err(mysql_error(error)),
+        };
+        json.map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|error| format!("invalid stream checkpoint JSON: {error}"))
+    }
+
+    fn query_count(&mut self, sql: &str) -> Result<u64, String> {
+        self.conn
+            .query_first::<u64, _>(sql)
+            .map_err(mysql_error)?
+            .ok_or_else(|| "count query returned no rows".to_string())
+    }
+}
+
+fn sync_progress_row_from_db(row: ProgressDbRow) -> Result<SyncProgressRow, String> {
+    Ok(SyncProgressRow {
+        table: row.0,
+        rows_scanned: row.1,
+        total_rows: parse_optional_u64_field("total_rows", &row.2)?,
+        inserts: row.3,
+        updates: row.4,
+        extra_target_rows: row.5,
+        status: row.6,
+        last_primary_key: row.7,
+        elapsed_seconds: row.8,
+        last_error: row.9,
+    })
+}
+
+fn build_checkpoint_json_select_sql(table: &str) -> String {
+    format!(
+        "SELECT checkpoint_json FROM {} WHERE checkpoint_name = 'stream-binlog' LIMIT 1",
+        quote_identifier_path(table)
+    )
+}
+
 fn parse_optional_u64_field(field: &str, value: &str) -> Result<Option<u64>, String> {
     if value.is_empty() {
         return Ok(None);
@@ -492,20 +612,39 @@ fn source_count(config: &SyncProgressConfig, table: &str) -> Result<Option<u64>,
         .map_err(|_| format!("source count for {table} was not an integer"))
 }
 
-fn run_mysql_query(
-    mariadb: &str,
-    target: &live::TargetMySqlConfig,
-    sql: &str,
-) -> Result<String, String> {
-    run_mariadb_query(mariadb, target_mysql_args(target), sql)
-}
-
 fn run_source_query(
     mariadb: &str,
     source: &mysql_snapshot::MySqlConnectionConfig,
     sql: &str,
 ) -> Result<String, String> {
     run_mariadb_query(mariadb, source_mysql_args(source), sql)
+}
+
+fn target_opts(target: &live::TargetMySqlConfig) -> Opts {
+    let builder = OptsBuilder::default()
+        .ip_or_hostname(Some(&target.host))
+        .tcp_port(target.port)
+        .user(Some(&target.user))
+        .pass(Some(&target.password))
+        .db_name(Some(&target.database))
+        .prefer_socket(false)
+        .tcp_connect_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
+        .read_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
+        .write_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
+        .ssl_opts(
+            SslOpts::default()
+                .with_danger_skip_domain_validation(true)
+                .with_danger_accept_invalid_certs(true),
+        );
+    Opts::from(builder)
+}
+
+fn mysql_error(error: mysql::Error) -> String {
+    error.to_string()
+}
+
+fn is_missing_table_error(error: &mysql::Error) -> bool {
+    matches!(error, mysql::Error::MySqlError(inner) if inner.code == 1146)
 }
 
 fn run_mariadb_query(mariadb: &str, args: Vec<String>, sql: &str) -> Result<String, String> {
@@ -526,20 +665,6 @@ fn command_output(output: std::process::Output) -> Result<String, String> {
     }
 
     Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-}
-
-fn target_mysql_args(target: &live::TargetMySqlConfig) -> Vec<String> {
-    vec![
-        "--host".to_string(),
-        target.host.clone(),
-        "--port".to_string(),
-        target.port.to_string(),
-        "--user".to_string(),
-        target.user.clone(),
-        format!("--password={}", target.password),
-        "--database".to_string(),
-        target.database.clone(),
-    ]
 }
 
 fn source_mysql_args(source: &mysql_snapshot::MySqlConnectionConfig) -> Vec<String> {
