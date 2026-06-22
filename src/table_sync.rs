@@ -561,6 +561,7 @@ mod tests {
             last_primary_key: Some(vec!["1".to_string()]),
             chunks: 1,
             rows_scanned: 1,
+            total_rows: None,
             inserts: 0,
             updates: 0,
             extra_target_rows: 0,

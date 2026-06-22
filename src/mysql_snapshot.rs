@@ -9,6 +9,7 @@ use crate::table_sync::{
     TableSyncError,
 };
 use crate::target::{SnapshotInsertMode, TargetMySqlWriter};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -125,6 +126,7 @@ pub fn run_catchup_snapshot(
     );
 
     for table in tables {
+        prepare_snapshot_table_progress(config, &progress_store, &table.name)?;
         println!("catchup_table_start table={}", table.name);
         let mut target = snapshot_target_for_table(config, &table);
         let result = snapshot_table(
@@ -148,6 +150,16 @@ pub fn run_catchup_snapshot(
     Ok(CatchupSnapshotReport { tables: reports })
 }
 
+fn prepare_snapshot_table_progress(
+    config: &CatchupSnapshotConfig,
+    progress_store: &CatchupProgressStore,
+    table: &str,
+) -> Result<(), CatchupSnapshotError> {
+    let total_rows = count_snapshot_rows(config, table)?;
+    progress_store.record_total_rows(table, total_rows);
+    Ok(())
+}
+
 fn catchup_progress_store(config: &CatchupSnapshotConfig) -> CatchupProgressStore {
     let mysql_store = MySqlSyncProgressStore::new(
         config.source.mariadb.clone(),
@@ -157,12 +169,14 @@ fn catchup_progress_store(config: &CatchupSnapshotConfig) -> CatchupProgressStor
     CatchupProgressStore {
         file_store: FileSnapshotProgressStore::new(&config.progress_file),
         mysql_store,
+        total_rows: RefCell::new(BTreeMap::new()),
     }
 }
 
 struct CatchupProgressStore {
     file_store: FileSnapshotProgressStore,
     mysql_store: MySqlSyncProgressStore,
+    total_rows: RefCell<BTreeMap<String, u64>>,
 }
 
 impl SnapshotProgressStore for CatchupProgressStore {
@@ -178,6 +192,12 @@ impl SnapshotProgressStore for CatchupProgressStore {
 }
 
 impl CatchupProgressStore {
+    fn record_total_rows(&self, table: &str, total_rows: u64) {
+        self.total_rows
+            .borrow_mut()
+            .insert(table.to_string(), total_rows);
+    }
+
     fn save_mysql_progress(&self, progress: &SnapshotProgress) -> Result<(), TableSyncError> {
         let mut store = self.mysql_store.clone();
         store.ensure()?;
@@ -187,6 +207,7 @@ impl CatchupProgressStore {
                 last_primary_key: table_progress.last_primary_key.clone(),
                 chunks: 0,
                 rows_scanned: table_progress.rows_copied,
+                total_rows: self.total_rows.borrow().get(table).copied(),
                 inserts: table_progress.rows_copied,
                 updates: 0,
                 extra_target_rows: 0,
@@ -318,6 +339,19 @@ fn read_snapshot_tables(
         .collect();
 
     Ok(tables)
+}
+
+fn count_snapshot_rows(config: &CatchupSnapshotConfig, table: &str) -> Result<u64, SnapshotError> {
+    let sql = build_count_rows_sql(table);
+    let output = run_mysql_query(&config.source, &sql).map_err(SnapshotError::InvalidTable)?;
+    output
+        .trim()
+        .parse()
+        .map_err(|_| SnapshotError::InvalidTable(format!("{table} row count was not an integer")))
+}
+
+fn build_count_rows_sql(table: &str) -> String {
+    format!("SELECT COUNT(*) FROM {}", quote_ident(table))
 }
 
 fn snapshot_target_for_table(

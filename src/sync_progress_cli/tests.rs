@@ -1,4 +1,5 @@
 use super::*;
+use crate::mysql_support::qualified_table_parts;
 use std::env;
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
@@ -175,7 +176,7 @@ fn command_line_overrides_config_file_defaults() {
 
 #[test]
 fn parses_progress_rows() {
-    let row = "releases\t200\t10\t3\t1\trunning\t[\"42\"]\t20\t";
+    let row = "releases\t200\t1000\t10\t3\t1\trunning\t[\"42\"]\t20\t";
 
     let rows = parse_progress_rows(row).expect("progress rows");
 
@@ -184,6 +185,7 @@ fn parses_progress_rows() {
         vec![SyncProgressRow {
             table: "releases".to_string(),
             rows_scanned: 200,
+            total_rows: Some(1000),
             inserts: 10,
             updates: 3,
             extra_target_rows: 1,
@@ -213,13 +215,36 @@ fn formats_rate_and_eta_when_total_rows_are_known() {
 }
 
 #[test]
+fn formats_progress_from_stored_total_rows_without_source_config() {
+    let row = SyncProgressRow {
+        table: "access_tokens".to_string(),
+        rows_scanned: 21_000,
+        total_rows: Some(42_000),
+        inserts: 21_000,
+        updates: 0,
+        extra_target_rows: 0,
+        status: "running".to_string(),
+        last_primary_key: "[\"21001\"]".to_string(),
+        elapsed_seconds: 100,
+        last_error: String::new(),
+    };
+    let config = default_sync_progress_config();
+
+    let line = format_progress_row(&config, &row);
+
+    assert!(line.contains("total_rows=42000"));
+    assert!(line.contains("progress=50.00%"));
+    assert!(line.contains("eta=1m40s"));
+}
+
+#[test]
 fn builds_progress_table_lookup_for_qualified_and_default_schema_tables() {
     assert_eq!(
-        progress_table_parts("globalcomix", "cdc.table_sync_progress"),
+        qualified_table_parts("globalcomix", "cdc.table_sync_progress"),
         ("cdc".to_string(), "table_sync_progress".to_string())
     );
     assert_eq!(
-        progress_table_parts("globalcomix", "table_sync_progress"),
+        qualified_table_parts("globalcomix", "table_sync_progress"),
         ("globalcomix".to_string(), "table_sync_progress".to_string())
     );
 

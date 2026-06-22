@@ -25,6 +25,15 @@ pub fn quote_identifier_path(identifier: &str) -> String {
         .join(".")
 }
 
+pub fn qualified_table_parts(default_schema: &str, table_path: &str) -> (String, String) {
+    let parts = table_path.split('.').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [schema, table] => (schema.to_string(), table.to_string()),
+        [table] => (default_schema.to_string(), table.to_string()),
+        _ => (default_schema.to_string(), table_path.to_string()),
+    }
+}
+
 pub fn quote_ident(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
@@ -61,5 +70,17 @@ mod tests {
             "`cdc`.`table``name`"
         );
         assert_eq!(quote_sql_literal("can't"), "'can''t'");
+    }
+
+    #[test]
+    fn splits_qualified_table_paths() {
+        assert_eq!(
+            qualified_table_parts("globalcomix", "cdc.table_sync_progress"),
+            ("cdc".to_string(), "table_sync_progress".to_string())
+        );
+        assert_eq!(
+            qualified_table_parts("globalcomix", "table_sync_progress"),
+            ("globalcomix".to_string(), "table_sync_progress".to_string())
+        );
     }
 }

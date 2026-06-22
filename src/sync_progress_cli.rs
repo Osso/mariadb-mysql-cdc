@@ -1,4 +1,5 @@
 use crate::checkpoint::FileCheckpointStore;
+use crate::mysql_support::qualified_table_parts;
 use crate::stream_checkpoint::{MySqlStreamCheckpointStore, default_stream_checkpoint_table};
 use crate::{live, mysql_snapshot};
 use serde::Deserialize;
@@ -39,6 +40,7 @@ struct SyncProgressConfig {
 struct SyncProgressRow {
     table: String,
     rows_scanned: u64,
+    total_rows: Option<u64>,
     inserts: u64,
     updates: u64,
     extra_target_rows: u64,
@@ -350,7 +352,9 @@ fn read_stream_checkpoint(
 fn format_progress_row(config: &SyncProgressConfig, row: &SyncProgressRow) -> String {
     let rows_per_second = rate(row.rows_scanned, row.elapsed_seconds);
     let inserts_per_second = rate(row.inserts, row.elapsed_seconds);
-    let total_rows = source_count(config, &row.table).ok().flatten();
+    let total_rows = row
+        .total_rows
+        .or_else(|| source_count(config, &row.table).ok().flatten());
     let remaining = total_rows.map(|total| total.saturating_sub(row.rows_scanned));
     let eta_seconds = remaining.and_then(|remaining| eta(remaining, rows_per_second));
 
@@ -377,28 +381,19 @@ fn build_progress_query(progress_table: &str, table: Option<&str>) -> String {
         .map(|table| format!(" WHERE table_name = {}", quote_sql_literal(table)))
         .unwrap_or_default();
     format!(
-        "SELECT table_name, rows_scanned, inserts_applied, updates_applied, extra_target_rows, status, COALESCE(last_primary_key_json,''), GREATEST(1,TIMESTAMPDIFF(SECOND,created_at,IF(status='running',NOW(),updated_at))), COALESCE(last_error,'') FROM {}{} ORDER BY FIELD(status,'running','error','complete'), updated_at DESC, table_name",
+        "SELECT table_name, rows_scanned, COALESCE(total_rows, ''), inserts_applied, updates_applied, extra_target_rows, status, COALESCE(last_primary_key_json,''), GREATEST(1,TIMESTAMPDIFF(SECOND,created_at,IF(status='running',NOW(),updated_at))), COALESCE(last_error,'') FROM {}{} ORDER BY FIELD(status,'running','error','complete'), updated_at DESC, table_name",
         quote_identifier_path(progress_table),
         table_filter
     )
 }
 
 fn build_progress_table_exists_query(default_schema: &str, progress_table: &str) -> String {
-    let (schema, table) = progress_table_parts(default_schema, progress_table);
+    let (schema, table) = qualified_table_parts(default_schema, progress_table);
     format!(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = {} AND table_name = {}",
         quote_sql_literal(&schema),
         quote_sql_literal(&table)
     )
-}
-
-fn progress_table_parts(default_schema: &str, progress_table: &str) -> (String, String) {
-    let parts = progress_table.split('.').collect::<Vec<_>>();
-    match parts.as_slice() {
-        [schema, table] => (schema.to_string(), table.to_string()),
-        [table] => (default_schema.to_string(), table.to_string()),
-        _ => (default_schema.to_string(), progress_table.to_string()),
-    }
 }
 
 fn parse_progress_rows(output: &str) -> Result<Vec<SyncProgressRow>, String> {
@@ -411,9 +406,9 @@ fn parse_progress_rows(output: &str) -> Result<Vec<SyncProgressRow>, String> {
 
 fn parse_progress_row(line: &str) -> Result<SyncProgressRow, String> {
     let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 9 {
+    if fields.len() != 10 {
         return Err(format!(
-            "progress row has {} fields, expected 9",
+            "progress row has {} fields, expected 10",
             fields.len()
         ));
     }
@@ -421,14 +416,22 @@ fn parse_progress_row(line: &str) -> Result<SyncProgressRow, String> {
     Ok(SyncProgressRow {
         table: fields[0].to_string(),
         rows_scanned: parse_u64_field("rows_scanned", fields[1])?,
-        inserts: parse_u64_field("inserts_applied", fields[2])?,
-        updates: parse_u64_field("updates_applied", fields[3])?,
-        extra_target_rows: parse_u64_field("extra_target_rows", fields[4])?,
-        status: fields[5].to_string(),
-        last_primary_key: fields[6].to_string(),
-        elapsed_seconds: parse_u64_field("elapsed_seconds", fields[7])?,
-        last_error: fields[8].to_string(),
+        total_rows: parse_optional_u64_field("total_rows", fields[2])?,
+        inserts: parse_u64_field("inserts_applied", fields[3])?,
+        updates: parse_u64_field("updates_applied", fields[4])?,
+        extra_target_rows: parse_u64_field("extra_target_rows", fields[5])?,
+        status: fields[6].to_string(),
+        last_primary_key: fields[7].to_string(),
+        elapsed_seconds: parse_u64_field("elapsed_seconds", fields[8])?,
+        last_error: fields[9].to_string(),
     })
+}
+
+fn parse_optional_u64_field(field: &str, value: &str) -> Result<Option<u64>, String> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_u64_field(field, value).map(Some)
 }
 
 fn source_count(config: &SyncProgressConfig, table: &str) -> Result<Option<u64>, String> {

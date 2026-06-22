@@ -1,7 +1,7 @@
 use super::{SyncMode, SyncTableReport, TableSyncError};
 use crate::live::TargetMySqlConfig;
 use crate::mysql_support::{
-    quote_ident, quote_identifier_path, quote_sql_literal, target_mysql_args,
+    qualified_table_parts, quote_ident, quote_identifier_path, quote_sql_literal, target_mysql_args,
 };
 use crate::target::{SqlStatement, TargetExecutor};
 use std::process::Command;
@@ -12,6 +12,7 @@ pub struct SyncTableProgress {
     pub last_primary_key: Option<Vec<String>>,
     pub chunks: u64,
     pub rows_scanned: u64,
+    pub total_rows: Option<u64>,
     pub inserts: u64,
     pub updates: u64,
     pub extra_target_rows: u64,
@@ -82,6 +83,10 @@ impl SyncProgressStore for MySqlSyncProgressStore {
         self.execute(&SqlStatement {
             sql: build_create_progress_table_sql(&self.table),
             params: Vec::new(),
+        })?;
+        self.execute(&SqlStatement {
+            sql: build_add_total_rows_column_sql(&self.target.database, &self.table),
+            params: Vec::new(),
         })
     }
 
@@ -140,6 +145,7 @@ impl SyncTableProgress {
             last_primary_key: None,
             chunks: 0,
             rows_scanned: 0,
+            total_rows: None,
             inserts: 0,
             updates: 0,
             extra_target_rows: 0,
@@ -189,6 +195,7 @@ table_name VARCHAR(255) NOT NULL PRIMARY KEY,\
 last_primary_key_json TEXT NULL,\
 chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,\
 rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,\
+total_rows BIGINT UNSIGNED NULL,\
 inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,\
 updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,\
 extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,\
@@ -202,6 +209,20 @@ updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMEST
     )
 }
 
+fn build_add_total_rows_column_sql(default_schema: &str, progress_table: &str) -> String {
+    let (schema, table) = qualified_table_parts(default_schema, progress_table);
+    let alter_table = format!(
+        "ALTER TABLE {} ADD COLUMN total_rows BIGINT UNSIGNED NULL AFTER rows_scanned",
+        quote_identifier_path(progress_table)
+    );
+    format!(
+        "SET @cdc_total_rows_ddl = (SELECT IF(COUNT(*) = 0, {}, 'SELECT 1') FROM information_schema.columns WHERE table_schema = {} AND table_name = {} AND column_name = 'total_rows'); PREPARE cdc_total_rows_stmt FROM @cdc_total_rows_ddl; EXECUTE cdc_total_rows_stmt; DEALLOCATE PREPARE cdc_total_rows_stmt",
+        quote_sql_literal(&alter_table),
+        quote_sql_literal(&schema),
+        quote_sql_literal(&table)
+    )
+}
+
 fn build_create_progress_schema_sql(table: &str) -> Option<String> {
     let schema = table.split_once('.')?.0;
     Some(format!(
@@ -212,7 +233,7 @@ fn build_create_progress_schema_sql(table: &str) -> Option<String> {
 
 fn build_progress_select_sql(progress_table: &str, table: &str) -> String {
     format!(
-        "SELECT COALESCE(last_primary_key_json, ''), chunks, rows_scanned, inserts_applied, updates_applied, extra_target_rows, mode, status, COALESCE(last_error, '') FROM {} WHERE table_name = {} LIMIT 1",
+        "SELECT COALESCE(last_primary_key_json, ''), chunks, rows_scanned, COALESCE(total_rows, ''), inserts_applied, updates_applied, extra_target_rows, mode, status, COALESCE(last_error, '') FROM {} WHERE table_name = {} LIMIT 1",
         quote_identifier_path(progress_table),
         quote_sql_literal(table)
     )
@@ -225,12 +246,13 @@ fn build_progress_upsert_sql(progress_table: &str, progress: &SyncTableProgress)
         .map(|values| json_string(values))
         .unwrap_or_default();
     format!(
-        "INSERT INTO {} (table_name,last_primary_key_json,chunks,rows_scanned,inserts_applied,updates_applied,extra_target_rows,mode,status,last_error) VALUES ({},{},{},{},{},{},{},{},{},NULL) ON DUPLICATE KEY UPDATE last_primary_key_json=VALUES(last_primary_key_json),chunks=VALUES(chunks),rows_scanned=VALUES(rows_scanned),inserts_applied=VALUES(inserts_applied),updates_applied=VALUES(updates_applied),extra_target_rows=VALUES(extra_target_rows),mode=VALUES(mode),status=VALUES(status),last_error=NULL",
+        "INSERT INTO {} (table_name,last_primary_key_json,chunks,rows_scanned,total_rows,inserts_applied,updates_applied,extra_target_rows,mode,status,last_error) VALUES ({},{},{},{},{},{},{},{},{},{},NULL) ON DUPLICATE KEY UPDATE last_primary_key_json=VALUES(last_primary_key_json),chunks=VALUES(chunks),rows_scanned=VALUES(rows_scanned),total_rows=VALUES(total_rows),inserts_applied=VALUES(inserts_applied),updates_applied=VALUES(updates_applied),extra_target_rows=VALUES(extra_target_rows),mode=VALUES(mode),status=VALUES(status),last_error=NULL",
         quote_identifier_path(progress_table),
         quote_sql_literal(&progress.table),
         nullable_sql_literal(&last_primary_key),
         progress.chunks,
         progress.rows_scanned,
+        nullable_u64(progress.total_rows),
         progress.inserts,
         progress.updates,
         progress.extra_target_rows,
@@ -256,9 +278,9 @@ fn parse_progress_row(
         return Ok(None);
     };
     let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 9 {
+    if fields.len() != 10 {
         return Err(TableSyncError::Progress(format!(
-            "progress row has {} fields, expected 9",
+            "progress row has {} fields, expected 10",
             fields.len()
         )));
     }
@@ -268,12 +290,13 @@ fn parse_progress_row(
         last_primary_key: parse_primary_key_json(fields[0])?,
         chunks: parse_u64("chunks", fields[1])?,
         rows_scanned: parse_u64("rows_scanned", fields[2])?,
-        inserts: parse_u64("inserts_applied", fields[3])?,
-        updates: parse_u64("updates_applied", fields[4])?,
-        extra_target_rows: parse_u64("extra_target_rows", fields[5])?,
-        mode: SyncMode::parse(fields[6])?,
-        status: SyncProgressStatus::parse(fields[7])?,
-        last_error: non_empty(fields[8]),
+        total_rows: parse_optional_u64("total_rows", fields[3])?,
+        inserts: parse_u64("inserts_applied", fields[4])?,
+        updates: parse_u64("updates_applied", fields[5])?,
+        extra_target_rows: parse_u64("extra_target_rows", fields[6])?,
+        mode: SyncMode::parse(fields[7])?,
+        status: SyncProgressStatus::parse(fields[8])?,
+        last_error: non_empty(fields[9]),
     }))
 }
 
@@ -291,6 +314,13 @@ fn parse_u64(field: &str, value: &str) -> Result<u64, TableSyncError> {
     value
         .parse()
         .map_err(|_| TableSyncError::Progress(format!("{field} must be an integer")))
+}
+
+fn parse_optional_u64(field: &str, value: &str) -> Result<Option<u64>, TableSyncError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_u64(field, value).map(Some)
 }
 
 fn json_string(values: &[String]) -> String {
@@ -353,6 +383,12 @@ fn nullable_sql_literal(value: &str) -> String {
     }
 }
 
+fn nullable_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "NULL".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,7 +399,17 @@ mod tests {
 
         assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS `cdc`.`table_sync_progress`"));
         assert!(sql.contains("last_primary_key_json TEXT"));
+        assert!(sql.contains("total_rows BIGINT UNSIGNED NULL"));
         assert!(sql.contains("status VARCHAR(16)"));
+    }
+
+    #[test]
+    fn add_total_rows_column_sql_is_conditional_for_existing_tables() {
+        let sql = build_add_total_rows_column_sql("globalcomix", "cdc.table_sync_progress");
+
+        assert!(sql.contains("information_schema.columns"));
+        assert!(sql.contains("column_name = 'total_rows'"));
+        assert!(sql.contains("ALTER TABLE `cdc`.`table_sync_progress` ADD COLUMN total_rows"));
     }
 
     #[test]
@@ -385,6 +431,7 @@ mod tests {
             last_primary_key: Some(vec!["42".to_string()]),
             chunks: 2,
             rows_scanned: 2000,
+            total_rows: Some(5000),
             inserts: 3,
             updates: 4,
             extra_target_rows: 5,
@@ -397,13 +444,13 @@ mod tests {
 
         assert!(sql.contains("'releases'"));
         assert!(sql.contains("'[\"42\"]'"));
-        assert!(sql.contains("2,2000,3,4,5"));
+        assert!(sql.contains("2,2000,5000,3,4,5"));
         assert!(sql.contains("'apply','running'"));
     }
 
     #[test]
     fn parse_progress_row_restores_resume_state() {
-        let row = "[\"42\"]\t2\t2000\t3\t4\t5\tapply\trunning\t";
+        let row = "[\"42\"]\t2\t2000\t5000\t3\t4\t5\tapply\trunning\t";
 
         let progress = parse_progress_row("releases", row)
             .expect("parse progress")
@@ -413,6 +460,7 @@ mod tests {
         assert_eq!(progress.last_primary_key, Some(vec!["42".to_string()]));
         assert_eq!(progress.chunks, 2);
         assert_eq!(progress.rows_scanned, 2000);
+        assert_eq!(progress.total_rows, Some(5000));
         assert_eq!(progress.inserts, 3);
         assert_eq!(progress.updates, 4);
         assert_eq!(progress.extra_target_rows, 5);
