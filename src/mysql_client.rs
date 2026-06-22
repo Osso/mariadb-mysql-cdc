@@ -119,6 +119,13 @@ impl PersistentTargetExecutor {
             insert_conflict_policy: config.insert_conflict_policy,
         })
     }
+
+    pub fn read_column_names(&self, table: &str) -> Result<Vec<String>, TargetExecuteError> {
+        self.conn
+            .borrow_mut()
+            .query(build_target_column_select_sql(table))
+            .map_err(target_query_error)
+    }
 }
 
 impl TargetExecutor for PersistentTargetExecutor {
@@ -386,6 +393,13 @@ fn build_snapshot_boundary_select_sql(
     )
 }
 
+fn build_target_column_select_sql(table: &str) -> String {
+    format!(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} ORDER BY ORDINAL_POSITION",
+        quote_sql_literal(table)
+    )
+}
+
 fn quote_column_list(columns: &[String]) -> String {
     columns
         .iter()
@@ -586,6 +600,16 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT `tenant_id`, `id` FROM `accounts` ORDER BY `tenant_id`, `id` LIMIT 1 OFFSET 99"
+        );
+    }
+
+    #[test]
+    fn builds_target_column_select_sql() {
+        let sql = build_target_column_select_sql("accounts");
+
+        assert_eq!(
+            sql,
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'accounts' ORDER BY ORDINAL_POSITION"
         );
     }
 }

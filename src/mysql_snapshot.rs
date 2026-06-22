@@ -463,7 +463,6 @@ impl MysqlProgressSaveState {
         self.saved_at = Some(now);
     }
 }
-
 fn snapshot_progress_status(complete: bool) -> SyncProgressStatus {
     if complete {
         SyncProgressStatus::Complete
@@ -613,11 +612,36 @@ fn snapshot_target_for_table(
 ) -> Result<TargetMySqlWriter<PersistentTargetExecutor>, SnapshotError> {
     let executor = PersistentTargetExecutor::new(&config.target)
         .map_err(|error| SnapshotError::InvalidTable(error.to_string()))?;
+    let target_columns = executor
+        .read_column_names(&table.name)
+        .map_err(|error| SnapshotError::InvalidTable(error.to_string()))?;
+    validate_target_table_columns(table, &target_columns)?;
     Ok(TargetMySqlWriter::from_snapshot_table(
         table,
         executor,
         SnapshotInsertMode::IgnoreDuplicate,
     ))
+}
+
+fn validate_target_table_columns(
+    table: &SnapshotTable,
+    target_columns: &[String],
+) -> Result<(), SnapshotError> {
+    let missing_columns = table
+        .columns
+        .iter()
+        .filter(|column| !target_columns.contains(column))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing_columns.is_empty() {
+        return Ok(());
+    }
+
+    Err(SnapshotError::InvalidTable(format!(
+        "target table {} is missing source columns: {}",
+        table.name,
+        missing_columns.join(",")
+    )))
 }
 
 #[cfg(test)]

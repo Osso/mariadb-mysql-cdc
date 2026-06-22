@@ -116,6 +116,35 @@ fn rejects_zero_parallel_workers() {
 }
 
 #[test]
+fn rejects_target_schema_missing_snapshot_column() {
+    let table = SnapshotTable {
+        name: "accounts".to_string(),
+        primary_key: vec!["id".to_string()],
+        columns: vec!["id".to_string(), "name".to_string()],
+    };
+    let target_columns = vec!["id".to_string()];
+
+    let error = validate_target_table_columns(&table, &target_columns).expect_err("schema error");
+
+    assert_eq!(
+        error.to_string(),
+        "target table accounts is missing source columns: name"
+    );
+}
+
+#[test]
+fn accepts_target_schema_with_extra_columns() {
+    let table = SnapshotTable {
+        name: "accounts".to_string(),
+        primary_key: vec!["id".to_string()],
+        columns: vec!["id".to_string(), "name".to_string()],
+    };
+    let target_columns = vec!["id".to_string(), "name".to_string(), "extra".to_string()];
+
+    validate_target_table_columns(&table, &target_columns).expect("compatible schema");
+}
+
+#[test]
 fn catchup_snapshot_uses_persistent_clients_for_chunk_io() {
     let source = include_str!("../mysql_snapshot.rs");
 
