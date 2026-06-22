@@ -1,6 +1,8 @@
 use crate::checkpoint::FileCheckpointStore;
 use crate::stream_checkpoint::{MySqlStreamCheckpointStore, default_stream_checkpoint_table};
 use crate::{live, mysql_snapshot};
+use serde::Deserialize;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -48,6 +50,7 @@ struct SyncProgressRow {
 
 fn parse_sync_progress_config(args: Vec<String>) -> Result<SyncProgressConfig, String> {
     let mut config = default_sync_progress_config();
+    load_file_config(&mut config)?;
     let mut index = 0;
 
     while index < args.len() {
@@ -63,6 +66,23 @@ fn parse_sync_progress_config(args: Vec<String>) -> Result<SyncProgressConfig, S
     Ok(config)
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileConfig {
+    sync_progress: Option<FileSyncProgressConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileSyncProgressConfig {
+    target_host: Option<String>,
+    target_port: Option<u16>,
+    target_user: Option<String>,
+    target_password_env: Option<String>,
+    target_database: Option<String>,
+    mariadb: Option<String>,
+    progress_table: Option<String>,
+    checkpoint_table: Option<String>,
+}
+
 fn default_sync_progress_config() -> SyncProgressConfig {
     SyncProgressConfig {
         target: live::TargetMySqlConfig::default(),
@@ -73,6 +93,74 @@ fn default_sync_progress_config() -> SyncProgressConfig {
         table: None,
         checkpoint_file: None,
     }
+}
+
+fn load_file_config(config: &mut SyncProgressConfig) -> Result<(), String> {
+    let Some(path) = config_path() else {
+        return Ok(());
+    };
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let file_config = serde_json::from_str::<FileConfig>(&contents)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    apply_file_config(config, file_config)
+}
+
+fn config_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("MARIADB_MYSQL_CDC_CONFIG") {
+        if path.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(path));
+    }
+
+    let home = std::env::var_os("HOME")?;
+    let path = PathBuf::from(home)
+        .join(".config")
+        .join("mariadb-mysql-cdc")
+        .join("config.json");
+    path.exists().then_some(path)
+}
+
+fn apply_file_config(
+    config: &mut SyncProgressConfig,
+    file_config: FileConfig,
+) -> Result<(), String> {
+    let Some(sync_progress) = file_config.sync_progress else {
+        return Ok(());
+    };
+    apply_optional_string(&mut config.target.host, sync_progress.target_host);
+    apply_optional_u16(&mut config.target.port, sync_progress.target_port);
+    apply_optional_string(&mut config.target.user, sync_progress.target_user);
+    apply_optional_password_env(
+        &mut config.target.password,
+        sync_progress.target_password_env,
+    )?;
+    apply_optional_string(&mut config.target.database, sync_progress.target_database);
+    apply_optional_string(&mut config.mariadb, sync_progress.mariadb);
+    apply_optional_string(&mut config.progress_table, sync_progress.progress_table);
+    apply_optional_string(&mut config.checkpoint_table, sync_progress.checkpoint_table);
+    Ok(())
+}
+
+fn apply_optional_string(target: &mut String, value: Option<String>) {
+    if let Some(value) = value {
+        *target = value;
+    }
+}
+
+fn apply_optional_u16(target: &mut u16, value: Option<u16>) {
+    if let Some(value) = value {
+        *target = value;
+    }
+}
+
+fn apply_optional_password_env(target: &mut String, value: Option<String>) -> Result<(), String> {
+    let Some(env_name) = value else {
+        return Ok(());
+    };
+    *target = crate::read_env_password(&env_name)?;
+    Ok(())
 }
 
 fn sync_progress_option(
@@ -474,126 +562,4 @@ fn quote_sql_literal(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::env;
-
-    #[test]
-    fn parses_progress_config_with_checkpoint_and_source_counts() {
-        set_env("SYNC_PROGRESS_TARGET_PASSWORD", "target-pass");
-        set_env("SYNC_PROGRESS_SOURCE_PASSWORD", "source-pass");
-
-        let config = parse_sync_progress_config(args([
-            "--target-host",
-            "target-db",
-            "--target-user",
-            "target-user",
-            "--target-password-env",
-            "SYNC_PROGRESS_TARGET_PASSWORD",
-            "--target-database",
-            "globalcomix",
-            "--source-host",
-            "source-db",
-            "--source-user",
-            "source-user",
-            "--source-password-env",
-            "SYNC_PROGRESS_SOURCE_PASSWORD",
-            "--source-database",
-            "globalcomix",
-            "--checkpoint-file",
-            "/var/lib/cdc/stream-checkpoint.json",
-        ]))
-        .expect("progress config");
-
-        assert_eq!(config.target.host, "target-db");
-        assert_eq!(config.target.password, "target-pass");
-        assert_eq!(config.source.host, "source-db");
-        assert_eq!(config.source.password, "source-pass");
-        assert_eq!(config.progress_table, "cdc.table_sync_progress");
-        assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
-        assert_eq!(
-            config.checkpoint_file,
-            Some(PathBuf::from("/var/lib/cdc/stream-checkpoint.json"))
-        );
-    }
-
-    #[test]
-    fn parses_progress_config_without_source_or_checkpoint_file() {
-        set_env("SYNC_PROGRESS_TARGET_PASSWORD_ONLY", "target-pass");
-
-        let config = parse_sync_progress_config(args([
-            "--target-host",
-            "target-db",
-            "--target-user",
-            "target-user",
-            "--target-password-env",
-            "SYNC_PROGRESS_TARGET_PASSWORD_ONLY",
-            "--target-database",
-            "globalcomix",
-        ]))
-        .expect("progress config");
-
-        assert_eq!(config.progress_table, "cdc.table_sync_progress");
-        assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
-        assert_eq!(config.checkpoint_file, None);
-        assert_eq!(config.source.host, "");
-    }
-
-    #[test]
-    fn parses_progress_rows() {
-        let row = "releases\t200\t10\t3\t1\trunning\t[\"42\"]\t20\t";
-
-        let rows = parse_progress_rows(row).expect("progress rows");
-
-        assert_eq!(
-            rows,
-            vec![SyncProgressRow {
-                table: "releases".to_string(),
-                rows_scanned: 200,
-                inserts: 10,
-                updates: 3,
-                extra_target_rows: 1,
-                status: "running".to_string(),
-                last_primary_key: "[\"42\"]".to_string(),
-                elapsed_seconds: 20,
-                last_error: String::new(),
-            }]
-        );
-    }
-
-    #[test]
-    fn formats_rate_and_eta_when_total_rows_are_known() {
-        let eta = eta(50, rate(100, 10));
-
-        assert_eq!(eta, Some(5));
-        assert_eq!(display_percent(25, Some(100)), "25.00%");
-        assert_eq!(display_duration(Some(125)), "2m05s");
-    }
-
-    #[test]
-    fn builds_progress_table_lookup_for_qualified_and_default_schema_tables() {
-        assert_eq!(
-            progress_table_parts("globalcomix", "cdc.table_sync_progress"),
-            ("cdc".to_string(), "table_sync_progress".to_string())
-        );
-        assert_eq!(
-            progress_table_parts("globalcomix", "table_sync_progress"),
-            ("globalcomix".to_string(), "table_sync_progress".to_string())
-        );
-
-        let sql = build_progress_table_exists_query("globalcomix", "cdc.table_sync_progress");
-
-        assert!(sql.contains("table_schema = 'cdc'"));
-        assert!(sql.contains("table_name = 'table_sync_progress'"));
-    }
-
-    fn args<const N: usize>(values: [&str; N]) -> Vec<String> {
-        values.into_iter().map(str::to_string).collect()
-    }
-
-    fn set_env(name: &str, value: &str) {
-        unsafe {
-            env::set_var(name, value);
-        }
-    }
-}
+mod tests;
