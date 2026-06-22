@@ -14,6 +14,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+const MYSQL_PROGRESS_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct MySqlConnectionConfig {
@@ -170,6 +173,7 @@ fn catchup_progress_store(config: &CatchupSnapshotConfig) -> CatchupProgressStor
         file_store: FileSnapshotProgressStore::new(&config.progress_file),
         mysql_store,
         total_rows: RefCell::new(BTreeMap::new()),
+        mysql_save_state: RefCell::new(BTreeMap::new()),
     }
 }
 
@@ -177,6 +181,7 @@ struct CatchupProgressStore {
     file_store: FileSnapshotProgressStore,
     mysql_store: MySqlSyncProgressStore,
     total_rows: RefCell<BTreeMap<String, u64>>,
+    mysql_save_state: RefCell<BTreeMap<String, MysqlProgressSaveState>>,
 }
 
 impl SnapshotProgressStore for CatchupProgressStore {
@@ -202,6 +207,10 @@ impl CatchupProgressStore {
         let mut store = self.mysql_store.clone();
         store.ensure()?;
         for (table, table_progress) in &progress.tables {
+            let status = snapshot_progress_status(table_progress.complete);
+            if !self.should_save_mysql_progress(table, table_progress.rows_copied, status) {
+                continue;
+            }
             store.save(&SyncTableProgress {
                 table: table.clone(),
                 last_primary_key: table_progress.last_primary_key.clone(),
@@ -212,11 +221,64 @@ impl CatchupProgressStore {
                 updates: 0,
                 extra_target_rows: 0,
                 mode: SyncMode::Apply,
-                status: snapshot_progress_status(table_progress.complete),
+                status,
                 last_error: None,
             })?;
+            self.record_mysql_progress_save(table, table_progress.rows_copied, status);
         }
         Ok(())
+    }
+
+    fn should_save_mysql_progress(
+        &self,
+        table: &str,
+        rows_copied: u64,
+        status: SyncProgressStatus,
+    ) -> bool {
+        self.mysql_save_state
+            .borrow_mut()
+            .entry(table.to_string())
+            .or_default()
+            .should_save(rows_copied, status, Instant::now())
+    }
+
+    fn record_mysql_progress_save(
+        &self,
+        table: &str,
+        rows_copied: u64,
+        status: SyncProgressStatus,
+    ) {
+        self.mysql_save_state
+            .borrow_mut()
+            .entry(table.to_string())
+            .or_default()
+            .record_save(rows_copied, status, Instant::now());
+    }
+}
+
+#[derive(Default)]
+struct MysqlProgressSaveState {
+    rows_copied: u64,
+    status: Option<SyncProgressStatus>,
+    saved_at: Option<Instant>,
+}
+
+impl MysqlProgressSaveState {
+    fn should_save(&self, rows_copied: u64, status: SyncProgressStatus, now: Instant) -> bool {
+        if self.status != Some(status) {
+            return true;
+        }
+        if self.rows_copied == rows_copied {
+            return false;
+        }
+        self.saved_at
+            .is_none_or(|saved_at| now.duration_since(saved_at) >= MYSQL_PROGRESS_SAVE_INTERVAL)
+    }
+
+    fn record_save(&mut self, rows_copied: u64, status: SyncProgressStatus, now: Instant) {
+        self.rows_copied = rows_copied;
+        self.status = Some(status);
+        self.saved_at = Some(now);
     }
 }
 
@@ -538,5 +600,20 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].primary_key, vec!["1"]);
         assert_eq!(rows[1].values["name"], "beta");
+    }
+
+    #[test]
+    fn mysql_progress_save_is_throttled_until_interval_or_completion() {
+        let now = std::time::Instant::now();
+        let mut state = MysqlProgressSaveState::default();
+        let running = SyncProgressStatus::Running;
+        let complete = SyncProgressStatus::Complete;
+
+        assert!(state.should_save(1_000, running, now));
+        state.record_save(1_000, running, now);
+
+        assert!(!state.should_save(2_000, running, now + MYSQL_PROGRESS_SAVE_INTERVAL / 2));
+        assert!(state.should_save(3_000, running, now + MYSQL_PROGRESS_SAVE_INTERVAL));
+        assert!(state.should_save(3_000, complete, now + MYSQL_PROGRESS_SAVE_INTERVAL / 2));
     }
 }

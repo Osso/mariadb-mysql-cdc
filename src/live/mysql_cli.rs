@@ -11,7 +11,7 @@ pub struct MysqlCliExecutor {
 }
 
 const TARGET_SLOW_QUERY_AFTER: Duration = Duration::from_secs(20);
-const TARGET_SLOW_QUERY_POLL: Duration = Duration::from_secs(1);
+const TARGET_SLOW_QUERY_POLL: Duration = Duration::from_millis(50);
 const TARGET_SLOW_QUERY_SQL_LIMIT: usize = 4_000;
 
 impl MysqlCliExecutor {

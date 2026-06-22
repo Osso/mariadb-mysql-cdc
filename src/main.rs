@@ -209,7 +209,7 @@ fn parse_catchup_snapshot_config(
         target: live::TargetMySqlConfig::default(),
         progress_file: PathBuf::new(),
         progress_table: "cdc.table_sync_progress".to_string(),
-        chunk_size: 1000,
+        chunk_size: 10_000,
         table: None,
     };
     let mut index = 0;
@@ -661,7 +661,7 @@ mod tests {
                 target: live::TargetMySqlConfig::default(),
                 progress_file: PathBuf::new(),
                 progress_table: "cdc.table_sync_progress".to_string(),
-                chunk_size: 1000,
+                chunk_size: 10_000,
                 table: None,
             },
             "--bogus",
