@@ -91,7 +91,7 @@ fn copy_catchup_table_range(
     log_context: CatchupTableLogContext,
 ) -> Result<crate::snapshot::SnapshotResult, CatchupSnapshotError> {
     let source = PersistentMySqlSource::new(&config.source)?;
-    let mut target = snapshot_target_for_table(config, table)?;
+    let mut target = snapshot_target_for_table(config, &source, table)?;
     let progress_store = mysql_only_progress_store(config)?;
     let observer = super::CatchupSnapshotLogger::new(
         log_context.table_number,

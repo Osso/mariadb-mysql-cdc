@@ -84,6 +84,16 @@ impl PersistentMySqlSource {
             })?;
         Ok(row.unwrap().into_iter().map(value_to_string).collect())
     }
+
+    pub fn read_create_table(&self, table: &str) -> Result<String, SnapshotError> {
+        let sql = format!("SHOW CREATE TABLE {}", quote_ident(table));
+        self.conn
+            .borrow_mut()
+            .query_first::<(String, String), _>(sql)
+            .map_err(snapshot_query_error)?
+            .map(|(_, ddl)| ddl)
+            .ok_or_else(|| SnapshotError::InvalidTable(format!("{table} DDL was empty")))
+    }
 }
 
 impl SnapshotSource for PersistentMySqlSource {

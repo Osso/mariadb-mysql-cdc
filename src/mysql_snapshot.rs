@@ -1,14 +1,11 @@
 use crate::inventory::{InventoryConfig, InventoryError, MariaDbInventoryReader, build_inventory};
 use crate::live::TargetMySqlConfig;
-use crate::mysql_client::{
-    PersistentMySqlSource, PersistentProgressWriter, PersistentTargetExecutor,
-};
+use crate::mysql_client::{PersistentMySqlSource, PersistentProgressWriter};
 use crate::snapshot::{
     ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotProgress,
     SnapshotProgressStore, SnapshotTable, snapshot_table_with_observer,
 };
 use crate::table_sync::{SyncMode, SyncProgressStatus, SyncTableProgress, TableSyncError};
-use crate::target::{SnapshotInsertMode, TargetMySqlWriter};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,12 +14,16 @@ use std::time::{Duration, Instant};
 
 mod parallel;
 mod progress_log;
+mod target_schema;
 #[cfg(test)]
 use parallel::parallel_worker_count;
 use parallel::{CatchupTableMode, catchup_table_mode, copy_catchup_table_parallel};
 use progress_log::{
     CatchupSnapshotLogger, format_catchup_table_complete, format_catchup_table_start,
 };
+use target_schema::snapshot_target_for_table;
+#[cfg(test)]
+use target_schema::validate_target_table_columns;
 
 const MYSQL_PROGRESS_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -227,7 +228,7 @@ fn copy_catchup_table_sequential(
     table: &SnapshotTable,
     log_context: CatchupTableLogContext,
 ) -> Result<crate::snapshot::SnapshotResult, CatchupSnapshotError> {
-    let mut target = snapshot_target_for_table(config, table)?;
+    let mut target = snapshot_target_for_table(config, source, table)?;
     let observer = CatchupSnapshotLogger::new(
         log_context.table_number,
         log_context.total_tables,
@@ -604,44 +605,6 @@ fn read_snapshot_tables(
         .collect();
 
     Ok(tables)
-}
-
-fn snapshot_target_for_table(
-    config: &CatchupSnapshotConfig,
-    table: &SnapshotTable,
-) -> Result<TargetMySqlWriter<PersistentTargetExecutor>, SnapshotError> {
-    let executor = PersistentTargetExecutor::new(&config.target)
-        .map_err(|error| SnapshotError::InvalidTable(error.to_string()))?;
-    let target_columns = executor
-        .read_column_names(&table.name)
-        .map_err(|error| SnapshotError::InvalidTable(error.to_string()))?;
-    validate_target_table_columns(table, &target_columns)?;
-    Ok(TargetMySqlWriter::from_snapshot_table(
-        table,
-        executor,
-        SnapshotInsertMode::IgnoreDuplicate,
-    ))
-}
-
-fn validate_target_table_columns(
-    table: &SnapshotTable,
-    target_columns: &[String],
-) -> Result<(), SnapshotError> {
-    let missing_columns = table
-        .columns
-        .iter()
-        .filter(|column| !target_columns.contains(column))
-        .cloned()
-        .collect::<Vec<_>>();
-    if missing_columns.is_empty() {
-        return Ok(());
-    }
-
-    Err(SnapshotError::InvalidTable(format!(
-        "target table {} is missing source columns: {}",
-        table.name,
-        missing_columns.join(",")
-    )))
 }
 
 #[cfg(test)]

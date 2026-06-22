@@ -39,6 +39,7 @@ use reconnect::{
     should_reconnect,
 };
 use repair::{FailedStatementRepairer, TableSyncStatementRepairer, repair_failed_statement};
+pub(crate) use schema_recovery::mysql_compatible_create_table;
 use schema_recovery::mysql_executor_with_recovery;
 
 #[derive(Clone, Debug)]

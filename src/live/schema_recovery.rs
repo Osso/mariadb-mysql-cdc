@@ -170,7 +170,7 @@ fn missing_target_table_name(error: &str) -> Option<String> {
     table_ref.rsplit('.').next().map(str::to_string)
 }
 
-fn mysql_compatible_create_table(source_ddl: &str) -> String {
+pub(crate) fn mysql_compatible_create_table(source_ddl: &str) -> String {
     let create_if_missing = source_ddl.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1);
     let mysql_collations = create_if_missing
         .replace("utf8mb4_uca1400_ai_ci", "utf8mb4_0900_ai_ci")

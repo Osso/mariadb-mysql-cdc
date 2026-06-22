@@ -147,12 +147,15 @@ fn accepts_target_schema_with_extra_columns() {
 #[test]
 fn catchup_snapshot_uses_persistent_clients_for_chunk_io() {
     let source = include_str!("../mysql_snapshot.rs");
+    let target_schema = include_str!("target_schema.rs");
 
     assert!(source.contains("PersistentMySqlSource::new(&config.source)"));
-    assert!(source.contains("PersistentTargetExecutor::new(&config.target)"));
+    assert!(target_schema.contains("PersistentTargetExecutor::new(&config.target)"));
     assert!(source.contains("PersistentProgressWriter::new(&config.target"));
     assert!(!source.contains("MysqlCliExecutor"));
     assert!(!source.contains("Command::new"));
+    assert!(!target_schema.contains("MysqlCliExecutor"));
+    assert!(!target_schema.contains("Command::new"));
 }
 
 #[test]
