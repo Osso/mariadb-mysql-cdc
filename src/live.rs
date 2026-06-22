@@ -380,12 +380,31 @@ where
     Q: StatementQuarantine + QuarantineRecorder,
     C: StreamCheckpointStore,
 {
+    run_stream_reconnect_loop(
+        config,
+        checkpoint_store,
+        |attempt_config| stream_statement_events_once(attempt_config, applier, checkpoint_store),
+        thread::sleep,
+    )
+}
+
+fn run_stream_reconnect_loop<C, F, S>(
+    config: &ApplyBinlogConfig,
+    checkpoint_store: Option<&C>,
+    mut run_attempt: F,
+    sleep: S,
+) -> Result<(), ApplyBinlogError>
+where
+    C: StreamCheckpointStore,
+    F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
+    S: Fn(std::time::Duration),
+{
     let mut attempt_config = config.clone();
     resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
     let mut attempt = 0;
 
     loop {
-        match stream_statement_events_once(&attempt_config, applier, checkpoint_store) {
+        match run_attempt(&attempt_config) {
             Ok(()) => return Ok(()),
             Err(error)
                 if checkpoint_store.is_some()
@@ -397,7 +416,7 @@ where
                     "{}",
                     format_reconnect_start(&attempt_config, attempt, &error)
                 );
-                thread::sleep(reconnect_delay(attempt));
+                sleep(reconnect_delay(attempt));
             }
             Err(error) => return Err(error),
         }

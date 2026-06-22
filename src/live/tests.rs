@@ -1,6 +1,7 @@
 use super::*;
 use crate::checkpoint::{Checkpoint, LastEvent};
 use std::cell::RefCell;
+use std::time::Duration;
 
 #[test]
 fn extracts_statement_events_with_coordinates_and_database() {
@@ -224,7 +225,7 @@ fn stream_checkpoint_is_saved_after_successful_apply() {
 #[test]
 fn stream_checkpoint_is_not_saved_after_failed_apply() {
     let checkpoint_store = MemoryCheckpointStore::default();
-    let executor = RecordingExecutor::failing("target down");
+    let executor = RecordingExecutor::with_failure("target down");
     let applier = StatementApplier::new(executor, RecordingQuarantine::default());
     let event = StatementEvent {
         coordinate: BinlogCoordinate {
@@ -261,6 +262,54 @@ fn reconnects_only_transient_source_errors_with_remaining_attempts() {
     assert!(!should_reconnect(&auth, 0, 3));
 }
 
+#[test]
+fn reconnect_loop_resumes_from_checkpoint_after_transient_loss() {
+    let checkpoint_store = MemoryCheckpointStore::default();
+    let config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            binlog_file: "mysqld-bin.000001".to_string(),
+            start_position: 4,
+            ..SourceBinlogConfig::default()
+        },
+        max_reconnects: 2,
+        ..ApplyBinlogConfig::default()
+    };
+    let seen_starts = RefCell::new(Vec::new());
+    let attempts = RefCell::new(0);
+
+    run_stream_reconnect_loop(
+        &config,
+        Some(&checkpoint_store),
+        |attempt_config| {
+            seen_starts.borrow_mut().push((
+                attempt_config.source.binlog_file.clone(),
+                attempt_config.source.start_position,
+            ));
+            let mut attempts_ref = attempts.borrow_mut();
+            *attempts_ref += 1;
+            if *attempts_ref == 1 {
+                checkpoint_store
+                    .save_checkpoint(&checkpoint_at("mysqld-bin.000777", 12345))
+                    .expect("save checkpoint");
+                return Err(ApplyBinlogError::SourceCommand(
+                    "TLS/SSL error: Connection reset by peer".to_string(),
+                ));
+            }
+            Ok(())
+        },
+        |_delay: Duration| {},
+    )
+    .expect("reconnect loop");
+
+    assert_eq!(
+        seen_starts.into_inner(),
+        vec![
+            ("mysqld-bin.000001".to_string(), 4),
+            ("mysqld-bin.000777".to_string(), 12345)
+        ]
+    );
+}
+
 #[derive(Default)]
 struct RecordingExecutor {
     statements: RefCell<Vec<String>>,
@@ -268,7 +317,7 @@ struct RecordingExecutor {
 }
 
 impl RecordingExecutor {
-    fn failing(message: &str) -> Self {
+    fn with_failure(message: &str) -> Self {
         Self {
             statements: RefCell::new(Vec::new()),
             failure: Some(message.to_string()),
@@ -298,6 +347,19 @@ impl MemoryCheckpointStore {
             loaded: RefCell::new(Some(checkpoint)),
             saved: RefCell::new(None),
         }
+    }
+}
+
+fn checkpoint_at(file: &str, position: u64) -> Checkpoint {
+    Checkpoint {
+        source_file: file.to_string(),
+        source_position: position,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: LastEvent {
+            event_type: "StatementEvent".to_string(),
+            description: "fixture".to_string(),
+        },
     }
 }
 
