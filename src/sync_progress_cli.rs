@@ -76,6 +76,7 @@ struct FileSyncProgressConfig {
     target_host: Option<String>,
     target_port: Option<u16>,
     target_user: Option<String>,
+    target_password: Option<String>,
     target_password_env: Option<String>,
     target_database: Option<String>,
     mariadb: Option<String>,
@@ -132,10 +133,13 @@ fn apply_file_config(
     apply_optional_string(&mut config.target.host, sync_progress.target_host);
     apply_optional_u16(&mut config.target.port, sync_progress.target_port);
     apply_optional_string(&mut config.target.user, sync_progress.target_user);
-    apply_optional_password_env(
-        &mut config.target.password,
-        sync_progress.target_password_env,
-    )?;
+    apply_optional_string(&mut config.target.password, sync_progress.target_password);
+    if config.target.password.is_empty() {
+        apply_optional_password_env(
+            &mut config.target.password,
+            sync_progress.target_password_env,
+        )?;
+    }
     apply_optional_string(&mut config.target.database, sync_progress.target_database);
     apply_optional_string(&mut config.mariadb, sync_progress.mariadb);
     apply_optional_string(&mut config.progress_table, sync_progress.progress_table);

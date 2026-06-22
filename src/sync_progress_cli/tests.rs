@@ -109,6 +109,33 @@ fn loads_sync_progress_defaults_from_config_file() {
 }
 
 #[test]
+fn loads_direct_target_password_from_config_file() {
+    let _guard = env_lock();
+    let path = unique_path("config-password.json");
+    fs::write(
+        &path,
+        r#"{
+          "sync_progress": {
+            "target_host": "target-from-config",
+            "target_user": "target_user",
+            "target_password": "target-pass",
+            "target_database": "globalcomix"
+          }
+        }"#,
+    )
+    .expect("write config");
+    set_env("MARIADB_MYSQL_CDC_CONFIG", path.to_string_lossy().as_ref());
+
+    let config = parse_sync_progress_config(Vec::new()).expect("progress config");
+
+    assert_eq!(config.target.host, "target-from-config");
+    assert_eq!(config.target.password, "target-pass");
+    assert_eq!(config.target.database, "globalcomix");
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn command_line_overrides_config_file_defaults() {
     let _guard = env_lock();
     let path = unique_path("config-override.json");
