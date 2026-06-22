@@ -267,11 +267,14 @@ impl MysqlCliExecutor {
         statement: &SqlStatement,
     ) -> Result<std::process::Output, TargetExecuteError> {
         let password_arg = format!("--password={}", self.target.password);
+        let init_command = target_session_init_command();
         Command::new(&self.mariadb)
             .args([
                 "--batch",
                 "--raw",
                 "--skip-column-names",
+                "--init-command",
+                init_command,
                 "--host",
                 &self.target.host,
                 "--port",
@@ -309,6 +312,10 @@ impl MysqlCliExecutor {
     fn can_ignore_duplicate_insert(&self, sql: &str, stderr: &str) -> bool {
         should_ignore_duplicate_insert(self.target.insert_conflict_policy, sql, stderr)
     }
+}
+
+fn target_session_init_command() -> &'static str {
+    "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',ANSI_QUOTES,', ','), ',,', ','), ',,', ','))"
 }
 
 pub fn extract_statement_events(output: &str, start: &BinlogCoordinate) -> Vec<StatementEvent> {
@@ -708,6 +715,11 @@ DELETE FROM accounts WHERE id = 1/*!*/;
                 .contains("INSERT INTO `users_search_queries_history`")
         );
         assert!(events[2].sql.contains("\\\"semantic\\\":true"));
+    }
+
+    #[test]
+    fn target_session_init_removes_ansi_quotes() {
+        assert!(target_session_init_command().contains("ANSI_QUOTES"));
     }
 
     #[derive(Default)]
