@@ -190,14 +190,31 @@ fn read_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
     if let Some(checkpoint) = checkpoint {
         lines.push(checkpoint);
     }
-    lines.extend(rows.iter().map(|row| format_progress_row(config, row)));
+    match rows {
+        Some(rows) => lines.extend(rows.iter().map(|row| format_progress_row(config, row))),
+        None => lines.push(format!(
+            "sync_progress_table table={} status=missing",
+            config.progress_table
+        )),
+    }
     Ok(format!("{}\n", lines.join("\n")))
 }
 
-fn query_progress_rows(config: &SyncProgressConfig) -> Result<Vec<SyncProgressRow>, String> {
+fn query_progress_rows(
+    config: &SyncProgressConfig,
+) -> Result<Option<Vec<SyncProgressRow>>, String> {
+    if !progress_table_exists(config)? {
+        return Ok(None);
+    }
     let sql = build_progress_query(&config.progress_table, config.table.as_deref());
     let output = run_mysql_query(&config.mariadb, &config.target, &sql)?;
-    parse_progress_rows(&output)
+    parse_progress_rows(&output).map(Some)
+}
+
+fn progress_table_exists(config: &SyncProgressConfig) -> Result<bool, String> {
+    let sql = build_progress_table_exists_query(&config.target.database, &config.progress_table);
+    let output = run_mysql_query(&config.mariadb, &config.target, &sql)?;
+    Ok(output.trim() == "1")
 }
 
 fn read_checkpoint_line(config: &SyncProgressConfig) -> Result<Option<String>, String> {
@@ -249,6 +266,24 @@ fn build_progress_query(progress_table: &str, table: Option<&str>) -> String {
         quote_identifier_path(progress_table),
         table_filter
     )
+}
+
+fn build_progress_table_exists_query(default_schema: &str, progress_table: &str) -> String {
+    let (schema, table) = progress_table_parts(default_schema, progress_table);
+    format!(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = {} AND table_name = {}",
+        quote_sql_literal(&schema),
+        quote_sql_literal(&table)
+    )
+}
+
+fn progress_table_parts(default_schema: &str, progress_table: &str) -> (String, String) {
+    let parts = progress_table.split('.').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [schema, table] => (schema.to_string(), table.to_string()),
+        [table] => (default_schema.to_string(), table.to_string()),
+        _ => (default_schema.to_string(), progress_table.to_string()),
+    }
 }
 
 fn parse_progress_rows(output: &str) -> Result<Vec<SyncProgressRow>, String> {
@@ -495,6 +530,23 @@ mod tests {
         assert_eq!(eta, Some(5));
         assert_eq!(display_percent(25, Some(100)), "25.00%");
         assert_eq!(display_duration(Some(125)), "2m05s");
+    }
+
+    #[test]
+    fn builds_progress_table_lookup_for_qualified_and_default_schema_tables() {
+        assert_eq!(
+            progress_table_parts("globalcomix", "cdc.table_sync_progress"),
+            ("cdc".to_string(), "table_sync_progress".to_string())
+        );
+        assert_eq!(
+            progress_table_parts("globalcomix", "table_sync_progress"),
+            ("globalcomix".to_string(), "table_sync_progress".to_string())
+        );
+
+        let sql = build_progress_table_exists_query("globalcomix", "cdc.table_sync_progress");
+
+        assert!(sql.contains("table_schema = 'cdc'"));
+        assert!(sql.contains("table_name = 'table_sync_progress'"));
     }
 
     fn args<const N: usize>(values: [&str; N]) -> Vec<String> {
