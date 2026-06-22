@@ -432,8 +432,9 @@ where
 {
     match applier.apply(event) {
         Ok(StatementOutcome::Replayed) => {
-            progress.record_applied(&event.coordinate);
-            println!("{}", format_stream_progress(progress));
+            if progress.record_applied(&event.coordinate) {
+                println!("{}", format_stream_progress(progress));
+            }
             Ok(())
         }
         Ok(StatementOutcome::Quarantined(reason)) => {

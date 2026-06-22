@@ -1,12 +1,18 @@
 use crate::live::ApplyBinlogConfig;
 use crate::probe::BinlogCoordinate;
 use crate::statement::QuarantineReason;
+use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+const PROGRESS_STATEMENT_INTERVAL: usize = 10_000;
+const PROGRESS_TIME_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug)]
 pub(super) struct StreamProgress {
     pub(super) applied_statements: usize,
     pub(super) quarantined_statements: usize,
     pub(super) last_coordinate: BinlogCoordinate,
+    last_progress_log_at: Option<Instant>,
+    last_progress_log_count: usize,
 }
 
 impl StreamProgress {
@@ -15,17 +21,51 @@ impl StreamProgress {
             applied_statements: 0,
             quarantined_statements: 0,
             last_coordinate: start,
+            last_progress_log_at: None,
+            last_progress_log_count: 0,
         }
     }
 
-    pub(super) fn record_applied(&mut self, coordinate: &BinlogCoordinate) {
+    pub(super) fn record_applied(&mut self, coordinate: &BinlogCoordinate) -> bool {
+        self.record_applied_at(coordinate, Instant::now())
+    }
+
+    fn record_applied_at(&mut self, coordinate: &BinlogCoordinate, now: Instant) -> bool {
         self.applied_statements += 1;
         self.last_coordinate = coordinate.clone();
+        self.should_log_progress(now)
     }
 
     pub(super) fn record_quarantined(&mut self, coordinate: &BinlogCoordinate) {
         self.quarantined_statements += 1;
         self.last_coordinate = coordinate.clone();
+    }
+
+    fn should_log_progress(&mut self, now: Instant) -> bool {
+        if self.is_first_applied_statement()
+            || self.reached_statement_interval()
+            || self.reached_time_interval(now)
+        {
+            self.last_progress_log_at = Some(now);
+            self.last_progress_log_count = self.applied_statements;
+            return true;
+        }
+
+        false
+    }
+
+    fn is_first_applied_statement(&self) -> bool {
+        self.applied_statements == 1
+    }
+
+    fn reached_statement_interval(&self) -> bool {
+        self.applied_statements - self.last_progress_log_count >= PROGRESS_STATEMENT_INTERVAL
+    }
+
+    fn reached_time_interval(&self, now: Instant) -> bool {
+        self.last_progress_log_at
+            .and_then(|last_log_at| now.checked_duration_since(last_log_at))
+            .is_some_and(|elapsed| elapsed >= PROGRESS_TIME_INTERVAL)
     }
 }
 
@@ -90,11 +130,43 @@ mod tests {
                 file: "mysqld-bin.000123".to_string(),
                 position: 456,
             },
+            last_progress_log_at: None,
+            last_progress_log_count: 0,
         };
 
         assert_eq!(
             format_stream_progress(&progress),
             "cdc_stream_progress applied_statements=7 quarantined_statements=1 last_file=mysqld-bin.000123 last_position=456"
+        );
+    }
+
+    #[test]
+    fn throttles_stream_progress_by_first_event_count_and_time() {
+        let start = BinlogCoordinate {
+            file: "mysqld-bin.000123".to_string(),
+            position: 4,
+        };
+        let event_coordinate = BinlogCoordinate {
+            file: "mysqld-bin.000123".to_string(),
+            position: 456,
+        };
+        let mut progress = StreamProgress::new(start);
+        let first_log_at = Instant::now();
+
+        assert!(progress.record_applied_at(&event_coordinate, first_log_at));
+        assert!(
+            !progress.record_applied_at(&event_coordinate, first_log_at + Duration::from_secs(29))
+        );
+
+        progress.applied_statements = 10_000;
+        assert!(
+            progress.record_applied_at(&event_coordinate, first_log_at + Duration::from_secs(29))
+        );
+        assert!(
+            !progress.record_applied_at(&event_coordinate, first_log_at + Duration::from_secs(29))
+        );
+        assert!(
+            progress.record_applied_at(&event_coordinate, first_log_at + Duration::from_secs(60))
         );
     }
 
