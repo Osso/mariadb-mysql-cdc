@@ -1,7 +1,7 @@
 use super::*;
 use crate::checkpoint::{Checkpoint, LastEvent};
 use std::cell::RefCell;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn extracts_statement_events_with_coordinates_and_database() {
@@ -332,6 +332,30 @@ fn reconnect_loop_requires_checkpoint_when_static_coordinates_are_absent() {
     .expect_err("missing checkpoint coordinate");
 
     assert_eq!(error.to_string(), "binlog file is required");
+}
+
+#[test]
+fn slow_target_query_log_includes_bounded_sql_preview() {
+    let statement = SqlStatement {
+        sql: "INSERT INTO events VALUES ('alpha')".repeat(200),
+        params: Vec::new(),
+    };
+    let started_at = Instant::now() - Duration::from_secs(21);
+
+    let log_line = format_slow_target_query_log(&statement, started_at);
+
+    assert!(log_line.starts_with("cdc_target_slow_query elapsed_seconds="));
+    assert!(log_line.contains(&format!("sql_bytes={}", statement.sql.len())));
+    assert!(log_line.contains("sql_truncated=true"));
+    assert!(log_line.contains("INSERT INTO events VALUES"));
+    assert!(log_line.len() < statement.sql.len());
+}
+
+#[test]
+fn truncate_sql_for_log_keeps_utf8_boundary() {
+    let sql = "éééSELECT";
+
+    assert_eq!(truncate_sql_for_log(sql, 3), "ééé");
 }
 
 #[derive(Default)]
