@@ -6,7 +6,7 @@ use crate::statement::{
 use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
 use std::cell::RefCell;
 use std::fmt;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Lines};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 mod binlog_command;
@@ -336,33 +336,60 @@ where
     E: TargetExecutor,
     Q: StatementQuarantine + QuarantineRecorder,
 {
-    let start = BinlogCoordinate {
-        file: config.source.binlog_file.clone(),
-        position: config.source.start_position,
-    };
+    let start = start_coordinate(&config.source);
     let (mut child, stdout) = spawn_stream_reader(config)?;
-    let mut extractor = StatementEventExtractor::new(start);
-    let mut progress = StreamProgress::new(BinlogCoordinate {
-        file: config.source.binlog_file.clone(),
-        position: config.source.start_position,
-    });
+    let mut extractor = StatementEventExtractor::new(start.clone());
+    let mut progress = StreamProgress::new(start);
 
     println!("{}", format_stream_start(config));
+    process_stream_lines(
+        BufReader::new(stdout).lines(),
+        &mut extractor,
+        applier,
+        &mut progress,
+    )?;
+    wait_for_stream_exit(&mut child, &progress)
+}
 
-    for line in BufReader::new(stdout).lines() {
+fn start_coordinate(source: &SourceBinlogConfig) -> BinlogCoordinate {
+    BinlogCoordinate {
+        file: source.binlog_file.clone(),
+        position: source.start_position,
+    }
+}
+
+fn process_stream_lines<E, Q>(
+    lines: Lines<BufReader<ChildStdout>>,
+    extractor: &mut StatementEventExtractor,
+    applier: &StatementApplier<E, Q>,
+    progress: &mut StreamProgress,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TargetExecutor,
+    Q: StatementQuarantine + QuarantineRecorder,
+{
+    for line in lines {
         let line = line.map_err(|error| {
             ApplyBinlogError::SourceCommand(format!("failed reading mariadb-binlog: {error}"))
         })?;
         if let Some(event) = extractor.accept_line(&line) {
-            apply_stream_event(applier, &event, &mut progress)?;
+            apply_stream_event(applier, &event, progress)?;
         }
     }
 
+    Ok(())
+}
+
+fn wait_for_stream_exit(
+    child: &mut Child,
+    progress: &StreamProgress,
+) -> Result<(), ApplyBinlogError> {
     let status = child.wait().map_err(|error| {
         ApplyBinlogError::SourceCommand(format!("failed waiting for mariadb-binlog: {error}"))
     })?;
+
     if status.success() {
-        println!("{}", format_stream_exit(&progress));
+        println!("{}", format_stream_exit(progress));
         Ok(())
     } else {
         Err(ApplyBinlogError::SourceCommand(format!(
