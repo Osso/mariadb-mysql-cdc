@@ -26,8 +26,8 @@ overlay, and no assumption that source statements stay inside chunk boundaries.
 
 Use `catchup-snapshot` for the source-to-target backfill. It reads the source
 schema inventory, copies rows in primary-key chunks, writes target rows with
-`INSERT IGNORE`, and persists chunk progress to a JSON file after each successful
-chunk.
+`INSERT IGNORE`, and persists chunk progress to the target CDC progress table
+and the local progress file.
 
 ```bash
 mariadb-mysql-cdc catchup-snapshot \
@@ -41,8 +41,15 @@ mariadb-mysql-cdc catchup-snapshot \
   --target-password-env TARGET_PASSWORD \
   --target-database globalcomix \
   --progress-file /var/lib/mariadb-mysql-cdc/snapshot-progress.json \
-  --chunk-size 5000
+  --chunk-size 10000 \
+  --parallel-workers 4
 ```
+
+`--parallel-workers 4` splits a table into disjoint primary-key ranges. Each
+worker opens its own persistent source, target, and progress database
+connections, and writes range-scoped checkpoints such as
+`table_name#range2` to the CDC progress table. Leave it at `1` for a sequential
+single-worker catchup.
 
 For a single-table retry or rehearsal:
 
@@ -57,6 +64,6 @@ mariadb-mysql-cdc catchup-progress \
   --progress-file /var/lib/mariadb-mysql-cdc/snapshot-progress.json
 ```
 
-Current implementation is sequential. The durable progress format supports
-safe restart after a failed pod, but bounded 4-worker parallel chunk import still
-needs explicit range ownership before it should be enabled.
+The durable progress state supports safe restart after a failed pod. Sequential
+catchup resumes from the table checkpoint; parallel catchup resumes from each
+worker range checkpoint.
