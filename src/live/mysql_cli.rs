@@ -447,14 +447,18 @@ mod tests {
             params: Vec::new(),
         };
 
-        executor.execute(&statement).expect("generated column retry");
+        executor
+            .execute(&statement)
+            .expect("generated column retry");
 
         assert_eq!(fixture.call_count(), 2);
         let replay_sql = fixture.replay_sql();
         assert!(replay_sql.contains(target_session_init_command()));
-        assert!(replay_sql.contains(
-            "INSERT INTO `releases` (`slug`,`title`) VALUES(\"a,b\",\"hello (world)\")"
-        ));
+        assert!(
+            replay_sql.contains(
+                "INSERT INTO `releases` (`slug`,`title`) VALUES(\"a,b\",\"hello (world)\")"
+            )
+        );
         assert!(!replay_sql.contains("`public_time`"));
     }
 
@@ -485,7 +489,9 @@ mod tests {
             params: Vec::new(),
         };
 
-        executor.execute(&statement).expect("large SQL through stdin");
+        executor
+            .execute(&statement)
+            .expect("large SQL through stdin");
 
         assert_eq!(fixture.call_count(), 1);
         assert!(fixture.replay_sql().contains(&statement.sql));
@@ -523,7 +529,9 @@ mod tests {
                 success_after_failures,
             );
             fs::write(&script, script_body).expect("fake mariadb script");
-            let mut permissions = fs::metadata(&script).expect("script metadata").permissions();
+            let mut permissions = fs::metadata(&script)
+                .expect("script metadata")
+                .permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(&script, permissions).expect("script permissions");
             Self {

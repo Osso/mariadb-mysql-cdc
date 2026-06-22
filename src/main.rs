@@ -9,6 +9,8 @@ pub mod rehearsal;
 pub mod row;
 pub mod snapshot;
 pub mod statement;
+mod sync_cli;
+pub mod table_sync;
 pub mod target;
 pub mod validation;
 
@@ -22,6 +24,7 @@ Usage:
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
   mariadb-mysql-cdc catchup-snapshot --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --progress-file PATH [options]
   mariadb-mysql-cdc catchup-progress --progress-file PATH
+  mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS [options]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
 
@@ -32,6 +35,8 @@ Commands:
           Copy source rows into target in resumable primary-key chunks.
   catchup-progress
           Print catchup checkpoint progress.
+  sync-table
+          Compare one source/target table by primary-key chunks and optionally repair target gaps.
   apply-binlog
           Read remote MariaDB binlog text and apply compatible statements.
   stream-binlog
@@ -86,6 +91,10 @@ Catchup snapshot options:
 
 Catchup progress options:
   --progress-file PATH            Durable JSON progress file.
+
+Sync table options:
+  Uses the catchup source/target options plus --table, --primary-key, --columns,
+  --chunk-size, --mode dry-run|apply, and --mariadb.
 ";
 
 fn main() {
@@ -98,6 +107,7 @@ fn main() {
         Some("probe") => run_probe_command(args.collect()),
         Some("catchup-snapshot") => run_catchup_snapshot_command(args.collect()),
         Some("catchup-progress") => run_catchup_progress_command(args.collect()),
+        Some("sync-table") => sync_cli::run_sync_table_command(args.collect(), USAGE),
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),
         Some("stream-binlog") => run_stream_binlog_command(args.collect()),
         Some("-h" | "--help") | None => print!("{USAGE}"),
@@ -407,7 +417,7 @@ fn apply_target_option(
     Ok(true)
 }
 
-fn parse_insert_policy(value: &str) -> Result<live::InsertConflictPolicy, String> {
+pub(crate) fn parse_insert_policy(value: &str) -> Result<live::InsertConflictPolicy, String> {
     match value {
         "error" => Ok(live::InsertConflictPolicy::Error),
         "ignore-duplicate" => Ok(live::InsertConflictPolicy::IgnoreDuplicate),
@@ -415,11 +425,11 @@ fn parse_insert_policy(value: &str) -> Result<live::InsertConflictPolicy, String
     }
 }
 
-fn read_env_password(name: &str) -> Result<String, String> {
+pub(crate) fn read_env_password(name: &str) -> Result<String, String> {
     env::var(name).map_err(|_| format!("{name} is not set"))
 }
 
-fn parse_u16(flag: &str, value: &str) -> Result<u16, String> {
+pub(crate) fn parse_u16(flag: &str, value: &str) -> Result<u16, String> {
     value
         .parse()
         .map_err(|_| format!("{flag} must be an integer"))
@@ -437,7 +447,7 @@ fn parse_u32(flag: &str, value: &str) -> Result<u32, String> {
         .map_err(|_| format!("{flag} must be an integer"))
 }
 
-fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
+pub(crate) fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
     value
         .parse()
         .map_err(|_| format!("{flag} must be an integer"))
