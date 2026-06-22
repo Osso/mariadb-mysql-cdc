@@ -240,6 +240,50 @@ fn stream_checkpoint_is_saved_after_successful_apply() {
 }
 
 #[test]
+fn stream_checkpoint_does_not_move_backwards_to_zero() {
+    let checkpoint_store =
+        MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.000777", 12_399));
+    let event = StatementEvent {
+        coordinate: BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 0,
+        },
+        resume_position: 0,
+        default_database: Some("globalcomix".to_string()),
+        sql: "INSERT INTO accounts (id) VALUES (1)".to_string(),
+    };
+
+    save_stream_checkpoint(Some(&checkpoint_store), &event).expect("skip checkpoint");
+
+    let loaded = checkpoint_store.loaded.borrow();
+    let checkpoint = loaded.as_ref().expect("existing checkpoint");
+    assert_eq!(checkpoint.source_position, 12_399);
+    assert!(checkpoint_store.saved.borrow().is_none());
+}
+
+#[test]
+fn stream_checkpoint_does_not_move_backwards_in_same_file() {
+    let checkpoint_store =
+        MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.000777", 12_399));
+    let event = StatementEvent {
+        coordinate: BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 12_000,
+        },
+        resume_position: 12_100,
+        default_database: Some("globalcomix".to_string()),
+        sql: "INSERT INTO accounts (id) VALUES (1)".to_string(),
+    };
+
+    save_stream_checkpoint(Some(&checkpoint_store), &event).expect("skip checkpoint");
+
+    let loaded = checkpoint_store.loaded.borrow();
+    let checkpoint = loaded.as_ref().expect("existing checkpoint");
+    assert_eq!(checkpoint.source_position, 12_399);
+    assert!(checkpoint_store.saved.borrow().is_none());
+}
+
+#[test]
 fn stream_checkpoint_is_saved_after_failed_apply_is_repaired() {
     let checkpoint_store = MemoryCheckpointStore::default();
     let executor = RecordingExecutor::with_failure("target down");

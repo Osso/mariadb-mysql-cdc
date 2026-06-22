@@ -38,9 +38,27 @@ pub(super) fn save_stream_checkpoint(
     };
 
     let checkpoint = statement_checkpoint(event);
+    if should_skip_checkpoint(store, &checkpoint)? {
+        println!("{}", format_checkpoint_skip(&checkpoint));
+        return Ok(());
+    }
     store.save_checkpoint(&checkpoint)?;
     println!("{}", format_checkpoint_write(&checkpoint));
     Ok(())
+}
+
+fn should_skip_checkpoint(
+    store: &impl StreamCheckpointStore,
+    checkpoint: &Checkpoint,
+) -> Result<bool, ApplyBinlogError> {
+    if checkpoint.source_position == 0 {
+        return Ok(true);
+    }
+    let Some(current) = store.load_checkpoint()? else {
+        return Ok(false);
+    };
+    Ok(current.source_file == checkpoint.source_file
+        && checkpoint.source_position <= current.source_position)
 }
 
 pub(super) fn statement_checkpoint(event: &StatementEvent) -> Checkpoint {
@@ -87,6 +105,13 @@ pub(super) fn reconnect_delay(attempt: u32) -> Duration {
 fn format_checkpoint_write(checkpoint: &Checkpoint) -> String {
     format!(
         "cdc_stream_checkpoint file={} position={} event_type={}",
+        checkpoint.source_file, checkpoint.source_position, checkpoint.last_event.event_type
+    )
+}
+
+fn format_checkpoint_skip(checkpoint: &Checkpoint) -> String {
+    format!(
+        "cdc_stream_checkpoint_skip file={} position={} event_type={}",
         checkpoint.source_file, checkpoint.source_position, checkpoint.last_event.event_type
     )
 }
