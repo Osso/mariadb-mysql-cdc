@@ -87,6 +87,69 @@ fn reports_chunk_progress_with_bounds_and_copied_rows() {
 }
 
 #[test]
+fn snapshots_range_with_worker_bounds_and_progress_key() {
+    let table = accounts_table();
+    let progress_store = MemoryProgressStore::default();
+    let range = SnapshotRange {
+        worker: 2,
+        start_after: Some(pk("100")),
+        end_at: Some(pk("200")),
+    };
+    let source = FakeSnapshotSource::new(vec![vec![row("150", "middle")]]);
+    let mut target = FakeSnapshotTarget::default();
+
+    let result = snapshot_table_range_with_observer(
+        &table,
+        &range,
+        10,
+        &progress_store,
+        &source,
+        &mut target,
+        &NoopSnapshotObserver,
+    )
+    .expect("snapshot range");
+
+    assert_eq!(result.table, "accounts");
+    assert_eq!(result.rows_copied, 1);
+    assert_eq!(source.requests.borrow()[0].start_after, Some(pk("100")));
+    assert_eq!(source.requests.borrow()[0].end_at, Some(pk("200")));
+
+    let saved = progress_store.load().expect("progress");
+    assert!(saved.table("accounts").is_none());
+    assert!(saved.table("accounts#range2").expect("range").complete);
+}
+
+#[test]
+fn resumes_snapshot_range_from_worker_progress() {
+    let table = accounts_table();
+    let progress_store = MemoryProgressStore::default();
+    let mut progress = SnapshotProgress::default();
+    progress.mark_chunk("accounts#range2", pk("150"), 50);
+    progress_store.save(&progress).expect("save progress");
+    let range = SnapshotRange {
+        worker: 2,
+        start_after: Some(pk("100")),
+        end_at: Some(pk("200")),
+    };
+    let source = FakeSnapshotSource::new(vec![Vec::new()]);
+    let mut target = FakeSnapshotTarget::default();
+
+    snapshot_table_range_with_observer(
+        &table,
+        &range,
+        10,
+        &progress_store,
+        &source,
+        &mut target,
+        &NoopSnapshotObserver,
+    )
+    .expect("snapshot range");
+
+    assert_eq!(source.requests.borrow()[0].start_after, Some(pk("150")));
+    assert_eq!(source.requests.borrow()[0].end_at, Some(pk("200")));
+}
+
+#[test]
 fn retries_temporary_source_read_failure() {
     let table = accounts_table();
     let progress_store = MemoryProgressStore::default();

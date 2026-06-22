@@ -264,6 +264,39 @@ pub fn snapshot_table(
     )
 }
 
+pub fn snapshot_table_range_with_observer(
+    table: &SnapshotTable,
+    range: &SnapshotRange,
+    chunk_size: usize,
+    progress_store: &impl SnapshotProgressStore,
+    source: &impl SnapshotSource,
+    target: &mut impl SnapshotTarget,
+    observer: &impl SnapshotObserver,
+) -> Result<SnapshotResult, SnapshotError> {
+    validate_table(table)?;
+    let progress_key = range_progress_key(&table.name, range.worker);
+    let mut progress = load_progress_with_retry(progress_store, &progress_key)?;
+    let starting_rows_copied = rows_copied_for_table(&progress, &progress_key);
+    if is_table_complete(&progress, &progress_key) {
+        return Ok(snapshot_result(table, 0));
+    }
+
+    copy_table_range_chunks(TableRangeCopy {
+        table,
+        range,
+        progress_key: &progress_key,
+        chunk_size,
+        progress: &mut progress,
+        progress_store,
+        source,
+        target,
+        observer,
+    })?;
+    let rows_copied = rows_copied_for_table(&progress, &progress_key) - starting_rows_copied;
+
+    Ok(snapshot_result(table, rows_copied))
+}
+
 pub fn snapshot_table_with_observer(
     table: &SnapshotTable,
     chunk_size: usize,
@@ -379,16 +412,132 @@ fn copy_table_chunks(
     }
 }
 
+struct TableRangeCopy<'a, S, T, O, P>
+where
+    S: SnapshotSource,
+    T: SnapshotTarget,
+    O: SnapshotObserver,
+    P: SnapshotProgressStore,
+{
+    table: &'a SnapshotTable,
+    range: &'a SnapshotRange,
+    progress_key: &'a str,
+    chunk_size: usize,
+    progress: &'a mut SnapshotProgress,
+    progress_store: &'a P,
+    source: &'a S,
+    target: &'a mut T,
+    observer: &'a O,
+}
+
+fn copy_table_range_chunks<S, T, O, P>(
+    context: TableRangeCopy<'_, S, T, O, P>,
+) -> Result<(), SnapshotError>
+where
+    S: SnapshotSource,
+    T: SnapshotTarget,
+    O: SnapshotObserver,
+    P: SnapshotProgressStore,
+{
+    let mut context = context;
+    loop {
+        let request = build_range_chunk_request(
+            context.table,
+            context.range,
+            context.progress_key,
+            context.chunk_size,
+            context.progress,
+        )?;
+        let rows = read_chunk_with_retry(context.source, &request)?;
+
+        if rows.is_empty() {
+            mark_range_complete(&mut context, &request)?;
+            return Ok(());
+        }
+
+        write_rows_with_retry(context.target, &request, &rows)?;
+        let last_primary_key = last_primary_key(&rows)?;
+        context
+            .progress
+            .mark_chunk(context.progress_key, last_primary_key, rows.len() as u64);
+        context
+            .observer
+            .chunk_copied(&snapshot_chunk_progress_for_key(
+                &request,
+                context.progress_key,
+                rows.len() as u64,
+                context.progress,
+            )?);
+
+        if rows.len() < context.chunk_size {
+            mark_range_complete(&mut context, &request)?;
+            return Ok(());
+        }
+
+        save_progress_with_retry(context.progress_store, context.progress, &request)?;
+    }
+}
+
+fn mark_range_complete<S, T, O, P>(
+    context: &mut TableRangeCopy<'_, S, T, O, P>,
+    request: &ChunkRequest,
+) -> Result<(), SnapshotError>
+where
+    S: SnapshotSource,
+    T: SnapshotTarget,
+    O: SnapshotObserver,
+    P: SnapshotProgressStore,
+{
+    context.progress.mark_complete(context.progress_key);
+    save_progress_with_retry(context.progress_store, context.progress, request)
+}
+
+fn build_range_chunk_request(
+    table: &SnapshotTable,
+    range: &SnapshotRange,
+    progress_key: &str,
+    limit: usize,
+    progress: &SnapshotProgress,
+) -> Result<ChunkRequest, SnapshotError> {
+    validate_table(table)?;
+    let table_progress = progress.table(progress_key);
+    let start_after = table_progress
+        .and_then(|progress| progress.last_primary_key.clone())
+        .or_else(|| range.start_after.clone());
+
+    Ok(ChunkRequest {
+        table: table.name.clone(),
+        primary_key: table.primary_key.clone(),
+        selected_columns: table.columns.clone(),
+        start_after,
+        end_at: range.end_at.clone(),
+        limit,
+    })
+}
+
+fn range_progress_key(table: &str, worker: usize) -> String {
+    format!("{table}#range{worker}")
+}
+
 fn snapshot_chunk_progress(
     request: &ChunkRequest,
     chunk_rows: u64,
     progress: &SnapshotProgress,
 ) -> Result<SnapshotChunkProgress, SnapshotError> {
-    let table_progress = progress.table(&request.table).ok_or_else(|| {
-        SnapshotError::InvalidTable(format!("{} progress was not recorded", request.table))
+    snapshot_chunk_progress_for_key(request, &request.table, chunk_rows, progress)
+}
+
+fn snapshot_chunk_progress_for_key(
+    request: &ChunkRequest,
+    progress_key: &str,
+    chunk_rows: u64,
+    progress: &SnapshotProgress,
+) -> Result<SnapshotChunkProgress, SnapshotError> {
+    let table_progress = progress.table(progress_key).ok_or_else(|| {
+        SnapshotError::InvalidTable(format!("{progress_key} progress was not recorded"))
     })?;
     let chunk_end = table_progress.last_primary_key.clone().ok_or_else(|| {
-        SnapshotError::InvalidTable(format!("{} progress has no chunk end", request.table))
+        SnapshotError::InvalidTable(format!("{progress_key} progress has no chunk end"))
     })?;
     Ok(SnapshotChunkProgress {
         table: request.table.clone(),
