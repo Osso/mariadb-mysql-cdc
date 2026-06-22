@@ -77,6 +77,25 @@ pub trait SnapshotTarget {
     fn write_rows(&mut self, rows: &[SnapshotRow]) -> Result<(), SnapshotError>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotChunkProgress {
+    pub table: String,
+    pub chunk_start: Option<Vec<String>>,
+    pub chunk_end: Vec<String>,
+    pub chunk_rows: u64,
+    pub rows_copied: u64,
+}
+
+pub trait SnapshotObserver {
+    fn chunk_copied(&self, progress: &SnapshotChunkProgress);
+}
+
+pub struct NoopSnapshotObserver;
+
+impl SnapshotObserver for NoopSnapshotObserver {
+    fn chunk_copied(&self, _progress: &SnapshotChunkProgress) {}
+}
+
 #[derive(Clone, Debug)]
 pub struct FileSnapshotProgressStore {
     path: PathBuf,
@@ -226,6 +245,24 @@ pub fn snapshot_table(
     source: &impl SnapshotSource,
     target: &mut impl SnapshotTarget,
 ) -> Result<SnapshotResult, SnapshotError> {
+    snapshot_table_with_observer(
+        table,
+        chunk_size,
+        progress_store,
+        source,
+        target,
+        &NoopSnapshotObserver,
+    )
+}
+
+pub fn snapshot_table_with_observer(
+    table: &SnapshotTable,
+    chunk_size: usize,
+    progress_store: &impl SnapshotProgressStore,
+    source: &impl SnapshotSource,
+    target: &mut impl SnapshotTarget,
+    observer: &impl SnapshotObserver,
+) -> Result<SnapshotResult, SnapshotError> {
     validate_table(table)?;
     let mut progress = load_progress_with_retry(progress_store, &table.name)?;
     let starting_rows_copied = rows_copied_for_table(&progress, &table.name);
@@ -240,6 +277,7 @@ pub fn snapshot_table(
         progress_store,
         source,
         target,
+        observer,
     )?;
     let rows_copied = rows_copied_for_table(&progress, &table.name) - starting_rows_copied;
 
@@ -253,6 +291,7 @@ fn copy_table_chunks(
     progress_store: &impl SnapshotProgressStore,
     source: &impl SnapshotSource,
     target: &mut impl SnapshotTarget,
+    observer: &impl SnapshotObserver,
 ) -> Result<(), SnapshotError> {
     loop {
         let request = build_chunk_request(table, chunk_size, progress)?;
@@ -267,6 +306,11 @@ fn copy_table_chunks(
         write_rows_with_retry(target, &request, &rows)?;
         let last_primary_key = last_primary_key(&rows)?;
         progress.mark_chunk(&table.name, last_primary_key, rows.len() as u64);
+        observer.chunk_copied(&snapshot_chunk_progress(
+            &request,
+            rows.len() as u64,
+            progress,
+        )?);
 
         if rows.len() < chunk_size {
             progress.mark_complete(&table.name);
@@ -276,6 +320,26 @@ fn copy_table_chunks(
 
         save_progress_with_retry(progress_store, progress, &request)?;
     }
+}
+
+fn snapshot_chunk_progress(
+    request: &ChunkRequest,
+    chunk_rows: u64,
+    progress: &SnapshotProgress,
+) -> Result<SnapshotChunkProgress, SnapshotError> {
+    let table_progress = progress.table(&request.table).ok_or_else(|| {
+        SnapshotError::InvalidTable(format!("{} progress was not recorded", request.table))
+    })?;
+    let chunk_end = table_progress.last_primary_key.clone().ok_or_else(|| {
+        SnapshotError::InvalidTable(format!("{} progress has no chunk end", request.table))
+    })?;
+    Ok(SnapshotChunkProgress {
+        table: request.table.clone(),
+        chunk_start: request.start_after.clone(),
+        chunk_end,
+        chunk_rows,
+        rows_copied: table_progress.rows_copied,
+    })
 }
 
 fn load_progress_with_retry(

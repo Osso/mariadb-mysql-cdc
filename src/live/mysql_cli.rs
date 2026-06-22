@@ -392,7 +392,8 @@ pub(super) fn target_client_character_set_arg() -> &'static str {
 mod tests {
     use super::*;
     use crate::live::InsertConflictPolicy;
-    use std::fs;
+    use std::fs::{self, File};
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -528,7 +529,7 @@ mod tests {
                 first_error,
                 success_after_failures,
             );
-            fs::write(&script, script_body).expect("fake mariadb script");
+            write_fake_mariadb_script(&script, &script_body);
             let mut permissions = fs::metadata(&script)
                 .expect("script metadata")
                 .permissions();
@@ -557,6 +558,13 @@ mod tests {
         fn replay_sql(&self) -> String {
             fs::read_to_string(&self.replay_sql_file).expect("replay sql")
         }
+    }
+
+    fn write_fake_mariadb_script(script: &Path, script_body: &str) {
+        let mut file = File::create(script).expect("fake mariadb script");
+        file.write_all(script_body.as_bytes())
+            .expect("write fake mariadb script");
+        file.sync_all().expect("sync fake mariadb script");
     }
 
     impl Drop for FakeMariadb {

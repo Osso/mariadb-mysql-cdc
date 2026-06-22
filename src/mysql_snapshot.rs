@@ -4,8 +4,9 @@ use crate::mysql_client::{
     PersistentMySqlSource, PersistentProgressWriter, PersistentTargetExecutor,
 };
 use crate::snapshot::{
-    ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotProgress,
-    SnapshotProgressStore, SnapshotTable, snapshot_table,
+    ChunkRequest, FileSnapshotProgressStore, SnapshotChunkProgress, SnapshotError,
+    SnapshotObserver, SnapshotProgress, SnapshotProgressStore, SnapshotTable,
+    snapshot_table_with_observer,
 };
 use crate::table_sync::{SyncMode, SyncProgressStatus, SyncTableProgress, TableSyncError};
 use crate::target::{SnapshotInsertMode, TargetMySqlWriter};
@@ -99,38 +100,106 @@ pub fn run_catchup_snapshot(
     let tables = read_snapshot_tables(config)?;
     let progress_store = catchup_progress_store(config)?;
     let source = PersistentMySqlSource::new(&config.source)?;
+    let total_tables = tables.len();
     let mut reports = Vec::new();
 
-    println!(
-        "catchup_snapshot_start tables={} chunk_size={} progress_file={}",
-        tables.len(),
-        config.chunk_size,
-        config.progress_file.display()
-    );
+    log_catchup_snapshot_start(total_tables, config);
 
     for table in tables {
-        prepare_snapshot_table_progress(&source, &progress_store, &table.name)?;
-        println!("catchup_table_start table={}", table.name);
-        let mut target = snapshot_target_for_table(config, &table)?;
-        let result = snapshot_table(
-            &table,
-            config.chunk_size,
-            &progress_store,
+        let report = run_catchup_table(
+            config,
             &source,
-            &mut target,
+            &progress_store,
+            &table,
+            &reports,
+            total_tables,
         )?;
-        println!(
-            "catchup_table_complete table={} rows_copied={}",
-            result.table, result.rows_copied
-        );
-        reports.push(CatchupSnapshotTableReport {
-            table: result.table,
-            rows_copied: result.rows_copied,
-        });
+        reports.push(report);
     }
 
     println!("catchup_snapshot_complete tables={}", reports.len());
     Ok(CatchupSnapshotReport { tables: reports })
+}
+
+fn log_catchup_snapshot_start(total_tables: usize, config: &CatchupSnapshotConfig) {
+    println!(
+        "catchup_snapshot_start tables={} chunk_size={} progress_file={}",
+        total_tables,
+        config.chunk_size,
+        config.progress_file.display()
+    );
+}
+
+fn run_catchup_table(
+    config: &CatchupSnapshotConfig,
+    source: &PersistentMySqlSource,
+    progress_store: &CatchupProgressStore,
+    table: &SnapshotTable,
+    reports: &[CatchupSnapshotTableReport],
+    total_tables: usize,
+) -> Result<CatchupSnapshotTableReport, CatchupSnapshotError> {
+    prepare_snapshot_table_progress(source, progress_store, &table.name)?;
+    let table_number = reports.len() + 1;
+    log_catchup_table_start(progress_store, table, table_number, total_tables);
+    let result = copy_catchup_table(
+        config,
+        progress_store,
+        source,
+        table,
+        table_number,
+        total_tables,
+        reports.len(),
+    )?;
+    Ok(CatchupSnapshotTableReport {
+        table: result.table,
+        rows_copied: result.rows_copied,
+    })
+}
+
+fn log_catchup_table_start(
+    progress_store: &CatchupProgressStore,
+    table: &SnapshotTable,
+    table_number: usize,
+    total_tables: usize,
+) {
+    let total_rows = progress_store.total_rows_for_table(&table.name);
+    println!(
+        "{}",
+        format_catchup_table_start(&table.name, table_number, total_tables, total_rows)
+    );
+}
+
+fn copy_catchup_table(
+    config: &CatchupSnapshotConfig,
+    progress_store: &CatchupProgressStore,
+    source: &PersistentMySqlSource,
+    table: &SnapshotTable,
+    table_number: usize,
+    total_tables: usize,
+    completed_tables: usize,
+) -> Result<crate::snapshot::SnapshotResult, CatchupSnapshotError> {
+    let mut target = snapshot_target_for_table(config, table)?;
+    let observer = CatchupSnapshotLogger::new(table_number, total_tables, completed_tables);
+    let result = snapshot_table_with_observer(
+        table,
+        config.chunk_size,
+        progress_store,
+        source,
+        &mut target,
+        &observer,
+    )?;
+    println!(
+        "{}",
+        format_catchup_table_complete(
+            &result.table,
+            table_number,
+            total_tables,
+            completed_tables + 1,
+            result.rows_copied,
+            observer.elapsed_seconds()
+        )
+    );
+    Ok(result)
 }
 
 fn prepare_snapshot_table_progress(
@@ -220,6 +289,10 @@ where
             .insert(table.to_string(), total_rows);
     }
 
+    fn total_rows_for_table(&self, table: &str) -> Option<u64> {
+        self.total_rows.borrow().get(table).copied()
+    }
+
     fn save_mysql_progress(&self, progress: &SnapshotProgress) -> Result<(), TableSyncError> {
         self.mysql_store.ensure()?;
         for (table, table_progress) in &progress.tables {
@@ -270,6 +343,108 @@ where
             .or_default()
             .record_save(rows_copied, status, Instant::now());
     }
+}
+
+struct CatchupSnapshotLogger {
+    table_number: usize,
+    total_tables: usize,
+    completed_tables: usize,
+    started_at: Instant,
+}
+
+impl CatchupSnapshotLogger {
+    fn new(table_number: usize, total_tables: usize, completed_tables: usize) -> Self {
+        Self {
+            table_number,
+            total_tables,
+            completed_tables,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn elapsed_seconds(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+}
+
+impl SnapshotObserver for CatchupSnapshotLogger {
+    fn chunk_copied(&self, progress: &SnapshotChunkProgress) {
+        println!(
+            "{}",
+            format_catchup_chunk_progress(
+                progress,
+                self.table_number,
+                self.total_tables,
+                self.completed_tables,
+                self.elapsed_seconds(),
+            )
+        );
+    }
+}
+
+fn format_catchup_table_start(
+    table: &str,
+    table_number: usize,
+    total_tables: usize,
+    total_rows: Option<u64>,
+) -> String {
+    format!(
+        "catchup_table_start table={} table_number={} total_tables={} completed_tables={} total_rows={}",
+        table,
+        table_number,
+        total_tables,
+        table_number - 1,
+        display_optional_u64(total_rows)
+    )
+}
+
+fn format_catchup_chunk_progress(
+    progress: &SnapshotChunkProgress,
+    table_number: usize,
+    total_tables: usize,
+    completed_tables: usize,
+    elapsed_seconds: u64,
+) -> String {
+    format!(
+        "catchup_table_progress table={} table_number={} total_tables={} completed_tables={} chunk_start={} chunk_end={} chunk_rows={} imported_rows={} skipped_rows={} elapsed_seconds={}",
+        progress.table,
+        table_number,
+        total_tables,
+        completed_tables,
+        display_primary_key(&progress.chunk_start),
+        display_primary_key(&Some(progress.chunk_end.clone())),
+        progress.chunk_rows,
+        progress.rows_copied,
+        0,
+        elapsed_seconds
+    )
+}
+
+fn format_catchup_table_complete(
+    table: &str,
+    table_number: usize,
+    total_tables: usize,
+    completed_tables: usize,
+    rows_copied: u64,
+    elapsed_seconds: u64,
+) -> String {
+    format!(
+        "catchup_table_complete table={} table_number={} total_tables={} completed_tables={} rows_copied={} elapsed_seconds={}",
+        table, table_number, total_tables, completed_tables, rows_copied, elapsed_seconds
+    )
+}
+
+fn display_primary_key(value: &Option<Vec<String>>) -> String {
+    value
+        .as_ref()
+        .map(|values| values.join(","))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn display_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 #[derive(Default)]
@@ -531,171 +706,4 @@ fn quote_sql_literal(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builds_first_chunk_select() {
-        let sql = build_select_chunk_sql(&ChunkRequest {
-            table: "accounts".to_string(),
-            primary_key: vec!["id".to_string()],
-            selected_columns: vec!["id".to_string(), "name".to_string()],
-            start_after: None,
-            limit: 100,
-        });
-
-        assert_eq!(
-            sql,
-            "SELECT `id`, `name` FROM `accounts` ORDER BY `id` LIMIT 100"
-        );
-    }
-
-    #[test]
-    fn builds_resume_select_for_composite_primary_key() {
-        let sql = build_select_chunk_sql(&ChunkRequest {
-            table: "edges".to_string(),
-            primary_key: vec!["left_id".to_string(), "right_id".to_string()],
-            selected_columns: vec!["left_id".to_string(), "right_id".to_string()],
-            start_after: Some(vec!["10".to_string(), "20".to_string()]),
-            limit: 50,
-        });
-
-        assert_eq!(
-            sql,
-            "SELECT `left_id`, `right_id` FROM `edges` WHERE (`left_id` > '10') OR (`left_id` = '10' AND `right_id` > '20') ORDER BY `left_id`, `right_id` LIMIT 50"
-        );
-    }
-
-    #[test]
-    fn parses_snapshot_rows_with_primary_key_values() {
-        let rows = parse_snapshot_rows(
-            &["id".to_string(), "name".to_string()],
-            &["id".to_string()],
-            "1\talpha\n2\tbeta\n",
-        )
-        .expect("rows");
-
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].primary_key, vec!["1"]);
-        assert_eq!(rows[1].values["name"], "beta");
-    }
-
-    #[test]
-    fn mysql_progress_save_is_throttled_until_interval_or_completion() {
-        let now = std::time::Instant::now();
-        let mut state = MysqlProgressSaveState::default();
-        let running = SyncProgressStatus::Running;
-        let complete = SyncProgressStatus::Complete;
-
-        assert!(state.should_save(1_000, running, now));
-        state.record_save(1_000, running, now);
-
-        assert!(!state.should_save(2_000, running, now + MYSQL_PROGRESS_SAVE_INTERVAL / 2));
-        assert!(state.should_save(3_000, running, now + MYSQL_PROGRESS_SAVE_INTERVAL));
-        assert!(state.should_save(3_000, complete, now + MYSQL_PROGRESS_SAVE_INTERVAL / 2));
-    }
-
-    #[test]
-    fn catchup_progress_loads_mysql_progress_when_file_is_empty() {
-        let path = unique_path("empty-progress.json");
-        let mysql_progress = snapshot_progress("accounts", Some(vec!["42".to_string()]), 42, false);
-        let store = catchup_progress_store_for_test(&path, mysql_progress.clone());
-
-        let loaded = store.load().expect("progress");
-
-        assert_eq!(loaded, mysql_progress);
-        assert_eq!(*store.mysql_store.ensure_calls.borrow(), 1);
-        assert_eq!(*store.mysql_store.load_calls.borrow(), 1);
-    }
-
-    #[test]
-    fn catchup_progress_prefers_file_progress_over_mysql_progress() {
-        let path = unique_path("file-progress.json");
-        let file_store = FileSnapshotProgressStore::new(path.clone());
-        let file_progress = snapshot_progress("accounts", Some(vec!["9".to_string()]), 9, false);
-        file_store.save(&file_progress).expect("save file progress");
-        let mysql_progress = snapshot_progress("accounts", Some(vec!["42".to_string()]), 42, false);
-        let store = catchup_progress_store_for_test(&path, mysql_progress);
-
-        let loaded = store.load().expect("progress");
-
-        assert_eq!(loaded, file_progress);
-        assert_eq!(*store.mysql_store.ensure_calls.borrow(), 0);
-        assert_eq!(*store.mysql_store.load_calls.borrow(), 0);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    fn catchup_progress_store_for_test(
-        path: &std::path::Path,
-        mysql_progress: SnapshotProgress,
-    ) -> CatchupProgressStore<FakeMysqlProgressStore> {
-        CatchupProgressStore {
-            file_store: FileSnapshotProgressStore::new(path),
-            mysql_store: FakeMysqlProgressStore::new(mysql_progress),
-            total_rows: RefCell::new(BTreeMap::new()),
-            mysql_save_state: RefCell::new(BTreeMap::new()),
-        }
-    }
-
-    fn snapshot_progress(
-        table: &str,
-        last_primary_key: Option<Vec<String>>,
-        rows_copied: u64,
-        complete: bool,
-    ) -> SnapshotProgress {
-        let table_progress = crate::snapshot::TableSnapshotProgress {
-            last_primary_key,
-            rows_copied,
-            complete,
-        };
-        SnapshotProgress {
-            tables: BTreeMap::from([(table.to_string(), table_progress)]),
-        }
-    }
-
-    fn unique_path(file_name: &str) -> std::path::PathBuf {
-        let mut path = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        path.push(format!("mariadb-mysql-cdc-{nanos}-{file_name}"));
-        path
-    }
-
-    struct FakeMysqlProgressStore {
-        progress: SnapshotProgress,
-        ensure_calls: RefCell<u32>,
-        load_calls: RefCell<u32>,
-        saved: RefCell<Vec<SyncTableProgress>>,
-    }
-
-    impl FakeMysqlProgressStore {
-        fn new(progress: SnapshotProgress) -> Self {
-            Self {
-                progress,
-                ensure_calls: RefCell::new(0),
-                load_calls: RefCell::new(0),
-                saved: RefCell::new(Vec::new()),
-            }
-        }
-    }
-
-    impl CatchupMysqlProgressStore for FakeMysqlProgressStore {
-        fn ensure(&self) -> Result<(), TableSyncError> {
-            *self.ensure_calls.borrow_mut() += 1;
-            Ok(())
-        }
-
-        fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError> {
-            *self.load_calls.borrow_mut() += 1;
-            Ok(self.progress.clone())
-        }
-
-        fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
-            self.saved.borrow_mut().push(progress.clone());
-            Ok(())
-        }
-    }
-}
+mod tests;

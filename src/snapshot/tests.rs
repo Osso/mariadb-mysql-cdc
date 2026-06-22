@@ -51,6 +51,41 @@ fn snapshots_table_in_chunks_and_saves_progress() {
 }
 
 #[test]
+fn reports_chunk_progress_with_bounds_and_copied_rows() {
+    let table = accounts_table();
+    let progress_store = MemoryProgressStore::default();
+    let source = FakeSnapshotSource::new(vec![
+        vec![row("1", "alpha"), row("2", "beta")],
+        vec![row("3", "gamma")],
+    ]);
+    let observer = RecordingSnapshotObserver::default();
+    let mut target = FakeSnapshotTarget::default();
+
+    snapshot_table_with_observer(&table, 2, &progress_store, &source, &mut target, &observer)
+        .expect("snapshot");
+
+    assert_eq!(
+        observer.events.borrow().as_slice(),
+        &[
+            SnapshotChunkProgress {
+                table: "accounts".to_string(),
+                chunk_start: None,
+                chunk_end: vec!["2".to_string()],
+                chunk_rows: 2,
+                rows_copied: 2,
+            },
+            SnapshotChunkProgress {
+                table: "accounts".to_string(),
+                chunk_start: Some(vec!["2".to_string()]),
+                chunk_end: vec!["3".to_string()],
+                chunk_rows: 1,
+                rows_copied: 3,
+            },
+        ]
+    );
+}
+
+#[test]
 fn retries_temporary_source_read_failure() {
     let table = accounts_table();
     let progress_store = MemoryProgressStore::default();
@@ -419,6 +454,17 @@ impl SnapshotTarget for FlakySnapshotTarget {
 
         self.rows.extend_from_slice(rows);
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingSnapshotObserver {
+    events: RefCell<Vec<SnapshotChunkProgress>>,
+}
+
+impl SnapshotObserver for RecordingSnapshotObserver {
+    fn chunk_copied(&self, progress: &SnapshotChunkProgress) {
+        self.events.borrow_mut().push(progress.clone());
     }
 }
 
