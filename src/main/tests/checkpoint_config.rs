@@ -35,4 +35,34 @@ fn parses_stream_config_with_checkpoint_as_coordinate_source() {
             "/var/lib/mariadb-mysql-cdc/stream-checkpoint.json"
         ))
     );
+    assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
+}
+
+#[test]
+fn parses_stream_config_with_default_cdc_checkpoint_table() {
+    set_env("SRC_PASSWORD_DEFAULT", "source-secret");
+    set_env("TARGET_PASSWORD_DEFAULT", "target-secret");
+
+    let config = parse_apply_binlog_config(args([
+        "--source-host",
+        "10.0.0.2",
+        "--source-user",
+        "cdc",
+        "--source-password-env",
+        "SRC_PASSWORD_DEFAULT",
+        "--source-database",
+        "app",
+        "--target-host",
+        "target.db",
+        "--target-user",
+        "writer",
+        "--target-password-env",
+        "TARGET_PASSWORD_DEFAULT",
+        "--target-database",
+        "app_target",
+    ]))
+    .expect("checkpoint config");
+
+    assert_eq!(config.checkpoint_file, None);
+    assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
 }

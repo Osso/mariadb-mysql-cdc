@@ -9,6 +9,7 @@ pub mod rehearsal;
 pub mod row;
 pub mod snapshot;
 pub mod statement;
+pub mod stream_checkpoint;
 mod sync_cli;
 mod sync_progress_cli;
 pub mod table_sync;
@@ -72,7 +73,6 @@ Apply options:
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
-  --checkpoint-file PATH          Durable stream checkpoint file used by stream-binlog.
 
 Catchup snapshot options:
   --source-host HOST              MariaDB source host.
@@ -87,9 +87,6 @@ Catchup snapshot options:
   --target-database DB            MySQL target database.
   --progress-file PATH            Durable JSON progress file.
   --chunk-size N                  Rows per chunk. Defaults to 1000.
-Sync table options:
-  Uses the catchup source/target options plus --table, --primary-key, --columns,
-  --chunk-size, --mode dry-run|apply, --progress-table, and --mariadb.
 ";
 
 fn main() {
@@ -370,6 +367,7 @@ fn apply_binlog_option(
         "--mariadb" => config.mariadb = value.to_string(),
         "--mariadb-binlog" => config.mariadb_binlog = value.to_string(),
         "--checkpoint-file" => config.checkpoint_file = Some(PathBuf::from(value)),
+        "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--max-reconnects" => config.max_reconnects = parse_u32(flag, value)?,
         other => return Err(format!("unknown apply-binlog option: {other}")),
     }
@@ -502,6 +500,8 @@ mod tests {
             "/usr/bin/mariadb-binlog",
             "--checkpoint-file",
             "/var/lib/mariadb-mysql-cdc/stream-checkpoint.json",
+            "--checkpoint-table",
+            "cdc.stream_checkpoint",
             "--max-reconnects",
             "3",
         ]))
@@ -530,6 +530,7 @@ mod tests {
                 "/var/lib/mariadb-mysql-cdc/stream-checkpoint.json"
             ))
         );
+        assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
         assert_eq!(config.max_reconnects, 3);
     }
 

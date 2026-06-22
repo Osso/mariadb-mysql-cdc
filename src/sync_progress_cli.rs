@@ -1,4 +1,5 @@
 use crate::checkpoint::FileCheckpointStore;
+use crate::stream_checkpoint::{MySqlStreamCheckpointStore, default_stream_checkpoint_table};
 use crate::{live, mysql_snapshot};
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,6 +28,7 @@ struct SyncProgressConfig {
     source: mysql_snapshot::MySqlConnectionConfig,
     mariadb: String,
     progress_table: String,
+    checkpoint_table: String,
     table: Option<String>,
     checkpoint_file: Option<PathBuf>,
 }
@@ -67,6 +69,7 @@ fn default_sync_progress_config() -> SyncProgressConfig {
         source: mysql_snapshot::MySqlConnectionConfig::default(),
         mariadb: "mariadb".to_string(),
         progress_table: "cdc.table_sync_progress".to_string(),
+        checkpoint_table: default_stream_checkpoint_table(),
         table: None,
         checkpoint_file: None,
     }
@@ -86,6 +89,7 @@ fn sync_progress_option(
 
     match flag {
         "--progress-table" => config.progress_table = value.to_string(),
+        "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--checkpoint-file" => config.checkpoint_file = Some(PathBuf::from(value)),
         "--table" => config.table = Some(value.to_string()),
         "--mariadb" => {
@@ -218,18 +222,29 @@ fn progress_table_exists(config: &SyncProgressConfig) -> Result<bool, String> {
 }
 
 fn read_checkpoint_line(config: &SyncProgressConfig) -> Result<Option<String>, String> {
-    let Some(path) = &config.checkpoint_file else {
-        return Ok(None);
-    };
-    let checkpoint = FileCheckpointStore::new(path)
-        .load()
-        .map_err(|error| error.to_string())?;
+    let checkpoint = read_stream_checkpoint(config)?;
     Ok(checkpoint.map(|checkpoint| {
         format!(
             "stream_checkpoint file={} position={} event_type={}",
             checkpoint.source_file, checkpoint.source_position, checkpoint.last_event.event_type
         )
     }))
+}
+
+fn read_stream_checkpoint(
+    config: &SyncProgressConfig,
+) -> Result<Option<crate::checkpoint::Checkpoint>, String> {
+    if let Some(path) = &config.checkpoint_file {
+        return FileCheckpointStore::new(path)
+            .load()
+            .map_err(|error| error.to_string());
+    }
+    MySqlStreamCheckpointStore::new(
+        config.mariadb.clone(),
+        config.target.clone(),
+        config.checkpoint_table.clone(),
+    )
+    .load()
 }
 
 fn format_progress_row(config: &SyncProgressConfig, row: &SyncProgressRow) -> String {
@@ -495,10 +510,33 @@ mod tests {
         assert_eq!(config.source.host, "source-db");
         assert_eq!(config.source.password, "source-pass");
         assert_eq!(config.progress_table, "cdc.table_sync_progress");
+        assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
         assert_eq!(
             config.checkpoint_file,
             Some(PathBuf::from("/var/lib/cdc/stream-checkpoint.json"))
         );
+    }
+
+    #[test]
+    fn parses_progress_config_without_source_or_checkpoint_file() {
+        set_env("SYNC_PROGRESS_TARGET_PASSWORD_ONLY", "target-pass");
+
+        let config = parse_sync_progress_config(args([
+            "--target-host",
+            "target-db",
+            "--target-user",
+            "target-user",
+            "--target-password-env",
+            "SYNC_PROGRESS_TARGET_PASSWORD_ONLY",
+            "--target-database",
+            "globalcomix",
+        ]))
+        .expect("progress config");
+
+        assert_eq!(config.progress_table, "cdc.table_sync_progress");
+        assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
+        assert_eq!(config.checkpoint_file, None);
+        assert_eq!(config.source.host, "");
     }
 
     #[test]

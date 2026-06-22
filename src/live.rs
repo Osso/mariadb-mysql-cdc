@@ -4,6 +4,7 @@ use crate::statement::{
     QuarantineError, QuarantinedStatement, StatementApplier, StatementEvent, StatementOutcome,
     StatementQuarantine,
 };
+use crate::stream_checkpoint::{MySqlStreamCheckpointStore, default_stream_checkpoint_table};
 use crate::target::TargetExecutor;
 use std::cell::RefCell;
 use std::fmt;
@@ -47,6 +48,7 @@ pub struct ApplyBinlogConfig {
     pub mariadb: String,
     pub mariadb_binlog: String,
     pub checkpoint_file: Option<PathBuf>,
+    pub checkpoint_table: String,
     pub max_reconnects: u32,
 }
 
@@ -58,6 +60,7 @@ impl Default for ApplyBinlogConfig {
             mariadb: "mariadb".to_string(),
             mariadb_binlog: "mariadb-binlog".to_string(),
             checkpoint_file: None,
+            checkpoint_table: default_stream_checkpoint_table(),
             max_reconnects: 12,
         }
     }
@@ -74,7 +77,7 @@ impl ApplyBinlogConfig {
         if self.source.password.is_empty() {
             return Err(config_error("source password is required"));
         }
-        if self.checkpoint_file.is_none() {
+        if self.checkpoint_file.is_none() && self.checkpoint_table.is_empty() {
             self.source.validate_start_coordinate()?;
         }
         self.target.validate()
@@ -233,9 +236,19 @@ pub fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlo
                 Some(&checkpoint_store),
             )
         }
-        None => stream_statement_events_with_reconnect::<_, _, _, FileCheckpointStore>(
-            config, &applier, &repairer, None,
-        ),
+        None => {
+            let checkpoint_store = MySqlStreamCheckpointStore::new(
+                config.mariadb.clone(),
+                config.target.clone(),
+                config.checkpoint_table.clone(),
+            );
+            stream_statement_events_with_reconnect(
+                config,
+                &applier,
+                &repairer,
+                Some(&checkpoint_store),
+            )
+        }
     }
 }
 

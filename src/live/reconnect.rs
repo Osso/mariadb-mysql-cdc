@@ -1,6 +1,7 @@
 use super::{ApplyBinlogConfig, ApplyBinlogError};
 use crate::checkpoint::{Checkpoint, CheckpointError, FileCheckpointStore, LastEvent};
 use crate::statement::StatementEvent;
+use crate::stream_checkpoint::MySqlStreamCheckpointStore;
 use std::time::Duration;
 
 pub(super) trait StreamCheckpointStore {
@@ -15,6 +16,16 @@ impl StreamCheckpointStore for FileCheckpointStore {
 
     fn save_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), ApplyBinlogError> {
         self.save(checkpoint).map_err(checkpoint_error)
+    }
+}
+
+impl StreamCheckpointStore for MySqlStreamCheckpointStore {
+    fn load_checkpoint(&self) -> Result<Option<Checkpoint>, ApplyBinlogError> {
+        self.load().map_err(ApplyBinlogError::Checkpoint)
+    }
+
+    fn save_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), ApplyBinlogError> {
+        self.save(checkpoint).map_err(ApplyBinlogError::Checkpoint)
     }
 }
 
