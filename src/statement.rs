@@ -5,8 +5,18 @@ use std::fmt;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatementEvent {
     pub coordinate: BinlogCoordinate,
+    pub resume_position: u64,
     pub default_database: Option<String>,
     pub sql: String,
+}
+
+impl StatementEvent {
+    pub fn resume_coordinate(&self) -> BinlogCoordinate {
+        BinlogCoordinate {
+            file: self.coordinate.file.clone(),
+            position: self.resume_position,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -406,6 +416,7 @@ mod tests {
                 file: "mysql-bin.000001".to_string(),
                 position: 42,
             },
+            resume_position: 84,
             default_database: Some("app".to_string()),
             sql: sql.to_string(),
         }

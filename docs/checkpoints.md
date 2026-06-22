@@ -32,7 +32,9 @@ partially written checkpoint at the final path.
 ## Live Stream Checkpoints
 
 `stream-binlog` uses `--checkpoint-file` to persist the last successfully
-applied statement coordinate:
+applied statement's resume coordinate. For statement events this is the
+`end_log_pos` reported by `mariadb-binlog`, not the `# at` start position, so a
+reconnect starts after the applied event.
 
 ```bash
 mariadb-mysql-cdc stream-binlog \

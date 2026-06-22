@@ -501,7 +501,7 @@ where
     match applier.apply(event) {
         Ok(StatementOutcome::Replayed) => {
             save_stream_checkpoint(checkpoint_store, event)?;
-            if progress.record_applied(&event.coordinate) {
+            if progress.record_applied(&event.resume_coordinate()) {
                 println!("{}", format_stream_progress(progress));
             }
             Ok(())
@@ -516,7 +516,7 @@ where
         Err(error) => {
             if repair_failed_statement(repairer, event, &error)? {
                 save_stream_checkpoint(checkpoint_store, event)?;
-                if progress.record_applied(&event.coordinate) {
+                if progress.record_applied(&event.resume_coordinate()) {
                     println!("{}", format_stream_progress(progress));
                 }
                 return Ok(());
@@ -545,6 +545,7 @@ fn resume_from_checkpoint(
 struct StatementEventExtractor {
     current_file: String,
     current_position: u64,
+    current_resume_position: u64,
     default_database: Option<String>,
     pending_statement: Vec<String>,
 }
@@ -554,6 +555,7 @@ impl StatementEventExtractor {
         Self {
             current_file: start.file,
             current_position: start.position,
+            current_resume_position: start.position,
             default_database: None,
             pending_statement: Vec::new(),
         }
@@ -568,6 +570,11 @@ impl StatementEventExtractor {
 
         if let Some(position) = parse_at_position(line) {
             self.current_position = position;
+            self.current_resume_position = position;
+            return None;
+        }
+        if let Some(position) = parse_end_log_position(line) {
+            self.current_resume_position = position;
             return None;
         }
         if let Some(file) = parse_rotate_file(line) {
@@ -621,6 +628,7 @@ impl StatementEventExtractor {
                 file: self.current_file.clone(),
                 position: self.current_position,
             },
+            resume_position: self.current_resume_position,
             default_database: self.default_database.clone(),
             sql,
         }
@@ -629,6 +637,11 @@ impl StatementEventExtractor {
 
 fn parse_at_position(line: &str) -> Option<u64> {
     let rest = line.strip_prefix("# at ")?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+fn parse_end_log_position(line: &str) -> Option<u64> {
+    let rest = line.split_once("end_log_pos ")?.1;
     rest.split_whitespace().next()?.parse().ok()
 }
 

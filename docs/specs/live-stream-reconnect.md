@@ -23,6 +23,9 @@ source connection loss without replaying from static startup coordinates.
 
 - [x] Persist the last successfully applied binlog file and position outside the
   running process before acknowledging stream progress.
+- [x] Persist the post-event resume position (`end_log_pos`) for statement
+  events, not the statement start position, so reconnect does not replay the
+  last applied event.
 - [ ] Persist GTID when available, alongside file/position.
 - [x] On process start, prefer the durable checkpoint over static startup
   coordinates unless an explicit reset flag is provided.
@@ -33,6 +36,8 @@ source connection loss without replaying from static startup coordinates.
 
 ### Replay safety
 
+- [x] Reconnect replay must not re-read the last statement applied before the
+  checkpoint boundary.
 - [ ] Reconnect replay must be idempotent for statements already applied before
   the checkpoint boundary.
 - [ ] Duplicate-key handling may be used only as a secondary safety net; it must

@@ -35,7 +35,7 @@ pub(super) fn save_stream_checkpoint(
 pub(super) fn statement_checkpoint(event: &StatementEvent) -> Checkpoint {
     Checkpoint {
         source_file: event.coordinate.file.clone(),
-        source_position: event.coordinate.position,
+        source_position: event.resume_position,
         gtid: None,
         event_timestamp: 0,
         last_event: LastEvent {

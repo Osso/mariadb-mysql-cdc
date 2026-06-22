@@ -9,15 +9,18 @@ fn extracts_statement_events_with_coordinates_and_database() {
     let events = extract_statement_events(
         "\
 # at 100
+#250601 12:00:00 server id 1  end_log_pos 180
 use `test_cdc`/*!*/;
 SET TIMESTAMP=1/*!*/;
 SET @@session.time_zone='SYSTEM'/*!*/;
 INSERT INTO accounts (id, name) VALUES (1, 'alpha')/*!*/;
 # at 180
+#250601 12:00:01 server id 1  end_log_pos 220
 UPDATE accounts SET name = 'beta' WHERE id = 1/*!*/;
 # at 220
 # Rotate to mysqld-bin.000002  pos: 4
 # at 4
+#250601 12:00:02 server id 1  end_log_pos 99
 DELETE FROM accounts WHERE id = 1/*!*/;
 ",
         &BinlogCoordinate {
@@ -28,12 +31,14 @@ DELETE FROM accounts WHERE id = 1/*!*/;
 
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].coordinate.position, 100);
+    assert_eq!(events[0].resume_position, 180);
     assert_eq!(events[0].default_database, Some("test_cdc".to_string()));
     assert_eq!(
         events[0].sql,
         "INSERT INTO accounts (id, name) VALUES (1, 'alpha')"
     );
     assert_eq!(events[2].coordinate.file, "mysqld-bin.000002");
+    assert_eq!(events[2].resume_position, 99);
 }
 
 #[test]
@@ -68,6 +73,7 @@ fn applies_extracted_compatible_statements() {
             file: "mysqld-bin.000001".to_string(),
             position: 100,
         },
+        resume_position: 180,
         default_database: Some("test_cdc".to_string()),
         sql: "INSERT INTO accounts (id, name) VALUES (1, 'alpha')".to_string(),
     }];
@@ -92,6 +98,7 @@ fn refuses_quarantined_statements() {
             file: "mysqld-bin.000001".to_string(),
             position: 100,
         },
+        resume_position: 180,
         default_database: Some("test_cdc".to_string()),
         sql: "CREATE TABLE accounts (id INT PRIMARY KEY)".to_string(),
     }];
@@ -205,6 +212,7 @@ fn stream_checkpoint_is_saved_after_successful_apply() {
             file: "mysqld-bin.000777".to_string(),
             position: 12345,
         },
+        resume_position: 12399,
         default_database: Some("globalcomix".to_string()),
         sql: "INSERT INTO accounts (id) VALUES (1)".to_string(),
     };
@@ -226,7 +234,7 @@ fn stream_checkpoint_is_saved_after_successful_apply() {
     let saved = checkpoint_store.saved.borrow();
     let checkpoint = saved.as_ref().expect("saved checkpoint");
     assert_eq!(checkpoint.source_file, "mysqld-bin.000777");
-    assert_eq!(checkpoint.source_position, 12345);
+    assert_eq!(checkpoint.source_position, 12399);
     assert_eq!(checkpoint.last_event.event_type, "StatementEvent");
     assert!(repairer.requests.borrow().is_empty());
 }
@@ -241,6 +249,7 @@ fn stream_checkpoint_is_saved_after_failed_apply_is_repaired() {
             file: "mysqld-bin.000777".to_string(),
             position: 12345,
         },
+        resume_position: 12399,
         default_database: Some("globalcomix".to_string()),
         sql: "INSERT INTO accounts (id) VALUES (1)".to_string(),
     };
@@ -261,7 +270,7 @@ fn stream_checkpoint_is_saved_after_failed_apply_is_repaired() {
 
     let saved = checkpoint_store.saved.borrow();
     let checkpoint = saved.as_ref().expect("saved checkpoint");
-    assert_eq!(checkpoint.source_position, 12345);
+    assert_eq!(checkpoint.source_position, 12399);
     assert_eq!(
         repairer.requests.borrow().as_slice(),
         &[StatementRepairRequest {
@@ -284,6 +293,7 @@ fn stream_checkpoint_is_not_saved_when_failed_apply_repair_fails() {
             file: "mysqld-bin.000777".to_string(),
             position: 12345,
         },
+        resume_position: 12399,
         default_database: Some("globalcomix".to_string()),
         sql: "UPDATE accounts SET name = 'Ada' WHERE id = 1".to_string(),
     };
@@ -332,6 +342,7 @@ fn delete_statement_failure_is_not_repairable_without_delete_support() {
             file: "mysqld-bin.000777".to_string(),
             position: 12345,
         },
+        resume_position: 12399,
         default_database: Some("globalcomix".to_string()),
         sql: "DELETE FROM accounts WHERE id = 1".to_string(),
     };
