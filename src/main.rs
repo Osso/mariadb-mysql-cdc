@@ -4,6 +4,7 @@ pub mod cutover;
 pub mod inventory;
 pub mod live;
 pub mod mysql_snapshot;
+pub mod mysql_support;
 mod probe;
 pub mod rehearsal;
 pub mod row;

@@ -1,5 +1,8 @@
 use crate::checkpoint::Checkpoint;
 use crate::live::TargetMySqlConfig;
+use crate::mysql_support::{
+    quote_ident, quote_identifier_path, quote_sql_literal, target_mysql_args,
+};
 use std::process::Command;
 
 const DEFAULT_CHECKPOINT_NAME: &str = "stream-binlog";
@@ -118,43 +121,12 @@ fn build_checkpoint_upsert_sql(table: &str, checkpoint_json: &str) -> String {
     )
 }
 
-fn target_mysql_args(target: &TargetMySqlConfig) -> Vec<String> {
-    vec![
-        "--host".to_string(),
-        target.host.clone(),
-        "--port".to_string(),
-        target.port.to_string(),
-        "--user".to_string(),
-        target.user.clone(),
-        format!("--password={}", target.password),
-        "--database".to_string(),
-        target.database.clone(),
-        "--default-character-set=utf8mb4".to_string(),
-    ]
-}
-
 fn command_spawn_error(error: std::io::Error) -> String {
     format!("failed to run mariadb: {error}")
 }
 
 fn command_stderr(output: std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
-}
-
-fn quote_identifier_path(identifier: &str) -> String {
-    identifier
-        .split('.')
-        .map(quote_ident)
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-fn quote_ident(identifier: &str) -> String {
-    format!("`{}`", identifier.replace('`', "``"))
-}
-
-fn quote_sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 #[cfg(test)]

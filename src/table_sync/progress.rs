@@ -1,5 +1,8 @@
 use super::{SyncMode, SyncTableReport, TableSyncError};
 use crate::live::TargetMySqlConfig;
+use crate::mysql_support::{
+    quote_ident, quote_identifier_path, quote_sql_literal, target_mysql_args,
+};
 use crate::target::{SqlStatement, TargetExecutor};
 use std::process::Command;
 
@@ -289,21 +292,6 @@ fn parse_u64(field: &str, value: &str) -> Result<u64, TableSyncError> {
         .map_err(|_| TableSyncError::Progress(format!("{field} must be an integer")))
 }
 
-fn target_mysql_args(target: &TargetMySqlConfig) -> Vec<String> {
-    vec![
-        "--host".to_string(),
-        target.host.clone(),
-        "--port".to_string(),
-        target.port.to_string(),
-        "--user".to_string(),
-        target.user.clone(),
-        format!("--password={}", target.password),
-        "--database".to_string(),
-        target.database.clone(),
-        "--default-character-set=utf8mb4".to_string(),
-    ]
-}
-
 fn json_string(values: &[String]) -> String {
     serde_json::to_string(values).expect("primary key JSON serialization cannot fail")
 }
@@ -354,22 +342,6 @@ impl SyncProgressStatus {
             ))),
         }
     }
-}
-
-fn quote_identifier_path(identifier: &str) -> String {
-    identifier
-        .split('.')
-        .map(quote_ident)
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-fn quote_ident(identifier: &str) -> String {
-    format!("`{}`", identifier.replace('`', "``"))
-}
-
-fn quote_sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 fn nullable_sql_literal(value: &str) -> String {
