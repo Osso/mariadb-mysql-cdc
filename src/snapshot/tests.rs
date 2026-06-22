@@ -13,6 +13,7 @@ fn builds_first_chunk_request_from_table_metadata() {
     assert_eq!(request.primary_key, vec!["id"]);
     assert_eq!(request.selected_columns, vec!["id", "name"]);
     assert_eq!(request.start_after, None);
+    assert_eq!(request.end_at, None);
     assert_eq!(request.limit, 500);
 }
 
@@ -225,6 +226,71 @@ fn builds_snapshot_table_from_inventory_table() {
     assert_eq!(table.columns, vec!["id", "name"]);
 }
 
+#[test]
+fn plans_four_disjoint_snapshot_ranges_from_three_boundaries() {
+    let ranges = plan_snapshot_ranges(vec![pk("100"), pk("200"), pk("300")], 4).expect("ranges");
+
+    assert_eq!(
+        ranges,
+        vec![
+            SnapshotRange {
+                worker: 0,
+                start_after: None,
+                end_at: Some(pk("100")),
+            },
+            SnapshotRange {
+                worker: 1,
+                start_after: Some(pk("100")),
+                end_at: Some(pk("200")),
+            },
+            SnapshotRange {
+                worker: 2,
+                start_after: Some(pk("200")),
+                end_at: Some(pk("300")),
+            },
+            SnapshotRange {
+                worker: 3,
+                start_after: Some(pk("300")),
+                end_at: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn plans_single_snapshot_range_without_boundaries() {
+    let ranges = plan_snapshot_ranges(Vec::new(), 1).expect("ranges");
+
+    assert_eq!(
+        ranges,
+        vec![SnapshotRange {
+            worker: 0,
+            start_after: None,
+            end_at: None,
+        }]
+    );
+}
+
+#[test]
+fn rejects_snapshot_ranges_with_unordered_boundaries() {
+    let error = plan_snapshot_ranges(vec![pk("200"), pk("100")], 3).expect_err("error");
+
+    assert_eq!(
+        error.to_string(),
+        "snapshot range boundaries must be strictly ascending"
+    );
+}
+
+#[test]
+fn rejects_snapshot_range_count_that_does_not_match_workers() {
+    let error = plan_snapshot_ranges(vec![pk("100")], 4).expect_err("error");
+
+    assert_eq!(
+        error.to_string(),
+        "snapshot range planning needs exactly workers - 1 boundaries"
+    );
+}
+
 fn accounts_table() -> SnapshotTable {
     SnapshotTable {
         name: "accounts".to_string(),
@@ -242,6 +308,10 @@ fn row(id: &str, name: &str) -> SnapshotRow {
         primary_key: vec![id.to_string()],
         values,
     }
+}
+
+fn pk(value: &str) -> Vec<String> {
+    vec![value.to_string()]
 }
 
 fn inventory_column(name: &str) -> crate::inventory::ColumnInventory {

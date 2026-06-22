@@ -9,6 +9,7 @@ fn builds_first_chunk_select() {
         primary_key: vec!["id".to_string()],
         selected_columns: vec!["id".to_string(), "name".to_string()],
         start_after: None,
+        end_at: None,
         limit: 100,
     });
 
@@ -25,12 +26,30 @@ fn builds_resume_select_for_composite_primary_key() {
         primary_key: vec!["left_id".to_string(), "right_id".to_string()],
         selected_columns: vec!["left_id".to_string(), "right_id".to_string()],
         start_after: Some(vec!["10".to_string(), "20".to_string()]),
+        end_at: None,
         limit: 50,
     });
 
     assert_eq!(
         sql,
         "SELECT `left_id`, `right_id` FROM `edges` WHERE (`left_id` > '10') OR (`left_id` = '10' AND `right_id` > '20') ORDER BY `left_id`, `right_id` LIMIT 50"
+    );
+}
+
+#[test]
+fn builds_bounded_select_for_snapshot_range() {
+    let sql = build_select_chunk_sql(&ChunkRequest {
+        table: "accounts".to_string(),
+        primary_key: vec!["id".to_string()],
+        selected_columns: vec!["id".to_string(), "name".to_string()],
+        start_after: Some(vec!["100".to_string()]),
+        end_at: Some(vec!["200".to_string()]),
+        limit: 100,
+    });
+
+    assert_eq!(
+        sql,
+        "SELECT `id`, `name` FROM `accounts` WHERE (`id` > '100') AND NOT ((`id` > '200')) ORDER BY `id` LIMIT 100"
     );
 }
 

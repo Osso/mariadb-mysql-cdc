@@ -432,22 +432,39 @@ fn snapshot_progress_status(complete: bool) -> SyncProgressStatus {
 pub fn build_select_chunk_sql(request: &ChunkRequest) -> String {
     let columns = quote_ident_list(&request.selected_columns);
     let order_by = quote_ident_list(&request.primary_key);
-    let start_after = request
-        .start_after
-        .as_ref()
-        .map(|values| {
-            format!(
-                " WHERE {}",
-                primary_key_after_predicate(&request.primary_key, values)
-            )
-        })
-        .unwrap_or_default();
+    let bounds = snapshot_chunk_bounds(request);
 
     format!(
-        "SELECT {columns} FROM {}{start_after} ORDER BY {order_by} LIMIT {}",
+        "SELECT {columns} FROM {}{bounds} ORDER BY {order_by} LIMIT {}",
         quote_ident(&request.table),
         request.limit
     )
+}
+
+fn snapshot_chunk_bounds(request: &ChunkRequest) -> String {
+    let predicates = snapshot_bound_predicates(request);
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", predicates.join(" AND "))
+    }
+}
+
+fn snapshot_bound_predicates(request: &ChunkRequest) -> Vec<String> {
+    let mut predicates = Vec::new();
+    if let Some(start_after) = &request.start_after {
+        predicates.push(primary_key_after_predicate(
+            &request.primary_key,
+            start_after,
+        ));
+    }
+    if let Some(end_at) = &request.end_at {
+        predicates.push(primary_key_at_or_before_predicate(
+            &request.primary_key,
+            end_at,
+        ));
+    }
+    predicates
 }
 
 fn validate_config(config: &CatchupSnapshotConfig) -> Result<(), CatchupSnapshotError> {
@@ -618,6 +635,10 @@ fn primary_key_after_predicate(columns: &[String], values: &[String]) -> String 
         predicates.push(primary_key_after_branch(columns, values, index));
     }
     predicates.join(" OR ")
+}
+
+fn primary_key_at_or_before_predicate(columns: &[String], values: &[String]) -> String {
+    format!("NOT ({})", primary_key_after_predicate(columns, values))
 }
 
 fn primary_key_after_branch(columns: &[String], values: &[String], index: usize) -> String {
