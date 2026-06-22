@@ -17,6 +17,11 @@ CDC stream has already been applying forward changes.
 - [x] Allow extra target rows inside a source window to be detected.
 - [x] Parse source, target, table, column, chunk-size, and mode options from the
   `sync-table` CLI command.
+- [x] On stream target-apply failure for INSERT, UPDATE, or REPLACE, run table
+  repair for the failed statement's table and checkpoint the event only after
+  repair succeeds.
+- [x] Do not checkpoint a failed DELETE through table repair until target deletes
+  are supported by the repair path.
 
 ## How it works
 
@@ -28,18 +33,23 @@ CDC stream has already been applying forward changes.
   and target repair adapter.
 - `src/sync_cli.rs` - `sync-table` option parsing and command dispatch.
 - `src/main.rs` - top-level command registration and shared option helpers.
+- `src/live.rs` - stream failure hook that runs table repair before checkpointing.
+- `src/live/repair.rs` - failed-statement table detection and table-sync repair.
 
 ## Tests asserting this spec
 
 - `src/table_sync.rs` - row comparison, dry-run/apply behavior, source-window
   target reads, and SQL generation tests.
 - `src/sync_cli.rs` - `sync-table` parser tests.
+- `src/live/tests.rs` - stream target-failure repair and checkpoint tests.
 
 ## Known gaps (current cycle)
 
 - [ ] Automate multi-table scheduling from schema inventory.
 - [ ] Persist per-table sync progress for long repair runs.
 - [ ] Add row-level divergence output suitable for operator review.
+- [ ] Scope stream repairs to affected primary-key windows when the failed SQL
+  allows safe key extraction.
 
 ## Out of scope
 

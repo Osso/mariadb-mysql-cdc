@@ -17,6 +17,7 @@ mod insert_conflict;
 mod mysql_cli;
 mod progress;
 mod reconnect;
+mod repair;
 mod schema_recovery;
 #[cfg(test)]
 use crate::target::{SqlStatement, TargetExecuteError};
@@ -36,6 +37,7 @@ use reconnect::{
     StreamCheckpointStore, format_reconnect_start, reconnect_delay, save_stream_checkpoint,
     should_reconnect,
 };
+use repair::{FailedStatementRepairer, TableSyncStatementRepairer, repair_failed_statement};
 use schema_recovery::mysql_executor_with_recovery;
 
 #[derive(Clone, Debug)]
@@ -219,14 +221,20 @@ pub fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlo
     let executor = mysql_executor_with_recovery(config);
     let quarantine = RecordingQuarantine::default();
     let applier = StatementApplier::new(executor, quarantine);
+    let repairer = TableSyncStatementRepairer::new(config.clone());
 
     match &config.checkpoint_file {
         Some(path) => {
             let checkpoint_store = FileCheckpointStore::new(path);
-            stream_statement_events_with_reconnect(config, &applier, Some(&checkpoint_store))
+            stream_statement_events_with_reconnect(
+                config,
+                &applier,
+                &repairer,
+                Some(&checkpoint_store),
+            )
         }
-        None => stream_statement_events_with_reconnect::<_, _, FileCheckpointStore>(
-            config, &applier, None,
+        None => stream_statement_events_with_reconnect::<_, _, _, FileCheckpointStore>(
+            config, &applier, &repairer, None,
         ),
     }
 }
@@ -298,20 +306,24 @@ pub fn extract_statement_events(output: &str, start: &BinlogCoordinate) -> Vec<S
     events
 }
 
-fn stream_statement_events_with_reconnect<E, Q, C>(
+fn stream_statement_events_with_reconnect<E, Q, R, C>(
     config: &ApplyBinlogConfig,
     applier: &StatementApplier<E, Q>,
+    repairer: &R,
     checkpoint_store: Option<&C>,
 ) -> Result<(), ApplyBinlogError>
 where
     E: TargetExecutor,
     Q: StatementQuarantine + QuarantineRecorder,
+    R: FailedStatementRepairer,
     C: StreamCheckpointStore,
 {
     run_stream_reconnect_loop(
         config,
         checkpoint_store,
-        |attempt_config| stream_statement_events_once(attempt_config, applier, checkpoint_store),
+        |attempt_config| {
+            stream_statement_events_once(attempt_config, applier, repairer, checkpoint_store)
+        },
         thread::sleep,
     )
 }
@@ -353,14 +365,16 @@ where
     }
 }
 
-fn stream_statement_events_once<E, Q, C>(
+fn stream_statement_events_once<E, Q, R, C>(
     config: &ApplyBinlogConfig,
     applier: &StatementApplier<E, Q>,
+    repairer: &R,
     checkpoint_store: Option<&C>,
 ) -> Result<(), ApplyBinlogError>
 where
     E: TargetExecutor,
     Q: StatementQuarantine + QuarantineRecorder,
+    R: FailedStatementRepairer,
     C: StreamCheckpointStore,
 {
     let start = start_coordinate(&config.source);
@@ -378,6 +392,7 @@ where
         BufReader::new(stdout).lines(),
         &mut extractor,
         applier,
+        repairer,
         &mut progress,
         checkpoint_store,
     )?;
@@ -391,23 +406,25 @@ fn start_coordinate(source: &SourceBinlogConfig) -> BinlogCoordinate {
     }
 }
 
-fn process_stream_lines<E, Q>(
+fn process_stream_lines<E, Q, R>(
     lines: Lines<BufReader<ChildStdout>>,
     extractor: &mut StatementEventExtractor,
     applier: &StatementApplier<E, Q>,
+    repairer: &R,
     progress: &mut StreamProgress,
     checkpoint_store: Option<&impl StreamCheckpointStore>,
 ) -> Result<(), ApplyBinlogError>
 where
     E: TargetExecutor,
     Q: StatementQuarantine + QuarantineRecorder,
+    R: FailedStatementRepairer,
 {
     for line in lines {
         let line = line.map_err(|error| {
             ApplyBinlogError::SourceCommand(format!("failed reading mariadb-binlog: {error}"))
         })?;
         if let Some(event) = extractor.accept_line(&line) {
-            apply_stream_event(applier, &event, progress, checkpoint_store)?;
+            apply_stream_event(applier, repairer, &event, progress, checkpoint_store)?;
         }
     }
 
@@ -469,8 +486,9 @@ fn spawn_stream_reader(config: &ApplyBinlogConfig) -> Result<StreamProcess, Appl
     })
 }
 
-fn apply_stream_event<E, Q>(
+fn apply_stream_event<E, Q, R>(
     applier: &StatementApplier<E, Q>,
+    repairer: &R,
     event: &StatementEvent,
     progress: &mut StreamProgress,
     checkpoint_store: Option<&impl StreamCheckpointStore>,
@@ -478,6 +496,7 @@ fn apply_stream_event<E, Q>(
 where
     E: TargetExecutor,
     Q: StatementQuarantine + QuarantineRecorder,
+    R: FailedStatementRepairer,
 {
     match applier.apply(event) {
         Ok(StatementOutcome::Replayed) => {
@@ -494,7 +513,16 @@ where
                 applier.quarantine_recorder().recorded_statements(),
             ))
         }
-        Err(error) => Err(ApplyBinlogError::Statement(error.to_string())),
+        Err(error) => {
+            if repair_failed_statement(repairer, event, &error)? {
+                save_stream_checkpoint(checkpoint_store, event)?;
+                if progress.record_applied(&event.coordinate) {
+                    println!("{}", format_stream_progress(progress));
+                }
+                return Ok(());
+            }
+            Err(ApplyBinlogError::Statement(error.to_string()))
+        }
     }
 }
 

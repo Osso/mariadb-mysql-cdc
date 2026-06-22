@@ -1,5 +1,6 @@
 use super::*;
 use crate::checkpoint::{Checkpoint, LastEvent};
+use crate::live::repair::{StatementRepairRequest, repair_table_name, repairable_table_name};
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
@@ -211,19 +212,27 @@ fn stream_checkpoint_is_saved_after_successful_apply() {
         file: "mysqld-bin.000777".to_string(),
         position: 4,
     });
+    let repairer = RecordingRepairer::default();
 
-    apply_stream_event(&applier, &event, &mut progress, Some(&checkpoint_store))
-        .expect("apply event");
+    apply_stream_event(
+        &applier,
+        &repairer,
+        &event,
+        &mut progress,
+        Some(&checkpoint_store),
+    )
+    .expect("apply event");
 
     let saved = checkpoint_store.saved.borrow();
     let checkpoint = saved.as_ref().expect("saved checkpoint");
     assert_eq!(checkpoint.source_file, "mysqld-bin.000777");
     assert_eq!(checkpoint.source_position, 12345);
     assert_eq!(checkpoint.last_event.event_type, "StatementEvent");
+    assert!(repairer.requests.borrow().is_empty());
 }
 
 #[test]
-fn stream_checkpoint_is_not_saved_after_failed_apply() {
+fn stream_checkpoint_is_saved_after_failed_apply_is_repaired() {
     let checkpoint_store = MemoryCheckpointStore::default();
     let executor = RecordingExecutor::with_failure("target down");
     let applier = StatementApplier::new(executor, RecordingQuarantine::default());
@@ -239,12 +248,112 @@ fn stream_checkpoint_is_not_saved_after_failed_apply() {
         file: "mysqld-bin.000777".to_string(),
         position: 4,
     });
+    let repairer = RecordingRepairer::default();
 
-    let error = apply_stream_event(&applier, &event, &mut progress, Some(&checkpoint_store))
-        .expect_err("target failure");
+    apply_stream_event(
+        &applier,
+        &repairer,
+        &event,
+        &mut progress,
+        Some(&checkpoint_store),
+    )
+    .expect("repaired target failure");
+
+    let saved = checkpoint_store.saved.borrow();
+    let checkpoint = saved.as_ref().expect("saved checkpoint");
+    assert_eq!(checkpoint.source_position, 12345);
+    assert_eq!(
+        repairer.requests.borrow().as_slice(),
+        &[StatementRepairRequest {
+            coordinate: event.coordinate,
+            default_database: Some("globalcomix".to_string()),
+            table: "accounts".to_string(),
+            sql: "INSERT INTO accounts (id) VALUES (1)".to_string(),
+            error: "target down".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn stream_checkpoint_is_not_saved_when_failed_apply_repair_fails() {
+    let checkpoint_store = MemoryCheckpointStore::default();
+    let executor = RecordingExecutor::with_failure("target down");
+    let applier = StatementApplier::new(executor, RecordingQuarantine::default());
+    let event = StatementEvent {
+        coordinate: BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 12345,
+        },
+        default_database: Some("globalcomix".to_string()),
+        sql: "UPDATE accounts SET name = 'Ada' WHERE id = 1".to_string(),
+    };
+    let mut progress = StreamProgress::new(BinlogCoordinate {
+        file: "mysqld-bin.000777".to_string(),
+        position: 4,
+    });
+    let repairer = RecordingRepairer::failing("repair failed");
+
+    let error = apply_stream_event(
+        &applier,
+        &repairer,
+        &event,
+        &mut progress,
+        Some(&checkpoint_store),
+    )
+    .expect_err("repair failure");
+
+    assert!(error.to_string().contains("repair failed"));
+    assert!(checkpoint_store.saved.borrow().is_none());
+}
+
+#[test]
+fn repair_table_name_extracts_known_dml_tables() {
+    assert_eq!(
+        repair_table_name("INSERT INTO `accounts` (id) VALUES (1)"),
+        Some("accounts".to_string())
+    );
+    assert_eq!(
+        repair_table_name("UPDATE `globalcomix`.`releases` SET title = 'x' WHERE id = 1"),
+        Some("releases".to_string())
+    );
+    assert_eq!(
+        repair_table_name("DELETE FROM comics WHERE id = 1"),
+        Some("comics".to_string())
+    );
+}
+
+#[test]
+fn delete_statement_failure_is_not_repairable_without_delete_support() {
+    let checkpoint_store = MemoryCheckpointStore::default();
+    let executor = RecordingExecutor::with_failure("target down");
+    let applier = StatementApplier::new(executor, RecordingQuarantine::default());
+    let event = StatementEvent {
+        coordinate: BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 12345,
+        },
+        default_database: Some("globalcomix".to_string()),
+        sql: "DELETE FROM accounts WHERE id = 1".to_string(),
+    };
+    let mut progress = StreamProgress::new(BinlogCoordinate {
+        file: "mysqld-bin.000777".to_string(),
+        position: 4,
+    });
+    let repairer = RecordingRepairer::default();
+
+    let error = apply_stream_event(
+        &applier,
+        &repairer,
+        &event,
+        &mut progress,
+        Some(&checkpoint_store),
+    )
+    .expect_err("delete not repairable");
 
     assert!(error.to_string().contains("target down"));
+    assert!(repairer.requests.borrow().is_empty());
     assert!(checkpoint_store.saved.borrow().is_none());
+    assert_eq!(repairable_table_name(&event.sql), None);
 }
 
 #[test]
@@ -380,6 +489,31 @@ impl TargetExecutor for RecordingExecutor {
             Some(message) => Err(TargetExecuteError::new(message)),
             None => Ok(()),
         }
+    }
+}
+
+#[derive(Default)]
+struct RecordingRepairer {
+    requests: RefCell<Vec<StatementRepairRequest>>,
+    failure: Option<String>,
+}
+
+impl RecordingRepairer {
+    fn failing(message: &str) -> Self {
+        Self {
+            requests: RefCell::new(Vec::new()),
+            failure: Some(message.to_string()),
+        }
+    }
+}
+
+impl FailedStatementRepairer for RecordingRepairer {
+    fn repair(&self, request: &StatementRepairRequest) -> Result<(), ApplyBinlogError> {
+        self.requests.borrow_mut().push(request.clone());
+        if let Some(message) = &self.failure {
+            return Err(ApplyBinlogError::Statement(message.clone()));
+        }
+        Ok(())
     }
 }
 
