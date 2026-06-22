@@ -629,9 +629,11 @@ mod tests {
 
     #[test]
     fn run_probe_produces_classified_events() {
-        let mut config = ProbeConfig::default();
-        config.user = "binlog_reader".to_string();
-        config.password = "secret".to_string();
+        let config = ProbeConfig {
+            user: "binlog_reader".to_string(),
+            password: "secret".to_string(),
+            ..ProbeConfig::default()
+        };
 
         let mut runner = FakeProcessRunner {
             status: "mysql-bin.000010\t4\t\t\t".to_string(),

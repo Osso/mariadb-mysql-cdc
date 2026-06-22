@@ -21,3 +21,42 @@ Updates and deletes still replay normally. Unsupported SQL is still quarantined.
 
 This keeps the workflow simple: no staging tables, no per-row touched-key
 overlay, and no assumption that source statements stay inside chunk boundaries.
+
+## Resumable Snapshot Catchup
+
+Use `catchup-snapshot` for the source-to-target backfill. It reads the source
+schema inventory, copies rows in primary-key chunks, writes target rows with
+`INSERT IGNORE`, and persists chunk progress to a JSON file after each successful
+chunk.
+
+```bash
+mariadb-mysql-cdc catchup-snapshot \
+  --source-host 192.0.2.10 \
+  --source-user cdc_reader \
+  --source-password-env SOURCE_PASSWORD \
+  --source-database globalcomix \
+  --target-host target-mysql.example \
+  --target-port 25060 \
+  --target-user target_user \
+  --target-password-env TARGET_PASSWORD \
+  --target-database globalcomix \
+  --progress-file /var/lib/mariadb-mysql-cdc/snapshot-progress.json \
+  --chunk-size 5000
+```
+
+For a single-table retry or rehearsal:
+
+```bash
+mariadb-mysql-cdc catchup-snapshot ... --table activity_tracking
+```
+
+Progress can be checked without reading pod logs:
+
+```bash
+mariadb-mysql-cdc catchup-progress \
+  --progress-file /var/lib/mariadb-mysql-cdc/snapshot-progress.json
+```
+
+Current implementation is sequential. The durable progress format supports
+safe restart after a failed pod, but bounded 4-worker parallel chunk import still
+needs explicit range ownership before it should be enabled.

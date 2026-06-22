@@ -3,6 +3,7 @@ pub mod checkpoint;
 pub mod cutover;
 pub mod inventory;
 pub mod live;
+pub mod mysql_snapshot;
 mod probe;
 pub mod rehearsal;
 pub mod row;
@@ -11,7 +12,7 @@ pub mod statement;
 pub mod target;
 pub mod validation;
 
-use std::env;
+use std::{env, path::PathBuf};
 
 const USAGE: &str = "\
 mariadb-mysql-cdc
@@ -19,12 +20,18 @@ mariadb-mysql-cdc
 Usage:
   mariadb-mysql-cdc plan
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
+  mariadb-mysql-cdc catchup-snapshot --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --progress-file PATH [options]
+  mariadb-mysql-cdc catchup-progress --progress-file PATH
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
 
 Commands:
   plan    Print the current migration tool design.
   probe   Read source binlog coordinates and classify MariaDB binlog events.
+  catchup-snapshot
+          Copy source rows into target in resumable primary-key chunks.
+  catchup-progress
+          Print catchup checkpoint progress.
   apply-binlog
           Read remote MariaDB binlog text and apply compatible statements.
   stream-binlog
@@ -58,6 +65,25 @@ Apply options:
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
   --mariadb PATH                  mariadb client path. Defaults to mariadb.
   --mariadb-binlog PATH           mariadb-binlog path. Defaults to mariadb-binlog.
+
+Catchup snapshot options:
+  --source-host HOST              MariaDB source host.
+  --source-port PORT              MariaDB source port. Defaults to 3306.
+  --source-user USER              MariaDB source user.
+  --source-password-env ENV       Environment variable containing source password.
+  --source-database DB            MariaDB source database.
+  --target-host HOST              MySQL target host.
+  --target-port PORT              MySQL target port. Defaults to 3306.
+  --target-user USER              MySQL target user.
+  --target-password-env ENV       Environment variable containing target password.
+  --target-database DB            MySQL target database.
+  --progress-file PATH            Durable JSON progress file.
+  --chunk-size N                  Rows per chunk. Defaults to 1000.
+  --table TABLE                   Restrict catchup to one table.
+  --mariadb PATH                  mariadb client path. Defaults to mariadb.
+
+Catchup progress options:
+  --progress-file PATH            Durable JSON progress file.
 ";
 
 fn main() {
@@ -68,6 +94,8 @@ fn main() {
     match command.as_deref() {
         Some("plan") => print_plan(),
         Some("probe") => run_probe_command(args.collect()),
+        Some("catchup-snapshot") => run_catchup_snapshot_command(args.collect()),
+        Some("catchup-progress") => run_catchup_progress_command(args.collect()),
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),
         Some("stream-binlog") => run_stream_binlog_command(args.collect()),
         Some("-h" | "--help") | None => print!("{USAGE}"),
@@ -116,6 +144,40 @@ fn run_apply_binlog_command(args: Vec<String>) {
     }
 }
 
+fn run_catchup_snapshot_command(args: Vec<String>) {
+    let config = match parse_catchup_snapshot_config(args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+
+    if let Err(error) = mysql_snapshot::run_catchup_snapshot(&config) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run_catchup_progress_command(args: Vec<String>) {
+    let progress_file = match parse_progress_file(args) {
+        Ok(progress_file) => progress_file,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let store = snapshot::FileSnapshotProgressStore::new(progress_file);
+
+    match snapshot::SnapshotProgressStore::load(&store) {
+        Ok(progress) => println!("{}", snapshot::format_progress(&progress)),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn print_plan() {
     println!(
         "\
@@ -134,6 +196,84 @@ Initial phases:
 5. Validate counts/checksums before cutover.
 "
     );
+}
+
+fn parse_catchup_snapshot_config(
+    args: Vec<String>,
+) -> Result<mysql_snapshot::CatchupSnapshotConfig, String> {
+    let mut config = mysql_snapshot::CatchupSnapshotConfig {
+        source: mysql_snapshot::MySqlConnectionConfig::default(),
+        target: live::TargetMySqlConfig::default(),
+        progress_file: PathBuf::new(),
+        chunk_size: 1000,
+        table: None,
+    };
+    let mut index = 0;
+
+    while index < args.len() {
+        let flag = &args[index];
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} needs a value"))?;
+
+        catchup_snapshot_option(&mut config, flag, value)?;
+        index += 2;
+    }
+
+    Ok(config)
+}
+
+fn parse_progress_file(args: Vec<String>) -> Result<PathBuf, String> {
+    if args.len() != 2 {
+        return Err("catchup-progress needs --progress-file PATH".to_string());
+    }
+    if args[0] != "--progress-file" {
+        return Err(format!("unknown catchup-progress option: {}", args[0]));
+    }
+
+    Ok(PathBuf::from(&args[1]))
+}
+
+fn catchup_snapshot_option(
+    config: &mut mysql_snapshot::CatchupSnapshotConfig,
+    flag: &str,
+    value: &str,
+) -> Result<(), String> {
+    if catchup_source_option(&mut config.source, flag, value)? {
+        return Ok(());
+    }
+    if apply_target_option(&mut config.target, flag, value)? {
+        return Ok(());
+    }
+
+    match flag {
+        "--progress-file" => config.progress_file = PathBuf::from(value),
+        "--chunk-size" => config.chunk_size = parse_usize(flag, value)?,
+        "--table" => config.table = Some(value.to_string()),
+        "--mariadb" => {
+            config.source.mariadb = value.to_string();
+        }
+        other => return Err(format!("unknown catchup-snapshot option: {other}")),
+    }
+
+    Ok(())
+}
+
+fn catchup_source_option(
+    source: &mut mysql_snapshot::MySqlConnectionConfig,
+    flag: &str,
+    value: &str,
+) -> Result<bool, String> {
+    match flag {
+        "--source-host" => source.host = value.to_string(),
+        "--source-port" => source.port = parse_u16(flag, value)?,
+        "--source-user" => source.user = value.to_string(),
+        "--source-password-env" => source.password = read_env_password(value)?,
+        "--source-database" => source.database = value.to_string(),
+        _ => return Ok(false),
+    }
+
+    Ok(true)
 }
 
 fn run_probe_command(args: Vec<String>) {
@@ -286,6 +426,12 @@ fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
         .map_err(|_| format!("{flag} must be an integer"))
 }
 
+fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{flag} must be an integer"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +534,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_catchup_snapshot_config() {
+        set_env("SRC_PASSWORD", "source-secret");
+        set_env("TARGET_PASSWORD", "target-secret");
+
+        let config = parse_catchup_snapshot_config(args([
+            "--source-host",
+            "10.0.0.2",
+            "--source-port",
+            "3307",
+            "--source-user",
+            "cdc",
+            "--source-password-env",
+            "SRC_PASSWORD",
+            "--source-database",
+            "globalcomix",
+            "--target-host",
+            "target.db",
+            "--target-port",
+            "25060",
+            "--target-user",
+            "target_user",
+            "--target-password-env",
+            "TARGET_PASSWORD",
+            "--target-database",
+            "globalcomix",
+            "--progress-file",
+            "/var/lib/cdc/snapshot-progress.json",
+            "--chunk-size",
+            "5000",
+            "--table",
+            "activity_tracking",
+            "--mariadb",
+            "/usr/bin/mariadb",
+        ]))
+        .expect("catchup config");
+
+        assert_eq!(config.source.host, "10.0.0.2");
+        assert_eq!(config.source.port, 3307);
+        assert_eq!(config.source.password, "source-secret");
+        assert_eq!(config.source.database, "globalcomix");
+        assert_eq!(config.target.host, "target.db");
+        assert_eq!(config.target.port, 25060);
+        assert_eq!(config.target.password, "target-secret");
+        assert_eq!(config.target.database, "globalcomix");
+        assert_eq!(
+            config.progress_file,
+            PathBuf::from("/var/lib/cdc/snapshot-progress.json")
+        );
+        assert_eq!(config.chunk_size, 5000);
+        assert_eq!(config.table.as_deref(), Some("activity_tracking"));
+        assert_eq!(config.source.mariadb, "/usr/bin/mariadb");
+    }
+
+    #[test]
     fn rejects_apply_binlog_options_without_values() {
         let error = parse_apply_binlog_config(args(["--source-host"])).expect_err("missing value");
 
@@ -417,6 +617,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_catchup_snapshot_option() {
+        let error = catchup_snapshot_option(
+            &mut mysql_snapshot::CatchupSnapshotConfig {
+                source: mysql_snapshot::MySqlConnectionConfig::default(),
+                target: live::TargetMySqlConfig::default(),
+                progress_file: PathBuf::new(),
+                chunk_size: 1000,
+                table: None,
+            },
+            "--bogus",
+            "x",
+        )
+        .expect_err("unknown option");
+
+        assert_eq!(error, "unknown catchup-snapshot option: --bogus");
+    }
+
+    #[test]
+    fn parses_catchup_progress_file() {
+        let progress_file = parse_progress_file(args([
+            "--progress-file",
+            "/var/lib/cdc/snapshot-progress.json",
+        ]))
+        .expect("progress file");
+
+        assert_eq!(
+            progress_file,
+            PathBuf::from("/var/lib/cdc/snapshot-progress.json")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_catchup_progress_option() {
+        let error =
+            parse_progress_file(args(["--bogus", "/tmp/progress.json"])).expect_err("unknown");
+
+        assert_eq!(error, "unknown catchup-progress option: --bogus");
+    }
+
+    #[test]
     fn rejects_invalid_numeric_options() {
         assert_eq!(
             parse_u16("--source-port", "not-a-port").expect_err("invalid port"),
@@ -425,6 +665,10 @@ mod tests {
         assert_eq!(
             parse_u64("--start-position", "not-a-position").expect_err("invalid position"),
             "--start-position must be an integer"
+        );
+        assert_eq!(
+            parse_usize("--chunk-size", "not-a-size").expect_err("invalid size"),
+            "--chunk-size must be an integer"
         );
     }
 

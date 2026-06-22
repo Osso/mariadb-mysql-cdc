@@ -15,7 +15,7 @@ fn builds_inventory_with_primary_keys_and_generated_columns() {
     assert_eq!(table.columns[0].name, "id");
     assert_eq!(table.columns[0].data_type, "int");
     assert_eq!(table.columns[1].name, "name");
-    assert_eq!(table.columns[1].is_nullable, false);
+    assert!(!table.columns[1].is_nullable);
     assert_eq!(table.columns[2].generated, Some(generated_balance_column()));
 }
 

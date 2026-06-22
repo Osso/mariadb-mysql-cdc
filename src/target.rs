@@ -12,6 +12,12 @@ pub struct PrimaryKey {
     pub values: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotInsertMode {
+    Upsert,
+    IgnoreDuplicate,
+}
+
 impl PrimaryKey {
     pub fn new(values: Vec<String>) -> Self {
         Self { values }
@@ -27,6 +33,7 @@ pub struct TargetMySqlWriter<E> {
     table: String,
     primary_key: Vec<String>,
     columns: Vec<String>,
+    insert_mode: SnapshotInsertMode,
     pub executor: E,
 }
 
@@ -44,6 +51,21 @@ where
             table: table.into(),
             primary_key: primary_key.into_iter().map(str::to_string).collect(),
             columns: columns.into_iter().map(str::to_string).collect(),
+            insert_mode: SnapshotInsertMode::Upsert,
+            executor,
+        }
+    }
+
+    pub fn from_snapshot_table(
+        table: &crate::snapshot::SnapshotTable,
+        executor: E,
+        insert_mode: SnapshotInsertMode,
+    ) -> Self {
+        Self {
+            table: table.name.clone(),
+            primary_key: table.primary_key.clone(),
+            columns: table.columns.clone(),
+            insert_mode,
             executor,
         }
     }
@@ -53,7 +75,13 @@ where
             return Ok(());
         }
 
-        let statement = build_insert_statement(&self.table, &self.primary_key, &self.columns, rows);
+        let statement = build_insert_statement(
+            &self.table,
+            &self.primary_key,
+            &self.columns,
+            rows,
+            self.insert_mode,
+        );
         self.execute_with_context("insert", rows.len(), statement)
     }
 
@@ -142,11 +170,33 @@ impl fmt::Display for TargetWriteError {
 
 impl std::error::Error for TargetWriteError {}
 
+pub fn render_sql_statement(statement: &SqlStatement) -> Result<String, TargetExecuteError> {
+    let placeholder_count = statement.sql.matches('?').count();
+    if placeholder_count != statement.params.len() {
+        return Err(TargetExecuteError::new(format!(
+            "statement has {placeholder_count} placeholders and {} params",
+            statement.params.len()
+        )));
+    }
+
+    let mut rendered = String::new();
+    let mut params = statement.params.iter();
+    for segment in statement.sql.split('?') {
+        rendered.push_str(segment);
+        if let Some(param) = params.next() {
+            rendered.push_str(&quote_sql_literal(param));
+        }
+    }
+
+    Ok(rendered)
+}
+
 fn build_insert_statement(
     table: &str,
     primary_key: &[String],
     columns: &[String],
     rows: &[SnapshotRow],
+    insert_mode: SnapshotInsertMode,
 ) -> SqlStatement {
     let column_list = columns
         .iter()
@@ -159,16 +209,23 @@ fn build_insert_statement(
         .flat_map(|row| ordered_values(row, columns))
         .collect();
 
-    SqlStatement {
-        sql: format!(
+    let sql = match insert_mode {
+        SnapshotInsertMode::Upsert => format!(
             "INSERT INTO {} ({}) VALUES {} ON DUPLICATE KEY UPDATE {}",
             quote_ident(table),
             column_list.join(", "),
             placeholders,
             update_list.join(", ")
         ),
-        params,
-    }
+        SnapshotInsertMode::IgnoreDuplicate => format!(
+            "INSERT IGNORE INTO {} ({}) VALUES {}",
+            quote_ident(table),
+            column_list.join(", "),
+            placeholders
+        ),
+    };
+
+    SqlStatement { sql, params }
 }
 
 fn build_update_statement(
@@ -250,6 +307,10 @@ fn quote_ident(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
 
+fn quote_sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +355,58 @@ mod tests {
         assert_eq!(executed[0].params, vec!["updated", "7"]);
         assert_eq!(executed[1].sql, "DELETE FROM `accounts` WHERE `id` = ?");
         assert_eq!(executed[1].params, vec!["7"]);
+    }
+
+    #[test]
+    fn writes_snapshot_rows_as_insert_ignore_when_requested() {
+        let executor = RecordingExecutor::default();
+        let table = crate::snapshot::SnapshotTable {
+            name: "accounts".to_string(),
+            primary_key: vec!["id".to_string()],
+            columns: vec!["id".to_string(), "name".to_string()],
+        };
+        let mut writer = TargetMySqlWriter::from_snapshot_table(
+            &table,
+            executor,
+            SnapshotInsertMode::IgnoreDuplicate,
+        );
+
+        writer.write_rows(&[row("1", "alpha")]).expect("write rows");
+
+        let executed = writer.executor.statements.borrow();
+        assert_eq!(
+            executed[0].sql,
+            "INSERT IGNORE INTO `accounts` (`id`, `name`) VALUES (?, ?)"
+        );
+        assert_eq!(executed[0].params, vec!["1", "alpha"]);
+    }
+
+    #[test]
+    fn renders_sql_statement_params_as_literals() {
+        let rendered = render_sql_statement(&SqlStatement {
+            sql: "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?)".to_string(),
+            params: vec!["1".to_string(), "O'Reilly\\Books".to_string()],
+        })
+        .expect("render statement");
+
+        assert_eq!(
+            rendered,
+            "INSERT INTO `accounts` (`id`, `name`) VALUES ('1', 'O''Reilly\\\\Books')"
+        );
+    }
+
+    #[test]
+    fn rejects_sql_statement_placeholder_param_mismatch() {
+        let error = render_sql_statement(&SqlStatement {
+            sql: "SELECT ?".to_string(),
+            params: Vec::new(),
+        })
+        .expect_err("placeholder mismatch");
+
+        assert_eq!(
+            error.to_string(),
+            "statement has 1 placeholders and 0 params"
+        );
     }
 
     #[test]

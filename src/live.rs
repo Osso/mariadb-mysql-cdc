@@ -3,7 +3,7 @@ use crate::statement::{
     QuarantineError, QuarantinedStatement, StatementApplier, StatementEvent, StatementOutcome,
     StatementQuarantine,
 };
-use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
+use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor, render_sql_statement};
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{BufRead, BufReader, Lines};
@@ -249,6 +249,15 @@ pub struct MysqlCliExecutor {
     target: TargetMySqlConfig,
 }
 
+impl MysqlCliExecutor {
+    pub fn new(mariadb: impl Into<String>, target: TargetMySqlConfig) -> Self {
+        Self {
+            mariadb: mariadb.into(),
+            target,
+        }
+    }
+}
+
 impl TargetExecutor for MysqlCliExecutor {
     fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
         let output = self.run_statement(statement)?;
@@ -267,7 +276,8 @@ impl MysqlCliExecutor {
         statement: &SqlStatement,
     ) -> Result<std::process::Output, TargetExecuteError> {
         let password_arg = format!("--password={}", self.target.password);
-        let replay_sql = target_replay_sql(&statement.sql);
+        let rendered_statement = render_sql_statement(statement)?;
+        let replay_sql = target_replay_sql(&rendered_statement);
         Command::new(&self.mariadb)
             .args([
                 "--batch",

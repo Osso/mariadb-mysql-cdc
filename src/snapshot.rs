@@ -19,6 +19,7 @@ impl From<&crate::inventory::TableInventory> for SnapshotTable {
             columns: table
                 .columns
                 .iter()
+                .filter(|column| column.generated.is_none())
                 .map(|column| column.name.clone())
                 .collect(),
         }
@@ -205,9 +206,10 @@ pub fn snapshot_table(
 ) -> Result<SnapshotResult, SnapshotError> {
     validate_table(table)?;
     let mut progress = progress_store.load()?;
-    let starting_rows_copied = progress
-        .table(&table.name)
-        .map_or(0, |table_progress| table_progress.rows_copied);
+    let starting_rows_copied = rows_copied_for_table(&progress, &table.name);
+    if is_table_complete(&progress, &table.name) {
+        return Ok(snapshot_result(table, 0));
+    }
 
     loop {
         let request = build_chunk_request(table, chunk_size, &progress)?;
@@ -232,17 +234,48 @@ pub fn snapshot_table(
         progress_store.save(&progress)?;
     }
 
-    let rows_copied = progress
-        .table(&table.name)
-        .map_or(starting_rows_copied, |table_progress| {
-            table_progress.rows_copied
-        })
-        - starting_rows_copied;
+    let rows_copied = rows_copied_for_table(&progress, &table.name) - starting_rows_copied;
 
-    Ok(SnapshotResult {
+    Ok(snapshot_result(table, rows_copied))
+}
+
+fn is_table_complete(progress: &SnapshotProgress, table: &str) -> bool {
+    progress.table(table).is_some_and(|table| table.complete)
+}
+
+fn rows_copied_for_table(progress: &SnapshotProgress, table: &str) -> u64 {
+    progress
+        .table(table)
+        .map_or(0, |table_progress| table_progress.rows_copied)
+}
+
+fn snapshot_result(table: &SnapshotTable, rows_copied: u64) -> SnapshotResult {
+    SnapshotResult {
         table: table.name.clone(),
         rows_copied,
-    })
+    }
+}
+
+pub fn format_progress(progress: &SnapshotProgress) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "snapshot_progress tables={}",
+        progress.tables.len()
+    ));
+
+    for (table, table_progress) in &progress.tables {
+        let last_primary_key = table_progress
+            .last_primary_key
+            .as_ref()
+            .map(|values| values.join(","))
+            .unwrap_or_default();
+        lines.push(format!(
+            "snapshot_table_progress table={} rows_copied={} complete={} last_primary_key={}",
+            table, table_progress.rows_copied, table_progress.complete, last_primary_key
+        ));
+    }
+
+    lines.join("\n")
 }
 
 pub fn encode_progress(progress: &SnapshotProgress) -> Result<String, SnapshotError> {
@@ -343,6 +376,35 @@ mod tests {
     }
 
     #[test]
+    fn skips_completed_table_on_rerun() {
+        let table = accounts_table();
+        let progress_store = MemoryProgressStore::default();
+        let mut progress = SnapshotProgress::default();
+        progress.mark_chunk("accounts", vec!["3".to_string()], 3);
+        progress.mark_complete("accounts");
+        progress_store.save(&progress).expect("save progress");
+        let source = FakeSnapshotSource::new(vec![vec![row("4", "delta")]]);
+        let mut target = FakeSnapshotTarget::default();
+
+        let result =
+            snapshot_table(&table, 2, &progress_store, &source, &mut target).expect("snapshot");
+
+        assert_eq!(result.rows_copied, 0);
+        assert!(target.rows.is_empty());
+    }
+
+    #[test]
+    fn formats_snapshot_progress_for_operators() {
+        let mut progress = SnapshotProgress::default();
+        progress.mark_chunk("accounts", vec!["42".to_string()], 42);
+
+        assert_eq!(
+            format_progress(&progress),
+            "snapshot_progress tables=1\nsnapshot_table_progress table=accounts rows_copied=42 complete=false last_primary_key=42"
+        );
+    }
+
+    #[test]
     fn file_progress_store_round_trips_table_progress() {
         let path = unique_path("snapshot-progress.json");
         let store = FileSnapshotProgressStore::new(path.clone());
@@ -365,7 +427,11 @@ mod tests {
             engine: Some("InnoDB".to_string()),
             collation: None,
             primary_key: vec!["id".to_string()],
-            columns: vec![inventory_column("id"), inventory_column("name")],
+            columns: vec![
+                inventory_column("id"),
+                inventory_column("name"),
+                generated_inventory_column("name_length"),
+            ],
         };
 
         let table = SnapshotTable::from(&inventory_table);
@@ -404,6 +470,16 @@ mod tests {
             default_value: None,
             extra: String::new(),
             generated: None,
+        }
+    }
+
+    fn generated_inventory_column(name: &str) -> crate::inventory::ColumnInventory {
+        crate::inventory::ColumnInventory {
+            generated: Some(crate::inventory::GeneratedColumn {
+                expression: "`name`".to_string(),
+                generation_kind: "VIRTUAL".to_string(),
+            }),
+            ..inventory_column(name)
         }
     }
 
