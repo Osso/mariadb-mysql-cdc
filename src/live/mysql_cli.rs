@@ -30,6 +30,14 @@ impl TargetExecutor for MysqlCliExecutor {
             return Ok(());
         }
 
+        if let Some(retry_statement) = rewrite_generated_column_insert(statement, &output) {
+            let retry_output = self.run_statement(&retry_statement)?;
+            if retry_output.status.success() {
+                return Ok(());
+            }
+            return self.handle_failed_statement(&retry_statement, &retry_output);
+        }
+
         self.handle_failed_statement(statement, &output)
     }
 }
@@ -115,6 +123,226 @@ fn wait_for_target_statement(
         .map_err(|error| TargetExecuteError::new(format!("failed to read mariadb output: {error}")))
 }
 
+fn rewrite_generated_column_insert(
+    statement: &SqlStatement,
+    output: &Output,
+) -> Option<SqlStatement> {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let generated_column = generated_column_from_error(&stderr)?;
+    let sql = strip_insert_column(&statement.sql, &generated_column)?;
+    println!(
+        "cdc_target_rewrite_generated_column column={} original_sql_bytes={} rewritten_sql_bytes={}",
+        generated_column,
+        statement.sql.len(),
+        sql.len()
+    );
+    Some(SqlStatement {
+        sql,
+        params: Vec::new(),
+    })
+}
+
+fn generated_column_from_error(stderr: &str) -> Option<String> {
+    let marker = "generated column '";
+    let start = stderr.find(marker)? + marker.len();
+    let rest = &stderr[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+fn strip_insert_column(sql: &str, generated_column: &str) -> Option<String> {
+    if !sql.trim_start().to_ascii_uppercase().starts_with("INSERT ") {
+        return None;
+    }
+
+    let column_start = sql.find('(')?;
+    let column_end = find_matching_parenthesis(sql, column_start)?;
+    let columns = split_top_level_csv(&sql[column_start + 1..column_end]);
+    let generated_index = columns
+        .iter()
+        .position(|column| unquote_identifier(column) == generated_column)?;
+    let retained_columns = remove_index(&columns, generated_index);
+    let values_start = find_values_start(&sql[column_end + 1..])? + column_end + 1;
+    let value_tuples = strip_value_tuples(&sql[values_start..], generated_index, columns.len())?;
+
+    Some(format!(
+        "{}({}){}{}",
+        &sql[..column_start],
+        retained_columns.join(","),
+        &sql[column_end + 1..values_start],
+        value_tuples
+    ))
+}
+
+fn find_values_start(input: &str) -> Option<usize> {
+    let upper = input.to_ascii_uppercase();
+    let values_index = upper.find("VALUES")?;
+    Some(values_index + "VALUES".len())
+}
+
+fn strip_value_tuples(
+    input: &str,
+    value_index_to_remove: usize,
+    expected_values: usize,
+) -> Option<String> {
+    let mut rest = input;
+    let mut tuples = Vec::new();
+
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if rest.starts_with(',') {
+            rest = &rest[1..];
+            continue;
+        }
+        if !rest.starts_with('(') {
+            return None;
+        }
+
+        let tuple_end = find_matching_parenthesis(rest, 0)?;
+        let values = split_top_level_csv(&rest[1..tuple_end]);
+        if values.len() != expected_values {
+            return None;
+        }
+        let retained_values = remove_index(&values, value_index_to_remove);
+        tuples.push(format!("({})", retained_values.join(",")));
+        rest = &rest[tuple_end + 1..];
+    }
+
+    Some(tuples.join(","))
+}
+
+fn remove_index(items: &[String], remove_index: usize) -> Vec<String> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(index, _item)| *index != remove_index)
+        .map(|(_index, item)| item.clone())
+        .collect()
+}
+
+fn unquote_identifier(identifier: &str) -> &str {
+    identifier
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+}
+
+fn find_matching_parenthesis(input: &str, open_index: usize) -> Option<usize> {
+    let mut scanner = SqlScanner::default();
+
+    for (index, character) in input
+        .char_indices()
+        .skip_while(|(index, _)| *index < open_index)
+    {
+        if scanner.accept(character) == SqlScanEvent::BalancedClose {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+fn split_top_level_csv(input: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut scanner = SqlScanner::default();
+    let mut value_start = 0;
+
+    for (index, character) in input.char_indices() {
+        if scanner.accept(character) == SqlScanEvent::TopLevelComma {
+            values.push(input[value_start..index].trim().to_string());
+            value_start = index + 1;
+        }
+    }
+
+    values.push(input[value_start..].trim().to_string());
+    values
+}
+
+#[derive(Default)]
+struct SqlScanner {
+    quote: Option<char>,
+    escaped: bool,
+    depth: i32,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SqlScanEvent {
+    BalancedClose,
+    TopLevelComma,
+    Other,
+}
+
+impl SqlScanner {
+    fn accept(&mut self, character: char) -> SqlScanEvent {
+        if self.consume_escape() {
+            return SqlScanEvent::Other;
+        }
+        if self.start_escape(character) {
+            return SqlScanEvent::Other;
+        }
+        if self.update_quote(character) {
+            return SqlScanEvent::Other;
+        }
+        self.accept_unquoted(character)
+    }
+
+    fn consume_escape(&mut self) -> bool {
+        let was_escaped = self.escaped;
+        self.escaped = false;
+        was_escaped
+    }
+
+    fn start_escape(&mut self, character: char) -> bool {
+        if self.quote.is_some() && character == '\\' {
+            self.escaped = true;
+            return true;
+        }
+        false
+    }
+
+    fn update_quote(&mut self, character: char) -> bool {
+        match self.quote {
+            Some(quote) if character == quote => {
+                self.quote = None;
+                true
+            }
+            Some(_) => true,
+            None if matches!(character, '\'' | '"' | '`') => {
+                self.quote = Some(character);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn accept_unquoted(&mut self, character: char) -> SqlScanEvent {
+        match character {
+            '(' => {
+                self.depth += 1;
+                SqlScanEvent::Other
+            }
+            ')' => {
+                self.depth -= 1;
+                self.close_event()
+            }
+            ',' if self.depth == 0 => SqlScanEvent::TopLevelComma,
+            _ => SqlScanEvent::Other,
+        }
+    }
+
+    fn close_event(&self) -> SqlScanEvent {
+        if self.depth == 0 {
+            SqlScanEvent::BalancedClose
+        } else {
+            SqlScanEvent::Other
+        }
+    }
+}
+
 pub(super) fn format_slow_target_query_log(
     statement: &SqlStatement,
     started_at: Instant,
@@ -147,4 +375,43 @@ fn target_replay_sql(sql: &str) -> String {
 
 pub(super) fn target_client_character_set_arg() -> &'static str {
     "--default-character-set=utf8mb4"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_generated_column_from_insert_values() {
+        let sql = "INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES (\"a\",NULL,\"hello\"),(\"b\",NULL,\"world\")";
+
+        let rewritten = strip_insert_column(sql, "public_time").expect("rewrite");
+
+        assert_eq!(
+            rewritten,
+            "INSERT INTO `releases` (`slug`,`title`) VALUES(\"a\",\"hello\"),(\"b\",\"world\")"
+        );
+    }
+
+    #[test]
+    fn strips_generated_column_without_splitting_quoted_commas() {
+        let sql = "INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES (\"a,b\",NULL,\"hello (world)\")";
+
+        let rewritten = strip_insert_column(sql, "public_time").expect("rewrite");
+
+        assert_eq!(
+            rewritten,
+            "INSERT INTO `releases` (`slug`,`title`) VALUES(\"a,b\",\"hello (world)\")"
+        );
+    }
+
+    #[test]
+    fn extracts_generated_column_from_mysql_error() {
+        let stderr = "ERROR 3105 (HY000): The value specified for generated column 'public_time' in table 'releases' is not allowed.";
+
+        assert_eq!(
+            generated_column_from_error(stderr),
+            Some("public_time".to_string())
+        );
+    }
 }
