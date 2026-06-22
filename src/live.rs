@@ -7,12 +7,17 @@ use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 mod binlog_command;
 mod insert_conflict;
+mod progress;
 use binlog_command::{read_remote_binlog, stop_never_args};
 pub use insert_conflict::{InsertConflictPolicy, should_ignore_duplicate_insert};
+use progress::{
+    StreamProgress, format_stream_exit, format_stream_progress, format_stream_quarantine,
+    format_stream_start,
+};
 
 #[derive(Clone, Debug)]
 pub struct ApplyBinlogConfig {
@@ -331,6 +336,44 @@ where
     E: TargetExecutor,
     Q: StatementQuarantine + QuarantineRecorder,
 {
+    let start = BinlogCoordinate {
+        file: config.source.binlog_file.clone(),
+        position: config.source.start_position,
+    };
+    let (mut child, stdout) = spawn_stream_reader(config)?;
+    let mut extractor = StatementEventExtractor::new(start);
+    let mut progress = StreamProgress::new(BinlogCoordinate {
+        file: config.source.binlog_file.clone(),
+        position: config.source.start_position,
+    });
+
+    println!("{}", format_stream_start(config));
+
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|error| {
+            ApplyBinlogError::SourceCommand(format!("failed reading mariadb-binlog: {error}"))
+        })?;
+        if let Some(event) = extractor.accept_line(&line) {
+            apply_stream_event(applier, &event, &mut progress)?;
+        }
+    }
+
+    let status = child.wait().map_err(|error| {
+        ApplyBinlogError::SourceCommand(format!("failed waiting for mariadb-binlog: {error}"))
+    })?;
+    if status.success() {
+        println!("{}", format_stream_exit(&progress));
+        Ok(())
+    } else {
+        Err(ApplyBinlogError::SourceCommand(format!(
+            "mariadb-binlog exited with {status}"
+        )))
+    }
+}
+
+fn spawn_stream_reader(
+    config: &ApplyBinlogConfig,
+) -> Result<(Child, ChildStdout), ApplyBinlogError> {
     let mut child = Command::new(&config.mariadb_binlog)
         .args(stop_never_args(&config.source))
         .stdout(Stdio::piped())
@@ -342,36 +385,14 @@ where
     let stdout = child.stdout.take().ok_or_else(|| {
         ApplyBinlogError::SourceCommand("mariadb-binlog stdout was not captured".to_string())
     })?;
-    let start = BinlogCoordinate {
-        file: config.source.binlog_file.clone(),
-        position: config.source.start_position,
-    };
-    let mut extractor = StatementEventExtractor::new(start);
 
-    for line in BufReader::new(stdout).lines() {
-        let line = line.map_err(|error| {
-            ApplyBinlogError::SourceCommand(format!("failed reading mariadb-binlog: {error}"))
-        })?;
-        if let Some(event) = extractor.accept_line(&line) {
-            apply_stream_event(applier, &event)?;
-        }
-    }
-
-    let status = child.wait().map_err(|error| {
-        ApplyBinlogError::SourceCommand(format!("failed waiting for mariadb-binlog: {error}"))
-    })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(ApplyBinlogError::SourceCommand(format!(
-            "mariadb-binlog exited with {status}"
-        )))
-    }
+    Ok((child, stdout))
 }
 
 fn apply_stream_event<E, Q>(
     applier: &StatementApplier<E, Q>,
     event: &StatementEvent,
+    progress: &mut StreamProgress,
 ) -> Result<(), ApplyBinlogError>
 where
     E: TargetExecutor,
@@ -379,15 +400,17 @@ where
 {
     match applier.apply(event) {
         Ok(StatementOutcome::Replayed) => {
-            println!(
-                "applied statement at {}:{}",
-                event.coordinate.file, event.coordinate.position
-            );
+            progress.record_applied(&event.coordinate);
+            println!("{}", format_stream_progress(progress));
             Ok(())
         }
-        Ok(StatementOutcome::Quarantined(_)) => Err(ApplyBinlogError::Quarantined(
-            applier.quarantine_recorder().recorded_statements(),
-        )),
+        Ok(StatementOutcome::Quarantined(reason)) => {
+            progress.record_quarantined(&event.coordinate);
+            println!("{}", format_stream_quarantine(progress, &reason));
+            Err(ApplyBinlogError::Quarantined(
+                applier.quarantine_recorder().recorded_statements(),
+            ))
+        }
         Err(error) => Err(ApplyBinlogError::Statement(error.to_string())),
     }
 }
