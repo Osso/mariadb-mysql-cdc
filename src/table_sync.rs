@@ -1,5 +1,4 @@
 use crate::snapshot::SnapshotRow;
-use crate::target::PrimaryKey;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -120,34 +119,118 @@ pub fn sync_table_with_progress(
     let mut start_after = progress.last_primary_key.clone();
 
     loop {
-        let source_request = sync_chunk_request(table, start_after.clone(), None, chunk_size);
-        let source_rows = source.read_rows(&source_request)?;
-        if source_rows.is_empty() {
-            complete_sync_progress(&mut progress, progress_store)?;
-            return Ok(report);
-        }
-
-        let end_at = last_primary_key(&source_rows)?;
-        let target_rows = read_target_window(
+        let Some(next_start_after) = sync_next_chunk(SyncChunkContext {
             table,
-            start_after.clone(),
-            Some(end_at.clone()),
             chunk_size,
+            mode,
+            start_after: start_after.clone(),
+            source,
             target,
-        )?;
-
-        repair_chunk(&source_rows, &target_rows, mode, repair_target, &mut report)?;
-        report.chunks += 1;
-        report.rows_scanned += source_rows.len() as u64;
-        progress.record_chunk(&report, end_at.clone());
-        progress_store.save(&progress)?;
-
-        if source_rows.len() < chunk_size {
+            repair_target,
+            progress_store,
+            progress: &mut progress,
+            report: &mut report,
+        })?
+        else {
             complete_sync_progress(&mut progress, progress_store)?;
             return Ok(report);
-        }
-        start_after = Some(end_at);
+        };
+        start_after = Some(next_start_after);
     }
+}
+
+struct SyncChunkContext<'a, S, T, R, P>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    table: &'a SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    start_after: Option<Vec<String>>,
+    source: &'a S,
+    target: &'a T,
+    repair_target: &'a mut R,
+    progress_store: &'a mut P,
+    progress: &'a mut SyncTableProgress,
+    report: &'a mut SyncTableReport,
+}
+
+fn sync_next_chunk<S, T, R, P>(
+    context: SyncChunkContext<'_, S, T, R, P>,
+) -> Result<Option<Vec<String>>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let source_rows = read_source_chunk(&context)?;
+    if source_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let end_at = last_primary_key(&source_rows)?;
+    let target_rows = read_target_window(
+        context.table,
+        context.start_after,
+        Some(end_at.clone()),
+        context.chunk_size,
+        context.target,
+    )?;
+    repair_chunk(
+        &source_rows,
+        &target_rows,
+        context.mode,
+        context.repair_target,
+        context.report,
+    )?;
+    record_sync_chunk(
+        context.progress,
+        context.report,
+        source_rows.len(),
+        end_at.clone(),
+        context.progress_store,
+    )?;
+
+    if source_rows.len() < context.chunk_size {
+        Ok(None)
+    } else {
+        Ok(Some(end_at))
+    }
+}
+
+fn read_source_chunk<S, T, R, P>(
+    context: &SyncChunkContext<'_, S, T, R, P>,
+) -> Result<Vec<SnapshotRow>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let request = sync_chunk_request(
+        context.table,
+        context.start_after.clone(),
+        None,
+        context.chunk_size,
+    );
+    context.source.read_rows(&request)
+}
+
+fn record_sync_chunk(
+    progress: &mut SyncTableProgress,
+    report: &mut SyncTableReport,
+    row_count: usize,
+    end_at: Vec<String>,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<(), TableSyncError> {
+    report.chunks += 1;
+    report.rows_scanned += row_count as u64;
+    progress.record_chunk(report, end_at);
+    progress_store.save(progress)
 }
 
 fn load_sync_progress(
@@ -378,10 +461,6 @@ where
         crate::target::TargetMySqlWriter::update_row(self, row)
             .map_err(|error| TableSyncError::Repair(error.to_string()))
     }
-}
-
-pub fn primary_key(values: Vec<String>) -> PrimaryKey {
-    PrimaryKey::new(values)
 }
 
 #[cfg(test)]
