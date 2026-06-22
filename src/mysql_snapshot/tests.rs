@@ -64,6 +64,17 @@ fn mysql_progress_save_is_throttled_until_interval_or_completion() {
 }
 
 #[test]
+fn catchup_snapshot_uses_persistent_clients_for_chunk_io() {
+    let source = include_str!("../mysql_snapshot.rs");
+
+    assert!(source.contains("PersistentMySqlSource::new(&config.source)"));
+    assert!(source.contains("PersistentTargetExecutor::new(&config.target)"));
+    assert!(source.contains("PersistentProgressWriter::new(&config.target"));
+    assert!(!source.contains("MysqlCliExecutor"));
+    assert!(!source.contains("Command::new"));
+}
+
+#[test]
 fn formats_catchup_table_start_with_total_rows() {
     let line = format_catchup_table_start("accounts", 2, 10, Some(42_000));
 
