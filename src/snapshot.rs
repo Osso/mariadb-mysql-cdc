@@ -211,14 +211,35 @@ pub fn snapshot_table(
         return Ok(snapshot_result(table, 0));
     }
 
+    copy_table_chunks(
+        table,
+        chunk_size,
+        &mut progress,
+        progress_store,
+        source,
+        target,
+    )?;
+    let rows_copied = rows_copied_for_table(&progress, &table.name) - starting_rows_copied;
+
+    Ok(snapshot_result(table, rows_copied))
+}
+
+fn copy_table_chunks(
+    table: &SnapshotTable,
+    chunk_size: usize,
+    progress: &mut SnapshotProgress,
+    progress_store: &impl SnapshotProgressStore,
+    source: &impl SnapshotSource,
+    target: &mut impl SnapshotTarget,
+) -> Result<(), SnapshotError> {
     loop {
-        let request = build_chunk_request(table, chunk_size, &progress)?;
+        let request = build_chunk_request(table, chunk_size, progress)?;
         let rows = source.read_chunk(&request)?;
 
         if rows.is_empty() {
             progress.mark_complete(&table.name);
-            progress_store.save(&progress)?;
-            break;
+            progress_store.save(progress)?;
+            return Ok(());
         }
 
         target.write_rows(&rows)?;
@@ -227,16 +248,12 @@ pub fn snapshot_table(
 
         if rows.len() < chunk_size {
             progress.mark_complete(&table.name);
-            progress_store.save(&progress)?;
-            break;
+            progress_store.save(progress)?;
+            return Ok(());
         }
 
-        progress_store.save(&progress)?;
+        progress_store.save(progress)?;
     }
-
-    let rows_copied = rows_copied_for_table(&progress, &table.name) - starting_rows_copied;
-
-    Ok(snapshot_result(table, rows_copied))
 }
 
 fn is_table_complete(progress: &SnapshotProgress, table: &str) -> bool {
