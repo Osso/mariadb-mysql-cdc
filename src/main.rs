@@ -216,6 +216,7 @@ fn parse_catchup_snapshot_config(
         progress_table: "cdc.table_sync_progress".to_string(),
         chunk_size: 10_000,
         throttle: Duration::ZERO,
+        parallel_workers: 1,
         table: None,
     };
     let mut index = 0;
@@ -261,6 +262,7 @@ fn catchup_snapshot_option(
         "--progress-table" => config.progress_table = value.to_string(),
         "--chunk-size" => config.chunk_size = parse_usize(flag, value)?,
         "--throttle-ms" => config.throttle = Duration::from_millis(parse_u64(flag, value)?),
+        "--parallel-workers" => config.parallel_workers = parse_usize(flag, value)?,
         "--table" => config.table = Some(value.to_string()),
         "--mariadb" => {
             config.source.mariadb = value.to_string();

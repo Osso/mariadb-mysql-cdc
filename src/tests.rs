@@ -150,6 +150,8 @@ fn parses_catchup_snapshot_config() {
         "5000",
         "--throttle-ms",
         "250",
+        "--parallel-workers",
+        "4",
         "--table",
         "activity_tracking",
         "--mariadb",
@@ -172,6 +174,7 @@ fn parses_catchup_snapshot_config() {
     assert_eq!(config.progress_table, "cdc.table_sync_progress");
     assert_eq!(config.chunk_size, 5000);
     assert_eq!(config.throttle, Duration::from_millis(250));
+    assert_eq!(config.parallel_workers, 4);
     assert_eq!(config.table.as_deref(), Some("activity_tracking"));
     assert_eq!(config.source.mariadb, "/usr/bin/mariadb");
 }
@@ -215,6 +218,7 @@ fn rejects_unknown_catchup_snapshot_option() {
             progress_table: "cdc.table_sync_progress".to_string(),
             chunk_size: 10_000,
             throttle: Duration::ZERO,
+            parallel_workers: 1,
             table: None,
         },
         "--bogus",

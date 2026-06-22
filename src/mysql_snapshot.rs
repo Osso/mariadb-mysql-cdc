@@ -53,6 +53,7 @@ pub struct CatchupSnapshotConfig {
     pub progress_table: String,
     pub chunk_size: usize,
     pub throttle: Duration,
+    pub parallel_workers: usize,
     pub table: Option<String>,
 }
 

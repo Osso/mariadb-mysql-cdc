@@ -55,6 +55,35 @@ impl PersistentMySqlSource {
             .map_err(snapshot_query_error)?
             .ok_or_else(|| SnapshotError::InvalidTable(format!("{table} row count was empty")))
     }
+
+    pub fn read_range_boundaries(
+        &self,
+        table: &crate::snapshot::SnapshotTable,
+        workers: usize,
+        total_rows: u64,
+    ) -> Result<Vec<Vec<String>>, SnapshotError> {
+        snapshot_boundary_offsets(total_rows, workers)
+            .into_iter()
+            .map(|offset| self.read_range_boundary(table, offset))
+            .collect()
+    }
+
+    fn read_range_boundary(
+        &self,
+        table: &crate::snapshot::SnapshotTable,
+        offset: u64,
+    ) -> Result<Vec<String>, SnapshotError> {
+        let sql = build_snapshot_boundary_select_sql(table, offset);
+        let row = self
+            .conn
+            .borrow_mut()
+            .query_first::<mysql::Row, _>(sql)
+            .map_err(snapshot_query_error)?
+            .ok_or_else(|| {
+                SnapshotError::InvalidTable(format!("{} boundary was empty", table.name))
+            })?;
+        Ok(row.unwrap().into_iter().map(value_to_string).collect())
+    }
 }
 
 impl SnapshotSource for PersistentMySqlSource {
@@ -328,6 +357,43 @@ fn value_to_string(value: Value) -> String {
     }
 }
 
+fn snapshot_boundary_offsets(total_rows: u64, workers: usize) -> Vec<u64> {
+    if total_rows == 0 || workers <= 1 {
+        return Vec::new();
+    }
+
+    let mut offsets = (1..workers)
+        .map(|worker| snapshot_boundary_offset(total_rows, workers, worker))
+        .filter(|offset| *offset < total_rows)
+        .collect::<Vec<_>>();
+    offsets.dedup();
+    offsets
+}
+
+fn snapshot_boundary_offset(total_rows: u64, workers: usize, worker: usize) -> u64 {
+    let numerator = total_rows * worker as u64;
+    numerator.div_ceil(workers as u64).saturating_sub(1)
+}
+
+fn build_snapshot_boundary_select_sql(
+    table: &crate::snapshot::SnapshotTable,
+    offset: u64,
+) -> String {
+    let primary_key = quote_column_list(&table.primary_key);
+    format!(
+        "SELECT {primary_key} FROM {} ORDER BY {primary_key} LIMIT 1 OFFSET {offset}",
+        quote_ident(&table.name)
+    )
+}
+
+fn quote_column_list(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn format_date(
     year: u16,
     month: u8,
@@ -495,5 +561,31 @@ mod tests {
         assert_eq!(releases.last_primary_key, None);
         assert_eq!(releases.rows_copied, 100);
         assert!(releases.complete);
+    }
+
+    #[test]
+    fn plans_snapshot_boundary_offsets_for_four_workers() {
+        assert_eq!(snapshot_boundary_offsets(10, 4), vec![2, 4, 7]);
+    }
+
+    #[test]
+    fn skips_snapshot_boundary_offsets_when_rows_are_too_sparse() {
+        assert_eq!(snapshot_boundary_offsets(2, 4), vec![0, 1]);
+    }
+
+    #[test]
+    fn builds_snapshot_boundary_select_sql() {
+        let table = crate::snapshot::SnapshotTable {
+            name: "accounts".to_string(),
+            primary_key: vec!["tenant_id".to_string(), "id".to_string()],
+            columns: Vec::new(),
+        };
+
+        let sql = build_snapshot_boundary_select_sql(&table, 99);
+
+        assert_eq!(
+            sql,
+            "SELECT `tenant_id`, `id` FROM `accounts` ORDER BY `tenant_id`, `id` LIMIT 1 OFFSET 99"
+        );
     }
 }
