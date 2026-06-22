@@ -273,9 +273,12 @@ fn aggregates_running_range_progress_by_parent_table() {
     assert!(lines[1].contains("rows_scanned=70"));
     assert!(lines[1].contains("total_rows=200"));
     assert!(lines[1].contains("progress=35.00%"));
-    assert_eq!(lines[3], "sync_progress_section name=range_details");
-    assert!(lines[4].contains("table=comics_releases_fragments_views#range0"));
-    assert!(lines[5].contains("table=comics_releases_fragments_views#range1"));
+    assert!(!lines.iter().any(|line| line.contains("#range")));
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("sync_progress_section name=range_details"))
+    );
 }
 
 #[test]

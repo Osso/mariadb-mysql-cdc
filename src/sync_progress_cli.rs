@@ -293,7 +293,7 @@ fn has_source_count_config(config: &SyncProgressConfig) -> bool {
 
 fn read_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
     let (sender, receiver) = mpsc::channel();
-    let cache_key = config.table.as_deref().unwrap_or("all").to_string();
+    let cache_key = format!("v2-{}", config.table.as_deref().unwrap_or("all"));
     let live_config = config.clone();
     thread::spawn(move || {
         let _ = sender.send(read_live_sync_progress(&live_config));

@@ -20,27 +20,15 @@ pub(super) fn format_progress_rows(
 }
 
 fn format_running_rows(config: &SyncProgressConfig, rows: &[&SyncProgressRow]) -> Vec<String> {
-    let (range_rows, regular_rows): (Vec<_>, Vec<_>) = rows
+    let regular_rows = rows
         .iter()
         .copied()
-        .partition(|row| range_parent(&row.table).is_some());
+        .filter(|row| range_parent(&row.table).is_none());
     let mut lines = running_table_summaries(config, rows)
         .into_iter()
         .map(|row| format_progress_row(config, &row))
         .collect::<Vec<_>>();
-    lines.extend(
-        regular_rows
-            .iter()
-            .map(|row| format_progress_row(config, row)),
-    );
-    if !range_rows.is_empty() {
-        lines.push("sync_progress_section name=range_details".to_string());
-    }
-    lines.extend(
-        range_rows
-            .iter()
-            .map(|row| format_progress_row(config, row)),
-    );
+    lines.extend(regular_rows.map(|row| format_progress_row(config, row)));
     lines
 }
 
