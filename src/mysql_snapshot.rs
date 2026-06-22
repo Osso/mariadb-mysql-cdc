@@ -1,8 +1,12 @@
 use crate::inventory::{InventoryConfig, InventoryError, MariaDbInventoryReader, build_inventory};
 use crate::live::{MysqlCliExecutor, TargetMySqlConfig};
 use crate::snapshot::{
-    ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotRow, SnapshotSource,
-    SnapshotTable, snapshot_table,
+    ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotProgress,
+    SnapshotProgressStore, SnapshotRow, SnapshotSource, SnapshotTable, snapshot_table,
+};
+use crate::table_sync::{
+    MySqlSyncProgressStore, SyncMode, SyncProgressStatus, SyncProgressStore, SyncTableProgress,
+    TableSyncError,
 };
 use crate::target::{SnapshotInsertMode, TargetMySqlWriter};
 use std::collections::BTreeMap;
@@ -38,6 +42,7 @@ pub struct CatchupSnapshotConfig {
     pub source: MySqlConnectionConfig,
     pub target: TargetMySqlConfig,
     pub progress_file: PathBuf,
+    pub progress_table: String,
     pub chunk_size: usize,
     pub table: Option<String>,
 }
@@ -108,7 +113,7 @@ pub fn run_catchup_snapshot(
 ) -> Result<CatchupSnapshotReport, CatchupSnapshotError> {
     validate_config(config)?;
     let tables = read_snapshot_tables(config)?;
-    let progress_store = FileSnapshotProgressStore::new(&config.progress_file);
+    let progress_store = catchup_progress_store(config);
     let source = MySqlSnapshotSource::new(config.source.clone());
     let mut reports = Vec::new();
 
@@ -141,6 +146,65 @@ pub fn run_catchup_snapshot(
 
     println!("catchup_snapshot_complete tables={}", reports.len());
     Ok(CatchupSnapshotReport { tables: reports })
+}
+
+fn catchup_progress_store(config: &CatchupSnapshotConfig) -> CatchupProgressStore {
+    let mysql_store = MySqlSyncProgressStore::new(
+        config.source.mariadb.clone(),
+        config.target.clone(),
+        config.progress_table.clone(),
+    );
+    CatchupProgressStore {
+        file_store: FileSnapshotProgressStore::new(&config.progress_file),
+        mysql_store,
+    }
+}
+
+struct CatchupProgressStore {
+    file_store: FileSnapshotProgressStore,
+    mysql_store: MySqlSyncProgressStore,
+}
+
+impl SnapshotProgressStore for CatchupProgressStore {
+    fn load(&self) -> Result<SnapshotProgress, SnapshotError> {
+        self.file_store.load()
+    }
+
+    fn save(&self, progress: &SnapshotProgress) -> Result<(), SnapshotError> {
+        self.file_store.save(progress)?;
+        self.save_mysql_progress(progress)
+            .map_err(|error| SnapshotError::InvalidTable(error.to_string()))
+    }
+}
+
+impl CatchupProgressStore {
+    fn save_mysql_progress(&self, progress: &SnapshotProgress) -> Result<(), TableSyncError> {
+        let mut store = self.mysql_store.clone();
+        store.ensure()?;
+        for (table, table_progress) in &progress.tables {
+            store.save(&SyncTableProgress {
+                table: table.clone(),
+                last_primary_key: table_progress.last_primary_key.clone(),
+                chunks: 0,
+                rows_scanned: table_progress.rows_copied,
+                inserts: table_progress.rows_copied,
+                updates: 0,
+                extra_target_rows: 0,
+                mode: SyncMode::Apply,
+                status: snapshot_progress_status(table_progress.complete),
+                last_error: None,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_progress_status(complete: bool) -> SyncProgressStatus {
+    if complete {
+        SyncProgressStatus::Complete
+    } else {
+        SyncProgressStatus::Running
+    }
 }
 
 pub fn build_select_chunk_sql(request: &ChunkRequest) -> String {

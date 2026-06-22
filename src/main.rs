@@ -56,9 +56,6 @@ Probe options:
   --binlog-file FILE          Override SHOW MASTER STATUS binlog file.
   --start-position POSITION   Override SHOW MASTER STATUS position.
   --stop-position POSITION    Stop reading at a binlog position.
-  --mariadb PATH              mariadb client path. Defaults to mariadb.
-  --mariadb-binlog PATH       mariadb-binlog path. Defaults to mariadb-binlog.
-
 Apply options:
   --source-host HOST              MariaDB source host.
   --source-port PORT              MariaDB source port. Defaults to 3306.
@@ -86,8 +83,6 @@ Catchup snapshot options:
   --target-user USER              MySQL target user.
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
-  --progress-file PATH            Durable JSON progress file.
-  --chunk-size N                  Rows per chunk. Defaults to 1000.
 ";
 
 fn main() {
@@ -213,6 +208,7 @@ fn parse_catchup_snapshot_config(
         source: mysql_snapshot::MySqlConnectionConfig::default(),
         target: live::TargetMySqlConfig::default(),
         progress_file: PathBuf::new(),
+        progress_table: "cdc.table_sync_progress".to_string(),
         chunk_size: 1000,
         table: None,
     };
@@ -256,6 +252,7 @@ fn catchup_snapshot_option(
 
     match flag {
         "--progress-file" => config.progress_file = PathBuf::from(value),
+        "--progress-table" => config.progress_table = value.to_string(),
         "--chunk-size" => config.chunk_size = parse_usize(flag, value)?,
         "--table" => config.table = Some(value.to_string()),
         "--mariadb" => {
@@ -621,6 +618,7 @@ mod tests {
             config.progress_file,
             PathBuf::from("/var/lib/cdc/snapshot-progress.json")
         );
+        assert_eq!(config.progress_table, "cdc.table_sync_progress");
         assert_eq!(config.chunk_size, 5000);
         assert_eq!(config.table.as_deref(), Some("activity_tracking"));
         assert_eq!(config.source.mariadb, "/usr/bin/mariadb");
@@ -662,6 +660,7 @@ mod tests {
                 source: mysql_snapshot::MySqlConnectionConfig::default(),
                 target: live::TargetMySqlConfig::default(),
                 progress_file: PathBuf::new(),
+                progress_table: "cdc.table_sync_progress".to_string(),
                 chunk_size: 1000,
                 table: None,
             },

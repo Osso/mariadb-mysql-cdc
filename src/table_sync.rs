@@ -9,7 +9,10 @@ mod target;
 use mysql::MySqlSyncReader;
 #[cfg(test)]
 pub(crate) use mysql::build_sync_select_sql;
-pub use progress::{NoopSyncProgressStore, SyncProgressStore, SyncTableProgress};
+pub use progress::{
+    MySqlSyncProgressStore, NoopSyncProgressStore, SyncProgressStatus, SyncProgressStore,
+    SyncTableProgress,
+};
 pub use target::SyncRepairTarget;
 
 #[derive(Clone, Debug)]

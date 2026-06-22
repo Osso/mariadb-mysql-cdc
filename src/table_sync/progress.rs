@@ -54,6 +54,7 @@ impl SyncProgressStore for NoopSyncProgressStore {
     }
 }
 
+#[derive(Clone)]
 pub struct MySqlSyncProgressStore {
     mariadb: String,
     target: TargetMySqlConfig,
