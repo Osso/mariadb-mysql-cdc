@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 mod mysql;
-mod progress;
+pub(crate) mod progress;
 mod target;
 
 use mysql::MySqlSyncReader;

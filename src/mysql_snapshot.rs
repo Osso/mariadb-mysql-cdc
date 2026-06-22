@@ -1,19 +1,18 @@
 use crate::inventory::{InventoryConfig, InventoryError, MariaDbInventoryReader, build_inventory};
-use crate::live::{MysqlCliExecutor, TargetMySqlConfig};
+use crate::live::TargetMySqlConfig;
+use crate::mysql_client::{
+    PersistentMySqlSource, PersistentProgressWriter, PersistentTargetExecutor,
+};
 use crate::snapshot::{
     ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotProgress,
-    SnapshotProgressStore, SnapshotRow, SnapshotSource, SnapshotTable, snapshot_table,
+    SnapshotProgressStore, SnapshotTable, snapshot_table,
 };
-use crate::table_sync::{
-    MySqlSyncProgressStore, SyncMode, SyncProgressStatus, SyncProgressStore, SyncTableProgress,
-    TableSyncError,
-};
+use crate::table_sync::{SyncMode, SyncProgressStatus, SyncTableProgress, TableSyncError};
 use crate::target::{SnapshotInsertMode, TargetMySqlWriter};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 const MYSQL_PROGRESS_SAVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -62,25 +61,6 @@ pub struct CatchupSnapshotTableReport {
     pub rows_copied: u64,
 }
 
-pub struct MySqlSnapshotSource {
-    config: MySqlConnectionConfig,
-}
-
-impl MySqlSnapshotSource {
-    pub fn new(config: MySqlConnectionConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl SnapshotSource for MySqlSnapshotSource {
-    fn read_chunk(&self, request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError> {
-        let sql = build_select_chunk_sql(request);
-        let output = run_mysql_query(&self.config, &sql).map_err(SnapshotError::InvalidTable)?;
-
-        parse_snapshot_rows(&request.selected_columns, &request.primary_key, &output)
-    }
-}
-
 #[derive(Debug)]
 pub enum CatchupSnapshotError {
     Config(String),
@@ -117,8 +97,8 @@ pub fn run_catchup_snapshot(
 ) -> Result<CatchupSnapshotReport, CatchupSnapshotError> {
     validate_config(config)?;
     let tables = read_snapshot_tables(config)?;
-    let progress_store = catchup_progress_store(config);
-    let source = MySqlSnapshotSource::new(config.source.clone());
+    let progress_store = catchup_progress_store(config)?;
+    let source = PersistentMySqlSource::new(&config.source)?;
     let mut reports = Vec::new();
 
     println!(
@@ -129,9 +109,9 @@ pub fn run_catchup_snapshot(
     );
 
     for table in tables {
-        prepare_snapshot_table_progress(config, &progress_store, &table.name)?;
+        prepare_snapshot_table_progress(&source, &progress_store, &table.name)?;
         println!("catchup_table_start table={}", table.name);
-        let mut target = snapshot_target_for_table(config, &table);
+        let mut target = snapshot_target_for_table(config, &table)?;
         let result = snapshot_table(
             &table,
             config.chunk_size,
@@ -154,32 +134,31 @@ pub fn run_catchup_snapshot(
 }
 
 fn prepare_snapshot_table_progress(
-    config: &CatchupSnapshotConfig,
+    source: &PersistentMySqlSource,
     progress_store: &CatchupProgressStore,
     table: &str,
 ) -> Result<(), CatchupSnapshotError> {
-    let total_rows = count_snapshot_rows(config, table)?;
+    let total_rows = source.count_rows(table)?;
     progress_store.record_total_rows(table, total_rows);
     Ok(())
 }
 
-fn catchup_progress_store(config: &CatchupSnapshotConfig) -> CatchupProgressStore {
-    let mysql_store = MySqlSyncProgressStore::new(
-        config.source.mariadb.clone(),
-        config.target.clone(),
-        config.progress_table.clone(),
-    );
-    CatchupProgressStore {
+fn catchup_progress_store(
+    config: &CatchupSnapshotConfig,
+) -> Result<CatchupProgressStore, CatchupSnapshotError> {
+    let mysql_store = PersistentProgressWriter::new(&config.target, config.progress_table.clone())
+        .map_err(|error| SnapshotError::InvalidTable(error.to_string()))?;
+    Ok(CatchupProgressStore {
         file_store: FileSnapshotProgressStore::new(&config.progress_file),
         mysql_store,
         total_rows: RefCell::new(BTreeMap::new()),
         mysql_save_state: RefCell::new(BTreeMap::new()),
-    }
+    })
 }
 
 struct CatchupProgressStore {
     file_store: FileSnapshotProgressStore,
-    mysql_store: MySqlSyncProgressStore,
+    mysql_store: PersistentProgressWriter,
     total_rows: RefCell<BTreeMap<String, u64>>,
     mysql_save_state: RefCell<BTreeMap<String, MysqlProgressSaveState>>,
 }
@@ -204,14 +183,13 @@ impl CatchupProgressStore {
     }
 
     fn save_mysql_progress(&self, progress: &SnapshotProgress) -> Result<(), TableSyncError> {
-        let mut store = self.mysql_store.clone();
-        store.ensure()?;
+        self.mysql_store.ensure()?;
         for (table, table_progress) in &progress.tables {
             let status = snapshot_progress_status(table_progress.complete);
             if !self.should_save_mysql_progress(table, table_progress.rows_copied, status) {
                 continue;
             }
-            store.save(&SyncTableProgress {
+            self.mysql_store.save(&SyncTableProgress {
                 table: table.clone(),
                 last_primary_key: table_progress.last_primary_key.clone(),
                 chunks: 0,
@@ -403,65 +381,25 @@ fn read_snapshot_tables(
     Ok(tables)
 }
 
-fn count_snapshot_rows(config: &CatchupSnapshotConfig, table: &str) -> Result<u64, SnapshotError> {
-    let sql = build_count_rows_sql(table);
-    let output = run_mysql_query(&config.source, &sql).map_err(SnapshotError::InvalidTable)?;
-    output
-        .trim()
-        .parse()
-        .map_err(|_| SnapshotError::InvalidTable(format!("{table} row count was not an integer")))
-}
-
-fn build_count_rows_sql(table: &str) -> String {
-    format!("SELECT COUNT(*) FROM {}", quote_ident(table))
-}
-
 fn snapshot_target_for_table(
     config: &CatchupSnapshotConfig,
     table: &SnapshotTable,
-) -> TargetMySqlWriter<MysqlCliExecutor> {
-    let executor = MysqlCliExecutor::new(config.source.mariadb.clone(), config.target.clone());
-    TargetMySqlWriter::from_snapshot_table(table, executor, SnapshotInsertMode::IgnoreDuplicate)
-}
-
-fn run_mysql_query(config: &MySqlConnectionConfig, sql: &str) -> Result<String, String> {
-    let output = Command::new(&config.mariadb)
-        .args([
-            "--batch",
-            "--raw",
-            "--skip-column-names",
-            "--default-character-set=utf8mb4",
-            "--host",
-            &config.host,
-            "--port",
-            &config.port.to_string(),
-            "--user",
-            &config.user,
-            &config.database,
-            "-e",
-            sql,
-        ])
-        .env("MYSQL_PWD", &config.password)
-        .output()
-        .map_err(|error| format!("failed to run mariadb: {error}"))?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!(
-        "mariadb exited with {}: {}",
-        output.status,
-        stderr.trim()
+) -> Result<TargetMySqlWriter<PersistentTargetExecutor>, SnapshotError> {
+    let executor = PersistentTargetExecutor::new(&config.target)
+        .map_err(|error| SnapshotError::InvalidTable(error.to_string()))?;
+    Ok(TargetMySqlWriter::from_snapshot_table(
+        table,
+        executor,
+        SnapshotInsertMode::IgnoreDuplicate,
     ))
 }
 
+#[cfg(test)]
 fn parse_snapshot_rows(
     columns: &[String],
     primary_key: &[String],
     output: &str,
-) -> Result<Vec<SnapshotRow>, SnapshotError> {
+) -> Result<Vec<crate::snapshot::SnapshotRow>, SnapshotError> {
     output
         .lines()
         .filter(|line| !line.is_empty())
@@ -469,11 +407,12 @@ fn parse_snapshot_rows(
         .collect()
 }
 
+#[cfg(test)]
 fn parse_snapshot_row(
     columns: &[String],
     primary_key: &[String],
     line: &str,
-) -> Result<SnapshotRow, SnapshotError> {
+) -> Result<crate::snapshot::SnapshotRow, SnapshotError> {
     let fields = line.split('\t').map(str::to_string).collect::<Vec<_>>();
     if fields.len() != columns.len() {
         return Err(SnapshotError::InvalidTable(format!(
@@ -489,12 +428,13 @@ fn parse_snapshot_row(
         .zip(fields)
         .collect::<BTreeMap<_, _>>();
     let primary_key = primary_key_values(primary_key, &values)?;
-    Ok(SnapshotRow {
+    Ok(crate::snapshot::SnapshotRow {
         primary_key,
         values,
     })
 }
 
+#[cfg(test)]
 fn primary_key_values(
     primary_key: &[String],
     values: &BTreeMap<String, String>,

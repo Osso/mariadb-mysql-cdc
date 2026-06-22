@@ -27,9 +27,9 @@ pub use insert_conflict::{InsertConflictPolicy, should_ignore_duplicate_insert};
 pub use mysql_cli::MysqlCliExecutor;
 #[cfg(test)]
 use mysql_cli::{
-    format_slow_target_query_log, target_client_character_set_arg, target_session_init_command,
-    truncate_sql_for_log,
+    format_slow_target_query_log, target_client_character_set_arg, truncate_sql_for_log,
 };
+pub(crate) use mysql_cli::{strip_insert_column_for_retry, target_session_init_command};
 use progress::{
     StreamProgress, format_stream_exit, format_stream_progress, format_stream_quarantine,
     format_stream_start,

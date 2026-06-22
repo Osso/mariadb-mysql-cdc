@@ -140,7 +140,7 @@ fn rewrite_generated_column_insert(
 ) -> Option<SqlStatement> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let generated_column = generated_column_from_error(&stderr)?;
-    let sql = strip_insert_column(&statement.sql, &generated_column)?;
+    let sql = strip_insert_column_for_retry(&statement.sql, &generated_column)?;
     println!(
         "cdc_target_rewrite_generated_column column={} original_sql_bytes={} rewritten_sql_bytes={}",
         generated_column,
@@ -161,7 +161,7 @@ fn generated_column_from_error(stderr: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn strip_insert_column(sql: &str, generated_column: &str) -> Option<String> {
+pub(crate) fn strip_insert_column_for_retry(sql: &str, generated_column: &str) -> Option<String> {
     if !sql.trim_start().to_ascii_uppercase().starts_with("INSERT ") {
         return None;
     }
@@ -376,7 +376,7 @@ pub(super) fn truncate_sql_for_log(sql: &str, limit: usize) -> String {
     }
 }
 
-pub(super) fn target_session_init_command() -> &'static str {
+pub(crate) fn target_session_init_command() -> &'static str {
     "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'"
 }
 
@@ -404,7 +404,7 @@ mod tests {
     fn strips_generated_column_from_insert_values() {
         let sql = "INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES (\"a\",NULL,\"hello\"),(\"b\",NULL,\"world\")";
 
-        let rewritten = strip_insert_column(sql, "public_time").expect("rewrite");
+        let rewritten = strip_insert_column_for_retry(sql, "public_time").expect("rewrite");
 
         assert_eq!(
             rewritten,
@@ -416,7 +416,7 @@ mod tests {
     fn strips_generated_column_without_splitting_quoted_commas() {
         let sql = "INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES (\"a,b\",NULL,\"hello (world)\")";
 
-        let rewritten = strip_insert_column(sql, "public_time").expect("rewrite");
+        let rewritten = strip_insert_column_for_retry(sql, "public_time").expect("rewrite");
 
         assert_eq!(
             rewritten,

@@ -188,7 +188,7 @@ impl SyncTableProgress {
     }
 }
 
-fn build_create_progress_table_sql(table: &str) -> String {
+pub(crate) fn build_create_progress_table_sql(table: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {} (\
 table_name VARCHAR(255) NOT NULL PRIMARY KEY,\
@@ -209,7 +209,10 @@ updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMEST
     )
 }
 
-fn build_add_total_rows_column_sql(default_schema: &str, progress_table: &str) -> String {
+pub(crate) fn build_add_total_rows_column_sql(
+    default_schema: &str,
+    progress_table: &str,
+) -> String {
     let (schema, table) = qualified_table_parts(default_schema, progress_table);
     let alter_table = format!(
         "ALTER TABLE {} ADD COLUMN total_rows BIGINT UNSIGNED NULL AFTER rows_scanned",
@@ -223,7 +226,7 @@ fn build_add_total_rows_column_sql(default_schema: &str, progress_table: &str) -
     )
 }
 
-fn build_create_progress_schema_sql(table: &str) -> Option<String> {
+pub(crate) fn build_create_progress_schema_sql(table: &str) -> Option<String> {
     let schema = table.split_once('.')?.0;
     Some(format!(
         "CREATE DATABASE IF NOT EXISTS {}",
@@ -239,7 +242,10 @@ fn build_progress_select_sql(progress_table: &str, table: &str) -> String {
     )
 }
 
-fn build_progress_upsert_sql(progress_table: &str, progress: &SyncTableProgress) -> String {
+pub(crate) fn build_progress_upsert_sql(
+    progress_table: &str,
+    progress: &SyncTableProgress,
+) -> String {
     let last_primary_key = progress
         .last_primary_key
         .as_ref()

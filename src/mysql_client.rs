@@ -1,0 +1,377 @@
+use crate::live::{InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert};
+use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_support::quote_ident;
+use crate::snapshot::{ChunkRequest, SnapshotError, SnapshotRow, SnapshotSource};
+use crate::table_sync::progress::{
+    build_add_total_rows_column_sql, build_create_progress_schema_sql,
+    build_create_progress_table_sql, build_progress_upsert_sql,
+};
+use crate::table_sync::{SyncTableProgress, TableSyncError};
+use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor, render_sql_statement};
+use mysql::prelude::Queryable;
+use mysql::{Conn, Opts, OptsBuilder, Params, SslOpts, Value};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+pub struct PersistentMySqlSource {
+    conn: RefCell<Conn>,
+}
+
+pub struct PersistentTargetExecutor {
+    conn: RefCell<Conn>,
+    insert_conflict_policy: InsertConflictPolicy,
+}
+
+pub struct PersistentProgressWriter {
+    conn: RefCell<Conn>,
+    default_database: String,
+    progress_table: String,
+}
+
+impl PersistentMySqlSource {
+    pub fn new(config: &MySqlConnectionConfig) -> Result<Self, SnapshotError> {
+        let opts = base_opts(
+            &config.host,
+            config.port,
+            &config.user,
+            &config.password,
+            &config.database,
+            false,
+        );
+        let conn = open_conn(opts).map_err(snapshot_connect_error)?;
+        Ok(Self {
+            conn: RefCell::new(conn),
+        })
+    }
+
+    pub fn count_rows(&self, table: &str) -> Result<u64, SnapshotError> {
+        let sql = format!("SELECT COUNT(*) FROM {}", quote_ident(table));
+        self.conn
+            .borrow_mut()
+            .query_first::<u64, _>(sql)
+            .map_err(snapshot_query_error)?
+            .ok_or_else(|| SnapshotError::InvalidTable(format!("{table} row count was empty")))
+    }
+}
+
+impl SnapshotSource for PersistentMySqlSource {
+    fn read_chunk(&self, request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError> {
+        let sql = crate::mysql_snapshot::build_select_chunk_sql(request);
+        let rows = self
+            .conn
+            .borrow_mut()
+            .query::<mysql::Row, _>(sql)
+            .map_err(snapshot_query_error)?;
+
+        rows.into_iter()
+            .map(|row| snapshot_row_from_mysql_row(request, row))
+            .collect()
+    }
+}
+
+impl PersistentTargetExecutor {
+    pub fn new(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
+        let opts = base_opts(
+            &config.host,
+            config.port,
+            &config.user,
+            &config.password,
+            &config.database,
+            true,
+        );
+        let mut conn = open_conn(opts).map_err(target_connect_error)?;
+        conn.query_drop(crate::live::target_session_init_command())
+            .map_err(target_query_error)?;
+        Ok(Self {
+            conn: RefCell::new(conn),
+            insert_conflict_policy: config.insert_conflict_policy,
+        })
+    }
+}
+
+impl TargetExecutor for PersistentTargetExecutor {
+    fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
+        let result = self.execute_statement(statement);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => self.retry_or_return_error(statement, error),
+        }
+    }
+}
+
+impl PersistentTargetExecutor {
+    fn execute_statement(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
+        let params = statement
+            .params
+            .iter()
+            .map(|value| Value::Bytes(value.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        self.conn
+            .borrow_mut()
+            .exec_drop(&statement.sql, Params::Positional(params))
+            .map_err(target_query_error)
+    }
+
+    fn retry_or_return_error(
+        &self,
+        statement: &SqlStatement,
+        error: TargetExecuteError,
+    ) -> Result<(), TargetExecuteError> {
+        if self.can_ignore_duplicate_insert(&statement.sql, &error.to_string()) {
+            return Ok(());
+        }
+        let Some(retry_sql) = generated_column_retry_sql(statement, &error.to_string()) else {
+            return Err(error);
+        };
+        self.conn
+            .borrow_mut()
+            .query_drop(retry_sql)
+            .map_err(target_query_error)
+    }
+
+    fn can_ignore_duplicate_insert(&self, sql: &str, error: &str) -> bool {
+        should_ignore_duplicate_insert(self.insert_conflict_policy, sql, error)
+    }
+}
+
+impl PersistentProgressWriter {
+    pub fn new(config: &TargetMySqlConfig, progress_table: String) -> Result<Self, TableSyncError> {
+        let opts = base_opts(
+            &config.host,
+            config.port,
+            &config.user,
+            &config.password,
+            &config.database,
+            true,
+        );
+        let mut conn = open_conn(opts).map_err(progress_connect_error)?;
+        conn.query_drop(crate::live::target_session_init_command())
+            .map_err(progress_query_error)?;
+        Ok(Self {
+            conn: RefCell::new(conn),
+            default_database: config.database.clone(),
+            progress_table,
+        })
+    }
+
+    pub fn ensure(&self) -> Result<(), TableSyncError> {
+        if let Some(sql) = build_create_progress_schema_sql(&self.progress_table) {
+            self.execute_progress_sql(sql)?;
+        }
+        self.execute_progress_sql(build_create_progress_table_sql(&self.progress_table))?;
+        self.execute_progress_sql(build_add_total_rows_column_sql(
+            &self.default_database,
+            &self.progress_table,
+        ))
+    }
+
+    pub fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
+        self.execute_progress_sql(build_progress_upsert_sql(&self.progress_table, progress))
+    }
+
+    fn execute_progress_sql(&self, sql: String) -> Result<(), TableSyncError> {
+        self.conn
+            .borrow_mut()
+            .query_drop(sql)
+            .map_err(progress_query_error)
+    }
+}
+
+fn base_opts(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    database: &str,
+    use_tls: bool,
+) -> Opts {
+    let mut builder = OptsBuilder::default()
+        .ip_or_hostname(Some(host))
+        .tcp_port(port)
+        .user(Some(user))
+        .pass(Some(password))
+        .db_name(Some(database))
+        .prefer_socket(false);
+    if use_tls {
+        builder = builder.ssl_opts(insecure_ssl_opts());
+    }
+    Opts::from(builder)
+}
+
+fn insecure_ssl_opts() -> SslOpts {
+    SslOpts::default()
+        .with_danger_skip_domain_validation(true)
+        .with_danger_accept_invalid_certs(true)
+}
+
+fn open_conn(opts: Opts) -> mysql::Result<Conn> {
+    Conn::new(opts)
+}
+
+fn snapshot_row_from_mysql_row(
+    request: &ChunkRequest,
+    row: mysql::Row,
+) -> Result<SnapshotRow, SnapshotError> {
+    let values = row
+        .unwrap()
+        .into_iter()
+        .map(value_to_string)
+        .collect::<Vec<_>>();
+    let values_by_column = request
+        .selected_columns
+        .iter()
+        .cloned()
+        .zip(values)
+        .collect::<BTreeMap<_, _>>();
+    let primary_key = request
+        .primary_key
+        .iter()
+        .map(|column| {
+            values_by_column.get(column).cloned().ok_or_else(|| {
+                SnapshotError::InvalidTable(format!(
+                    "primary-key column `{column}` was not selected"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SnapshotRow {
+        primary_key,
+        values: values_by_column,
+    })
+}
+
+fn value_to_string(value: Value) -> String {
+    match value {
+        Value::NULL => "NULL".to_string(),
+        Value::Bytes(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Value::Int(value) => value.to_string(),
+        Value::UInt(value) => value.to_string(),
+        Value::Float(value) => value.to_string(),
+        Value::Double(value) => value.to_string(),
+        Value::Date(year, month, day, hour, minute, second, micros) => {
+            format_date(year, month, day, hour, minute, second, micros)
+        }
+        Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            format_time(negative, days, hours, minutes, seconds, micros)
+        }
+    }
+}
+
+fn format_date(
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    micros: u32,
+) -> String {
+    let base = format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}");
+    if micros == 0 {
+        base
+    } else {
+        format!("{base}.{micros:06}")
+    }
+}
+
+fn format_time(
+    negative: bool,
+    days: u32,
+    hours: u8,
+    minutes: u8,
+    seconds: u8,
+    micros: u32,
+) -> String {
+    let sign = if negative { "-" } else { "" };
+    let total_hours = days * 24 + u32::from(hours);
+    let base = format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}");
+    if micros == 0 {
+        base
+    } else {
+        format!("{base}.{micros:06}")
+    }
+}
+
+fn generated_column_retry_sql(statement: &SqlStatement, error: &str) -> Option<String> {
+    let generated_column = generated_column_from_error(error)?;
+    let rendered = render_sql_statement(statement).ok()?;
+    strip_insert_column(&rendered, &generated_column)
+}
+
+fn generated_column_from_error(error: &str) -> Option<String> {
+    let marker = "generated column '";
+    let start = error.find(marker)? + marker.len();
+    let rest = &error[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+fn strip_insert_column(sql: &str, generated_column: &str) -> Option<String> {
+    crate::live::strip_insert_column_for_retry(sql, generated_column)
+}
+
+fn snapshot_connect_error(error: mysql::Error) -> SnapshotError {
+    SnapshotError::InvalidTable(format!("failed to connect to source mysql: {error}"))
+}
+
+fn snapshot_query_error(error: mysql::Error) -> SnapshotError {
+    SnapshotError::InvalidTable(format!("source mysql query failed: {error}"))
+}
+
+fn target_connect_error(error: mysql::Error) -> TargetExecuteError {
+    TargetExecuteError::new(format!("failed to connect to target mysql: {error}"))
+}
+
+fn target_query_error(error: mysql::Error) -> TargetExecuteError {
+    TargetExecuteError::new(format!("target mysql query failed: {error}"))
+}
+
+fn progress_connect_error(error: mysql::Error) -> TableSyncError {
+    TableSyncError::Progress(format!("failed to connect to target mysql: {error}"))
+}
+
+fn progress_query_error(error: mysql::Error) -> TableSyncError {
+    TableSyncError::Progress(format!("target progress query failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_mysql_values_like_snapshot_text_rows() {
+        assert_eq!(value_to_string(Value::Int(-5)), "-5");
+        assert_eq!(value_to_string(Value::UInt(5)), "5");
+        assert_eq!(
+            value_to_string(Value::Date(2026, 6, 22, 12, 3, 4, 0)),
+            "2026-06-22 12:03:04"
+        );
+        assert_eq!(
+            value_to_string(Value::Time(false, 1, 2, 3, 4, 0)),
+            "26:03:04"
+        );
+    }
+
+    #[test]
+    fn target_opts_use_insecure_tls_for_do_mysql() {
+        let target = TargetMySqlConfig {
+            host: "target".to_string(),
+            port: 25060,
+            user: "target_user".to_string(),
+            password: "secret".to_string(),
+            database: "globalcomix".to_string(),
+            insert_conflict_policy: InsertConflictPolicy::IgnoreDuplicate,
+        };
+
+        let opts = base_opts(
+            &target.host,
+            target.port,
+            &target.user,
+            &target.password,
+            &target.database,
+            true,
+        );
+
+        assert!(opts.get_ssl_opts().is_some());
+    }
+}
