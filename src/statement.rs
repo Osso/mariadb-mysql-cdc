@@ -201,7 +201,29 @@ fn normalize_statement(sql: &str) -> String {
 }
 
 fn contains_multi_statement(sql: &str) -> bool {
-    sql.split(';').skip(1).any(|tail| !tail.trim().is_empty())
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, character) in sql.char_indices() {
+        if let Some(quote_character) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == quote_character {
+                quote = None;
+            }
+            continue;
+        }
+
+        match character {
+            '\'' | '"' => quote = Some(character),
+            ';' if !sql[index + 1..].trim().is_empty() => return true,
+            _ => {}
+        }
+    }
+
+    false
 }
 
 fn find_mariadb_only_pattern(sql: &str) -> Option<String> {
@@ -340,6 +362,23 @@ mod tests {
             StatementOutcome::Quarantined(QuarantineReason::MultiStatement)
         );
         assert!(applier.executor.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn replays_semicolon_inside_string_literal() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let outcome = applier
+            .apply(&statement(
+                r#"INSERT INTO guests (http_user_agent) VALUES ("Mozilla/5.0 (Macintosh; Intel Mac OS X)")"#,
+            ))
+            .expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::Replayed);
+        assert_eq!(applier.executor.statements.borrow().len(), 1);
+        assert!(applier.quarantine.statements.borrow().is_empty());
     }
 
     #[test]

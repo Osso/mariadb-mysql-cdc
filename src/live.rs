@@ -595,6 +595,7 @@ mod tests {
 # at 100
 use `test_cdc`/*!*/;
 SET TIMESTAMP=1/*!*/;
+SET @@session.time_zone='SYSTEM'/*!*/;
 INSERT INTO accounts (id, name) VALUES (1, 'alpha')/*!*/;
 # at 180
 UPDATE accounts SET name = 'beta' WHERE id = 1/*!*/;
