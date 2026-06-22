@@ -1,5 +1,6 @@
 use super::{TargetMySqlConfig, should_ignore_duplicate_insert};
 use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor, render_sql_statement};
+use std::io::Write;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,7 +53,7 @@ impl MysqlCliExecutor {
         let password_arg = format!("--password={}", self.target.password);
         let rendered_statement = render_sql_statement(statement)?;
         let replay_sql = target_replay_sql(&rendered_statement);
-        Command::new(&self.mariadb)
+        let mut child = Command::new(&self.mariadb)
             .args([
                 "--batch",
                 "--raw",
@@ -68,13 +69,14 @@ impl MysqlCliExecutor {
                 "--ssl",
                 "--ssl-verify-server-cert=0",
                 &self.target.database,
-                "-e",
-                &replay_sql,
             ])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| TargetExecuteError::new(format!("failed to run mariadb: {error}")))
+            .map_err(|error| TargetExecuteError::new(format!("failed to run mariadb: {error}")))?;
+        write_replay_sql(&mut child, &replay_sql)?;
+        Ok(child)
     }
 
     fn handle_failed_statement(
@@ -97,6 +99,15 @@ impl MysqlCliExecutor {
     fn can_ignore_duplicate_insert(&self, sql: &str, stderr: &str) -> bool {
         should_ignore_duplicate_insert(self.target.insert_conflict_policy, sql, stderr)
     }
+}
+
+fn write_replay_sql(child: &mut Child, replay_sql: &str) -> Result<(), TargetExecuteError> {
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(TargetExecuteError::new("failed to open mariadb stdin"));
+    };
+    stdin
+        .write_all(replay_sql.as_bytes())
+        .map_err(|error| TargetExecuteError::new(format!("failed to write mariadb stdin: {error}")))
 }
 
 fn wait_for_target_statement(
@@ -384,7 +395,10 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn strips_generated_column_from_insert_values() {
@@ -457,6 +471,24 @@ mod tests {
 
         assert!(error.to_string().contains("ERROR 1064"));
         assert_eq!(fixture.call_count(), 1);
+    }
+
+    #[test]
+    fn execute_sends_large_sql_through_stdin() {
+        let fixture = FakeMariadb::new("", 0);
+        let executor = MysqlCliExecutor::new(fixture.script_path(), target_config());
+        let statement = SqlStatement {
+            sql: format!(
+                "INSERT INTO `events` (`body`) VALUES (\"{}\")",
+                "x".repeat(200_000)
+            ),
+            params: Vec::new(),
+        };
+
+        executor.execute(&statement).expect("large SQL through stdin");
+
+        assert_eq!(fixture.call_count(), 1);
+        assert!(fixture.replay_sql().contains(&statement.sql));
     }
 
     fn target_config() -> TargetMySqlConfig {
@@ -540,12 +572,12 @@ count=$((count + 1))
 printf '%s' "$count" > "$count_file"
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "-e" ]; then
-    shift
-    printf '%s' "$1" > "$replay_sql_file"
-    break
+    printf '%s\n' "unexpected -e argument" >&2
+    exit 2
   fi
   shift
 done
+cat > "$replay_sql_file"
 if [ "$count" -le {success_after_failures} ]; then
   printf '%s\n' {first_error} >&2
   exit 1
@@ -571,8 +603,9 @@ exit 0
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
+        let counter = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "mariadb-mysql-cdc-test-{}-{nanos}",
+            "mariadb-mysql-cdc-test-{}-{nanos}-{counter}",
             std::process::id()
         ))
     }
