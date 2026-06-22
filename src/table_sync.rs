@@ -4,11 +4,13 @@ use std::fmt;
 
 mod mysql;
 mod progress;
+mod target;
 
 use mysql::MySqlSyncReader;
 #[cfg(test)]
 pub(crate) use mysql::build_sync_select_sql;
 pub use progress::{NoopSyncProgressStore, SyncProgressStore, SyncTableProgress};
+pub use target::SyncRepairTarget;
 
 #[derive(Clone, Debug)]
 pub struct SyncTableConfig {
@@ -56,11 +58,6 @@ pub struct SyncTableReport {
 
 pub trait SyncTableReader {
     fn read_rows(&self, request: &SyncChunkRequest) -> Result<Vec<SnapshotRow>, TableSyncError>;
-}
-
-pub trait SyncRepairTarget {
-    fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError>;
-    fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError>;
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -446,21 +443,6 @@ fn apply_update(
         repair_target.update_row(row)?;
     }
     Ok(())
-}
-
-impl<E> SyncRepairTarget for crate::target::TargetMySqlWriter<E>
-where
-    E: crate::target::TargetExecutor,
-{
-    fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
-        self.insert_rows(std::slice::from_ref(row))
-            .map_err(|error| TableSyncError::Repair(error.to_string()))
-    }
-
-    fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
-        crate::target::TargetMySqlWriter::update_row(self, row)
-            .map_err(|error| TableSyncError::Repair(error.to_string()))
-    }
 }
 
 #[cfg(test)]
