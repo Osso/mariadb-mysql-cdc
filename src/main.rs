@@ -63,6 +63,8 @@ Apply options:
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
+  --checkpoint-file PATH          Durable stream checkpoint file used by stream-binlog.
+  --max-reconnects N              Transient stream reconnect attempts. Defaults to 12.
   --mariadb PATH                  mariadb client path. Defaults to mariadb.
   --mariadb-binlog PATH           mariadb-binlog path. Defaults to mariadb-binlog.
 
@@ -358,6 +360,8 @@ fn apply_binlog_option(
     match flag {
         "--mariadb" => config.mariadb = value.to_string(),
         "--mariadb-binlog" => config.mariadb_binlog = value.to_string(),
+        "--checkpoint-file" => config.checkpoint_file = Some(PathBuf::from(value)),
+        "--max-reconnects" => config.max_reconnects = parse_u32(flag, value)?,
         other => return Err(format!("unknown apply-binlog option: {other}")),
     }
 
@@ -426,6 +430,12 @@ fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
         .map_err(|_| format!("{flag} must be an integer"))
 }
 
+fn parse_u32(flag: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{flag} must be an integer"))
+}
+
 fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
     value
         .parse()
@@ -474,6 +484,10 @@ mod tests {
             "/usr/bin/mariadb",
             "--mariadb-binlog",
             "/usr/bin/mariadb-binlog",
+            "--checkpoint-file",
+            "/var/lib/mariadb-mysql-cdc/stream-checkpoint.json",
+            "--max-reconnects",
+            "3",
         ]))
         .expect("apply config");
 
@@ -494,6 +508,13 @@ mod tests {
         );
         assert_eq!(config.mariadb, "/usr/bin/mariadb");
         assert_eq!(config.mariadb_binlog, "/usr/bin/mariadb-binlog");
+        assert_eq!(
+            config.checkpoint_file,
+            Some(PathBuf::from(
+                "/var/lib/mariadb-mysql-cdc/stream-checkpoint.json"
+            ))
+        );
+        assert_eq!(config.max_reconnects, 3);
     }
 
     #[test]
@@ -669,6 +690,10 @@ mod tests {
         assert_eq!(
             parse_usize("--chunk-size", "not-a-size").expect_err("invalid size"),
             "--chunk-size must be an integer"
+        );
+        assert_eq!(
+            parse_u32("--max-reconnects", "not-a-count").expect_err("invalid count"),
+            "--max-reconnects must be an integer"
         );
     }
 

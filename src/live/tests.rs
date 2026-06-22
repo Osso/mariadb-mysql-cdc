@@ -1,4 +1,5 @@
 use super::*;
+use crate::checkpoint::{Checkpoint, LastEvent};
 use std::cell::RefCell;
 
 #[test]
@@ -165,14 +166,149 @@ fn target_client_uses_utf8mb4_connection_charset() {
     );
 }
 
+#[test]
+fn stream_resume_prefers_existing_checkpoint_over_static_coordinates() {
+    let checkpoint_store = MemoryCheckpointStore::with_checkpoint(Checkpoint {
+        source_file: "mysqld-bin.000999".to_string(),
+        source_position: 98765,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: LastEvent {
+            event_type: "StatementEvent".to_string(),
+            description: "INSERT INTO accounts".to_string(),
+        },
+    });
+    let mut config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            binlog_file: "mysqld-bin.000001".to_string(),
+            start_position: 4,
+            ..SourceBinlogConfig::default()
+        },
+        ..ApplyBinlogConfig::default()
+    };
+
+    resume_from_checkpoint(&mut config, Some(&checkpoint_store)).expect("resume checkpoint");
+
+    assert_eq!(config.source.binlog_file, "mysqld-bin.000999");
+    assert_eq!(config.source.start_position, 98765);
+}
+
+#[test]
+fn stream_checkpoint_is_saved_after_successful_apply() {
+    let checkpoint_store = MemoryCheckpointStore::default();
+    let executor = RecordingExecutor::default();
+    let applier = StatementApplier::new(executor, RecordingQuarantine::default());
+    let event = StatementEvent {
+        coordinate: BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 12345,
+        },
+        default_database: Some("globalcomix".to_string()),
+        sql: "INSERT INTO accounts (id) VALUES (1)".to_string(),
+    };
+    let mut progress = StreamProgress::new(BinlogCoordinate {
+        file: "mysqld-bin.000777".to_string(),
+        position: 4,
+    });
+
+    apply_stream_event(&applier, &event, &mut progress, Some(&checkpoint_store))
+        .expect("apply event");
+
+    let saved = checkpoint_store.saved.borrow();
+    let checkpoint = saved.as_ref().expect("saved checkpoint");
+    assert_eq!(checkpoint.source_file, "mysqld-bin.000777");
+    assert_eq!(checkpoint.source_position, 12345);
+    assert_eq!(checkpoint.last_event.event_type, "StatementEvent");
+}
+
+#[test]
+fn stream_checkpoint_is_not_saved_after_failed_apply() {
+    let checkpoint_store = MemoryCheckpointStore::default();
+    let executor = RecordingExecutor::failing("target down");
+    let applier = StatementApplier::new(executor, RecordingQuarantine::default());
+    let event = StatementEvent {
+        coordinate: BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 12345,
+        },
+        default_database: Some("globalcomix".to_string()),
+        sql: "INSERT INTO accounts (id) VALUES (1)".to_string(),
+    };
+    let mut progress = StreamProgress::new(BinlogCoordinate {
+        file: "mysqld-bin.000777".to_string(),
+        position: 4,
+    });
+
+    let error = apply_stream_event(&applier, &event, &mut progress, Some(&checkpoint_store))
+        .expect_err("target failure");
+
+    assert!(error.to_string().contains("target down"));
+    assert!(checkpoint_store.saved.borrow().is_none());
+}
+
+#[test]
+fn reconnects_only_transient_source_errors_with_remaining_attempts() {
+    let transient = ApplyBinlogError::SourceCommand(
+        "mariadb-binlog exited with exit status: 1: TLS/SSL error: Connection reset by peer"
+            .to_string(),
+    );
+    let auth = ApplyBinlogError::SourceCommand(
+        "mariadb-binlog exited with exit status: 1: Access denied".to_string(),
+    );
+
+    assert!(should_reconnect(&transient, 0, 3));
+    assert!(!should_reconnect(&transient, 3, 3));
+    assert!(!should_reconnect(&auth, 0, 3));
+}
+
 #[derive(Default)]
 struct RecordingExecutor {
     statements: RefCell<Vec<String>>,
+    failure: Option<String>,
+}
+
+impl RecordingExecutor {
+    fn failing(message: &str) -> Self {
+        Self {
+            statements: RefCell::new(Vec::new()),
+            failure: Some(message.to_string()),
+        }
+    }
 }
 
 impl TargetExecutor for RecordingExecutor {
     fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
         self.statements.borrow_mut().push(statement.sql.clone());
+        match &self.failure {
+            Some(message) => Err(TargetExecuteError::new(message)),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MemoryCheckpointStore {
+    loaded: RefCell<Option<Checkpoint>>,
+    saved: RefCell<Option<Checkpoint>>,
+}
+
+impl MemoryCheckpointStore {
+    fn with_checkpoint(checkpoint: Checkpoint) -> Self {
+        Self {
+            loaded: RefCell::new(Some(checkpoint)),
+            saved: RefCell::new(None),
+        }
+    }
+}
+
+impl StreamCheckpointStore for MemoryCheckpointStore {
+    fn load_checkpoint(&self) -> Result<Option<Checkpoint>, ApplyBinlogError> {
+        Ok(self.loaded.borrow().clone())
+    }
+
+    fn save_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), ApplyBinlogError> {
+        self.saved.replace(Some(checkpoint.clone()));
+        self.loaded.replace(Some(checkpoint.clone()));
         Ok(())
     }
 }

@@ -8,27 +8,27 @@ source connection loss without replaying from static startup coordinates.
 
 ### Connection loss
 
-- [ ] Detect source stream loss, including TCP reset, TLS reset, EOF, timeout,
+- [x] Detect source stream loss, including TCP reset, TLS reset, EOF, timeout,
   and `mariadb-binlog`/client process exit.
-- [ ] Reconnect automatically after transient source stream loss.
-- [ ] Resume from the last durably applied source coordinate, not from the
+- [x] Reconnect automatically after transient source stream loss.
+- [x] Resume from the last durably applied source coordinate, not from the
   manifest's original `--binlog-file` and `--start-position` arguments.
-- [ ] Apply bounded retry backoff with clear logs for attempt count, delay, and
+- [x] Apply bounded retry backoff with clear logs for attempt count, delay, and
   last durable coordinate.
-- [ ] Stop and fail explicitly on non-transient errors such as authentication
+- [x] Stop and fail explicitly on non-transient errors such as authentication
   failure, missing binlog file, unsupported event type, quarantine, or target
   write failure.
 
 ### Durable checkpointing
 
-- [ ] Persist the last successfully applied binlog file and position outside the
+- [x] Persist the last successfully applied binlog file and position outside the
   running process before acknowledging stream progress.
 - [ ] Persist GTID when available, alongside file/position.
-- [ ] On process start, prefer the durable checkpoint over static startup
+- [x] On process start, prefer the durable checkpoint over static startup
   coordinates unless an explicit reset flag is provided.
-- [ ] Never advance the checkpoint before the corresponding target write has
+- [x] Never advance the checkpoint before the corresponding target write has
   succeeded.
-- [ ] Make checkpoint writes atomic so pod eviction or node loss cannot leave a
+- [x] Make checkpoint writes atomic so pod eviction or node loss cannot leave a
   partially written checkpoint.
 
 ### Replay safety
@@ -37,19 +37,19 @@ source connection loss without replaying from static startup coordinates.
   the checkpoint boundary.
 - [ ] Duplicate-key handling may be used only as a secondary safety net; it must
   not be the primary recovery mechanism.
-- [ ] Preserve binlog order across reconnects.
+- [x] Preserve binlog order across reconnects.
 - [ ] Log every reconnect boundary with previous coordinate, resume coordinate,
   and first applied coordinate after reconnect.
 
 ### Architecture
 
-- [ ] The production stream must own reconnect and checkpoint semantics in Rust.
-- [ ] `mariadb-binlog --stop-never` may be used for fixtures, probes, and
+- [x] The production stream must own reconnect and checkpoint semantics in Rust.
+- [x] `mariadb-binlog --stop-never` may be used for fixtures, probes, and
   debugging, but must not be the production live-stream architecture unless it
   is wrapped by durable reconnect/resume logic that satisfies this spec.
-- [ ] Kubernetes restarts must not be required for normal source connection
+- [x] Kubernetes restarts must not be required for normal source connection
   recovery.
-- [ ] A Kubernetes restart must resume from the same durable checkpoint as an
+- [x] A Kubernetes restart must resume from the same durable checkpoint as an
   in-process reconnect.
 
 ### Observability
@@ -82,17 +82,25 @@ source connection loss without replaying from static startup coordinates.
 
 ## Tests asserting this spec
 
-- No automated tests assert reconnect behavior yet.
+- `src/live/tests.rs` — asserts startup prefers an existing stream checkpoint
+  over static CLI coordinates.
+- `src/live/tests.rs` — asserts stream checkpoints are saved after successful
+  target apply and not saved after failed target apply.
+- `src/live/tests.rs` — asserts transient TLS/connection-reset source failures
+  reconnect only while attempts remain, and non-transient source failures do not
+  reconnect.
+- `src/checkpoint.rs` — asserts file-backed checkpoint writes are atomic through
+  temporary-file-and-rename behavior.
 
 ## Known gaps (current cycle)
 
 - [ ] Add a failing test where stream input exits after applying events and the
   next stream resumes from the saved checkpoint.
-- [ ] Add a failing test where process startup reads an existing checkpoint and
+- [x] Add a failing test where process startup reads an existing checkpoint and
   overrides static startup coordinates.
-- [ ] Add a failing test that checkpoint is written only after successful target
+- [x] Add a failing test that checkpoint is written only after successful target
   apply.
-- [ ] Replace or wrap the `mariadb-binlog --stop-never` production path so a TLS
+- [x] Replace or wrap the `mariadb-binlog --stop-never` production path so a TLS
   reset does not terminate CDC progress.
 
 ## Out of scope

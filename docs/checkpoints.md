@@ -29,3 +29,30 @@ Example:
 Writes use a temporary file followed by rename so a crash does not leave a
 partially written checkpoint at the final path.
 
+## Live Stream Checkpoints
+
+`stream-binlog` uses `--checkpoint-file` to persist the last successfully
+applied statement coordinate:
+
+```bash
+mariadb-mysql-cdc stream-binlog \
+  --source-host 192.0.2.10 \
+  --source-user cdc_reader \
+  --source-password-env SOURCE_PASSWORD \
+  --source-database globalcomix \
+  --binlog-file mysqld-bin.002524 \
+  --start-position 882748822 \
+  --target-host target-mysql.example \
+  --target-port 25060 \
+  --target-user target_user \
+  --target-password-env TARGET_PASSWORD \
+  --target-database globalcomix \
+  --insert-conflict-policy ignore-duplicate \
+  --checkpoint-file /var/lib/mariadb-mysql-cdc/stream-checkpoint.json
+```
+
+When the checkpoint file exists, `stream-binlog` resumes from it instead of the
+static `--binlog-file` and `--start-position` arguments. Transient source stream
+loss such as TLS connection reset triggers in-process reconnect with bounded
+backoff. Non-transient source errors, target write failures, and quarantined SQL
+still fail the process.
