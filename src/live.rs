@@ -582,12 +582,11 @@ impl StatementEventExtractor {
         }
 
         if let Some(position) = parse_at_position(line) {
-            self.current_position = position;
-            self.current_resume_position = position;
+            self.accept_position(position);
             return None;
         }
         if let Some(position) = parse_end_log_position(line) {
-            self.current_resume_position = position;
+            self.accept_resume_position(position);
             return None;
         }
         if let Some(file) = parse_rotate_file(line) {
@@ -608,6 +607,21 @@ impl StatementEventExtractor {
 
     fn is_collecting_statement(&self) -> bool {
         !self.pending_statement.is_empty()
+    }
+
+    fn accept_position(&mut self, position: u64) {
+        if position == 0 {
+            return;
+        }
+        self.current_position = position;
+        self.current_resume_position = position;
+    }
+
+    fn accept_resume_position(&mut self, position: u64) {
+        if position == 0 {
+            return;
+        }
+        self.current_resume_position = position;
     }
 
     fn collect_statement_line(&mut self, line: &str) -> Option<StatementEvent> {

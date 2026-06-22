@@ -42,6 +42,27 @@ DELETE FROM accounts WHERE id = 1/*!*/;
 }
 
 #[test]
+fn extractor_ignores_zero_positions_after_resume_coordinate() {
+    let events = extract_statement_events(
+        "\
+# at 0
+#250601 12:00:00 server id 1  end_log_pos 0
+use `test_cdc`/*!*/;
+SET TIMESTAMP=1/*!*/;
+INSERT INTO accounts (id, name) VALUES (1, 'alpha')/*!*/;
+",
+        &BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 905_294_149,
+        },
+    );
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].coordinate.position, 905_294_149);
+    assert_eq!(events[0].resume_position, 905_294_149);
+}
+
+#[test]
 fn keeps_semicolon_lines_inside_multiline_string_literals() {
     let events = extract_statement_events(
         "\
