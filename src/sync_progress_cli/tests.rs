@@ -1,3 +1,6 @@
+use super::progress_format::{
+    display_duration, display_percent, eta, format_progress_row, format_progress_rows, rate,
+};
 use super::*;
 use crate::mysql_support::qualified_table_parts;
 use std::env;
@@ -255,6 +258,27 @@ fn formats_running_progress_at_bottom_under_header() {
 }
 
 #[test]
+fn aggregates_running_range_progress_by_parent_table() {
+    let config = default_sync_progress_config();
+    let rows = vec![
+        range_progress_row("comics_releases_fragments_views#range0", 40, 100),
+        range_progress_row("comics_releases_fragments_views#range1", 30, 100),
+        progress_row("unrelated", "running"),
+    ];
+
+    let lines = format_progress_rows(&config, &rows);
+
+    assert_eq!(lines[0], "sync_progress_section name=in_progress");
+    assert!(lines[1].contains("table=comics_releases_fragments_views status=running"));
+    assert!(lines[1].contains("rows_scanned=70"));
+    assert!(lines[1].contains("total_rows=200"));
+    assert!(lines[1].contains("progress=35.00%"));
+    assert_eq!(lines[3], "sync_progress_section name=range_details");
+    assert!(lines[4].contains("table=comics_releases_fragments_views#range0"));
+    assert!(lines[5].contains("table=comics_releases_fragments_views#range1"));
+}
+
+#[test]
 fn builds_progress_table_lookup_for_qualified_and_default_schema_tables() {
     assert_eq!(
         qualified_table_parts("globalcomix", "cdc.table_sync_progress"),
@@ -339,6 +363,21 @@ fn progress_row(table: &str, status: &str) -> SyncProgressRow {
         status: status.to_string(),
         last_primary_key: String::new(),
         elapsed_seconds: 5,
+        last_error: String::new(),
+    }
+}
+
+fn range_progress_row(table: &str, rows_scanned: u64, total_rows: u64) -> SyncProgressRow {
+    SyncProgressRow {
+        table: table.to_string(),
+        rows_scanned,
+        total_rows: Some(total_rows),
+        inserts: rows_scanned,
+        updates: 0,
+        extra_target_rows: 0,
+        status: "running".to_string(),
+        last_primary_key: String::new(),
+        elapsed_seconds: 10,
         last_error: String::new(),
     }
 }

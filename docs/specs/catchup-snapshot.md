@@ -69,7 +69,7 @@ in [catchup.md](../catchup.md).
 
 ## Known gaps (current cycle)
 
-- [ ] Add aggregate parent-table progress while parallel ranges are running.
+- [x] Add aggregate parent-table progress while parallel ranges are running.
 
 ## Out of scope
 

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 mod cache;
 mod output;
+mod progress_format;
 
 const SYNC_PROGRESS_DB_TIMEOUT: Duration = Duration::from_secs(2);
 pub fn run_sync_progress_command(args: Vec<String>, usage: &str) {
@@ -330,7 +331,7 @@ fn read_live_sync_progress(config: &SyncProgressConfig) -> Result<String, String
             &config.progress_table,
             "empty",
         )),
-        Some(rows) => lines.extend(format_progress_rows(config, &rows)),
+        Some(rows) => lines.extend(progress_format::format_progress_rows(config, &rows)),
         None => lines.push(format_progress_table_status(
             &config.progress_table,
             "missing",
@@ -382,52 +383,6 @@ fn read_stream_checkpoint(
             .map_err(|error| error.to_string());
     }
     reader.read_stream_checkpoint(&config.checkpoint_table)
-}
-
-fn format_progress_rows(config: &SyncProgressConfig, rows: &[SyncProgressRow]) -> Vec<String> {
-    let (running_rows, other_rows): (Vec<_>, Vec<_>) = rows
-        .iter()
-        .partition(|row| row.status.eq_ignore_ascii_case("running"));
-    let mut lines = other_rows
-        .iter()
-        .map(|row| format_progress_row(config, row))
-        .collect::<Vec<_>>();
-    if !running_rows.is_empty() {
-        lines.push("sync_progress_section name=in_progress".to_string());
-        lines.extend(
-            running_rows
-                .iter()
-                .map(|row| format_progress_row(config, row)),
-        );
-    }
-    lines
-}
-
-fn format_progress_row(config: &SyncProgressConfig, row: &SyncProgressRow) -> String {
-    let rows_per_second = rate(row.rows_scanned, row.elapsed_seconds);
-    let inserts_per_second = rate(row.inserts, row.elapsed_seconds);
-    let total_rows = row
-        .total_rows
-        .or_else(|| source_count(config, &row.table).ok().flatten());
-    let remaining = total_rows.map(|total| total.saturating_sub(row.rows_scanned));
-    let eta_seconds = remaining.and_then(|remaining| eta(remaining, rows_per_second));
-
-    format!(
-        "table={} status={} rows_scanned={} total_rows={} progress={} rows_per_second={:.2} inserts_per_second={:.2} eta={} last_pk={} inserts={} updates={} extras={} error={}",
-        row.table,
-        row.status,
-        row.rows_scanned,
-        display_optional_u64(total_rows),
-        display_percent(row.rows_scanned, total_rows),
-        rows_per_second,
-        inserts_per_second,
-        display_duration(eta_seconds),
-        display_last_primary_key(&row.last_primary_key),
-        row.inserts,
-        row.updates,
-        row.extra_target_rows,
-        display_error(&row.last_error)
-    )
 }
 
 fn build_progress_query(progress_table: &str, table: Option<&str>, has_total_rows: bool) -> String {
@@ -679,49 +634,6 @@ fn source_mysql_args(source: &mysql_snapshot::MySqlConnectionConfig) -> Vec<Stri
         "--database".to_string(),
         source.database.clone(),
     ]
-}
-
-fn rate(count: u64, seconds: u64) -> f64 {
-    count as f64 / seconds.max(1) as f64
-}
-
-fn eta(remaining: u64, rows_per_second: f64) -> Option<u64> {
-    if rows_per_second <= 0.0 {
-        None
-    } else {
-        Some((remaining as f64 / rows_per_second).ceil() as u64)
-    }
-}
-
-fn display_optional_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn display_percent(done: u64, total: Option<u64>) -> String {
-    match total {
-        Some(0) => "100.00%".to_string(),
-        Some(total) => format!("{:.2}%", (done as f64 / total as f64) * 100.0),
-        None => "-".to_string(),
-    }
-}
-
-fn display_duration(seconds: Option<u64>) -> String {
-    let Some(seconds) = seconds else {
-        return "-".to_string();
-    };
-    let minutes = seconds / 60;
-    let seconds = seconds % 60;
-    format!("{minutes}m{seconds:02}s")
-}
-
-fn display_last_primary_key(value: &str) -> &str {
-    if value.is_empty() { "-" } else { value }
-}
-
-fn display_error(value: &str) -> &str {
-    if value.is_empty() { "-" } else { value }
 }
 
 fn parse_u64_field(field: &str, value: &str) -> Result<u64, String> {
