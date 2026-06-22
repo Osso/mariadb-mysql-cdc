@@ -156,16 +156,44 @@ fn catchup_progress_store(
     })
 }
 
-struct CatchupProgressStore {
+trait CatchupMysqlProgressStore {
+    fn ensure(&self) -> Result<(), TableSyncError>;
+    fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError>;
+    fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError>;
+}
+
+impl CatchupMysqlProgressStore for PersistentProgressWriter {
+    fn ensure(&self) -> Result<(), TableSyncError> {
+        self.ensure()
+    }
+
+    fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError> {
+        self.load_snapshot_progress()
+    }
+
+    fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
+        self.save(progress)
+    }
+}
+
+struct CatchupProgressStore<M = PersistentProgressWriter> {
     file_store: FileSnapshotProgressStore,
-    mysql_store: PersistentProgressWriter,
+    mysql_store: M,
     total_rows: RefCell<BTreeMap<String, u64>>,
     mysql_save_state: RefCell<BTreeMap<String, MysqlProgressSaveState>>,
 }
 
-impl SnapshotProgressStore for CatchupProgressStore {
+impl<M> SnapshotProgressStore for CatchupProgressStore<M>
+where
+    M: CatchupMysqlProgressStore,
+{
     fn load(&self) -> Result<SnapshotProgress, SnapshotError> {
-        self.file_store.load()
+        let file_progress = self.file_store.load()?;
+        if !file_progress.tables.is_empty() {
+            return Ok(file_progress);
+        }
+
+        self.load_mysql_progress()
     }
 
     fn save(&self, progress: &SnapshotProgress) -> Result<(), SnapshotError> {
@@ -175,7 +203,17 @@ impl SnapshotProgressStore for CatchupProgressStore {
     }
 }
 
-impl CatchupProgressStore {
+impl<M> CatchupProgressStore<M>
+where
+    M: CatchupMysqlProgressStore,
+{
+    fn load_mysql_progress(&self) -> Result<SnapshotProgress, SnapshotError> {
+        self.mysql_store
+            .ensure()
+            .and_then(|_| self.mysql_store.load_snapshot_progress())
+            .map_err(|error| SnapshotError::InvalidTable(error.to_string()))
+    }
+
     fn record_total_rows(&self, table: &str, total_rows: u64) {
         self.total_rows
             .borrow_mut()
@@ -555,5 +593,109 @@ mod tests {
         assert!(!state.should_save(2_000, running, now + MYSQL_PROGRESS_SAVE_INTERVAL / 2));
         assert!(state.should_save(3_000, running, now + MYSQL_PROGRESS_SAVE_INTERVAL));
         assert!(state.should_save(3_000, complete, now + MYSQL_PROGRESS_SAVE_INTERVAL / 2));
+    }
+
+    #[test]
+    fn catchup_progress_loads_mysql_progress_when_file_is_empty() {
+        let path = unique_path("empty-progress.json");
+        let mysql_progress = snapshot_progress("accounts", Some(vec!["42".to_string()]), 42, false);
+        let store = catchup_progress_store_for_test(&path, mysql_progress.clone());
+
+        let loaded = store.load().expect("progress");
+
+        assert_eq!(loaded, mysql_progress);
+        assert_eq!(*store.mysql_store.ensure_calls.borrow(), 1);
+        assert_eq!(*store.mysql_store.load_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn catchup_progress_prefers_file_progress_over_mysql_progress() {
+        let path = unique_path("file-progress.json");
+        let file_store = FileSnapshotProgressStore::new(path.clone());
+        let file_progress = snapshot_progress("accounts", Some(vec!["9".to_string()]), 9, false);
+        file_store.save(&file_progress).expect("save file progress");
+        let mysql_progress = snapshot_progress("accounts", Some(vec!["42".to_string()]), 42, false);
+        let store = catchup_progress_store_for_test(&path, mysql_progress);
+
+        let loaded = store.load().expect("progress");
+
+        assert_eq!(loaded, file_progress);
+        assert_eq!(*store.mysql_store.ensure_calls.borrow(), 0);
+        assert_eq!(*store.mysql_store.load_calls.borrow(), 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn catchup_progress_store_for_test(
+        path: &std::path::Path,
+        mysql_progress: SnapshotProgress,
+    ) -> CatchupProgressStore<FakeMysqlProgressStore> {
+        CatchupProgressStore {
+            file_store: FileSnapshotProgressStore::new(path),
+            mysql_store: FakeMysqlProgressStore::new(mysql_progress),
+            total_rows: RefCell::new(BTreeMap::new()),
+            mysql_save_state: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    fn snapshot_progress(
+        table: &str,
+        last_primary_key: Option<Vec<String>>,
+        rows_copied: u64,
+        complete: bool,
+    ) -> SnapshotProgress {
+        let table_progress = crate::snapshot::TableSnapshotProgress {
+            last_primary_key,
+            rows_copied,
+            complete,
+        };
+        SnapshotProgress {
+            tables: BTreeMap::from([(table.to_string(), table_progress)]),
+        }
+    }
+
+    fn unique_path(file_name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        path.push(format!("mariadb-mysql-cdc-{nanos}-{file_name}"));
+        path
+    }
+
+    struct FakeMysqlProgressStore {
+        progress: SnapshotProgress,
+        ensure_calls: RefCell<u32>,
+        load_calls: RefCell<u32>,
+        saved: RefCell<Vec<SyncTableProgress>>,
+    }
+
+    impl FakeMysqlProgressStore {
+        fn new(progress: SnapshotProgress) -> Self {
+            Self {
+                progress,
+                ensure_calls: RefCell::new(0),
+                load_calls: RefCell::new(0),
+                saved: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CatchupMysqlProgressStore for FakeMysqlProgressStore {
+        fn ensure(&self) -> Result<(), TableSyncError> {
+            *self.ensure_calls.borrow_mut() += 1;
+            Ok(())
+        }
+
+        fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError> {
+            *self.load_calls.borrow_mut() += 1;
+            Ok(self.progress.clone())
+        }
+
+        fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
+            self.saved.borrow_mut().push(progress.clone());
+            Ok(())
+        }
     }
 }

@@ -1,7 +1,10 @@
 use crate::live::{InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert};
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::quote_ident;
-use crate::snapshot::{ChunkRequest, SnapshotError, SnapshotRow, SnapshotSource};
+use crate::mysql_support::{quote_ident, quote_identifier_path};
+use crate::snapshot::{
+    ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource,
+    TableSnapshotProgress,
+};
 use crate::table_sync::progress::{
     build_add_total_rows_column_sql, build_create_progress_schema_sql,
     build_create_progress_table_sql, build_progress_upsert_sql,
@@ -169,12 +172,63 @@ impl PersistentProgressWriter {
         self.execute_progress_sql(build_progress_upsert_sql(&self.progress_table, progress))
     }
 
+    pub fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError> {
+        let sql = build_snapshot_progress_select_sql(&self.progress_table);
+        let rows = self
+            .conn
+            .borrow_mut()
+            .query::<SnapshotProgressRow, _>(sql)
+            .map_err(progress_query_error)?;
+        snapshot_progress_from_rows(rows)
+    }
+
     fn execute_progress_sql(&self, sql: String) -> Result<(), TableSyncError> {
         self.conn
             .borrow_mut()
             .query_drop(sql)
             .map_err(progress_query_error)
     }
+}
+
+type SnapshotProgressRow = (String, String, u64, String);
+
+fn build_snapshot_progress_select_sql(progress_table: &str) -> String {
+    format!(
+        "SELECT table_name, COALESCE(last_primary_key_json, ''), rows_scanned, status FROM {}",
+        quote_identifier_path(progress_table)
+    )
+}
+
+fn snapshot_progress_from_rows(
+    rows: Vec<SnapshotProgressRow>,
+) -> Result<SnapshotProgress, TableSyncError> {
+    let tables = rows
+        .into_iter()
+        .map(snapshot_table_progress_from_row)
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok(SnapshotProgress { tables })
+}
+
+fn snapshot_table_progress_from_row(
+    row: SnapshotProgressRow,
+) -> Result<(String, TableSnapshotProgress), TableSyncError> {
+    let (table, primary_key_json, rows_copied, status) = row;
+    let progress = TableSnapshotProgress {
+        last_primary_key: parse_progress_primary_key(&primary_key_json)?,
+        rows_copied,
+        complete: status == "complete",
+    };
+    Ok((table, progress))
+}
+
+fn parse_progress_primary_key(value: &str) -> Result<Option<Vec<String>>, TableSyncError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    serde_json::from_str(value)
+        .map(Some)
+        .map_err(|error| TableSyncError::Progress(format!("invalid primary key json: {error}")))
 }
 
 fn base_opts(
@@ -373,5 +427,45 @@ mod tests {
         );
 
         assert!(opts.get_ssl_opts().is_some());
+    }
+
+    #[test]
+    fn builds_snapshot_progress_select_sql_for_cdc_table() {
+        let sql = build_snapshot_progress_select_sql("cdc.table_sync_progress");
+
+        assert_eq!(
+            sql,
+            "SELECT table_name, COALESCE(last_primary_key_json, ''), rows_scanned, status FROM `cdc`.`table_sync_progress`"
+        );
+    }
+
+    #[test]
+    fn converts_mysql_progress_rows_to_snapshot_progress() {
+        let rows = vec![
+            (
+                "accounts".to_string(),
+                "[\"42\"]".to_string(),
+                42,
+                "running".to_string(),
+            ),
+            (
+                "releases".to_string(),
+                String::new(),
+                100,
+                "complete".to_string(),
+            ),
+        ];
+
+        let progress = snapshot_progress_from_rows(rows).expect("progress");
+
+        let accounts = progress.table("accounts").expect("accounts");
+        assert_eq!(accounts.last_primary_key, Some(vec!["42".to_string()]));
+        assert_eq!(accounts.rows_copied, 42);
+        assert!(!accounts.complete);
+
+        let releases = progress.table("releases").expect("releases");
+        assert_eq!(releases.last_primary_key, None);
+        assert_eq!(releases.rows_copied, 100);
+        assert!(releases.complete);
     }
 }
