@@ -227,7 +227,7 @@ pub fn snapshot_table(
     target: &mut impl SnapshotTarget,
 ) -> Result<SnapshotResult, SnapshotError> {
     validate_table(table)?;
-    let mut progress = progress_store.load()?;
+    let mut progress = load_progress_with_retry(progress_store, &table.name)?;
     let starting_rows_copied = rows_copied_for_table(&progress, &table.name);
     if is_table_complete(&progress, &table.name) {
         return Ok(snapshot_result(table, 0));
@@ -278,11 +278,20 @@ fn copy_table_chunks(
     }
 }
 
+fn load_progress_with_retry(
+    progress_store: &impl SnapshotProgressStore,
+    table: &str,
+) -> Result<SnapshotProgress, SnapshotError> {
+    let context = RetryContext::new("progress_load", table, None);
+    retry_snapshot_operation(&context, || progress_store.load())
+}
+
 fn read_chunk_with_retry(
     source: &impl SnapshotSource,
     request: &ChunkRequest,
 ) -> Result<Vec<SnapshotRow>, SnapshotError> {
-    retry_snapshot_operation("source_read", request, || source.read_chunk(request))
+    let context = RetryContext::from_request("source_read", request);
+    retry_snapshot_operation(&context, || source.read_chunk(request))
 }
 
 fn write_rows_with_retry(
@@ -290,7 +299,8 @@ fn write_rows_with_retry(
     request: &ChunkRequest,
     rows: &[SnapshotRow],
 ) -> Result<(), SnapshotError> {
-    retry_snapshot_operation("target_write", request, || target.write_rows(rows))
+    let context = RetryContext::from_request("target_write", request);
+    retry_snapshot_operation(&context, || target.write_rows(rows))
 }
 
 fn save_progress_with_retry(
@@ -298,12 +308,12 @@ fn save_progress_with_retry(
     progress: &SnapshotProgress,
     request: &ChunkRequest,
 ) -> Result<(), SnapshotError> {
-    retry_snapshot_operation("progress_save", request, || progress_store.save(progress))
+    let context = RetryContext::from_request("progress_save", request);
+    retry_snapshot_operation(&context, || progress_store.save(progress))
 }
 
 fn retry_snapshot_operation<T>(
-    operation: &str,
-    request: &ChunkRequest,
+    context: &RetryContext,
     mut attempt_operation: impl FnMut() -> Result<T, SnapshotError>,
 ) -> Result<T, SnapshotError> {
     let mut last_error = None;
@@ -311,7 +321,7 @@ fn retry_snapshot_operation<T>(
         match attempt_operation() {
             Ok(value) => return Ok(value),
             Err(error) => {
-                log_snapshot_retry(operation, request, attempt, &error);
+                log_snapshot_retry(context, attempt, &error);
                 last_error = Some(error);
             }
         }
@@ -321,36 +331,48 @@ fn retry_snapshot_operation<T>(
         }
     }
 
-    Err(retry_error(
-        operation,
-        request,
-        last_error.expect("retry error"),
-    ))
+    Err(retry_error(context, last_error.expect("retry error")))
 }
 
-fn log_snapshot_retry(
-    operation: &str,
-    request: &ChunkRequest,
-    attempt: u32,
-    error: &SnapshotError,
-) {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetryContext {
+    operation: &'static str,
+    table: String,
+    start_after: String,
+}
+
+impl RetryContext {
+    fn new(operation: &'static str, table: &str, start_after: Option<Vec<String>>) -> Self {
+        Self {
+            operation,
+            table: table.to_string(),
+            start_after: format_start_after(&start_after),
+        }
+    }
+
+    fn from_request(operation: &'static str, request: &ChunkRequest) -> Self {
+        Self::new(operation, &request.table, request.start_after.clone())
+    }
+}
+
+fn log_snapshot_retry(context: &RetryContext, attempt: u32, error: &SnapshotError) {
     eprintln!(
         "snapshot_retry operation={} table={} attempt={} attempts={} start_after={} error={}",
-        operation,
-        request.table,
+        context.operation,
+        context.table,
         attempt,
         SNAPSHOT_RETRY_ATTEMPTS,
-        format_start_after(&request.start_after),
+        context.start_after,
         error
     );
 }
 
-fn retry_error(operation: &str, request: &ChunkRequest, source: SnapshotError) -> SnapshotError {
+fn retry_error(context: &RetryContext, source: SnapshotError) -> SnapshotError {
     SnapshotError::Retry {
-        operation: operation.to_string(),
-        table: request.table.clone(),
+        operation: context.operation.to_string(),
+        table: context.table.clone(),
         attempts: SNAPSHOT_RETRY_ATTEMPTS,
-        start_after: format_start_after(&request.start_after),
+        start_after: context.start_after.clone(),
         source: Box::new(source),
     }
 }

@@ -90,6 +90,24 @@ fn retries_temporary_progress_save_failure() {
 }
 
 #[test]
+fn retries_temporary_progress_load_failure_before_resuming() {
+    let table = accounts_table();
+    let mut saved_progress = SnapshotProgress::default();
+    saved_progress.mark_chunk("accounts", vec!["1".to_string()], 1);
+    let progress_store = FlakyProgressStore::fail_load_then_return(1, saved_progress);
+    let source = FakeSnapshotSource::new(vec![vec![row("2", "bravo")]]);
+    let mut target = FakeSnapshotTarget::default();
+
+    snapshot_table(&table, 2, &progress_store, &source, &mut target).expect("snapshot");
+
+    assert_eq!(progress_store.load_attempts(), 2);
+    assert_eq!(
+        source.requests.borrow()[0].start_after,
+        Some(vec!["1".to_string()])
+    );
+}
+
+#[test]
 fn reports_retry_context_after_repeated_failure() {
     let table = accounts_table();
     let progress_store = MemoryProgressStore::default();
@@ -241,6 +259,8 @@ impl SnapshotProgressStore for MemoryProgressStore {
 }
 
 struct FlakyProgressStore {
+    load_failures_remaining: RefCell<u32>,
+    load_attempts: RefCell<u32>,
     failures_remaining: RefCell<u32>,
     progress: RefCell<SnapshotProgress>,
     save_attempts: RefCell<u32>,
@@ -249,10 +269,26 @@ struct FlakyProgressStore {
 impl FlakyProgressStore {
     fn fail_then_save(failures: u32) -> Self {
         Self {
+            load_failures_remaining: RefCell::new(0),
+            load_attempts: RefCell::new(0),
             failures_remaining: RefCell::new(failures),
             progress: RefCell::new(SnapshotProgress::default()),
             save_attempts: RefCell::new(0),
         }
+    }
+
+    fn fail_load_then_return(failures: u32, progress: SnapshotProgress) -> Self {
+        Self {
+            load_failures_remaining: RefCell::new(failures),
+            load_attempts: RefCell::new(0),
+            failures_remaining: RefCell::new(0),
+            progress: RefCell::new(progress),
+            save_attempts: RefCell::new(0),
+        }
+    }
+
+    fn load_attempts(&self) -> u32 {
+        *self.load_attempts.borrow()
     }
 
     fn save_attempts(&self) -> u32 {
@@ -262,6 +298,11 @@ impl FlakyProgressStore {
 
 impl SnapshotProgressStore for FlakyProgressStore {
     fn load(&self) -> Result<SnapshotProgress, SnapshotError> {
+        *self.load_attempts.borrow_mut() += 1;
+        if take_failure(&self.load_failures_remaining) {
+            return Err(test_error("progress load timeout"));
+        }
+
         Ok(self.progress.borrow().clone())
     }
 
@@ -278,18 +319,21 @@ impl SnapshotProgressStore for FlakyProgressStore {
 
 struct FakeSnapshotSource {
     chunks: RefCell<VecDeque<Vec<SnapshotRow>>>,
+    requests: RefCell<Vec<ChunkRequest>>,
 }
 
 impl FakeSnapshotSource {
     fn new(chunks: Vec<Vec<SnapshotRow>>) -> Self {
         Self {
             chunks: RefCell::new(chunks.into()),
+            requests: RefCell::new(Vec::new()),
         }
     }
 }
 
 impl SnapshotSource for FakeSnapshotSource {
-    fn read_chunk(&self, _request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError> {
+    fn read_chunk(&self, request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError> {
+        self.requests.borrow_mut().push(request.clone());
         Ok(self.chunks.borrow_mut().pop_front().unwrap_or_default())
     }
 }
