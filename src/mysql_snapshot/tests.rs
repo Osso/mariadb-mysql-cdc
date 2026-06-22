@@ -83,6 +83,39 @@ fn mysql_progress_save_is_throttled_until_interval_or_completion() {
 }
 
 #[test]
+fn parallel_worker_count_is_bounded_by_table_rows() {
+    assert_eq!(parallel_worker_count(0, 4), 1);
+    assert_eq!(parallel_worker_count(2, 4), 2);
+    assert_eq!(parallel_worker_count(100, 4), 4);
+}
+
+#[test]
+fn catchup_table_mode_uses_parallel_only_when_requested() {
+    assert_eq!(catchup_table_mode(100, 1), CatchupTableMode::Sequential);
+    assert_eq!(
+        catchup_table_mode(100, 4),
+        CatchupTableMode::Parallel { workers: 4 }
+    );
+    assert_eq!(
+        catchup_table_mode(2, 4),
+        CatchupTableMode::Parallel { workers: 2 }
+    );
+}
+
+#[test]
+fn rejects_zero_parallel_workers() {
+    let mut config = valid_catchup_config();
+    config.parallel_workers = 0;
+
+    let error = validate_config(&config).expect_err("zero workers");
+
+    assert_eq!(
+        error.to_string(),
+        "parallel workers must be greater than zero"
+    );
+}
+
+#[test]
 fn catchup_snapshot_uses_persistent_clients_for_chunk_io() {
     let source = include_str!("../mysql_snapshot.rs");
 
@@ -91,6 +124,42 @@ fn catchup_snapshot_uses_persistent_clients_for_chunk_io() {
     assert!(source.contains("PersistentProgressWriter::new(&config.target"));
     assert!(!source.contains("MysqlCliExecutor"));
     assert!(!source.contains("Command::new"));
+}
+
+#[test]
+fn catchup_snapshot_parallel_path_uses_threaded_range_workers() {
+    let source = include_str!("parallel.rs");
+
+    assert!(source.contains("std::thread::scope"));
+    assert!(source.contains("read_range_boundaries"));
+    assert!(source.contains("snapshot_table_range_with_observer"));
+}
+
+fn valid_catchup_config() -> CatchupSnapshotConfig {
+    CatchupSnapshotConfig {
+        source: MySqlConnectionConfig {
+            host: "source".to_string(),
+            port: 3306,
+            user: "reader".to_string(),
+            password: "secret".to_string(),
+            database: "globalcomix".to_string(),
+            mariadb: "mariadb".to_string(),
+        },
+        target: TargetMySqlConfig {
+            host: "target".to_string(),
+            port: 25060,
+            user: "writer".to_string(),
+            password: "secret".to_string(),
+            database: "globalcomix".to_string(),
+            insert_conflict_policy: crate::live::InsertConflictPolicy::IgnoreDuplicate,
+        },
+        progress_file: std::path::PathBuf::from("progress.json"),
+        progress_table: "cdc.table_sync_progress".to_string(),
+        chunk_size: 10_000,
+        throttle: Duration::ZERO,
+        parallel_workers: 1,
+        table: None,
+    }
 }
 
 #[test]

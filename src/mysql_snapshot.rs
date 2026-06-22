@@ -15,7 +15,11 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+mod parallel;
 mod progress_log;
+#[cfg(test)]
+use parallel::parallel_worker_count;
+use parallel::{CatchupTableMode, catchup_table_mode, copy_catchup_table_parallel};
 use progress_log::{
     CatchupSnapshotLogger, format_catchup_table_complete, format_catchup_table_start,
 };
@@ -66,6 +70,13 @@ pub struct CatchupSnapshotReport {
 pub struct CatchupSnapshotTableReport {
     pub table: String,
     pub rows_copied: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CatchupTableLogContext {
+    table_number: usize,
+    total_tables: usize,
+    completed_tables: usize,
 }
 
 #[derive(Debug)]
@@ -129,9 +140,10 @@ pub fn run_catchup_snapshot(
 
 fn log_catchup_snapshot_start(total_tables: usize, config: &CatchupSnapshotConfig) {
     println!(
-        "catchup_snapshot_start tables={} chunk_size={} progress_file={}",
+        "catchup_snapshot_start tables={} chunk_size={} parallel_workers={} progress_file={}",
         total_tables,
         config.chunk_size,
+        config.parallel_workers,
         config.progress_file.display()
     );
 }
@@ -163,15 +175,12 @@ fn run_catchup_table_inner(
     prepare_snapshot_table_progress(source, progress_store, &table.name)?;
     let table_number = reports.len() + 1;
     log_catchup_table_start(progress_store, table, table_number, total_tables);
-    let result = copy_catchup_table(
-        config,
-        progress_store,
-        source,
-        table,
+    let log_context = CatchupTableLogContext {
         table_number,
         total_tables,
-        reports.len(),
-    )?;
+        completed_tables: reports.len(),
+    };
+    let result = copy_catchup_table(config, progress_store, source, table, log_context)?;
     Ok(CatchupSnapshotTableReport {
         table: result.table,
         rows_copied: result.rows_copied,
@@ -196,15 +205,33 @@ fn copy_catchup_table(
     progress_store: &CatchupProgressStore,
     source: &PersistentMySqlSource,
     table: &SnapshotTable,
-    table_number: usize,
-    total_tables: usize,
-    completed_tables: usize,
+    log_context: CatchupTableLogContext,
+) -> Result<crate::snapshot::SnapshotResult, CatchupSnapshotError> {
+    let total_rows = progress_store
+        .total_rows_for_table(&table.name)
+        .unwrap_or(0);
+    match catchup_table_mode(total_rows, config.parallel_workers) {
+        CatchupTableMode::Sequential => {
+            copy_catchup_table_sequential(config, progress_store, source, table, log_context)
+        }
+        CatchupTableMode::Parallel { workers } => {
+            copy_catchup_table_parallel(config, source, table, workers, log_context, total_rows)
+        }
+    }
+}
+
+fn copy_catchup_table_sequential(
+    config: &CatchupSnapshotConfig,
+    progress_store: &CatchupProgressStore,
+    source: &PersistentMySqlSource,
+    table: &SnapshotTable,
+    log_context: CatchupTableLogContext,
 ) -> Result<crate::snapshot::SnapshotResult, CatchupSnapshotError> {
     let mut target = snapshot_target_for_table(config, table)?;
     let observer = CatchupSnapshotLogger::new(
-        table_number,
-        total_tables,
-        completed_tables,
+        log_context.table_number,
+        log_context.total_tables,
+        log_context.completed_tables,
         config.throttle,
     );
     let result = snapshot_table_with_observer(
@@ -219,9 +246,9 @@ fn copy_catchup_table(
         "{}",
         format_catchup_table_complete(
             &result.table,
-            table_number,
-            total_tables,
-            completed_tables + 1,
+            log_context.table_number,
+            log_context.total_tables,
+            log_context.completed_tables + 1,
             result.rows_copied,
             observer.elapsed_seconds()
         )
@@ -345,55 +372,70 @@ where
     }
 
     fn save_mysql_progress(&self, progress: &SnapshotProgress) -> Result<(), TableSyncError> {
-        self.mysql_store.ensure()?;
-        for (table, table_progress) in &progress.tables {
-            let status = snapshot_progress_status(table_progress.complete);
-            if !self.should_save_mysql_progress(table, table_progress.rows_copied, status) {
-                continue;
-            }
-            self.mysql_store.save(&SyncTableProgress {
-                table: table.clone(),
-                last_primary_key: table_progress.last_primary_key.clone(),
-                chunks: 0,
-                rows_scanned: table_progress.rows_copied,
-                total_rows: self.total_rows.borrow().get(table).copied(),
-                inserts: table_progress.rows_copied,
-                updates: 0,
-                extra_target_rows: 0,
-                mode: SyncMode::Apply,
-                status,
-                last_error: None,
-            })?;
-            self.record_mysql_progress_save(table, table_progress.rows_copied, status);
+        save_mysql_snapshot_progress(
+            &self.mysql_store,
+            &self.total_rows.borrow(),
+            &self.mysql_save_state,
+            progress,
+        )
+    }
+}
+
+fn save_mysql_snapshot_progress(
+    mysql_store: &impl CatchupMysqlProgressStore,
+    total_rows: &BTreeMap<String, u64>,
+    mysql_save_state: &RefCell<BTreeMap<String, MysqlProgressSaveState>>,
+    progress: &SnapshotProgress,
+) -> Result<(), TableSyncError> {
+    mysql_store.ensure()?;
+    for (table, table_progress) in &progress.tables {
+        let status = snapshot_progress_status(table_progress.complete);
+        if !should_save_mysql_progress(mysql_save_state, table, table_progress.rows_copied, status)
+        {
+            continue;
         }
-        Ok(())
+        mysql_store.save(&SyncTableProgress {
+            table: table.clone(),
+            last_primary_key: table_progress.last_primary_key.clone(),
+            chunks: 0,
+            rows_scanned: table_progress.rows_copied,
+            total_rows: total_rows.get(table).copied(),
+            inserts: table_progress.rows_copied,
+            updates: 0,
+            extra_target_rows: 0,
+            mode: SyncMode::Apply,
+            status,
+            last_error: None,
+        })?;
+        record_mysql_progress_save(mysql_save_state, table, table_progress.rows_copied, status);
     }
+    Ok(())
+}
 
-    fn should_save_mysql_progress(
-        &self,
-        table: &str,
-        rows_copied: u64,
-        status: SyncProgressStatus,
-    ) -> bool {
-        self.mysql_save_state
-            .borrow_mut()
-            .entry(table.to_string())
-            .or_default()
-            .should_save(rows_copied, status, Instant::now())
-    }
+fn should_save_mysql_progress(
+    mysql_save_state: &RefCell<BTreeMap<String, MysqlProgressSaveState>>,
+    table: &str,
+    rows_copied: u64,
+    status: SyncProgressStatus,
+) -> bool {
+    mysql_save_state
+        .borrow_mut()
+        .entry(table.to_string())
+        .or_default()
+        .should_save(rows_copied, status, Instant::now())
+}
 
-    fn record_mysql_progress_save(
-        &self,
-        table: &str,
-        rows_copied: u64,
-        status: SyncProgressStatus,
-    ) {
-        self.mysql_save_state
-            .borrow_mut()
-            .entry(table.to_string())
-            .or_default()
-            .record_save(rows_copied, status, Instant::now());
-    }
+fn record_mysql_progress_save(
+    mysql_save_state: &RefCell<BTreeMap<String, MysqlProgressSaveState>>,
+    table: &str,
+    rows_copied: u64,
+    status: SyncProgressStatus,
+) {
+    mysql_save_state
+        .borrow_mut()
+        .entry(table.to_string())
+        .or_default()
+        .record_save(rows_copied, status, Instant::now());
 }
 
 #[derive(Default)]
@@ -479,6 +521,11 @@ fn validate_config(config: &CatchupSnapshotConfig) -> Result<(), CatchupSnapshot
     if config.chunk_size == 0 {
         return Err(CatchupSnapshotError::Config(
             "chunk size must be greater than zero".to_string(),
+        ));
+    }
+    if config.parallel_workers == 0 {
+        return Err(CatchupSnapshotError::Config(
+            "parallel workers must be greater than zero".to_string(),
         ));
     }
 
