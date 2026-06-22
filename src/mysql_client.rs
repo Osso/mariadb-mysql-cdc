@@ -1,6 +1,6 @@
 use crate::live::{InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert};
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::{quote_ident, quote_identifier_path};
+use crate::mysql_support::{quote_ident, quote_identifier_path, quote_sql_literal};
 use crate::snapshot::{
     ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource,
     TableSnapshotProgress,
@@ -172,6 +172,14 @@ impl PersistentProgressWriter {
         self.execute_progress_sql(build_progress_upsert_sql(&self.progress_table, progress))
     }
 
+    pub fn save_error_message(&self, table: &str, error: &str) -> Result<(), TableSyncError> {
+        self.execute_progress_sql(build_progress_error_message_sql(
+            &self.progress_table,
+            table,
+            error,
+        ))
+    }
+
     pub fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError> {
         let sql = build_snapshot_progress_select_sql(&self.progress_table);
         let rows = self
@@ -196,6 +204,15 @@ fn build_snapshot_progress_select_sql(progress_table: &str) -> String {
     format!(
         "SELECT table_name, COALESCE(last_primary_key_json, ''), rows_scanned, status FROM {}",
         quote_identifier_path(progress_table)
+    )
+}
+
+fn build_progress_error_message_sql(progress_table: &str, table: &str, error: &str) -> String {
+    format!(
+        "INSERT INTO {} (table_name,mode,status,last_error) VALUES ({},'apply','error',{}) ON DUPLICATE KEY UPDATE status='error',last_error=VALUES(last_error)",
+        quote_identifier_path(progress_table),
+        quote_sql_literal(table),
+        quote_sql_literal(error)
     )
 }
 
@@ -436,6 +453,17 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT table_name, COALESCE(last_primary_key_json, ''), rows_scanned, status FROM `cdc`.`table_sync_progress`"
+        );
+    }
+
+    #[test]
+    fn builds_progress_error_sql_with_table_and_message() {
+        let sql =
+            build_progress_error_message_sql("cdc.table_sync_progress", "releases", "can't copy");
+
+        assert_eq!(
+            sql,
+            "INSERT INTO `cdc`.`table_sync_progress` (table_name,mode,status,last_error) VALUES ('releases','apply','error','can''t copy') ON DUPLICATE KEY UPDATE status='error',last_error=VALUES(last_error)"
         );
     }
 

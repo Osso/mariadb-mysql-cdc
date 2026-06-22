@@ -4,9 +4,8 @@ use crate::mysql_client::{
     PersistentMySqlSource, PersistentProgressWriter, PersistentTargetExecutor,
 };
 use crate::snapshot::{
-    ChunkRequest, FileSnapshotProgressStore, SnapshotChunkProgress, SnapshotError,
-    SnapshotObserver, SnapshotProgress, SnapshotProgressStore, SnapshotTable,
-    snapshot_table_with_observer,
+    ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotProgress,
+    SnapshotProgressStore, SnapshotTable, snapshot_table_with_observer,
 };
 use crate::table_sync::{SyncMode, SyncProgressStatus, SyncTableProgress, TableSyncError};
 use crate::target::{SnapshotInsertMode, TargetMySqlWriter};
@@ -15,6 +14,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+mod progress_log;
+use progress_log::{
+    CatchupSnapshotLogger, format_catchup_table_complete, format_catchup_table_start,
+};
 
 const MYSQL_PROGRESS_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -139,6 +143,22 @@ fn run_catchup_table(
     reports: &[CatchupSnapshotTableReport],
     total_tables: usize,
 ) -> Result<CatchupSnapshotTableReport, CatchupSnapshotError> {
+    let result =
+        run_catchup_table_inner(config, source, progress_store, table, reports, total_tables);
+    if let Err(error) = &result {
+        progress_store.record_table_error(&table.name, error);
+    }
+    result
+}
+
+fn run_catchup_table_inner(
+    config: &CatchupSnapshotConfig,
+    source: &PersistentMySqlSource,
+    progress_store: &CatchupProgressStore,
+    table: &SnapshotTable,
+    reports: &[CatchupSnapshotTableReport],
+    total_tables: usize,
+) -> Result<CatchupSnapshotTableReport, CatchupSnapshotError> {
     prepare_snapshot_table_progress(source, progress_store, &table.name)?;
     let table_number = reports.len() + 1;
     log_catchup_table_start(progress_store, table, table_number, total_tables);
@@ -235,6 +255,7 @@ trait CatchupMysqlProgressStore {
     fn ensure(&self) -> Result<(), TableSyncError>;
     fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError>;
     fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError>;
+    fn save_error_message(&self, table: &str, error: &str) -> Result<(), TableSyncError>;
 }
 
 impl CatchupMysqlProgressStore for PersistentProgressWriter {
@@ -248,6 +269,10 @@ impl CatchupMysqlProgressStore for PersistentProgressWriter {
 
     fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
         self.save(progress)
+    }
+
+    fn save_error_message(&self, table: &str, error: &str) -> Result<(), TableSyncError> {
+        self.save_error_message(table, error)
     }
 }
 
@@ -297,6 +322,25 @@ where
 
     fn total_rows_for_table(&self, table: &str) -> Option<u64> {
         self.total_rows.borrow().get(table).copied()
+    }
+
+    fn record_table_error(&self, table: &str, error: &CatchupSnapshotError) {
+        if let Err(save_error) = self.save_table_error(table, error) {
+            eprintln!(
+                "catchup_error_persist_failed table={} error={} persist_error={}",
+                table, error, save_error
+            );
+        }
+    }
+
+    fn save_table_error(
+        &self,
+        table: &str,
+        error: &CatchupSnapshotError,
+    ) -> Result<(), TableSyncError> {
+        self.mysql_store.ensure()?;
+        self.mysql_store
+            .save_error_message(table, &error.to_string())
     }
 
     fn save_mysql_progress(&self, progress: &SnapshotProgress) -> Result<(), TableSyncError> {
@@ -349,124 +393,6 @@ where
             .or_default()
             .record_save(rows_copied, status, Instant::now());
     }
-}
-
-struct CatchupSnapshotLogger {
-    table_number: usize,
-    total_tables: usize,
-    completed_tables: usize,
-    started_at: Instant,
-    throttle: Duration,
-}
-
-impl CatchupSnapshotLogger {
-    fn new(
-        table_number: usize,
-        total_tables: usize,
-        completed_tables: usize,
-        throttle: Duration,
-    ) -> Self {
-        Self {
-            table_number,
-            total_tables,
-            completed_tables,
-            started_at: Instant::now(),
-            throttle,
-        }
-    }
-
-    fn elapsed_seconds(&self) -> u64 {
-        self.started_at.elapsed().as_secs()
-    }
-}
-
-impl SnapshotObserver for CatchupSnapshotLogger {
-    fn chunk_copied(&self, progress: &SnapshotChunkProgress) {
-        println!(
-            "{}",
-            format_catchup_chunk_progress(
-                progress,
-                self.table_number,
-                self.total_tables,
-                self.completed_tables,
-                self.elapsed_seconds(),
-            )
-        );
-        throttle_after_chunk(self.throttle);
-    }
-}
-
-fn throttle_after_chunk(throttle: Duration) {
-    if throttle.is_zero() {
-        return;
-    }
-
-    std::thread::sleep(throttle);
-}
-
-fn format_catchup_table_start(
-    table: &str,
-    table_number: usize,
-    total_tables: usize,
-    total_rows: Option<u64>,
-) -> String {
-    format!(
-        "catchup_table_start table={} table_number={} total_tables={} completed_tables={} total_rows={}",
-        table,
-        table_number,
-        total_tables,
-        table_number - 1,
-        display_optional_u64(total_rows)
-    )
-}
-
-fn format_catchup_chunk_progress(
-    progress: &SnapshotChunkProgress,
-    table_number: usize,
-    total_tables: usize,
-    completed_tables: usize,
-    elapsed_seconds: u64,
-) -> String {
-    format!(
-        "catchup_table_progress table={} table_number={} total_tables={} completed_tables={} chunk_start={} chunk_end={} chunk_rows={} imported_rows={} skipped_rows={} elapsed_seconds={}",
-        progress.table,
-        table_number,
-        total_tables,
-        completed_tables,
-        display_primary_key(&progress.chunk_start),
-        display_primary_key(&Some(progress.chunk_end.clone())),
-        progress.chunk_rows,
-        progress.rows_copied,
-        0,
-        elapsed_seconds
-    )
-}
-
-fn format_catchup_table_complete(
-    table: &str,
-    table_number: usize,
-    total_tables: usize,
-    completed_tables: usize,
-    rows_copied: u64,
-    elapsed_seconds: u64,
-) -> String {
-    format!(
-        "catchup_table_complete table={} table_number={} total_tables={} completed_tables={} rows_copied={} elapsed_seconds={}",
-        table, table_number, total_tables, completed_tables, rows_copied, elapsed_seconds
-    )
-}
-
-fn display_primary_key(value: &Option<Vec<String>>) -> String {
-    value
-        .as_ref()
-        .map(|values| values.join(","))
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn display_optional_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_string())
 }
 
 #[derive(Default)]

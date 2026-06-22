@@ -1,4 +1,6 @@
+use super::progress_log::format_catchup_chunk_progress;
 use super::*;
+use crate::snapshot::SnapshotChunkProgress;
 
 #[test]
 fn builds_first_chunk_select() {
@@ -130,6 +132,22 @@ fn catchup_progress_prefers_file_progress_over_mysql_progress() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn catchup_progress_records_table_error_for_run_history() {
+    let path = unique_path("error-progress.json");
+    let store = catchup_progress_store_for_test(&path, SnapshotProgress::default());
+    let error = CatchupSnapshotError::Config("source disconnected".to_string());
+
+    store
+        .save_table_error("accounts", &error)
+        .expect("save table error");
+
+    assert_eq!(
+        store.mysql_store.errors.borrow().as_slice(),
+        &[("accounts".to_string(), "source disconnected".to_string())]
+    );
+}
+
 fn catchup_progress_store_for_test(
     path: &std::path::Path,
     mysql_progress: SnapshotProgress,
@@ -175,6 +193,7 @@ struct FakeMysqlProgressStore {
     ensure_calls: RefCell<u32>,
     load_calls: RefCell<u32>,
     saved: RefCell<Vec<SyncTableProgress>>,
+    errors: RefCell<Vec<(String, String)>>,
 }
 
 impl FakeMysqlProgressStore {
@@ -184,6 +203,7 @@ impl FakeMysqlProgressStore {
             ensure_calls: RefCell::new(0),
             load_calls: RefCell::new(0),
             saved: RefCell::new(Vec::new()),
+            errors: RefCell::new(Vec::new()),
         }
     }
 }
@@ -201,6 +221,13 @@ impl CatchupMysqlProgressStore for FakeMysqlProgressStore {
 
     fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
         self.saved.borrow_mut().push(progress.clone());
+        Ok(())
+    }
+
+    fn save_error_message(&self, table: &str, error: &str) -> Result<(), TableSyncError> {
+        self.errors
+            .borrow_mut()
+            .push((table.to_string(), error.to_string()));
         Ok(())
     }
 }
