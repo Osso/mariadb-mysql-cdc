@@ -196,6 +196,14 @@ fn parses_progress_rows() {
 }
 
 #[test]
+fn empty_progress_rows_are_reported_explicitly() {
+    assert_eq!(
+        format_progress_table_status("cdc.table_sync_progress", "empty"),
+        "sync_progress_table table=cdc.table_sync_progress status=empty"
+    );
+}
+
+#[test]
 fn formats_rate_and_eta_when_total_rows_are_known() {
     let eta = eta(50, rate(100, 10));
 

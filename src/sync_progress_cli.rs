@@ -287,13 +287,21 @@ fn read_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
         lines.push(checkpoint);
     }
     match rows {
+        Some(rows) if rows.is_empty() => lines.push(format_progress_table_status(
+            &config.progress_table,
+            "empty",
+        )),
         Some(rows) => lines.extend(rows.iter().map(|row| format_progress_row(config, row))),
-        None => lines.push(format!(
-            "sync_progress_table table={} status=missing",
-            config.progress_table
+        None => lines.push(format_progress_table_status(
+            &config.progress_table,
+            "missing",
         )),
     }
     Ok(format!("{}\n", lines.join("\n")))
+}
+
+fn format_progress_table_status(table: &str, status: &str) -> String {
+    format!("sync_progress_table table={table} status={status}")
 }
 
 fn query_progress_rows(
