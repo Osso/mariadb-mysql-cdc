@@ -58,3 +58,60 @@ pub(super) fn stop_never_args(source: &SourceBinlogConfig) -> Vec<String> {
     args.insert(binlog_file_index, "--stop-never".to_string());
     args
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_remote_binlog_args_with_database_and_stop_position() {
+        let args = binlog_args(&SourceBinlogConfig {
+            host: "10.0.0.2".to_string(),
+            port: 3307,
+            user: "cdc".to_string(),
+            password: "secret".to_string(),
+            database: Some("app".to_string()),
+            binlog_file: "mysqld-bin.000777".to_string(),
+            start_position: 12345,
+            stop_position: Some(45678),
+        });
+
+        assert_eq!(
+            args,
+            vec![
+                "--read-from-remote-server",
+                "--verbose",
+                "--base64-output=decode-rows",
+                "--host",
+                "10.0.0.2",
+                "--port",
+                "3307",
+                "--user",
+                "cdc",
+                "--password=secret",
+                "--start-position",
+                "12345",
+                "--database",
+                "app",
+                "--stop-position",
+                "45678",
+                "mysqld-bin.000777",
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_never_args_keep_binlog_file_last() {
+        let args = stop_never_args(&SourceBinlogConfig {
+            host: "10.0.0.2".to_string(),
+            user: "cdc".to_string(),
+            password: "secret".to_string(),
+            binlog_file: "mysqld-bin.000777".to_string(),
+            start_position: 12345,
+            ..SourceBinlogConfig::default()
+        });
+
+        assert!(args.contains(&"--stop-never".to_string()));
+        assert_eq!(args.last(), Some(&"mysqld-bin.000777".to_string()));
+    }
+}

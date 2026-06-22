@@ -280,16 +280,7 @@ fn classify_line(line: &str) -> Option<EventClass> {
     }
 
     if line.starts_with('#') && !line.starts_with("###") {
-        if line.contains("Rotate to") {
-            return Some(EventClass::Rotate);
-        }
-        if line.contains("GTID") {
-            return Some(EventClass::Gtid);
-        }
-        if line.contains("Table_map:") {
-            return Some(EventClass::TableMap);
-        }
-        return None;
+        return classify_comment_line(line);
     }
 
     let upper = line.to_ascii_uppercase();
@@ -304,10 +295,6 @@ fn classify_line(line: &str) -> Option<EventClass> {
         return Some(EventClass::RowsDelete);
     }
 
-    if upper.starts_with("# QUERY") {
-        return Some(EventClass::Query);
-    }
-
     if upper.starts_with("INSERT INTO")
         || upper.starts_with("UPDATE ")
         || upper.starts_with("DELETE FROM")
@@ -320,6 +307,23 @@ fn classify_line(line: &str) -> Option<EventClass> {
     }
 
     Some(EventClass::Unknown)
+}
+
+fn classify_comment_line(line: &str) -> Option<EventClass> {
+    if line.contains("Rotate to") {
+        return Some(EventClass::Rotate);
+    }
+    if line.to_ascii_uppercase().starts_with("# QUERY") {
+        return Some(EventClass::Query);
+    }
+    if line.contains("GTID") {
+        return Some(EventClass::Gtid);
+    }
+    if line.contains("Table_map:") {
+        return Some(EventClass::TableMap);
+    }
+
+    None
 }
 
 fn record_event(
@@ -475,8 +479,9 @@ pub fn print_report(report: &ProbeReport) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BinlogCoordinate, ProbeConfig, ProbeProcessRunner, ProbeReport, classify_binlog_events,
-        parse_at_position, parse_master_status, run_probe,
+        BinlogCoordinate, EventClass, ProbeConfig, ProbeProcessRunner, ProbeReport,
+        build_binlog_args, classify_binlog_events, classify_line, parse_at_position,
+        parse_master_status, parse_rotate_file, run_probe,
     };
 
     struct FakeProcessRunner {
@@ -513,9 +518,113 @@ mod tests {
     }
 
     #[test]
+    fn parse_master_status_reports_missing_or_bad_fields() {
+        assert_eq!(
+            parse_master_status("")
+                .expect_err("empty status")
+                .to_string(),
+            "SHOW MASTER STATUS returned no rows"
+        );
+        assert_eq!(
+            parse_master_status("\t123")
+                .expect_err("missing file")
+                .to_string(),
+            "SHOW MASTER STATUS missing binlog file"
+        );
+        assert_eq!(
+            parse_master_status("mysql-bin.000010")
+                .expect_err("missing position")
+                .to_string(),
+            "SHOW MASTER STATUS missing position"
+        );
+        assert_eq!(
+            parse_master_status("mysql-bin.000010\tnot-a-number")
+                .expect_err("bad position")
+                .to_string(),
+            "SHOW MASTER STATUS position is not numeric"
+        );
+    }
+
+    #[test]
     fn parse_at_position_detects_file_offsets() {
         assert_eq!(parse_at_position("# at 123"), Some(123));
         assert_eq!(parse_at_position("#  at 123"), None);
+    }
+
+    #[test]
+    fn parses_rotate_file_from_verbose_binlog_line() {
+        assert_eq!(
+            parse_rotate_file("# Rotate to `mysql-bin.000011`, pos: 4"),
+            Some("mysql-bin.000011".to_string())
+        );
+        assert_eq!(parse_rotate_file("# Query: not a rotate event"), None);
+    }
+
+    #[test]
+    fn classifies_statement_row_and_unknown_lines() {
+        assert_eq!(classify_line(""), None);
+        assert_eq!(
+            classify_line("# Table_map: `app`.`users`"),
+            Some(EventClass::TableMap)
+        );
+        assert_eq!(classify_line("# GTID 0-1-2"), Some(EventClass::Gtid));
+        assert_eq!(classify_line("# Query"), Some(EventClass::Query));
+        assert_eq!(
+            classify_line("### UPDATE `app`.`users`"),
+            Some(EventClass::RowsUpdate)
+        );
+        assert_eq!(
+            classify_line("### DELETE FROM `app`.`users`"),
+            Some(EventClass::RowsDelete)
+        );
+        assert_eq!(
+            classify_line("ALTER TABLE users ADD name varchar(255)"),
+            Some(EventClass::Statement)
+        );
+        assert_eq!(
+            classify_line("unrecognized payload"),
+            Some(EventClass::Unknown)
+        );
+    }
+
+    #[test]
+    fn builds_remote_binlog_args_with_stop_position_before_file() {
+        let config = ProbeConfig {
+            host: "10.0.0.2".to_string(),
+            port: 3307,
+            user: "cdc".to_string(),
+            password: "secret".to_string(),
+            ..ProbeConfig::default()
+        };
+
+        let args = build_binlog_args(
+            &config,
+            &BinlogCoordinate {
+                file: "mysqld-bin.000777".to_string(),
+                position: 12345,
+            },
+            Some(45678),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--read-from-remote-server",
+                "--verbose",
+                "--base64-output=decode-rows",
+                "--host",
+                "10.0.0.2",
+                "--port",
+                "3307",
+                "--user",
+                "cdc",
+                "--start-position",
+                "12345",
+                "--stop-position",
+                "45678",
+                "mysqld-bin.000777",
+            ]
+        );
     }
 
     #[test]

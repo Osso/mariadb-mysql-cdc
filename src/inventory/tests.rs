@@ -49,6 +49,162 @@ fn parses_cli_rows_and_quotes_schema_names() {
     assert_eq!(quote_sql_string("app's\\schema"), "'app''s\\\\schema'");
 }
 
+#[test]
+fn builds_information_schema_queries_with_quoted_schema() {
+    let schema = "app's\\schema";
+    let quoted = "'app''s\\\\schema'";
+
+    assert!(tables_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
+    assert!(columns_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
+    assert!(primary_keys_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
+    assert!(views_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
+    assert!(triggers_query(schema).contains(&format!("TRIGGER_SCHEMA = {quoted}")));
+    assert!(routines_query(schema).contains(&format!("ROUTINE_SCHEMA = {quoted}")));
+    assert!(events_query(schema).contains(&format!("EVENT_SCHEMA = {quoted}")));
+}
+
+#[test]
+fn parses_all_inventory_row_types() {
+    assert_eq!(
+        parse_view_row(&["account_balances".to_string(), "select 1".to_string()])
+            .expect("view row"),
+        ViewRow {
+            table_name: "account_balances".to_string(),
+            view_definition: "select 1".to_string(),
+        }
+    );
+    assert_eq!(
+        parse_trigger_row(&[
+            "accounts_ai".to_string(),
+            "INSERT".to_string(),
+            "AFTER".to_string(),
+            "accounts".to_string(),
+            "insert into audit_log values (...)".to_string(),
+        ])
+        .expect("trigger row"),
+        accounts_insert_trigger()
+    );
+    assert_eq!(
+        parse_routine_row(&[
+            "recalculate_accounts".to_string(),
+            "PROCEDURE".to_string(),
+            String::new(),
+        ])
+        .expect("routine row"),
+        RoutineRow {
+            routine_name: "recalculate_accounts".to_string(),
+            routine_type: "PROCEDURE".to_string(),
+            routine_definition: None,
+        }
+    );
+    assert_eq!(
+        parse_event_row(&[
+            "nightly_recalc".to_string(),
+            "ENABLED".to_string(),
+            "call recalculate_accounts()".to_string(),
+        ])
+        .expect("event row"),
+        nightly_recalc_event()
+    );
+}
+
+#[test]
+fn decodes_null_fields_and_ignores_blank_tsv_lines() {
+    let rows = parse_tsv("\naccounts\tBASE TABLE\tNULL\tNULL\n\n");
+    let table = parse_table_row(&rows[0]).expect("table row");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(table.engine, None);
+    assert_eq!(table.table_collation, None);
+}
+
+#[test]
+fn reports_malformed_inventory_rows_with_row_type() {
+    let error = parse_column_row(&["accounts".to_string()]).expect_err("short column row");
+
+    assert_eq!(error.to_string(), "column row has 1 fields, expected 9");
+}
+
+#[test]
+fn reports_invalid_numeric_inventory_fields_with_context() {
+    let error = parse_primary_key_row(&[
+        "accounts".to_string(),
+        "id".to_string(),
+        "not-a-number".to_string(),
+    ])
+    .expect_err("invalid ordinal");
+
+    assert_eq!(
+        error.to_string(),
+        "primary key ordinal is not numeric: not-a-number"
+    );
+}
+
+#[test]
+fn orders_composite_primary_keys_by_ordinal_position() {
+    let keys = group_primary_keys(vec![
+        PrimaryKeyRow {
+            table_name: "edges".to_string(),
+            column_name: "right_id".to_string(),
+            ordinal_position: 2,
+        },
+        PrimaryKeyRow {
+            table_name: "edges".to_string(),
+            column_name: "left_id".to_string(),
+            ordinal_position: 1,
+        },
+    ]);
+
+    assert_eq!(keys["edges"], vec!["left_id", "right_id"]);
+}
+
+#[test]
+fn classifies_stored_generated_columns() {
+    let column = build_column(ColumnRow {
+        table_name: "accounts".to_string(),
+        column_name: "balance_copy".to_string(),
+        ordinal_position: 1,
+        column_type: "int".to_string(),
+        data_type: "int".to_string(),
+        is_nullable: false,
+        column_default: None,
+        extra: "STORED GENERATED".to_string(),
+        generation_expression: Some("`balance`".to_string()),
+    });
+
+    assert_eq!(
+        column.generated,
+        Some(GeneratedColumn {
+            expression: "`balance`".to_string(),
+            generation_kind: "STORED".to_string(),
+        })
+    );
+}
+
+#[test]
+fn builds_empty_metadata_for_tables_without_related_rows() {
+    let reader = FakeInventoryReader {
+        tables: vec![TableRow {
+            table_name: "no_columns_yet".to_string(),
+            table_type: "BASE TABLE".to_string(),
+            engine: Some("InnoDB".to_string()),
+            table_collation: Some("utf8mb4_unicode_ci".to_string()),
+        }],
+        columns: Vec::new(),
+        primary_keys: Vec::new(),
+        views: Vec::new(),
+        triggers: Vec::new(),
+        routines: Vec::new(),
+        events: Vec::new(),
+    };
+
+    let inventory = build_inventory("fixture_cdc", &reader).expect("inventory");
+
+    assert_eq!(inventory.tables[0].name, "no_columns_yet");
+    assert!(inventory.tables[0].columns.is_empty());
+    assert!(inventory.tables[0].primary_key.is_empty());
+}
+
 struct FakeInventoryReader {
     tables: Vec<TableRow>,
     columns: Vec<ColumnRow>,

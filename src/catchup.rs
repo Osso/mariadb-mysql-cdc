@@ -189,6 +189,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_invalid_catchup_plans_before_snapshot() {
+        let mut plan = CatchupPlan {
+            tables: vec![accounts_table()],
+            chunk_size: 2,
+            start_file: "mysqld-bin.000001".to_string(),
+            start_position: 123,
+        };
+
+        plan.tables.clear();
+        assert_eq!(
+            validate_plan(&plan)
+                .expect_err("missing tables")
+                .to_string(),
+            "catchup needs at least one table"
+        );
+
+        plan.tables = vec![accounts_table()];
+        plan.chunk_size = 0;
+        assert_eq!(
+            validate_plan(&plan).expect_err("zero chunk").to_string(),
+            "catchup chunk size must be greater than zero"
+        );
+
+        plan.chunk_size = 2;
+        plan.start_file.clear();
+        assert_eq!(
+            validate_plan(&plan)
+                .expect_err("missing binlog file")
+                .to_string(),
+            "catchup start binlog file is required"
+        );
+
+        plan.start_file = "mysqld-bin.000001".to_string();
+        plan.start_position = 0;
+        assert_eq!(
+            validate_plan(&plan).expect_err("zero position").to_string(),
+            "catchup start binlog position must be greater than zero"
+        );
+    }
+
     fn accounts_table() -> SnapshotTable {
         SnapshotTable {
             name: "accounts".to_string(),

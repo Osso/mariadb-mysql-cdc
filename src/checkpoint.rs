@@ -30,7 +30,7 @@ impl FileCheckpointStore {
 
     pub fn load(&self) -> Result<Option<Checkpoint>, CheckpointError> {
         match fs::read_to_string(&self.path) {
-            Ok(contents) => decode_checkpoint(&contents).map(Some),
+            Ok(contents) => decode_checkpoint(&contents, Some(self.path.clone())).map(Some),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(CheckpointError::Read {
                 path: self.path.clone(),
@@ -110,8 +110,8 @@ pub fn encode_checkpoint(checkpoint: &Checkpoint) -> Result<String, CheckpointEr
         .map_err(CheckpointError::Encode)
 }
 
-fn decode_checkpoint(contents: &str) -> Result<Checkpoint, CheckpointError> {
-    serde_json::from_str(contents).map_err(|source| CheckpointError::Decode { path: None, source })
+fn decode_checkpoint(contents: &str, path: Option<PathBuf>) -> Result<Checkpoint, CheckpointError> {
+    serde_json::from_str(contents).map_err(|source| CheckpointError::Decode { path, source })
 }
 
 fn temp_checkpoint_path(path: &Path) -> PathBuf {
@@ -163,6 +163,40 @@ mod tests {
         assert!(encoded.contains("\"gtid\""));
         assert!(encoded.contains("\"event_timestamp\""));
         assert!(encoded.contains("\"last_event\""));
+    }
+
+    #[test]
+    fn corrupt_checkpoint_reports_decode_error_with_path() {
+        let path = unique_path("checkpoint-corrupt.json");
+        fs::write(&path, "{not json").expect("write corrupt checkpoint");
+        let store = FileCheckpointStore::new(path.clone());
+
+        let error = store.load().expect_err("decode error").to_string();
+
+        assert!(error.contains("failed to decode"));
+        assert!(error.contains(path.to_string_lossy().as_ref()));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn temp_checkpoint_path_preserves_existing_extension() {
+        let path = std::path::Path::new("/tmp/checkpoint.json");
+
+        assert_eq!(
+            temp_checkpoint_path(path),
+            std::path::PathBuf::from("/tmp/checkpoint.json.tmp")
+        );
+    }
+
+    #[test]
+    fn temp_checkpoint_path_adds_extension_when_missing() {
+        let path = std::path::Path::new("/tmp/checkpoint");
+
+        assert_eq!(
+            temp_checkpoint_path(path),
+            std::path::PathBuf::from("/tmp/checkpoint.tmp")
+        );
     }
 
     fn sample_checkpoint() -> Checkpoint {
