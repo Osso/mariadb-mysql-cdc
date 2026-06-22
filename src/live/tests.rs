@@ -310,6 +310,30 @@ fn reconnect_loop_resumes_from_checkpoint_after_transient_loss() {
     );
 }
 
+#[test]
+fn reconnect_loop_requires_checkpoint_when_static_coordinates_are_absent() {
+    let checkpoint_store = MemoryCheckpointStore::default();
+    let config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            binlog_file: String::new(),
+            start_position: 0,
+            ..SourceBinlogConfig::default()
+        },
+        checkpoint_file: Some("/var/lib/cdc/checkpoint.json".into()),
+        ..ApplyBinlogConfig::default()
+    };
+
+    let error = run_stream_reconnect_loop(
+        &config,
+        Some(&checkpoint_store),
+        |_attempt_config| Ok(()),
+        |_delay: Duration| {},
+    )
+    .expect_err("missing checkpoint coordinate");
+
+    assert_eq!(error.to_string(), "binlog file is required");
+}
+
 #[derive(Default)]
 struct RecordingExecutor {
     statements: RefCell<Vec<String>>,

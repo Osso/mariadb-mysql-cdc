@@ -328,6 +328,7 @@ fn parse_probe_config(args: Vec<String>) -> Result<probe::ProbeConfig, String> {
 
 fn parse_apply_binlog_config(args: Vec<String>) -> Result<live::ApplyBinlogConfig, String> {
     let mut config = live::ApplyBinlogConfig::default();
+    config.source.start_position = 0;
     let mut index = 0;
 
     while index < args.len() {
@@ -445,6 +446,13 @@ fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod checkpoint_config {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/main/tests/checkpoint_config.rs"
+        ));
+    }
 
     #[test]
     fn parses_apply_binlog_config_with_all_source_and_target_options() {

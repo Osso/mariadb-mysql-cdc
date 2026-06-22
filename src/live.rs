@@ -63,11 +63,8 @@ impl ApplyBinlogConfig {
         if self.source.password.is_empty() {
             return Err(config_error("source password is required"));
         }
-        if self.source.binlog_file.is_empty() {
-            return Err(config_error("binlog file is required"));
-        }
-        if self.source.start_position == 0 {
-            return Err(config_error("start position must be greater than zero"));
+        if self.checkpoint_file.is_none() {
+            self.source.validate_start_coordinate()?;
         }
         self.target.validate()
     }
@@ -97,6 +94,19 @@ impl Default for SourceBinlogConfig {
             start_position: 4,
             stop_position: None,
         }
+    }
+}
+
+impl SourceBinlogConfig {
+    fn validate_start_coordinate(&self) -> Result<(), ApplyBinlogError> {
+        if self.binlog_file.is_empty() {
+            return Err(config_error("binlog file is required"));
+        }
+        if self.start_position == 0 {
+            return Err(config_error("start position must be greater than zero"));
+        }
+
+        Ok(())
     }
 }
 
@@ -401,6 +411,7 @@ where
 {
     let mut attempt_config = config.clone();
     resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
+    attempt_config.source.validate_start_coordinate()?;
     let mut attempt = 0;
 
     loop {
@@ -412,6 +423,7 @@ where
             {
                 attempt += 1;
                 resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
+                attempt_config.source.validate_start_coordinate()?;
                 println!(
                     "{}",
                     format_reconnect_start(&attempt_config, attempt, &error)
