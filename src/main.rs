@@ -10,6 +10,7 @@ mod probe;
 pub mod rehearsal;
 pub mod row;
 pub mod snapshot;
+mod snapshot_ranges;
 pub mod statement;
 pub mod stream_checkpoint;
 mod sync_cli;

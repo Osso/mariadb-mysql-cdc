@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+pub use crate::snapshot_ranges::{SnapshotRange, plan_snapshot_ranges};
+
 const SNAPSHOT_RETRY_ATTEMPTS: u32 = 3;
 const SNAPSHOT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
@@ -45,13 +47,6 @@ pub struct ChunkRequest {
     pub start_after: Option<Vec<String>>,
     pub end_at: Option<Vec<String>>,
     pub limit: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SnapshotRange {
-    pub worker: usize,
-    pub start_after: Option<Vec<String>>,
-    pub end_at: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -324,54 +319,6 @@ pub fn snapshot_table_with_observer(
     let rows_copied = rows_copied_for_table(&progress, &table.name) - starting_rows_copied;
 
     Ok(snapshot_result(table, rows_copied))
-}
-
-pub fn plan_snapshot_ranges(
-    boundaries: Vec<Vec<String>>,
-    workers: usize,
-) -> Result<Vec<SnapshotRange>, SnapshotError> {
-    validate_snapshot_range_plan(&boundaries, workers)?;
-
-    let ranges = (0..workers)
-        .map(|worker| SnapshotRange {
-            worker,
-            start_after: range_start_after(&boundaries, worker),
-            end_at: boundaries.get(worker).cloned(),
-        })
-        .collect();
-    Ok(ranges)
-}
-
-fn validate_snapshot_range_plan(
-    boundaries: &[Vec<String>],
-    workers: usize,
-) -> Result<(), SnapshotError> {
-    if workers == 0 {
-        return Err(SnapshotError::InvalidTable(
-            "snapshot range planning needs at least one worker".to_string(),
-        ));
-    }
-    if boundaries.len() + 1 != workers {
-        return Err(SnapshotError::InvalidTable(
-            "snapshot range planning needs exactly workers - 1 boundaries".to_string(),
-        ));
-    }
-    if !snapshot_boundaries_are_strictly_ascending(boundaries) {
-        return Err(SnapshotError::InvalidTable(
-            "snapshot range boundaries must be strictly ascending".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn snapshot_boundaries_are_strictly_ascending(boundaries: &[Vec<String>]) -> bool {
-    boundaries.windows(2).all(|pair| pair[0] < pair[1])
-}
-
-fn range_start_after(boundaries: &[Vec<String>], worker: usize) -> Option<Vec<String>> {
-    worker
-        .checked_sub(1)
-        .and_then(|boundary_index| boundaries.get(boundary_index).cloned())
 }
 
 fn copy_table_chunks(

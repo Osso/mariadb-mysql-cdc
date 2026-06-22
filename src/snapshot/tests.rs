@@ -321,6 +321,21 @@ fn plans_four_disjoint_snapshot_ranges_from_three_boundaries() {
 }
 
 #[test]
+fn plans_numeric_snapshot_ranges_across_string_digit_widths() {
+    let ranges =
+        plan_snapshot_ranges(vec![pk("99999"), pk("100000"), pk("200000")], 4).expect("ranges");
+
+    assert_eq!(
+        ranges[1],
+        SnapshotRange {
+            worker: 1,
+            start_after: Some(pk("99999")),
+            end_at: Some(pk("100000")),
+        }
+    );
+}
+
+#[test]
 fn plans_single_snapshot_range_without_boundaries() {
     let ranges = plan_snapshot_ranges(Vec::new(), 1).expect("ranges");
 
