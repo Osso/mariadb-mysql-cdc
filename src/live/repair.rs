@@ -60,6 +60,7 @@ impl TableSyncStatementRepairer {
             table: read_sync_table(&self.config, &database, &request.table)?,
             chunk_size: REPAIR_CHUNK_SIZE,
             mode: SyncMode::Apply,
+            progress_table: "cdc.table_sync_progress".to_string(),
         })
     }
 

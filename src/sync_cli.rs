@@ -60,6 +60,7 @@ fn default_sync_table_config() -> table_sync::SyncTableConfig {
         },
         chunk_size: 1000,
         mode: table_sync::SyncMode::DryRun,
+        progress_table: "cdc.table_sync_progress".to_string(),
     }
 }
 
@@ -81,6 +82,7 @@ fn sync_table_option(
         "--columns" => config.table.columns = parse_csv_columns(value),
         "--chunk-size" => config.chunk_size = crate::parse_usize(flag, value)?,
         "--mode" => config.mode = parse_sync_mode(value)?,
+        "--progress-table" => config.progress_table = value.to_string(),
         "--mariadb" => {
             config.mariadb = value.to_string();
             config.source.mariadb = value.to_string();
@@ -142,6 +144,9 @@ fn validate_sync_table_config(config: &table_sync::SyncTableConfig) -> Result<()
     }
     if config.chunk_size == 0 {
         return Err("chunk size must be greater than zero".to_string());
+    }
+    if config.progress_table.is_empty() {
+        return Err("progress table is required".to_string());
     }
     Ok(())
 }
@@ -242,19 +247,27 @@ mod tests {
         assert_eq!(config.table.columns, vec!["id", "slug", "title"]);
         assert_eq!(config.chunk_size, 1000);
         assert_eq!(config.mode, table_sync::SyncMode::DryRun);
+        assert_eq!(config.progress_table, "cdc.table_sync_progress");
     }
 
     #[test]
-    fn parses_apply_mode_and_custom_chunk_size() {
+    fn parses_apply_mode_custom_chunk_size_and_progress_table() {
         set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
         set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
 
-        let config =
-            parse_sync_table_config(required_args(["--chunk-size", "250", "--mode", "apply"]))
-                .expect("sync-table config");
+        let config = parse_sync_table_config(required_args([
+            "--chunk-size",
+            "250",
+            "--mode",
+            "apply",
+            "--progress-table",
+            "cdc.table_sync_progress",
+        ]))
+        .expect("sync-table config");
 
         assert_eq!(config.chunk_size, 250);
         assert_eq!(config.mode, table_sync::SyncMode::Apply);
+        assert_eq!(config.progress_table, "cdc.table_sync_progress");
     }
 
     #[test]

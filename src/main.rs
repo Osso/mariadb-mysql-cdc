@@ -94,7 +94,7 @@ Catchup progress options:
 
 Sync table options:
   Uses the catchup source/target options plus --table, --primary-key, --columns,
-  --chunk-size, --mode dry-run|apply, and --mariadb.
+  --chunk-size, --mode dry-run|apply, --progress-table, and --mariadb.
 ";
 
 fn main() {

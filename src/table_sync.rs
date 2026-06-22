@@ -2,7 +2,14 @@ use crate::snapshot::SnapshotRow;
 use crate::target::PrimaryKey;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::process::Command;
+
+mod mysql;
+mod progress;
+
+use mysql::MySqlSyncReader;
+#[cfg(test)]
+pub(crate) use mysql::build_sync_select_sql;
+pub use progress::{NoopSyncProgressStore, SyncProgressStore, SyncTableProgress};
 
 #[derive(Clone, Debug)]
 pub struct SyncTableConfig {
@@ -12,6 +19,7 @@ pub struct SyncTableConfig {
     pub table: SyncTable,
     pub chunk_size: usize,
     pub mode: SyncMode,
+    pub progress_table: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +69,7 @@ pub enum TableSyncError {
     InvalidTable(String),
     Read(String),
     Repair(String),
+    Progress(String),
 }
 
 impl fmt::Display for TableSyncError {
@@ -69,6 +78,7 @@ impl fmt::Display for TableSyncError {
             Self::InvalidTable(message) => write!(formatter, "invalid sync table: {message}"),
             Self::Read(message) => write!(formatter, "sync read failed: {message}"),
             Self::Repair(message) => write!(formatter, "sync repair failed: {message}"),
+            Self::Progress(message) => write!(formatter, "sync progress failed: {message}"),
         }
     }
 }
@@ -83,17 +93,37 @@ pub fn sync_table(
     target: &impl SyncTableReader,
     repair_target: &mut impl SyncRepairTarget,
 ) -> Result<SyncTableReport, TableSyncError> {
+    let mut progress_store = NoopSyncProgressStore;
+    sync_table_with_progress(
+        table,
+        chunk_size,
+        mode,
+        source,
+        target,
+        repair_target,
+        &mut progress_store,
+    )
+}
+
+pub fn sync_table_with_progress(
+    table: &SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    source: &impl SyncTableReader,
+    target: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableReport, TableSyncError> {
     validate_sync_table(table, chunk_size)?;
-    let mut report = SyncTableReport {
-        table: table.name.clone(),
-        ..SyncTableReport::default()
-    };
-    let mut start_after = None;
+    let mut progress = load_sync_progress(table, mode, progress_store)?;
+    let mut report = progress.report();
+    let mut start_after = progress.last_primary_key.clone();
 
     loop {
         let source_request = sync_chunk_request(table, start_after.clone(), None, chunk_size);
         let source_rows = source.read_rows(&source_request)?;
         if source_rows.is_empty() {
+            complete_sync_progress(&mut progress, progress_store)?;
             return Ok(report);
         }
 
@@ -109,12 +139,37 @@ pub fn sync_table(
         repair_chunk(&source_rows, &target_rows, mode, repair_target, &mut report)?;
         report.chunks += 1;
         report.rows_scanned += source_rows.len() as u64;
+        progress.record_chunk(&report, end_at.clone());
+        progress_store.save(&progress)?;
 
         if source_rows.len() < chunk_size {
+            complete_sync_progress(&mut progress, progress_store)?;
             return Ok(report);
         }
         start_after = Some(end_at);
     }
+}
+
+fn load_sync_progress(
+    table: &SyncTable,
+    mode: SyncMode,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableProgress, TableSyncError> {
+    progress_store.ensure()?;
+    let mut progress = progress_store
+        .load(&table.name)?
+        .unwrap_or_else(|| SyncTableProgress::started(table.name.clone(), mode));
+    progress.mark_running(mode);
+    progress_store.save(&progress)?;
+    Ok(progress)
+}
+
+fn complete_sync_progress(
+    progress: &mut SyncTableProgress,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<(), TableSyncError> {
+    progress.mark_complete();
+    progress_store.save(progress)
 }
 
 fn read_target_window(
@@ -152,19 +207,29 @@ pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, Table
     let target = MySqlSyncReader::new(target_connection_config(config));
     let executor =
         crate::live::MysqlCliExecutor::new(config.mariadb.clone(), config.target.clone());
+    let mut progress_store = progress::MySqlSyncProgressStore::new(
+        config.mariadb.clone(),
+        config.target.clone(),
+        config.progress_table.clone(),
+    );
     let mut repair_target = crate::target::TargetMySqlWriter::from_snapshot_table(
         &snapshot_table(&config.table),
         executor,
         crate::target::SnapshotInsertMode::IgnoreDuplicate,
     );
-    sync_table(
+    let result = sync_table_with_progress(
         &config.table,
         config.chunk_size,
         config.mode,
         &source,
         &target,
         &mut repair_target,
-    )
+        &mut progress_store,
+    );
+    if let Err(error) = &result {
+        progress_store.save_error(&config.table.name, error)?;
+    }
+    result
 }
 
 fn target_connection_config(
@@ -319,202 +384,6 @@ pub fn primary_key(values: Vec<String>) -> PrimaryKey {
     PrimaryKey::new(values)
 }
 
-pub struct MySqlSyncReader {
-    config: crate::mysql_snapshot::MySqlConnectionConfig,
-}
-
-impl MySqlSyncReader {
-    pub fn new(config: crate::mysql_snapshot::MySqlConnectionConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl SyncTableReader for MySqlSyncReader {
-    fn read_rows(&self, request: &SyncChunkRequest) -> Result<Vec<SnapshotRow>, TableSyncError> {
-        let sql = build_sync_select_sql(request);
-        let output = run_mysql_query(&self.config, &sql)?;
-        parse_sync_rows(&request.columns, &request.primary_key, &output)
-    }
-}
-
-pub fn build_sync_select_sql(request: &SyncChunkRequest) -> String {
-    let columns = quote_ident_list(&request.columns);
-    let order_by = quote_ident_list(&request.primary_key);
-    let bounds = sync_bounds(request);
-    format!(
-        "SELECT {columns} FROM {}{bounds} ORDER BY {order_by} LIMIT {}",
-        quote_ident(&request.table),
-        request.limit
-    )
-}
-
-fn sync_bounds(request: &SyncChunkRequest) -> String {
-    let mut predicates = Vec::new();
-    if let Some(start_after) = &request.start_after {
-        predicates.push(primary_key_after_predicate(
-            &request.primary_key,
-            start_after,
-        ));
-    }
-    if let Some(end_at) = &request.end_at {
-        predicates.push(primary_key_at_or_before_predicate(
-            &request.primary_key,
-            end_at,
-        ));
-    }
-    if predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", predicates.join(" AND "))
-    }
-}
-
-fn run_mysql_query(
-    config: &crate::mysql_snapshot::MySqlConnectionConfig,
-    sql: &str,
-) -> Result<String, TableSyncError> {
-    let output = Command::new(&config.mariadb)
-        .args([
-            "--batch",
-            "--raw",
-            "--skip-column-names",
-            "--default-character-set=utf8mb4",
-            "--host",
-            &config.host,
-            "--port",
-            &config.port.to_string(),
-            "--user",
-            &config.user,
-            &config.database,
-            "-e",
-            sql,
-        ])
-        .env("MYSQL_PWD", &config.password)
-        .output()
-        .map_err(|error| TableSyncError::Read(format!("failed to run mariadb: {error}")))?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(TableSyncError::Read(format!(
-        "mariadb exited with {}: {}",
-        output.status,
-        stderr.trim()
-    )))
-}
-
-fn parse_sync_rows(
-    columns: &[String],
-    primary_key: &[String],
-    output: &str,
-) -> Result<Vec<SnapshotRow>, TableSyncError> {
-    output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| parse_sync_row(columns, primary_key, line))
-        .collect()
-}
-
-fn parse_sync_row(
-    columns: &[String],
-    primary_key: &[String],
-    line: &str,
-) -> Result<SnapshotRow, TableSyncError> {
-    let fields = line.split('\t').map(str::to_string).collect::<Vec<_>>();
-    if fields.len() != columns.len() {
-        return Err(TableSyncError::Read(format!(
-            "sync row has {} fields for {} columns",
-            fields.len(),
-            columns.len()
-        )));
-    }
-
-    let values = columns
-        .iter()
-        .cloned()
-        .zip(fields)
-        .collect::<BTreeMap<_, _>>();
-    let primary_key = primary_key_values(primary_key, &values)?;
-    Ok(SnapshotRow {
-        primary_key,
-        values,
-    })
-}
-
-fn primary_key_values(
-    primary_key: &[String],
-    values: &BTreeMap<String, String>,
-) -> Result<Vec<String>, TableSyncError> {
-    primary_key
-        .iter()
-        .map(|column| {
-            values.get(column).cloned().ok_or_else(|| {
-                TableSyncError::Read(format!("primary key column `{column}` missing from row"))
-            })
-        })
-        .collect()
-}
-
-fn primary_key_after_predicate(columns: &[String], values: &[String]) -> String {
-    primary_key_bound_predicate(columns, values, ">")
-}
-
-fn primary_key_at_or_before_predicate(columns: &[String], values: &[String]) -> String {
-    format!(
-        "NOT ({})",
-        primary_key_bound_predicate(columns, values, ">")
-    )
-}
-
-fn primary_key_bound_predicate(columns: &[String], values: &[String], operator: &str) -> String {
-    columns
-        .iter()
-        .enumerate()
-        .map(|(index, _column)| primary_key_bound_branch(columns, values, index, operator))
-        .collect::<Vec<_>>()
-        .join(" OR ")
-}
-
-fn primary_key_bound_branch(
-    columns: &[String],
-    values: &[String],
-    index: usize,
-    operator: &str,
-) -> String {
-    let mut parts = Vec::new();
-    for equal_index in 0..index {
-        parts.push(format!(
-            "{} = {}",
-            quote_ident(&columns[equal_index]),
-            quote_sql_literal(&values[equal_index])
-        ));
-    }
-    parts.push(format!(
-        "{} {operator} {}",
-        quote_ident(&columns[index]),
-        quote_sql_literal(&values[index])
-    ));
-    format!("({})", parts.join(" AND "))
-}
-
-fn quote_ident_list(columns: &[String]) -> String {
-    columns
-        .iter()
-        .map(|column| quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn quote_ident(identifier: &str) -> String {
-    format!("`{}`", identifier.replace('`', "``"))
-}
-
-fn quote_sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +488,51 @@ mod tests {
     }
 
     #[test]
+    fn resumes_from_saved_table_progress_and_saves_each_chunk() {
+        let source = FakeReader::new(vec![row("1", "old"), row("2", "bravo"), row("3", "coda")]);
+        let target = FakeReader::new(vec![row("2", "bravo"), row("3", "coda")]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::with_progress(SyncTableProgress {
+            table: "accounts".to_string(),
+            last_primary_key: Some(vec!["1".to_string()]),
+            chunks: 1,
+            rows_scanned: 1,
+            inserts: 0,
+            updates: 0,
+            extra_target_rows: 0,
+            mode: SyncMode::Apply,
+            status: progress::SyncProgressStatus::Running,
+            last_error: None,
+        });
+
+        let report = sync_table_with_progress(
+            &account_table(),
+            1,
+            SyncMode::Apply,
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+        )
+        .expect("sync report");
+
+        assert_eq!(
+            source.requests.borrow()[0].start_after,
+            Some(vec!["1".to_string()])
+        );
+        assert_eq!(report.rows_scanned, 3);
+        let saved = progress_store.saved.borrow();
+        assert_eq!(
+            saved.last().expect("saved progress").last_primary_key,
+            Some(vec!["3".to_string()])
+        );
+        assert_eq!(
+            saved.last().expect("saved progress").status,
+            progress::SyncProgressStatus::Complete
+        );
+    }
+
+    #[test]
     fn builds_sync_select_with_start_and_end_bounds() {
         let sql = build_sync_select_sql(&SyncChunkRequest {
             table: "accounts".to_string(),
@@ -709,6 +623,44 @@ mod tests {
 
         fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
             self.updates.borrow_mut().push(row.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingProgressStore {
+        loaded: Option<SyncTableProgress>,
+        saved: RefCell<Vec<SyncTableProgress>>,
+    }
+
+    impl RecordingProgressStore {
+        fn with_progress(progress: SyncTableProgress) -> Self {
+            Self {
+                loaded: Some(progress),
+                saved: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SyncProgressStore for RecordingProgressStore {
+        fn ensure(&mut self) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn load(&self, _table: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
+            Ok(self.loaded.clone())
+        }
+
+        fn save(&mut self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
+            self.saved.borrow_mut().push(progress.clone());
+            Ok(())
+        }
+
+        fn save_error(
+            &mut self,
+            _table: &str,
+            _error: &TableSyncError,
+        ) -> Result<(), TableSyncError> {
             Ok(())
         }
     }

@@ -17,6 +17,9 @@ CDC stream has already been applying forward changes.
 - [x] Allow extra target rows inside a source window to be detected.
 - [x] Parse source, target, table, column, chunk-size, and mode options from the
   `sync-table` CLI command.
+- [x] Store resumable per-table sync progress in the target CDC database table,
+  defaulting to `cdc.table_sync_progress`.
+- [x] Auto-create the CDC progress schema/table when missing.
 - [x] On stream target-apply failure for INSERT, UPDATE, or REPLACE, run table
   repair for the failed statement's table and checkpoint the event only after
   repair succeeds.
@@ -31,6 +34,8 @@ CDC stream has already been applying forward changes.
 
 - `src/table_sync.rs` - chunk comparison, repair reporting, MySQL row readers,
   and target repair adapter.
+- `src/table_sync/progress.rs` - target-side CDC progress table schema, loading,
+  saving, and error recording.
 - `src/sync_cli.rs` - `sync-table` option parsing and command dispatch.
 - `src/main.rs` - top-level command registration and shared option helpers.
 - `src/live.rs` - stream failure hook that runs table repair before checkpointing.
@@ -40,6 +45,8 @@ CDC stream has already been applying forward changes.
 
 - `src/table_sync.rs` - row comparison, dry-run/apply behavior, source-window
   target reads, and SQL generation tests.
+- `src/table_sync/progress.rs` - progress table DDL, upsert SQL, and load
+  parsing tests.
 - `src/sync_cli.rs` - `sync-table` parser tests.
 - `src/live/tests.rs` - stream target-failure repair and checkpoint tests.
 
