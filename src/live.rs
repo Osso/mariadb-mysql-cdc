@@ -12,12 +12,14 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 mod binlog_command;
 mod insert_conflict;
 mod progress;
+mod schema_recovery;
 use binlog_command::{read_remote_binlog, stop_never_args};
 pub use insert_conflict::{InsertConflictPolicy, should_ignore_duplicate_insert};
 use progress::{
     StreamProgress, format_stream_exit, format_stream_progress, format_stream_quarantine,
     format_stream_start,
 };
+use schema_recovery::mysql_executor_with_recovery;
 
 #[derive(Clone, Debug)]
 pub struct ApplyBinlogConfig {
@@ -175,19 +177,13 @@ pub fn apply_remote_binlog(
             position: config.source.start_position,
         },
     );
-    let executor = MysqlCliExecutor {
-        mariadb: config.mariadb.clone(),
-        target: config.target.clone(),
-    };
+    let executor = mysql_executor_with_recovery(config);
     apply_statement_events(events, executor, RecordingQuarantine::default())
 }
 
 pub fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
     config.validate()?;
-    let executor = MysqlCliExecutor {
-        mariadb: config.mariadb.clone(),
-        target: config.target.clone(),
-    };
+    let executor = mysql_executor_with_recovery(config);
     let quarantine = RecordingQuarantine::default();
     let applier = StatementApplier::new(executor, quarantine);
 
@@ -715,12 +711,12 @@ DELETE FROM accounts WHERE id = 1/*!*/;
 
     #[derive(Default)]
     struct RecordingExecutor {
-        statements: RefCell<Vec<SqlStatement>>,
+        statements: RefCell<Vec<String>>,
     }
 
     impl TargetExecutor for RecordingExecutor {
         fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
-            self.statements.borrow_mut().push(statement.clone());
+            self.statements.borrow_mut().push(statement.sql.clone());
             Ok(())
         }
     }
