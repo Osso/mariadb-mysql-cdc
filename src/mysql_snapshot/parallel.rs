@@ -44,7 +44,7 @@ pub(super) fn copy_catchup_table_parallel(
     let started_at = Instant::now();
     let boundaries = source.read_range_boundaries(table, workers, total_rows)?;
     let ranges = plan_snapshot_ranges(boundaries, workers)?;
-    let rows_copied = copy_catchup_table_ranges(config, table, ranges, log_context)?;
+    let rows_copied = copy_catchup_table_ranges(config, table, ranges, log_context, total_rows)?;
     record_parallel_table_complete(config, table, rows_copied, total_rows)?;
     println!(
         "{}",
@@ -68,7 +68,9 @@ fn copy_catchup_table_ranges(
     table: &SnapshotTable,
     ranges: Vec<SnapshotRange>,
     log_context: CatchupTableLogContext,
+    total_rows: u64,
 ) -> Result<u64, CatchupSnapshotError> {
+    let workers = ranges.len();
     std::thread::scope(|scope| {
         let handles = ranges
             .into_iter()
@@ -76,7 +78,14 @@ fn copy_catchup_table_ranges(
                 let worker_config = config.clone();
                 let worker_table = table.clone();
                 scope.spawn(move || {
-                    copy_catchup_table_range(&worker_config, &worker_table, &range, log_context)
+                    let range_total_rows = range_total_rows(total_rows, workers, range.worker);
+                    copy_catchup_table_range(
+                        &worker_config,
+                        &worker_table,
+                        &range,
+                        range_total_rows,
+                        log_context,
+                    )
                 })
             })
             .collect::<Vec<_>>();
@@ -88,11 +97,12 @@ fn copy_catchup_table_range(
     config: &CatchupSnapshotConfig,
     table: &SnapshotTable,
     range: &SnapshotRange,
+    range_total_rows: u64,
     log_context: CatchupTableLogContext,
 ) -> Result<crate::snapshot::SnapshotResult, CatchupSnapshotError> {
     let source = PersistentMySqlSource::new(&config.source)?;
     let mut target = snapshot_target_for_table(config, &source, table)?;
-    let progress_store = mysql_only_progress_store(config)?;
+    let progress_store = mysql_only_progress_store(config, table, range, range_total_rows)?;
     let observer = super::CatchupSnapshotLogger::new(
         log_context.table_number,
         log_context.total_tables,
@@ -128,14 +138,58 @@ fn collect_range_results(
 
 fn mysql_only_progress_store(
     config: &CatchupSnapshotConfig,
+    table: &SnapshotTable,
+    range: &SnapshotRange,
+    range_total_rows: u64,
 ) -> Result<MysqlOnlyCatchupProgressStore, CatchupSnapshotError> {
     let mysql_store = PersistentProgressWriter::new(&config.target, config.progress_table.clone())
         .map_err(|error| SnapshotError::InvalidTable(error.to_string()))?;
+    let mut total_rows = BTreeMap::new();
+    total_rows.insert(
+        range_progress_key(&table.name, range.worker),
+        range_total_rows,
+    );
     Ok(MysqlOnlyCatchupProgressStore {
         mysql_store,
-        total_rows: BTreeMap::new(),
+        total_rows,
         mysql_save_state: RefCell::new(BTreeMap::new()),
     })
+}
+
+fn range_progress_key(table: &str, worker: usize) -> String {
+    format!("{table}#range{worker}")
+}
+
+fn range_total_rows(total_rows: u64, workers: usize, worker: usize) -> u64 {
+    let offsets = snapshot_boundary_offsets(total_rows, workers);
+    match (
+        worker,
+        offsets.get(worker),
+        worker.checked_sub(1).and_then(|index| offsets.get(index)),
+    ) {
+        (0, Some(end), _) => end + 1,
+        (_, Some(end), Some(previous)) => end - previous,
+        (_, None, Some(previous)) => total_rows.saturating_sub(previous + 1),
+        _ => total_rows,
+    }
+}
+
+fn snapshot_boundary_offsets(total_rows: u64, workers: usize) -> Vec<u64> {
+    if total_rows == 0 || workers <= 1 {
+        return Vec::new();
+    }
+
+    let mut offsets = (1..workers)
+        .map(|worker| snapshot_boundary_offset(total_rows, workers, worker))
+        .filter(|offset| *offset < total_rows)
+        .collect::<Vec<_>>();
+    offsets.dedup();
+    offsets
+}
+
+fn snapshot_boundary_offset(total_rows: u64, workers: usize, worker: usize) -> u64 {
+    let numerator = total_rows * worker as u64;
+    numerator.div_ceil(workers as u64).saturating_sub(1)
 }
 
 fn record_parallel_table_complete(
@@ -165,6 +219,30 @@ fn record_parallel_table_complete(
         })
         .map_err(|error| SnapshotError::InvalidTable(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_totals_sum_to_table_total() {
+        let totals = (0..4)
+            .map(|worker| range_total_rows(10, 4, worker))
+            .collect::<Vec<_>>();
+
+        assert_eq!(totals, vec![3, 2, 3, 2]);
+        assert_eq!(totals.iter().sum::<u64>(), 10);
+    }
+
+    #[test]
+    fn range_totals_handle_more_workers_than_rows() {
+        let totals = (0..2)
+            .map(|worker| range_total_rows(2, 2, worker))
+            .collect::<Vec<_>>();
+
+        assert_eq!(totals, vec![1, 1]);
+    }
 }
 
 struct MysqlOnlyCatchupProgressStore {
