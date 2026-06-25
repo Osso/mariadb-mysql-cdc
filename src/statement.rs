@@ -237,9 +237,9 @@ fn contains_multi_statement(sql: &str) -> bool {
 }
 
 fn find_mariadb_only_pattern(sql: &str) -> Option<String> {
-    let upper = sql.to_ascii_uppercase();
+    let upper = uppercase_outside_string_literals(sql);
     let patterns = [
-        " RETURNING",
+        "RETURNING",
         "SEQUENCE",
         "SYSTEM VERSIONING",
         "VERSIONING",
@@ -251,14 +251,14 @@ fn find_mariadb_only_pattern(sql: &str) -> Option<String> {
 }
 
 fn find_unsafe_pattern(sql: &str) -> Option<String> {
-    let upper = sql.to_ascii_uppercase();
+    let upper = uppercase_outside_string_literals(sql);
     let patterns = [
-        " LOAD_FILE(",
-        " INTO OUTFILE",
-        " INTO DUMPFILE",
-        " LOAD DATA",
-        " DEFINER=",
-        " SQL SECURITY DEFINER",
+        "LOAD_FILE(",
+        "INTO OUTFILE",
+        "INTO DUMPFILE",
+        "LOAD DATA",
+        "DEFINER=",
+        "SQL SECURITY DEFINER",
     ];
 
     find_pattern(&upper, &patterns)
@@ -267,8 +267,111 @@ fn find_unsafe_pattern(sql: &str) -> Option<String> {
 fn find_pattern(upper_sql: &str, patterns: &[&str]) -> Option<String> {
     patterns
         .iter()
-        .find(|pattern| upper_sql.contains(**pattern))
+        .find(|pattern| contains_bounded_pattern(upper_sql, pattern))
         .map(|pattern| pattern.trim().to_string())
+}
+
+fn uppercase_outside_string_literals(sql: &str) -> String {
+    let mut upper = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut quote = QuoteState::default();
+    let mut escaped = false;
+
+    while let Some(character) = chars.next() {
+        if quote.is_inside() {
+            upper.push(' ');
+            quote.update(character, &mut escaped, &mut chars, &mut upper);
+            continue;
+        }
+
+        match character {
+            '\'' | '"' => {
+                quote.enter(character);
+                upper.push(' ');
+            }
+            _ => upper.extend(character.to_uppercase()),
+        }
+    }
+
+    upper
+}
+
+#[derive(Default)]
+struct QuoteState {
+    quote_character: Option<char>,
+}
+
+impl QuoteState {
+    fn is_inside(&self) -> bool {
+        self.quote_character.is_some()
+    }
+
+    fn enter(&mut self, quote_character: char) {
+        self.quote_character = Some(quote_character);
+    }
+
+    fn update<I>(
+        &mut self,
+        character: char,
+        escaped: &mut bool,
+        chars: &mut std::iter::Peekable<I>,
+        upper: &mut String,
+    ) where
+        I: Iterator<Item = char>,
+    {
+        if *escaped {
+            *escaped = false;
+            return;
+        }
+
+        if character == '\\' {
+            *escaped = true;
+            return;
+        }
+
+        if self.is_escaped_sql_quote(character, chars) {
+            upper.push(' ');
+            chars.next();
+            return;
+        }
+
+        if self.quote_character == Some(character) {
+            self.quote_character = None;
+        }
+    }
+
+    fn is_escaped_sql_quote<I>(&self, character: char, chars: &mut std::iter::Peekable<I>) -> bool
+    where
+        I: Iterator<Item = char>,
+    {
+        self.quote_character == Some('\'') && character == '\'' && chars.peek() == Some(&'\'')
+    }
+}
+
+fn contains_bounded_pattern(sql: &str, pattern: &str) -> bool {
+    sql.match_indices(pattern)
+        .any(|(index, _)| pattern_has_valid_bounds(sql, pattern, index))
+}
+
+fn pattern_has_valid_bounds(sql: &str, pattern: &str, index: usize) -> bool {
+    let pattern_start = pattern.as_bytes()[0];
+    let pattern_end = pattern.as_bytes()[pattern.len() - 1];
+    let before = sql[..index].bytes().next_back();
+    let after = sql[index + pattern.len()..].bytes().next();
+
+    has_valid_boundary_before(pattern_start, before) && has_valid_boundary_after(pattern_end, after)
+}
+
+fn has_valid_boundary_before(pattern_start: u8, before: Option<u8>) -> bool {
+    !is_sql_word_byte(pattern_start) || before.is_none_or(|byte| !is_sql_word_byte(byte))
+}
+
+fn has_valid_boundary_after(pattern_end: u8, after: Option<u8>) -> bool {
+    !is_sql_word_byte(pattern_end) || after.is_none_or(|byte| !is_sql_word_byte(byte))
+}
+
+fn is_sql_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn is_known_compatible_dml(sql: &str) -> bool {
@@ -353,6 +456,23 @@ mod tests {
             ))
         );
         assert!(applier.executor.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn replays_sequence_text_inside_string_literal() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let outcome = applier
+            .apply(&statement(
+                r#"INSERT INTO guests (original_uri) VALUES ("https://globalcomix.com/forums/16355/chastity-blood-consequences")"#,
+            ))
+            .expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::Replayed);
+        assert_eq!(applier.executor.statements.borrow().len(), 1);
+        assert!(applier.quarantine.statements.borrow().is_empty());
     }
 
     #[test]
