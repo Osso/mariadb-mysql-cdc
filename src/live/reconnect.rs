@@ -78,8 +78,9 @@ pub(super) fn should_reconnect(
     error: &ApplyBinlogError,
     attempt: u32,
     max_reconnects: u32,
+    reconnect_forever: bool,
 ) -> bool {
-    attempt < max_reconnects && is_transient_source_error(error)
+    (reconnect_forever || attempt < max_reconnects) && is_transient_source_error(error)
 }
 
 pub(super) fn format_reconnect_start(

@@ -51,6 +51,8 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "cdc.stream_checkpoint",
         "--max-reconnects",
         "3",
+        "--reconnect-forever",
+        "true",
     ]))
     .expect("apply config");
 
@@ -79,6 +81,68 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
     );
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
     assert_eq!(config.max_reconnects, 3);
+    assert!(config.reconnect_forever);
+}
+
+#[test]
+fn parses_zero_max_reconnects_as_disabled_retry_cap() {
+    set_env("SOURCE_PASSWORD", "source-secret");
+    set_env("TARGET_PASSWORD", "target-secret");
+
+    let config = parse_apply_binlog_config(args([
+        "--source-host",
+        "10.0.0.2",
+        "--source-user",
+        "cdc",
+        "--source-password-env",
+        "SOURCE_PASSWORD",
+        "--binlog-file",
+        "mysqld-bin.000777",
+        "--target-host",
+        "target.db",
+        "--target-user",
+        "writer",
+        "--target-password-env",
+        "TARGET_PASSWORD",
+        "--target-database",
+        "app_target",
+        "--max-reconnects",
+        "0",
+    ]))
+    .expect("apply config");
+
+    assert_eq!(config.max_reconnects, 0);
+    assert!(!config.reconnect_forever);
+}
+
+#[test]
+fn parses_reconnect_forever_for_unlimited_stream_retries() {
+    set_env("SOURCE_PASSWORD", "source-secret");
+    set_env("TARGET_PASSWORD", "target-secret");
+
+    let config = parse_apply_binlog_config(args([
+        "--source-host",
+        "10.0.0.2",
+        "--source-user",
+        "cdc",
+        "--source-password-env",
+        "SOURCE_PASSWORD",
+        "--binlog-file",
+        "mysqld-bin.000777",
+        "--target-host",
+        "target.db",
+        "--target-user",
+        "writer",
+        "--target-password-env",
+        "TARGET_PASSWORD",
+        "--target-database",
+        "app_target",
+        "--reconnect-forever",
+        "true",
+    ]))
+    .expect("apply config");
+
+    assert!(config.reconnect_forever);
 }
 
 #[test]
@@ -267,6 +331,10 @@ fn rejects_invalid_numeric_options() {
     assert_eq!(
         parse_u32("--max-reconnects", "not-a-count").expect_err("invalid count"),
         "--max-reconnects must be an integer"
+    );
+    assert_eq!(
+        parse_bool("--reconnect-forever", "yes").expect_err("invalid bool"),
+        "--reconnect-forever must be true or false"
     );
 }
 

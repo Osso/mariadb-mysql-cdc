@@ -92,8 +92,9 @@ source connection loss without replaying from static startup coordinates.
 - `src/live/tests.rs` — asserts stream checkpoints are saved after successful
   target apply and not saved after failed target apply.
 - `src/live/tests.rs` — asserts transient TLS/connection-reset source failures
-  reconnect only while attempts remain, and non-transient source failures do not
-  reconnect.
+  reconnect only while positive attempts remain, `--reconnect-forever true`
+  allows unlimited transient reconnects, and non-transient source failures do
+  not reconnect.
 - `src/checkpoint.rs` — asserts file-backed checkpoint writes are atomic through
   temporary-file-and-rename behavior.
 

@@ -442,9 +442,37 @@ fn reconnects_only_transient_source_errors_with_remaining_attempts() {
         "mariadb-binlog exited with exit status: 1: Access denied".to_string(),
     );
 
-    assert!(should_reconnect(&transient, 0, 3));
-    assert!(!should_reconnect(&transient, 3, 3));
-    assert!(!should_reconnect(&auth, 0, 3));
+    assert!(should_reconnect(&transient, 0, 3, false));
+    assert!(!should_reconnect(&transient, 3, 3, false));
+    assert!(!should_reconnect(&auth, 0, 3, false));
+}
+
+#[test]
+fn max_zero_keeps_reconnects_disabled() {
+    let transient = ApplyBinlogError::SourceCommand(
+        "mariadb-binlog exited with exit status: 1: TLS/SSL error: Connection reset by peer"
+            .to_string(),
+    );
+    let auth = ApplyBinlogError::SourceCommand(
+        "mariadb-binlog exited with exit status: 1: Access denied".to_string(),
+    );
+
+    assert!(!should_reconnect(&transient, 0, 0, false));
+    assert!(!should_reconnect(&auth, 0, 0, false));
+}
+
+#[test]
+fn reconnect_forever_allows_unlimited_transient_reconnects() {
+    let transient = ApplyBinlogError::SourceCommand(
+        "mariadb-binlog exited with exit status: 1: TLS/SSL error: Connection reset by peer"
+            .to_string(),
+    );
+    let auth = ApplyBinlogError::SourceCommand(
+        "mariadb-binlog exited with exit status: 1: Access denied".to_string(),
+    );
+
+    assert!(should_reconnect(&transient, 1_000, 3, true));
+    assert!(!should_reconnect(&auth, 1_000, 3, true));
 }
 
 #[test]

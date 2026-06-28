@@ -73,6 +73,8 @@ Apply options:
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
+  --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
+  --reconnect-forever BOOL        Ignore reconnect cap for transient source loss. Defaults to false.
 
 Catchup snapshot options:
   --source-host HOST              MariaDB source host.
@@ -377,6 +379,7 @@ fn apply_binlog_option(
         "--checkpoint-file" => config.checkpoint_file = Some(PathBuf::from(value)),
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--max-reconnects" => config.max_reconnects = parse_u32(flag, value)?,
+        "--reconnect-forever" => config.reconnect_forever = parse_bool(flag, value)?,
         other => return Err(format!("unknown apply-binlog option: {other}")),
     }
 
@@ -449,6 +452,14 @@ fn parse_u32(flag: &str, value: &str) -> Result<u32, String> {
     value
         .parse()
         .map_err(|_| format!("{flag} must be an integer"))
+}
+
+fn parse_bool(flag: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("{flag} must be true or false")),
+    }
 }
 
 pub(crate) fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {

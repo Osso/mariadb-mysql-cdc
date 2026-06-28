@@ -51,6 +51,7 @@ pub struct ApplyBinlogConfig {
     pub checkpoint_file: Option<PathBuf>,
     pub checkpoint_table: String,
     pub max_reconnects: u32,
+    pub reconnect_forever: bool,
 }
 
 impl Default for ApplyBinlogConfig {
@@ -63,6 +64,7 @@ impl Default for ApplyBinlogConfig {
             checkpoint_file: None,
             checkpoint_table: default_stream_checkpoint_table(),
             max_reconnects: 12,
+            reconnect_forever: false,
         }
     }
 }
@@ -363,7 +365,12 @@ where
             Ok(()) => return Ok(()),
             Err(error)
                 if checkpoint_store.is_some()
-                    && should_reconnect(&error, attempt, config.max_reconnects) =>
+                    && should_reconnect(
+                        &error,
+                        attempt,
+                        config.max_reconnects,
+                        config.reconnect_forever,
+                    ) =>
             {
                 attempt += 1;
                 resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
