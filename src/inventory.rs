@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::process::Command;
 
+const BASE_TABLE_TYPE: &str = "BASE TABLE";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SchemaInventory {
     pub schema: String,
@@ -457,6 +459,7 @@ fn build_tables(
 ) -> Vec<TableInventory> {
     table_rows
         .into_iter()
+        .filter(|row| row.table_type == BASE_TABLE_TYPE)
         .map(|row| {
             let table_columns = columns.get(&row.table_name).cloned().unwrap_or_default();
             let primary_key = primary_keys

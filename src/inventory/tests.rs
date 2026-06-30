@@ -40,6 +40,28 @@ fn includes_views_triggers_routines_and_events() {
 }
 
 #[test]
+fn excludes_views_from_table_inventory() {
+    let reader = FakeInventoryReader {
+        tables: vec![accounts_table(), account_balances_view_table()],
+        columns: account_columns(),
+        primary_keys: vec![account_primary_key()],
+        views: vec![account_balances_view()],
+        triggers: Vec::new(),
+        routines: Vec::new(),
+        events: Vec::new(),
+    };
+
+    let inventory = build_inventory("fixture_cdc", &reader).expect("inventory");
+    let table_names = inventory
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(table_names, vec!["accounts"]);
+}
+
+#[test]
 fn parses_cli_rows_and_quotes_schema_names() {
     let rows = parse_tsv("accounts\tBASE TABLE\tInnoDB\tutf8mb4_unicode_ci\n");
     let table = parse_table_row(&rows[0]).expect("table row");
@@ -232,6 +254,15 @@ fn accounts_table() -> TableRow {
         table_name: "accounts".to_string(),
         table_type: "BASE TABLE".to_string(),
         engine: Some("InnoDB".to_string()),
+        table_collation: Some("utf8mb4_unicode_ci".to_string()),
+    }
+}
+
+fn account_balances_view_table() -> TableRow {
+    TableRow {
+        table_name: "account_balances".to_string(),
+        table_type: "VIEW".to_string(),
+        engine: None,
         table_collation: Some("utf8mb4_unicode_ci".to_string()),
     }
 }
