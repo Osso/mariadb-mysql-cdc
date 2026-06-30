@@ -1,8 +1,11 @@
 use super::{ApplyBinlogConfig, ApplyBinlogError};
 use crate::checkpoint::{Checkpoint, CheckpointError, FileCheckpointStore, LastEvent};
+use crate::probe::{BinlogCoordinate, ProbeConfig, current_master_coordinate};
 use crate::statement::StatementEvent;
 use crate::stream_checkpoint::MySqlStreamCheckpointStore;
 use std::time::Duration;
+
+pub(super) const BINLOG_START_POSITION: u64 = 4;
 
 pub(super) trait StreamCheckpointStore {
     fn load_checkpoint(&self) -> Result<Option<Checkpoint>, ApplyBinlogError>;
@@ -74,6 +77,151 @@ pub(super) fn statement_checkpoint(event: &StatementEvent) -> Checkpoint {
     }
 }
 
+pub(super) trait SourceCoordinateReader {
+    fn current_coordinate(
+        &self,
+        config: &ApplyBinlogConfig,
+    ) -> Result<BinlogCoordinate, ApplyBinlogError>;
+}
+
+struct MariaDbSourceCoordinateReader;
+
+impl SourceCoordinateReader for MariaDbSourceCoordinateReader {
+    fn current_coordinate(
+        &self,
+        config: &ApplyBinlogConfig,
+    ) -> Result<BinlogCoordinate, ApplyBinlogError> {
+        let probe_config = ProbeConfig {
+            host: config.source.host.clone(),
+            port: config.source.port,
+            user: config.source.user.clone(),
+            password: config.source.password.clone(),
+            mariadb: config.mariadb.clone(),
+            ..ProbeConfig::default()
+        };
+        current_master_coordinate(&probe_config)
+            .map_err(|error| ApplyBinlogError::SourceCommand(error.to_string()))
+    }
+}
+
+pub(super) fn run_stream_reconnect_loop<C, F, S>(
+    config: &ApplyBinlogConfig,
+    checkpoint_store: Option<&C>,
+    run_attempt: F,
+    sleep: S,
+) -> Result<(), ApplyBinlogError>
+where
+    C: StreamCheckpointStore,
+    F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
+    S: Fn(std::time::Duration),
+{
+    run_stream_reconnect_loop_with_coordinate_reader(
+        config,
+        checkpoint_store,
+        &MariaDbSourceCoordinateReader,
+        run_attempt,
+        sleep,
+    )
+}
+
+pub(super) fn run_stream_reconnect_loop_with_coordinate_reader<C, R, F, S>(
+    config: &ApplyBinlogConfig,
+    checkpoint_store: Option<&C>,
+    coordinate_reader: &R,
+    mut run_attempt: F,
+    sleep: S,
+) -> Result<(), ApplyBinlogError>
+where
+    C: StreamCheckpointStore,
+    R: SourceCoordinateReader,
+    F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
+    S: Fn(std::time::Duration),
+{
+    let mut attempt_config = config.clone();
+    resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
+    attempt_config.source.validate_start_coordinate()?;
+    let mut attempt = 0;
+    let mut auto_skip_retry_in_progress = false;
+
+    loop {
+        match run_attempt(&attempt_config) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if should_auto_skip_stale_binlog(
+                    &error,
+                    checkpoint_store,
+                    config.reconnect_forever,
+                ) =>
+            {
+                let old_coordinate = start_coordinate(&attempt_config);
+                if auto_skip_retry_in_progress {
+                    return Err(stale_binlog_auto_skip_repeated_error(
+                        &old_coordinate,
+                        &error,
+                    ));
+                }
+                let master_coordinate = coordinate_reader.current_coordinate(&attempt_config)?;
+                let new_coordinate = current_binlog_start_coordinate(&master_coordinate);
+                if new_coordinate == old_coordinate {
+                    return Err(stale_binlog_auto_skip_same_coordinate_error(
+                        &old_coordinate,
+                        &error,
+                    ));
+                }
+                save_stale_binlog_checkpoint(checkpoint_store, &old_coordinate, &new_coordinate)?;
+                println!(
+                    "{}",
+                    format_stale_binlog_auto_skip(
+                        &old_coordinate,
+                        &master_coordinate,
+                        &new_coordinate,
+                        &error,
+                    )
+                );
+                resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
+                attempt_config.source.validate_start_coordinate()?;
+                auto_skip_retry_in_progress = true;
+            }
+            Err(error)
+                if checkpoint_store.is_some()
+                    && should_reconnect(
+                        &error,
+                        attempt,
+                        config.max_reconnects,
+                        config.reconnect_forever,
+                    ) =>
+            {
+                auto_skip_retry_in_progress = false;
+                attempt += 1;
+                resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
+                attempt_config.source.validate_start_coordinate()?;
+                println!(
+                    "{}",
+                    format_reconnect_start(&attempt_config, attempt, &error)
+                );
+                sleep(reconnect_delay(attempt));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub(super) fn resume_from_checkpoint(
+    config: &mut ApplyBinlogConfig,
+    checkpoint_store: Option<&impl StreamCheckpointStore>,
+) -> Result<(), ApplyBinlogError> {
+    let Some(store) = checkpoint_store else {
+        return Ok(());
+    };
+    let Some(checkpoint) = store.load_checkpoint()? else {
+        return Ok(());
+    };
+
+    config.source.binlog_file = checkpoint.source_file;
+    config.source.start_position = checkpoint.source_position;
+    Ok(())
+}
+
 pub(super) fn should_reconnect(
     error: &ApplyBinlogError,
     attempt: u32,
@@ -81,6 +229,39 @@ pub(super) fn should_reconnect(
     reconnect_forever: bool,
 ) -> bool {
     (reconnect_forever || attempt < max_reconnects) && is_transient_source_error(error)
+}
+
+pub(super) fn is_stale_or_missing_binlog_error(error: &ApplyBinlogError) -> bool {
+    let ApplyBinlogError::SourceCommand(message) = error else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    lower.contains("could not find first log file name in binary log index file")
+        || lower.contains("could not find log file") && lower.contains("in binary log index file")
+        || lower.contains("not found in binlog index")
+        || lower.contains("not found in binary log index")
+}
+
+pub(super) fn stale_binlog_checkpoint(
+    old_coordinate: &BinlogCoordinate,
+    new_coordinate: &BinlogCoordinate,
+) -> Checkpoint {
+    Checkpoint {
+        source_file: new_coordinate.file.clone(),
+        source_position: new_coordinate.position,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: LastEvent {
+            event_type: "AutoSkipStaleBinlog".to_string(),
+            description: format!(
+                "auto-skipped stale source binlog checkpoint from {}:{} to {}:{}",
+                old_coordinate.file,
+                old_coordinate.position,
+                new_coordinate.file,
+                new_coordinate.position
+            ),
+        },
+    }
 }
 
 pub(super) fn format_reconnect_start(
@@ -103,6 +284,24 @@ pub(super) fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs(seconds)
 }
 
+pub(super) fn format_stale_binlog_auto_skip(
+    old_coordinate: &BinlogCoordinate,
+    master_coordinate: &BinlogCoordinate,
+    new_coordinate: &BinlogCoordinate,
+    error: &ApplyBinlogError,
+) -> String {
+    format!(
+        "cdc_stream_stale_binlog_auto_skip level=warn old_file={} old_position={} master_file={} master_position={} new_file={} new_position={} last_event=AutoSkipStaleBinlog error={}",
+        old_coordinate.file,
+        old_coordinate.position,
+        master_coordinate.file,
+        master_coordinate.position,
+        new_coordinate.file,
+        new_coordinate.position,
+        shell_word(&error.to_string())
+    )
+}
+
 fn format_checkpoint_write(checkpoint: &Checkpoint) -> String {
     format!(
         "cdc_stream_checkpoint file={} position={} event_type={}",
@@ -115,6 +314,62 @@ fn format_checkpoint_skip(checkpoint: &Checkpoint) -> String {
         "cdc_stream_checkpoint_skip file={} position={} event_type={}",
         checkpoint.source_file, checkpoint.source_position, checkpoint.last_event.event_type
     )
+}
+
+fn should_auto_skip_stale_binlog<C>(
+    error: &ApplyBinlogError,
+    checkpoint_store: Option<&C>,
+    reconnect_forever: bool,
+) -> bool
+where
+    C: StreamCheckpointStore,
+{
+    reconnect_forever && checkpoint_store.is_some() && is_stale_or_missing_binlog_error(error)
+}
+
+fn stale_binlog_auto_skip_same_coordinate_error(
+    coordinate: &BinlogCoordinate,
+    error: &ApplyBinlogError,
+) -> ApplyBinlogError {
+    ApplyBinlogError::SourceCommand(format!(
+        "stale binlog auto-skip refused because SHOW MASTER STATUS returned the same coordinate {}:{} that already failed; error={}",
+        coordinate.file, coordinate.position, error
+    ))
+}
+
+fn stale_binlog_auto_skip_repeated_error(
+    coordinate: &BinlogCoordinate,
+    error: &ApplyBinlogError,
+) -> ApplyBinlogError {
+    ApplyBinlogError::SourceCommand(format!(
+        "stale binlog auto-skip refused because the immediate retry from {}:{} also failed with a stale or missing binlog error; error={}",
+        coordinate.file, coordinate.position, error
+    ))
+}
+
+fn save_stale_binlog_checkpoint(
+    checkpoint_store: Option<&impl StreamCheckpointStore>,
+    old_coordinate: &BinlogCoordinate,
+    new_coordinate: &BinlogCoordinate,
+) -> Result<(), ApplyBinlogError> {
+    let Some(store) = checkpoint_store else {
+        return Ok(());
+    };
+    store.save_checkpoint(&stale_binlog_checkpoint(old_coordinate, new_coordinate))
+}
+
+fn current_binlog_start_coordinate(master_coordinate: &BinlogCoordinate) -> BinlogCoordinate {
+    BinlogCoordinate {
+        file: master_coordinate.file.clone(),
+        position: BINLOG_START_POSITION,
+    }
+}
+
+fn start_coordinate(config: &ApplyBinlogConfig) -> BinlogCoordinate {
+    BinlogCoordinate {
+        file: config.source.binlog_file.clone(),
+        position: config.source.start_position,
+    }
 }
 
 fn is_transient_source_error(error: &ApplyBinlogError) -> bool {

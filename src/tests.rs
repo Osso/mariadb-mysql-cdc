@@ -53,6 +53,8 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "3",
         "--reconnect-forever",
         "true",
+        "--stop-never-slave-server-id",
+        "4242",
     ]))
     .expect("apply config");
 
@@ -82,6 +84,40 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
     assert_eq!(config.max_reconnects, 3);
     assert!(config.reconnect_forever);
+    assert_eq!(config.source.stop_never_slave_server_id, Some(4242));
+}
+
+#[test]
+fn rejects_zero_stop_never_slave_server_id() {
+    set_env("SOURCE_PASSWORD", "source-secret");
+    set_env("TARGET_PASSWORD", "target-secret");
+
+    let error = parse_apply_binlog_config(args([
+        "--source-host",
+        "10.0.0.2",
+        "--source-user",
+        "cdc",
+        "--source-password-env",
+        "SOURCE_PASSWORD",
+        "--binlog-file",
+        "mysqld-bin.000777",
+        "--target-host",
+        "target.db",
+        "--target-user",
+        "writer",
+        "--target-password-env",
+        "TARGET_PASSWORD",
+        "--target-database",
+        "app_target",
+        "--stop-never-slave-server-id",
+        "0",
+    ]))
+    .expect_err("zero stop-never slave server id");
+
+    assert_eq!(
+        error,
+        "--stop-never-slave-server-id must be greater than zero"
+    );
 }
 
 #[test]
@@ -241,6 +277,53 @@ fn parses_catchup_snapshot_config() {
     assert_eq!(config.parallel_workers, 4);
     assert_eq!(config.table.as_deref(), Some("activity_tracking"));
     assert_eq!(config.source.mariadb, "/usr/bin/mariadb");
+}
+
+#[test]
+fn parses_drift_check_config_with_selected_tables() {
+    set_env("DRIFT_SOURCE_PASSWORD", "source-secret");
+    set_env("DRIFT_TARGET_PASSWORD", "target-secret");
+
+    let config = parse_drift_check_config(args([
+        "--source-host",
+        "10.0.0.2",
+        "--source-port",
+        "3307",
+        "--source-user",
+        "cdc",
+        "--source-password-env",
+        "DRIFT_SOURCE_PASSWORD",
+        "--source-database",
+        "globalcomix",
+        "--target-host",
+        "target.db",
+        "--target-port",
+        "25060",
+        "--target-user",
+        "target_user",
+        "--target-password-env",
+        "DRIFT_TARGET_PASSWORD",
+        "--target-database",
+        "globalcomix",
+        "--table",
+        "accounts",
+        "--table",
+        "releases",
+        "--mariadb",
+        "/usr/bin/mariadb",
+    ]))
+    .expect("drift config");
+
+    assert_eq!(config.source.host, "10.0.0.2");
+    assert_eq!(config.source.port, 3307);
+    assert_eq!(config.source.password, "source-secret");
+    assert_eq!(config.source.database, "globalcomix");
+    assert_eq!(config.source.mariadb, "/usr/bin/mariadb");
+    assert_eq!(config.target.host, "target.db");
+    assert_eq!(config.target.port, 25060);
+    assert_eq!(config.target.password, "target-secret");
+    assert_eq!(config.target.database, "globalcomix");
+    assert_eq!(config.tables, vec!["accounts", "releases"]);
 }
 
 #[test]

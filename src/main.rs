@@ -1,6 +1,7 @@
 pub mod catchup;
 pub mod checkpoint;
 pub mod cutover;
+pub mod drift_check;
 pub mod inventory;
 pub mod live;
 pub mod mysql_client;
@@ -31,6 +32,7 @@ Usage:
   mariadb-mysql-cdc catchup-progress --progress-file PATH
   mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS [options]
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
+  mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
 
@@ -45,6 +47,8 @@ Commands:
           Compare one source/target table by primary-key chunks and optionally repair target gaps.
   sync-progress
           Print table sync progress, stream checkpoint, rates, and ETA when source counts are supplied.
+  drift-check
+          Read-only source/target COUNT(*) drift check for selected tables, or all source base tables when no --table is supplied.
   apply-binlog
           Read remote MariaDB binlog text and apply compatible statements.
   stream-binlog
@@ -75,6 +79,7 @@ Apply options:
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
   --reconnect-forever BOOL        Ignore reconnect cap for transient source loss. Defaults to false.
+  --stop-never-slave-server-id ID MariaDB --stop-never slave server_id. Generated when omitted.
 
 Catchup snapshot options:
   --source-host HOST              MariaDB source host.
@@ -107,6 +112,7 @@ fn main() {
         Some("sync-progress") => {
             sync_progress_cli::run_sync_progress_command(args.collect(), USAGE)
         }
+        Some("drift-check") => run_drift_check_command(args.collect()),
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),
         Some("stream-binlog") => run_stream_binlog_command(args.collect()),
         Some("-h" | "--help") | None => print!("{USAGE}"),
@@ -129,6 +135,29 @@ fn run_stream_binlog_command(args: Vec<String>) {
     if let Err(error) = live::stream_remote_binlog(&config) {
         eprintln!("{error}");
         std::process::exit(1);
+    }
+}
+
+fn run_drift_check_command(args: Vec<String>) {
+    let config = match parse_drift_check_config(args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+
+    match drift_check::run_drift_check(&config) {
+        Ok(report) => {
+            println!("{}", drift_check::format_drift_report(&report));
+            if report.has_mismatches() {
+                std::process::exit(3);
+            }
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -341,6 +370,48 @@ fn parse_probe_config(args: Vec<String>) -> Result<probe::ProbeConfig, String> {
     Ok(config)
 }
 
+fn parse_drift_check_config(args: Vec<String>) -> Result<drift_check::DriftCheckConfig, String> {
+    let mut config = drift_check::DriftCheckConfig {
+        source: mysql_snapshot::MySqlConnectionConfig::default(),
+        target: live::TargetMySqlConfig::default(),
+        tables: Vec::new(),
+    };
+    let mut index = 0;
+
+    while index < args.len() {
+        let flag = &args[index];
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} needs a value"))?;
+
+        drift_check_option(&mut config, flag, value)?;
+        index += 2;
+    }
+
+    Ok(config)
+}
+
+fn drift_check_option(
+    config: &mut drift_check::DriftCheckConfig,
+    flag: &str,
+    value: &str,
+) -> Result<(), String> {
+    if catchup_source_option(&mut config.source, flag, value)? {
+        return Ok(());
+    }
+    if apply_target_option(&mut config.target, flag, value)? {
+        return Ok(());
+    }
+
+    match flag {
+        "--table" => config.tables.push(value.to_string()),
+        "--mariadb" => config.source.mariadb = value.to_string(),
+        other => return Err(format!("unknown drift-check option: {other}")),
+    }
+
+    Ok(())
+}
+
 fn parse_apply_binlog_config(args: Vec<String>) -> Result<live::ApplyBinlogConfig, String> {
     let mut config = live::ApplyBinlogConfig::default();
     config.source.start_position = 0;
@@ -380,6 +451,9 @@ fn apply_binlog_option(
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--max-reconnects" => config.max_reconnects = parse_u32(flag, value)?,
         "--reconnect-forever" => config.reconnect_forever = parse_bool(flag, value)?,
+        "--stop-never-slave-server-id" => {
+            config.source.stop_never_slave_server_id = Some(parse_nonzero_u32(flag, value)?);
+        }
         other => return Err(format!("unknown apply-binlog option: {other}")),
     }
 
@@ -452,6 +526,15 @@ fn parse_u32(flag: &str, value: &str) -> Result<u32, String> {
     value
         .parse()
         .map_err(|_| format!("{flag} must be an integer"))
+}
+
+fn parse_nonzero_u32(flag: &str, value: &str) -> Result<u32, String> {
+    let parsed = parse_u32(flag, value)?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be greater than zero"));
+    }
+
+    Ok(parsed)
 }
 
 fn parse_bool(flag: &str, value: &str) -> Result<bool, String> {

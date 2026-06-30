@@ -34,10 +34,12 @@ use progress::{
     StreamProgress, format_stream_exit, format_stream_progress, format_stream_quarantine,
     format_stream_start,
 };
+#[cfg(test)]
 use reconnect::{
-    StreamCheckpointStore, format_reconnect_start, reconnect_delay, save_stream_checkpoint,
-    should_reconnect,
+    SourceCoordinateReader, is_stale_or_missing_binlog_error, resume_from_checkpoint,
+    run_stream_reconnect_loop_with_coordinate_reader, should_reconnect,
 };
+use reconnect::{StreamCheckpointStore, run_stream_reconnect_loop, save_stream_checkpoint};
 use repair::{FailedStatementRepairer, TableSyncStatementRepairer, repair_failed_statement};
 pub(crate) use schema_recovery::mysql_compatible_create_table;
 use schema_recovery::mysql_executor_with_recovery;
@@ -83,6 +85,7 @@ impl ApplyBinlogConfig {
         if self.checkpoint_file.is_none() && self.checkpoint_table.is_empty() {
             self.source.validate_start_coordinate()?;
         }
+        self.source.validate_stop_never_slave_server_id()?;
         self.target.validate()
     }
 }
@@ -97,6 +100,7 @@ pub struct SourceBinlogConfig {
     pub binlog_file: String,
     pub start_position: u64,
     pub stop_position: Option<u64>,
+    pub stop_never_slave_server_id: Option<u32>,
 }
 
 impl Default for SourceBinlogConfig {
@@ -110,17 +114,28 @@ impl Default for SourceBinlogConfig {
             binlog_file: String::new(),
             start_position: 4,
             stop_position: None,
+            stop_never_slave_server_id: None,
         }
     }
 }
 
 impl SourceBinlogConfig {
-    fn validate_start_coordinate(&self) -> Result<(), ApplyBinlogError> {
+    pub(super) fn validate_start_coordinate(&self) -> Result<(), ApplyBinlogError> {
         if self.binlog_file.is_empty() {
             return Err(config_error("binlog file is required"));
         }
         if self.start_position == 0 {
             return Err(config_error("start position must be greater than zero"));
+        }
+
+        self.validate_stop_never_slave_server_id()
+    }
+
+    fn validate_stop_never_slave_server_id(&self) -> Result<(), ApplyBinlogError> {
+        if self.stop_never_slave_server_id == Some(0) {
+            return Err(config_error(
+                "--stop-never-slave-server-id must be greater than zero",
+            ));
         }
 
         Ok(())
@@ -344,48 +359,6 @@ where
     )
 }
 
-fn run_stream_reconnect_loop<C, F, S>(
-    config: &ApplyBinlogConfig,
-    checkpoint_store: Option<&C>,
-    mut run_attempt: F,
-    sleep: S,
-) -> Result<(), ApplyBinlogError>
-where
-    C: StreamCheckpointStore,
-    F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
-    S: Fn(std::time::Duration),
-{
-    let mut attempt_config = config.clone();
-    resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
-    attempt_config.source.validate_start_coordinate()?;
-    let mut attempt = 0;
-
-    loop {
-        match run_attempt(&attempt_config) {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if checkpoint_store.is_some()
-                    && should_reconnect(
-                        &error,
-                        attempt,
-                        config.max_reconnects,
-                        config.reconnect_forever,
-                    ) =>
-            {
-                attempt += 1;
-                resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
-                attempt_config.source.validate_start_coordinate()?;
-                println!(
-                    "{}",
-                    format_reconnect_start(&attempt_config, attempt, &error)
-                );
-                sleep(reconnect_delay(attempt));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 fn stream_statement_events_once<E, Q, R, C>(
     config: &ApplyBinlogConfig,
     applier: &StatementApplier<E, Q>,
@@ -545,22 +518,6 @@ where
             Err(ApplyBinlogError::Statement(error.to_string()))
         }
     }
-}
-
-fn resume_from_checkpoint(
-    config: &mut ApplyBinlogConfig,
-    checkpoint_store: Option<&impl StreamCheckpointStore>,
-) -> Result<(), ApplyBinlogError> {
-    let Some(store) = checkpoint_store else {
-        return Ok(());
-    };
-    let Some(checkpoint) = store.load_checkpoint()? else {
-        return Ok(());
-    };
-
-    config.source.binlog_file = checkpoint.source_file;
-    config.source.start_position = checkpoint.source_position;
-    Ok(())
 }
 
 struct StatementEventExtractor {

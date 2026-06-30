@@ -103,6 +103,15 @@ pub trait ProbeProcessRunner {
     ) -> Result<String, ProbeError>;
 }
 
+pub fn current_master_coordinate(config: &ProbeConfig) -> Result<BinlogCoordinate, ProbeError> {
+    let runner = ProcessRunner;
+    let status = runner.show_master_status(config)?;
+    Ok(BinlogCoordinate {
+        file: status.binlog_file,
+        position: status.position,
+    })
+}
+
 pub fn run_probe(
     config: &ProbeConfig,
     runner: &mut impl ProbeProcessRunner,

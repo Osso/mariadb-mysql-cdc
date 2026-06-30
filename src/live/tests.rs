@@ -1,5 +1,7 @@
 use super::*;
 use crate::checkpoint::{Checkpoint, LastEvent};
+
+mod reconnect;
 use crate::live::repair::{StatementRepairRequest, repair_table_name, repairable_table_name};
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
