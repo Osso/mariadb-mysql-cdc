@@ -526,6 +526,7 @@ struct StatementEventExtractor {
     current_resume_position: u64,
     default_database: Option<String>,
     pending_statement: Vec<String>,
+    ignoring_annotate_query: bool,
 }
 
 impl StatementEventExtractor {
@@ -536,6 +537,7 @@ impl StatementEventExtractor {
             current_resume_position: start.position,
             default_database: None,
             pending_statement: Vec::new(),
+            ignoring_annotate_query: false,
         }
     }
 
@@ -544,6 +546,21 @@ impl StatementEventExtractor {
 
         if self.is_collecting_statement() {
             return self.collect_statement_line(line);
+        }
+
+        if is_annotate_query_line(line) {
+            self.ignoring_annotate_query = !line_has_statement_terminator(line);
+            return None;
+        }
+
+        if self.ignoring_annotate_query {
+            if line_has_statement_terminator(line) {
+                self.ignoring_annotate_query = false;
+            }
+            if !is_binlog_metadata_line(line) {
+                return None;
+            }
+            self.ignoring_annotate_query = false;
         }
 
         if let Some(position) = parse_at_position(line) {
@@ -657,6 +674,14 @@ fn parse_use_database(line: &str) -> Option<String> {
     } else {
         Some(database.to_string())
     }
+}
+
+fn is_annotate_query_line(line: &str) -> bool {
+    line.starts_with("#Q>")
+}
+
+fn is_binlog_metadata_line(line: &str) -> bool {
+    line.starts_with("# at ") || line.starts_with("###") || line.starts_with('#')
 }
 
 fn starts_sql_statement(line: &str) -> bool {

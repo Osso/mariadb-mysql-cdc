@@ -90,6 +90,41 @@ body {
 }
 
 #[test]
+fn ignores_multiline_annotate_query_text_that_starts_with_sql_keywords() {
+    let events = extract_statement_events(
+        "\
+# at 100
+#250630  6:26:16 server id 1  end_log_pos 180 Annotate_rows:
+#Q> INSERT INTO `email_history` (`body`) VALUES (\"<html>
+    <p>
+        Create your own page and start publishing.
+    </p>
+</html>\")
+# at 180
+#250630  6:26:16 server id 1  end_log_pos 240 Table_map: `globalcomix`.`email_history` mapped to number 1
+### INSERT INTO `globalcomix`.`email_history`
+### SET
+###   @1='body'
+# at 240
+use `test_cdc`/*!*/;
+SET TIMESTAMP=1/*!*/;
+UPDATE accounts SET name = 'beta' WHERE id = 1/*!*/;
+",
+        &BinlogCoordinate {
+            file: "mysqld-bin.000001".to_string(),
+            position: 4,
+        },
+    );
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].coordinate.position, 240);
+    assert_eq!(
+        events[0].sql,
+        "UPDATE accounts SET name = 'beta' WHERE id = 1"
+    );
+}
+
+#[test]
 fn applies_extracted_compatible_statements() {
     let events = vec![StatementEvent {
         coordinate: BinlogCoordinate {
