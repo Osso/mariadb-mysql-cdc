@@ -125,6 +125,50 @@ UPDATE accounts SET name = 'beta' WHERE id = 1/*!*/;
 }
 
 #[test]
+fn ignores_body_text_line_starting_with_create() {
+    let events = extract_statement_events(
+        "\
+# at 100
+use `test_cdc`/*!*/;
+Create your own page and start publishing/*!*/;
+# at 180
+#250630  6:26:16 server id 1  end_log_pos 240
+UPDATE accounts SET name = 'beta' WHERE id = 1/*!*/;
+",
+        &BinlogCoordinate {
+            file: "mysqld-bin.000001".to_string(),
+            position: 4,
+        },
+    );
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].coordinate.position, 180);
+    assert_eq!(
+        events[0].sql,
+        "UPDATE accounts SET name = 'beta' WHERE id = 1"
+    );
+}
+
+#[test]
+fn extracts_real_create_table_statement() {
+    let events = extract_statement_events(
+        "\
+# at 100
+use `test_cdc`/*!*/;
+CREATE TABLE accounts (id INT PRIMARY KEY)/*!*/;
+",
+        &BinlogCoordinate {
+            file: "mysqld-bin.000001".to_string(),
+            position: 4,
+        },
+    );
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].coordinate.position, 100);
+    assert_eq!(events[0].sql, "CREATE TABLE accounts (id INT PRIMARY KEY)");
+}
+
+#[test]
 fn applies_extracted_compatible_statements() {
     let events = vec![StatementEvent {
         coordinate: BinlogCoordinate {

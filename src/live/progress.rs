@@ -97,10 +97,6 @@ pub(super) fn format_stream_quarantine(
     )
 }
 
-pub(super) fn format_stream_exit(progress: &StreamProgress) -> String {
-    format_stream_totals("cdc_stream_exit", progress)
-}
-
 fn format_stream_totals(event_name: &str, progress: &StreamProgress) -> String {
     format!(
         "{} applied_statements={} quarantined_statements={} last_file={} last_position={}",

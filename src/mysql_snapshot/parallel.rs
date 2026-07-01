@@ -221,30 +221,6 @@ fn record_parallel_table_complete(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn range_totals_sum_to_table_total() {
-        let totals = (0..4)
-            .map(|worker| range_total_rows(10, 4, worker))
-            .collect::<Vec<_>>();
-
-        assert_eq!(totals, vec![3, 2, 3, 2]);
-        assert_eq!(totals.iter().sum::<u64>(), 10);
-    }
-
-    #[test]
-    fn range_totals_handle_more_workers_than_rows() {
-        let totals = (0..2)
-            .map(|worker| range_total_rows(2, 2, worker))
-            .collect::<Vec<_>>();
-
-        assert_eq!(totals, vec![1, 1]);
-    }
-}
-
 struct MysqlOnlyCatchupProgressStore {
     mysql_store: PersistentProgressWriter,
     total_rows: BTreeMap<String, u64>,
@@ -267,5 +243,29 @@ impl SnapshotProgressStore for MysqlOnlyCatchupProgressStore {
             progress,
         )
         .map_err(|error| SnapshotError::InvalidTable(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_totals_sum_to_table_total() {
+        let totals = (0..4)
+            .map(|worker| range_total_rows(10, 4, worker))
+            .collect::<Vec<_>>();
+
+        assert_eq!(totals, vec![3, 2, 3, 2]);
+        assert_eq!(totals.iter().sum::<u64>(), 10);
+    }
+
+    #[test]
+    fn range_totals_handle_more_workers_than_rows() {
+        let totals = (0..2)
+            .map(|worker| range_total_rows(2, 2, worker))
+            .collect::<Vec<_>>();
+
+        assert_eq!(totals, vec![1, 1]);
     }
 }

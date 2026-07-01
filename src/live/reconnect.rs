@@ -1,6 +1,7 @@
 use super::{ApplyBinlogConfig, ApplyBinlogError};
 use crate::checkpoint::{Checkpoint, CheckpointError, FileCheckpointStore, LastEvent};
 use crate::probe::{BinlogCoordinate, ProbeConfig, current_master_coordinate};
+#[cfg(test)]
 use crate::statement::StatementEvent;
 use crate::stream_checkpoint::MySqlStreamCheckpointStore;
 use std::time::Duration;
@@ -32,21 +33,38 @@ impl StreamCheckpointStore for MySqlStreamCheckpointStore {
     }
 }
 
+#[cfg(test)]
 pub(super) fn save_stream_checkpoint(
     checkpoint_store: Option<&impl StreamCheckpointStore>,
     event: &StatementEvent,
+) -> Result<(), ApplyBinlogError> {
+    let checkpoint = statement_checkpoint(event);
+    save_checkpoint_if_advanced(checkpoint_store, &checkpoint)
+}
+
+pub(super) fn save_coordinate_checkpoint(
+    checkpoint_store: Option<&impl StreamCheckpointStore>,
+    coordinate: &BinlogCoordinate,
+    event_type: &str,
+) -> Result<(), ApplyBinlogError> {
+    let checkpoint = coordinate_checkpoint(coordinate, event_type);
+    save_checkpoint_if_advanced(checkpoint_store, &checkpoint)
+}
+
+fn save_checkpoint_if_advanced(
+    checkpoint_store: Option<&impl StreamCheckpointStore>,
+    checkpoint: &Checkpoint,
 ) -> Result<(), ApplyBinlogError> {
     let Some(store) = checkpoint_store else {
         return Ok(());
     };
 
-    let checkpoint = statement_checkpoint(event);
-    if should_skip_checkpoint(store, &checkpoint)? {
-        println!("{}", format_checkpoint_skip(&checkpoint));
+    if should_skip_checkpoint(store, checkpoint)? {
+        println!("{}", format_checkpoint_skip(checkpoint));
         return Ok(());
     }
-    store.save_checkpoint(&checkpoint)?;
-    println!("{}", format_checkpoint_write(&checkpoint));
+    store.save_checkpoint(checkpoint)?;
+    println!("{}", format_checkpoint_write(checkpoint));
     Ok(())
 }
 
@@ -64,6 +82,7 @@ fn should_skip_checkpoint(
         && checkpoint.source_position <= current.source_position)
 }
 
+#[cfg(test)]
 pub(super) fn statement_checkpoint(event: &StatementEvent) -> Checkpoint {
     Checkpoint {
         source_file: event.coordinate.file.clone(),
@@ -73,6 +92,22 @@ pub(super) fn statement_checkpoint(event: &StatementEvent) -> Checkpoint {
         last_event: LastEvent {
             event_type: "StatementEvent".to_string(),
             description: event.sql.chars().take(120).collect(),
+        },
+    }
+}
+
+fn coordinate_checkpoint(coordinate: &BinlogCoordinate, event_type: &str) -> Checkpoint {
+    Checkpoint {
+        source_file: coordinate.file.clone(),
+        source_position: coordinate.position,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: LastEvent {
+            event_type: event_type.to_string(),
+            description: format!(
+                "structured binlog event at {}:{}",
+                coordinate.file, coordinate.position
+            ),
         },
     }
 }

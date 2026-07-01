@@ -607,7 +607,7 @@ exit 0
     }
 
     fn shell_quote_path(path: &Path) -> String {
-        shell_quote(&path.to_string_lossy())
+        shell_quote(path.to_string_lossy())
     }
 
     fn shell_quote(value: impl AsRef<str>) -> String {

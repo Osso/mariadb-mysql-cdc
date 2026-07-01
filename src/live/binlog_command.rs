@@ -1,7 +1,9 @@
 use super::{ApplyBinlogConfig, ApplyBinlogError, SourceBinlogConfig};
 use std::process::Command;
 
+#[cfg(test)]
 const FNV_OFFSET_BASIS: u32 = 2_166_136_261;
+#[cfg(test)]
 const FNV_PRIME: u32 = 16_777_619;
 
 pub(super) fn read_remote_binlog(config: &ApplyBinlogConfig) -> Result<String, ApplyBinlogError> {
@@ -55,6 +57,7 @@ fn binlog_args(source: &SourceBinlogConfig) -> Vec<String> {
     args
 }
 
+#[cfg(test)]
 pub(super) fn stop_never_args(source: &SourceBinlogConfig) -> Vec<String> {
     let mut args = binlog_args(source);
     let binlog_file_index = args.len().saturating_sub(1);
@@ -69,12 +72,14 @@ pub(super) fn stop_never_args(source: &SourceBinlogConfig) -> Vec<String> {
     args
 }
 
+#[cfg(test)]
 fn stop_never_slave_server_id(source: &SourceBinlogConfig) -> u32 {
     source
         .stop_never_slave_server_id
         .unwrap_or_else(generate_stop_never_slave_server_id)
 }
 
+#[cfg(test)]
 fn generate_stop_never_slave_server_id() -> u32 {
     let hostname = std::env::var("HOSTNAME").unwrap_or_default();
     let process_id = std::process::id();
@@ -84,6 +89,7 @@ fn generate_stop_never_slave_server_id() -> u32 {
     if hash == 0 { 1 } else { hash }
 }
 
+#[cfg(test)]
 fn fnv1a(bytes: &[u8], seed: u32) -> u32 {
     bytes.iter().fold(seed, |hash, byte| {
         let mixed = hash ^ u32::from(*byte);

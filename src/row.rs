@@ -130,6 +130,10 @@ where
         &self.executor
     }
 
+    pub fn table_map(&self, table_id: u64) -> Option<&RowTableMap> {
+        self.registry.table(table_id)
+    }
+
     fn resolve_table(
         &self,
         table_id: u64,

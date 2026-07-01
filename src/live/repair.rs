@@ -1,13 +1,7 @@
-use crate::inventory::{InventoryConfig, MariaDbInventoryReader, build_inventory};
-use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::probe::BinlogCoordinate;
-use crate::snapshot::SnapshotTable;
 use crate::statement::{StatementApplyError, StatementEvent};
-use crate::table_sync::{SyncMode, SyncTable, SyncTableConfig, run_sync_table};
 
-use super::{ApplyBinlogConfig, ApplyBinlogError};
-
-const REPAIR_CHUNK_SIZE: usize = 1000;
+use super::ApplyBinlogError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct StatementRepairRequest {
@@ -20,60 +14,6 @@ pub(super) struct StatementRepairRequest {
 
 pub(super) trait FailedStatementRepairer {
     fn repair(&self, request: &StatementRepairRequest) -> Result<(), ApplyBinlogError>;
-}
-
-pub(super) struct TableSyncStatementRepairer {
-    config: ApplyBinlogConfig,
-}
-
-impl TableSyncStatementRepairer {
-    pub fn new(config: ApplyBinlogConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl FailedStatementRepairer for TableSyncStatementRepairer {
-    fn repair(&self, request: &StatementRepairRequest) -> Result<(), ApplyBinlogError> {
-        println!("{}", format_statement_repair_start(request));
-        let sync_config = self.sync_config(request)?;
-        let report = run_sync_table(&sync_config).map_err(|error| {
-            ApplyBinlogError::Statement(format!(
-                "failed to repair {} after stream apply failure: {error}",
-                request.table
-            ))
-        })?;
-        println!("{}", format_statement_repair_complete(request, &report));
-        Ok(())
-    }
-}
-
-impl TableSyncStatementRepairer {
-    fn sync_config(
-        &self,
-        request: &StatementRepairRequest,
-    ) -> Result<SyncTableConfig, ApplyBinlogError> {
-        let database = repair_database(&self.config, request)?;
-        Ok(SyncTableConfig {
-            source: self.source_config(&database),
-            target: self.config.target.clone(),
-            mariadb: self.config.mariadb.clone(),
-            table: read_sync_table(&self.config, &database, &request.table)?,
-            chunk_size: REPAIR_CHUNK_SIZE,
-            mode: SyncMode::Apply,
-            progress_table: "cdc.table_sync_progress".to_string(),
-        })
-    }
-
-    fn source_config(&self, database: &str) -> MySqlConnectionConfig {
-        MySqlConnectionConfig {
-            host: self.config.source.host.clone(),
-            port: self.config.source.port,
-            user: self.config.source.user.clone(),
-            password: self.config.source.password.clone(),
-            database: database.to_string(),
-            mariadb: self.config.mariadb.clone(),
-        }
-    }
 }
 
 pub(super) fn repair_failed_statement(
@@ -98,52 +38,6 @@ pub(super) fn repair_failed_statement(
 
     repairer.repair(&request)?;
     Ok(true)
-}
-
-fn repair_database(
-    config: &ApplyBinlogConfig,
-    request: &StatementRepairRequest,
-) -> Result<String, ApplyBinlogError> {
-    request
-        .default_database
-        .clone()
-        .or_else(|| config.source.database.clone())
-        .ok_or_else(|| {
-            ApplyBinlogError::Statement(format!(
-                "failed to repair {}: no source database was recorded",
-                request.table
-            ))
-        })
-}
-
-fn read_sync_table(
-    config: &ApplyBinlogConfig,
-    database: &str,
-    table: &str,
-) -> Result<SyncTable, ApplyBinlogError> {
-    let inventory_config = InventoryConfig {
-        host: config.source.host.clone(),
-        port: config.source.port,
-        user: config.source.user.clone(),
-        password: config.source.password.clone(),
-        mariadb: config.mariadb.clone(),
-    };
-    let reader = MariaDbInventoryReader::new(inventory_config);
-    let inventory = build_inventory(database, &reader).map_err(|error| {
-        ApplyBinlogError::Statement(format!("repair inventory failed: {error}"))
-    })?;
-    let table = inventory
-        .tables
-        .iter()
-        .find(|candidate| candidate.name == table)
-        .ok_or_else(|| ApplyBinlogError::Statement(format!("repair table not found: {table}")))?;
-    let snapshot_table = SnapshotTable::from(table);
-
-    Ok(SyncTable {
-        name: snapshot_table.name,
-        primary_key: snapshot_table.primary_key,
-        columns: snapshot_table.columns,
-    })
 }
 
 pub(super) fn repair_table_name(sql: &str) -> Option<String> {
@@ -198,34 +92,6 @@ fn read_table_identifier(input: &str) -> Option<String> {
     } else {
         Some(table.to_string())
     }
-}
-
-fn format_statement_repair_start(request: &StatementRepairRequest) -> String {
-    format!(
-        "cdc_statement_repair_start file={} position={} database={} table={} error={}",
-        request.coordinate.file,
-        request.coordinate.position,
-        request.default_database.as_deref().unwrap_or("-"),
-        request.table,
-        shell_word(&request.error)
-    )
-}
-
-fn format_statement_repair_complete(
-    request: &StatementRepairRequest,
-    report: &crate::table_sync::SyncTableReport,
-) -> String {
-    format!(
-        "cdc_statement_repair_complete file={} position={} table={} chunks={} rows_scanned={} inserts={} updates={} extra_target_rows={}",
-        request.coordinate.file,
-        request.coordinate.position,
-        request.table,
-        report.chunks,
-        report.rows_scanned,
-        report.inserts,
-        report.updates,
-        report.extra_target_rows
-    )
 }
 
 fn format_statement_repair_skipped(event: &StatementEvent, sql: &str) -> String {
