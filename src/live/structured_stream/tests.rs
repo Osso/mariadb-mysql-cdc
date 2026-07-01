@@ -769,6 +769,7 @@ fn schema(columns: Vec<&str>) -> ResolvedTableSchema {
     ResolvedTableSchema {
         columns: columns.into_iter().map(str::to_string).collect(),
         primary_key: vec!["id".to_string()],
+        generated_columns: Vec::new(),
     }
 }
 

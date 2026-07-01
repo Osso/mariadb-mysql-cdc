@@ -111,6 +111,7 @@ impl StructuredEventState {
 struct ResolvedTableSchema {
     columns: Vec<String>,
     primary_key: Vec<String>,
+    generated_columns: Vec<String>,
 }
 
 trait TableSchemaResolver {
@@ -158,10 +159,17 @@ impl TableSchemaResolver for SourceInventorySchemaResolver {
             .iter()
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
+        let generated_columns = table
+            .columns
+            .iter()
+            .filter(|column| column.generated.is_some())
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
         validate_column_count(schema, &table.name, column_count, &columns)?;
         Ok(ResolvedTableSchema {
             columns,
             primary_key: table.primary_key.clone(),
+            generated_columns,
         })
     }
 }
@@ -599,6 +607,7 @@ where
             table: table_map.table_name.clone(),
             columns: schema.columns,
             primary_key: schema.primary_key,
+            generated_columns: schema.generated_columns,
         },
     })
 }
@@ -631,13 +640,27 @@ where
         &columns,
     )?;
 
-    let primary_key = match primary_key_from_metadata(metadata, &columns)? {
-        Some(primary_key) => primary_key,
-        None => fallback()?.primary_key,
+    let metadata_primary_key = primary_key_from_metadata(metadata, &columns)?;
+    let fallback_schema = if metadata_primary_key.is_some() {
+        fallback().ok()
+    } else {
+        Some(fallback()?)
     };
+    let primary_key = match metadata_primary_key {
+        Some(primary_key) => primary_key,
+        None => fallback_schema
+            .as_ref()
+            .expect("fallback schema exists when metadata lacks primary key")
+            .primary_key
+            .clone(),
+    };
+    let generated_columns = fallback_schema
+        .map(|schema| schema.generated_columns)
+        .unwrap_or_default();
     Ok(ResolvedTableSchema {
         columns,
         primary_key,
+        generated_columns,
     })
 }
 

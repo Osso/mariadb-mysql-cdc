@@ -13,6 +13,7 @@ pub struct RowTableMap {
     pub table: String,
     pub columns: Vec<String>,
     pub primary_key: Vec<String>,
+    pub generated_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -351,16 +352,16 @@ fn primary_key_value(
 }
 
 fn build_insert_statement(table: &RowTableMap, rows: &[RowImage]) -> SqlStatement {
-    let column_list = table
-        .columns
+    let writable_columns = writable_columns(table);
+    let column_list = writable_columns
         .iter()
         .map(|column| quote_ident(column))
         .collect::<Vec<_>>();
-    let placeholders = row_placeholders(table.columns.len(), rows.len());
-    let update_list = update_assignments(&table.columns, &table.primary_key);
+    let placeholders = row_placeholders(writable_columns.len(), rows.len());
+    let update_list = update_assignments(&writable_columns, &table.primary_key);
     let params = rows
         .iter()
-        .flat_map(|row| ordered_values(row, &table.columns))
+        .flat_map(|row| ordered_values(row, &writable_columns))
         .collect();
 
     SqlStatement {
@@ -380,7 +381,8 @@ fn build_update_statement(
     row: &RowImage,
     coordinate: &BinlogCoordinate,
 ) -> RowResult<SqlStatement> {
-    let changed_columns = non_primary_columns(&table.columns, &table.primary_key);
+    let writable_columns = writable_columns(table);
+    let changed_columns = non_primary_columns(&writable_columns, &table.primary_key);
     let assignments = changed_columns
         .iter()
         .map(|column| format!("{} = ?", quote_ident(column)))
@@ -428,6 +430,15 @@ where
     executor
         .execute(&statement)
         .map_err(|source| target_error(coordinate, table, operation, source))
+}
+
+fn writable_columns(table: &RowTableMap) -> Vec<String> {
+    table
+        .columns
+        .iter()
+        .filter(|column| !table.generated_columns.contains(column))
+        .cloned()
+        .collect()
 }
 
 fn ordered_values(row: &RowImage, columns: &[String]) -> Vec<Value> {
@@ -539,6 +550,61 @@ mod tests {
     }
 
     #[test]
+    fn excludes_generated_columns_from_write_and_update_statements() {
+        let mut applier = RowApplier::new(RecordingExecutor::default());
+        applier.apply_table_map(TableMapEvent {
+            coordinate: coordinate(100),
+            table: RowTableMap {
+                table_id: 9,
+                schema: "app".to_string(),
+                table: "releases".to_string(),
+                columns: vec![
+                    "id".to_string(),
+                    "slug".to_string(),
+                    "public_time".to_string(),
+                ],
+                primary_key: vec!["id".to_string()],
+                generated_columns: vec!["public_time".to_string()],
+            },
+        });
+        let row = BTreeMap::from([
+            ("id".to_string(), value("1")),
+            ("slug".to_string(), value("alpha")),
+            ("public_time".to_string(), value("2026-07-01 00:00:00")),
+        ]);
+
+        applier
+            .apply_write_rows(&WriteRowsEvent {
+                coordinate: coordinate(120),
+                table_id: 9,
+                rows: vec![row.clone()],
+            })
+            .expect("write row");
+        applier
+            .apply_update_rows(&UpdateRowsEvent {
+                coordinate: coordinate(140),
+                table_id: 9,
+                rows: vec![RowUpdate {
+                    before: row.clone(),
+                    after: row,
+                }],
+            })
+            .expect("update row");
+
+        let statements = applier.executor().statements.borrow();
+        assert_eq!(
+            statements[0].sql,
+            "INSERT INTO `releases` (`id`, `slug`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `slug` = VALUES(`slug`)"
+        );
+        assert_eq!(statements[0].params, values(["1", "alpha"]));
+        assert_eq!(
+            statements[1].sql,
+            "UPDATE `releases` SET `slug` = ? WHERE `id` = ?"
+        );
+        assert_eq!(statements[1].params, values(["alpha", "1"]));
+    }
+
+    #[test]
     fn applies_delete_rows_using_before_image_primary_key() {
         let applier = applier_with_accounts_table();
         let event = DeleteRowsEvent {
@@ -637,6 +703,7 @@ mod tests {
                 table: "accounts".to_string(),
                 columns: vec!["id".to_string(), "name".to_string()],
                 primary_key: vec!["id".to_string()],
+                generated_columns: Vec::new(),
             },
         }
     }
