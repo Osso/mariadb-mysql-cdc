@@ -677,6 +677,16 @@ fn formats_mysql_cdc_values_like_snapshot_text_rows() {
         Value::Bytes(b"hello".to_vec())
     );
     assert_eq!(
+        mysql_value_to_target_value(&Some(MySqlValue::Bit(vec![true]))),
+        Value::Bytes(vec![1])
+    );
+    assert_eq!(
+        mysql_value_to_target_value(&Some(MySqlValue::Bit(vec![
+            true, false, true, false, true, false, true, false, true
+        ]))),
+        Value::Bytes(vec![1, 85])
+    );
+    assert_eq!(
         mysql_value_to_target_value(&Some(MySqlValue::Time(Time {
             hour: 26,
             minute: 3,

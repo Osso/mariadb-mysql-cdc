@@ -765,7 +765,7 @@ fn mysql_value_to_target_value(value: &Option<MySqlValue>) -> Value {
         Some(MySqlValue::Double(value)) => Value::Double(*value),
         Some(MySqlValue::Decimal(value)) => bytes_value(value.as_str()),
         Some(MySqlValue::String(value)) => bytes_value(value.as_str()),
-        Some(MySqlValue::Bit(value)) => bytes_value(format_bit_value(value)),
+        Some(MySqlValue::Bit(value)) => Value::Bytes(pack_bit_value(value)),
         Some(MySqlValue::Enum(value)) => Value::UInt(u64::from(*value)),
         Some(MySqlValue::Set(value)) => Value::UInt(*value),
         Some(MySqlValue::Blob(value)) => Value::Bytes(value.clone()),
@@ -863,10 +863,18 @@ fn mapping_error(message: String) -> ApplyBinlogError {
     ApplyBinlogError::Statement(message)
 }
 
-fn format_bit_value(bits: &[bool]) -> String {
-    bits.iter()
-        .fold(0_u64, |value, bit| (value << 1) | u64::from(*bit))
-        .to_string()
+fn pack_bit_value(bits: &[bool]) -> Vec<u8> {
+    let numeric_value = bits
+        .iter()
+        .fold(0_u64, |value, bit| (value << 1) | u64::from(*bit));
+    let byte_count = bits.len().max(1).div_ceil(8);
+
+    (0..byte_count)
+        .map(|index| {
+            let shift = (byte_count - index - 1) * 8;
+            ((numeric_value >> shift) & 0xff) as u8
+        })
+        .collect()
 }
 
 fn format_date(value: &Date) -> String {
