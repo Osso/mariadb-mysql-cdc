@@ -112,6 +112,7 @@ struct ResolvedTableSchema {
     columns: Vec<String>,
     primary_key: Vec<String>,
     generated_columns: Vec<String>,
+    signed_columns: Vec<String>,
 }
 
 trait TableSchemaResolver {
@@ -165,11 +166,18 @@ impl TableSchemaResolver for SourceInventorySchemaResolver {
             .filter(|column| column.generated.is_some())
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
+        let signed_columns = table
+            .columns
+            .iter()
+            .filter(|column| is_signed_integer_column(&column.data_type, &column.column_type))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
         validate_column_count(schema, &table.name, column_count, &columns)?;
         Ok(ResolvedTableSchema {
             columns,
             primary_key: table.primary_key.clone(),
             generated_columns,
+            signed_columns,
         })
     }
 }
@@ -461,11 +469,11 @@ where
         return Ok(EventPolicy::Ignore);
     }
     require_full_row_image(&rows.columns_present, "write")?;
-    let columns = row_event_columns(applier, rows.table_id, coordinate)?;
+    let table = row_event_table_map(applier, rows.table_id, coordinate)?;
     let event = crate::row::WriteRowsEvent {
         coordinate: coordinate.clone(),
         table_id: rows.table_id,
-        rows: map_row_data_list(&rows.rows, &columns)?,
+        rows: map_row_data_list(&rows.rows, &table)?,
     };
     applier
         .apply_write_rows(&event)
@@ -487,14 +495,14 @@ where
     }
     require_full_row_image(&rows.columns_before_update, "update before")?;
     require_full_row_image(&rows.columns_after_update, "update after")?;
-    let columns = row_event_columns(applier, rows.table_id, coordinate)?;
+    let table = row_event_table_map(applier, rows.table_id, coordinate)?;
     let event = crate::row::UpdateRowsEvent {
         coordinate: coordinate.clone(),
         table_id: rows.table_id,
         rows: rows
             .rows
             .iter()
-            .map(|row| map_update_row_data(row, &columns))
+            .map(|row| map_update_row_data(row, &table))
             .collect::<Result<Vec<_>, _>>()?,
     };
     applier
@@ -516,11 +524,11 @@ where
         return Ok(EventPolicy::Ignore);
     }
     require_full_row_image(&rows.columns_present, "delete")?;
-    let columns = row_event_columns(applier, rows.table_id, coordinate)?;
+    let table = row_event_table_map(applier, rows.table_id, coordinate)?;
     let event = DeleteRowsEvent {
         coordinate: coordinate.clone(),
         table_id: rows.table_id,
-        rows: map_row_data_list(&rows.rows, &columns)?,
+        rows: map_row_data_list(&rows.rows, &table)?,
     };
     applier
         .apply_delete_rows(&event)
@@ -608,6 +616,7 @@ where
             columns: schema.columns,
             primary_key: schema.primary_key,
             generated_columns: schema.generated_columns,
+            signed_columns: schema.signed_columns,
         },
     })
 }
@@ -654,14 +663,22 @@ where
             .primary_key
             .clone(),
     };
-    let generated_columns = fallback_schema
-        .map(|schema| schema.generated_columns)
+    let (generated_columns, signed_columns) = fallback_schema
+        .map(|schema| (schema.generated_columns, schema.signed_columns))
         .unwrap_or_default();
     Ok(ResolvedTableSchema {
         columns,
         primary_key,
         generated_columns,
+        signed_columns,
     })
+}
+
+fn is_signed_integer_column(data_type: &str, column_type: &str) -> bool {
+    matches!(
+        data_type,
+        "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+    ) && !column_type.to_ascii_lowercase().contains("unsigned")
 }
 
 fn primary_key_from_metadata(
@@ -701,65 +718,71 @@ fn validate_column_count(
     )))
 }
 
-fn row_event_columns<E>(
+fn row_event_table_map<E>(
     applier: &RowApplier<E>,
     table_id: u64,
     coordinate: &BinlogCoordinate,
-) -> Result<Vec<String>, ApplyBinlogError>
+) -> Result<RowTableMap, ApplyBinlogError>
 where
     E: TargetExecutor,
 {
-    applier
-        .table_map(table_id)
-        .map(|table| table.columns.clone())
-        .ok_or_else(|| {
-            mapping_error(format!(
-                "missing table map for table id {table_id} at {}:{}",
-                coordinate.file, coordinate.position
-            ))
-        })
+    applier.table_map(table_id).cloned().ok_or_else(|| {
+        mapping_error(format!(
+            "missing table map for table id {table_id} at {}:{}",
+            coordinate.file, coordinate.position
+        ))
+    })
 }
 
 fn map_update_row_data(
     row: &mysql_cdc::events::row_events::row_data::UpdateRowData,
-    columns: &[String],
+    table: &RowTableMap,
 ) -> Result<RowUpdate, ApplyBinlogError> {
     Ok(RowUpdate {
-        before: map_row_data(&row.before_update, columns)?,
-        after: map_row_data(&row.after_update, columns)?,
+        before: map_row_data(&row.before_update, table)?,
+        after: map_row_data(&row.after_update, table)?,
     })
 }
 
 fn map_row_data_list(
     rows: &[RowData],
-    columns: &[String],
+    table: &RowTableMap,
 ) -> Result<Vec<RowImage>, ApplyBinlogError> {
-    rows.iter().map(|row| map_row_data(row, columns)).collect()
+    rows.iter().map(|row| map_row_data(row, table)).collect()
 }
 
-fn map_row_data(row: &RowData, columns: &[String]) -> Result<RowImage, ApplyBinlogError> {
-    if row.cells.len() != columns.len() {
+fn map_row_data(row: &RowData, table: &RowTableMap) -> Result<RowImage, ApplyBinlogError> {
+    if row.cells.len() != table.columns.len() {
         return Err(mapping_error(format!(
             "row has {} cells but table map has {} columns",
             row.cells.len(),
-            columns.len()
+            table.columns.len()
         )));
     }
 
-    Ok(columns
+    Ok(table
+        .columns
         .iter()
         .zip(&row.cells)
-        .map(|(column, value)| (column.clone(), mysql_value_to_target_value(value)))
+        .map(|(column, value)| {
+            let signed = table.signed_columns.contains(column);
+            (column.clone(), mysql_value_to_target_value(value, signed))
+        })
         .collect())
 }
 
-fn mysql_value_to_target_value(value: &Option<MySqlValue>) -> Value {
+fn mysql_value_to_target_value(value: &Option<MySqlValue>, signed: bool) -> Value {
     match value {
         None => Value::NULL,
+        Some(MySqlValue::TinyInt(value)) if signed => Value::Int(i64::from(*value as i8)),
         Some(MySqlValue::TinyInt(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::SmallInt(value)) if signed => Value::Int(i64::from(*value as i16)),
         Some(MySqlValue::SmallInt(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::MediumInt(value)) if signed => Value::Int(sign_extend_u24(*value)),
         Some(MySqlValue::MediumInt(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::Int(value)) if signed => Value::Int(i64::from(*value as i32)),
         Some(MySqlValue::Int(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::BigInt(value)) if signed => Value::Int(*value as i64),
         Some(MySqlValue::BigInt(value)) => Value::UInt(*value),
         Some(MySqlValue::Float(value)) => Value::Float(*value),
         Some(MySqlValue::Double(value)) => Value::Double(*value),
@@ -779,6 +802,14 @@ fn mysql_value_to_target_value(value: &Option<MySqlValue>) -> Value {
 
 fn bytes_value(value: impl Into<Vec<u8>>) -> Value {
     Value::Bytes(value.into())
+}
+
+fn sign_extend_u24(value: u32) -> i64 {
+    if value & 0x80_0000 == 0 {
+        i64::from(value)
+    } else {
+        i64::from(value) - 0x1_000000
+    }
 }
 
 fn require_full_row_image(

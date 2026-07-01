@@ -190,6 +190,18 @@ fn annotation_rows_query_events_are_ignored_even_when_text_starts_with_sql() {
 }
 
 #[test]
+fn signed_integer_detection_uses_inventory_type_and_unsigned_marker() {
+    assert!(is_signed_integer_column("smallint", "smallint(6)"));
+    assert!(is_signed_integer_column("bigint", "bigint(20)"));
+    assert!(!is_signed_integer_column(
+        "smallint",
+        "smallint(6) unsigned"
+    ));
+    assert!(!is_signed_integer_column("int", "INT(11) UNSIGNED"));
+    assert!(!is_signed_integer_column("varchar", "varchar(255)"));
+}
+
+#[test]
 fn metadata_table_map_supplies_column_names_and_primary_keys() {
     let resolver = EmptySchemaResolver;
     let table_map = MysqlCdcTableMapEvent {
@@ -673,27 +685,45 @@ fn binlog_options_use_from_position_for_live_stream_start() {
 fn formats_mysql_cdc_values_like_snapshot_text_rows() {
     assert_eq!(format_timestamp(1_782_075_535_000), "2026-06-21 20:58:55");
     assert_eq!(
-        mysql_value_to_target_value(&Some(MySqlValue::Blob(b"hello".to_vec()))),
+        mysql_value_to_target_value(&Some(MySqlValue::Blob(b"hello".to_vec())), false),
         Value::Bytes(b"hello".to_vec())
     );
     assert_eq!(
-        mysql_value_to_target_value(&Some(MySqlValue::Bit(vec![true]))),
+        mysql_value_to_target_value(&Some(MySqlValue::Bit(vec![true])), false),
         Value::Bytes(vec![1])
     );
     assert_eq!(
-        mysql_value_to_target_value(&Some(MySqlValue::Bit(vec![
-            true, false, true, false, true, false, true, false, true
-        ]))),
+        mysql_value_to_target_value(
+            &Some(MySqlValue::Bit(vec![
+                true, false, true, false, true, false, true, false, true
+            ])),
+            false,
+        ),
         Value::Bytes(vec![1, 85])
     );
     assert_eq!(
-        mysql_value_to_target_value(&Some(MySqlValue::Time(Time {
-            hour: 26,
-            minute: 3,
-            second: 4,
-            millis: 0,
-        }))),
+        mysql_value_to_target_value(
+            &Some(MySqlValue::Time(Time {
+                hour: 26,
+                minute: 3,
+                second: 4,
+                millis: 0,
+            })),
+            false,
+        ),
         Value::Bytes(b"26:03:04".to_vec())
+    );
+    assert_eq!(
+        mysql_value_to_target_value(&Some(MySqlValue::SmallInt(0xfd68)), true),
+        Value::Int(-664)
+    );
+    assert_eq!(
+        mysql_value_to_target_value(&Some(MySqlValue::SmallInt(840)), true),
+        Value::Int(840)
+    );
+    assert_eq!(
+        mysql_value_to_target_value(&Some(MySqlValue::SmallInt(0xfd68)), false),
+        Value::UInt(64872)
     );
 }
 
@@ -780,6 +810,7 @@ fn schema(columns: Vec<&str>) -> ResolvedTableSchema {
         columns: columns.into_iter().map(str::to_string).collect(),
         primary_key: vec!["id".to_string()],
         generated_columns: Vec::new(),
+        signed_columns: Vec::new(),
     }
 }
 
