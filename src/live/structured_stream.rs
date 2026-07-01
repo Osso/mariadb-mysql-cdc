@@ -1,21 +1,28 @@
-use super::{ApplyBinlogConfig, ApplyBinlogError, SourceBinlogConfig};
+use super::{
+    ApplyBinlogConfig, ApplyBinlogError, QuarantineRecorder, RecordingQuarantine,
+    SourceBinlogConfig,
+};
 use crate::inventory::{InventoryConfig, MariaDbInventoryReader, SchemaInventory, build_inventory};
 use crate::probe::BinlogCoordinate;
 use crate::row::{DeleteRowsEvent, RowApplier, RowImage, RowTableMap, RowUpdate, TableMapEvent};
+use crate::statement::{StatementApplier, StatementEvent, StatementOutcome};
 use crate::target::TargetExecutor;
+use mysql::Value;
 use mysql_cdc::binlog_client::BinlogClient;
 use mysql_cdc::binlog_options::BinlogOptions;
 use mysql_cdc::errors::Error as MysqlCdcError;
 use mysql_cdc::events::binlog_event::BinlogEvent;
 use mysql_cdc::events::event_header::EventHeader;
+use mysql_cdc::events::intvar_event::IntVarEvent;
 use mysql_cdc::events::row_events::mysql_value::{Date, DateTime, MySqlValue, Time};
 use mysql_cdc::events::row_events::row_data::RowData;
 use mysql_cdc::events::table_map_event::TableMapEvent as MysqlCdcTableMapEvent;
+use mysql_cdc::events::uservar_event::UserVarEvent;
 use mysql_cdc::metadata::table_metadata::TableMetadata;
 use mysql_cdc::replica_options::ReplicaOptions;
 use mysql_cdc::ssl_mode::SslMode;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::Duration;
 
@@ -36,9 +43,68 @@ pub(crate) struct StructuredEventOutcome {
 pub(crate) enum EventPolicy {
     Ignore,
     IgnoreAnnotation,
-    SkipQuery,
     ApplyTableMap,
     ApplyRows,
+    CommitTransaction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StructuredEventState {
+    source_database: Option<String>,
+    ignored_table_ids: BTreeSet<u64>,
+    pending_intvars: Vec<PendingIntVar>,
+    pending_uservars: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingIntVar {
+    intvar_type: u8,
+    value: u64,
+}
+
+impl StructuredEventState {
+    fn new(source_database: Option<String>) -> Self {
+        Self {
+            source_database,
+            ignored_table_ids: BTreeSet::new(),
+            pending_intvars: Vec::new(),
+            pending_uservars: Vec::new(),
+        }
+    }
+
+    fn should_apply_schema(&self, schema: &str) -> bool {
+        self.source_database
+            .as_ref()
+            .is_none_or(|source_database| source_database == schema)
+    }
+
+    fn ignore_table_id(&mut self, table_id: u64) {
+        self.ignored_table_ids.insert(table_id);
+    }
+
+    fn apply_table_id(&mut self, table_id: u64) {
+        self.ignored_table_ids.remove(&table_id);
+    }
+
+    fn is_ignored_table_id(&self, table_id: u64) -> bool {
+        self.ignored_table_ids.contains(&table_id)
+    }
+
+    fn record_intvar(&mut self, event: &IntVarEvent) {
+        self.pending_intvars.push(PendingIntVar {
+            intvar_type: event.intvar_type,
+            value: event.value,
+        });
+    }
+
+    fn record_uservar(&mut self, event: &UserVarEvent) {
+        self.pending_uservars.push(event.name.clone());
+    }
+
+    fn clear_query_context(&mut self) {
+        self.pending_intvars.clear();
+        self.pending_uservars.clear();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,35 +225,51 @@ fn stream_once(
     let mut client = BinlogClient::new(replica_options_from_source(&config.source)?);
     let mut events = client.replicate().map_err(source_error)?;
     let mut current_file = config.source.binlog_file.clone();
+    let mut state = StructuredEventState::new(config.source.database.clone());
 
     for result in &mut events {
         let (header, event) = result.map_err(source_error)?;
         let outcome = handle_structured_event(
             &mut applier,
             &schema_resolver,
+            &mut state,
             &current_file,
             &header,
             &event,
         )?;
-        if let Some(coordinate) = &outcome.resume_coordinate {
-            super::reconnect::save_coordinate_checkpoint(
-                checkpoint_store,
-                coordinate,
-                event_name(&event),
-            )?;
-            current_file = coordinate.file.clone();
-        }
+        save_outcome_checkpoint(checkpoint_store, &mut current_file, &event, &outcome)?;
         client.commit(&header, &event);
     }
 
-    Err(ApplyBinlogError::SourceCommand(
-        "mysql_cdc binlog stream ended at EOF".to_string(),
-    ))
+    Err(stream_ended_error())
+}
+
+fn stream_ended_error() -> ApplyBinlogError {
+    ApplyBinlogError::SourceCommand("mysql_cdc binlog stream ended at EOF".to_string())
+}
+
+fn save_outcome_checkpoint<C>(
+    checkpoint_store: Option<&C>,
+    current_file: &mut String,
+    event: &BinlogEvent,
+    outcome: &StructuredEventOutcome,
+) -> Result<(), ApplyBinlogError>
+where
+    C: StreamCheckpointStore,
+{
+    let Some(coordinate) = &outcome.resume_coordinate else {
+        return Ok(());
+    };
+
+    super::reconnect::save_coordinate_checkpoint(checkpoint_store, coordinate, event_name(event))?;
+    *current_file = coordinate.file.clone();
+    Ok(())
 }
 
 fn handle_structured_event<E, R>(
     applier: &mut RowApplier<E>,
     schema_resolver: &R,
+    state: &mut StructuredEventState,
     current_file: &str,
     header: &EventHeader,
     event: &BinlogEvent,
@@ -197,7 +279,7 @@ where
     R: TableSchemaResolver,
 {
     let coordinate = event_coordinate(current_file, header, event);
-    let policy = apply_structured_event(applier, schema_resolver, &coordinate, event)?;
+    let policy = apply_structured_event(applier, schema_resolver, state, &coordinate, event)?;
     Ok(StructuredEventOutcome {
         policy,
         resume_coordinate: resume_coordinate(current_file, header, event),
@@ -207,6 +289,7 @@ where
 fn apply_structured_event<E, R>(
     applier: &mut RowApplier<E>,
     schema_resolver: &R,
+    state: &mut StructuredEventState,
     coordinate: &BinlogCoordinate,
     event: &BinlogEvent,
 ) -> Result<EventPolicy, ApplyBinlogError>
@@ -216,27 +299,159 @@ where
 {
     match event {
         BinlogEvent::TableMapEvent(table_map) => {
-            let event = map_table_map_event(coordinate, table_map, schema_resolver)?;
-            applier.apply_table_map(event);
-            Ok(EventPolicy::ApplyTableMap)
+            apply_table_map_event(applier, schema_resolver, state, coordinate, table_map)
         }
-        BinlogEvent::WriteRowsEvent(rows) => apply_write_rows_event(applier, coordinate, rows),
-        BinlogEvent::UpdateRowsEvent(rows) => apply_update_rows_event(applier, coordinate, rows),
-        BinlogEvent::DeleteRowsEvent(rows) => apply_delete_rows_event(applier, coordinate, rows),
-        BinlogEvent::QueryEvent(_) => Ok(EventPolicy::SkipQuery),
+        BinlogEvent::WriteRowsEvent(rows) => {
+            apply_write_rows_event(applier, state, coordinate, rows)
+        }
+        BinlogEvent::UpdateRowsEvent(rows) => {
+            apply_update_rows_event(applier, state, coordinate, rows)
+        }
+        BinlogEvent::DeleteRowsEvent(rows) => {
+            apply_delete_rows_event(applier, state, coordinate, rows)
+        }
+        BinlogEvent::XidEvent(_) => Ok(EventPolicy::CommitTransaction),
+        BinlogEvent::IntVarEvent(event) => {
+            state.record_intvar(event);
+            Ok(EventPolicy::Ignore)
+        }
+        BinlogEvent::UserVarEvent(event) => {
+            state.record_uservar(event);
+            Ok(EventPolicy::Ignore)
+        }
+        BinlogEvent::QueryEvent(query) => apply_query_event(applier, state, coordinate, query),
         BinlogEvent::RowsQueryEvent(_) => Ok(EventPolicy::IgnoreAnnotation),
         _ => Ok(EventPolicy::Ignore),
     }
 }
 
+fn apply_query_event<E>(
+    applier: &RowApplier<E>,
+    state: &mut StructuredEventState,
+    coordinate: &BinlogCoordinate,
+    query: &mysql_cdc::events::query_event::QueryEvent,
+) -> Result<EventPolicy, ApplyBinlogError>
+where
+    E: TargetExecutor,
+{
+    if !state.should_apply_schema(&query.database_name) {
+        state.clear_query_context();
+        return Ok(EventPolicy::Ignore);
+    }
+
+    reject_ambiguous_query_database(&query.sql_statement)?;
+    apply_query_context(applier.executor(), state)?;
+
+    let event = StatementEvent {
+        coordinate: coordinate.clone(),
+        resume_position: coordinate.position,
+        default_database: Some(query.database_name.clone()),
+        sql: query.sql_statement.clone(),
+    };
+    let statement_applier =
+        StatementApplier::new(applier.executor(), RecordingQuarantine::default());
+
+    let result = match statement_applier.apply(&event) {
+        Ok(StatementOutcome::Replayed) => Ok(EventPolicy::ApplyRows),
+        Ok(StatementOutcome::Quarantined(_)) => Err(ApplyBinlogError::Quarantined(
+            statement_applier
+                .quarantine_recorder()
+                .recorded_statements(),
+        )),
+        Err(error) => Err(ApplyBinlogError::Statement(error.to_string())),
+    };
+    state.clear_query_context();
+    result
+}
+
+fn apply_query_context<E>(
+    executor: &E,
+    state: &StructuredEventState,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TargetExecutor,
+{
+    if !state.pending_uservars.is_empty() {
+        return Err(mapping_error(format!(
+            "cannot replay QueryEvent with user variables: {}",
+            state.pending_uservars.join(", ")
+        )));
+    }
+
+    for intvar in &state.pending_intvars {
+        apply_intvar(executor, intvar)?;
+    }
+    Ok(())
+}
+
+fn apply_intvar<E>(executor: &E, intvar: &PendingIntVar) -> Result<(), ApplyBinlogError>
+where
+    E: TargetExecutor,
+{
+    const INSERT_ID: u8 = 2;
+    if intvar.intvar_type != INSERT_ID {
+        return Err(mapping_error(format!(
+            "cannot replay unsupported IntVarEvent type {}",
+            intvar.intvar_type
+        )));
+    }
+
+    executor
+        .execute(&crate::target::SqlStatement {
+            sql: "SET INSERT_ID = ?".to_string(),
+            params: vec![Value::UInt(intvar.value)],
+        })
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))
+}
+
+fn reject_ambiguous_query_database(sql: &str) -> Result<(), ApplyBinlogError> {
+    if query_contains_qualified_identifier(sql) {
+        return Err(mapping_error(format!(
+            "cannot replay QueryEvent with qualified identifier: {}",
+            sql.chars().take(120).collect::<String>()
+        )));
+    }
+    Ok(())
+}
+
+fn query_contains_qualified_identifier(sql: &str) -> bool {
+    sql.contains("`.`")
+}
+
+fn apply_table_map_event<E, R>(
+    applier: &mut RowApplier<E>,
+    schema_resolver: &R,
+    state: &mut StructuredEventState,
+    coordinate: &BinlogCoordinate,
+    table_map: &MysqlCdcTableMapEvent,
+) -> Result<EventPolicy, ApplyBinlogError>
+where
+    E: TargetExecutor,
+    R: TableSchemaResolver,
+{
+    if !state.should_apply_schema(&table_map.database_name) {
+        state.ignore_table_id(table_map.table_id);
+        return Ok(EventPolicy::Ignore);
+    }
+
+    state.apply_table_id(table_map.table_id);
+    let event = map_table_map_event(coordinate, table_map, schema_resolver)?;
+    applier.apply_table_map(event);
+    Ok(EventPolicy::ApplyTableMap)
+}
+
 fn apply_write_rows_event<E>(
     applier: &mut RowApplier<E>,
+    state: &StructuredEventState,
     coordinate: &BinlogCoordinate,
     rows: &mysql_cdc::events::row_events::write_rows_event::WriteRowsEvent,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
 {
+    if state.is_ignored_table_id(rows.table_id) {
+        return Ok(EventPolicy::Ignore);
+    }
     require_full_row_image(&rows.columns_present, "write")?;
     let columns = row_event_columns(applier, rows.table_id, coordinate)?;
     let event = crate::row::WriteRowsEvent {
@@ -252,12 +467,16 @@ where
 
 fn apply_update_rows_event<E>(
     applier: &mut RowApplier<E>,
+    state: &StructuredEventState,
     coordinate: &BinlogCoordinate,
     rows: &mysql_cdc::events::row_events::update_rows_event::UpdateRowsEvent,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
 {
+    if state.is_ignored_table_id(rows.table_id) {
+        return Ok(EventPolicy::Ignore);
+    }
     require_full_row_image(&rows.columns_before_update, "update before")?;
     require_full_row_image(&rows.columns_after_update, "update after")?;
     let columns = row_event_columns(applier, rows.table_id, coordinate)?;
@@ -278,12 +497,16 @@ where
 
 fn apply_delete_rows_event<E>(
     applier: &mut RowApplier<E>,
+    state: &StructuredEventState,
     coordinate: &BinlogCoordinate,
     rows: &mysql_cdc::events::row_events::delete_rows_event::DeleteRowsEvent,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
 {
+    if state.is_ignored_table_id(rows.table_id) {
+        return Ok(EventPolicy::Ignore);
+    }
     require_full_row_image(&rows.columns_present, "delete")?;
     let columns = row_event_columns(applier, rows.table_id, coordinate)?;
     let event = DeleteRowsEvent {
@@ -348,12 +571,13 @@ pub(crate) fn classify_event(
 #[cfg(test)]
 fn event_policy(event: &BinlogEvent) -> EventPolicy {
     match event {
-        BinlogEvent::QueryEvent(_) => EventPolicy::SkipQuery,
+        BinlogEvent::QueryEvent(_) => EventPolicy::Ignore,
         BinlogEvent::RowsQueryEvent(_) => EventPolicy::IgnoreAnnotation,
         BinlogEvent::TableMapEvent(_) => EventPolicy::ApplyTableMap,
         BinlogEvent::WriteRowsEvent(_)
         | BinlogEvent::UpdateRowsEvent(_)
         | BinlogEvent::DeleteRowsEvent(_) => EventPolicy::ApplyRows,
+        BinlogEvent::XidEvent(_) => EventPolicy::CommitTransaction,
         _ => EventPolicy::Ignore,
     }
 }
@@ -502,32 +726,36 @@ fn map_row_data(row: &RowData, columns: &[String]) -> Result<RowImage, ApplyBinl
     Ok(columns
         .iter()
         .zip(&row.cells)
-        .map(|(column, value)| (column.clone(), mysql_value_to_target_string(value)))
+        .map(|(column, value)| (column.clone(), mysql_value_to_target_value(value)))
         .collect())
 }
 
-fn mysql_value_to_target_string(value: &Option<MySqlValue>) -> String {
+fn mysql_value_to_target_value(value: &Option<MySqlValue>) -> Value {
     match value {
-        None => "NULL".to_string(),
-        Some(MySqlValue::TinyInt(value)) => value.to_string(),
-        Some(MySqlValue::SmallInt(value)) => value.to_string(),
-        Some(MySqlValue::MediumInt(value)) => value.to_string(),
-        Some(MySqlValue::Int(value)) => value.to_string(),
-        Some(MySqlValue::BigInt(value)) => value.to_string(),
-        Some(MySqlValue::Float(value)) => value.to_string(),
-        Some(MySqlValue::Double(value)) => value.to_string(),
-        Some(MySqlValue::Decimal(value)) => value.clone(),
-        Some(MySqlValue::String(value)) => value.clone(),
-        Some(MySqlValue::Bit(value)) => format_bit_value(value),
-        Some(MySqlValue::Enum(value)) => value.to_string(),
-        Some(MySqlValue::Set(value)) => value.to_string(),
-        Some(MySqlValue::Blob(value)) => String::from_utf8_lossy(value).to_string(),
-        Some(MySqlValue::Year(value)) => value.to_string(),
-        Some(MySqlValue::Date(value)) => format_date(value),
-        Some(MySqlValue::Time(value)) => format_time(value),
-        Some(MySqlValue::DateTime(value)) => format_datetime(value),
-        Some(MySqlValue::Timestamp(value)) => format_timestamp(*value),
+        None => Value::NULL,
+        Some(MySqlValue::TinyInt(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::SmallInt(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::MediumInt(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::Int(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::BigInt(value)) => Value::UInt(*value),
+        Some(MySqlValue::Float(value)) => Value::Float(*value),
+        Some(MySqlValue::Double(value)) => Value::Double(*value),
+        Some(MySqlValue::Decimal(value)) => bytes_value(value.as_str()),
+        Some(MySqlValue::String(value)) => bytes_value(value.as_str()),
+        Some(MySqlValue::Bit(value)) => bytes_value(format_bit_value(value)),
+        Some(MySqlValue::Enum(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::Set(value)) => Value::UInt(*value),
+        Some(MySqlValue::Blob(value)) => Value::Bytes(value.clone()),
+        Some(MySqlValue::Year(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::Date(value)) => bytes_value(format_date(value)),
+        Some(MySqlValue::Time(value)) => bytes_value(format_time(value)),
+        Some(MySqlValue::DateTime(value)) => bytes_value(format_datetime(value)),
+        Some(MySqlValue::Timestamp(value)) => bytes_value(format_timestamp(*value)),
     }
+}
+
+fn bytes_value(value: impl Into<Vec<u8>>) -> Value {
+    Value::Bytes(value.into())
 }
 
 fn require_full_row_image(
@@ -564,7 +792,7 @@ fn resume_coordinate(
             file: rotate.binlog_filename.clone(),
             position: rotate.binlog_position,
         }),
-        _ if header.next_event_position > 0 => Some(BinlogCoordinate {
+        BinlogEvent::XidEvent(_) if header.next_event_position > 0 => Some(BinlogCoordinate {
             file: current_file.to_string(),
             position: u64::from(header.next_event_position),
         }),

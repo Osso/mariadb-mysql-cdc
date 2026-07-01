@@ -150,11 +150,7 @@ impl TargetExecutor for PersistentTargetExecutor {
 
 impl PersistentTargetExecutor {
     fn execute_statement(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
-        let params = statement
-            .params
-            .iter()
-            .map(|value| Value::Bytes(value.as_bytes().to_vec()))
-            .collect::<Vec<_>>();
+        let params = statement.params.clone();
         self.conn
             .borrow_mut()
             .exec_drop(&statement.sql, Params::Positional(params))

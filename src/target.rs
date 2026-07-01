@@ -1,17 +1,18 @@
 use crate::snapshot::{SnapshotRow, SnapshotTarget};
+use mysql::Value;
 use std::fmt;
 
 const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SqlStatement {
     pub sql: String,
-    pub params: Vec<String>,
+    pub params: Vec<Value>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PrimaryKey {
-    pub values: Vec<String>,
+    pub values: Vec<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,7 +22,7 @@ pub enum SnapshotInsertMode {
 }
 
 impl PrimaryKey {
-    pub fn new(values: Vec<String>) -> Self {
+    pub fn new(values: Vec<Value>) -> Self {
         Self { values }
     }
 }
@@ -197,7 +198,7 @@ pub fn render_sql_statement(statement: &SqlStatement) -> Result<String, TargetEx
     for segment in statement.sql.split('?') {
         rendered.push_str(segment);
         if let Some(param) = params.next() {
-            rendered.push_str(&quote_sql_literal(param));
+            rendered.push_str(&quote_sql_value(param));
         }
     }
 
@@ -259,7 +260,7 @@ fn build_update_statement(
         .collect::<Vec<_>>();
     let predicates = primary_key_predicates(primary_key);
     let mut params = ordered_values(row, &changed_columns);
-    params.extend(row.primary_key.clone());
+    params.extend(row.primary_key.iter().cloned().map(string_param));
 
     SqlStatement {
         sql: format!(
@@ -287,10 +288,10 @@ fn build_delete_statement(
     }
 }
 
-fn ordered_values(row: &SnapshotRow, columns: &[String]) -> Vec<String> {
+fn ordered_values(row: &SnapshotRow, columns: &[String]) -> Vec<Value> {
     columns
         .iter()
-        .map(|column| row.values.get(column).cloned().unwrap_or_default())
+        .map(|column| string_param(row.values.get(column).cloned().unwrap_or_default()))
         .collect()
 }
 
@@ -325,6 +326,31 @@ fn quote_ident(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
 
+fn string_param(value: String) -> Value {
+    Value::Bytes(value.into_bytes())
+}
+
+fn quote_sql_value(value: &Value) -> String {
+    match value {
+        Value::NULL => "NULL".to_string(),
+        Value::Bytes(bytes) => quote_sql_literal(&String::from_utf8_lossy(bytes)),
+        Value::Int(value) => value.to_string(),
+        Value::UInt(value) => value.to_string(),
+        Value::Float(value) => value.to_string(),
+        Value::Double(value) => value.to_string(),
+        Value::Date(year, month, day, hour, minute, second, micros) => quote_sql_literal(&format!(
+            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"
+        )),
+        Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            let sign = if *negative { "-" } else { "" };
+            let hours = u32::from(*hours) + (*days * 24);
+            quote_sql_literal(&format!(
+                "{sign}{hours:02}:{minutes:02}:{seconds:02}.{micros:06}"
+            ))
+        }
+    }
+}
+
 fn quote_sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
@@ -352,7 +378,7 @@ mod tests {
             executed[0].sql,
             "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?), (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"
         );
-        assert_eq!(executed[0].params, vec!["1", "alpha", "2", "beta"]);
+        assert_eq!(executed[0].params, values(["1", "alpha", "2", "beta"]));
     }
 
     #[test]
@@ -362,7 +388,7 @@ mod tests {
 
         writer.update_row(&row("7", "updated")).expect("update row");
         writer
-            .delete_row(&PrimaryKey::new(vec!["7".to_string()]))
+            .delete_row(&PrimaryKey::new(values(["7"])))
             .expect("delete row");
 
         let executed = writer.executor.statements.borrow();
@@ -370,9 +396,9 @@ mod tests {
             executed[0].sql,
             "UPDATE `accounts` SET `name` = ? WHERE `id` = ?"
         );
-        assert_eq!(executed[0].params, vec!["updated", "7"]);
+        assert_eq!(executed[0].params, values(["updated", "7"]));
         assert_eq!(executed[1].sql, "DELETE FROM `accounts` WHERE `id` = ?");
-        assert_eq!(executed[1].params, vec!["7"]);
+        assert_eq!(executed[1].params, values(["7"]));
     }
 
     #[test]
@@ -396,7 +422,7 @@ mod tests {
             executed[0].sql,
             "INSERT IGNORE INTO `accounts` (`id`, `name`) VALUES (?, ?)"
         );
-        assert_eq!(executed[0].params, vec!["1", "alpha"]);
+        assert_eq!(executed[0].params, values(["1", "alpha"]));
     }
 
     #[test]
@@ -425,7 +451,7 @@ mod tests {
     fn renders_sql_statement_params_as_literals() {
         let rendered = render_sql_statement(&SqlStatement {
             sql: "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?)".to_string(),
-            params: vec!["1".to_string(), "O'Reilly\\Books".to_string()],
+            params: values(["1", "O'Reilly\\Books"]),
         })
         .expect("render statement");
 
@@ -453,7 +479,7 @@ mod tests {
     fn rejects_sql_statement_placeholder_param_mismatch() {
         let error = render_sql_statement(&SqlStatement {
             sql: "SELECT ?, ?".to_string(),
-            params: vec!["one".to_string()],
+            params: values(["one"]),
         })
         .expect_err("placeholder mismatch");
 
@@ -490,6 +516,13 @@ mod tests {
             primary_key: vec![id.to_string()],
             values,
         }
+    }
+
+    fn values<const N: usize>(items: [&str; N]) -> Vec<Value> {
+        items
+            .into_iter()
+            .map(|item| Value::Bytes(item.as_bytes().to_vec()))
+            .collect()
     }
 
     fn numbered_columns(count: usize) -> Vec<String> {

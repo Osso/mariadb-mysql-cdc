@@ -1,4 +1,5 @@
 use super::*;
+use mysql::Value;
 use mysql_cdc::binlog_reader::BinlogReader;
 use mysql_cdc::events::event_header::EventHeader;
 use mysql_cdc::events::query_event::QueryEvent;
@@ -7,6 +8,7 @@ use mysql_cdc::events::row_events::row_data::{RowData, UpdateRowData};
 use mysql_cdc::events::row_events::update_rows_event::UpdateRowsEvent as MysqlCdcUpdateRowsEvent;
 use mysql_cdc::events::row_events::write_rows_event::WriteRowsEvent as MysqlCdcWriteRowsEvent;
 use mysql_cdc::events::rows_query_event::RowsQueryEvent;
+use mysql_cdc::events::xid_event::XidEvent;
 use mysql_cdc::starting_strategy::StartingStrategy;
 use std::fs::File;
 
@@ -61,25 +63,115 @@ fn rejects_mysql_cdc_start_positions_that_do_not_fit_crate_api() {
 }
 
 #[test]
-fn structured_query_events_are_skipped_without_parsing_sql_keywords() {
+fn source_query_ddl_is_quarantined_without_checkpointing_past_it() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let event = BinlogEvent::QueryEvent(QueryEvent {
         thread_id: 1,
         duration: 0,
         error_code: 0,
         status_variables: Vec::new(),
-        database_name: "globalcomix".to_string(),
+        database_name: "fixture_cdc".to_string(),
         sql_statement: "CREATE TABLE should_not_be_applied (id int)".to_string(),
     });
-    let header = event_header(99, 180);
+
+    let error = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(99, 180),
+        &event,
+    )
+    .expect_err("source DDL should quarantine");
+
+    assert!(error.to_string().contains("quarantined"));
+    assert!(applier.executor().statements.borrow().is_empty());
+}
+
+#[test]
+fn source_query_dml_is_applied_before_transaction_checkpoint() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "INSERT INTO accounts (id, name) VALUES (999, 'query-event')".to_string(),
+    });
+
+    let outcome = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(99, 180),
+        &event,
+    )
+    .expect("source DML should apply");
+
+    assert_eq!(outcome.policy, EventPolicy::ApplyRows);
+    assert_eq!(outcome.resume_coordinate, None);
+    let statements = applier.executor().statements.borrow();
+    assert_eq!(statements.len(), 1);
+    assert_eq!(
+        statements[0].sql,
+        "INSERT INTO accounts (id, name) VALUES (999, 'query-event')"
+    );
+}
+
+#[test]
+fn table_map_and_row_events_do_not_checkpoint_without_transaction_boundary() {
+    let table_map = BinlogEvent::TableMapEvent(accounts_table_map_event(5));
+    let write = BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id: 18,
+        flags: 0,
+        columns_number: 5,
+        columns_present: vec![true; 5],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(1)),
+            Some(MySqlValue::String("alpha".to_string())),
+            Some(MySqlValue::Int(100)),
+            Some(MySqlValue::String("safe".to_string())),
+            Some(MySqlValue::DateTime(DateTime {
+                year: 2026,
+                month: 6,
+                day: 22,
+                hour: 12,
+                minute: 3,
+                second: 4,
+                millis: 0,
+            })),
+        ])],
+    });
+
+    assert_eq!(
+        classify_event("mysqld-bin.000777", &event_header(19, 200), &table_map).resume_coordinate,
+        None
+    );
+    assert_eq!(
+        classify_event("mysqld-bin.000777", &event_header(30, 220), &write).resume_coordinate,
+        None
+    );
+}
+
+#[test]
+fn xid_event_checkpoints_after_transaction_rows_are_applied() {
+    let event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
+    let header = event_header(16, 260);
 
     let outcome = classify_event("mysqld-bin.000777", &header, &event);
 
-    assert_eq!(outcome.policy, EventPolicy::SkipQuery);
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
     assert_eq!(
         outcome.resume_coordinate,
         Some(BinlogCoordinate {
             file: "mysqld-bin.000777".to_string(),
-            position: 180,
+            position: 260,
         })
     );
 }
@@ -94,13 +186,7 @@ fn annotation_rows_query_events_are_ignored_even_when_text_starts_with_sql() {
     let outcome = classify_event("mysqld-bin.000777", &header, &event);
 
     assert_eq!(outcome.policy, EventPolicy::IgnoreAnnotation);
-    assert_eq!(
-        outcome.resume_coordinate,
-        Some(BinlogCoordinate {
-            file: "mysqld-bin.000777".to_string(),
-            position: 240,
-        })
-    );
+    assert_eq!(outcome.resume_coordinate, None);
 }
 
 #[test]
@@ -142,30 +228,280 @@ fn fixture_row_events_apply_through_row_applier_with_schema_resolver() {
     let events = fixture_events("fixtures/mixed-binlog/mysql-bin.000001");
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
 
     for (header, event) in &events {
-        handle_structured_event(&mut applier, &resolver, "mysql-bin.000001", header, event)
-            .expect("handle fixture event");
+        if matches!(event, BinlogEvent::QueryEvent(_)) {
+            continue;
+        }
+        handle_structured_event(
+            &mut applier,
+            &resolver,
+            &mut state,
+            "mysql-bin.000001",
+            header,
+            event,
+        )
+        .expect("handle fixture event");
     }
 
     let statements = applier.executor().statements.borrow();
     assert!(statements.iter().any(|statement| {
             statement.sql == "UPDATE `accounts` SET `name` = ?, `balance` = ?, `note` = ?, `created_at` = ? WHERE `id` = ?"
-                && statement.params == vec!["alpha", "125", "row update", "2026-06-21 20:58:55", "1"]
+                && statement.params == vec![bytes("alpha"), Value::UInt(125), bytes("row update"), bytes("2026-06-21 20:58:55"), Value::UInt(1)]
         }));
     assert!(statements.iter().any(|statement| {
-        statement.sql == "DELETE FROM `accounts` WHERE `id` = ?" && statement.params == vec!["2"]
+        statement.sql == "DELETE FROM `accounts` WHERE `id` = ?"
+            && statement.params == vec![Value::UInt(2)]
     }));
     assert!(statements.iter().any(|statement| {
         statement
             .sql
             .starts_with("INSERT INTO `accounts` (`id`, `name`, `balance`, `note`, `created_at`)")
-            && statement.params == vec!["3", "gamma", "300", "row insert", "2026-06-21 20:58:55"]
+            && statement.params
+                == vec![
+                    Value::UInt(3),
+                    bytes("gamma"),
+                    Value::UInt(300),
+                    bytes("row insert"),
+                    bytes("2026-06-21 20:58:55"),
+                ]
     }));
 }
 
 #[test]
-fn structured_query_and_rows_query_events_do_not_execute_sql_text() {
+fn non_source_schema_table_maps_and_rows_are_ignored_without_target_apply() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let table_map = MysqlCdcTableMapEvent {
+        table_id: 99,
+        database_name: "mysql".to_string(),
+        table_name: "accounts".to_string(),
+        column_types: vec![3; 5],
+        column_metadata: vec![0; 5],
+        null_bitmap: vec![false; 5],
+        table_metadata: None,
+    };
+    let write = MysqlCdcWriteRowsEvent {
+        table_id: 99,
+        flags: 0,
+        columns_number: 5,
+        columns_present: vec![true; 5],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(999)),
+            Some(MySqlValue::String("system".to_string())),
+            Some(MySqlValue::Int(1)),
+            Some(MySqlValue::String("ignored".to_string())),
+            Some(MySqlValue::DateTime(DateTime {
+                year: 2026,
+                month: 6,
+                day: 22,
+                hour: 12,
+                minute: 3,
+                second: 4,
+                millis: 0,
+            })),
+        ])],
+    };
+
+    let table_outcome = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysql-bin.000001",
+        &event_header(19, 100),
+        &BinlogEvent::TableMapEvent(table_map),
+    )
+    .expect("ignore non-source table map");
+    let rows_outcome = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysql-bin.000001",
+        &event_header(30, 120),
+        &BinlogEvent::WriteRowsEvent(write),
+    )
+    .expect("ignore non-source rows");
+
+    assert_eq!(table_outcome.policy, EventPolicy::Ignore);
+    assert_eq!(rows_outcome.policy, EventPolicy::Ignore);
+    assert!(applier.executor().statements.borrow().is_empty());
+}
+
+#[test]
+fn structured_rows_preserve_null_and_blob_values_as_mysql_params() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let table_map = BinlogEvent::TableMapEvent(accounts_table_map_event(6));
+    let write = BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id: 18,
+        flags: 0,
+        columns_number: 6,
+        columns_present: vec![true; 6],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(7)),
+            None,
+            Some(MySqlValue::Blob(vec![0, 159, 146, 150, 255])),
+            Some(MySqlValue::Blob(b"uuid-bytes".to_vec())),
+            Some(MySqlValue::DateTime(DateTime {
+                year: 2026,
+                month: 6,
+                day: 22,
+                hour: 12,
+                minute: 3,
+                second: 4,
+                millis: 0,
+            })),
+            Some(MySqlValue::String("active".to_string())),
+        ])],
+    });
+
+    for event in [&table_map, &write] {
+        handle_structured_event(
+            &mut applier,
+            &resolver,
+            &mut state,
+            "mysql-bin.000001",
+            &event_header(99, 120),
+            event,
+        )
+        .expect("apply typed row event");
+    }
+
+    let statements = applier.executor().statements.borrow();
+    assert_eq!(statements.len(), 1);
+    assert_eq!(statements[0].params[0], Value::UInt(7));
+    assert_eq!(statements[0].params[1], Value::NULL);
+    assert_eq!(
+        statements[0].params[2],
+        Value::Bytes(vec![0, 159, 146, 150, 255])
+    );
+    assert_eq!(
+        statements[0].params[3],
+        Value::Bytes(b"uuid-bytes".to_vec())
+    );
+}
+
+#[test]
+fn query_dml_applies_insert_id_intvar_before_statement() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let intvar = BinlogEvent::IntVarEvent(IntVarEvent {
+        intvar_type: 2,
+        value: 42,
+    });
+    let query = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "INSERT INTO accounts (name) VALUES ('query-event')".to_string(),
+    });
+
+    handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(5, 100),
+        &intvar,
+    )
+    .expect("record intvar");
+    handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(99, 180),
+        &query,
+    )
+    .expect("apply query with intvar");
+
+    let statements = applier.executor().statements.borrow();
+    assert_eq!(statements.len(), 2);
+    assert_eq!(statements[0].sql, "SET INSERT_ID = ?");
+    assert_eq!(statements[0].params, vec![Value::UInt(42)]);
+    assert_eq!(
+        statements[1].sql,
+        "INSERT INTO accounts (name) VALUES ('query-event')"
+    );
+}
+
+#[test]
+fn query_with_user_variables_is_rejected_before_checkpoint() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let uservar = BinlogEvent::UserVarEvent(UserVarEvent {
+        name: "account_id".to_string(),
+        value: None,
+    });
+    let query = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "INSERT INTO accounts (id) VALUES (@account_id)".to_string(),
+    });
+
+    handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(14, 100),
+        &uservar,
+    )
+    .expect("record uservar");
+    let error = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(99, 180),
+        &query,
+    )
+    .expect_err("uservar query should not replay");
+
+    assert!(error.to_string().contains("user variables"));
+    assert!(applier.executor().statements.borrow().is_empty());
+}
+
+#[test]
+fn qualified_query_dml_is_rejected_as_ambiguous() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let query = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "INSERT INTO `other_db`.`accounts` (id) VALUES (1)".to_string(),
+    });
+
+    let error = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(99, 180),
+        &query,
+    )
+    .expect_err("qualified query should not replay");
+
+    assert!(error.to_string().contains("qualified identifier"));
+    assert!(applier.executor().statements.borrow().is_empty());
+}
+
+#[test]
+fn non_source_query_and_rows_query_events_do_not_execute_sql_text() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
     let events = vec![
@@ -182,10 +518,13 @@ fn structured_query_and_rows_query_events_do_not_execute_sql_text() {
         }),
     ];
 
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+
     for event in &events {
         handle_structured_event(
             &mut applier,
             &resolver,
+            &mut state,
             "mysql-bin.000001",
             &event_header(99, 120),
             event,
@@ -262,10 +601,13 @@ fn maps_constructed_write_update_and_delete_rows_to_recording_executor() {
         )],
     });
 
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+
     for event in [&table_map, &write, &update] {
         handle_structured_event(
             &mut applier,
             &resolver,
+            &mut state,
             "mysql-bin.000001",
             &event_header(99, 120),
             event,
@@ -277,11 +619,23 @@ fn maps_constructed_write_update_and_delete_rows_to_recording_executor() {
     assert_eq!(statements.len(), 2);
     assert_eq!(
         statements[0].params,
-        vec!["9", "nine", "900", "manual", "2026-06-22 12:03:04"]
+        vec![
+            Value::UInt(9),
+            bytes("nine"),
+            Value::UInt(900),
+            bytes("manual"),
+            bytes("2026-06-22 12:03:04")
+        ]
     );
     assert_eq!(
         statements[1].params,
-        vec!["niner", "901", "manual update", "2026-06-22 12:03:05", "9"]
+        vec![
+            bytes("niner"),
+            Value::UInt(901),
+            bytes("manual update"),
+            bytes("2026-06-22 12:03:05"),
+            Value::UInt(9)
+        ]
     );
 }
 
@@ -319,17 +673,17 @@ fn binlog_options_use_from_position_for_live_stream_start() {
 fn formats_mysql_cdc_values_like_snapshot_text_rows() {
     assert_eq!(format_timestamp(1_782_075_535_000), "2026-06-21 20:58:55");
     assert_eq!(
-        mysql_value_to_target_string(&Some(MySqlValue::Blob(b"hello".to_vec()))),
-        "hello"
+        mysql_value_to_target_value(&Some(MySqlValue::Blob(b"hello".to_vec()))),
+        Value::Bytes(b"hello".to_vec())
     );
     assert_eq!(
-        mysql_value_to_target_string(&Some(MySqlValue::Time(Time {
+        mysql_value_to_target_value(&Some(MySqlValue::Time(Time {
             hour: 26,
             minute: 3,
             second: 4,
             millis: 0,
         }))),
-        "26:03:04"
+        Value::Bytes(b"26:03:04".to_vec())
     );
 }
 
@@ -359,6 +713,10 @@ fn stream_coordinate(position: u64) -> BinlogCoordinate {
         file: "mysql-bin.000001".to_string(),
         position,
     }
+}
+
+fn bytes(item: &str) -> Value {
+    Value::Bytes(item.as_bytes().to_vec())
 }
 
 fn event_header(event_type: u8, next_event_position: u32) -> EventHeader {

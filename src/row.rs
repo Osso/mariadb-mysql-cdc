@@ -1,10 +1,10 @@
 use crate::probe::BinlogCoordinate;
-use crate::snapshot::SnapshotRow;
-use crate::target::{PrimaryKey, TargetExecutor, TargetMySqlWriter, TargetWriteError};
+use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
+use mysql::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub type RowImage = BTreeMap<String, String>;
+pub type RowImage = BTreeMap<String, Value>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowTableMap {
@@ -21,28 +21,28 @@ pub struct TableMapEvent {
     pub table: RowTableMap,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WriteRowsEvent {
     pub coordinate: BinlogCoordinate,
     pub table_id: u64,
     pub rows: Vec<RowImage>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateRowsEvent {
     pub coordinate: BinlogCoordinate,
     pub table_id: u64,
     pub rows: Vec<RowUpdate>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeleteRowsEvent {
     pub coordinate: BinlogCoordinate,
     pub table_id: u64,
     pub rows: Vec<RowImage>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RowUpdate {
     pub before: RowImage,
     pub after: RowImage,
@@ -87,26 +87,30 @@ where
 
     pub fn apply_write_rows(&self, event: &WriteRowsEvent) -> RowResult<()> {
         let table = self.resolve_table(event.table_id, &event.coordinate)?;
-        let rows = event
-            .rows
-            .iter()
-            .map(|row| snapshot_row(table, row, &event.coordinate))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        self.writer(table)
-            .insert_rows(&rows)
-            .map_err(|source| target_error(&event.coordinate, table, RowOperation::Insert, source))
+        validate_rows_have_primary_keys(table, &event.rows, &event.coordinate)?;
+        let statement = build_insert_statement(table, &event.rows);
+        execute_row_statement(
+            &self.executor,
+            statement,
+            &event.coordinate,
+            table,
+            RowOperation::Insert,
+        )
     }
 
     pub fn apply_update_rows(&self, event: &UpdateRowsEvent) -> RowResult<()> {
         let table = self.resolve_table(event.table_id, &event.coordinate)?;
-        let writer = self.writer(table);
 
         for update in &event.rows {
-            let row = snapshot_row(table, &update.after, &event.coordinate)?;
-            writer.update_row(&row).map_err(|source| {
-                target_error(&event.coordinate, table, RowOperation::Update, source)
-            })?;
+            validate_row_has_primary_key(table, &update.after, &event.coordinate)?;
+            let statement = build_update_statement(table, &update.after, &event.coordinate)?;
+            execute_row_statement(
+                &self.executor,
+                statement,
+                &event.coordinate,
+                table,
+                RowOperation::Update,
+            )?;
         }
 
         Ok(())
@@ -114,13 +118,16 @@ where
 
     pub fn apply_delete_rows(&self, event: &DeleteRowsEvent) -> RowResult<()> {
         let table = self.resolve_table(event.table_id, &event.coordinate)?;
-        let writer = self.writer(table);
 
         for row in &event.rows {
-            let primary_key = primary_key(table, row, &event.coordinate)?;
-            writer.delete_row(&primary_key).map_err(|source| {
-                target_error(&event.coordinate, table, RowOperation::Delete, source)
-            })?;
+            let statement = build_delete_statement(table, row, &event.coordinate)?;
+            execute_row_statement(
+                &self.executor,
+                statement,
+                &event.coordinate,
+                table,
+                RowOperation::Delete,
+            )?;
         }
 
         Ok(())
@@ -145,15 +152,6 @@ where
                 table_id,
             })
         })
-    }
-
-    fn writer<'a>(&'a self, table: &'a RowTableMap) -> TargetMySqlWriter<&'a E> {
-        TargetMySqlWriter::new(
-            table.table.clone(),
-            table.primary_key.iter().map(String::as_str).collect(),
-            table.columns.iter().map(String::as_str).collect(),
-            &self.executor,
-        )
     }
 }
 
@@ -208,7 +206,7 @@ pub enum RowApplyError {
         schema: String,
         table: String,
         operation: RowOperation,
-        source: Box<TargetWriteError>,
+        source: TargetExecuteError,
     },
 }
 
@@ -288,7 +286,7 @@ fn write_target_error(
     schema: &str,
     table: &str,
     operation: RowOperation,
-    source: &TargetWriteError,
+    source: &TargetExecuteError,
 ) -> fmt::Result {
     write!(
         formatter,
@@ -297,32 +295,30 @@ fn write_target_error(
     )
 }
 
-fn snapshot_row(
+fn validate_rows_have_primary_keys(
     table: &RowTableMap,
-    values: &RowImage,
+    rows: &[RowImage],
     coordinate: &BinlogCoordinate,
-) -> RowResult<SnapshotRow> {
-    Ok(SnapshotRow {
-        primary_key: primary_key_values(table, values, coordinate)?,
-        values: values.clone(),
-    })
+) -> RowResult<()> {
+    for row in rows {
+        validate_row_has_primary_key(table, row, coordinate)?;
+    }
+    Ok(())
 }
 
-fn primary_key(
+fn validate_row_has_primary_key(
     table: &RowTableMap,
     values: &RowImage,
     coordinate: &BinlogCoordinate,
-) -> RowResult<PrimaryKey> {
-    Ok(PrimaryKey::new(primary_key_values(
-        table, values, coordinate,
-    )?))
+) -> RowResult<()> {
+    primary_key_values(table, values, coordinate).map(|_| ())
 }
 
 fn primary_key_values(
     table: &RowTableMap,
     values: &RowImage,
     coordinate: &BinlogCoordinate,
-) -> RowResult<Vec<String>> {
+) -> RowResult<Vec<Value>> {
     if table.primary_key.is_empty() {
         return Err(row_error(RowApplyError::MissingPrimaryKey {
             coordinate: coordinate.clone(),
@@ -343,7 +339,7 @@ fn primary_key_value(
     values: &RowImage,
     column: &str,
     coordinate: &BinlogCoordinate,
-) -> RowResult<String> {
+) -> RowResult<Value> {
     values.get(column).cloned().ok_or_else(|| {
         row_error(RowApplyError::MissingPrimaryKeyValue {
             coordinate: coordinate.clone(),
@@ -354,18 +350,136 @@ fn primary_key_value(
     })
 }
 
+fn build_insert_statement(table: &RowTableMap, rows: &[RowImage]) -> SqlStatement {
+    let column_list = table
+        .columns
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>();
+    let placeholders = row_placeholders(table.columns.len(), rows.len());
+    let update_list = update_assignments(&table.columns, &table.primary_key);
+    let params = rows
+        .iter()
+        .flat_map(|row| ordered_values(row, &table.columns))
+        .collect();
+
+    SqlStatement {
+        sql: format!(
+            "INSERT INTO {} ({}) VALUES {} ON DUPLICATE KEY UPDATE {}",
+            quote_ident(&table.table),
+            column_list.join(", "),
+            placeholders,
+            update_list.join(", ")
+        ),
+        params,
+    }
+}
+
+fn build_update_statement(
+    table: &RowTableMap,
+    row: &RowImage,
+    coordinate: &BinlogCoordinate,
+) -> RowResult<SqlStatement> {
+    let changed_columns = non_primary_columns(&table.columns, &table.primary_key);
+    let assignments = changed_columns
+        .iter()
+        .map(|column| format!("{} = ?", quote_ident(column)))
+        .collect::<Vec<_>>();
+    let predicates = primary_key_predicates(&table.primary_key);
+    let mut params = ordered_values(row, &changed_columns);
+    params.extend(primary_key_values(table, row, coordinate)?);
+
+    Ok(SqlStatement {
+        sql: format!(
+            "UPDATE {} SET {} WHERE {}",
+            quote_ident(&table.table),
+            assignments.join(", "),
+            predicates.join(" AND ")
+        ),
+        params,
+    })
+}
+
+fn build_delete_statement(
+    table: &RowTableMap,
+    row: &RowImage,
+    coordinate: &BinlogCoordinate,
+) -> RowResult<SqlStatement> {
+    Ok(SqlStatement {
+        sql: format!(
+            "DELETE FROM {} WHERE {}",
+            quote_ident(&table.table),
+            primary_key_predicates(&table.primary_key).join(" AND ")
+        ),
+        params: primary_key_values(table, row, coordinate)?,
+    })
+}
+
+fn execute_row_statement<E>(
+    executor: &E,
+    statement: SqlStatement,
+    coordinate: &BinlogCoordinate,
+    table: &RowTableMap,
+    operation: RowOperation,
+) -> RowResult<()>
+where
+    E: TargetExecutor,
+{
+    executor
+        .execute(&statement)
+        .map_err(|source| target_error(coordinate, table, operation, source))
+}
+
+fn ordered_values(row: &RowImage, columns: &[String]) -> Vec<Value> {
+    columns
+        .iter()
+        .map(|column| row.get(column).cloned().unwrap_or(Value::NULL))
+        .collect()
+}
+
+fn row_placeholders(column_count: usize, row_count: usize) -> String {
+    let row_placeholder = format!("({})", vec!["?"; column_count].join(", "));
+    vec![row_placeholder; row_count].join(", ")
+}
+
+fn update_assignments(columns: &[String], primary_key: &[String]) -> Vec<String> {
+    non_primary_columns(columns, primary_key)
+        .iter()
+        .map(|column| format!("{} = VALUES({})", quote_ident(column), quote_ident(column)))
+        .collect()
+}
+
+fn non_primary_columns(columns: &[String], primary_key: &[String]) -> Vec<String> {
+    columns
+        .iter()
+        .filter(|column| !primary_key.contains(column))
+        .cloned()
+        .collect()
+}
+
+fn primary_key_predicates(primary_key: &[String]) -> Vec<String> {
+    primary_key
+        .iter()
+        .map(|column| format!("{} = ?", quote_ident(column)))
+        .collect()
+}
+
+fn quote_ident(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
+}
+
 fn target_error(
     coordinate: &BinlogCoordinate,
     table: &RowTableMap,
     operation: RowOperation,
-    source: TargetWriteError,
+    source: TargetExecuteError,
 ) -> Box<RowApplyError> {
     row_error(RowApplyError::Target {
         coordinate: coordinate.clone(),
         schema: table.schema.clone(),
         table: table.table.clone(),
         operation,
-        source: Box::new(source),
+        source,
     })
 }
 
@@ -396,7 +510,7 @@ mod tests {
             statements[0].sql,
             "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?), (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"
         );
-        assert_eq!(statements[0].params, vec!["1", "alpha", "2", "beta"]);
+        assert_eq!(statements[0].params, values(["1", "alpha", "2", "beta"]));
     }
 
     #[test]
@@ -421,7 +535,7 @@ mod tests {
             statements[0].sql,
             "UPDATE `accounts` SET `name` = ? WHERE `id` = ?"
         );
-        assert_eq!(statements[0].params, vec!["updated", "1"]);
+        assert_eq!(statements[0].params, values(["updated", "1"]));
     }
 
     #[test]
@@ -440,7 +554,7 @@ mod tests {
         let statements = applier.executor().statements.borrow();
         assert_eq!(statements.len(), 1);
         assert_eq!(statements[0].sql, "DELETE FROM `accounts` WHERE `id` = ?");
-        assert_eq!(statements[0].params, vec!["2"]);
+        assert_eq!(statements[0].params, values(["2"]));
     }
 
     #[test]
@@ -466,7 +580,7 @@ mod tests {
     fn rejects_row_event_without_primary_key_value() {
         let applier = applier_with_accounts_table();
         let mut row = RowImage::new();
-        row.insert("name".to_string(), "orphan".to_string());
+        row.insert("name".to_string(), value("orphan"));
         let event = WriteRowsEvent {
             coordinate: coordinate(180),
             table_id: 7,
@@ -529,9 +643,17 @@ mod tests {
 
     fn row(id: &str, name: &str) -> RowImage {
         BTreeMap::from([
-            ("id".to_string(), id.to_string()),
-            ("name".to_string(), name.to_string()),
+            ("id".to_string(), value(id)),
+            ("name".to_string(), value(name)),
         ])
+    }
+
+    fn values<const N: usize>(items: [&str; N]) -> Vec<Value> {
+        items.into_iter().map(value).collect()
+    }
+
+    fn value(item: &str) -> Value {
+        Value::Bytes(item.as_bytes().to_vec())
     }
 
     fn coordinate(position: u64) -> BinlogCoordinate {
