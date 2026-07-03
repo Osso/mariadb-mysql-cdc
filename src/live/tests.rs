@@ -202,12 +202,12 @@ fn refuses_quarantined_statements() {
         },
         resume_position: 180,
         default_database: Some("test_cdc".to_string()),
-        sql: "CREATE TABLE accounts (id INT PRIMARY KEY)".to_string(),
+        sql: "GRANT SELECT ON accounts TO 'reader'@'%'".to_string(),
     }];
     let executor = RecordingExecutor::default();
 
     let error = apply_statement_events(events, executor, RecordingQuarantine::default())
-        .expect_err("ddl should quarantine")
+        .expect_err("unsupported statement should quarantine")
         .to_string();
 
     assert!(error.contains("quarantined"));

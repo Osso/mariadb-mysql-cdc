@@ -269,7 +269,9 @@ where
 
     for event in &events {
         match applier.apply(event) {
-            Ok(StatementOutcome::Replayed) => applied_statements += 1,
+            Ok(StatementOutcome::Replayed) | Ok(StatementOutcome::AlreadyApplied) => {
+                applied_statements += 1
+            }
             Ok(StatementOutcome::Quarantined(_)) => quarantined_statements += 1,
             Err(error) => return Err(ApplyBinlogError::Statement(error.to_string())),
         }
@@ -335,7 +337,7 @@ where
     R: FailedStatementRepairer,
 {
     match applier.apply(event) {
-        Ok(StatementOutcome::Replayed) => {
+        Ok(StatementOutcome::Replayed) | Ok(StatementOutcome::AlreadyApplied) => {
             save_stream_checkpoint(checkpoint_store, event)?;
             if progress.record_applied(&event.resume_coordinate()) {
                 println!("{}", format_stream_progress(progress));

@@ -53,6 +53,7 @@ pub enum QuarantineReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatementOutcome {
     Replayed,
+    AlreadyApplied,
     Quarantined(QuarantineReason),
 }
 
@@ -154,15 +155,17 @@ where
             sql: sql.clone(),
             params: Vec::new(),
         };
-        self.executor
-            .execute(&statement)
-            .map_err(|source| StatementApplyError::Target {
+        match self.executor.execute(&statement) {
+            Ok(()) => Ok(StatementOutcome::Replayed),
+            Err(source) if is_ddl_already_applied_error(&sql, &source.to_string()) => {
+                Ok(StatementOutcome::AlreadyApplied)
+            }
+            Err(source) => Err(StatementApplyError::Target {
                 coordinate: event.coordinate.clone(),
                 sql,
                 source,
-            })?;
-
-        Ok(StatementOutcome::Replayed)
+            }),
+        }
     }
 
     fn quarantine(
@@ -212,7 +215,11 @@ fn classify_statement(sql: &str) -> StatementDecision {
         return StatementDecision::Quarantine(QuarantineReason::UnsafePattern(pattern));
     }
 
-    if is_known_compatible_dml(sql) {
+    if let Some(pattern) = find_ddl_if_exists_pattern(sql) {
+        return StatementDecision::Quarantine(QuarantineReason::MariaDbOnlySyntax(pattern));
+    }
+
+    if is_known_compatible_dml(sql) || is_known_compatible_ddl(sql) {
         return StatementDecision::Replay;
     }
 
@@ -396,6 +403,50 @@ fn is_known_compatible_dml(sql: &str) -> bool {
         || upper.starts_with("REPLACE INTO ")
 }
 
+fn is_known_compatible_ddl(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.starts_with("ALTER TABLE ")
+        || upper.starts_with("CREATE TABLE ")
+        || upper.starts_with("DROP TABLE ")
+        || upper.starts_with("TRUNCATE ")
+        || upper.starts_with("CREATE INDEX ")
+        || upper.starts_with("CREATE UNIQUE INDEX ")
+        || upper.starts_with("DROP INDEX ")
+        || upper.starts_with("RENAME TABLE ")
+}
+
+// MySQL 8 does not accept IF [NOT] EXISTS on ALTER TABLE clauses or index DDL;
+// CREATE TABLE IF NOT EXISTS and DROP TABLE IF EXISTS stay replayable.
+fn find_ddl_if_exists_pattern(sql: &str) -> Option<String> {
+    let upper = uppercase_outside_string_literals(sql);
+    let guarded = upper.starts_with("ALTER TABLE ")
+        || upper.starts_with("CREATE INDEX ")
+        || upper.starts_with("CREATE UNIQUE INDEX ")
+        || upper.starts_with("DROP INDEX ");
+    if !guarded {
+        return None;
+    }
+
+    find_pattern(&upper, &["IF NOT EXISTS", "IF EXISTS"])
+}
+
+// Replaying DDL is not idempotent; after a crash between apply and checkpoint,
+// the re-applied statement reports one of these already-applied server errors.
+const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 5] = [
+    "ERROR 1050", // table already exists
+    "ERROR 1051", // unknown table (already dropped)
+    "ERROR 1060", // duplicate column name (already added)
+    "ERROR 1061", // duplicate key name (already added)
+    "ERROR 1091", // cannot drop column or key (already dropped)
+];
+
+fn is_ddl_already_applied_error(sql: &str, error: &str) -> bool {
+    is_known_compatible_ddl(sql)
+        && DDL_ALREADY_APPLIED_ERROR_CODES
+            .iter()
+            .any(|code| error.contains(code))
+}
+
 fn first_keyword(sql: &str) -> Option<&str> {
     sql.split_whitespace().next()
 }
@@ -447,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn quarantines_ddl_with_binlog_coordinate() {
+    fn replays_known_compatible_ddl() {
         let executor = RecordingExecutor::default();
         let quarantine = RecordingQuarantine::default();
         let applier = StatementApplier::new(executor, quarantine);
@@ -455,10 +506,30 @@ mod tests {
         let event = statement("ALTER TABLE accounts ADD COLUMN handle VARCHAR(64)");
         let outcome = applier.apply(&event).expect("apply statement");
 
+        assert_eq!(outcome, StatementOutcome::Replayed);
+        assert_eq!(
+            applier.executor.statements.borrow().as_slice(),
+            &[SqlStatement {
+                sql: "ALTER TABLE accounts ADD COLUMN handle VARCHAR(64)".to_string(),
+                params: Vec::new(),
+            }]
+        );
+        assert!(applier.quarantine.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn quarantines_unsupported_statement_with_binlog_coordinate() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let event = statement("GRANT SELECT ON accounts TO 'reader'@'%'");
+        let outcome = applier.apply(&event).expect("apply statement");
+
         assert_eq!(
             outcome,
             StatementOutcome::Quarantined(QuarantineReason::UnsupportedStatementType(
-                "ALTER".to_string()
+                "GRANT".to_string()
             ))
         );
         assert!(applier.executor.statements.borrow().is_empty());
@@ -467,10 +538,77 @@ mod tests {
             &[QuarantinedStatement {
                 coordinate: event.coordinate,
                 default_database: Some("app".to_string()),
-                sql: "ALTER TABLE accounts ADD COLUMN handle VARCHAR(64)".to_string(),
-                reason: QuarantineReason::UnsupportedStatementType("ALTER".to_string()),
+                sql: "GRANT SELECT ON accounts TO 'reader'@'%'".to_string(),
+                reason: QuarantineReason::UnsupportedStatementType("GRANT".to_string()),
             }]
         );
+    }
+
+    #[test]
+    fn quarantines_alter_with_mariadb_only_if_exists_clause() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let event = statement("ALTER TABLE accounts DROP COLUMN IF EXISTS handle");
+        let outcome = applier.apply(&event).expect("apply statement");
+
+        assert_eq!(
+            outcome,
+            StatementOutcome::Quarantined(QuarantineReason::MariaDbOnlySyntax(
+                "IF EXISTS".to_string()
+            ))
+        );
+        assert!(applier.executor.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn replays_create_table_if_not_exists() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let event = statement("CREATE TABLE IF NOT EXISTS accounts (id INT PRIMARY KEY)");
+        let outcome = applier.apply(&event).expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::Replayed);
+        assert!(applier.quarantine.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn tolerates_already_applied_ddl_replay_error() {
+        let executor = RecordingExecutor {
+            statements: RefCell::new(Vec::new()),
+            error: Some(TargetExecuteError::new(
+                "target mysql query failed: ERROR 1091 (42000): Can't DROP COLUMN `handle`; check that it exists",
+            )),
+        };
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let event = statement("ALTER TABLE accounts DROP COLUMN handle");
+        let outcome = applier.apply(&event).expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::AlreadyApplied);
+    }
+
+    #[test]
+    fn does_not_tolerate_already_applied_errors_for_dml() {
+        let executor = RecordingExecutor {
+            statements: RefCell::new(Vec::new()),
+            error: Some(TargetExecuteError::new(
+                "target mysql query failed: ERROR 1091 (42000): unexpected",
+            )),
+        };
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let event = statement("UPDATE accounts SET name = 'Ada' WHERE id = 7");
+        let error = applier
+            .apply(&event)
+            .expect_err("dml error should propagate");
+
+        assert!(error.to_string().contains("ERROR 1091"));
     }
 
     #[test]

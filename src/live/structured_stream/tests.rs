@@ -63,7 +63,7 @@ fn rejects_mysql_cdc_start_positions_that_do_not_fit_crate_api() {
 }
 
 #[test]
-fn source_query_ddl_is_quarantined_without_checkpointing_past_it() {
+fn source_query_ddl_is_replayed_as_checkpointed_statement() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -73,7 +73,51 @@ fn source_query_ddl_is_quarantined_without_checkpointing_past_it() {
         error_code: 0,
         status_variables: Vec::new(),
         database_name: "fixture_cdc".to_string(),
-        sql_statement: "CREATE TABLE should_not_be_applied (id int)".to_string(),
+        sql_statement: "CREATE TABLE now_applied (id int)".to_string(),
+    });
+
+    let outcome = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(99, 180),
+        &event,
+    )
+    .expect("source DDL should replay");
+
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
+    assert_eq!(
+        outcome.resume_coordinate,
+        Some(BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 180,
+        })
+    );
+    assert_eq!(
+        applier
+            .executor()
+            .statements
+            .borrow()
+            .iter()
+            .map(|statement| statement.sql.clone())
+            .collect::<Vec<_>>(),
+        vec!["CREATE TABLE now_applied (id int)".to_string()]
+    );
+}
+
+#[test]
+fn source_query_mariadb_only_ddl_is_quarantined_without_checkpointing_past_it() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "ALTER TABLE accounts DROP COLUMN IF EXISTS handle".to_string(),
     });
 
     let error = handle_structured_event(
@@ -84,7 +128,7 @@ fn source_query_ddl_is_quarantined_without_checkpointing_past_it() {
         &event_header(99, 180),
         &event,
     )
-    .expect_err("source DDL should quarantine");
+    .expect_err("mariadb-only DDL should quarantine");
 
     assert!(error.to_string().contains("quarantined"));
     assert!(applier.executor().statements.borrow().is_empty());
