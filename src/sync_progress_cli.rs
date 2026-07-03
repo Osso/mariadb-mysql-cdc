@@ -7,7 +7,6 @@ use mysql::{Conn, Opts, OptsBuilder, SslOpts};
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -559,29 +558,40 @@ fn source_count(config: &SyncProgressConfig, table: &str) -> Result<Option<u64>,
         return Ok(None);
     }
     let sql = format!("SELECT COUNT(*) FROM {}", quote_ident(table));
-    let output = run_source_query(&config.mariadb, &config.source, &sql)?;
-    output
-        .trim()
-        .parse()
+    let mut conn = Conn::new(source_opts(&config.source)).map_err(mysql_error)?;
+    conn.query_first::<u64, _>(sql)
+        .map_err(mysql_error)?
         .map(Some)
-        .map_err(|_| format!("source count for {table} was not an integer"))
-}
-
-fn run_source_query(
-    mariadb: &str,
-    source: &mysql_snapshot::MySqlConnectionConfig,
-    sql: &str,
-) -> Result<String, String> {
-    run_mariadb_query(mariadb, source_mysql_args(source), sql)
+        .ok_or_else(|| format!("source count for {table} returned no rows"))
 }
 
 fn target_opts(target: &live::TargetMySqlConfig) -> Opts {
+    mysql_opts(
+        &target.host,
+        target.port,
+        &target.user,
+        &target.password,
+        &target.database,
+    )
+}
+
+fn source_opts(source: &mysql_snapshot::MySqlConnectionConfig) -> Opts {
+    mysql_opts(
+        &source.host,
+        source.port,
+        &source.user,
+        &source.password,
+        &source.database,
+    )
+}
+
+fn mysql_opts(host: &str, port: u16, user: &str, password: &str, database: &str) -> Opts {
     let builder = OptsBuilder::default()
-        .ip_or_hostname(Some(&target.host))
-        .tcp_port(target.port)
-        .user(Some(&target.user))
-        .pass(Some(&target.password))
-        .db_name(Some(&target.database))
+        .ip_or_hostname(Some(host))
+        .tcp_port(port)
+        .user(Some(user))
+        .pass(Some(password))
+        .db_name(Some(database))
         .prefer_socket(false)
         .tcp_connect_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
         .read_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
@@ -600,40 +610,6 @@ fn mysql_error(error: mysql::Error) -> String {
 
 fn is_missing_table_error(error: &mysql::Error) -> bool {
     matches!(error, mysql::Error::MySqlError(inner) if inner.code == 1146)
-}
-
-fn run_mariadb_query(mariadb: &str, args: Vec<String>, sql: &str) -> Result<String, String> {
-    let output = Command::new(mariadb)
-        .args(args)
-        .arg("--batch")
-        .arg("--skip-column-names")
-        .arg("--execute")
-        .arg(sql)
-        .output()
-        .map_err(|error| format!("failed to run mariadb: {error}"))?;
-    command_output(output)
-}
-
-fn command_output(output: std::process::Output) -> Result<String, String> {
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-    }
-
-    Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-}
-
-fn source_mysql_args(source: &mysql_snapshot::MySqlConnectionConfig) -> Vec<String> {
-    vec![
-        "--host".to_string(),
-        source.host.clone(),
-        "--port".to_string(),
-        source.port.to_string(),
-        "--user".to_string(),
-        source.user.clone(),
-        format!("--password={}", source.password),
-        "--database".to_string(),
-        source.database.clone(),
-    ]
 }
 
 fn parse_u64_field(field: &str, value: &str) -> Result<u64, String> {
