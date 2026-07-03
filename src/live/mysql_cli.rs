@@ -2,6 +2,7 @@ use super::TargetMySqlConfig;
 use crate::mysql_client::PersistentTargetExecutor;
 use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
 use std::cell::RefCell;
+#[cfg(test)]
 use std::time::Instant;
 
 pub struct MysqlCliExecutor {
@@ -9,6 +10,7 @@ pub struct MysqlCliExecutor {
     executor: RefCell<Option<PersistentTargetExecutor>>,
 }
 
+#[cfg(test)]
 const TARGET_SLOW_QUERY_SQL_LIMIT: usize = 4_000;
 
 impl MysqlCliExecutor {
@@ -232,6 +234,7 @@ impl SqlScanner {
     }
 }
 
+#[cfg(test)]
 pub(super) fn format_slow_target_query_log(
     statement: &SqlStatement,
     started_at: Instant,
@@ -247,6 +250,7 @@ pub(super) fn format_slow_target_query_log(
     )
 }
 
+#[cfg(test)]
 pub(super) fn truncate_sql_for_log(sql: &str, limit: usize) -> String {
     match sql.char_indices().nth(limit) {
         Some((index, _)) => sql[..index].to_string(),
@@ -258,10 +262,12 @@ pub(crate) fn target_session_init_command() -> &'static str {
     "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'"
 }
 
+#[cfg(test)]
 fn target_replay_sql(sql: &str) -> String {
     format!("{}; {}", target_session_init_command(), sql)
 }
 
+#[cfg(test)]
 pub(super) fn target_client_character_set_arg() -> &'static str {
     "--default-character-set=utf8mb4"
 }
