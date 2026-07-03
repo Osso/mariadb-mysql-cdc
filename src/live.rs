@@ -12,7 +12,6 @@ use std::path::PathBuf;
 mod binlog_command;
 mod insert_conflict;
 mod mysql_cli;
-#[cfg(test)]
 mod progress;
 mod reconnect;
 #[cfg(test)]

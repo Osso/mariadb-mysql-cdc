@@ -1,5 +1,7 @@
+#[cfg(test)]
 use crate::live::ApplyBinlogConfig;
 use crate::probe::BinlogCoordinate;
+#[cfg(test)]
 use crate::statement::QuarantineReason;
 use std::time::{Duration, Instant};
 
@@ -36,6 +38,7 @@ impl StreamProgress {
         self.should_log_progress(now)
     }
 
+    #[cfg(test)]
     pub(super) fn record_quarantined(&mut self, coordinate: &BinlogCoordinate) {
         self.quarantined_statements += 1;
         self.last_coordinate = coordinate.clone();
@@ -69,6 +72,7 @@ impl StreamProgress {
     }
 }
 
+#[cfg(test)]
 pub(super) fn format_stream_start(config: &ApplyBinlogConfig) -> String {
     format!(
         "cdc_stream_start source_host={} source_database={} start_file={} start_position={} target_host={} target_database={} insert_conflict_policy={:?}",
@@ -86,6 +90,7 @@ pub(super) fn format_stream_progress(progress: &StreamProgress) -> String {
     format_stream_totals("cdc_stream_progress", progress)
 }
 
+#[cfg(test)]
 pub(super) fn format_stream_quarantine(
     progress: &StreamProgress,
     reason: &QuarantineReason,
@@ -108,6 +113,7 @@ fn format_stream_totals(event_name: &str, progress: &StreamProgress) -> String {
     )
 }
 
+#[cfg(test)]
 fn optional_database_name(database: &Option<String>) -> &str {
     database.as_deref().unwrap_or("*")
 }

@@ -70,11 +70,9 @@ fn save_checkpoint_if_advanced(
     };
 
     if should_skip_checkpoint(store, checkpoint)? {
-        println!("{}", format_checkpoint_skip(checkpoint));
         return Ok(());
     }
     store.save_checkpoint(checkpoint)?;
-    println!("{}", format_checkpoint_write(checkpoint));
     Ok(())
 }
 
@@ -345,20 +343,6 @@ pub(super) fn format_stale_binlog_auto_skip(
         new_coordinate.file,
         new_coordinate.position,
         shell_word(&error.to_string())
-    )
-}
-
-pub(super) fn format_checkpoint_write(checkpoint: &Checkpoint) -> String {
-    format!(
-        "cdc_stream_checkpoint file={} position={} event_type={}",
-        checkpoint.source_file, checkpoint.source_position, checkpoint.last_event.event_type
-    )
-}
-
-fn format_checkpoint_skip(checkpoint: &Checkpoint) -> String {
-    format!(
-        "cdc_stream_checkpoint_skip file={} position={} event_type={}",
-        checkpoint.source_file, checkpoint.source_position, checkpoint.last_event.event_type
     )
 }
 

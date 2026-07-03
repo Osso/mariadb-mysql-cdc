@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::progress::{StreamProgress, format_stream_progress};
 use super::reconnect::{StreamCheckpointStore, run_stream_reconnect_loop};
 
 const DEFAULT_REPLICA_SERVER_ID: u32 = 65_535;
@@ -267,6 +268,10 @@ fn stream_once(
     let mut events = client.replicate().map_err(source_error)?;
     let mut current_file = config.source.binlog_file.clone();
     let mut state = StructuredEventState::new(config.source.database.clone());
+    let mut progress = StreamProgress::new(BinlogCoordinate {
+        file: config.source.binlog_file.clone(),
+        position: config.source.start_position,
+    });
     let mut target_transaction = TargetTransaction::default();
     let group_config = TargetTransactionGroupConfig::from_apply_config(config);
 
@@ -287,7 +292,9 @@ fn stream_once(
             current_file: &mut current_file,
             group_config,
         };
-        apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?;
+        let outcome =
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?;
+        log_stream_progress(&mut progress, &outcome);
         client.commit(&header, &event);
     }
 
@@ -557,7 +564,6 @@ where
     if let Some(checkpoint) = checkpoint {
         if let Some(store) = context.checkpoint_store {
             store.save_checkpoint(&checkpoint)?;
-            println!("{}", super::reconnect::format_checkpoint_write(&checkpoint));
         }
     }
     Ok(())
@@ -592,6 +598,15 @@ fn stream_ended_error() -> ApplyBinlogError {
     ApplyBinlogError::SourceCommand("mysql_cdc binlog stream ended at EOF".to_string())
 }
 
+fn log_stream_progress(progress: &mut StreamProgress, outcome: &StructuredEventOutcome) {
+    let Some(coordinate) = &outcome.resume_coordinate else {
+        return;
+    };
+    if progress.record_applied(coordinate) {
+        println!("{}", format_stream_progress(progress));
+    }
+}
+
 fn save_outcome_checkpoint<E, R, C>(
     executor: &E,
     context: &mut StreamEventContext<'_, R, C>,
@@ -615,7 +630,6 @@ where
             checkpoint_table,
             &checkpoint,
         )?;
-        println!("{}", super::reconnect::format_checkpoint_write(&checkpoint));
         *context.current_file = coordinate.file.clone();
         return Ok(());
     }
