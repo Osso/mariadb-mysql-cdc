@@ -4,6 +4,7 @@ use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::mysql_support::{quote_ident, quote_sql_literal};
 use mysql::prelude::{FromRow, Queryable};
 use mysql::{Conn, Opts, OptsBuilder, Row, SslOpts, Value};
+use std::cell::RefCell;
 use std::fmt;
 
 const MIN_REPAIR_RANGE_ROWS: u64 = 100;
@@ -26,12 +27,14 @@ pub struct DriftComparison {
     pub content: Option<ContentDriftSummary>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ContentDriftSummary {
     pub chunks: u64,
     pub mismatched_chunks: u64,
     pub mismatched_ranges: Vec<ContentDriftRange>,
     pub range_limit_exceeded: bool,
+    pub skipped_columns: Vec<String>,
+    pub skipped_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -329,50 +332,78 @@ fn compare_table_content(
     config: &DriftCheckConfig,
     table: &str,
 ) -> Result<ContentDriftSummary, DriftCheckError> {
-    let context = ChecksumCompareContext::load(config, table)?;
-    compare_checksum_chunks(&context)
+    match ChecksumCompareContext::load(config, table)? {
+        ContentCheckPlan::Compare(context) => compare_checksum_chunks(&context),
+        ContentCheckPlan::Skip(reason) => Ok(ContentDriftSummary {
+            skipped_reason: Some(reason),
+            ..ContentDriftSummary::default()
+        }),
+    }
+}
+
+enum ContentCheckPlan {
+    Compare(ChecksumCompareContext),
+    Skip(String),
 }
 
 struct ChecksumCompareContext {
-    source: QueryConnectionConfig,
-    target: QueryConnectionConfig,
+    source_conn: RefCell<Conn>,
+    target_conn: RefCell<Conn>,
     table: String,
     primary_key: Vec<String>,
     columns: Vec<ChecksumColumn>,
+    skipped_columns: Vec<String>,
     chunk_size: usize,
 }
 
 impl ChecksumCompareContext {
-    fn load(config: &DriftCheckConfig, table: &str) -> Result<Self, DriftCheckError> {
-        let source = source_query_config(&config.source);
-        let target = target_query_config(&config.target);
-        let primary_key = query_primary_key(&source, table)?;
-        let columns = query_checksum_columns(&source, table)?;
-        Ok(Self {
-            source,
-            target,
+    fn load(config: &DriftCheckConfig, table: &str) -> Result<ContentCheckPlan, DriftCheckError> {
+        let mut source_conn = open_connection(&source_query_config(&config.source))?;
+        let primary_key = query_primary_key(&mut source_conn, table)?;
+        if primary_key.is_empty() {
+            return Ok(ContentCheckPlan::Skip("no primary key".to_string()));
+        }
+        let all_columns = query_checksum_columns(&mut source_conn, table)?;
+        let (columns, skipped_columns) = partition_checksum_columns(all_columns);
+        if let Some(unsupported_key) = primary_key.iter().find(|key| skipped_columns.contains(key))
+        {
+            return Ok(ContentCheckPlan::Skip(format!(
+                "primary key column `{unsupported_key}` has an unsupported checksum type"
+            )));
+        }
+        let target_conn = open_connection(&target_query_config(&config.target))?;
+        Ok(ContentCheckPlan::Compare(Self {
+            source_conn: RefCell::new(source_conn),
+            target_conn: RefCell::new(target_conn),
             table: table.to_string(),
             primary_key,
             columns,
+            skipped_columns,
             chunk_size: config.chunk_size,
-        })
+        }))
     }
+}
+
+fn partition_checksum_columns(columns: Vec<ChecksumColumn>) -> (Vec<ChecksumColumn>, Vec<String>) {
+    let (supported, skipped): (Vec<_>, Vec<_>) = columns
+        .into_iter()
+        .partition(|column| crate::checksum::is_supported_checksum_type(&column.data_type));
+    let skipped_names = skipped.into_iter().map(|column| column.name).collect();
+    (supported, skipped_names)
 }
 
 fn compare_checksum_chunks(
     context: &ChecksumCompareContext,
 ) -> Result<ContentDriftSummary, DriftCheckError> {
     let mut summary = ContentDriftSummary {
-        chunks: 0,
-        mismatched_chunks: 0,
-        mismatched_ranges: Vec::new(),
-        range_limit_exceeded: false,
+        skipped_columns: context.skipped_columns.clone(),
+        ..ContentDriftSummary::default()
     };
     let mut start_after = None;
 
     loop {
         let endpoints = query_primary_key_endpoints(
-            &context.source,
+            &context.source_conn,
             &context.table,
             &context.primary_key,
             start_after.clone(),
@@ -442,13 +473,13 @@ fn compare_checksum_range(
 ) -> Result<ChecksumRangeComparison, DriftCheckError> {
     let source = checksum_for_range(
         context,
-        &context.source,
+        &context.source_conn,
         start_after.clone(),
         end_at.clone(),
     )?;
     let target = checksum_for_range(
         context,
-        &context.target,
+        &context.target_conn,
         start_after.clone(),
         end_at.clone(),
     )?;
@@ -501,7 +532,7 @@ fn mismatch_midpoint(
     }
     let split_size = (comparison.source_count() / 2) as usize;
     let endpoints = query_primary_key_endpoints_in_range(
-        &context.source,
+        &context.source_conn,
         &context.table,
         &context.primary_key,
         comparison.start_after.clone(),
@@ -525,12 +556,12 @@ fn record_target_tail_checksum(
 
 fn checksum_for_range(
     context: &ChecksumCompareContext,
-    config: &QueryConnectionConfig,
+    conn: &RefCell<Conn>,
     start_after: Option<Vec<String>>,
     end_at: Option<Vec<String>>,
 ) -> Result<(u64, u64), DriftCheckError> {
     query_chunk_checksum(
-        config,
+        conn,
         &context.table,
         &context.primary_key,
         &context.columns,
@@ -559,24 +590,15 @@ fn is_missing_table_error(message: &str) -> bool {
         && message.contains("doesn't exist")
 }
 
-fn query_primary_key(
-    config: &QueryConnectionConfig,
-    table: &str,
-) -> Result<Vec<String>, DriftCheckError> {
-    let primary_key = query_list(config, &build_primary_key_sql(table))?;
-    if primary_key.is_empty() {
-        return Err(DriftCheckError::Config(format!(
-            "table `{table}` has no primary key for content drift check"
-        )));
-    }
-    Ok(primary_key)
+fn query_primary_key(conn: &mut Conn, table: &str) -> Result<Vec<String>, DriftCheckError> {
+    conn.query::<String, _>(build_primary_key_sql(table))
+        .map_err(query_error)
 }
 
 fn query_checksum_columns(
-    config: &QueryConnectionConfig,
+    conn: &mut Conn,
     table: &str,
 ) -> Result<Vec<ChecksumColumn>, DriftCheckError> {
-    let mut conn = open_connection(config)?;
     let mut columns = conn
         .query_map(
             build_checksum_columns_sql(table),
@@ -587,7 +609,7 @@ fn query_checksum_columns(
             },
         )
         .map_err(query_error)?;
-    let json_checks = query_json_check_clauses(&mut conn, table)?;
+    let json_checks = query_json_check_clauses(conn, table)?;
     mark_json_alias_columns(&mut columns, &json_checks);
     Ok(columns)
 }
@@ -615,17 +637,17 @@ fn check_clause_references_json_column(clause: &str, column: &str) -> bool {
 }
 
 fn query_primary_key_endpoints(
-    config: &QueryConnectionConfig,
+    conn: &RefCell<Conn>,
     table: &str,
     primary_key: &[String],
     start_after: Option<Vec<String>>,
     limit: usize,
 ) -> Result<Vec<Vec<String>>, DriftCheckError> {
-    query_primary_key_endpoints_in_range(config, table, primary_key, start_after, None, limit)
+    query_primary_key_endpoints_in_range(conn, table, primary_key, start_after, None, limit)
 }
 
 fn query_primary_key_endpoints_in_range(
-    config: &QueryConnectionConfig,
+    conn: &RefCell<Conn>,
     table: &str,
     primary_key: &[String],
     start_after: Option<Vec<String>>,
@@ -634,11 +656,15 @@ fn query_primary_key_endpoints_in_range(
 ) -> Result<Vec<Vec<String>>, DriftCheckError> {
     let sql =
         build_primary_key_endpoints_range_sql(table, primary_key, start_after, end_at, limit)?;
-    query_rows(config, &sql)
+    let rows = conn
+        .borrow_mut()
+        .query::<Row, _>(sql)
+        .map_err(query_error)?;
+    Ok(rows.into_iter().map(row_to_strings).collect())
 }
 
 fn query_chunk_checksum(
-    config: &QueryConnectionConfig,
+    conn: &RefCell<Conn>,
     table: &str,
     primary_key: &[String],
     columns: &[ChecksumColumn],
@@ -653,29 +679,15 @@ fn query_chunk_checksum(
         end_at,
     })
     .map_err(DriftCheckError::Config)?;
-    query_required_scalar(config, &sql)
+    conn.borrow_mut()
+        .query_first::<(u64, u64), _>(sql)
+        .map_err(query_error)?
+        .ok_or_else(|| DriftCheckError::Query("checksum query returned no rows".to_string()))
 }
 
 fn query_list(config: &QueryConnectionConfig, sql: &str) -> Result<Vec<String>, DriftCheckError> {
     let mut conn = open_connection(config)?;
     conn.query::<String, _>(sql).map_err(query_error)
-}
-
-fn query_rows(
-    config: &QueryConnectionConfig,
-    sql: &str,
-) -> Result<Vec<Vec<String>>, DriftCheckError> {
-    let mut conn = open_connection(config)?;
-    let rows = conn.query::<Row, _>(sql).map_err(query_error)?;
-    Ok(rows.into_iter().map(row_to_strings).collect())
-}
-
-fn query_required_scalar<T>(config: &QueryConnectionConfig, sql: &str) -> Result<T, DriftCheckError>
-where
-    T: FromRow,
-{
-    query_scalar(config, sql)?
-        .ok_or_else(|| DriftCheckError::Query("checksum query returned no rows".to_string()))
 }
 
 fn query_scalar<T>(config: &QueryConnectionConfig, sql: &str) -> Result<Option<T>, DriftCheckError>
@@ -806,15 +818,26 @@ fn format_key_bound_json(bound: Option<&Vec<String>>) -> String {
 fn format_content_summary(content: Option<&ContentDriftSummary>) -> String {
     content
         .map(|content| {
+            if let Some(reason) = &content.skipped_reason {
+                return format!(" content_skipped={}", reason.replace(char::is_whitespace, "_"));
+            }
             format!(
-                " content_chunks={} content_mismatches={} content_ranges={} content_range_limit_exceeded={}",
+                " content_chunks={} content_mismatches={} content_ranges={} content_range_limit_exceeded={}{}",
                 content.chunks,
                 content.mismatched_chunks,
                 content.mismatched_ranges.len(),
-                content.range_limit_exceeded
+                content.range_limit_exceeded,
+                format_skipped_columns(&content.skipped_columns)
             )
         })
         .unwrap_or_default()
+}
+
+fn format_skipped_columns(skipped_columns: &[String]) -> String {
+    if skipped_columns.is_empty() {
+        return String::new();
+    }
+    format!(" content_skipped_columns={}", skipped_columns.join(","))
 }
 
 fn format_count(count: Option<u64>) -> String {
@@ -967,6 +990,54 @@ mod tests {
     }
 
     #[test]
+    fn partitions_unsupported_columns_out_of_checksum_set() {
+        let columns = vec![
+            checksum_column("id", "bigint"),
+            checksum_column("score", "float"),
+            checksum_column("payload", "json"),
+            checksum_column("name", "varchar"),
+        ];
+
+        let (supported, skipped) = partition_checksum_columns(columns);
+
+        assert_eq!(
+            supported
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+        assert_eq!(skipped, vec!["score".to_string(), "payload".to_string()]);
+    }
+
+    #[test]
+    fn formats_skipped_columns_and_skip_reason_in_content_summary() {
+        assert_eq!(
+            format_content_summary(Some(&ContentDriftSummary {
+                chunks: 2,
+                skipped_columns: vec!["score".to_string(), "payload".to_string()],
+                ..ContentDriftSummary::default()
+            })),
+            " content_chunks=2 content_mismatches=0 content_ranges=0 content_range_limit_exceeded=false content_skipped_columns=score,payload"
+        );
+        assert_eq!(
+            format_content_summary(Some(&ContentDriftSummary {
+                skipped_reason: Some("no primary key".to_string()),
+                ..ContentDriftSummary::default()
+            })),
+            " content_skipped=no_primary_key"
+        );
+    }
+
+    fn checksum_column(name: &str, data_type: &str) -> ChecksumColumn {
+        ChecksumColumn {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            column_type: data_type.to_string(),
+        }
+    }
+
+    #[test]
     fn formats_drift_report_with_match_and_mismatch_status() {
         let report = DriftCheckReport {
             comparisons: vec![
@@ -1015,6 +1086,7 @@ mod tests {
                         target_count: 1,
                     }],
                     range_limit_exceeded: false,
+                    ..ContentDriftSummary::default()
                 }),
             }],
         };

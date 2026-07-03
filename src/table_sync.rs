@@ -124,15 +124,17 @@ pub fn sync_table_with_progress(
 ) -> Result<SyncTableReport, TableSyncError> {
     sync_table_with_progress_range(
         table,
-        chunk_size,
-        mode,
+        SyncRunOptions {
+            chunk_size,
+            mode,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
         source,
         target,
         repair_target,
         progress_store,
-        None,
-        None,
-        Some(0),
     )
 }
 
@@ -185,18 +187,29 @@ fn read_recent_update_chunk(
     ))
 }
 
+pub struct SyncRunOptions {
+    pub chunk_size: usize,
+    pub mode: SyncMode,
+    pub start_after: Option<Vec<String>>,
+    pub end_at: Option<Vec<String>>,
+    pub max_deletes: Option<u64>,
+}
+
 pub fn sync_table_with_progress_range(
     table: &SyncTable,
-    chunk_size: usize,
-    mode: SyncMode,
+    options: SyncRunOptions,
     source: &impl SyncTableReader,
     target: &impl SyncTableReader,
     repair_target: &mut impl SyncRepairTarget,
     progress_store: &mut impl SyncProgressStore,
-    range_start_after: Option<Vec<String>>,
-    range_end_at: Option<Vec<String>>,
-    max_deletes: Option<u64>,
 ) -> Result<SyncTableReport, TableSyncError> {
+    let SyncRunOptions {
+        chunk_size,
+        mode,
+        start_after: range_start_after,
+        end_at: range_end_at,
+        max_deletes,
+    } = options;
     validate_sync_table(table, chunk_size)?;
     validate_sync_range(table, range_start_after.as_ref(), range_end_at.as_ref())?;
     let mut progress = load_sync_progress(table, mode, progress_store)?;
@@ -500,15 +513,17 @@ fn run_sync_table_with_targets(
     } else {
         sync_table_with_progress_range(
             &config.table,
-            config.chunk_size,
-            config.mode,
+            SyncRunOptions {
+                chunk_size: config.chunk_size,
+                mode: config.mode,
+                start_after: config.start_after.clone(),
+                end_at: config.end_at.clone(),
+                max_deletes: config.max_deletes,
+            },
             source,
             target,
             repair_target,
             progress_store,
-            config.start_after.clone(),
-            config.end_at.clone(),
-            config.max_deletes,
         )
     }
 }
@@ -816,15 +831,17 @@ mod tests {
         let mut progress_store = RecordingProgressStore::default();
         let report = sync_table_with_progress_range(
             &account_table(),
-            10,
-            SyncMode::Apply,
+            SyncRunOptions {
+                chunk_size: 10,
+                mode: SyncMode::Apply,
+                start_after: None,
+                end_at: None,
+                max_deletes: Some(1),
+            },
             &source,
             &target,
             &mut repair_target,
             &mut progress_store,
-            None,
-            None,
-            Some(1),
         )
         .expect("sync report");
 
@@ -854,15 +871,17 @@ mod tests {
 
         let error = sync_table_with_progress_range(
             &account_table(),
-            10,
-            SyncMode::Apply,
+            SyncRunOptions {
+                chunk_size: 10,
+                mode: SyncMode::Apply,
+                start_after: None,
+                end_at: None,
+                max_deletes: Some(0),
+            },
             &source,
             &target,
             &mut repair_target,
             &mut progress_store,
-            None,
-            None,
-            Some(0),
         )
         .expect_err("delete threshold");
 
@@ -943,15 +962,17 @@ mod tests {
 
         let error = sync_table_with_progress_range(
             &table,
-            10,
-            SyncMode::DryRun,
+            SyncRunOptions {
+                chunk_size: 10,
+                mode: SyncMode::DryRun,
+                start_after: Some(vec!["1".to_string()]),
+                end_at: None,
+                max_deletes: Some(0),
+            },
             &source,
             &target,
             &mut repair_target,
             &mut progress_store,
-            Some(vec!["1".to_string()]),
-            None,
-            Some(0),
         )
         .expect_err("bad arity");
 
@@ -970,15 +991,17 @@ mod tests {
 
         let report = sync_table_with_progress_range(
             &account_table(),
-            10,
-            SyncMode::Apply,
+            SyncRunOptions {
+                chunk_size: 10,
+                mode: SyncMode::Apply,
+                start_after: None,
+                end_at: None,
+                max_deletes: Some(1),
+            },
             &source,
             &target,
             &mut repair_target,
             &mut progress_store,
-            None,
-            None,
-            Some(1),
         )
         .expect("sync report");
 
@@ -998,15 +1021,17 @@ mod tests {
 
         let report = sync_table_with_progress_range(
             &account_table(),
-            10,
-            SyncMode::Apply,
+            SyncRunOptions {
+                chunk_size: 10,
+                mode: SyncMode::Apply,
+                start_after: Some(vec!["1".to_string()]),
+                end_at: Some(vec!["3".to_string()]),
+                max_deletes: Some(1),
+            },
             &source,
             &target,
             &mut repair_target,
             &mut progress_store,
-            Some(vec!["1".to_string()]),
-            Some(vec!["3".to_string()]),
-            Some(1),
         )
         .expect("sync report");
 

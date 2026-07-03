@@ -49,6 +49,16 @@ fn encoded_column_expr(column: &ChecksumColumn) -> Result<String, String> {
     ))
 }
 
+// FLOAT/DOUBLE string conversion differs between MariaDB and MySQL 8; JSON is
+// stored as text on MariaDB but binary-normalized (reformatted) on MySQL 8.
+// Both would mismatch on identical data, so they cannot be checksummed.
+pub fn is_supported_checksum_type(data_type: &str) -> bool {
+    !matches!(
+        data_type.to_ascii_lowercase().as_str(),
+        "float" | "double" | "real" | "json"
+    )
+}
+
 fn normalized_value_expr(column: &ChecksumColumn) -> Result<String, String> {
     let quoted = quote_ident(&column.name);
     match column.data_type.to_ascii_lowercase().as_str() {
