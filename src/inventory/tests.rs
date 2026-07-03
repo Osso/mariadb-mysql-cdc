@@ -62,13 +62,28 @@ fn excludes_views_from_table_inventory() {
 }
 
 #[test]
-fn parses_cli_rows_and_quotes_schema_names() {
-    let rows = parse_tsv("accounts\tBASE TABLE\tInnoDB\tutf8mb4_unicode_ci\n");
-    let table = parse_table_row(&rows[0]).expect("table row");
+fn parses_native_mysql_values_and_quotes_schema_names() {
+    let row = vec![
+        "accounts".to_string(),
+        "BASE TABLE".to_string(),
+        "InnoDB".to_string(),
+        "utf8mb4_unicode_ci".to_string(),
+    ];
+    let table = parse_table_row(&row).expect("table row");
 
     assert_eq!(table.table_name, "accounts");
     assert_eq!(table.engine, Some("InnoDB".to_string()));
     assert_eq!(quote_sql_string("app's\\schema"), "'app''s\\\\schema'");
+}
+
+#[test]
+fn inventory_reader_does_not_shell_out_to_mariadb_cli() {
+    let source = include_str!("../inventory.rs");
+
+    assert!(source.contains("RefCell<Option<Conn>>"));
+    assert!(source.contains("Conn::new"));
+    assert!(!source.contains("std::process::Command"));
+    assert!(!source.contains("Command::new"));
 }
 
 #[test]
@@ -131,11 +146,15 @@ fn parses_all_inventory_row_types() {
 }
 
 #[test]
-fn decodes_null_fields_and_ignores_blank_tsv_lines() {
-    let rows = parse_tsv("\naccounts\tBASE TABLE\tNULL\tNULL\n\n");
-    let table = parse_table_row(&rows[0]).expect("table row");
+fn decodes_null_inventory_values_as_empty_optional_fields() {
+    let row = vec![
+        "accounts".to_string(),
+        "BASE TABLE".to_string(),
+        inventory_value_to_string(mysql::Value::NULL),
+        inventory_value_to_string(mysql::Value::NULL),
+    ];
+    let table = parse_table_row(&row).expect("table row");
 
-    assert_eq!(rows.len(), 1);
     assert_eq!(table.engine, None);
     assert_eq!(table.table_collation, None);
 }

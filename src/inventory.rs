@@ -1,6 +1,8 @@
+use mysql::prelude::Queryable;
+use mysql::{Conn, Opts, OptsBuilder, Row, Value};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::process::Command;
 
 const BASE_TABLE_TYPE: &str = "BASE TABLE";
 
@@ -102,50 +104,70 @@ impl Default for InventoryConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MariaDbInventoryReader {
     config: InventoryConfig,
+    conn: RefCell<Option<Conn>>,
 }
 
 impl MariaDbInventoryReader {
     pub fn new(config: InventoryConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            conn: RefCell::new(None),
+        }
+    }
+
+    fn query_rows(&self, query: &str) -> Result<Vec<Vec<String>>, InventoryError> {
+        let mut conn = self.ensure_conn()?;
+        let rows = conn.query::<Row, _>(query).map_err(inventory_query_error)?;
+        Ok(rows.into_iter().map(row_to_inventory_fields).collect())
+    }
+
+    fn ensure_conn(&self) -> Result<std::cell::RefMut<'_, Conn>, InventoryError> {
+        if self.conn.borrow().is_none() {
+            let conn = open_inventory_conn(&self.config)?;
+            self.conn.replace(Some(conn));
+        }
+        Ok(std::cell::RefMut::map(self.conn.borrow_mut(), |conn| {
+            conn.as_mut().expect("inventory connection initialized")
+        }))
     }
 }
 
 impl InventoryReader for MariaDbInventoryReader {
     fn read_tables(&self, schema: &str) -> Result<Vec<TableRow>, InventoryError> {
-        let rows = run_inventory_query(&self.config, &tables_query(schema))?;
+        let rows = self.query_rows(&tables_query(schema))?;
         rows.iter().map(|row| parse_table_row(row)).collect()
     }
 
     fn read_columns(&self, schema: &str) -> Result<Vec<ColumnRow>, InventoryError> {
-        let rows = run_inventory_query(&self.config, &columns_query(schema))?;
+        let rows = self.query_rows(&columns_query(schema))?;
         rows.iter().map(|row| parse_column_row(row)).collect()
     }
 
     fn read_primary_keys(&self, schema: &str) -> Result<Vec<PrimaryKeyRow>, InventoryError> {
-        let rows = run_inventory_query(&self.config, &primary_keys_query(schema))?;
+        let rows = self.query_rows(&primary_keys_query(schema))?;
         rows.iter().map(|row| parse_primary_key_row(row)).collect()
     }
 
     fn read_views(&self, schema: &str) -> Result<Vec<ViewRow>, InventoryError> {
-        let rows = run_inventory_query(&self.config, &views_query(schema))?;
+        let rows = self.query_rows(&views_query(schema))?;
         rows.iter().map(|row| parse_view_row(row)).collect()
     }
 
     fn read_triggers(&self, schema: &str) -> Result<Vec<TriggerRow>, InventoryError> {
-        let rows = run_inventory_query(&self.config, &triggers_query(schema))?;
+        let rows = self.query_rows(&triggers_query(schema))?;
         rows.iter().map(|row| parse_trigger_row(row)).collect()
     }
 
     fn read_routines(&self, schema: &str) -> Result<Vec<RoutineRow>, InventoryError> {
-        let rows = run_inventory_query(&self.config, &routines_query(schema))?;
+        let rows = self.query_rows(&routines_query(schema))?;
         rows.iter().map(|row| parse_routine_row(row)).collect()
     }
 
     fn read_events(&self, schema: &str) -> Result<Vec<EventRow>, InventoryError> {
-        let rows = run_inventory_query(&self.config, &events_query(schema))?;
+        let rows = self.query_rows(&events_query(schema))?;
         rows.iter().map(|row| parse_event_row(row)).collect()
     }
 }
@@ -246,54 +268,85 @@ pub fn build_inventory(
     })
 }
 
-fn run_inventory_query(
-    config: &InventoryConfig,
-    query: &str,
-) -> Result<Vec<Vec<String>>, InventoryError> {
-    let output = Command::new(&config.mariadb)
-        .args([
-            "--batch",
-            "--raw",
-            "--skip-column-names",
-            "--host",
-            &config.host,
-            "--port",
-            &config.port.to_string(),
-            "--user",
-            &config.user,
-            "-e",
-            query,
-        ])
-        .env("MYSQL_PWD", &config.password)
-        .output()
-        .map_err(|error| InventoryError::new(format!("failed to run mariadb: {error}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(InventoryError::new(format!(
-            "mariadb exited with {}: {}",
-            output.status,
-            stderr.trim()
-        )));
-    }
-
-    Ok(parse_tsv(&String::from_utf8_lossy(&output.stdout)))
+fn open_inventory_conn(config: &InventoryConfig) -> Result<Conn, InventoryError> {
+    Conn::new(inventory_opts(config)).map_err(inventory_connect_error)
 }
 
-fn parse_tsv(output: &str) -> Vec<Vec<String>> {
-    output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.split('\t').map(decode_optional_field).collect())
+fn inventory_opts(config: &InventoryConfig) -> Opts {
+    let builder = OptsBuilder::default()
+        .ip_or_hostname(Some(&config.host))
+        .tcp_port(config.port)
+        .user(Some(&config.user))
+        .pass(Some(&config.password))
+        .prefer_socket(false);
+    Opts::from(builder)
+}
+
+fn row_to_inventory_fields(row: Row) -> Vec<String> {
+    row.unwrap()
+        .into_iter()
+        .map(inventory_value_to_string)
         .collect()
 }
 
-fn decode_optional_field(value: &str) -> String {
-    if value == "NULL" {
-        String::new()
-    } else {
-        value.to_string()
+fn inventory_value_to_string(value: Value) -> String {
+    match value {
+        Value::NULL => String::new(),
+        Value::Bytes(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Value::Int(value) => value.to_string(),
+        Value::UInt(value) => value.to_string(),
+        Value::Float(value) => value.to_string(),
+        Value::Double(value) => value.to_string(),
+        Value::Date(year, month, day, hour, minute, second, micros) => {
+            format_date(year, month, day, hour, minute, second, micros)
+        }
+        Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            format_time(negative, days, hours, minutes, seconds, micros)
+        }
     }
+}
+
+fn format_date(
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    micros: u32,
+) -> String {
+    if hour == 0 && minute == 0 && second == 0 && micros == 0 {
+        format!("{year:04}-{month:02}-{day:02}")
+    } else if micros == 0 {
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+    } else {
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}")
+    }
+}
+
+fn format_time(
+    negative: bool,
+    days: u32,
+    hours: u8,
+    minutes: u8,
+    seconds: u8,
+    micros: u32,
+) -> String {
+    let sign = if negative { "-" } else { "" };
+    let total_hours = days * 24 + u32::from(hours);
+    if micros == 0 {
+        format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
+    }
+}
+
+fn inventory_connect_error(error: mysql::Error) -> InventoryError {
+    InventoryError::new(format!("failed to connect to source mysql: {error}"))
+}
+
+fn inventory_query_error(error: mysql::Error) -> InventoryError {
+    InventoryError::new(format!("source inventory query failed: {error}"))
 }
 
 fn parse_table_row(fields: &[String]) -> Result<TableRow, InventoryError> {
