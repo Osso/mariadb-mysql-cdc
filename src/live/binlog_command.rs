@@ -1,4 +1,6 @@
-use super::{ApplyBinlogConfig, ApplyBinlogError, SourceBinlogConfig};
+#[cfg(test)]
+use super::SourceBinlogConfig;
+use super::{ApplyBinlogConfig, ApplyBinlogError};
 
 #[cfg(test)]
 const FNV_OFFSET_BASIS: u32 = 2_166_136_261;

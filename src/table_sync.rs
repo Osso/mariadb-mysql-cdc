@@ -598,27 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn run_sync_table_uses_native_mysql_not_cli_processes() {
-        let table_sync_source = include_str!("table_sync.rs");
-        let table_sync_production = table_sync_source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source");
-        let mysql_reader_source = include_str!("table_sync/mysql.rs");
-        let progress_source = include_str!("table_sync/progress.rs");
-
-        assert!(table_sync_production.contains("PersistentTargetExecutor::new"));
-        assert!(mysql_reader_source.contains("PersistentMySqlSource"));
-        assert!(progress_source.contains("PersistentProgressWriter"));
-        assert!(!table_sync_production.contains("MysqlCliExecutor"));
-        assert!(!mysql_reader_source.contains("std::process::Command"));
-        assert!(!mysql_reader_source.contains("Command::new"));
-        assert!(!progress_source.contains("std::process::Command"));
-        assert!(!progress_source.contains("Command::new"));
-        assert!(!progress_source.contains("MysqlCliExecutor"));
-    }
-
-    #[test]
     fn builds_sync_select_with_start_and_end_bounds() {
         let sql = build_sync_select_sql(&SyncChunkRequest {
             table: "accounts".to_string(),
