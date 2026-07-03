@@ -306,9 +306,9 @@ fn fixture_row_events_apply_through_row_applier_with_schema_resolver() {
 
     let statements = applier.executor().statements.borrow();
     assert!(statements.iter().any(|statement| {
-            statement.sql == "UPDATE `accounts` SET `name` = ?, `balance` = ?, `note` = ?, `created_at` = ? WHERE `id` = ?"
-                && statement.params == vec![bytes("alpha"), Value::UInt(125), bytes("row update"), bytes("2026-06-21 20:58:55"), Value::UInt(1)]
-        }));
+        statement.sql == "UPDATE `accounts` SET `balance` = ?, `note` = ? WHERE `id` = ?"
+            && statement.params == vec![Value::UInt(125), bytes("row update"), Value::UInt(1)]
+    }));
     assert!(statements.iter().any(|statement| {
         statement.sql == "DELETE FROM `accounts` WHERE `id` = ?"
             && statement.params == vec![Value::UInt(2)]

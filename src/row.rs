@@ -106,7 +106,9 @@ where
 
         for update in &event.rows {
             validate_row_has_primary_key(table, &update.after, &event.coordinate)?;
-            let statement = build_update_statement(table, &update.after, &event.coordinate)?;
+            let Some(statement) = build_update_statement(table, update, &event.coordinate)? else {
+                continue;
+            };
             execute_row_statement(
                 &self.executor,
                 statement,
@@ -380,20 +382,24 @@ fn build_insert_statement(table: &RowTableMap, rows: &[RowImage]) -> SqlStatemen
 
 fn build_update_statement(
     table: &RowTableMap,
-    row: &RowImage,
+    update: &RowUpdate,
     coordinate: &BinlogCoordinate,
-) -> RowResult<SqlStatement> {
+) -> RowResult<Option<SqlStatement>> {
     let writable_columns = writable_columns(table);
-    let changed_columns = non_primary_columns(&writable_columns, &table.primary_key);
+    let changed_columns = changed_non_primary_columns(table, &writable_columns, update);
+    if changed_columns.is_empty() {
+        return Ok(None);
+    }
+
     let assignments = changed_columns
         .iter()
         .map(|column| format!("{} = ?", quote_ident(column)))
         .collect::<Vec<_>>();
     let predicates = primary_key_predicates(&table.primary_key);
-    let mut params = ordered_values(row, &changed_columns);
-    params.extend(primary_key_values(table, row, coordinate)?);
+    let mut params = ordered_values(&update.after, &changed_columns);
+    params.extend(primary_key_values(table, &update.after, coordinate)?);
 
-    Ok(SqlStatement {
+    Ok(Some(SqlStatement {
         sql: format!(
             "UPDATE {} SET {} WHERE {}",
             quote_ident(&table.table),
@@ -401,7 +407,18 @@ fn build_update_statement(
             predicates.join(" AND ")
         ),
         params,
-    })
+    }))
+}
+
+fn changed_non_primary_columns(
+    table: &RowTableMap,
+    writable_columns: &[String],
+    update: &RowUpdate,
+) -> Vec<String> {
+    non_primary_columns(writable_columns, &table.primary_key)
+        .into_iter()
+        .filter(|column| update.before.get(column) != update.after.get(column))
+        .collect()
 }
 
 fn build_delete_statement(
@@ -596,16 +613,37 @@ mod tests {
             .expect("update row");
 
         let statements = applier.executor().statements.borrow();
+        assert_eq!(statements.len(), 1);
         assert_eq!(
             statements[0].sql,
             "INSERT INTO `releases` (`id`, `slug`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `slug` = VALUES(`slug`)"
         );
         assert_eq!(statements[0].params, values(["1", "alpha"]));
+    }
+
+    #[test]
+    fn update_rows_only_write_changed_columns() {
+        let applier = applier_with_accounts_table();
+        let event = UpdateRowsEvent {
+            coordinate: coordinate(140),
+            table_id: 7,
+            rows: vec![RowUpdate {
+                before: row("1", "alpha"),
+                after: row("1", "updated"),
+            }],
+        };
+
+        applier
+            .apply_update_rows(&event)
+            .expect("apply update rows");
+
+        let statements = applier.executor().statements.borrow();
+        assert_eq!(statements.len(), 1);
         assert_eq!(
-            statements[1].sql,
-            "UPDATE `releases` SET `slug` = ? WHERE `id` = ?"
+            statements[0].sql,
+            "UPDATE `accounts` SET `name` = ? WHERE `id` = ?"
         );
-        assert_eq!(statements[1].params, values(["alpha", "1"]));
+        assert_eq!(statements[0].params, values(["updated", "1"]));
     }
 
     #[test]
