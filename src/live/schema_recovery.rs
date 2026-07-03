@@ -1,14 +1,16 @@
 use super::{ApplyBinlogConfig, MysqlCliExecutor, SourceBinlogConfig};
 use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
-use std::process::Command;
+use mysql::prelude::Queryable;
+use mysql::{Conn, Opts, OptsBuilder, SslOpts};
+use std::cell::RefCell;
 
 pub trait SourceSchemaReader {
     fn read_create_table(&self, table: &str) -> Result<String, TargetExecuteError>;
 }
 
 pub struct SourceSchemaCliReader {
-    mariadb: String,
     source: SourceBinlogConfig,
+    conn: RefCell<Option<Conn>>,
 }
 
 pub struct MissingTableRecoveringExecutor<E, S> {
@@ -87,43 +89,31 @@ where
 impl SourceSchemaReader for SourceSchemaCliReader {
     fn read_create_table(&self, table: &str) -> Result<String, TargetExecuteError> {
         let database = required_source_database(&self.source)?;
-        let output = self.run_show_create_table(database, table)?;
-        parse_show_create_table_output(&String::from_utf8_lossy(&output.stdout))
-            .ok_or_else(|| TargetExecuteError::new(format!("source returned no DDL for `{table}`")))
-    }
-}
-
-impl SourceSchemaCliReader {
-    fn run_show_create_table(
-        &self,
-        database: &str,
-        table: &str,
-    ) -> Result<std::process::Output, TargetExecuteError> {
         let sql = format!(
             "SHOW CREATE TABLE {}.{}",
             quote_mysql_ident(database),
             quote_mysql_ident(table)
         );
-        let password_arg = format!("--password={}", self.source.password);
-        let output = Command::new(&self.mariadb)
-            .args([
-                "--batch",
-                "--raw",
-                "--skip-column-names",
-                "--host",
-                &self.source.host,
-                "--port",
-                &self.source.port.to_string(),
-                "--user",
-                &self.source.user,
-                &password_arg,
-                "-e",
-                &sql,
-            ])
-            .output()
-            .map_err(|error| TargetExecuteError::new(format!("failed to run mariadb: {error}")))?;
+        self.ensure_conn()?
+            .query_first::<(String, String), _>(sql)
+            .map_err(|error| {
+                TargetExecuteError::new(format!(
+                    "source SHOW CREATE TABLE failed for `{table}`: {error}"
+                ))
+            })?
+            .map(|(_table, ddl)| ddl)
+            .ok_or_else(|| TargetExecuteError::new(format!("source returned no DDL for `{table}`")))
+    }
+}
 
-        show_create_table_result(output, table)
+impl SourceSchemaCliReader {
+    fn ensure_conn(&self) -> Result<std::cell::RefMut<'_, Conn>, TargetExecuteError> {
+        if self.conn.borrow().is_none() {
+            self.conn.replace(Some(open_source_conn(&self.source)?));
+        }
+        Ok(std::cell::RefMut::map(self.conn.borrow_mut(), |conn| {
+            conn.as_mut().expect("source schema connection initialized")
+        }))
     }
 }
 
@@ -133,8 +123,8 @@ pub(super) fn mysql_executor_with_recovery(
     MissingTableRecoveringExecutor::new(
         MysqlCliExecutor::new(config.mariadb.clone(), config.target.clone()),
         SourceSchemaCliReader {
-            mariadb: config.mariadb.clone(),
             source: config.source.clone(),
+            conn: RefCell::new(None),
         },
     )
 }
@@ -145,20 +135,27 @@ fn required_source_database(source: &SourceBinlogConfig) -> Result<&str, TargetE
     })
 }
 
-fn show_create_table_result(
-    output: std::process::Output,
-    table: &str,
-) -> Result<std::process::Output, TargetExecuteError> {
-    if output.status.success() {
-        return Ok(output);
-    }
+fn open_source_conn(source: &SourceBinlogConfig) -> Result<Conn, TargetExecuteError> {
+    Conn::new(source_opts(source)).map_err(|error| {
+        TargetExecuteError::new(format!("source schema connection failed: {error}"))
+    })
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(TargetExecuteError::new(format!(
-        "source SHOW CREATE TABLE failed for `{table}` with {}: {}",
-        output.status,
-        stderr.trim()
-    )))
+fn source_opts(source: &SourceBinlogConfig) -> Opts {
+    let builder = OptsBuilder::default()
+        .ip_or_hostname(Some(&source.host))
+        .tcp_port(source.port)
+        .user(Some(&source.user))
+        .pass(Some(&source.password))
+        .prefer_socket(false)
+        .ssl_opts(insecure_ssl_opts());
+    Opts::from(builder)
+}
+
+fn insecure_ssl_opts() -> SslOpts {
+    SslOpts::default()
+        .with_danger_skip_domain_validation(true)
+        .with_danger_accept_invalid_certs(true)
 }
 
 fn missing_target_table_name(error: &str) -> Option<String> {
