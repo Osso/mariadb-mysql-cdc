@@ -202,13 +202,6 @@ fn line_before_table_options(lines: &[String]) -> Option<usize> {
         .and_then(|index| index.checked_sub(1))
 }
 
-fn parse_show_create_table_output(output: &str) -> Option<String> {
-    output
-        .trim_end()
-        .split_once('\t')
-        .map(|(_, ddl)| ddl.to_string())
-}
-
 fn quote_mysql_ident(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
