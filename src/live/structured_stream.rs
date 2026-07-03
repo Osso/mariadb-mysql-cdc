@@ -31,6 +31,9 @@ use super::reconnect::{StreamCheckpointStore, run_stream_reconnect_loop};
 
 const DEFAULT_REPLICA_SERVER_ID: u32 = 65_535;
 const MYSQL_CDC_HEARTBEAT_SECONDS: u64 = 30;
+// Bounds read-ahead memory while keeping the source socket drained during slow
+// applies, so the server's net_write_timeout does not kill the dump connection.
+const READ_AHEAD_EVENT_BUFFER: usize = 1024;
 const MYSQL_COLUMN_TYPE_ENUM: u8 = 247;
 const MILLIS_PER_SECOND: u64 = 1_000;
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -265,7 +268,8 @@ fn stream_once(
     let mut applier = RowApplier::new(executor);
     let schema_resolver = SourceInventorySchemaResolver::new(config);
     let mut client = BinlogClient::new(replica_options_from_source(&config.source)?);
-    let mut events = client.replicate().map_err(source_error)?;
+    let events = client.replicate().map_err(source_error)?;
+    let event_receiver = spawn_read_ahead_reader(client, events);
     let mut current_file = config.source.binlog_file.clone();
     let mut state = StructuredEventState::new(config.source.database.clone());
     let mut progress = StreamProgress::new(BinlogCoordinate {
@@ -275,7 +279,7 @@ fn stream_once(
     let mut target_transaction = TargetTransaction::default();
     let group_config = TargetTransactionGroupConfig::from_apply_config(config);
 
-    for result in &mut events {
+    for result in event_receiver.iter() {
         let (header, event) = match result {
             Ok(event) => event,
             Err(error) => {
@@ -295,7 +299,6 @@ fn stream_once(
         let outcome =
             apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?;
         log_stream_progress(&mut progress, &outcome);
-        client.commit(&header, &event);
     }
 
     let mut context = StreamEventContext {
@@ -309,6 +312,30 @@ fn stream_once(
     };
     flush_grouped_transaction(applier.executor(), &mut context)?;
     Err(stream_ended_error())
+}
+
+type BinlogEventResult = Result<(EventHeader, BinlogEvent), MysqlCdcError>;
+
+// Reads binlog events on a dedicated thread so the source socket stays drained
+// while the applier works; a stalled applier otherwise trips the server's
+// net_write_timeout and resets the dump connection.
+fn spawn_read_ahead_reader(
+    mut client: BinlogClient,
+    mut events: mysql_cdc::binlog_events::BinlogEvents,
+) -> std::sync::mpsc::Receiver<BinlogEventResult> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(READ_AHEAD_EVENT_BUFFER);
+    thread::spawn(move || {
+        for result in &mut events {
+            let stop_after_send = result.is_err();
+            if let Ok((header, event)) = &result {
+                client.commit(header, event);
+            }
+            if sender.send(result).is_err() || stop_after_send {
+                return;
+            }
+        }
+    });
+    receiver
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -561,10 +588,10 @@ where
     }
     let checkpoint = context.target_transaction.take_file_checkpoint();
     context.target_transaction.commit_if_open(executor)?;
-    if let Some(checkpoint) = checkpoint {
-        if let Some(store) = context.checkpoint_store {
-            store.save_checkpoint(&checkpoint)?;
-        }
+    if let Some(checkpoint) = checkpoint
+        && let Some(store) = context.checkpoint_store
+    {
+        store.save_checkpoint(&checkpoint)?;
     }
     Ok(())
 }
@@ -596,6 +623,18 @@ fn event_can_write_target(event: &BinlogEvent, state: &StructuredEventState) -> 
 
 fn stream_ended_error() -> ApplyBinlogError {
     ApplyBinlogError::SourceCommand("mysql_cdc binlog stream ended at EOF".to_string())
+}
+
+fn format_statement_already_applied(coordinate: &BinlogCoordinate, sql: &str) -> String {
+    format!(
+        "cdc_stream_statement_already_applied level=warn file={} position={} sql={}",
+        coordinate.file,
+        coordinate.position,
+        sql.replace(char::is_whitespace, "_")
+            .chars()
+            .take(160)
+            .collect::<String>()
+    )
 }
 
 fn log_stream_progress(progress: &mut StreamProgress, outcome: &StructuredEventOutcome) {
@@ -730,6 +769,13 @@ where
 
     let result = match statement_applier.apply(&event) {
         Ok(StatementOutcome::Replayed) => Ok(EventPolicy::CommitTransaction),
+        Ok(StatementOutcome::AlreadyApplied) => {
+            println!(
+                "{}",
+                format_statement_already_applied(coordinate, &query.sql_statement)
+            );
+            Ok(EventPolicy::CommitTransaction)
+        }
         Ok(StatementOutcome::Quarantined(_)) => Err(ApplyBinlogError::Quarantined(
             statement_applier
                 .quarantine_recorder()
