@@ -177,6 +177,83 @@ fn xid_event_checkpoints_after_transaction_rows_are_applied() {
 }
 
 #[test]
+fn wraps_target_writes_in_source_xid_transaction() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: None::<&NoopCheckpointStore>,
+                current_file: &mut current_file,
+            };
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+    process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("write rows");
+    process_event!(
+        event_header(16, 260),
+        BinlogEvent::XidEvent(XidEvent { xid: 42 })
+    )
+    .expect("xid");
+
+    assert_eq!(
+        applier.executor().operations.borrow().as_slice(),
+        ["BEGIN", "EXEC", "COMMIT"]
+    );
+}
+
+#[test]
+fn rolls_back_open_target_transaction_when_row_apply_fails() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::failing());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: None::<&NoopCheckpointStore>,
+                current_file: &mut current_file,
+            };
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+    let result = process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha"));
+
+    assert!(result.is_err());
+    assert_eq!(
+        applier.executor().operations.borrow().as_slice(),
+        ["BEGIN", "EXEC", "ROLLBACK"]
+    );
+    assert!(!transaction.is_open());
+}
+
+#[test]
 fn annotation_rows_query_events_are_ignored_even_when_text_starts_with_sql() {
     let event = BinlogEvent::RowsQueryEvent(RowsQueryEvent {
         query: "INSERT INTO email_history VALUES ('annotation only')".to_string(),
@@ -819,6 +896,30 @@ fn fixture_events(path: &str) -> Vec<(EventHeader, BinlogEvent)> {
         .collect()
 }
 
+fn write_rows_event(table_id: u64, id: u32, name: &str) -> BinlogEvent {
+    BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id,
+        flags: 0,
+        columns_number: 5,
+        columns_present: vec![true; 5],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(id)),
+            Some(MySqlValue::String(name.to_string())),
+            Some(MySqlValue::Int(100)),
+            Some(MySqlValue::String("safe".to_string())),
+            Some(MySqlValue::DateTime(DateTime {
+                year: 2026,
+                month: 6,
+                day: 22,
+                hour: 12,
+                minute: 3,
+                second: 4,
+                millis: 0,
+            })),
+        ])],
+    })
+}
+
 fn accounts_table_map_event(column_count: usize) -> MysqlCdcTableMapEvent {
     MysqlCdcTableMapEvent {
         table_id: 18,
@@ -923,6 +1024,21 @@ impl TableSchemaResolver for ReleasesSchemaResolver {
     }
 }
 
+struct NoopCheckpointStore;
+
+impl StreamCheckpointStore for NoopCheckpointStore {
+    fn load_checkpoint(&self) -> Result<Option<crate::checkpoint::Checkpoint>, ApplyBinlogError> {
+        Ok(None)
+    }
+
+    fn save_checkpoint(
+        &self,
+        _checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> Result<(), ApplyBinlogError> {
+        Ok(())
+    }
+}
+
 struct EmptySchemaResolver;
 
 impl TableSchemaResolver for EmptySchemaResolver {
@@ -935,6 +1051,51 @@ impl TableSchemaResolver for EmptySchemaResolver {
         Err(mapping_error(format!(
             "unexpected fallback for {schema}.{table}"
         )))
+    }
+}
+
+#[derive(Default)]
+struct TransactionRecordingExecutor {
+    operations: RefCell<Vec<&'static str>>,
+    fail_execute: bool,
+}
+
+impl TransactionRecordingExecutor {
+    fn failing() -> Self {
+        Self {
+            operations: RefCell::new(Vec::new()),
+            fail_execute: true,
+        }
+    }
+}
+
+impl TargetExecutor for TransactionRecordingExecutor {
+    fn execute(
+        &self,
+        _statement: &crate::target::SqlStatement,
+    ) -> Result<(), crate::target::TargetExecuteError> {
+        self.operations.borrow_mut().push("EXEC");
+        if self.fail_execute {
+            return Err(crate::target::TargetExecuteError::new("forced failure"));
+        }
+        Ok(())
+    }
+}
+
+impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor {
+    fn begin_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
+        self.operations.borrow_mut().push("BEGIN");
+        Ok(())
+    }
+
+    fn commit_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
+        self.operations.borrow_mut().push("COMMIT");
+        Ok(())
+    }
+
+    fn rollback_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
+        self.operations.borrow_mut().push("ROLLBACK");
+        Ok(())
     }
 }
 

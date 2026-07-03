@@ -10,7 +10,10 @@ use crate::table_sync::progress::{
     build_create_progress_table_sql, build_progress_upsert_sql,
 };
 use crate::table_sync::{SyncTableProgress, TableSyncError};
-use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor, render_sql_statement};
+use crate::target::{
+    SqlStatement, TargetExecuteError, TargetExecutor, TransactionalTargetExecutor,
+    render_sql_statement,
+};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Params, SslOpts, Value};
 use std::cell::RefCell;
@@ -148,7 +151,28 @@ impl TargetExecutor for PersistentTargetExecutor {
     }
 }
 
+impl TransactionalTargetExecutor for PersistentTargetExecutor {
+    fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.execute_transaction_control("BEGIN")
+    }
+
+    fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.execute_transaction_control("COMMIT")
+    }
+
+    fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.execute_transaction_control("ROLLBACK")
+    }
+}
+
 impl PersistentTargetExecutor {
+    fn execute_transaction_control(&self, sql: &str) -> Result<(), TargetExecuteError> {
+        self.conn
+            .borrow_mut()
+            .query_drop(sql)
+            .map_err(target_query_error)
+    }
+
     fn execute_statement(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
         let params = statement.params.clone();
         self.conn

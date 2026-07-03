@@ -31,6 +31,29 @@ pub trait TargetExecutor {
     fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError>;
 }
 
+pub trait TransactionalTargetExecutor: TargetExecutor {
+    fn begin_transaction(&self) -> Result<(), TargetExecuteError>;
+    fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
+    fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
+}
+
+impl<E> TransactionalTargetExecutor for &E
+where
+    E: TransactionalTargetExecutor,
+{
+    fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
+        (*self).begin_transaction()
+    }
+
+    fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
+        (*self).commit_transaction()
+    }
+
+    fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
+        (*self).rollback_transaction()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TargetMySqlWriter<E> {
     table: String,

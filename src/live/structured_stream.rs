@@ -6,7 +6,7 @@ use crate::inventory::{InventoryConfig, MariaDbInventoryReader, SchemaInventory,
 use crate::probe::BinlogCoordinate;
 use crate::row::{DeleteRowsEvent, RowApplier, RowImage, RowTableMap, RowUpdate, TableMapEvent};
 use crate::statement::{StatementApplier, StatementEvent, StatementOutcome};
-use crate::target::TargetExecutor;
+use crate::target::{TargetExecutor, TransactionalTargetExecutor};
 use mysql::Value;
 use mysql_cdc::binlog_client::BinlogClient;
 use mysql_cdc::binlog_options::BinlogOptions;
@@ -252,22 +252,143 @@ fn stream_once(
     let mut events = client.replicate().map_err(source_error)?;
     let mut current_file = config.source.binlog_file.clone();
     let mut state = StructuredEventState::new(config.source.database.clone());
+    let mut target_transaction = TargetTransaction::default();
 
     for result in &mut events {
         let (header, event) = result.map_err(source_error)?;
-        let outcome = handle_structured_event(
-            &mut applier,
-            &schema_resolver,
-            &mut state,
-            &current_file,
-            &header,
-            &event,
-        )?;
-        save_outcome_checkpoint(checkpoint_store, &mut current_file, &event, &outcome)?;
+        let mut context = StreamEventContext {
+            schema_resolver: &schema_resolver,
+            state: &mut state,
+            target_transaction: &mut target_transaction,
+            checkpoint_store,
+            current_file: &mut current_file,
+        };
+        apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?;
         client.commit(&header, &event);
     }
 
     Err(stream_ended_error())
+}
+
+#[derive(Default)]
+pub(crate) struct TargetTransaction {
+    open: bool,
+}
+
+impl TargetTransaction {
+    fn begin_if_needed<E>(&mut self, executor: &E) -> Result<(), ApplyBinlogError>
+    where
+        E: TransactionalTargetExecutor,
+    {
+        if self.open {
+            return Ok(());
+        }
+        executor
+            .begin_transaction()
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        self.open = true;
+        Ok(())
+    }
+
+    fn commit_if_open<E>(&mut self, executor: &E) -> Result<(), ApplyBinlogError>
+    where
+        E: TransactionalTargetExecutor,
+    {
+        if !self.open {
+            return Ok(());
+        }
+        executor
+            .commit_transaction()
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        self.open = false;
+        Ok(())
+    }
+
+    fn rollback_if_open<E>(&mut self, executor: &E) -> Result<(), ApplyBinlogError>
+    where
+        E: TransactionalTargetExecutor,
+    {
+        if !self.open {
+            return Ok(());
+        }
+        executor
+            .rollback_transaction()
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        self.open = false;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
+    }
+}
+
+struct StreamEventContext<'a, R, C> {
+    schema_resolver: &'a R,
+    state: &'a mut StructuredEventState,
+    target_transaction: &'a mut TargetTransaction,
+    checkpoint_store: Option<&'a C>,
+    current_file: &'a mut String,
+}
+
+fn apply_stream_event_transactionally<E, R, C>(
+    applier: &mut RowApplier<E>,
+    context: &mut StreamEventContext<'_, R, C>,
+    header: &EventHeader,
+    event: &BinlogEvent,
+) -> Result<StructuredEventOutcome, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    R: TableSchemaResolver,
+    C: StreamCheckpointStore,
+{
+    if event_can_write_target(event, context.state) {
+        context
+            .target_transaction
+            .begin_if_needed(applier.executor())?;
+    }
+
+    let outcome = match handle_structured_event(
+        applier,
+        context.schema_resolver,
+        context.state,
+        context.current_file,
+        header,
+        event,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            context
+                .target_transaction
+                .rollback_if_open(applier.executor())?;
+            return Err(error);
+        }
+    };
+
+    if outcome.policy == EventPolicy::CommitTransaction {
+        context
+            .target_transaction
+            .commit_if_open(applier.executor())?;
+    }
+
+    save_outcome_checkpoint(
+        context.checkpoint_store,
+        context.current_file,
+        event,
+        &outcome,
+    )?;
+    Ok(outcome)
+}
+
+fn event_can_write_target(event: &BinlogEvent, state: &StructuredEventState) -> bool {
+    match event {
+        BinlogEvent::WriteRowsEvent(rows) => !state.is_ignored_table_id(rows.table_id),
+        BinlogEvent::UpdateRowsEvent(rows) => !state.is_ignored_table_id(rows.table_id),
+        BinlogEvent::DeleteRowsEvent(rows) => !state.is_ignored_table_id(rows.table_id),
+        BinlogEvent::QueryEvent(query) => state.should_apply_schema(&query.database_name),
+        _ => false,
+    }
 }
 
 fn stream_ended_error() -> ApplyBinlogError {
