@@ -786,6 +786,17 @@ fn converts_enum_ordinals_to_metadata_strings() {
 }
 
 #[test]
+fn converts_enum_zero_ordinal_to_mysql_empty_value() {
+    let enum_values = vec!["1".to_string()];
+
+    assert_eq!(
+        mysql_value_to_target_value(&Some(MySqlValue::Enum(0)), false, Some(&enum_values))
+            .expect("enum zero value"),
+        Value::Bytes(Vec::new())
+    );
+}
+
+#[test]
 fn rejects_enum_ordinals_outside_metadata() {
     let enum_values = vec!["1".to_string()];
     let error = mysql_value_to_target_value(&Some(MySqlValue::Enum(2)), false, Some(&enum_values))

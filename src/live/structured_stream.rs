@@ -910,12 +910,12 @@ fn enum_value_to_target_value(
     let Some(enum_values) = enum_values else {
         return Ok(Value::UInt(u64::from(ordinal)));
     };
+    if ordinal == 0 {
+        return Ok(bytes_value(""));
+    }
     let value_index = usize::try_from(ordinal)
         .map_err(|_| mapping_error(format!("enum ordinal {ordinal} cannot fit usize")))?
-        .checked_sub(1)
-        .ok_or_else(|| {
-            mapping_error("enum ordinal 0 is not a valid MySQL enum value".to_string())
-        })?;
+        - 1;
     let value = enum_values.get(value_index).ok_or_else(|| {
         mapping_error(format!(
             "enum ordinal {ordinal} exceeds {} metadata values",
