@@ -89,7 +89,6 @@ pub struct InventoryConfig {
     pub port: u16,
     pub user: String,
     pub password: String,
-    pub mariadb: String,
 }
 
 impl Default for InventoryConfig {
@@ -99,7 +98,6 @@ impl Default for InventoryConfig {
             port: 3306,
             user: String::new(),
             password: String::new(),
-            mariadb: "mariadb".to_string(),
         }
     }
 }

@@ -121,7 +121,7 @@ pub(super) fn mysql_executor_with_recovery(
     config: &ApplyBinlogConfig,
 ) -> MissingTableRecoveringExecutor<MysqlCliExecutor, SourceSchemaCliReader> {
     MissingTableRecoveringExecutor::new(
-        MysqlCliExecutor::new(config.mariadb.clone(), config.target.clone()),
+        MysqlCliExecutor::new(config.target.clone()),
         SourceSchemaCliReader {
             source: config.source.clone(),
             conn: RefCell::new(None),

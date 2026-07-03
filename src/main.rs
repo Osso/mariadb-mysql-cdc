@@ -296,9 +296,6 @@ fn catchup_snapshot_option(
         "--throttle-ms" => config.throttle = Duration::from_millis(parse_u64(flag, value)?),
         "--parallel-workers" => config.parallel_workers = parse_usize(flag, value)?,
         "--table" => config.table = Some(value.to_string()),
-        "--mariadb" => {
-            config.source.mariadb = value.to_string();
-        }
         other => return Err(format!("unknown catchup-snapshot option: {other}")),
     }
 
@@ -359,8 +356,6 @@ fn parse_probe_config(args: Vec<String>) -> Result<probe::ProbeConfig, String> {
             "--binlog-file" => config.binlog_file = Some(value.clone()),
             "--start-position" => config.start_position = Some(parse_u64(flag, value)?),
             "--stop-position" => config.stop_position = Some(parse_u64(flag, value)?),
-            "--mariadb" => config.mariadb = value.clone(),
-            "--mariadb-binlog" => config.mariadb_binlog = value.clone(),
             other => return Err(format!("unknown probe option: {other}")),
         }
 
@@ -405,7 +400,6 @@ fn drift_check_option(
 
     match flag {
         "--table" => config.tables.push(value.to_string()),
-        "--mariadb" => config.source.mariadb = value.to_string(),
         other => return Err(format!("unknown drift-check option: {other}")),
     }
 
@@ -445,8 +439,6 @@ fn apply_binlog_option(
     }
 
     match flag {
-        "--mariadb" => config.mariadb = value.to_string(),
-        "--mariadb-binlog" => config.mariadb_binlog = value.to_string(),
         "--checkpoint-file" => config.checkpoint_file = Some(PathBuf::from(value)),
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--max-reconnects" => config.max_reconnects = parse_u32(flag, value)?,

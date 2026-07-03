@@ -41,10 +41,6 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "app_target",
         "--insert-conflict-policy",
         "ignore-duplicate",
-        "--mariadb",
-        "/usr/bin/mariadb",
-        "--mariadb-binlog",
-        "/usr/bin/mariadb-binlog",
         "--checkpoint-file",
         "/var/lib/mariadb-mysql-cdc/stream-checkpoint.json",
         "--checkpoint-table",
@@ -77,8 +73,6 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         config.target.insert_conflict_policy,
         live::InsertConflictPolicy::IgnoreDuplicate
     );
-    assert_eq!(config.mariadb, "/usr/bin/mariadb");
-    assert_eq!(config.mariadb_binlog, "/usr/bin/mariadb-binlog");
     assert_eq!(
         config.checkpoint_file,
         Some(PathBuf::from(
@@ -206,10 +200,6 @@ fn parses_probe_config_with_optional_coordinates_and_tools() {
         "12345",
         "--stop-position",
         "45678",
-        "--mariadb",
-        "/usr/bin/mariadb",
-        "--mariadb-binlog",
-        "/usr/bin/mariadb-binlog",
     ]))
     .expect("probe config");
 
@@ -220,8 +210,6 @@ fn parses_probe_config_with_optional_coordinates_and_tools() {
     assert_eq!(config.binlog_file.as_deref(), Some("mysqld-bin.000777"));
     assert_eq!(config.start_position, Some(12345));
     assert_eq!(config.stop_position, Some(45678));
-    assert_eq!(config.mariadb, "/usr/bin/mariadb");
-    assert_eq!(config.mariadb_binlog, "/usr/bin/mariadb-binlog");
 }
 
 #[test]
@@ -260,8 +248,6 @@ fn parses_catchup_snapshot_config() {
         "4",
         "--table",
         "activity_tracking",
-        "--mariadb",
-        "/usr/bin/mariadb",
     ]))
     .expect("catchup config");
 
@@ -282,7 +268,6 @@ fn parses_catchup_snapshot_config() {
     assert_eq!(config.throttle, Duration::from_millis(250));
     assert_eq!(config.parallel_workers, 4);
     assert_eq!(config.table.as_deref(), Some("activity_tracking"));
-    assert_eq!(config.source.mariadb, "/usr/bin/mariadb");
 }
 
 #[test]
@@ -315,8 +300,6 @@ fn parses_drift_check_config_with_selected_tables() {
         "accounts",
         "--table",
         "releases",
-        "--mariadb",
-        "/usr/bin/mariadb",
     ]))
     .expect("drift config");
 
@@ -324,7 +307,6 @@ fn parses_drift_check_config_with_selected_tables() {
     assert_eq!(config.source.port, 3307);
     assert_eq!(config.source.password, "source-secret");
     assert_eq!(config.source.database, "globalcomix");
-    assert_eq!(config.source.mariadb, "/usr/bin/mariadb");
     assert_eq!(config.target.host, "target.db");
     assert_eq!(config.target.port, 25060);
     assert_eq!(config.target.password, "target-secret");

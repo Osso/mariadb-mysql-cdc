@@ -1323,7 +1323,6 @@ fn source_inventory_config(config: &ApplyBinlogConfig) -> InventoryConfig {
         port: config.source.port,
         user: config.source.user.clone(),
         password: config.source.password.clone(),
-        mariadb: config.mariadb.clone(),
     }
 }
 

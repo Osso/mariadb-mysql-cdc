@@ -38,7 +38,6 @@ pub fn run_sync_progress_command(args: Vec<String>, usage: &str) {
 struct SyncProgressConfig {
     target: live::TargetMySqlConfig,
     source: mysql_snapshot::MySqlConnectionConfig,
-    mariadb: String,
     progress_table: String,
     checkpoint_table: String,
     table: Option<String>,
@@ -90,7 +89,6 @@ struct FileSyncProgressConfig {
     target_password: Option<String>,
     target_password_env: Option<String>,
     target_database: Option<String>,
-    mariadb: Option<String>,
     progress_table: Option<String>,
     checkpoint_table: Option<String>,
 }
@@ -99,7 +97,6 @@ fn default_sync_progress_config() -> SyncProgressConfig {
     SyncProgressConfig {
         target: live::TargetMySqlConfig::default(),
         source: mysql_snapshot::MySqlConnectionConfig::default(),
-        mariadb: "mariadb".to_string(),
         progress_table: "cdc.table_sync_progress".to_string(),
         checkpoint_table: default_stream_checkpoint_table(),
         table: None,
@@ -152,7 +149,6 @@ fn apply_file_config(
         )?;
     }
     apply_optional_string(&mut config.target.database, sync_progress.target_database);
-    apply_optional_string(&mut config.mariadb, sync_progress.mariadb);
     apply_optional_string(&mut config.progress_table, sync_progress.progress_table);
     apply_optional_string(&mut config.checkpoint_table, sync_progress.checkpoint_table);
     Ok(())
@@ -195,10 +191,6 @@ fn sync_progress_option(
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--checkpoint-file" => config.checkpoint_file = Some(PathBuf::from(value)),
         "--table" => config.table = Some(value.to_string()),
-        "--mariadb" => {
-            config.mariadb = value.to_string();
-            config.source.mariadb = value.to_string();
-        }
         other => return Err(format!("unknown sync-progress option: {other}")),
     }
 

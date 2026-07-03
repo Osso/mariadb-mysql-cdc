@@ -19,7 +19,6 @@ pub use target::SyncRepairTarget;
 pub struct SyncTableConfig {
     pub source: crate::mysql_snapshot::MySqlConnectionConfig,
     pub target: crate::live::TargetMySqlConfig,
-    pub mariadb: String,
     pub table: SyncTable,
     pub chunk_size: usize,
     pub mode: SyncMode,
@@ -290,11 +289,8 @@ pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, Table
     let target = MySqlSyncReader::new(target_connection_config(config));
     let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
         .map_err(|error| TableSyncError::Repair(error.to_string()))?;
-    let mut progress_store = progress::MySqlSyncProgressStore::new(
-        config.mariadb.clone(),
-        config.target.clone(),
-        config.progress_table.clone(),
-    );
+    let mut progress_store =
+        progress::MySqlSyncProgressStore::new(config.target.clone(), config.progress_table.clone());
     let mut repair_target = crate::target::TargetMySqlWriter::from_snapshot_table(
         &snapshot_table(&config.table),
         executor,
@@ -324,7 +320,6 @@ fn target_connection_config(
         user: config.target.user.clone(),
         password: config.target.password.clone(),
         database: config.target.database.clone(),
-        mariadb: config.mariadb.clone(),
     }
 }
 

@@ -47,8 +47,6 @@ use schema_recovery::mysql_executor_with_recovery;
 pub struct ApplyBinlogConfig {
     pub source: SourceBinlogConfig,
     pub target: TargetMySqlConfig,
-    pub mariadb: String,
-    pub mariadb_binlog: String,
     pub checkpoint_file: Option<PathBuf>,
     pub checkpoint_table: String,
     pub max_reconnects: u32,
@@ -62,8 +60,6 @@ impl Default for ApplyBinlogConfig {
         Self {
             source: SourceBinlogConfig::default(),
             target: TargetMySqlConfig::default(),
-            mariadb: "mariadb".to_string(),
-            mariadb_binlog: "mariadb-binlog".to_string(),
             checkpoint_file: None,
             checkpoint_table: default_stream_checkpoint_table(),
             max_reconnects: 12,

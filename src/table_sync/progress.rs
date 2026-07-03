@@ -62,7 +62,7 @@ pub struct MySqlSyncProgressStore {
 }
 
 impl MySqlSyncProgressStore {
-    pub fn new(_mariadb: String, target: TargetMySqlConfig, table: String) -> Self {
+    pub fn new(target: TargetMySqlConfig, table: String) -> Self {
         Self {
             target,
             table,

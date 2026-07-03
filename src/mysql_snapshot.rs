@@ -34,7 +34,6 @@ pub struct MySqlConnectionConfig {
     pub user: String,
     pub password: String,
     pub database: String,
-    pub mariadb: String,
 }
 
 impl Default for MySqlConnectionConfig {
@@ -45,7 +44,6 @@ impl Default for MySqlConnectionConfig {
             user: String::new(),
             password: String::new(),
             database: String::new(),
-            mariadb: "mariadb".to_string(),
         }
     }
 }
@@ -593,7 +591,6 @@ fn read_snapshot_tables(
         port: config.source.port,
         user: config.source.user.clone(),
         password: config.source.password.clone(),
-        mariadb: config.source.mariadb.clone(),
     };
     let reader = MariaDbInventoryReader::new(inventory_config);
     let inventory = build_inventory(&config.source.database, &reader)?;

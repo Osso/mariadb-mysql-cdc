@@ -52,7 +52,6 @@ fn default_sync_table_config() -> table_sync::SyncTableConfig {
     table_sync::SyncTableConfig {
         source: mysql_snapshot::MySqlConnectionConfig::default(),
         target: live::TargetMySqlConfig::default(),
-        mariadb: "mariadb".to_string(),
         table: table_sync::SyncTable {
             name: String::new(),
             primary_key: Vec::new(),
@@ -83,10 +82,6 @@ fn sync_table_option(
         "--chunk-size" => config.chunk_size = crate::parse_usize(flag, value)?,
         "--mode" => config.mode = parse_sync_mode(value)?,
         "--progress-table" => config.progress_table = value.to_string(),
-        "--mariadb" => {
-            config.mariadb = value.to_string();
-            config.source.mariadb = value.to_string();
-        }
         other => return Err(format!("unknown sync-table option: {other}")),
     }
 

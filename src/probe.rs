@@ -13,8 +13,6 @@ pub struct ProbeConfig {
     pub binlog_file: Option<String>,
     pub start_position: Option<u64>,
     pub stop_position: Option<u64>,
-    pub mariadb: String,
-    pub mariadb_binlog: String,
 }
 
 impl Default for ProbeConfig {
@@ -27,8 +25,6 @@ impl Default for ProbeConfig {
             binlog_file: None,
             start_position: None,
             stop_position: None,
-            mariadb: "mariadb".to_string(),
-            mariadb_binlog: "mariadb-binlog".to_string(),
         }
     }
 }

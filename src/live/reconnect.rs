@@ -141,7 +141,6 @@ impl SourceCoordinateReader for MariaDbSourceCoordinateReader {
             port: config.source.port,
             user: config.source.user.clone(),
             password: config.source.password.clone(),
-            mariadb: config.mariadb.clone(),
             ..ProbeConfig::default()
         };
         current_master_coordinate(&probe_config)

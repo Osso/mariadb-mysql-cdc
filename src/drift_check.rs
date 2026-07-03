@@ -371,13 +371,13 @@ mod tests {
     #[test]
     fn only_1146_42s02_errors_are_treated_as_missing_tables() {
         assert!(is_missing_table_error(
-            "mariadb exited with exit status: 1: ERROR 1146 (42S02) at line 1: Table 'db.accounts' doesn't exist"
+            "ERROR 1146 (42S02): Table 'db.accounts' doesn't exist"
         ));
         assert!(!is_missing_table_error(
-            "mariadb exited with exit status: 1: ERROR 1146 (HY000) at line 1: Table metadata lock failed"
+            "ERROR 1146 (HY000): Table metadata lock failed"
         ));
         assert!(!is_missing_table_error(
-            "mariadb exited with exit status: 1: ERROR 1051 (42S02) at line 1: Unknown table 'db.accounts'"
+            "ERROR 1051 (42S02): Unknown table 'db.accounts'"
         ));
     }
 }

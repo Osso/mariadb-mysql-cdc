@@ -88,7 +88,6 @@ fn loads_sync_progress_defaults_from_config_file() {
             "target_user": "target_user",
             "target_password_env": "SYNC_PROGRESS_CONFIG_PASSWORD",
             "target_database": "globalcomix",
-            "mariadb": "/tmp/mariadb-noverify",
             "progress_table": "cdc.table_sync_progress",
             "checkpoint_table": "cdc.stream_checkpoint"
           }
@@ -105,7 +104,6 @@ fn loads_sync_progress_defaults_from_config_file() {
     assert_eq!(config.target.user, "target_user");
     assert_eq!(config.target.password, "target-pass");
     assert_eq!(config.target.database, "globalcomix");
-    assert_eq!(config.mariadb, "/tmp/mariadb-noverify");
     assert_eq!(config.progress_table, "cdc.table_sync_progress");
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
 

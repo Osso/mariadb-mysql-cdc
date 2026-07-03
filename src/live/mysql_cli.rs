@@ -14,7 +14,7 @@ pub struct MysqlCliExecutor {
 const TARGET_SLOW_QUERY_SQL_LIMIT: usize = 4_000;
 
 impl MysqlCliExecutor {
-    pub fn new(_mariadb: impl Into<String>, target: TargetMySqlConfig) -> Self {
+    pub fn new(target: TargetMySqlConfig) -> Self {
         Self {
             target,
             executor: RefCell::new(None),
