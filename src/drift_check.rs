@@ -67,12 +67,113 @@ impl fmt::Display for DriftCheckError {
 
 impl std::error::Error for DriftCheckError {}
 
+pub trait DriftCheckObserver {
+    fn table_started(&self, _table: &str, _index: usize, _total: usize) {}
+    fn count_started(&self, _table: &str, _side: &str) {}
+    fn count_completed(
+        &self,
+        _table: &str,
+        _source_count: Option<u64>,
+        _target_count: Option<u64>,
+    ) {
+    }
+    fn content_started(&self, _table: &str, _chunk_size: usize) {}
+    fn content_skipped(&self, _table: &str, _reason: &str) {}
+    fn content_chunk_started(
+        &self,
+        _table: &str,
+        _start_after: Option<&Vec<String>>,
+        _end_at: Option<&Vec<String>>,
+    ) {
+    }
+    fn content_chunk_completed(
+        &self,
+        _table: &str,
+        _source_count: u64,
+        _target_count: u64,
+        _mismatch: bool,
+    ) {
+    }
+    fn table_completed(&self, _comparison: &DriftComparison) {}
+}
+
+pub struct NoopDriftCheckObserver;
+impl DriftCheckObserver for NoopDriftCheckObserver {}
+
+pub struct StderrDriftCheckObserver;
+impl DriftCheckObserver for StderrDriftCheckObserver {
+    fn table_started(&self, table: &str, index: usize, total: usize) {
+        eprintln!("drift_check_table_start table={table} index={index} total={total}");
+    }
+
+    fn count_started(&self, table: &str, side: &str) {
+        eprintln!("drift_check_count_start table={table} side={side}");
+    }
+
+    fn count_completed(&self, table: &str, source_count: Option<u64>, target_count: Option<u64>) {
+        eprintln!(
+            "drift_check_count_complete table={table} source_count={} target_count={}",
+            format_count(source_count),
+            format_count(target_count)
+        );
+    }
+
+    fn content_started(&self, table: &str, chunk_size: usize) {
+        eprintln!("drift_check_content_start table={table} chunk_size={chunk_size}");
+    }
+
+    fn content_skipped(&self, table: &str, reason: &str) {
+        eprintln!(
+            "drift_check_content_skipped table={table} reason={}",
+            quote_log_value(reason)
+        );
+    }
+
+    fn content_chunk_started(
+        &self,
+        table: &str,
+        start_after: Option<&Vec<String>>,
+        end_at: Option<&Vec<String>>,
+    ) {
+        eprintln!(
+            "drift_check_chunk_start table={table} start_after_json={} end_at_json={}",
+            format_key_bound_json(start_after),
+            format_key_bound_json(end_at)
+        );
+    }
+
+    fn content_chunk_completed(
+        &self,
+        table: &str,
+        source_count: u64,
+        target_count: u64,
+        mismatch: bool,
+    ) {
+        eprintln!(
+            "drift_check_chunk_complete table={table} source_count={source_count} target_count={target_count} mismatch={mismatch}"
+        );
+    }
+
+    fn table_completed(&self, comparison: &DriftComparison) {
+        eprintln!("{}", format_drift_comparison(comparison));
+    }
+}
+
 pub fn run_drift_check(config: &DriftCheckConfig) -> Result<DriftCheckReport, DriftCheckError> {
+    run_drift_check_with_observer(config, &NoopDriftCheckObserver)
+}
+
+pub fn run_drift_check_with_observer(
+    config: &DriftCheckConfig,
+    observer: &impl DriftCheckObserver,
+) -> Result<DriftCheckReport, DriftCheckError> {
     validate_config(config)?;
     let tables = drift_tables(config)?;
+    let total = tables.len();
     let comparisons = tables
         .iter()
-        .map(|table| compare_table(config, table))
+        .enumerate()
+        .map(|(index, table)| compare_table(config, table, index + 1, total, observer))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(DriftCheckReport { comparisons })
@@ -301,22 +402,32 @@ fn drift_tables(config: &DriftCheckConfig) -> Result<Vec<String>, DriftCheckErro
 fn compare_table(
     config: &DriftCheckConfig,
     table: &str,
+    index: usize,
+    total: usize,
+    observer: &impl DriftCheckObserver,
 ) -> Result<DriftComparison, DriftCheckError> {
+    observer.table_started(table, index, total);
     let sql = build_count_sql(table);
+    observer.count_started(table, "source");
     let source_count = query_count(&source_query_config(&config.source), table, &sql)?;
+    observer.count_started(table, "target");
     let target_count = query_count(&target_query_config(&config.target), table, &sql)?;
+    observer.count_completed(table, source_count, target_count);
     let content = if should_check_content(config, source_count, target_count) {
-        Some(compare_table_content(config, table)?)
+        observer.content_started(table, config.chunk_size);
+        Some(compare_table_content(config, table, observer)?)
     } else {
         None
     };
 
-    Ok(DriftComparison {
+    let comparison = DriftComparison {
         table: table.to_string(),
         source_count,
         target_count,
         content,
-    })
+    };
+    observer.table_completed(&comparison);
+    Ok(comparison)
 }
 
 fn should_check_content(
@@ -331,13 +442,17 @@ fn should_check_content(
 fn compare_table_content(
     config: &DriftCheckConfig,
     table: &str,
+    observer: &impl DriftCheckObserver,
 ) -> Result<ContentDriftSummary, DriftCheckError> {
     match ChecksumCompareContext::load(config, table)? {
-        ContentCheckPlan::Compare(context) => compare_checksum_chunks(&context),
-        ContentCheckPlan::Skip(reason) => Ok(ContentDriftSummary {
-            skipped_reason: Some(reason),
-            ..ContentDriftSummary::default()
-        }),
+        ContentCheckPlan::Compare(context) => compare_checksum_chunks(&context, observer),
+        ContentCheckPlan::Skip(reason) => {
+            observer.content_skipped(table, &reason);
+            Ok(ContentDriftSummary {
+                skipped_reason: Some(reason),
+                ..ContentDriftSummary::default()
+            })
+        }
     }
 }
 
@@ -394,6 +509,7 @@ fn partition_checksum_columns(columns: Vec<ChecksumColumn>) -> (Vec<ChecksumColu
 
 fn compare_checksum_chunks(
     context: &ChecksumCompareContext,
+    observer: &impl DriftCheckObserver,
 ) -> Result<ContentDriftSummary, DriftCheckError> {
     let mut summary = ContentDriftSummary {
         skipped_columns: context.skipped_columns.clone(),
@@ -410,10 +526,16 @@ fn compare_checksum_chunks(
             context.chunk_size,
         )?;
         let end_at = endpoints.last().cloned();
-        record_checksum_comparison(&mut summary, context, start_after.clone(), end_at.clone())?;
+        record_checksum_comparison(
+            &mut summary,
+            context,
+            start_after.clone(),
+            end_at.clone(),
+            observer,
+        )?;
 
         if endpoints.len() < context.chunk_size {
-            record_target_tail_checksum(&mut summary, context, end_at)?;
+            record_target_tail_checksum(&mut summary, context, end_at, observer)?;
             return Ok(summary);
         }
         start_after = end_at;
@@ -425,12 +547,20 @@ fn record_checksum_comparison(
     context: &ChecksumCompareContext,
     start_after: Option<Vec<String>>,
     end_at: Option<Vec<String>>,
+    observer: &impl DriftCheckObserver,
 ) -> Result<(), DriftCheckError> {
+    observer.content_chunk_started(&context.table, start_after.as_ref(), end_at.as_ref());
     let comparison = compare_checksum_range(context, start_after, end_at)?;
+    observer.content_chunk_completed(
+        &context.table,
+        comparison.source_count(),
+        comparison.target_count(),
+        comparison.is_mismatch(),
+    );
     summary.chunks += 1;
     if comparison.is_mismatch() {
         summary.mismatched_chunks += 1;
-        split_or_record_mismatch(summary, context, comparison)?;
+        split_or_record_mismatch(summary, context, comparison, observer)?;
     }
     Ok(())
 }
@@ -495,6 +625,7 @@ fn split_or_record_mismatch(
     summary: &mut ContentDriftSummary,
     context: &ChecksumCompareContext,
     comparison: ChecksumRangeComparison,
+    observer: &impl DriftCheckObserver,
 ) -> Result<(), DriftCheckError> {
     let Some(midpoint) = mismatch_midpoint(summary, context, &comparison)? else {
         record_mismatched_range(summary, comparison.drift_range());
@@ -506,8 +637,15 @@ fn split_or_record_mismatch(
         context,
         comparison.start_after.clone(),
         Some(midpoint.clone()),
+        observer,
     )?;
-    record_checksum_comparison(summary, context, Some(midpoint), comparison.end_at)?;
+    record_checksum_comparison(
+        summary,
+        context,
+        Some(midpoint),
+        comparison.end_at,
+        observer,
+    )?;
     Ok(())
 }
 
@@ -547,9 +685,10 @@ fn record_target_tail_checksum(
     summary: &mut ContentDriftSummary,
     context: &ChecksumCompareContext,
     end_at: Option<Vec<String>>,
+    observer: &impl DriftCheckObserver,
 ) -> Result<(), DriftCheckError> {
     if end_at.is_some() {
-        record_checksum_comparison(summary, context, end_at, None)?;
+        record_checksum_comparison(summary, context, end_at, None, observer)?;
     }
     Ok(())
 }
@@ -782,6 +921,10 @@ fn format_drift_comparison(comparison: &DriftComparison) -> String {
         comparison.status(),
         format_content_summary(comparison.content.as_ref())
     )
+}
+
+fn quote_log_value(value: &str) -> String {
+    serde_json::to_string(value).expect("serialize log value")
 }
 
 fn format_content_ranges(comparison: &DriftComparison) -> Vec<String> {

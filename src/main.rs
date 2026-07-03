@@ -155,7 +155,8 @@ fn run_drift_check_command(args: Vec<String>) {
         }
     };
 
-    match drift_check::run_drift_check(&config) {
+    let observer = drift_check::StderrDriftCheckObserver;
+    match drift_check::run_drift_check_with_observer(&config, &observer) {
         Ok(report) => {
             println!("{}", drift_check::format_drift_report(&report));
             if report.has_mismatches() {
