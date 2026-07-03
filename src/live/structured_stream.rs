@@ -565,7 +565,7 @@ where
         StatementApplier::new(applier.executor(), RecordingQuarantine::default());
 
     let result = match statement_applier.apply(&event) {
-        Ok(StatementOutcome::Replayed) => Ok(EventPolicy::ApplyRows),
+        Ok(StatementOutcome::Replayed) => Ok(EventPolicy::CommitTransaction),
         Ok(StatementOutcome::Quarantined(_)) => Err(ApplyBinlogError::Quarantined(
             statement_applier
                 .quarantine_recorder()
@@ -1157,10 +1157,12 @@ fn resume_coordinate(
             file: rotate.binlog_filename.clone(),
             position: rotate.binlog_position,
         }),
-        BinlogEvent::XidEvent(_) if header.next_event_position > 0 => Some(BinlogCoordinate {
-            file: current_file.to_string(),
-            position: u64::from(header.next_event_position),
-        }),
+        BinlogEvent::XidEvent(_) | BinlogEvent::QueryEvent(_) if header.next_event_position > 0 => {
+            Some(BinlogCoordinate {
+                file: current_file.to_string(),
+                position: u64::from(header.next_event_position),
+            })
+        }
         _ => None,
     }
 }

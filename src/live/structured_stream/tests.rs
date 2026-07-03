@@ -91,7 +91,7 @@ fn source_query_ddl_is_quarantined_without_checkpointing_past_it() {
 }
 
 #[test]
-fn source_query_dml_is_applied_before_transaction_checkpoint() {
+fn source_query_dml_is_applied_as_checkpointed_statement_transaction() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -114,8 +114,14 @@ fn source_query_dml_is_applied_before_transaction_checkpoint() {
     )
     .expect("source DML should apply");
 
-    assert_eq!(outcome.policy, EventPolicy::ApplyRows);
-    assert_eq!(outcome.resume_coordinate, None);
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
+    assert_eq!(
+        outcome.resume_coordinate,
+        Some(BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 180,
+        })
+    );
     let statements = applier.executor().statements.borrow();
     assert_eq!(statements.len(), 1);
     assert_eq!(
@@ -215,6 +221,41 @@ fn wraps_target_writes_and_checkpoint_in_source_xid_transaction() {
         applier.executor().operations().as_slice(),
         ["BEGIN", "EXEC", "CHECKPOINT", "COMMIT"]
     );
+}
+
+#[test]
+fn query_dml_checkpoints_and_commits_as_statement_transaction() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "INSERT INTO accounts (id, name) VALUES (999, 'query-event')".to_string(),
+    });
+    let header = event_header(99, 180);
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        current_file: &mut current_file,
+    };
+
+    apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        .expect("query dml");
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "CHECKPOINT", "COMMIT"]
+    );
+    assert_eq!(current_file, "mysqld-bin.000777");
 }
 
 #[test]
