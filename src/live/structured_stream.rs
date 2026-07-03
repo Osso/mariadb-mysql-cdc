@@ -213,14 +213,21 @@ pub(super) fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), App
     match &config.checkpoint_file {
         Some(path) => {
             let checkpoint_store = crate::checkpoint::FileCheckpointStore::new(path);
-            stream_with_checkpoint_store(config, Some(&checkpoint_store))
+            stream_with_checkpoint_store(config, Some(&checkpoint_store), None)
         }
         None => {
             let checkpoint_store = crate::stream_checkpoint::MySqlStreamCheckpointStore::new(
                 config.target.clone(),
                 config.checkpoint_table.clone(),
             );
-            stream_with_checkpoint_store(config, Some(&checkpoint_store))
+            checkpoint_store
+                .ensure()
+                .map_err(ApplyBinlogError::Checkpoint)?;
+            stream_with_checkpoint_store(
+                config,
+                Some(&checkpoint_store),
+                Some(config.checkpoint_table.as_str()),
+            )
         }
     }
 }
@@ -228,6 +235,7 @@ pub(super) fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), App
 fn stream_with_checkpoint_store<C>(
     config: &ApplyBinlogConfig,
     checkpoint_store: Option<&C>,
+    transaction_checkpoint_table: Option<&str>,
 ) -> Result<(), ApplyBinlogError>
 where
     C: StreamCheckpointStore,
@@ -235,7 +243,13 @@ where
     run_stream_reconnect_loop(
         config,
         checkpoint_store,
-        |attempt_config| stream_once(attempt_config, checkpoint_store),
+        |attempt_config| {
+            stream_once(
+                attempt_config,
+                checkpoint_store,
+                transaction_checkpoint_table,
+            )
+        },
         thread::sleep,
     )
 }
@@ -243,6 +257,7 @@ where
 fn stream_once(
     config: &ApplyBinlogConfig,
     checkpoint_store: Option<&impl StreamCheckpointStore>,
+    transaction_checkpoint_table: Option<&str>,
 ) -> Result<(), ApplyBinlogError> {
     let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
@@ -261,6 +276,7 @@ fn stream_once(
             state: &mut state,
             target_transaction: &mut target_transaction,
             checkpoint_store,
+            transaction_checkpoint_table,
             current_file: &mut current_file,
         };
         apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?;
@@ -304,6 +320,23 @@ impl TargetTransaction {
         Ok(())
     }
 
+    fn save_checkpoint_if_open<E>(
+        &self,
+        executor: &E,
+        checkpoint_table: &str,
+        checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> Result<(), ApplyBinlogError>
+    where
+        E: TransactionalTargetExecutor,
+    {
+        if !self.open {
+            return Ok(());
+        }
+        executor
+            .save_transaction_checkpoint(checkpoint_table, checkpoint)
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))
+    }
+
     fn rollback_if_open<E>(&mut self, executor: &E) -> Result<(), ApplyBinlogError>
     where
         E: TransactionalTargetExecutor,
@@ -318,7 +351,6 @@ impl TargetTransaction {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
         self.open
     }
@@ -329,6 +361,7 @@ struct StreamEventContext<'a, R, C> {
     state: &'a mut StructuredEventState,
     target_transaction: &'a mut TargetTransaction,
     checkpoint_store: Option<&'a C>,
+    transaction_checkpoint_table: Option<&'a str>,
     current_file: &'a mut String,
 }
 
@@ -367,18 +400,32 @@ where
     };
 
     if outcome.policy == EventPolicy::CommitTransaction {
-        context
-            .target_transaction
-            .commit_if_open(applier.executor())?;
+        finish_source_transaction(applier.executor(), context, event, &outcome)?;
+        return Ok(outcome);
     }
 
-    save_outcome_checkpoint(
-        context.checkpoint_store,
-        context.current_file,
-        event,
-        &outcome,
-    )?;
+    save_outcome_checkpoint(applier.executor(), context, event, &outcome)?;
     Ok(outcome)
+}
+
+fn finish_source_transaction<E, R, C>(
+    executor: &E,
+    context: &mut StreamEventContext<'_, R, C>,
+    event: &BinlogEvent,
+    outcome: &StructuredEventOutcome,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    C: StreamCheckpointStore,
+{
+    if context.transaction_checkpoint_table.is_some() {
+        save_outcome_checkpoint(executor, context, event, outcome)?;
+        context.target_transaction.commit_if_open(executor)?;
+        return Ok(());
+    }
+
+    context.target_transaction.commit_if_open(executor)?;
+    save_outcome_checkpoint(executor, context, event, outcome)
 }
 
 fn event_can_write_target(event: &BinlogEvent, state: &StructuredEventState) -> bool {
@@ -395,21 +442,40 @@ fn stream_ended_error() -> ApplyBinlogError {
     ApplyBinlogError::SourceCommand("mysql_cdc binlog stream ended at EOF".to_string())
 }
 
-fn save_outcome_checkpoint<C>(
-    checkpoint_store: Option<&C>,
-    current_file: &mut String,
+fn save_outcome_checkpoint<E, R, C>(
+    executor: &E,
+    context: &mut StreamEventContext<'_, R, C>,
     event: &BinlogEvent,
     outcome: &StructuredEventOutcome,
 ) -> Result<(), ApplyBinlogError>
 where
+    E: TransactionalTargetExecutor,
     C: StreamCheckpointStore,
 {
     let Some(coordinate) = &outcome.resume_coordinate else {
         return Ok(());
     };
 
-    super::reconnect::save_coordinate_checkpoint(checkpoint_store, coordinate, event_name(event))?;
-    *current_file = coordinate.file.clone();
+    if context.target_transaction.is_open()
+        && let Some(checkpoint_table) = context.transaction_checkpoint_table
+    {
+        let checkpoint = super::reconnect::coordinate_checkpoint(coordinate, event_name(event));
+        context.target_transaction.save_checkpoint_if_open(
+            executor,
+            checkpoint_table,
+            &checkpoint,
+        )?;
+        println!("{}", super::reconnect::format_checkpoint_write(&checkpoint));
+        *context.current_file = coordinate.file.clone();
+        return Ok(());
+    }
+
+    super::reconnect::save_coordinate_checkpoint(
+        context.checkpoint_store,
+        coordinate,
+        event_name(event),
+    )?;
+    *context.current_file = coordinate.file.clone();
     Ok(())
 }
 

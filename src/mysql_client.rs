@@ -1,3 +1,4 @@
+use crate::checkpoint::Checkpoint;
 use crate::live::{InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert};
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::mysql_support::{quote_ident, quote_identifier_path, quote_sql_literal};
@@ -156,6 +157,22 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         self.execute_transaction_control("BEGIN")
     }
 
+    fn save_transaction_checkpoint(
+        &self,
+        checkpoint_table: &str,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), TargetExecuteError> {
+        let sql = crate::stream_checkpoint::build_checkpoint_upsert_sql_for_checkpoint(
+            checkpoint_table,
+            checkpoint,
+        )
+        .map_err(TargetExecuteError::new)?;
+        self.conn
+            .borrow_mut()
+            .query_drop(sql)
+            .map_err(target_query_error)
+    }
+
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
         self.execute_transaction_control("COMMIT")
     }
@@ -256,12 +273,40 @@ impl PersistentProgressWriter {
         snapshot_progress_from_rows(rows)
     }
 
+    pub fn execute_table_sync_progress_sql(&self, sql: String) -> Result<(), TableSyncError> {
+        self.execute_progress_sql(sql)
+    }
+
+    pub fn query_table_sync_progress_tsv(&self, sql: String) -> Result<String, TableSyncError> {
+        let rows = self
+            .conn
+            .borrow_mut()
+            .query::<mysql::Row, _>(sql)
+            .map_err(progress_query_error)?;
+        Ok(rows_to_tsv(rows))
+    }
+
     fn execute_progress_sql(&self, sql: String) -> Result<(), TableSyncError> {
         self.conn
             .borrow_mut()
             .query_drop(sql)
             .map_err(progress_query_error)
     }
+}
+
+fn rows_to_tsv(rows: Vec<mysql::Row>) -> String {
+    rows.into_iter()
+        .map(row_to_tsv)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn row_to_tsv(row: mysql::Row) -> String {
+    row.unwrap()
+        .into_iter()
+        .map(value_to_string)
+        .collect::<Vec<_>>()
+        .join("\t")
 }
 
 type SnapshotProgressRow = (String, String, u64, String);
@@ -377,7 +422,7 @@ fn snapshot_row_from_mysql_row(
     })
 }
 
-fn value_to_string(value: Value) -> String {
+pub(crate) fn value_to_string(value: Value) -> String {
     match value {
         Value::NULL => "NULL".to_string(),
         Value::Bytes(bytes) => String::from_utf8_lossy(&bytes).to_string(),

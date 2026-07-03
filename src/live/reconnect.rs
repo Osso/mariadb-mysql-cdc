@@ -106,7 +106,7 @@ pub(super) fn statement_checkpoint(event: &StatementEvent) -> Checkpoint {
     }
 }
 
-fn coordinate_checkpoint(coordinate: &BinlogCoordinate, event_type: &str) -> Checkpoint {
+pub(super) fn coordinate_checkpoint(coordinate: &BinlogCoordinate, event_type: &str) -> Checkpoint {
     Checkpoint {
         source_file: coordinate.file.clone(),
         source_position: coordinate.position,
@@ -349,7 +349,7 @@ pub(super) fn format_stale_binlog_auto_skip(
     )
 }
 
-fn format_checkpoint_write(checkpoint: &Checkpoint) -> String {
+pub(super) fn format_checkpoint_write(checkpoint: &Checkpoint) -> String {
     format!(
         "cdc_stream_checkpoint file={} position={} event_type={}",
         checkpoint.source_file, checkpoint.source_position, checkpoint.last_event.event_type

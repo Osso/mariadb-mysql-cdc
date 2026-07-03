@@ -61,9 +61,8 @@ impl MySqlStreamCheckpointStore {
 
     pub fn save(&self, checkpoint: &Checkpoint) -> Result<(), String> {
         self.ensure()?;
-        let json = serde_json::to_string(checkpoint)
-            .map_err(|error| format!("failed to encode stream checkpoint: {error}"))?;
-        self.execute(&build_checkpoint_upsert_sql(&self.table, &json))?;
+        let sql = build_checkpoint_upsert_sql_for_checkpoint(&self.table, checkpoint)?;
+        self.execute(&sql)?;
         self.last_checkpoint.replace(Some(checkpoint.clone()));
         Ok(())
     }
@@ -124,6 +123,15 @@ fn build_checkpoint_select_sql(table: &str) -> String {
         quote_identifier_path(table),
         quote_sql_literal(DEFAULT_CHECKPOINT_NAME)
     )
+}
+
+pub(crate) fn build_checkpoint_upsert_sql_for_checkpoint(
+    table: &str,
+    checkpoint: &Checkpoint,
+) -> Result<String, String> {
+    let json = serde_json::to_string(checkpoint)
+        .map_err(|error| format!("failed to encode stream checkpoint: {error}"))?;
+    Ok(build_checkpoint_upsert_sql(table, &json))
 }
 
 fn build_checkpoint_upsert_sql(table: &str, checkpoint_json: &str) -> String {

@@ -177,7 +177,7 @@ fn xid_event_checkpoints_after_transaction_rows_are_applied() {
 }
 
 #[test]
-fn wraps_target_writes_in_source_xid_transaction() {
+fn wraps_target_writes_and_checkpoint_in_source_xid_transaction() {
     let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -191,7 +191,8 @@ fn wraps_target_writes_in_source_xid_transaction() {
                 schema_resolver: &resolver,
                 state: &mut state,
                 target_transaction: &mut transaction,
-                checkpoint_store: None::<&NoopCheckpointStore>,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
                 current_file: &mut current_file,
             };
             apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
@@ -211,8 +212,50 @@ fn wraps_target_writes_in_source_xid_transaction() {
     .expect("xid");
 
     assert_eq!(
-        applier.executor().operations.borrow().as_slice(),
-        ["BEGIN", "EXEC", "COMMIT"]
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "CHECKPOINT", "COMMIT"]
+    );
+}
+
+#[test]
+fn file_checkpoint_waits_until_after_target_commit() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+    let checkpoint_store = RecordingCheckpointStore::new(applier.executor().shared_operations());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&checkpoint_store),
+                transaction_checkpoint_table: None,
+                current_file: &mut current_file,
+            };
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+    process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("write rows");
+    process_event!(
+        event_header(16, 260),
+        BinlogEvent::XidEvent(XidEvent { xid: 42 })
+    )
+    .expect("xid");
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "COMMIT", "CHECKPOINT"]
     );
 }
 
@@ -232,6 +275,7 @@ fn rolls_back_open_target_transaction_when_row_apply_fails() {
                 state: &mut state,
                 target_transaction: &mut transaction,
                 checkpoint_store: None::<&NoopCheckpointStore>,
+                transaction_checkpoint_table: None,
                 current_file: &mut current_file,
             };
             apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
@@ -247,7 +291,7 @@ fn rolls_back_open_target_transaction_when_row_apply_fails() {
 
     assert!(result.is_err());
     assert_eq!(
-        applier.executor().operations.borrow().as_slice(),
+        applier.executor().operations().as_slice(),
         ["BEGIN", "EXEC", "ROLLBACK"]
     );
     assert!(!transaction.is_open());
@@ -1026,6 +1070,30 @@ impl TableSchemaResolver for ReleasesSchemaResolver {
 
 struct NoopCheckpointStore;
 
+struct RecordingCheckpointStore {
+    operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+}
+
+impl RecordingCheckpointStore {
+    fn new(operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>) -> Self {
+        Self { operations }
+    }
+}
+
+impl StreamCheckpointStore for RecordingCheckpointStore {
+    fn load_checkpoint(&self) -> Result<Option<crate::checkpoint::Checkpoint>, ApplyBinlogError> {
+        Ok(None)
+    }
+
+    fn save_checkpoint(
+        &self,
+        _checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> Result<(), ApplyBinlogError> {
+        self.operations.borrow_mut().push("CHECKPOINT");
+        Ok(())
+    }
+}
+
 impl StreamCheckpointStore for NoopCheckpointStore {
     fn load_checkpoint(&self) -> Result<Option<crate::checkpoint::Checkpoint>, ApplyBinlogError> {
         Ok(None)
@@ -1056,16 +1124,24 @@ impl TableSchemaResolver for EmptySchemaResolver {
 
 #[derive(Default)]
 struct TransactionRecordingExecutor {
-    operations: RefCell<Vec<&'static str>>,
+    operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     fail_execute: bool,
 }
 
 impl TransactionRecordingExecutor {
     fn failing() -> Self {
         Self {
-            operations: RefCell::new(Vec::new()),
+            operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: true,
         }
+    }
+
+    fn operations(&self) -> Vec<&'static str> {
+        self.operations.borrow().clone()
+    }
+
+    fn shared_operations(&self) -> std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> {
+        std::rc::Rc::clone(&self.operations)
     }
 }
 
@@ -1085,6 +1161,15 @@ impl TargetExecutor for TransactionRecordingExecutor {
 impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor {
     fn begin_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
         self.operations.borrow_mut().push("BEGIN");
+        Ok(())
+    }
+
+    fn save_transaction_checkpoint(
+        &self,
+        _checkpoint_table: &str,
+        _checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> Result<(), crate::target::TargetExecuteError> {
+        self.operations.borrow_mut().push("CHECKPOINT");
         Ok(())
     }
 

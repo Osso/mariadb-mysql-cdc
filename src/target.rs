@@ -1,3 +1,4 @@
+use crate::checkpoint::Checkpoint;
 use crate::snapshot::{SnapshotRow, SnapshotTarget};
 use mysql::Value;
 use std::fmt;
@@ -33,6 +34,11 @@ pub trait TargetExecutor {
 
 pub trait TransactionalTargetExecutor: TargetExecutor {
     fn begin_transaction(&self) -> Result<(), TargetExecuteError>;
+    fn save_transaction_checkpoint(
+        &self,
+        checkpoint_table: &str,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), TargetExecuteError>;
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
 }
@@ -43,6 +49,14 @@ where
 {
     fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
         (*self).begin_transaction()
+    }
+
+    fn save_transaction_checkpoint(
+        &self,
+        checkpoint_table: &str,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), TargetExecuteError> {
+        (*self).save_transaction_checkpoint(checkpoint_table, checkpoint)
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
