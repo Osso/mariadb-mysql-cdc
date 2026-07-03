@@ -210,8 +210,9 @@ impl fmt::Display for ApplyBinlogError {
             Self::Statement(message) => write!(formatter, "statement apply failed: {message}"),
             Self::Quarantined(statements) => write!(
                 formatter,
-                "{} statement(s) quarantined; refusing to continue",
-                statements.len()
+                "{} statement(s) quarantined; refusing to continue: {}",
+                statements.len(),
+                format_quarantined_statements(statements)
             ),
             Self::Checkpoint(message) => write!(formatter, "checkpoint failed: {message}"),
         }
@@ -219,6 +220,14 @@ impl fmt::Display for ApplyBinlogError {
 }
 
 impl std::error::Error for ApplyBinlogError {}
+
+fn format_quarantined_statements(statements: &[QuarantinedStatement]) -> String {
+    statements
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 pub fn apply_remote_binlog(
     config: &ApplyBinlogConfig,
