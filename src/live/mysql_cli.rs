@@ -1,164 +1,42 @@
-use super::{TargetMySqlConfig, should_ignore_duplicate_insert};
-use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor, render_sql_statement};
-use std::io::Write;
-use std::process::{Child, Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use super::TargetMySqlConfig;
+use crate::mysql_client::PersistentTargetExecutor;
+use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
+use std::cell::RefCell;
+use std::time::Instant;
 
 pub struct MysqlCliExecutor {
-    mariadb: String,
     target: TargetMySqlConfig,
+    executor: RefCell<Option<PersistentTargetExecutor>>,
 }
 
-const TARGET_SLOW_QUERY_AFTER: Duration = Duration::from_secs(20);
-const TARGET_SLOW_QUERY_POLL: Duration = Duration::from_millis(50);
 const TARGET_SLOW_QUERY_SQL_LIMIT: usize = 4_000;
 
 impl MysqlCliExecutor {
-    pub fn new(mariadb: impl Into<String>, target: TargetMySqlConfig) -> Self {
+    pub fn new(_mariadb: impl Into<String>, target: TargetMySqlConfig) -> Self {
         Self {
-            mariadb: mariadb.into(),
             target,
+            executor: RefCell::new(None),
         }
+    }
+
+    fn ensure_executor(
+        &self,
+    ) -> Result<std::cell::RefMut<'_, PersistentTargetExecutor>, TargetExecuteError> {
+        if self.executor.borrow().is_none() {
+            self.executor
+                .replace(Some(PersistentTargetExecutor::new(&self.target)?));
+        }
+        Ok(std::cell::RefMut::map(
+            self.executor.borrow_mut(),
+            |executor| executor.as_mut().expect("target executor initialized"),
+        ))
     }
 }
 
 impl TargetExecutor for MysqlCliExecutor {
     fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
-        let output = self.run_statement(statement)?;
-
-        if output.status.success() {
-            return Ok(());
-        }
-
-        if let Some(retry_statement) = rewrite_generated_column_insert(statement, &output) {
-            let retry_output = self.run_statement(&retry_statement)?;
-            if retry_output.status.success() {
-                return Ok(());
-            }
-            return self.handle_failed_statement(&retry_statement, &retry_output);
-        }
-
-        self.handle_failed_statement(statement, &output)
+        self.ensure_executor()?.execute(statement)
     }
-}
-
-impl MysqlCliExecutor {
-    fn run_statement(&self, statement: &SqlStatement) -> Result<Output, TargetExecuteError> {
-        let child = self.spawn_statement(statement)?;
-        wait_for_target_statement(child, statement)
-    }
-
-    fn spawn_statement(&self, statement: &SqlStatement) -> Result<Child, TargetExecuteError> {
-        let password_arg = format!("--password={}", self.target.password);
-        let rendered_statement = render_sql_statement(statement)?;
-        let replay_sql = target_replay_sql(&rendered_statement);
-        let mut child = Command::new(&self.mariadb)
-            .args([
-                "--batch",
-                "--raw",
-                "--skip-column-names",
-                target_client_character_set_arg(),
-                "--host",
-                &self.target.host,
-                "--port",
-                &self.target.port.to_string(),
-                "--user",
-                &self.target.user,
-                &password_arg,
-                "--ssl",
-                "--ssl-verify-server-cert=0",
-                &self.target.database,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| TargetExecuteError::new(format!("failed to run mariadb: {error}")))?;
-        write_replay_sql(&mut child, &replay_sql)?;
-        Ok(child)
-    }
-
-    fn handle_failed_statement(
-        &self,
-        statement: &SqlStatement,
-        output: &Output,
-    ) -> Result<(), TargetExecuteError> {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if self.can_ignore_duplicate_insert(&statement.sql, &stderr) {
-            return Ok(());
-        }
-
-        Err(TargetExecuteError::new(format!(
-            "mariadb exited with {}: {}",
-            output.status,
-            stderr.trim()
-        )))
-    }
-
-    fn can_ignore_duplicate_insert(&self, sql: &str, stderr: &str) -> bool {
-        should_ignore_duplicate_insert(self.target.insert_conflict_policy, sql, stderr)
-    }
-}
-
-fn write_replay_sql(child: &mut Child, replay_sql: &str) -> Result<(), TargetExecuteError> {
-    let Some(mut stdin) = child.stdin.take() else {
-        return Err(TargetExecuteError::new("failed to open mariadb stdin"));
-    };
-    stdin
-        .write_all(replay_sql.as_bytes())
-        .map_err(|error| TargetExecuteError::new(format!("failed to write mariadb stdin: {error}")))
-}
-
-fn wait_for_target_statement(
-    mut child: Child,
-    statement: &SqlStatement,
-) -> Result<Output, TargetExecuteError> {
-    let started_at = Instant::now();
-    let mut logged_slow_query = false;
-
-    while child
-        .try_wait()
-        .map_err(|error| TargetExecuteError::new(format!("failed to wait for mariadb: {error}")))?
-        .is_none()
-    {
-        if !logged_slow_query && started_at.elapsed() >= TARGET_SLOW_QUERY_AFTER {
-            println!("{}", format_slow_target_query_log(statement, started_at));
-            logged_slow_query = true;
-        }
-        thread::sleep(TARGET_SLOW_QUERY_POLL);
-    }
-
-    child
-        .wait_with_output()
-        .map_err(|error| TargetExecuteError::new(format!("failed to read mariadb output: {error}")))
-}
-
-fn rewrite_generated_column_insert(
-    statement: &SqlStatement,
-    output: &Output,
-) -> Option<SqlStatement> {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let generated_column = generated_column_from_error(&stderr)?;
-    let sql = strip_insert_column_for_retry(&statement.sql, &generated_column)?;
-    println!(
-        "cdc_target_rewrite_generated_column column={} original_sql_bytes={} rewritten_sql_bytes={}",
-        generated_column,
-        statement.sql.len(),
-        sql.len()
-    );
-    Some(SqlStatement {
-        sql,
-        params: Vec::new(),
-    })
-}
-
-fn generated_column_from_error(stderr: &str) -> Option<String> {
-    let marker = "generated column '";
-    let start = stderr.find(marker)? + marker.len();
-    let rest = &stderr[start..];
-    let end = rest.find('\'')?;
-    Some(rest[..end].to_string())
 }
 
 pub(crate) fn strip_insert_column_for_retry(sql: &str, generated_column: &str) -> Option<String> {
@@ -391,238 +269,56 @@ pub(super) fn target_client_character_set_arg() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live::InsertConflictPolicy;
-    use std::fs::{self, File};
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    use std::time::Duration;
 
     #[test]
     fn strips_generated_column_from_insert_values() {
-        let sql = "INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES (\"a\",NULL,\"hello\"),(\"b\",NULL,\"world\")";
+        let sql = r#"INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES ("a",NULL,"hello"),("b",NULL,"world")"#;
 
         let rewritten = strip_insert_column_for_retry(sql, "public_time").expect("rewrite");
 
         assert_eq!(
             rewritten,
-            "INSERT INTO `releases` (`slug`,`title`) VALUES(\"a\",\"hello\"),(\"b\",\"world\")"
+            r#"INSERT INTO `releases` (`slug`,`title`) VALUES("a","hello"),("b","world")"#
         );
     }
 
     #[test]
     fn strips_generated_column_without_splitting_quoted_commas() {
-        let sql = "INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES (\"a,b\",NULL,\"hello (world)\")";
+        let sql = r#"INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES ("a,b",NULL,"hello (world)")"#;
 
         let rewritten = strip_insert_column_for_retry(sql, "public_time").expect("rewrite");
 
         assert_eq!(
             rewritten,
-            "INSERT INTO `releases` (`slug`,`title`) VALUES(\"a,b\",\"hello (world)\")"
+            r#"INSERT INTO `releases` (`slug`,`title`) VALUES("a,b","hello (world)")"#
         );
     }
 
     #[test]
-    fn extracts_generated_column_from_mysql_error() {
-        let stderr = "ERROR 3105 (HY000): The value specified for generated column 'public_time' in table 'releases' is not allowed.";
+    fn slow_query_log_marks_untruncated_sql() {
+        let statement = SqlStatement {
+            sql: "SELECT 1".to_string(),
+            params: Vec::new(),
+        };
+        let started_at = Instant::now() - Duration::from_secs(21);
 
+        let log_line = format_slow_target_query_log(&statement, started_at);
+
+        assert!(log_line.starts_with("cdc_target_slow_query elapsed_seconds="));
+        assert!(log_line.contains("sql_truncated=false"));
+    }
+
+    #[test]
+    fn truncate_sql_for_log_keeps_utf8_boundary() {
+        assert_eq!(truncate_sql_for_log("éééSELECT", 3), "ééé");
+    }
+
+    #[test]
+    fn target_replay_sql_keeps_session_init_prefix() {
         assert_eq!(
-            generated_column_from_error(stderr),
-            Some("public_time".to_string())
+            target_replay_sql("INSERT INTO accounts VALUES (1)"),
+            "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'; INSERT INTO accounts VALUES (1)"
         );
-    }
-
-    #[test]
-    fn execute_retries_insert_without_generated_column() {
-        let fixture = FakeMariadb::new(
-            "ERROR 3105 (HY000): The value specified for generated column 'public_time' in table 'releases' is not allowed.",
-            1,
-        );
-        let executor = MysqlCliExecutor::new(fixture.script_path(), target_config());
-        let statement = SqlStatement {
-            sql: "INSERT INTO `releases` (`slug`,`public_time`,`title`) VALUES (\"a,b\",NULL,\"hello (world)\")"
-                .to_string(),
-            params: Vec::new(),
-        };
-
-        executor
-            .execute(&statement)
-            .expect("generated column retry");
-
-        assert_eq!(fixture.call_count(), 2);
-        let replay_sql = fixture.replay_sql();
-        assert!(replay_sql.contains(target_session_init_command()));
-        assert!(
-            replay_sql.contains(
-                "INSERT INTO `releases` (`slug`,`title`) VALUES(\"a,b\",\"hello (world)\")"
-            )
-        );
-        assert!(!replay_sql.contains("`public_time`"));
-    }
-
-    #[test]
-    fn execute_does_not_retry_unrelated_target_error() {
-        let fixture = FakeMariadb::new("ERROR 1064 (42000): syntax error", 99);
-        let executor = MysqlCliExecutor::new(fixture.script_path(), target_config());
-        let statement = SqlStatement {
-            sql: "INSERT INTO `releases` (`slug`) VALUES (\"alpha\")".to_string(),
-            params: Vec::new(),
-        };
-
-        let error = executor.execute(&statement).expect_err("target failure");
-
-        assert!(error.to_string().contains("ERROR 1064"));
-        assert_eq!(fixture.call_count(), 1);
-    }
-
-    #[test]
-    fn execute_sends_large_sql_through_stdin() {
-        let fixture = FakeMariadb::new("", 0);
-        let executor = MysqlCliExecutor::new(fixture.script_path(), target_config());
-        let statement = SqlStatement {
-            sql: format!(
-                "INSERT INTO `events` (`body`) VALUES (\"{}\")",
-                "x".repeat(200_000)
-            ),
-            params: Vec::new(),
-        };
-
-        executor
-            .execute(&statement)
-            .expect("large SQL through stdin");
-
-        assert_eq!(fixture.call_count(), 1);
-        assert!(fixture.replay_sql().contains(&statement.sql));
-    }
-
-    fn target_config() -> TargetMySqlConfig {
-        TargetMySqlConfig {
-            host: "target.db".to_string(),
-            port: 25060,
-            user: "target_user".to_string(),
-            password: "secret".to_string(),
-            database: "globalcomix".to_string(),
-            insert_conflict_policy: InsertConflictPolicy::Error,
-        }
-    }
-
-    struct FakeMariadb {
-        dir: PathBuf,
-        script: PathBuf,
-        count_file: PathBuf,
-        replay_sql_file: PathBuf,
-    }
-
-    impl FakeMariadb {
-        fn new(first_error: &str, success_after_failures: usize) -> Self {
-            let dir = temp_fixture_dir();
-            fs::create_dir_all(&dir).expect("fixture dir");
-            let script = dir.join("mariadb");
-            let count_file = dir.join("count");
-            let replay_sql_file = dir.join("replay.sql");
-            let script_body = fake_mariadb_script(
-                &count_file,
-                &replay_sql_file,
-                first_error,
-                success_after_failures,
-            );
-            write_fake_mariadb_script(&script, &script_body);
-            let mut permissions = fs::metadata(&script)
-                .expect("script metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script, permissions).expect("script permissions");
-            Self {
-                dir,
-                script,
-                count_file,
-                replay_sql_file,
-            }
-        }
-
-        fn script_path(&self) -> String {
-            self.script.to_string_lossy().into_owned()
-        }
-
-        fn call_count(&self) -> usize {
-            fs::read_to_string(&self.count_file)
-                .expect("call count")
-                .trim()
-                .parse()
-                .expect("numeric call count")
-        }
-
-        fn replay_sql(&self) -> String {
-            fs::read_to_string(&self.replay_sql_file).expect("replay sql")
-        }
-    }
-
-    fn write_fake_mariadb_script(script: &Path, script_body: &str) {
-        let mut file = File::create(script).expect("fake mariadb script");
-        file.write_all(script_body.as_bytes())
-            .expect("write fake mariadb script");
-        file.sync_all().expect("sync fake mariadb script");
-    }
-
-    impl Drop for FakeMariadb {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    fn fake_mariadb_script(
-        count_file: &Path,
-        replay_sql_file: &Path,
-        first_error: &str,
-        success_after_failures: usize,
-    ) -> String {
-        format!(
-            r#"#!/bin/sh
-count_file={count_file}
-replay_sql_file={replay_sql_file}
-count="$(cat "$count_file" 2>/dev/null || echo 0)"
-count=$((count + 1))
-printf '%s' "$count" > "$count_file"
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "-e" ]; then
-    printf '%s\n' "unexpected -e argument" >&2
-    exit 2
-  fi
-  shift
-done
-cat > "$replay_sql_file"
-if [ "$count" -le {success_after_failures} ]; then
-  printf '%s\n' {first_error} >&2
-  exit 1
-fi
-exit 0
-"#,
-            count_file = shell_quote_path(count_file),
-            replay_sql_file = shell_quote_path(replay_sql_file),
-            first_error = shell_quote(first_error),
-        )
-    }
-
-    fn shell_quote_path(path: &Path) -> String {
-        shell_quote(path.to_string_lossy())
-    }
-
-    fn shell_quote(value: impl AsRef<str>) -> String {
-        format!("'{}'", value.as_ref().replace('\'', "'\\''"))
-    }
-
-    fn temp_fixture_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let counter = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "mariadb-mysql-cdc-test-{}-{nanos}-{counter}",
-            std::process::id()
-        ))
     }
 }
