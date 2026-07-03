@@ -1,79 +1,94 @@
 use crate::checkpoint::Checkpoint;
 use crate::live::TargetMySqlConfig;
-use crate::mysql_support::{
-    quote_ident, quote_identifier_path, quote_sql_literal, target_mysql_args,
-};
-use std::process::Command;
+use crate::mysql_support::{quote_ident, quote_identifier_path, quote_sql_literal};
+use mysql::prelude::Queryable;
+use mysql::{Conn, Opts, OptsBuilder, SslOpts};
+use std::cell::{Cell, RefCell};
 
 const DEFAULT_CHECKPOINT_NAME: &str = "stream-binlog";
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MySqlStreamCheckpointStore {
-    mariadb: String,
     target: TargetMySqlConfig,
     table: String,
+    conn: RefCell<Option<Conn>>,
+    ensured: Cell<bool>,
+    last_checkpoint: RefCell<Option<Checkpoint>>,
 }
 
 impl MySqlStreamCheckpointStore {
-    pub fn new(mariadb: String, target: TargetMySqlConfig, table: String) -> Self {
+    pub fn new(target: TargetMySqlConfig, table: String) -> Self {
         Self {
-            mariadb,
             target,
             table,
+            conn: RefCell::new(None),
+            ensured: Cell::new(false),
+            last_checkpoint: RefCell::new(None),
         }
     }
 
     pub fn ensure(&self) -> Result<(), String> {
+        if self.ensured.get() {
+            return Ok(());
+        }
         if let Some(schema_sql) = build_create_checkpoint_schema_sql(&self.table) {
             self.execute(&schema_sql)?;
         }
-        self.execute(&build_create_checkpoint_table_sql(&self.table))
+        self.execute(&build_create_checkpoint_table_sql(&self.table))?;
+        self.ensured.set(true);
+        Ok(())
     }
 
     pub fn load(&self) -> Result<Option<Checkpoint>, String> {
         self.ensure()?;
-        let output = self.query(&build_checkpoint_select_sql(&self.table))?;
-        let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+        let row = self.query_checkpoint_json(&build_checkpoint_select_sql(&self.table))?;
+        let Some(value) = row else {
+            self.last_checkpoint.replace(None);
             return Ok(None);
         };
-        serde_json::from_str(line)
-            .map(Some)
-            .map_err(|error| format!("invalid stream checkpoint JSON: {error}"))
+        let checkpoint: Checkpoint = serde_json::from_str(&value)
+            .map_err(|error| format!("invalid stream checkpoint JSON: {error}"))?;
+        self.last_checkpoint.replace(Some(checkpoint.clone()));
+        Ok(Some(checkpoint))
+    }
+
+    pub fn checkpoint_for_skip(&self) -> Result<Option<Checkpoint>, String> {
+        if let Some(checkpoint) = self.last_checkpoint.borrow().clone() {
+            return Ok(Some(checkpoint));
+        }
+        self.load()
     }
 
     pub fn save(&self, checkpoint: &Checkpoint) -> Result<(), String> {
         self.ensure()?;
         let json = serde_json::to_string(checkpoint)
             .map_err(|error| format!("failed to encode stream checkpoint: {error}"))?;
-        self.execute(&build_checkpoint_upsert_sql(&self.table, &json))
+        self.execute(&build_checkpoint_upsert_sql(&self.table, &json))?;
+        self.last_checkpoint.replace(Some(checkpoint.clone()));
+        Ok(())
     }
 
     fn execute(&self, sql: &str) -> Result<(), String> {
-        let output = self.command(sql).output().map_err(command_spawn_error)?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(command_stderr(output))
+        self.with_conn(|conn| conn.query_drop(sql).map_err(mysql_error))
     }
 
-    fn query(&self, sql: &str) -> Result<String, String> {
-        let output = self.command(sql).output().map_err(command_spawn_error)?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-        }
-        Err(command_stderr(output))
+    fn query_checkpoint_json(&self, sql: &str) -> Result<Option<String>, String> {
+        self.with_conn(|conn| conn.query_first(sql).map_err(mysql_error))
     }
 
-    fn command(&self, sql: &str) -> Command {
-        let mut command = Command::new(&self.mariadb);
-        command
-            .args(target_mysql_args(&self.target))
-            .arg("--batch")
-            .arg("--raw")
-            .arg("--skip-column-names")
-            .arg("--execute")
-            .arg(sql);
-        command
+    fn with_conn<T>(
+        &self,
+        query: impl FnOnce(&mut Conn) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.conn.borrow().is_none() {
+            let conn = Conn::new(target_opts(&self.target)).map_err(mysql_error)?;
+            self.conn.replace(Some(conn));
+        }
+        let mut conn_ref = self.conn.borrow_mut();
+        let conn = conn_ref
+            .as_mut()
+            .expect("checkpoint mysql connection exists after initialization");
+        query(conn)
     }
 }
 
@@ -121,12 +136,26 @@ fn build_checkpoint_upsert_sql(table: &str, checkpoint_json: &str) -> String {
     )
 }
 
-fn command_spawn_error(error: std::io::Error) -> String {
-    format!("failed to run mariadb: {error}")
+fn target_opts(target: &TargetMySqlConfig) -> Opts {
+    let builder = OptsBuilder::default()
+        .ip_or_hostname(Some(&target.host))
+        .tcp_port(target.port)
+        .user(Some(&target.user))
+        .pass(Some(&target.password))
+        .db_name(Some(&target.database))
+        .prefer_socket(false)
+        .ssl_opts(insecure_ssl_opts());
+    Opts::from(builder)
 }
 
-fn command_stderr(output: std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).trim().to_string()
+fn insecure_ssl_opts() -> SslOpts {
+    SslOpts::default()
+        .with_danger_skip_domain_validation(true)
+        .with_danger_accept_invalid_certs(true)
+}
+
+fn mysql_error(error: mysql::Error) -> String {
+    format!("checkpoint mysql query failed: {error}")
 }
 
 #[cfg(test)]

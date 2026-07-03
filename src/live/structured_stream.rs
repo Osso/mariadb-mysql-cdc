@@ -217,7 +217,6 @@ pub(super) fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), App
         }
         None => {
             let checkpoint_store = crate::stream_checkpoint::MySqlStreamCheckpointStore::new(
-                config.mariadb.clone(),
                 config.target.clone(),
                 config.checkpoint_table.clone(),
             );

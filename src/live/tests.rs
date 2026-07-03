@@ -364,6 +364,43 @@ fn stream_checkpoint_does_not_move_backwards_to_zero() {
 }
 
 #[test]
+fn stream_checkpoint_uses_cached_position_after_first_save() {
+    let checkpoint_store = MemoryCheckpointStore::default();
+    let first = StatementEvent {
+        coordinate: BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 12_300,
+        },
+        resume_position: 12_399,
+        default_database: Some("globalcomix".to_string()),
+        sql: "INSERT INTO accounts (id) VALUES (1)".to_string(),
+    };
+    let second = StatementEvent {
+        coordinate: BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 12_400,
+        },
+        resume_position: 12_499,
+        default_database: Some("globalcomix".to_string()),
+        sql: "INSERT INTO accounts (id) VALUES (2)".to_string(),
+    };
+
+    save_stream_checkpoint(Some(&checkpoint_store), &first).expect("save first checkpoint");
+    save_stream_checkpoint(Some(&checkpoint_store), &second).expect("save second checkpoint");
+
+    assert_eq!(*checkpoint_store.load_count.borrow(), 1);
+    assert_eq!(
+        checkpoint_store
+            .saved
+            .borrow()
+            .as_ref()
+            .expect("saved checkpoint")
+            .source_position,
+        12_499
+    );
+}
+
+#[test]
 fn stream_checkpoint_does_not_move_backwards_in_same_file() {
     let checkpoint_store =
         MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.000777", 12_399));
@@ -706,6 +743,7 @@ impl FailedStatementRepairer for RecordingRepairer {
 struct MemoryCheckpointStore {
     loaded: RefCell<Option<Checkpoint>>,
     saved: RefCell<Option<Checkpoint>>,
+    load_count: RefCell<usize>,
 }
 
 impl MemoryCheckpointStore {
@@ -713,6 +751,7 @@ impl MemoryCheckpointStore {
         Self {
             loaded: RefCell::new(Some(checkpoint)),
             saved: RefCell::new(None),
+            load_count: RefCell::new(0),
         }
     }
 }
@@ -732,6 +771,7 @@ fn checkpoint_at(file: &str, position: u64) -> Checkpoint {
 
 impl StreamCheckpointStore for MemoryCheckpointStore {
     fn load_checkpoint(&self) -> Result<Option<Checkpoint>, ApplyBinlogError> {
+        *self.load_count.borrow_mut() += 1;
         Ok(self.loaded.borrow().clone())
     }
 
@@ -739,5 +779,12 @@ impl StreamCheckpointStore for MemoryCheckpointStore {
         self.saved.replace(Some(checkpoint.clone()));
         self.loaded.replace(Some(checkpoint.clone()));
         Ok(())
+    }
+
+    fn checkpoint_for_skip(&self) -> Result<Option<Checkpoint>, ApplyBinlogError> {
+        if self.saved.borrow().is_some() {
+            return Ok(self.loaded.borrow().clone());
+        }
+        self.load_checkpoint()
     }
 }

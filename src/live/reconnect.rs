@@ -7,10 +7,15 @@ use crate::stream_checkpoint::MySqlStreamCheckpointStore;
 use std::time::Duration;
 
 pub(super) const BINLOG_START_POSITION: u64 = 4;
+const MAX_RECONNECT_DELAY_SECONDS: u64 = 5;
 
 pub(super) trait StreamCheckpointStore {
     fn load_checkpoint(&self) -> Result<Option<Checkpoint>, ApplyBinlogError>;
     fn save_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), ApplyBinlogError>;
+
+    fn checkpoint_for_skip(&self) -> Result<Option<Checkpoint>, ApplyBinlogError> {
+        self.load_checkpoint()
+    }
 }
 
 impl StreamCheckpointStore for FileCheckpointStore {
@@ -30,6 +35,11 @@ impl StreamCheckpointStore for MySqlStreamCheckpointStore {
 
     fn save_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), ApplyBinlogError> {
         self.save(checkpoint).map_err(ApplyBinlogError::Checkpoint)
+    }
+
+    fn checkpoint_for_skip(&self) -> Result<Option<Checkpoint>, ApplyBinlogError> {
+        self.checkpoint_for_skip()
+            .map_err(ApplyBinlogError::Checkpoint)
     }
 }
 
@@ -75,7 +85,7 @@ fn should_skip_checkpoint(
     if checkpoint.source_position == 0 {
         return Ok(true);
     }
-    let Some(current) = store.load_checkpoint()? else {
+    let Some(current) = store.checkpoint_for_skip()? else {
         return Ok(false);
     };
     Ok(current.source_file == checkpoint.source_file
@@ -315,7 +325,9 @@ pub(super) fn format_reconnect_start(
 }
 
 pub(super) fn reconnect_delay(attempt: u32) -> Duration {
-    let seconds = 2_u64.saturating_pow(attempt.saturating_sub(1)).min(30);
+    let seconds = 2_u64
+        .saturating_pow(attempt.saturating_sub(1))
+        .min(MAX_RECONNECT_DELAY_SECONDS);
     Duration::from_secs(seconds)
 }
 

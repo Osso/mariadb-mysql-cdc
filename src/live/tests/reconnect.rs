@@ -1,5 +1,14 @@
 use super::*;
-use crate::live::reconnect::{BINLOG_START_POSITION, format_stale_binlog_auto_skip};
+use crate::live::reconnect::{
+    BINLOG_START_POSITION, format_stale_binlog_auto_skip, reconnect_delay,
+};
+
+#[test]
+fn reconnect_delay_caps_at_five_seconds() {
+    assert_eq!(reconnect_delay(1), Duration::from_secs(1));
+    assert_eq!(reconnect_delay(4), Duration::from_secs(5));
+    assert_eq!(reconnect_delay(36), Duration::from_secs(5));
+}
 
 #[test]
 fn classifies_purged_or_missing_binlog_source_errors() {
