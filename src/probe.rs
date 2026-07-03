@@ -1,5 +1,6 @@
+use mysql::prelude::Queryable;
+use mysql::{Conn, Opts, OptsBuilder, SslOpts};
 use std::collections::BTreeMap;
-use std::process::Command;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 
@@ -358,66 +359,59 @@ pub struct MasterStatus {
     executed_gtid_set: Option<String>,
 }
 
-fn run_command(command: &str, args: &[String], password: &str) -> Result<String, ProbeError> {
-    let mut command = Command::new(command);
-    let child = command
-        .args(args)
-        .env("MYSQL_PWD", password)
-        .output()
-        .map_err(|error| ProbeError::new(format!("failed to execute {command:?}: {error}")))?;
-
-    let stdout = String::from_utf8_lossy(&child.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&child.stderr).to_string();
-
-    if !child.status.success() {
-        return Err(ProbeError::new(format!(
-            "{command:?} exited with status {}: {}",
-            child.status.code().unwrap_or(-1),
-            stderr.trim().trim_end_matches('\n')
-        )));
-    }
-
-    if stdout.trim().is_empty() {
-        return Err(ProbeError::new(format!(
-            "{command:?} returned no output; {}",
-            stderr.trim().trim_end_matches('\n')
-        )));
-    }
-
-    Ok(stdout)
-}
-
 impl ProbeProcessRunner for ProcessRunner {
     fn show_master_status(&self, config: &ProbeConfig) -> Result<MasterStatus, ProbeError> {
-        let output = run_command(
-            &config.mariadb,
-            &[
-                "--host".to_string(),
-                config.host.clone(),
-                "--port".to_string(),
-                config.port.to_string(),
-                "--user".to_string(),
-                config.user.clone(),
-                "--batch".to_string(),
-                "--skip-column-names".to_string(),
-                "-e".to_string(),
-                "SHOW MASTER STATUS".to_string(),
-            ],
-            &config.password,
-        )?;
-
-        parse_master_status(&output)
+        let mut conn = open_probe_connection(config)?;
+        conn.query_first::<(String, u64, Option<String>, Option<String>, Option<String>), _>(
+            "SHOW MASTER STATUS",
+        )
+        .map_err(probe_mysql_error)?
+        .map(master_status_from_row)
+        .ok_or_else(|| ProbeError::new("SHOW MASTER STATUS returned no rows"))
     }
 
     fn read_binlog(
         &self,
-        config: &ProbeConfig,
-        start: &BinlogCoordinate,
-        stop_position: Option<u64>,
+        _config: &ProbeConfig,
+        _start: &BinlogCoordinate,
+        _stop_position: Option<u64>,
     ) -> Result<String, ProbeError> {
-        let args = build_binlog_args(config, start, stop_position);
+        Err(ProbeError::new(
+            "probe binlog text mode was removed; use stream-binlog native replication",
+        ))
+    }
+}
 
-        run_command(&config.mariadb_binlog, &args, &config.password)
+fn open_probe_connection(config: &ProbeConfig) -> Result<Conn, ProbeError> {
+    Conn::new(probe_opts(config)).map_err(probe_mysql_error)
+}
+
+fn probe_opts(config: &ProbeConfig) -> Opts {
+    let builder = OptsBuilder::default()
+        .ip_or_hostname(Some(&config.host))
+        .tcp_port(config.port)
+        .user(Some(&config.user))
+        .pass(Some(&config.password))
+        .prefer_socket(false)
+        .ssl_opts(
+            SslOpts::default()
+                .with_danger_skip_domain_validation(true)
+                .with_danger_accept_invalid_certs(true),
+        );
+    Opts::from(builder)
+}
+
+fn probe_mysql_error(error: mysql::Error) -> ProbeError {
+    ProbeError::new(error.to_string())
+}
+
+fn master_status_from_row(
+    row: (String, u64, Option<String>, Option<String>, Option<String>),
+) -> MasterStatus {
+    MasterStatus {
+        binlog_file: row.0,
+        position: row.1,
+        executed_gtid_set: row.4.filter(|value| !value.trim().is_empty()),
     }
 }
 
