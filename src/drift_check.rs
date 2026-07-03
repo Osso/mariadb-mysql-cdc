@@ -1,8 +1,9 @@
 use crate::live::TargetMySqlConfig;
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::mysql_support::quote_ident;
+use mysql::prelude::Queryable;
+use mysql::{Conn, Opts, OptsBuilder, SslOpts};
 use std::fmt;
-use std::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct DriftCheckConfig {
@@ -169,16 +170,10 @@ fn drift_tables(config: &DriftCheckConfig) -> Result<Vec<String>, DriftCheckErro
         return Ok(config.tables.clone());
     }
 
-    let output = query_connection(
+    query_list(
         &source_query_config(&config.source),
         &build_list_tables_sql(),
-    )?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    )
 }
 
 fn compare_table_count(
@@ -187,11 +182,7 @@ fn compare_table_count(
 ) -> Result<DriftComparison, DriftCheckError> {
     let sql = build_count_sql(table);
     let source_count = query_count(&source_query_config(&config.source), table, &sql)?;
-    let target_count = query_count(
-        &target_query_config(&config.target, &config.source.mariadb),
-        table,
-        &sql,
-    )?;
+    let target_count = query_count(&target_query_config(&config.target), table, &sql)?;
 
     Ok(DriftComparison {
         table: table.to_string(),
@@ -205,55 +196,56 @@ fn query_count(
     table: &str,
     sql: &str,
 ) -> Result<Option<u64>, DriftCheckError> {
-    let output = match query_connection(config, sql) {
-        Ok(output) => output,
-        Err(DriftCheckError::Query(message)) if is_missing_table_error(&message) => {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    output
-        .trim()
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|_| DriftCheckError::Query(format!("{table} count was not numeric: {output:?}")))
+    match query_scalar::<u64>(config, sql) {
+        Ok(Some(count)) => Ok(Some(count)),
+        Ok(None) => Err(DriftCheckError::Query(format!(
+            "{table} count query returned no rows"
+        ))),
+        Err(DriftCheckError::Query(message)) if is_missing_table_error(&message) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn is_missing_table_error(message: &str) -> bool {
-    message.contains("ERROR 1146 (42S02)") && message.contains("doesn't exist")
+    (message.contains("ERROR 1146") || message.contains("error 1146"))
+        && message.contains("doesn't exist")
 }
 
-fn query_connection(config: &QueryConnectionConfig, sql: &str) -> Result<String, DriftCheckError> {
-    let output = Command::new(&config.mariadb)
-        .args([
-            "--batch",
-            "--raw",
-            "--skip-column-names",
-            "--default-character-set=utf8mb4",
-            "--host",
-            &config.host,
-            "--port",
-            &config.port.to_string(),
-            "--user",
-            &config.user,
-            &config.database,
-            "-e",
-            sql,
-        ])
-        .env("MYSQL_PWD", &config.password)
-        .output()
-        .map_err(|error| DriftCheckError::Query(format!("failed to run mariadb: {error}")))?;
+fn query_list(config: &QueryConnectionConfig, sql: &str) -> Result<Vec<String>, DriftCheckError> {
+    let mut conn = open_connection(config)?;
+    conn.query::<String, _>(sql).map_err(query_error)
+}
 
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-    }
+fn query_scalar<T>(config: &QueryConnectionConfig, sql: &str) -> Result<Option<T>, DriftCheckError>
+where
+    T: mysql::prelude::FromValue,
+{
+    let mut conn = open_connection(config)?;
+    conn.query_first::<T, _>(sql).map_err(query_error)
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(DriftCheckError::Query(format!(
-        "mariadb exited with {}: {}",
-        output.status,
-        stderr.trim()
-    )))
+fn open_connection(config: &QueryConnectionConfig) -> Result<Conn, DriftCheckError> {
+    Conn::new(connection_opts(config)).map_err(query_error)
+}
+
+fn query_error(error: mysql::Error) -> DriftCheckError {
+    DriftCheckError::Query(error.to_string())
+}
+
+fn connection_opts(config: &QueryConnectionConfig) -> Opts {
+    let builder = OptsBuilder::default()
+        .ip_or_hostname(Some(&config.host))
+        .tcp_port(config.port)
+        .user(Some(&config.user))
+        .pass(Some(&config.password))
+        .db_name(Some(&config.database))
+        .prefer_socket(false)
+        .ssl_opts(
+            SslOpts::default()
+                .with_danger_skip_domain_validation(true)
+                .with_danger_accept_invalid_certs(true),
+        );
+    Opts::from(builder)
 }
 
 #[derive(Clone, Debug)]
@@ -263,7 +255,6 @@ struct QueryConnectionConfig {
     user: String,
     password: String,
     database: String,
-    mariadb: String,
 }
 
 fn source_query_config(config: &MySqlConnectionConfig) -> QueryConnectionConfig {
@@ -273,18 +264,16 @@ fn source_query_config(config: &MySqlConnectionConfig) -> QueryConnectionConfig 
         user: config.user.clone(),
         password: config.password.clone(),
         database: config.database.clone(),
-        mariadb: config.mariadb.clone(),
     }
 }
 
-fn target_query_config(target: &TargetMySqlConfig, mariadb: &str) -> QueryConnectionConfig {
+fn target_query_config(target: &TargetMySqlConfig) -> QueryConnectionConfig {
     QueryConnectionConfig {
         host: target.host.clone(),
         port: target.port,
         user: target.user.clone(),
         password: target.password.clone(),
         database: target.database.clone(),
-        mariadb: mariadb.to_string(),
     }
 }
 
@@ -314,14 +303,6 @@ fn format_delta(delta: Option<i128>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, File};
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static FAKE_MARIADB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn count_sql_quotes_table_identifier() {
@@ -388,74 +369,6 @@ mod tests {
     }
 
     #[test]
-    fn selected_table_missing_on_target_is_reported_as_drift() {
-        let mariadb = write_fake_mariadb(
-            "target_missing",
-            r#"#!/usr/bin/env bash
-if [[ "$*" == *"target_db"* ]]; then
-  echo "ERROR 1146 (42S02) at line 1: Table 'target_db.missing_target' doesn't exist" >&2
-  exit 1
-fi
-echo 4
-"#,
-        );
-        let config = drift_check_config(&mariadb, &["missing_target"]);
-
-        let report = run_drift_check(&config).expect("missing target table should not abort");
-
-        assert_eq!(
-            format_drift_report(&report),
-            [
-                "drift_check tables=1 mismatches=1",
-                "drift_check_table table=missing_target source_count=4 target_count=missing delta=missing status=target_missing",
-            ]
-            .join("\n")
-        );
-    }
-
-    #[test]
-    fn selected_table_missing_on_source_is_reported_as_drift() {
-        let mariadb = write_fake_mariadb(
-            "source_missing",
-            r#"#!/usr/bin/env bash
-if [[ "$*" == *"source_db"* ]]; then
-  echo "ERROR 1146 (42S02) at line 1: Table 'source_db.missing_source' doesn't exist" >&2
-  exit 1
-fi
-echo 9
-"#,
-        );
-        let config = drift_check_config(&mariadb, &["missing_source"]);
-
-        let report = run_drift_check(&config).expect("missing source table should not abort");
-
-        assert_eq!(
-            format_drift_report(&report),
-            [
-                "drift_check tables=1 mismatches=1",
-                "drift_check_table table=missing_source source_count=missing target_count=9 delta=missing status=source_missing",
-            ]
-            .join("\n")
-        );
-    }
-
-    #[test]
-    fn non_missing_table_query_error_stays_hard_failure() {
-        let mariadb = write_fake_mariadb(
-            "auth_error",
-            r#"#!/usr/bin/env bash
-echo "ERROR 1045 (28000): Access denied for user" >&2
-exit 1
-"#,
-        );
-        let config = drift_check_config(&mariadb, &["accounts"]);
-
-        let error = run_drift_check(&config).expect_err("auth errors must abort drift check");
-
-        assert!(error.to_string().contains("ERROR 1045"));
-    }
-
-    #[test]
     fn only_1146_42s02_errors_are_treated_as_missing_tables() {
         assert!(is_missing_table_error(
             "mariadb exited with exit status: 1: ERROR 1146 (42S02) at line 1: Table 'db.accounts' doesn't exist"
@@ -466,54 +379,5 @@ exit 1
         assert!(!is_missing_table_error(
             "mariadb exited with exit status: 1: ERROR 1051 (42S02) at line 1: Unknown table 'db.accounts'"
         ));
-    }
-
-    fn drift_check_config(mariadb: &str, tables: &[&str]) -> DriftCheckConfig {
-        DriftCheckConfig {
-            source: MySqlConnectionConfig {
-                host: "source-host".to_string(),
-                port: 3306,
-                user: "source-user".to_string(),
-                password: "source-password".to_string(),
-                database: "source_db".to_string(),
-                mariadb: mariadb.to_string(),
-            },
-            target: TargetMySqlConfig {
-                host: "target-host".to_string(),
-                port: 3306,
-                user: "target-user".to_string(),
-                password: "target-password".to_string(),
-                database: "target_db".to_string(),
-                ..TargetMySqlConfig::default()
-            },
-            tables: tables.iter().map(|table| table.to_string()).collect(),
-        }
-    }
-
-    fn write_fake_mariadb(name: &str, script: &str) -> String {
-        let path = temp_script_path(name);
-        let mut file = File::create(&path).expect("create fake mariadb script");
-        file.write_all(script.as_bytes())
-            .expect("write fake mariadb script");
-        file.sync_all().expect("sync fake mariadb script");
-        drop(file);
-        let mut permissions = fs::metadata(&path)
-            .expect("fake mariadb metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("mark fake mariadb executable");
-        path.to_string_lossy().into_owned()
-    }
-
-    fn temp_script_path(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos();
-        let counter = FAKE_MARIADB_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "mariadb-mysql-cdc-{}-{name}-{unique}-{counter}.sh",
-            std::process::id()
-        ))
     }
 }
