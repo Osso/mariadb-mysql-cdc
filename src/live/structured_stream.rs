@@ -30,6 +30,7 @@ use super::reconnect::{StreamCheckpointStore, run_stream_reconnect_loop};
 
 const DEFAULT_REPLICA_SERVER_ID: u32 = 65_535;
 const MYSQL_CDC_HEARTBEAT_SECONDS: u64 = 30;
+const MYSQL_COLUMN_TYPE_ENUM: u8 = 247;
 const MILLIS_PER_SECOND: u64 = 1_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -113,6 +114,7 @@ struct ResolvedTableSchema {
     primary_key: Vec<String>,
     generated_columns: Vec<String>,
     signed_columns: Vec<String>,
+    enum_columns: BTreeMap<String, Vec<String>>,
 }
 
 trait TableSchemaResolver {
@@ -178,6 +180,7 @@ impl TableSchemaResolver for SourceInventorySchemaResolver {
             primary_key: table.primary_key.clone(),
             generated_columns,
             signed_columns,
+            enum_columns: BTreeMap::new(),
         })
     }
 }
@@ -617,6 +620,7 @@ where
             primary_key: schema.primary_key,
             generated_columns: schema.generated_columns,
             signed_columns: schema.signed_columns,
+            enum_columns: schema.enum_columns,
         },
     })
 }
@@ -663,6 +667,7 @@ where
             .primary_key
             .clone(),
     };
+    let enum_columns = enum_columns_from_metadata(table_map, metadata, &columns)?;
     let (generated_columns, signed_columns) = fallback_schema
         .map(|schema| (schema.generated_columns, schema.signed_columns))
         .unwrap_or_default();
@@ -671,7 +676,44 @@ where
         primary_key,
         generated_columns,
         signed_columns,
+        enum_columns,
     })
+}
+
+fn enum_columns_from_metadata(
+    table_map: &MysqlCdcTableMapEvent,
+    metadata: &TableMetadata,
+    columns: &[String],
+) -> Result<BTreeMap<String, Vec<String>>, ApplyBinlogError> {
+    let Some(enum_value_sets) = &metadata.enum_string_values else {
+        return Ok(BTreeMap::new());
+    };
+    let enum_column_indexes = table_map
+        .column_types
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column_type)| {
+            (*column_type == MYSQL_COLUMN_TYPE_ENUM).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if enum_column_indexes.len() != enum_value_sets.len() {
+        return Err(mapping_error(format!(
+            "table map enum metadata has {} enum columns but {} enum value sets",
+            enum_column_indexes.len(),
+            enum_value_sets.len()
+        )));
+    }
+
+    enum_column_indexes
+        .into_iter()
+        .zip(enum_value_sets.iter())
+        .map(|(column_index, values)| {
+            let column = columns.get(column_index).cloned().ok_or_else(|| {
+                mapping_error(format!("enum column index {column_index} is out of range"))
+            })?;
+            Ok((column, values.clone()))
+        })
+        .collect()
 }
 
 fn is_signed_integer_column(data_type: &str, column_type: &str) -> bool {
@@ -760,19 +802,24 @@ fn map_row_data(row: &RowData, table: &RowTableMap) -> Result<RowImage, ApplyBin
         )));
     }
 
-    Ok(table
+    table
         .columns
         .iter()
         .zip(&row.cells)
         .map(|(column, value)| {
             let signed = table.signed_columns.contains(column);
-            (column.clone(), mysql_value_to_target_value(value, signed))
+            mysql_value_to_target_value(value, signed, table.enum_columns.get(column))
+                .map(|target_value| (column.clone(), target_value))
         })
-        .collect())
+        .collect::<Result<BTreeMap<_, _>, _>>()
 }
 
-fn mysql_value_to_target_value(value: &Option<MySqlValue>, signed: bool) -> Value {
-    match value {
+fn mysql_value_to_target_value(
+    value: &Option<MySqlValue>,
+    signed: bool,
+    enum_values: Option<&Vec<String>>,
+) -> Result<Value, ApplyBinlogError> {
+    let target_value = match value {
         None => Value::NULL,
         Some(MySqlValue::TinyInt(value)) if signed => Value::Int(i64::from(*value as i8)),
         Some(MySqlValue::TinyInt(value)) => Value::UInt(u64::from(*value)),
@@ -789,7 +836,7 @@ fn mysql_value_to_target_value(value: &Option<MySqlValue>, signed: bool) -> Valu
         Some(MySqlValue::Decimal(value)) => bytes_value(value.as_str()),
         Some(MySqlValue::String(value)) => bytes_value(value.as_str()),
         Some(MySqlValue::Bit(value)) => Value::Bytes(pack_bit_value(value)),
-        Some(MySqlValue::Enum(value)) => Value::UInt(u64::from(*value)),
+        Some(MySqlValue::Enum(value)) => enum_value_to_target_value(*value, enum_values)?,
         Some(MySqlValue::Set(value)) => Value::UInt(*value),
         Some(MySqlValue::Blob(value)) => Value::Bytes(value.clone()),
         Some(MySqlValue::Year(value)) => Value::UInt(u64::from(*value)),
@@ -797,7 +844,30 @@ fn mysql_value_to_target_value(value: &Option<MySqlValue>, signed: bool) -> Valu
         Some(MySqlValue::Time(value)) => bytes_value(format_time(value)),
         Some(MySqlValue::DateTime(value)) => bytes_value(format_datetime(value)),
         Some(MySqlValue::Timestamp(value)) => bytes_value(format_timestamp(*value)),
-    }
+    };
+    Ok(target_value)
+}
+
+fn enum_value_to_target_value(
+    ordinal: u32,
+    enum_values: Option<&Vec<String>>,
+) -> Result<Value, ApplyBinlogError> {
+    let Some(enum_values) = enum_values else {
+        return Ok(Value::UInt(u64::from(ordinal)));
+    };
+    let value_index = usize::try_from(ordinal)
+        .map_err(|_| mapping_error(format!("enum ordinal {ordinal} cannot fit usize")))?
+        .checked_sub(1)
+        .ok_or_else(|| {
+            mapping_error("enum ordinal 0 is not a valid MySQL enum value".to_string())
+        })?;
+    let value = enum_values.get(value_index).ok_or_else(|| {
+        mapping_error(format!(
+            "enum ordinal {ordinal} exceeds {} metadata values",
+            enum_values.len()
+        ))
+    })?;
+    Ok(bytes_value(value.as_str()))
 }
 
 fn bytes_value(value: impl Into<Vec<u8>>) -> Value {

@@ -685,15 +685,15 @@ fn binlog_options_use_from_position_for_live_stream_start() {
 fn formats_mysql_cdc_values_like_snapshot_text_rows() {
     assert_eq!(format_timestamp(1_782_075_535_000), "2026-06-21 20:58:55");
     assert_eq!(
-        mysql_value_to_target_value(&Some(MySqlValue::Blob(b"hello".to_vec())), false),
+        convert_mysql_value(&Some(MySqlValue::Blob(b"hello".to_vec())), false),
         Value::Bytes(b"hello".to_vec())
     );
     assert_eq!(
-        mysql_value_to_target_value(&Some(MySqlValue::Bit(vec![true])), false),
+        convert_mysql_value(&Some(MySqlValue::Bit(vec![true])), false),
         Value::Bytes(vec![1])
     );
     assert_eq!(
-        mysql_value_to_target_value(
+        convert_mysql_value(
             &Some(MySqlValue::Bit(vec![
                 true, false, true, false, true, false, true, false, true
             ])),
@@ -702,7 +702,7 @@ fn formats_mysql_cdc_values_like_snapshot_text_rows() {
         Value::Bytes(vec![1, 85])
     );
     assert_eq!(
-        mysql_value_to_target_value(
+        convert_mysql_value(
             &Some(MySqlValue::Time(Time {
                 hour: 26,
                 minute: 3,
@@ -714,17 +714,42 @@ fn formats_mysql_cdc_values_like_snapshot_text_rows() {
         Value::Bytes(b"26:03:04".to_vec())
     );
     assert_eq!(
-        mysql_value_to_target_value(&Some(MySqlValue::SmallInt(0xfd68)), true),
+        convert_mysql_value(&Some(MySqlValue::SmallInt(0xfd68)), true),
         Value::Int(-664)
     );
     assert_eq!(
-        mysql_value_to_target_value(&Some(MySqlValue::SmallInt(840)), true),
+        convert_mysql_value(&Some(MySqlValue::SmallInt(840)), true),
         Value::Int(840)
     );
     assert_eq!(
-        mysql_value_to_target_value(&Some(MySqlValue::SmallInt(0xfd68)), false),
+        convert_mysql_value(&Some(MySqlValue::SmallInt(0xfd68)), false),
         Value::UInt(64872)
     );
+}
+
+#[test]
+fn converts_enum_ordinals_to_metadata_strings() {
+    let enum_values = vec!["1".to_string(), "2".to_string(), "14".to_string()];
+
+    assert_eq!(
+        mysql_value_to_target_value(&Some(MySqlValue::Enum(3)), false, Some(&enum_values))
+            .expect("enum value"),
+        Value::Bytes(b"14".to_vec())
+    );
+}
+
+#[test]
+fn rejects_enum_ordinals_outside_metadata() {
+    let enum_values = vec!["1".to_string()];
+    let error = mysql_value_to_target_value(&Some(MySqlValue::Enum(2)), false, Some(&enum_values))
+        .expect_err("enum ordinal error")
+        .to_string();
+
+    assert!(error.contains("enum ordinal 2 exceeds 1 metadata values"));
+}
+
+fn convert_mysql_value(value: &Option<MySqlValue>, signed: bool) -> Value {
+    mysql_value_to_target_value(value, signed, None).expect("convert mysql value")
 }
 
 fn fixture_events(path: &str) -> Vec<(EventHeader, BinlogEvent)> {
@@ -811,6 +836,7 @@ fn schema(columns: Vec<&str>) -> ResolvedTableSchema {
         primary_key: vec!["id".to_string()],
         generated_columns: Vec::new(),
         signed_columns: Vec::new(),
+        enum_columns: BTreeMap::new(),
     }
 }
 

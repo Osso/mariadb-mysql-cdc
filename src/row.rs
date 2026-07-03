@@ -15,6 +15,7 @@ pub struct RowTableMap {
     pub primary_key: Vec<String>,
     pub generated_columns: Vec<String>,
     pub signed_columns: Vec<String>,
+    pub enum_columns: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -567,6 +568,7 @@ mod tests {
                 primary_key: vec!["id".to_string()],
                 generated_columns: vec!["public_time".to_string()],
                 signed_columns: Vec::new(),
+                enum_columns: BTreeMap::new(),
             },
         });
         let row = BTreeMap::from([
@@ -707,6 +709,7 @@ mod tests {
                 primary_key: vec!["id".to_string()],
                 generated_columns: Vec::new(),
                 signed_columns: Vec::new(),
+                enum_columns: BTreeMap::new(),
             },
         }
     }
