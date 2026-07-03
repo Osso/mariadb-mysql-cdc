@@ -314,10 +314,14 @@ fn format_delta(delta: Option<i128>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, File};
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static FAKE_MARIADB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn count_sql_quotes_table_identifier() {
@@ -488,7 +492,11 @@ exit 1
 
     fn write_fake_mariadb(name: &str, script: &str) -> String {
         let path = temp_script_path(name);
-        fs::write(&path, script).expect("write fake mariadb script");
+        let mut file = File::create(&path).expect("create fake mariadb script");
+        file.write_all(script.as_bytes())
+            .expect("write fake mariadb script");
+        file.sync_all().expect("sync fake mariadb script");
+        drop(file);
         let mut permissions = fs::metadata(&path)
             .expect("fake mariadb metadata")
             .permissions();
@@ -502,6 +510,10 @@ exit 1
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("mariadb-mysql-cdc-{name}-{unique}.sh"))
+        let counter = FAKE_MARIADB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "mariadb-mysql-cdc-{}-{name}-{unique}-{counter}.sh",
+            std::process::id()
+        ))
     }
 }
