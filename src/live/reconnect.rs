@@ -413,6 +413,9 @@ fn is_transient_source_error(error: &ApplyBinlogError) -> bool {
         || lower.contains("eof")
         || lower.contains("broken pipe")
         || lower.contains("timed out")
+        // Rollout race: the replaced pod still holds the dump connection when
+        // the new pod registers with the same server_id (error 4052).
+        || lower.contains("same server_id is already connected")
 }
 
 fn checkpoint_error(error: CheckpointError) -> ApplyBinlogError {
