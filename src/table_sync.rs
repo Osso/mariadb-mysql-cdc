@@ -288,8 +288,8 @@ fn read_target_window(
 pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, TableSyncError> {
     let source = MySqlSyncReader::new(config.source.clone());
     let target = MySqlSyncReader::new(target_connection_config(config));
-    let executor =
-        crate::live::MysqlCliExecutor::new(config.mariadb.clone(), config.target.clone());
+    let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
+        .map_err(|error| TableSyncError::Repair(error.to_string()))?;
     let mut progress_store = progress::MySqlSyncProgressStore::new(
         config.mariadb.clone(),
         config.target.clone(),
@@ -595,6 +595,27 @@ mod tests {
             saved.last().expect("saved progress").status,
             progress::SyncProgressStatus::Complete
         );
+    }
+
+    #[test]
+    fn run_sync_table_uses_native_mysql_not_cli_processes() {
+        let table_sync_source = include_str!("table_sync.rs");
+        let table_sync_production = table_sync_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        let mysql_reader_source = include_str!("table_sync/mysql.rs");
+        let progress_source = include_str!("table_sync/progress.rs");
+
+        assert!(table_sync_production.contains("PersistentTargetExecutor::new"));
+        assert!(mysql_reader_source.contains("PersistentMySqlSource"));
+        assert!(progress_source.contains("PersistentProgressWriter"));
+        assert!(!table_sync_production.contains("MysqlCliExecutor"));
+        assert!(!mysql_reader_source.contains("std::process::Command"));
+        assert!(!mysql_reader_source.contains("Command::new"));
+        assert!(!progress_source.contains("std::process::Command"));
+        assert!(!progress_source.contains("Command::new"));
+        assert!(!progress_source.contains("MysqlCliExecutor"));
     }
 
     #[test]

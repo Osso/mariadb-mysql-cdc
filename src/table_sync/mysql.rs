@@ -1,24 +1,52 @@
 use super::{SyncChunkRequest, SyncTableReader, TableSyncError};
-use crate::snapshot::SnapshotRow;
+use crate::mysql_client::PersistentMySqlSource;
+use crate::snapshot::{SnapshotError, SnapshotRow};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::process::Command;
 
 pub(super) struct MySqlSyncReader {
     config: crate::mysql_snapshot::MySqlConnectionConfig,
+    source: RefCell<Option<PersistentMySqlSource>>,
 }
 
 impl MySqlSyncReader {
     pub fn new(config: crate::mysql_snapshot::MySqlConnectionConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            source: RefCell::new(None),
+        }
+    }
+
+    fn query_rows(&self, sql: &str) -> Result<Vec<Vec<String>>, TableSyncError> {
+        self.ensure_source()?
+            .query_rows_as_strings(sql)
+            .map_err(snapshot_error_to_table_sync)
+    }
+
+    fn ensure_source(
+        &self,
+    ) -> Result<std::cell::RefMut<'_, PersistentMySqlSource>, TableSyncError> {
+        if self.source.borrow().is_none() {
+            let source =
+                PersistentMySqlSource::new(&self.config).map_err(snapshot_error_to_table_sync)?;
+            self.source.replace(Some(source));
+        }
+        Ok(std::cell::RefMut::map(self.source.borrow_mut(), |source| {
+            source.as_mut().expect("sync source initialized")
+        }))
     }
 }
 
 impl SyncTableReader for MySqlSyncReader {
     fn read_rows(&self, request: &SyncChunkRequest) -> Result<Vec<SnapshotRow>, TableSyncError> {
         let sql = build_sync_select_sql(request);
-        let output = run_mysql_query(&self.config, &sql)?;
-        parse_sync_rows(&request.columns, &request.primary_key, &output)
+        let rows = self.query_rows(&sql)?;
+        parse_sync_rows(&request.columns, &request.primary_key, rows)
     }
+}
+
+fn snapshot_error_to_table_sync(error: SnapshotError) -> TableSyncError {
+    TableSyncError::Read(error.to_string())
 }
 
 pub(crate) fn build_sync_select_sql(request: &SyncChunkRequest) -> String {
@@ -58,60 +86,21 @@ fn sync_bound_predicates(request: &SyncChunkRequest) -> Vec<String> {
     predicates
 }
 
-fn run_mysql_query(
-    config: &crate::mysql_snapshot::MySqlConnectionConfig,
-    sql: &str,
-) -> Result<String, TableSyncError> {
-    let output = Command::new(&config.mariadb)
-        .args([
-            "--batch",
-            "--raw",
-            "--skip-column-names",
-            "--default-character-set=utf8mb4",
-            "--host",
-            &config.host,
-            "--port",
-            &config.port.to_string(),
-            "--user",
-            &config.user,
-            &config.database,
-            "-e",
-            sql,
-        ])
-        .env("MYSQL_PWD", &config.password)
-        .output()
-        .map_err(|error| TableSyncError::Read(format!("failed to run mariadb: {error}")))?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(TableSyncError::Read(format!(
-        "mariadb exited with {}: {}",
-        output.status,
-        stderr.trim()
-    )))
-}
-
 fn parse_sync_rows(
     columns: &[String],
     primary_key: &[String],
-    output: &str,
+    rows: Vec<Vec<String>>,
 ) -> Result<Vec<SnapshotRow>, TableSyncError> {
-    output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| parse_sync_row(columns, primary_key, line))
+    rows.into_iter()
+        .map(|fields| parse_sync_row(columns, primary_key, fields))
         .collect()
 }
 
 fn parse_sync_row(
     columns: &[String],
     primary_key: &[String],
-    line: &str,
+    fields: Vec<String>,
 ) -> Result<SnapshotRow, TableSyncError> {
-    let fields = line.split('\t').map(str::to_string).collect::<Vec<_>>();
     if fields.len() != columns.len() {
         return Err(TableSyncError::Read(format!(
             "sync row has {} fields for {} columns",

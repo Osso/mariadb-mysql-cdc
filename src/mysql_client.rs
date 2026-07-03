@@ -98,6 +98,18 @@ impl PersistentMySqlSource {
             .map(|(_, ddl)| ddl)
             .ok_or_else(|| SnapshotError::InvalidTable(format!("{table} DDL was empty")))
     }
+
+    pub(crate) fn query_rows_as_strings(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<Vec<String>>, SnapshotError> {
+        let rows = self
+            .conn
+            .borrow_mut()
+            .query::<mysql::Row, _>(sql)
+            .map_err(snapshot_query_error)?;
+        Ok(rows.into_iter().map(row_to_strings).collect())
+    }
 }
 
 impl SnapshotSource for PersistentMySqlSource {
@@ -420,6 +432,10 @@ fn snapshot_row_from_mysql_row(
         primary_key,
         values: values_by_column,
     })
+}
+
+fn row_to_strings(row: mysql::Row) -> Vec<String> {
+    row.unwrap().into_iter().map(value_to_string).collect()
 }
 
 pub(crate) fn value_to_string(value: Value) -> String {

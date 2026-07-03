@@ -1,10 +1,10 @@
 use super::{SyncMode, SyncTableReport, TableSyncError};
 use crate::live::TargetMySqlConfig;
+use crate::mysql_client::PersistentProgressWriter;
 use crate::mysql_support::{
-    qualified_table_parts, quote_ident, quote_identifier_path, quote_sql_literal, target_mysql_args,
+    qualified_table_parts, quote_ident, quote_identifier_path, quote_sql_literal,
 };
-use crate::target::{SqlStatement, TargetExecutor};
-use std::process::Command;
+use std::cell::RefCell;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncTableProgress {
@@ -55,19 +55,18 @@ impl SyncProgressStore for NoopSyncProgressStore {
     }
 }
 
-#[derive(Clone)]
 pub struct MySqlSyncProgressStore {
-    mariadb: String,
     target: TargetMySqlConfig,
     table: String,
+    writer: RefCell<Option<PersistentProgressWriter>>,
 }
 
 impl MySqlSyncProgressStore {
-    pub fn new(mariadb: String, target: TargetMySqlConfig, table: String) -> Self {
+    pub fn new(_mariadb: String, target: TargetMySqlConfig, table: String) -> Self {
         Self {
-            mariadb,
             target,
             table,
+            writer: RefCell::new(None),
         }
     }
 }
@@ -75,66 +74,46 @@ impl MySqlSyncProgressStore {
 impl SyncProgressStore for MySqlSyncProgressStore {
     fn ensure(&mut self) -> Result<(), TableSyncError> {
         if let Some(schema_sql) = build_create_progress_schema_sql(&self.table) {
-            self.execute(&SqlStatement {
-                sql: schema_sql,
-                params: Vec::new(),
-            })?;
+            self.execute(schema_sql)?;
         }
-        self.execute(&SqlStatement {
-            sql: build_create_progress_table_sql(&self.table),
-            params: Vec::new(),
-        })?;
-        self.execute(&SqlStatement {
-            sql: build_add_total_rows_column_sql(&self.target.database, &self.table),
-            params: Vec::new(),
-        })
+        self.execute(build_create_progress_table_sql(&self.table))?;
+        self.execute(build_add_total_rows_column_sql(
+            &self.target.database,
+            &self.table,
+        ))
     }
 
     fn load(&self, table: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
-        let output = self.query(&build_progress_select_sql(&self.table, table))?;
+        let output = self.query(build_progress_select_sql(&self.table, table))?;
         parse_progress_row(table, &output)
     }
 
     fn save(&mut self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
-        self.execute(&SqlStatement {
-            sql: build_progress_upsert_sql(&self.table, progress),
-            params: Vec::new(),
-        })
+        self.execute(build_progress_upsert_sql(&self.table, progress))
     }
 
     fn save_error(&mut self, table: &str, error: &TableSyncError) -> Result<(), TableSyncError> {
-        self.execute(&SqlStatement {
-            sql: build_progress_error_sql(&self.table, table, error),
-            params: Vec::new(),
-        })
+        self.execute(build_progress_error_sql(&self.table, table, error))
     }
 }
 
 impl MySqlSyncProgressStore {
-    fn execute(&self, statement: &SqlStatement) -> Result<(), TableSyncError> {
-        crate::live::MysqlCliExecutor::new(self.mariadb.clone(), self.target.clone())
-            .execute(statement)
-            .map_err(|error| TableSyncError::Progress(error.to_string()))
+    fn execute(&self, statement: String) -> Result<(), TableSyncError> {
+        self.writer()?.execute_table_sync_progress_sql(statement)
     }
 
-    fn query(&self, sql: &str) -> Result<String, TableSyncError> {
-        let output = Command::new(&self.mariadb)
-            .args(target_mysql_args(&self.target))
-            .arg("--batch")
-            .arg("--skip-column-names")
-            .arg("--execute")
-            .arg(sql)
-            .output()
-            .map_err(|error| TableSyncError::Progress(format!("failed to run mariadb: {error}")))?;
+    fn query(&self, sql: String) -> Result<String, TableSyncError> {
+        self.writer()?.query_table_sync_progress_tsv(sql)
+    }
 
-        if !output.status.success() {
-            return Err(TableSyncError::Progress(format!(
-                "mariadb progress query failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+    fn writer(&self) -> Result<std::cell::RefMut<'_, PersistentProgressWriter>, TableSyncError> {
+        if self.writer.borrow().is_none() {
+            let writer = PersistentProgressWriter::new(&self.target, self.table.clone())?;
+            self.writer.replace(Some(writer));
         }
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(std::cell::RefMut::map(self.writer.borrow_mut(), |writer| {
+            writer.as_mut().expect("sync progress writer initialized")
+        }))
     }
 }
 
