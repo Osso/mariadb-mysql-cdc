@@ -270,7 +270,13 @@ fn stream_once(
     let mut target_transaction = TargetTransaction::default();
 
     for result in &mut events {
-        let (header, event) = result.map_err(source_error)?;
+        let (header, event) = match result {
+            Ok(event) => event,
+            Err(error) => {
+                target_transaction.rollback_if_open(applier.executor())?;
+                return Err(source_error(error));
+            }
+        };
         let mut context = StreamEventContext {
             schema_resolver: &schema_resolver,
             state: &mut state,
