@@ -27,6 +27,20 @@ pub struct QuarantinedStatement {
     pub reason: QuarantineReason,
 }
 
+impl fmt::Display for QuarantinedStatement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}:{} database={} reason={:?} sql={}",
+            self.coordinate.file,
+            self.coordinate.position,
+            self.default_database.as_deref().unwrap_or("<none>"),
+            self.reason,
+            self.sql
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QuarantineReason {
     EmptyStatement,
