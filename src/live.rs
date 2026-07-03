@@ -53,6 +53,8 @@ pub struct ApplyBinlogConfig {
     pub checkpoint_table: String,
     pub max_reconnects: u32,
     pub reconnect_forever: bool,
+    pub target_transaction_group_size: usize,
+    pub target_transaction_group_timeout_ms: u64,
 }
 
 impl Default for ApplyBinlogConfig {
@@ -66,6 +68,8 @@ impl Default for ApplyBinlogConfig {
             checkpoint_table: default_stream_checkpoint_table(),
             max_reconnects: 12,
             reconnect_forever: false,
+            target_transaction_group_size: 1,
+            target_transaction_group_timeout_ms: 0,
         }
     }
 }
@@ -85,6 +89,11 @@ impl ApplyBinlogConfig {
             self.source.validate_start_coordinate()?;
         }
         self.source.validate_stop_never_slave_server_id()?;
+        if self.target_transaction_group_size == 0 {
+            return Err(config_error(
+                "target transaction group size must be greater than zero",
+            ));
+        }
         self.target.validate()
     }
 }

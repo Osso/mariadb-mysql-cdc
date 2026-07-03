@@ -24,7 +24,7 @@ use mysql_cdc::ssl_mode::SslMode;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::reconnect::{StreamCheckpointStore, run_stream_reconnect_loop};
 
@@ -268,6 +268,7 @@ fn stream_once(
     let mut current_file = config.source.binlog_file.clone();
     let mut state = StructuredEventState::new(config.source.database.clone());
     let mut target_transaction = TargetTransaction::default();
+    let group_config = TargetTransactionGroupConfig::from_apply_config(config);
 
     for result in &mut events {
         let (header, event) = match result {
@@ -284,17 +285,55 @@ fn stream_once(
             checkpoint_store,
             transaction_checkpoint_table,
             current_file: &mut current_file,
+            group_config,
         };
         apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?;
         client.commit(&header, &event);
     }
 
+    let mut context = StreamEventContext {
+        schema_resolver: &schema_resolver,
+        state: &mut state,
+        target_transaction: &mut target_transaction,
+        checkpoint_store,
+        transaction_checkpoint_table,
+        current_file: &mut current_file,
+        group_config,
+    };
+    flush_grouped_transaction(applier.executor(), &mut context)?;
     Err(stream_ended_error())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TargetTransactionGroupConfig {
+    size: usize,
+    timeout: Duration,
+}
+
+impl TargetTransactionGroupConfig {
+    fn from_apply_config(config: &ApplyBinlogConfig) -> Self {
+        Self {
+            size: config.target_transaction_group_size.max(1),
+            timeout: Duration::from_millis(config.target_transaction_group_timeout_ms),
+        }
+    }
+}
+
+impl Default for TargetTransactionGroupConfig {
+    fn default() -> Self {
+        Self {
+            size: 1,
+            timeout: Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct TargetTransaction {
     open: bool,
+    source_transactions: usize,
+    opened_at: Option<Instant>,
+    pending_file_checkpoint: Option<crate::checkpoint::Checkpoint>,
 }
 
 impl TargetTransaction {
@@ -309,6 +348,7 @@ impl TargetTransaction {
             .begin_transaction()
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         self.open = true;
+        self.opened_at = Some(Instant::now());
         Ok(())
     }
 
@@ -322,7 +362,7 @@ impl TargetTransaction {
         executor
             .commit_transaction()
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        self.open = false;
+        self.reset();
         Ok(())
     }
 
@@ -353,8 +393,48 @@ impl TargetTransaction {
         executor
             .rollback_transaction()
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        self.open = false;
+        self.reset();
         Ok(())
+    }
+
+    fn record_source_transaction(&mut self) {
+        if self.open {
+            self.source_transactions += 1;
+        }
+    }
+
+    fn remember_file_checkpoint(&mut self, checkpoint: crate::checkpoint::Checkpoint) {
+        self.pending_file_checkpoint = Some(checkpoint);
+    }
+
+    fn take_file_checkpoint(&mut self) -> Option<crate::checkpoint::Checkpoint> {
+        self.pending_file_checkpoint.take()
+    }
+
+    fn should_flush(&self, config: TargetTransactionGroupConfig, force: bool) -> bool {
+        self.has_completed_source_transactions()
+            && (force
+                || config.size <= 1
+                || self.source_transactions >= config.size
+                || self.group_timed_out(config))
+    }
+
+    fn has_completed_source_transactions(&self) -> bool {
+        self.source_transactions > 0
+    }
+
+    fn group_timed_out(&self, config: TargetTransactionGroupConfig) -> bool {
+        config.timeout > Duration::ZERO
+            && self
+                .opened_at
+                .is_some_and(|opened_at| opened_at.elapsed() >= config.timeout)
+    }
+
+    fn reset(&mut self) {
+        self.open = false;
+        self.source_transactions = 0;
+        self.opened_at = None;
+        self.pending_file_checkpoint = None;
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -369,6 +449,7 @@ struct StreamEventContext<'a, R, C> {
     checkpoint_store: Option<&'a C>,
     transaction_checkpoint_table: Option<&'a str>,
     current_file: &'a mut String,
+    group_config: TargetTransactionGroupConfig,
 }
 
 fn apply_stream_event_transactionally<E, R, C>(
@@ -382,6 +463,14 @@ where
     R: TableSchemaResolver,
     C: StreamCheckpointStore,
 {
+    if context
+        .target_transaction
+        .should_flush(context.group_config, false)
+        || matches!(event, BinlogEvent::RotateEvent(_))
+    {
+        flush_grouped_transaction(applier.executor(), context)?;
+    }
+
     if event_can_write_target(event, context.state) {
         context
             .target_transaction
@@ -406,7 +495,8 @@ where
     };
 
     if outcome.policy == EventPolicy::CommitTransaction {
-        finish_source_transaction(applier.executor(), context, event, &outcome)?;
+        let force_flush = matches!(event, BinlogEvent::QueryEvent(_));
+        finish_source_transaction(applier.executor(), context, event, &outcome, force_flush)?;
         return Ok(outcome);
     }
 
@@ -419,19 +509,73 @@ fn finish_source_transaction<E, R, C>(
     context: &mut StreamEventContext<'_, R, C>,
     event: &BinlogEvent,
     outcome: &StructuredEventOutcome,
+    force_flush: bool,
 ) -> Result<(), ApplyBinlogError>
 where
     E: TransactionalTargetExecutor,
     C: StreamCheckpointStore,
 {
+    context.target_transaction.record_source_transaction();
+
     if context.transaction_checkpoint_table.is_some() {
         save_outcome_checkpoint(executor, context, event, outcome)?;
-        context.target_transaction.commit_if_open(executor)?;
+        if context
+            .target_transaction
+            .should_flush(context.group_config, force_flush)
+        {
+            context.target_transaction.commit_if_open(executor)?;
+        }
         return Ok(());
     }
 
+    remember_file_checkpoint(context, event, outcome);
+    if context
+        .target_transaction
+        .should_flush(context.group_config, force_flush)
+    {
+        flush_grouped_transaction(executor, context)?;
+    }
+    Ok(())
+}
+
+fn flush_grouped_transaction<E, R, C>(
+    executor: &E,
+    context: &mut StreamEventContext<'_, R, C>,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    C: StreamCheckpointStore,
+{
+    if !context
+        .target_transaction
+        .has_completed_source_transactions()
+    {
+        return Ok(());
+    }
+    let checkpoint = context.target_transaction.take_file_checkpoint();
     context.target_transaction.commit_if_open(executor)?;
-    save_outcome_checkpoint(executor, context, event, outcome)
+    if let Some(checkpoint) = checkpoint {
+        if let Some(store) = context.checkpoint_store {
+            store.save_checkpoint(&checkpoint)?;
+            println!("{}", super::reconnect::format_checkpoint_write(&checkpoint));
+        }
+    }
+    Ok(())
+}
+
+fn remember_file_checkpoint<R, C>(
+    context: &mut StreamEventContext<'_, R, C>,
+    event: &BinlogEvent,
+    outcome: &StructuredEventOutcome,
+) {
+    let Some(coordinate) = &outcome.resume_coordinate else {
+        return;
+    };
+    let checkpoint = super::reconnect::coordinate_checkpoint(coordinate, event_name(event));
+    context
+        .target_transaction
+        .remember_file_checkpoint(checkpoint);
+    *context.current_file = coordinate.file.clone();
 }
 
 fn event_can_write_target(event: &BinlogEvent, state: &StructuredEventState) -> bool {

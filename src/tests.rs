@@ -53,6 +53,10 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "3",
         "--reconnect-forever",
         "true",
+        "--target-transaction-group-size",
+        "25",
+        "--target-transaction-group-timeout-ms",
+        "500",
         "--stop-never-slave-server-id",
         "4242",
     ]))
@@ -84,6 +88,8 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
     assert_eq!(config.max_reconnects, 3);
     assert!(config.reconnect_forever);
+    assert_eq!(config.target_transaction_group_size, 25);
+    assert_eq!(config.target_transaction_group_timeout_ms, 500);
     assert_eq!(config.source.stop_never_slave_server_id, Some(4242));
 }
 

@@ -200,6 +200,7 @@ fn wraps_target_writes_and_checkpoint_in_source_xid_transaction() {
                 checkpoint_store: Some(&NoopCheckpointStore),
                 transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
                 current_file: &mut current_file,
+                group_config: TargetTransactionGroupConfig::default(),
             };
             apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
         }};
@@ -246,6 +247,7 @@ fn query_dml_checkpoints_and_commits_as_statement_transaction() {
         checkpoint_store: Some(&NoopCheckpointStore),
         transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
         current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
     };
 
     apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
@@ -277,6 +279,7 @@ fn file_checkpoint_waits_until_after_target_commit() {
                 checkpoint_store: Some(&checkpoint_store),
                 transaction_checkpoint_table: None,
                 current_file: &mut current_file,
+                group_config: TargetTransactionGroupConfig::default(),
             };
             apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
         }};
@@ -301,6 +304,173 @@ fn file_checkpoint_waits_until_after_target_commit() {
 }
 
 #[test]
+fn groups_multiple_xids_in_one_mysql_target_transaction() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let group_config = TargetTransactionGroupConfig {
+        size: 2,
+        timeout: Duration::ZERO,
+    };
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                current_file: &mut current_file,
+                group_config,
+            };
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+    process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("write rows");
+    process_event!(
+        event_header(16, 260),
+        BinlogEvent::XidEvent(XidEvent { xid: 42 })
+    )
+    .expect("first xid");
+    process_event!(event_header(30, 280), write_rows_event(18, 2, "beta")).expect("write rows");
+    process_event!(
+        event_header(16, 320),
+        BinlogEvent::XidEvent(XidEvent { xid: 43 })
+    )
+    .expect("second xid");
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        [
+            "BEGIN",
+            "EXEC",
+            "CHECKPOINT",
+            "EXEC",
+            "CHECKPOINT",
+            "COMMIT"
+        ]
+    );
+}
+
+#[test]
+fn grouped_file_checkpoint_saves_last_xid_after_group_commit() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+    let checkpoint_store = RecordingCheckpointStore::new(applier.executor().shared_operations());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let group_config = TargetTransactionGroupConfig {
+        size: 2,
+        timeout: Duration::ZERO,
+    };
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&checkpoint_store),
+                transaction_checkpoint_table: None,
+                current_file: &mut current_file,
+                group_config,
+            };
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+    process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("write rows");
+    process_event!(
+        event_header(16, 260),
+        BinlogEvent::XidEvent(XidEvent { xid: 42 })
+    )
+    .expect("first xid");
+    process_event!(event_header(30, 280), write_rows_event(18, 2, "beta")).expect("write rows");
+    process_event!(
+        event_header(16, 320),
+        BinlogEvent::XidEvent(XidEvent { xid: 43 })
+    )
+    .expect("second xid");
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "EXEC", "COMMIT", "CHECKPOINT"]
+    );
+}
+
+#[test]
+fn rotate_flushes_open_group_before_rotate_checkpoint() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+    let checkpoint_store = RecordingCheckpointStore::new(applier.executor().shared_operations());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let group_config = TargetTransactionGroupConfig {
+        size: 10,
+        timeout: Duration::ZERO,
+    };
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&checkpoint_store),
+                transaction_checkpoint_table: None,
+                current_file: &mut current_file,
+                group_config,
+            };
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+    process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("write rows");
+    process_event!(
+        event_header(16, 260),
+        BinlogEvent::XidEvent(XidEvent { xid: 42 })
+    )
+    .expect("xid");
+    process_event!(
+        event_header(20, 4),
+        BinlogEvent::RotateEvent(RotateEvent {
+            binlog_position: 4,
+            binlog_filename: "mysqld-bin.000778".to_string(),
+        })
+    )
+    .expect("rotate");
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "COMMIT", "CHECKPOINT", "CHECKPOINT"]
+    );
+}
+
+#[test]
 fn rolls_back_open_target_transaction_when_row_apply_fails() {
     let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::failing());
     let resolver = FixtureSchemaResolver;
@@ -318,6 +488,7 @@ fn rolls_back_open_target_transaction_when_row_apply_fails() {
                 checkpoint_store: None::<&NoopCheckpointStore>,
                 transaction_checkpoint_table: None,
                 current_file: &mut current_file,
+                group_config: TargetTransactionGroupConfig::default(),
             };
             apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
         }};

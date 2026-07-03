@@ -451,6 +451,12 @@ fn apply_binlog_option(
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--max-reconnects" => config.max_reconnects = parse_u32(flag, value)?,
         "--reconnect-forever" => config.reconnect_forever = parse_bool(flag, value)?,
+        "--target-transaction-group-size" => {
+            config.target_transaction_group_size = parse_nonzero_usize(flag, value)?;
+        }
+        "--target-transaction-group-timeout-ms" => {
+            config.target_transaction_group_timeout_ms = parse_u64(flag, value)?;
+        }
         "--stop-never-slave-server-id" => {
             config.source.stop_never_slave_server_id = Some(parse_nonzero_u32(flag, value)?);
         }
@@ -526,6 +532,16 @@ fn parse_u32(flag: &str, value: &str) -> Result<u32, String> {
     value
         .parse()
         .map_err(|_| format!("{flag} must be an integer"))
+}
+
+fn parse_nonzero_usize(flag: &str, value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("{flag} must be an integer"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be greater than zero"));
+    }
+    Ok(parsed)
 }
 
 fn parse_nonzero_u32(flag: &str, value: &str) -> Result<u32, String> {
