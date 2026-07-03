@@ -415,6 +415,10 @@ fn is_known_compatible_ddl(sql: &str) -> bool {
         || upper.starts_with("RENAME TABLE ")
 }
 
+pub fn is_schema_changing_statement(sql: &str) -> bool {
+    is_known_compatible_ddl(&normalize_statement(sql))
+}
+
 // MySQL 8 does not accept IF [NOT] EXISTS on ALTER TABLE clauses or index DDL;
 // CREATE TABLE IF NOT EXISTS and DROP TABLE IF EXISTS stay replayable.
 fn find_ddl_if_exists_pattern(sql: &str) -> Option<String> {

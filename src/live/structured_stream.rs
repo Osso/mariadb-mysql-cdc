@@ -128,23 +128,40 @@ trait TableSchemaResolver {
         table: &str,
         column_count: usize,
     ) -> Result<ResolvedTableSchema, ApplyBinlogError>;
+
+    fn invalidate_schema(&self, _schema: &str) {}
 }
 
-struct SourceInventorySchemaResolver {
+// Resolves row-event schemas from the TARGET database. The live source schema
+// can be ahead of the stream position (later DDL), while the target schema is
+// position-consistent because the stream replays DDL statements in binlog
+// order.
+struct TargetInventorySchemaResolver {
     reader: MariaDbInventoryReader,
+    source_database: Option<String>,
+    target_database: String,
     inventories: RefCell<BTreeMap<String, SchemaInventory>>,
 }
 
-impl SourceInventorySchemaResolver {
+impl TargetInventorySchemaResolver {
     fn new(config: &ApplyBinlogConfig) -> Self {
         Self {
-            reader: MariaDbInventoryReader::new(source_inventory_config(config)),
+            reader: MariaDbInventoryReader::new(target_inventory_config(config)),
+            source_database: config.source.database.clone(),
+            target_database: config.target.database.clone(),
             inventories: RefCell::new(BTreeMap::new()),
         }
     }
+
+    fn target_schema_name(&self, schema: &str) -> String {
+        if self.source_database.as_deref() == Some(schema) {
+            return self.target_database.clone();
+        }
+        schema.to_string()
+    }
 }
 
-impl TableSchemaResolver for SourceInventorySchemaResolver {
+impl TableSchemaResolver for TargetInventorySchemaResolver {
     fn resolve_table_schema(
         &self,
         schema: &str,
@@ -195,16 +212,23 @@ impl TableSchemaResolver for SourceInventorySchemaResolver {
             enum_columns,
         })
     }
+
+    fn invalidate_schema(&self, schema: &str) {
+        self.inventories.borrow_mut().remove(schema);
+    }
 }
 
-impl SourceInventorySchemaResolver {
+impl TargetInventorySchemaResolver {
     fn ensure_schema_inventory(&self, schema: &str) -> Result<(), ApplyBinlogError> {
         if self.inventories.borrow().contains_key(schema) {
             return Ok(());
         }
 
-        let inventory = build_inventory(schema, &self.reader).map_err(|error| {
-            mapping_error(format!("failed to read source schema {schema}: {error}"))
+        let target_schema = self.target_schema_name(schema);
+        let inventory = build_inventory(&target_schema, &self.reader).map_err(|error| {
+            mapping_error(format!(
+                "failed to read target schema {target_schema}: {error}"
+            ))
         })?;
         self.inventories
             .borrow_mut()
@@ -266,7 +290,7 @@ fn stream_once(
     let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
     let mut applier = RowApplier::new(executor);
-    let schema_resolver = SourceInventorySchemaResolver::new(config);
+    let schema_resolver = TargetInventorySchemaResolver::new(config);
     let mut client = BinlogClient::new(replica_options_from_source(&config.source)?);
     let events = client.replicate().map_err(source_error)?;
     let event_receiver = spawn_read_ahead_reader(client, events);
@@ -735,7 +759,15 @@ where
             state.record_uservar(event);
             Ok(EventPolicy::Ignore)
         }
-        BinlogEvent::QueryEvent(query) => apply_query_event(applier, state, coordinate, query),
+        BinlogEvent::QueryEvent(query) => {
+            let policy = apply_query_event(applier, state, coordinate, query)?;
+            if policy == EventPolicy::CommitTransaction
+                && crate::statement::is_schema_changing_statement(&query.sql_statement)
+            {
+                schema_resolver.invalidate_schema(&query.database_name);
+            }
+            Ok(policy)
+        }
         BinlogEvent::RowsQueryEvent(_) => Ok(EventPolicy::IgnoreAnnotation),
         _ => Ok(EventPolicy::Ignore),
     }
@@ -1377,12 +1409,12 @@ fn resume_coordinate(
     }
 }
 
-fn source_inventory_config(config: &ApplyBinlogConfig) -> InventoryConfig {
+fn target_inventory_config(config: &ApplyBinlogConfig) -> InventoryConfig {
     InventoryConfig {
-        host: config.source.host.clone(),
-        port: config.source.port,
-        user: config.source.user.clone(),
-        password: config.source.password.clone(),
+        host: config.target.host.clone(),
+        port: config.target.port,
+        user: config.target.user.clone(),
+        password: config.target.password.clone(),
     }
 }
 
