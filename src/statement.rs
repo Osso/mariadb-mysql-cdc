@@ -427,6 +427,26 @@ mod tests {
     }
 
     #[test]
+    fn formats_quarantined_statement_with_context() {
+        let quarantined = QuarantinedStatement {
+            coordinate: BinlogCoordinate {
+                file: "mysqld-bin.000001".to_string(),
+                position: 123,
+            },
+            default_database: Some("globalcomix".to_string()),
+            sql: "CREATE TABLE accounts (id BIGINT)".to_string(),
+            reason: QuarantineReason::UnsupportedStatementType("CREATE".to_string()),
+        };
+
+        let formatted = quarantined.to_string();
+
+        assert!(formatted.contains("mysqld-bin.000001:123"));
+        assert!(formatted.contains("database=globalcomix"));
+        assert!(formatted.contains("UnsupportedStatementType(\"CREATE\")"));
+        assert!(formatted.contains("CREATE TABLE accounts"));
+    }
+
+    #[test]
     fn quarantines_ddl_with_binlog_coordinate() {
         let executor = RecordingExecutor::default();
         let quarantine = RecordingQuarantine::default();
