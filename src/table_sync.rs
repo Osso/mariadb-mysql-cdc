@@ -23,8 +23,10 @@ pub struct SyncTableConfig {
     pub chunk_size: usize,
     pub mode: SyncMode,
     pub progress_table: String,
+    pub start_after: Option<Vec<String>>,
+    pub end_at: Option<Vec<String>>,
+    pub max_deletes: Option<u64>,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncTable {
     pub name: String,
@@ -112,10 +114,37 @@ pub fn sync_table_with_progress(
     repair_target: &mut impl SyncRepairTarget,
     progress_store: &mut impl SyncProgressStore,
 ) -> Result<SyncTableReport, TableSyncError> {
+    sync_table_with_progress_range(
+        table,
+        chunk_size,
+        mode,
+        source,
+        target,
+        repair_target,
+        progress_store,
+        None,
+        None,
+        Some(0),
+    )
+}
+
+pub fn sync_table_with_progress_range(
+    table: &SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    source: &impl SyncTableReader,
+    target: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    progress_store: &mut impl SyncProgressStore,
+    range_start_after: Option<Vec<String>>,
+    range_end_at: Option<Vec<String>>,
+    max_deletes: Option<u64>,
+) -> Result<SyncTableReport, TableSyncError> {
     validate_sync_table(table, chunk_size)?;
+    validate_sync_range(table, range_start_after.as_ref(), range_end_at.as_ref())?;
     let mut progress = load_sync_progress(table, mode, progress_store)?;
     let mut report = progress.report();
-    let mut start_after = progress.last_primary_key.clone();
+    let mut start_after = progress.last_primary_key.clone().or(range_start_after);
 
     loop {
         let Some(next_start_after) = sync_next_chunk(SyncChunkContext {
@@ -129,6 +158,8 @@ pub fn sync_table_with_progress(
             progress_store,
             progress: &mut progress,
             report: &mut report,
+            range_end_at: range_end_at.clone(),
+            max_deletes,
         })?
         else {
             complete_sync_progress(&mut progress, progress_store)?;
@@ -155,10 +186,12 @@ where
     progress_store: &'a mut P,
     progress: &'a mut SyncTableProgress,
     report: &'a mut SyncTableReport,
+    range_end_at: Option<Vec<String>>,
+    max_deletes: Option<u64>,
 }
 
 fn sync_next_chunk<S, T, R, P>(
-    context: SyncChunkContext<'_, S, T, R, P>,
+    mut context: SyncChunkContext<'_, S, T, R, P>,
 ) -> Result<Option<Vec<String>>, TableSyncError>
 where
     S: SyncTableReader,
@@ -168,23 +201,46 @@ where
 {
     let source_rows = read_source_chunk(&context)?;
     if source_rows.is_empty() {
+        let tail_start_after = context.start_after.clone();
+        repair_target_tail(&mut context, tail_start_after)?;
         return Ok(None);
     }
 
-    let end_at = last_primary_key(&source_rows)?;
+    let end_at = repair_source_chunk(&mut context, &source_rows)?;
+
+    if source_rows.len() < context.chunk_size {
+        repair_target_tail(&mut context, Some(end_at))?;
+        Ok(None)
+    } else {
+        Ok(Some(end_at))
+    }
+}
+
+fn repair_source_chunk<S, T, R, P>(
+    context: &mut SyncChunkContext<'_, S, T, R, P>,
+    source_rows: &[SnapshotRow],
+) -> Result<Vec<String>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let end_at = last_primary_key(source_rows)?;
     let target_rows = read_target_window(
         context.table,
-        context.start_after,
+        context.start_after.clone(),
         Some(end_at.clone()),
         context.chunk_size,
         context.target,
     )?;
     repair_chunk(
-        &source_rows,
+        source_rows,
         &target_rows,
         context.mode,
         context.repair_target,
         context.report,
+        context.max_deletes,
     )?;
     record_sync_chunk(
         context.progress,
@@ -193,12 +249,34 @@ where
         end_at.clone(),
         context.progress_store,
     )?;
+    Ok(end_at)
+}
 
-    if source_rows.len() < context.chunk_size {
-        Ok(None)
-    } else {
-        Ok(Some(end_at))
-    }
+fn repair_target_tail<S, T, R, P>(
+    context: &mut SyncChunkContext<'_, S, T, R, P>,
+    start_after: Option<Vec<String>>,
+) -> Result<(), TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let target_rows = read_target_window(
+        context.table,
+        start_after,
+        context.range_end_at.clone(),
+        context.chunk_size,
+        context.target,
+    )?;
+    repair_chunk(
+        &[],
+        &target_rows,
+        context.mode,
+        context.repair_target,
+        context.report,
+        context.max_deletes,
+    )
 }
 
 fn read_source_chunk<S, T, R, P>(
@@ -213,7 +291,7 @@ where
     let request = sync_chunk_request(
         context.table,
         context.start_after.clone(),
-        None,
+        context.range_end_at.clone(),
         context.chunk_size,
     );
     context.source.read_rows(&request)
@@ -296,7 +374,7 @@ pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, Table
         executor,
         crate::target::SnapshotInsertMode::IgnoreDuplicate,
     );
-    let result = sync_table_with_progress(
+    let result = sync_table_with_progress_range(
         &config.table,
         config.chunk_size,
         config.mode,
@@ -304,6 +382,9 @@ pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, Table
         &target,
         &mut repair_target,
         &mut progress_store,
+        config.start_after.clone(),
+        config.end_at.clone(),
+        config.max_deletes,
     );
     if let Err(error) = &result {
         progress_store.save_error(&config.table.name, error)?;
@@ -329,6 +410,34 @@ fn snapshot_table(table: &SyncTable) -> crate::snapshot::SnapshotTable {
         primary_key: table.primary_key.clone(),
         columns: table.columns.clone(),
     }
+}
+
+fn validate_sync_range(
+    table: &SyncTable,
+    start_after: Option<&Vec<String>>,
+    end_at: Option<&Vec<String>>,
+) -> Result<(), TableSyncError> {
+    validate_bound_arity(&table.primary_key, start_after, "start_after")?;
+    validate_bound_arity(&table.primary_key, end_at, "end_at")?;
+    Ok(())
+}
+
+fn validate_bound_arity(
+    primary_key: &[String],
+    values: Option<&Vec<String>>,
+    label: &str,
+) -> Result<(), TableSyncError> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    if values.len() != primary_key.len() {
+        return Err(TableSyncError::InvalidTable(format!(
+            "{label} has {} values for {} primary-key columns",
+            values.len(),
+            primary_key.len()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_sync_table(table: &SyncTable, chunk_size: usize) -> Result<(), TableSyncError> {
@@ -383,28 +492,62 @@ fn repair_chunk(
     mode: SyncMode,
     repair_target: &mut impl SyncRepairTarget,
     report: &mut SyncTableReport,
+    max_deletes: Option<u64>,
 ) -> Result<(), TableSyncError> {
     let source_by_key = rows_by_key(source_rows);
     let target_by_key = rows_by_key(target_rows);
 
     for primary_key in row_keys(&source_by_key, &target_by_key) {
-        match (
-            source_by_key.get(&primary_key),
-            target_by_key.get(&primary_key),
-        ) {
-            (Some(source), Some(target)) if source.values != target.values => {
-                apply_update(source, mode, repair_target)?;
-                report.updates += 1;
-            }
-            (Some(source), None) => {
-                apply_insert(source, mode, repair_target)?;
-                report.inserts += 1;
-            }
-            (None, Some(_target)) => report.extra_target_rows += 1,
-            _ => {}
-        }
+        repair_row_difference(RowDifferenceContext {
+            primary_key: &primary_key,
+            source: source_by_key.get(&primary_key).copied(),
+            target: target_by_key.get(&primary_key).copied(),
+            mode,
+            repair_target,
+            report,
+            max_deletes,
+        })?;
     }
 
+    Ok(())
+}
+
+struct RowDifferenceContext<'a, R>
+where
+    R: SyncRepairTarget,
+{
+    primary_key: &'a [String],
+    source: Option<&'a SnapshotRow>,
+    target: Option<&'a SnapshotRow>,
+    mode: SyncMode,
+    repair_target: &'a mut R,
+    report: &'a mut SyncTableReport,
+    max_deletes: Option<u64>,
+}
+
+fn repair_row_difference(
+    context: RowDifferenceContext<'_, impl SyncRepairTarget>,
+) -> Result<(), TableSyncError> {
+    match (context.source, context.target) {
+        (Some(source), Some(target)) if source.values != target.values => {
+            apply_update(source, context.mode, context.repair_target)?;
+            context.report.updates += 1;
+        }
+        (Some(source), None) => {
+            apply_insert(source, context.mode, context.repair_target)?;
+            context.report.inserts += 1;
+        }
+        (None, Some(_target)) => {
+            ensure_delete_allowed(
+                context.report.extra_target_rows,
+                context.max_deletes,
+                context.mode,
+            )?;
+            apply_delete(context.primary_key, context.mode, context.repair_target)?;
+            context.report.extra_target_rows += 1;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -419,6 +562,20 @@ fn row_keys(
     target: &BTreeMap<Vec<String>, &SnapshotRow>,
 ) -> BTreeSet<Vec<String>> {
     source.keys().chain(target.keys()).cloned().collect()
+}
+
+fn ensure_delete_allowed(
+    existing_deletes: u64,
+    max_deletes: Option<u64>,
+    mode: SyncMode,
+) -> Result<(), TableSyncError> {
+    if mode == SyncMode::Apply && max_deletes.is_some_and(|limit| existing_deletes >= limit) {
+        return Err(TableSyncError::Repair(format!(
+            "delete safety threshold exceeded: max_deletes={}",
+            max_deletes.expect("checked max deletes")
+        )));
+    }
+    Ok(())
 }
 
 fn apply_insert(
@@ -439,6 +596,17 @@ fn apply_update(
 ) -> Result<(), TableSyncError> {
     if mode == SyncMode::Apply {
         repair_target.update_row(row)?;
+    }
+    Ok(())
+}
+
+fn apply_delete(
+    primary_key: &[String],
+    mode: SyncMode,
+    repair_target: &mut impl SyncRepairTarget,
+) -> Result<(), TableSyncError> {
+    if mode == SyncMode::Apply {
+        repair_target.delete_row(primary_key)?;
     }
     Ok(())
 }
@@ -472,23 +640,29 @@ mod tests {
     }
 
     #[test]
-    fn apply_repairs_missing_and_different_target_rows() {
+    fn apply_repairs_missing_different_and_extra_target_rows() {
         let source = FakeReader::new(vec![row("1", "alpha"), row("2", "bravo")]);
-        let target = FakeReader::new(vec![row("1", "old")]);
+        let target = FakeReader::new(vec![row("0", "extra"), row("1", "old")]);
         let mut repair_target = RecordingRepairTarget::default();
 
-        let report = sync_table(
+        let mut progress_store = RecordingProgressStore::default();
+        let report = sync_table_with_progress_range(
             &account_table(),
             10,
             SyncMode::Apply,
             &source,
             &target,
             &mut repair_target,
+            &mut progress_store,
+            None,
+            None,
+            Some(1),
         )
         .expect("sync report");
 
         assert_eq!(report.inserts, 1);
         assert_eq!(report.updates, 1);
+        assert_eq!(report.extra_target_rows, 1);
         assert_eq!(
             repair_target.inserts.borrow().as_slice(),
             &[row("2", "bravo")]
@@ -496,6 +670,126 @@ mod tests {
         assert_eq!(
             repair_target.updates.borrow().as_slice(),
             &[row("1", "alpha")]
+        );
+        assert_eq!(
+            repair_target.deletes.borrow().as_slice(),
+            &[vec!["0".to_string()]]
+        );
+    }
+
+    #[test]
+    fn apply_stops_before_deleting_above_safety_threshold() {
+        let source = FakeReader::new(vec![row("1", "alpha")]);
+        let target = FakeReader::new(vec![row("0", "extra"), row("1", "alpha")]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::default();
+
+        let error = sync_table_with_progress_range(
+            &account_table(),
+            10,
+            SyncMode::Apply,
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+            None,
+            None,
+            Some(0),
+        )
+        .expect_err("delete threshold");
+
+        assert_eq!(
+            error.to_string(),
+            "sync repair failed: delete safety threshold exceeded: max_deletes=0"
+        );
+        assert!(repair_target.deletes.borrow().is_empty());
+    }
+
+    #[test]
+    fn rejects_range_bounds_with_wrong_composite_primary_key_arity() {
+        let source = FakeReader::new(vec![]);
+        let target = FakeReader::new(vec![]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::default();
+        let table = SyncTable {
+            name: "accounts".to_string(),
+            primary_key: vec!["tenant_id".to_string(), "id".to_string()],
+            columns: vec!["tenant_id".to_string(), "id".to_string()],
+        };
+
+        let error = sync_table_with_progress_range(
+            &table,
+            10,
+            SyncMode::DryRun,
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+            Some(vec!["1".to_string()]),
+            None,
+            Some(0),
+        )
+        .expect_err("bad arity");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid sync table: start_after has 1 values for 2 primary-key columns"
+        );
+    }
+
+    #[test]
+    fn apply_repairs_target_tail_after_last_source_row() {
+        let source = FakeReader::new(vec![row("1", "alpha")]);
+        let target = FakeReader::new(vec![row("1", "alpha"), row("2", "extra")]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::default();
+
+        let report = sync_table_with_progress_range(
+            &account_table(),
+            10,
+            SyncMode::Apply,
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+            None,
+            None,
+            Some(1),
+        )
+        .expect("sync report");
+
+        assert_eq!(report.extra_target_rows, 1);
+        assert_eq!(
+            repair_target.deletes.borrow().as_slice(),
+            &[vec!["2".to_string()]]
+        );
+    }
+
+    #[test]
+    fn apply_repairs_source_empty_target_range() {
+        let source = FakeReader::new(vec![]);
+        let target = FakeReader::new(vec![row("2", "extra")]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::default();
+
+        let report = sync_table_with_progress_range(
+            &account_table(),
+            10,
+            SyncMode::Apply,
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+            Some(vec!["1".to_string()]),
+            Some(vec!["3".to_string()]),
+            Some(1),
+        )
+        .expect("sync report");
+
+        assert_eq!(report.extra_target_rows, 1);
+        assert_eq!(
+            repair_target.deletes.borrow().as_slice(),
+            &[vec!["2".to_string()]]
         );
     }
 
@@ -673,6 +967,7 @@ mod tests {
     struct RecordingRepairTarget {
         inserts: RefCell<Vec<SnapshotRow>>,
         updates: RefCell<Vec<SnapshotRow>>,
+        deletes: RefCell<Vec<Vec<String>>>,
     }
 
     impl SyncRepairTarget for RecordingRepairTarget {
@@ -683,6 +978,11 @@ mod tests {
 
         fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
             self.updates.borrow_mut().push(row.clone());
+            Ok(())
+        }
+
+        fn delete_row(&mut self, primary_key: &[String]) -> Result<(), TableSyncError> {
+            self.deletes.borrow_mut().push(primary_key.to_vec());
             Ok(())
         }
     }

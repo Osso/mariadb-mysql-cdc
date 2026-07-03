@@ -1,5 +1,6 @@
 pub mod catchup;
 pub mod checkpoint;
+pub mod checksum;
 pub mod cutover;
 pub mod drift_check;
 pub mod inventory;
@@ -32,7 +33,7 @@ Usage:
   mariadb-mysql-cdc catchup-progress --progress-file PATH
   mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS [options]
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
-  mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...]
+  mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
 
@@ -94,6 +95,9 @@ Catchup snapshot options:
   --target-database DB            MySQL target database.
   --progress-file PATH            Local fallback checkpoint file.
   --progress-table TABLE          Target checkpoint table. Defaults to cdc.table_sync_progress.
+  --start-after CSV               Primary-key lower bound for targeted sync-table repair.
+  --end-at CSV                    Primary-key upper bound for targeted sync-table repair.
+  --max-deletes COUNT             Maximum target orphan deletes allowed in sync-table apply mode. Defaults to 0.
   --chunk-size ROWS               Rows per chunk. Defaults to 10000.
   --throttle-ms MS                Sleep after each copied chunk. Defaults to 0.
 ";
@@ -370,6 +374,8 @@ fn parse_drift_check_config(args: Vec<String>) -> Result<drift_check::DriftCheck
         source: mysql_snapshot::MySqlConnectionConfig::default(),
         target: live::TargetMySqlConfig::default(),
         tables: Vec::new(),
+        content_check: false,
+        chunk_size: 10000,
     };
     let mut index = 0;
 
@@ -400,6 +406,8 @@ fn drift_check_option(
 
     match flag {
         "--table" => config.tables.push(value.to_string()),
+        "--content-check" => config.content_check = parse_bool(flag, value)?,
+        "--chunk-size" => config.chunk_size = parse_usize(flag, value)?,
         other => return Err(format!("unknown drift-check option: {other}")),
     }
 

@@ -300,6 +300,10 @@ fn parses_drift_check_config_with_selected_tables() {
         "accounts",
         "--table",
         "releases",
+        "--content-check",
+        "true",
+        "--chunk-size",
+        "2500",
     ]))
     .expect("drift config");
 
@@ -312,6 +316,8 @@ fn parses_drift_check_config_with_selected_tables() {
     assert_eq!(config.target.password, "target-secret");
     assert_eq!(config.target.database, "globalcomix");
     assert_eq!(config.tables, vec!["accounts", "releases"]);
+    assert!(config.content_check);
+    assert_eq!(config.chunk_size, 2500);
 }
 
 #[test]

@@ -1,8 +1,9 @@
+use crate::checksum::{ChecksumColumn, ChecksumRequest, build_chunk_checksum_sql};
 use crate::live::TargetMySqlConfig;
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::quote_ident;
-use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder, SslOpts};
+use crate::mysql_support::{quote_ident, quote_sql_literal};
+use mysql::prelude::{FromRow, Queryable};
+use mysql::{Conn, Opts, OptsBuilder, Row, SslOpts, Value};
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -10,6 +11,8 @@ pub struct DriftCheckConfig {
     pub source: MySqlConnectionConfig,
     pub target: TargetMySqlConfig,
     pub tables: Vec<String>,
+    pub content_check: bool,
+    pub chunk_size: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +20,13 @@ pub struct DriftComparison {
     pub table: String,
     pub source_count: Option<u64>,
     pub target_count: Option<u64>,
+    pub content: Option<ContentDriftSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentDriftSummary {
+    pub chunks: u64,
+    pub mismatched_chunks: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,7 +56,7 @@ pub fn run_drift_check(config: &DriftCheckConfig) -> Result<DriftCheckReport, Dr
     let tables = drift_tables(config)?;
     let comparisons = tables
         .iter()
-        .map(|table| compare_table_count(config, table))
+        .map(|table| compare_table(config, table))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(DriftCheckReport { comparisons })
@@ -58,6 +68,54 @@ pub fn build_count_sql(table: &str) -> String {
 
 pub fn build_list_tables_sql() -> String {
     "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME".to_string()
+}
+
+pub fn build_primary_key_sql(table: &str) -> String {
+    format!(
+        "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION",
+        quote_sql_literal(table)
+    )
+}
+
+pub fn build_checksum_columns_sql(table: &str) -> String {
+    format!(
+        "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} AND COALESCE(GENERATION_EXPRESSION, '') = '' ORDER BY ORDINAL_POSITION",
+        quote_sql_literal(table)
+    )
+}
+
+pub fn build_json_check_clauses_sql(table: &str) -> String {
+    format!(
+        "SELECT cc.CHECK_CLAUSE FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA = DATABASE() AND tc.TABLE_NAME = {} AND tc.CONSTRAINT_TYPE = 'CHECK' AND cc.CHECK_CLAUSE LIKE '%json_valid%'",
+        quote_sql_literal(table)
+    )
+}
+
+pub fn build_primary_key_endpoints_sql(
+    table: &str,
+    primary_key: &[String],
+    start_after: Option<Vec<String>>,
+    limit: usize,
+) -> Result<String, DriftCheckError> {
+    validate_bound_arity(primary_key, start_after.as_ref(), "start_after")?;
+    let columns = primary_key
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order_by = columns.clone();
+    let bounds = start_after
+        .map(|start| {
+            format!(
+                " WHERE {}",
+                primary_key_bound_predicate(primary_key, &start, ">")
+            )
+        })
+        .unwrap_or_default();
+    Ok(format!(
+        "SELECT {columns} FROM {}{bounds} ORDER BY {order_by} LIMIT {limit}",
+        quote_ident(table)
+    ))
 }
 
 pub fn format_drift_report(report: &DriftCheckReport) -> String {
@@ -90,10 +148,15 @@ impl DriftCheckReport {
 
 impl DriftComparison {
     pub fn matches(&self) -> bool {
-        matches!(
+        let counts_match = matches!(
             (self.source_count, self.target_count),
             (Some(source_count), Some(target_count)) if source_count == target_count
-        )
+        );
+        let content_matches = self
+            .content
+            .as_ref()
+            .is_none_or(|content| content.mismatched_chunks == 0);
+        counts_match && content_matches
     }
 
     fn delta(&self) -> Option<i128> {
@@ -106,7 +169,15 @@ impl DriftComparison {
         match (self.source_count, self.target_count) {
             (None, _) => "source_missing",
             (_, None) => "target_missing",
-            (Some(source_count), Some(target_count)) if source_count == target_count => "ok",
+            (Some(source_count), Some(target_count))
+                if source_count == target_count
+                    && self
+                        .content
+                        .as_ref()
+                        .is_none_or(|content| content.mismatched_chunks == 0) =>
+            {
+                "ok"
+            }
             (Some(_), Some(_)) => "drift",
         }
     }
@@ -114,7 +185,13 @@ impl DriftComparison {
 
 fn validate_config(config: &DriftCheckConfig) -> Result<(), DriftCheckError> {
     validate_source_connection(&config.source)?;
-    validate_target_connection(&config.target)
+    validate_target_connection(&config.target)?;
+    if config.chunk_size == 0 {
+        return Err(DriftCheckError::Config(
+            "chunk size must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_source_connection(config: &MySqlConnectionConfig) -> Result<(), DriftCheckError> {
@@ -176,19 +253,143 @@ fn drift_tables(config: &DriftCheckConfig) -> Result<Vec<String>, DriftCheckErro
     )
 }
 
-fn compare_table_count(
+fn compare_table(
     config: &DriftCheckConfig,
     table: &str,
 ) -> Result<DriftComparison, DriftCheckError> {
     let sql = build_count_sql(table);
     let source_count = query_count(&source_query_config(&config.source), table, &sql)?;
     let target_count = query_count(&target_query_config(&config.target), table, &sql)?;
+    let content = if should_check_content(config, source_count, target_count) {
+        Some(compare_table_content(config, table)?)
+    } else {
+        None
+    };
 
     Ok(DriftComparison {
         table: table.to_string(),
         source_count,
         target_count,
+        content,
     })
+}
+
+fn should_check_content(
+    config: &DriftCheckConfig,
+    source_count: Option<u64>,
+    target_count: Option<u64>,
+) -> bool {
+    config.content_check
+        && matches!((source_count, target_count), (Some(source), Some(target)) if source == target)
+}
+
+fn compare_table_content(
+    config: &DriftCheckConfig,
+    table: &str,
+) -> Result<ContentDriftSummary, DriftCheckError> {
+    let context = ChecksumCompareContext::load(config, table)?;
+    compare_checksum_chunks(&context)
+}
+
+struct ChecksumCompareContext {
+    source: QueryConnectionConfig,
+    target: QueryConnectionConfig,
+    table: String,
+    primary_key: Vec<String>,
+    columns: Vec<ChecksumColumn>,
+    chunk_size: usize,
+}
+
+impl ChecksumCompareContext {
+    fn load(config: &DriftCheckConfig, table: &str) -> Result<Self, DriftCheckError> {
+        let source = source_query_config(&config.source);
+        let target = target_query_config(&config.target);
+        let primary_key = query_primary_key(&source, table)?;
+        let columns = query_checksum_columns(&source, table)?;
+        Ok(Self {
+            source,
+            target,
+            table: table.to_string(),
+            primary_key,
+            columns,
+            chunk_size: config.chunk_size,
+        })
+    }
+}
+
+fn compare_checksum_chunks(
+    context: &ChecksumCompareContext,
+) -> Result<ContentDriftSummary, DriftCheckError> {
+    let mut summary = ContentDriftSummary {
+        chunks: 0,
+        mismatched_chunks: 0,
+    };
+    let mut start_after = None;
+
+    loop {
+        let endpoints = query_primary_key_endpoints(
+            &context.source,
+            &context.table,
+            &context.primary_key,
+            start_after.clone(),
+            context.chunk_size,
+        )?;
+        let end_at = endpoints.last().cloned();
+        record_checksum_comparison(&mut summary, context, start_after.clone(), end_at.clone())?;
+
+        if endpoints.len() < context.chunk_size {
+            record_target_tail_checksum(&mut summary, context, end_at)?;
+            return Ok(summary);
+        }
+        start_after = end_at;
+    }
+}
+
+fn record_checksum_comparison(
+    summary: &mut ContentDriftSummary,
+    context: &ChecksumCompareContext,
+    start_after: Option<Vec<String>>,
+    end_at: Option<Vec<String>>,
+) -> Result<(), DriftCheckError> {
+    let source_checksum = checksum_for_range(
+        context,
+        &context.source,
+        start_after.clone(),
+        end_at.clone(),
+    )?;
+    let target_checksum = checksum_for_range(context, &context.target, start_after, end_at)?;
+    summary.chunks += 1;
+    if source_checksum != target_checksum {
+        summary.mismatched_chunks += 1;
+    }
+    Ok(())
+}
+
+fn record_target_tail_checksum(
+    summary: &mut ContentDriftSummary,
+    context: &ChecksumCompareContext,
+    end_at: Option<Vec<String>>,
+) -> Result<(), DriftCheckError> {
+    if end_at.is_some() {
+        record_checksum_comparison(summary, context, end_at, None)?;
+    }
+    Ok(())
+}
+
+fn checksum_for_range(
+    context: &ChecksumCompareContext,
+    config: &QueryConnectionConfig,
+    start_after: Option<Vec<String>>,
+    end_at: Option<Vec<String>>,
+) -> Result<(u64, u64), DriftCheckError> {
+    query_chunk_checksum(
+        config,
+        &context.table,
+        &context.primary_key,
+        &context.columns,
+        start_after,
+        end_at,
+    )
 }
 
 fn query_count(
@@ -211,17 +412,140 @@ fn is_missing_table_error(message: &str) -> bool {
         && message.contains("doesn't exist")
 }
 
+fn query_primary_key(
+    config: &QueryConnectionConfig,
+    table: &str,
+) -> Result<Vec<String>, DriftCheckError> {
+    let primary_key = query_list(config, &build_primary_key_sql(table))?;
+    if primary_key.is_empty() {
+        return Err(DriftCheckError::Config(format!(
+            "table `{table}` has no primary key for content drift check"
+        )));
+    }
+    Ok(primary_key)
+}
+
+fn query_checksum_columns(
+    config: &QueryConnectionConfig,
+    table: &str,
+) -> Result<Vec<ChecksumColumn>, DriftCheckError> {
+    let mut conn = open_connection(config)?;
+    let mut columns = conn
+        .query_map(
+            build_checksum_columns_sql(table),
+            |(name, data_type, column_type): (String, String, String)| ChecksumColumn {
+                name,
+                data_type,
+                column_type,
+            },
+        )
+        .map_err(query_error)?;
+    let json_checks = query_json_check_clauses(&mut conn, table)?;
+    mark_json_alias_columns(&mut columns, &json_checks);
+    Ok(columns)
+}
+
+fn query_json_check_clauses(conn: &mut Conn, table: &str) -> Result<Vec<String>, DriftCheckError> {
+    conn.query::<String, _>(build_json_check_clauses_sql(table))
+        .map_err(query_error)
+}
+
+fn mark_json_alias_columns(columns: &mut [ChecksumColumn], check_clauses: &[String]) {
+    for column in columns {
+        if check_clauses
+            .iter()
+            .any(|clause| check_clause_references_json_column(clause, &column.name))
+        {
+            column.data_type = "json".to_string();
+        }
+    }
+}
+
+fn check_clause_references_json_column(clause: &str, column: &str) -> bool {
+    let lower_clause = clause.to_ascii_lowercase();
+    let lower_column = quote_ident(column).to_ascii_lowercase();
+    lower_clause.contains("json_valid") && lower_clause.contains(&lower_column)
+}
+
+fn query_primary_key_endpoints(
+    config: &QueryConnectionConfig,
+    table: &str,
+    primary_key: &[String],
+    start_after: Option<Vec<String>>,
+    limit: usize,
+) -> Result<Vec<Vec<String>>, DriftCheckError> {
+    let sql = build_primary_key_endpoints_sql(table, primary_key, start_after, limit)?;
+    query_rows(config, &sql)
+}
+
+fn query_chunk_checksum(
+    config: &QueryConnectionConfig,
+    table: &str,
+    primary_key: &[String],
+    columns: &[ChecksumColumn],
+    start_after: Option<Vec<String>>,
+    end_at: Option<Vec<String>>,
+) -> Result<(u64, u64), DriftCheckError> {
+    let sql = build_chunk_checksum_sql(&ChecksumRequest {
+        table: table.to_string(),
+        primary_key: primary_key.to_vec(),
+        columns: columns.to_vec(),
+        start_after,
+        end_at,
+    })
+    .map_err(DriftCheckError::Config)?;
+    query_required_scalar(config, &sql)
+}
+
 fn query_list(config: &QueryConnectionConfig, sql: &str) -> Result<Vec<String>, DriftCheckError> {
     let mut conn = open_connection(config)?;
     conn.query::<String, _>(sql).map_err(query_error)
 }
 
+fn query_rows(
+    config: &QueryConnectionConfig,
+    sql: &str,
+) -> Result<Vec<Vec<String>>, DriftCheckError> {
+    let mut conn = open_connection(config)?;
+    let rows = conn.query::<Row, _>(sql).map_err(query_error)?;
+    Ok(rows.into_iter().map(row_to_strings).collect())
+}
+
+fn query_required_scalar<T>(config: &QueryConnectionConfig, sql: &str) -> Result<T, DriftCheckError>
+where
+    T: FromRow,
+{
+    query_scalar(config, sql)?
+        .ok_or_else(|| DriftCheckError::Query("checksum query returned no rows".to_string()))
+}
+
 fn query_scalar<T>(config: &QueryConnectionConfig, sql: &str) -> Result<Option<T>, DriftCheckError>
 where
-    T: mysql::prelude::FromValue,
+    T: FromRow,
 {
     let mut conn = open_connection(config)?;
     conn.query_first::<T, _>(sql).map_err(query_error)
+}
+
+fn row_to_strings(row: Row) -> Vec<String> {
+    row.unwrap().into_iter().map(value_to_string).collect()
+}
+
+fn value_to_string(value: Value) -> String {
+    match value {
+        Value::NULL => String::new(),
+        Value::Bytes(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Value::Int(value) => value.to_string(),
+        Value::UInt(value) => value.to_string(),
+        Value::Float(value) => value.to_string(),
+        Value::Double(value) => value.to_string(),
+        Value::Date(year, month, day, hour, minute, second, micros) => {
+            format_date(year, month, day, hour, minute, second, micros)
+        }
+        Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            format_time(negative, days, hours, minutes, seconds, micros)
+        }
+    }
 }
 
 fn open_connection(config: &QueryConnectionConfig) -> Result<Conn, DriftCheckError> {
@@ -279,13 +603,25 @@ fn target_query_config(target: &TargetMySqlConfig) -> QueryConnectionConfig {
 
 fn format_drift_comparison(comparison: &DriftComparison) -> String {
     format!(
-        "drift_check_table table={} source_count={} target_count={} delta={} status={}",
+        "drift_check_table table={} source_count={} target_count={} delta={} status={}{}",
         comparison.table,
         format_count(comparison.source_count),
         format_count(comparison.target_count),
         format_delta(comparison.delta()),
-        comparison.status()
+        comparison.status(),
+        format_content_summary(comparison.content.as_ref())
     )
+}
+
+fn format_content_summary(content: Option<&ContentDriftSummary>) -> String {
+    content
+        .map(|content| {
+            format!(
+                " content_chunks={} content_mismatches={}",
+                content.chunks, content.mismatched_chunks
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn format_count(count: Option<u64>) -> String {
@@ -298,6 +634,90 @@ fn format_delta(delta: Option<i128>) -> String {
     delta
         .map(|delta| delta.to_string())
         .unwrap_or_else(|| "missing".to_string())
+}
+
+fn validate_bound_arity(
+    primary_key: &[String],
+    values: Option<&Vec<String>>,
+    label: &str,
+) -> Result<(), DriftCheckError> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    if values.len() != primary_key.len() {
+        return Err(DriftCheckError::Config(format!(
+            "{label} has {} values for {} primary-key columns",
+            values.len(),
+            primary_key.len()
+        )));
+    }
+    Ok(())
+}
+
+fn primary_key_bound_predicate(columns: &[String], values: &[String], operator: &str) -> String {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, _column)| primary_key_bound_branch(columns, values, index, operator))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn primary_key_bound_branch(
+    columns: &[String],
+    values: &[String],
+    index: usize,
+    operator: &str,
+) -> String {
+    let mut parts = Vec::new();
+    for equal_index in 0..index {
+        parts.push(format!(
+            "{} = {}",
+            quote_ident(&columns[equal_index]),
+            quote_sql_literal(&values[equal_index])
+        ));
+    }
+    parts.push(format!(
+        "{} {operator} {}",
+        quote_ident(&columns[index]),
+        quote_sql_literal(&values[index])
+    ));
+    format!("({})", parts.join(" AND "))
+}
+
+fn format_date(
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    micros: u32,
+) -> String {
+    if hour == 0 && minute == 0 && second == 0 && micros == 0 {
+        format!("{year:04}-{month:02}-{day:02}")
+    } else if micros == 0 {
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+    } else {
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}")
+    }
+}
+
+fn format_time(
+    negative: bool,
+    days: u32,
+    hours: u8,
+    minutes: u8,
+    seconds: u8,
+    micros: u32,
+) -> String {
+    let sign = if negative { "-" } else { "" };
+    let total_hours = days * 24 + u32::from(hours);
+    if micros == 0 {
+        format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +745,35 @@ mod tests {
     }
 
     #[test]
+    fn primary_key_endpoint_sql_rejects_bad_bound_arity() {
+        let error = build_primary_key_endpoints_sql(
+            "accounts",
+            &["tenant_id".to_string(), "id".to_string()],
+            Some(vec!["10".to_string()]),
+            100,
+        )
+        .expect_err("bad arity");
+
+        assert_eq!(
+            error.to_string(),
+            "start_after has 1 values for 2 primary-key columns"
+        );
+    }
+
+    #[test]
+    fn marks_mariadb_json_alias_columns_from_json_valid_checks() {
+        let mut columns = vec![ChecksumColumn {
+            name: "payload".to_string(),
+            data_type: "longtext".to_string(),
+            column_type: "longtext".to_string(),
+        }];
+
+        mark_json_alias_columns(&mut columns, &["json_valid(`payload`)".to_string()]);
+
+        assert_eq!(columns[0].data_type, "json");
+    }
+
+    #[test]
     fn formats_drift_report_with_match_and_mismatch_status() {
         let report = DriftCheckReport {
             comparisons: vec![
@@ -332,11 +781,13 @@ mod tests {
                     table: "accounts".to_string(),
                     source_count: Some(10),
                     target_count: Some(10),
+                    content: None,
                 },
                 DriftComparison {
                     table: "releases".to_string(),
                     source_count: Some(7),
                     target_count: Some(5),
+                    content: None,
                 },
             ],
         };
@@ -355,12 +806,38 @@ mod tests {
     }
 
     #[test]
+    fn formats_content_drift_as_mismatch_even_when_counts_match() {
+        let report = DriftCheckReport {
+            comparisons: vec![DriftComparison {
+                table: "accounts".to_string(),
+                source_count: Some(10),
+                target_count: Some(10),
+                content: Some(ContentDriftSummary {
+                    chunks: 3,
+                    mismatched_chunks: 1,
+                }),
+            }],
+        };
+
+        assert!(report.has_mismatches());
+        assert_eq!(
+            format_drift_report(&report),
+            [
+                "drift_check tables=1 mismatches=1",
+                "drift_check_table table=accounts source_count=10 target_count=10 delta=0 status=drift content_chunks=3 content_mismatches=1",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
     fn clean_report_has_no_mismatches() {
         let report = DriftCheckReport {
             comparisons: vec![DriftComparison {
                 table: "accounts".to_string(),
                 source_count: Some(10),
                 target_count: Some(10),
+                content: None,
             }],
         };
 

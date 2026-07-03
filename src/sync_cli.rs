@@ -60,6 +60,9 @@ fn default_sync_table_config() -> table_sync::SyncTableConfig {
         chunk_size: 1000,
         mode: table_sync::SyncMode::DryRun,
         progress_table: "cdc.table_sync_progress".to_string(),
+        start_after: None,
+        end_at: None,
+        max_deletes: Some(0),
     }
 }
 
@@ -82,6 +85,9 @@ fn sync_table_option(
         "--chunk-size" => config.chunk_size = crate::parse_usize(flag, value)?,
         "--mode" => config.mode = parse_sync_mode(value)?,
         "--progress-table" => config.progress_table = value.to_string(),
+        "--start-after" => config.start_after = Some(parse_csv_columns(value)),
+        "--end-at" => config.end_at = Some(parse_csv_columns(value)),
+        "--max-deletes" => config.max_deletes = Some(crate::parse_u64(flag, value)?),
         other => return Err(format!("unknown sync-table option: {other}")),
     }
 
@@ -142,6 +148,30 @@ fn validate_sync_table_config(config: &table_sync::SyncTableConfig) -> Result<()
     }
     if config.progress_table.is_empty() {
         return Err("progress table is required".to_string());
+    }
+    validate_bound_arity(
+        &config.table.primary_key,
+        config.start_after.as_ref(),
+        "start-after",
+    )?;
+    validate_bound_arity(&config.table.primary_key, config.end_at.as_ref(), "end-at")?;
+    Ok(())
+}
+
+fn validate_bound_arity(
+    primary_key: &[String],
+    values: Option<&Vec<String>>,
+    label: &str,
+) -> Result<(), String> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    if values.len() != primary_key.len() {
+        return Err(format!(
+            "{label} has {} values for {} primary-key columns",
+            values.len(),
+            primary_key.len()
+        ));
     }
     Ok(())
 }
@@ -243,6 +273,7 @@ mod tests {
         assert_eq!(config.chunk_size, 1000);
         assert_eq!(config.mode, table_sync::SyncMode::DryRun);
         assert_eq!(config.progress_table, "cdc.table_sync_progress");
+        assert_eq!(config.max_deletes, Some(0));
     }
 
     #[test]
@@ -263,6 +294,42 @@ mod tests {
         assert_eq!(config.chunk_size, 250);
         assert_eq!(config.mode, table_sync::SyncMode::Apply);
         assert_eq!(config.progress_table, "cdc.table_sync_progress");
+    }
+
+    #[test]
+    fn parses_range_bounds_for_targeted_repair() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let config = parse_sync_table_config(required_args([
+            "--start-after",
+            "10",
+            "--end-at",
+            "20",
+            "--max-deletes",
+            "5",
+        ]))
+        .expect("sync-table config");
+
+        assert_eq!(config.start_after, Some(vec!["10".to_string()]));
+        assert_eq!(config.end_at, Some(vec!["20".to_string()]));
+        assert_eq!(config.max_deletes, Some(5));
+    }
+
+    #[test]
+    fn rejects_range_bounds_with_wrong_composite_primary_key_arity() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let error = parse_sync_table_config(required_args([
+            "--primary-key",
+            "tenant_id,id",
+            "--start-after",
+            "10",
+        ]))
+        .expect_err("bad arity");
+
+        assert_eq!(error, "start-after has 1 values for 2 primary-key columns");
     }
 
     #[test]
