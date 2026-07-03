@@ -1,6 +1,6 @@
 use crate::errors::Error;
 use crate::events::row_events::mysql_value::{Date, DateTime, Time};
-use crate::extensions::{read_bitmap_big_endian, read_string};
+use crate::extensions::read_bitmap_big_endian;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 
@@ -10,7 +10,9 @@ pub fn parse_string(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<String,
     } else {
         cursor.read_u16::<LittleEndian>()? as usize
     };
-    Ok(read_string(cursor, length)?)
+    let mut bytes = vec![0; length];
+    cursor.read_exact(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub fn parse_bit(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<Vec<bool>, Error> {
@@ -25,6 +27,22 @@ pub fn parse_blob(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<Vec<u8>, 
     let mut vec = vec![0; length];
     cursor.read_exact(&mut vec)?;
     Ok(vec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_string_preserves_non_utf8_bytes_lossily() {
+        let bytes = [32, 162, 115, 146, 171, 116, 13, 97, 107, 102, 172, 93, 36, 187, 4, 11, 70, 81, 244, 255, 170, 85, 181, 120, 171, 186, 118, 3, 196, 183, 63, 234, 164];
+        let mut cursor = Cursor::new(bytes.as_slice());
+
+        let value = parse_string(&mut cursor, 255).expect("lossy string parse");
+
+        assert!(value.contains('�'));
+        assert!(value.contains("akf"));
+    }
 }
 
 pub fn parse_year(cursor: &mut Cursor<&[u8]>, _metadata: u16) -> Result<u16, Error> {
