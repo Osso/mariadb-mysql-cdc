@@ -220,6 +220,7 @@ fn classify_binlog_events(
     (events, totals)
 }
 
+#[cfg(test)]
 fn parse_master_status(output: &str) -> Result<MasterStatus, ProbeError> {
     let mut lines = output.lines().filter(|line| !line.trim().is_empty());
     let line = lines
@@ -415,6 +416,7 @@ fn master_status_from_row(
     }
 }
 
+#[cfg(test)]
 fn build_binlog_args(
     config: &ProbeConfig,
     start: &BinlogCoordinate,
