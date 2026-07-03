@@ -1,4 +1,4 @@
-use super::{SyncChunkRequest, SyncTableReader, TableSyncError};
+use super::{SyncChunkRequest, SyncTableReader, TableSyncError, UpdatedSince};
 use crate::mysql_client::PersistentMySqlSource;
 use crate::snapshot::{SnapshotError, SnapshotRow};
 use std::cell::RefCell;
@@ -83,7 +83,18 @@ fn sync_bound_predicates(request: &SyncChunkRequest) -> Vec<String> {
             end_at,
         ));
     }
+    if let Some(updated_since) = &request.updated_since {
+        predicates.push(updated_since_predicate(updated_since));
+    }
     predicates
+}
+
+fn updated_since_predicate(updated_since: &UpdatedSince) -> String {
+    format!(
+        "{} >= {}",
+        quote_ident(&updated_since.column),
+        quote_sql_literal(&updated_since.value)
+    )
 }
 
 fn parse_sync_rows(

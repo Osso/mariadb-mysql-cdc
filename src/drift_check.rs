@@ -6,6 +6,9 @@ use mysql::prelude::{FromRow, Queryable};
 use mysql::{Conn, Opts, OptsBuilder, Row, SslOpts, Value};
 use std::fmt;
 
+const MIN_REPAIR_RANGE_ROWS: u64 = 100;
+const MAX_MISMATCH_RANGES: usize = 1000;
+
 #[derive(Clone, Debug)]
 pub struct DriftCheckConfig {
     pub source: MySqlConnectionConfig,
@@ -27,6 +30,16 @@ pub struct DriftComparison {
 pub struct ContentDriftSummary {
     pub chunks: u64,
     pub mismatched_chunks: u64,
+    pub mismatched_ranges: Vec<ContentDriftRange>,
+    pub range_limit_exceeded: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentDriftRange {
+    pub start_after: Option<Vec<String>>,
+    pub end_at: Option<Vec<String>>,
+    pub source_count: u64,
+    pub target_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,25 +110,51 @@ pub fn build_primary_key_endpoints_sql(
     start_after: Option<Vec<String>>,
     limit: usize,
 ) -> Result<String, DriftCheckError> {
+    build_primary_key_endpoints_range_sql(table, primary_key, start_after, None, limit)
+}
+
+pub fn build_primary_key_endpoints_range_sql(
+    table: &str,
+    primary_key: &[String],
+    start_after: Option<Vec<String>>,
+    end_at: Option<Vec<String>>,
+    limit: usize,
+) -> Result<String, DriftCheckError> {
     validate_bound_arity(primary_key, start_after.as_ref(), "start_after")?;
+    validate_bound_arity(primary_key, end_at.as_ref(), "end_at")?;
     let columns = primary_key
         .iter()
         .map(|column| quote_ident(column))
         .collect::<Vec<_>>()
         .join(", ");
     let order_by = columns.clone();
-    let bounds = start_after
-        .map(|start| {
-            format!(
-                " WHERE {}",
-                primary_key_bound_predicate(primary_key, &start, ">")
-            )
-        })
-        .unwrap_or_default();
+    let bounds = endpoint_bounds(primary_key, start_after, end_at);
     Ok(format!(
         "SELECT {columns} FROM {}{bounds} ORDER BY {order_by} LIMIT {limit}",
         quote_ident(table)
     ))
+}
+
+fn endpoint_bounds(
+    primary_key: &[String],
+    start_after: Option<Vec<String>>,
+    end_at: Option<Vec<String>>,
+) -> String {
+    let mut predicates = Vec::new();
+    if let Some(start) = start_after {
+        predicates.push(primary_key_bound_predicate(primary_key, &start, ">"));
+    }
+    if let Some(end) = end_at {
+        predicates.push(format!(
+            "NOT ({})",
+            primary_key_bound_predicate(primary_key, &end, ">")
+        ));
+    }
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", predicates.join(" AND "))
+    }
 }
 
 pub fn format_drift_report(report: &DriftCheckReport) -> String {
@@ -125,7 +164,10 @@ pub fn format_drift_report(report: &DriftCheckReport) -> String {
         report.comparisons.len()
     )];
 
-    lines.extend(report.comparisons.iter().map(format_drift_comparison));
+    for comparison in &report.comparisons {
+        lines.push(format_drift_comparison(comparison));
+        lines.extend(format_content_ranges(comparison));
+    }
     lines.join("\n")
 }
 
@@ -323,6 +365,8 @@ fn compare_checksum_chunks(
     let mut summary = ContentDriftSummary {
         chunks: 0,
         mismatched_chunks: 0,
+        mismatched_ranges: Vec::new(),
+        range_limit_exceeded: false,
     };
     let mut start_after = None;
 
@@ -351,18 +395,121 @@ fn record_checksum_comparison(
     start_after: Option<Vec<String>>,
     end_at: Option<Vec<String>>,
 ) -> Result<(), DriftCheckError> {
-    let source_checksum = checksum_for_range(
+    let comparison = compare_checksum_range(context, start_after, end_at)?;
+    summary.chunks += 1;
+    if comparison.is_mismatch() {
+        summary.mismatched_chunks += 1;
+        split_or_record_mismatch(summary, context, comparison)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChecksumRangeComparison {
+    start_after: Option<Vec<String>>,
+    end_at: Option<Vec<String>>,
+    source: (u64, u64),
+    target: (u64, u64),
+}
+
+impl ChecksumRangeComparison {
+    fn is_mismatch(&self) -> bool {
+        self.source != self.target
+    }
+
+    fn source_count(&self) -> u64 {
+        self.source.0
+    }
+
+    fn target_count(&self) -> u64 {
+        self.target.0
+    }
+
+    fn drift_range(&self) -> ContentDriftRange {
+        ContentDriftRange {
+            start_after: self.start_after.clone(),
+            end_at: self.end_at.clone(),
+            source_count: self.source_count(),
+            target_count: self.target_count(),
+        }
+    }
+}
+
+fn compare_checksum_range(
+    context: &ChecksumCompareContext,
+    start_after: Option<Vec<String>>,
+    end_at: Option<Vec<String>>,
+) -> Result<ChecksumRangeComparison, DriftCheckError> {
+    let source = checksum_for_range(
         context,
         &context.source,
         start_after.clone(),
         end_at.clone(),
     )?;
-    let target_checksum = checksum_for_range(context, &context.target, start_after, end_at)?;
-    summary.chunks += 1;
-    if source_checksum != target_checksum {
-        summary.mismatched_chunks += 1;
-    }
+    let target = checksum_for_range(
+        context,
+        &context.target,
+        start_after.clone(),
+        end_at.clone(),
+    )?;
+    Ok(ChecksumRangeComparison {
+        start_after,
+        end_at,
+        source,
+        target,
+    })
+}
+
+fn split_or_record_mismatch(
+    summary: &mut ContentDriftSummary,
+    context: &ChecksumCompareContext,
+    comparison: ChecksumRangeComparison,
+) -> Result<(), DriftCheckError> {
+    let Some(midpoint) = mismatch_midpoint(summary, context, &comparison)? else {
+        record_mismatched_range(summary, comparison.drift_range());
+        return Ok(());
+    };
+
+    record_checksum_comparison(
+        summary,
+        context,
+        comparison.start_after.clone(),
+        Some(midpoint.clone()),
+    )?;
+    record_checksum_comparison(summary, context, Some(midpoint), comparison.end_at)?;
     Ok(())
+}
+
+fn record_mismatched_range(summary: &mut ContentDriftSummary, range: ContentDriftRange) {
+    if summary.mismatched_ranges.len() >= MAX_MISMATCH_RANGES {
+        summary.range_limit_exceeded = true;
+    } else {
+        summary.mismatched_ranges.push(range);
+    }
+}
+
+fn mismatch_midpoint(
+    summary: &ContentDriftSummary,
+    context: &ChecksumCompareContext,
+    comparison: &ChecksumRangeComparison,
+) -> Result<Option<Vec<String>>, DriftCheckError> {
+    if summary.range_limit_exceeded
+        || summary.mismatched_ranges.len() >= MAX_MISMATCH_RANGES
+        || comparison.source_count() <= MIN_REPAIR_RANGE_ROWS
+    {
+        return Ok(None);
+    }
+    let split_size = (comparison.source_count() / 2) as usize;
+    let endpoints = query_primary_key_endpoints_in_range(
+        &context.source,
+        &context.table,
+        &context.primary_key,
+        comparison.start_after.clone(),
+        comparison.end_at.clone(),
+        split_size.max(1),
+    )?;
+    let midpoint = endpoints.last().cloned();
+    Ok(midpoint.filter(|value| Some(value.clone()) != comparison.end_at))
 }
 
 fn record_target_tail_checksum(
@@ -474,7 +621,19 @@ fn query_primary_key_endpoints(
     start_after: Option<Vec<String>>,
     limit: usize,
 ) -> Result<Vec<Vec<String>>, DriftCheckError> {
-    let sql = build_primary_key_endpoints_sql(table, primary_key, start_after, limit)?;
+    query_primary_key_endpoints_in_range(config, table, primary_key, start_after, None, limit)
+}
+
+fn query_primary_key_endpoints_in_range(
+    config: &QueryConnectionConfig,
+    table: &str,
+    primary_key: &[String],
+    start_after: Option<Vec<String>>,
+    end_at: Option<Vec<String>>,
+    limit: usize,
+) -> Result<Vec<Vec<String>>, DriftCheckError> {
+    let sql =
+        build_primary_key_endpoints_range_sql(table, primary_key, start_after, end_at, limit)?;
     query_rows(config, &sql)
 }
 
@@ -613,12 +772,46 @@ fn format_drift_comparison(comparison: &DriftComparison) -> String {
     )
 }
 
+fn format_content_ranges(comparison: &DriftComparison) -> Vec<String> {
+    comparison
+        .content
+        .as_ref()
+        .map(|content| {
+            content
+                .mismatched_ranges
+                .iter()
+                .map(|range| format_content_range(&comparison.table, range))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn format_content_range(table: &str, range: &ContentDriftRange) -> String {
+    format!(
+        "drift_check_range table={} start_after_json={} end_at_json={} source_count={} target_count={}",
+        table,
+        format_key_bound_json(range.start_after.as_ref()),
+        format_key_bound_json(range.end_at.as_ref()),
+        range.source_count,
+        range.target_count
+    )
+}
+
+fn format_key_bound_json(bound: Option<&Vec<String>>) -> String {
+    bound
+        .map(|values| serde_json::to_string(values).expect("serialize key bound"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
 fn format_content_summary(content: Option<&ContentDriftSummary>) -> String {
     content
         .map(|content| {
             format!(
-                " content_chunks={} content_mismatches={}",
-                content.chunks, content.mismatched_chunks
+                " content_chunks={} content_mismatches={} content_ranges={} content_range_limit_exceeded={}",
+                content.chunks,
+                content.mismatched_chunks,
+                content.mismatched_ranges.len(),
+                content.range_limit_exceeded
             )
         })
         .unwrap_or_default()
@@ -815,6 +1008,13 @@ mod tests {
                 content: Some(ContentDriftSummary {
                     chunks: 3,
                     mismatched_chunks: 1,
+                    mismatched_ranges: vec![ContentDriftRange {
+                        start_after: Some(vec!["10,tenant".to_string()]),
+                        end_at: Some(vec!["11".to_string()]),
+                        source_count: 1,
+                        target_count: 1,
+                    }],
+                    range_limit_exceeded: false,
                 }),
             }],
         };
@@ -824,7 +1024,8 @@ mod tests {
             format_drift_report(&report),
             [
                 "drift_check tables=1 mismatches=1",
-                "drift_check_table table=accounts source_count=10 target_count=10 delta=0 status=drift content_chunks=3 content_mismatches=1",
+                "drift_check_table table=accounts source_count=10 target_count=10 delta=0 status=drift content_chunks=3 content_mismatches=1 content_ranges=1 content_range_limit_exceeded=false",
+                "drift_check_range table=accounts start_after_json=[\"10,tenant\"] end_at_json=[\"11\"] source_count=1 target_count=1",
             ]
             .join("\n")
         );

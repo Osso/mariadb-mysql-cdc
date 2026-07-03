@@ -97,7 +97,11 @@ Catchup snapshot options:
   --progress-table TABLE          Target checkpoint table. Defaults to cdc.table_sync_progress.
   --start-after CSV               Primary-key lower bound for targeted sync-table repair.
   --end-at CSV                    Primary-key upper bound for targeted sync-table repair.
+  --start-after-json JSON         Primary-key lower bound as JSON string array; use for values containing commas.
+  --end-at-json JSON              Primary-key upper bound as JSON string array; use for values containing commas.
   --max-deletes COUNT             Maximum target orphan deletes allowed in sync-table apply mode. Defaults to 0.
+  --updated-at-column COLUMN      Source update timestamp column for update_time accelerator.
+  --updated-since VALUE           Upsert source rows where updated-at column is >= VALUE. Does not delete orphans; run checksum validation after.
   --chunk-size ROWS               Rows per chunk. Defaults to 10000.
   --throttle-ms MS                Sleep after each copied chunk. Defaults to 0.
 ";

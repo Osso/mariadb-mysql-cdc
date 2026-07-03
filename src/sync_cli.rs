@@ -63,6 +63,7 @@ fn default_sync_table_config() -> table_sync::SyncTableConfig {
         start_after: None,
         end_at: None,
         max_deletes: Some(0),
+        updated_since: None,
     }
 }
 
@@ -87,7 +88,11 @@ fn sync_table_option(
         "--progress-table" => config.progress_table = value.to_string(),
         "--start-after" => config.start_after = Some(parse_csv_columns(value)),
         "--end-at" => config.end_at = Some(parse_csv_columns(value)),
+        "--start-after-json" => config.start_after = Some(parse_json_columns(flag, value)?),
+        "--end-at-json" => config.end_at = Some(parse_json_columns(flag, value)?),
         "--max-deletes" => config.max_deletes = Some(crate::parse_u64(flag, value)?),
+        "--updated-at-column" => set_updated_since_column(config, value),
+        "--updated-since" => set_updated_since_value(config, value),
         other => return Err(format!("unknown sync-table option: {other}")),
     }
 
@@ -131,6 +136,27 @@ fn target_option(
     Ok(true)
 }
 
+fn set_updated_since_column(config: &mut table_sync::SyncTableConfig, value: &str) {
+    config
+        .updated_since
+        .get_or_insert_with(empty_updated_since)
+        .column = value.to_string();
+}
+
+fn set_updated_since_value(config: &mut table_sync::SyncTableConfig, value: &str) {
+    config
+        .updated_since
+        .get_or_insert_with(empty_updated_since)
+        .value = value.to_string();
+}
+
+fn empty_updated_since() -> table_sync::UpdatedSince {
+    table_sync::UpdatedSince {
+        column: String::new(),
+        value: String::new(),
+    }
+}
+
 fn validate_sync_table_config(config: &table_sync::SyncTableConfig) -> Result<(), String> {
     validate_source_connection(&config.source)?;
     validate_target_connection(&config.target)?;
@@ -155,6 +181,29 @@ fn validate_sync_table_config(config: &table_sync::SyncTableConfig) -> Result<()
         "start-after",
     )?;
     validate_bound_arity(&config.table.primary_key, config.end_at.as_ref(), "end-at")?;
+    validate_updated_since(config)?;
+    Ok(())
+}
+
+fn validate_updated_since(config: &table_sync::SyncTableConfig) -> Result<(), String> {
+    let Some(updated_since) = &config.updated_since else {
+        return Ok(());
+    };
+    if updated_since.column.is_empty() {
+        return Err("updated-at column is required when updated-since is set".to_string());
+    }
+    if updated_since.value.is_empty() {
+        return Err("updated-since value is required when updated-at column is set".to_string());
+    }
+    if config.start_after.is_some() || config.end_at.is_some() {
+        return Err("updated-since cannot be combined with start-after or end-at".to_string());
+    }
+    if !config.table.columns.contains(&updated_since.column) {
+        return Err(format!(
+            "updated-at column `{}` must be included in columns",
+            updated_since.column
+        ));
+    }
     Ok(())
 }
 
@@ -208,6 +257,11 @@ fn validate_target_connection(target: &live::TargetMySqlConfig) -> Result<(), St
         return Err("target database is required".to_string());
     }
     Ok(())
+}
+
+fn parse_json_columns(flag: &str, value: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str::<Vec<String>>(value)
+        .map_err(|error| format!("{flag} must be a JSON string array: {error}"))
 }
 
 fn parse_csv_columns(value: &str) -> Vec<String> {
@@ -314,6 +368,97 @@ mod tests {
         assert_eq!(config.start_after, Some(vec!["10".to_string()]));
         assert_eq!(config.end_at, Some(vec!["20".to_string()]));
         assert_eq!(config.max_deletes, Some(5));
+    }
+
+    #[test]
+    fn parses_updated_since_accelerator_options() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let config = parse_sync_table_config(required_args([
+            "--columns",
+            "id,slug,updated_at",
+            "--updated-at-column",
+            "updated_at",
+            "--updated-since",
+            "2026-06-01 00:00:00",
+        ]))
+        .expect("sync-table config");
+
+        assert_eq!(
+            config.updated_since,
+            Some(table_sync::UpdatedSince {
+                column: "updated_at".to_string(),
+                value: "2026-06-01 00:00:00".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_updated_since_column_missing_from_selected_columns() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let error = parse_sync_table_config(required_args([
+            "--updated-at-column",
+            "updated_at",
+            "--updated-since",
+            "2026-06-01 00:00:00",
+        ]))
+        .expect_err("missing column");
+
+        assert_eq!(
+            error,
+            "updated-at column `updated_at` must be included in columns"
+        );
+    }
+
+    #[test]
+    fn parses_json_range_bounds_for_values_containing_commas() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let config = parse_sync_table_config(required_args([
+            "--start-after-json",
+            "[\"tenant,1\",\"10\"]",
+            "--end-at-json",
+            "[\"tenant,1\",\"20\"]",
+            "--primary-key",
+            "tenant_id,id",
+        ]))
+        .expect("sync-table config");
+
+        assert_eq!(
+            config.start_after,
+            Some(vec!["tenant,1".to_string(), "10".to_string()])
+        );
+        assert_eq!(
+            config.end_at,
+            Some(vec!["tenant,1".to_string(), "20".to_string()])
+        );
+    }
+
+    #[test]
+    fn rejects_updated_since_combined_with_primary_key_bounds() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let error = parse_sync_table_config(required_args([
+            "--columns",
+            "id,slug,updated_at",
+            "--updated-at-column",
+            "updated_at",
+            "--updated-since",
+            "2026-06-01 00:00:00",
+            "--start-after",
+            "10",
+        ]))
+        .expect_err("conflicting bounds");
+
+        assert_eq!(
+            error,
+            "updated-since cannot be combined with start-after or end-at"
+        );
     }
 
     #[test]

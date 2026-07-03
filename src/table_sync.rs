@@ -26,6 +26,7 @@ pub struct SyncTableConfig {
     pub start_after: Option<Vec<String>>,
     pub end_at: Option<Vec<String>>,
     pub max_deletes: Option<u64>,
+    pub updated_since: Option<UpdatedSince>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncTable {
@@ -41,7 +42,14 @@ pub struct SyncChunkRequest {
     pub columns: Vec<String>,
     pub start_after: Option<Vec<String>>,
     pub end_at: Option<Vec<String>>,
+    pub updated_since: Option<UpdatedSince>,
     pub limit: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdatedSince {
+    pub column: String,
+    pub value: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +134,55 @@ pub fn sync_table_with_progress(
         None,
         Some(0),
     )
+}
+
+pub fn sync_recent_updates(
+    table: &SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    source: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    updated_since: UpdatedSince,
+) -> Result<SyncTableReport, TableSyncError> {
+    validate_sync_table(table, chunk_size)?;
+    let mut report = SyncTableReport {
+        table: table.name.clone(),
+        ..SyncTableReport::default()
+    };
+    let mut start_after = None;
+
+    loop {
+        let source_rows = read_recent_update_chunk(
+            table,
+            chunk_size,
+            source,
+            start_after.clone(),
+            updated_since.clone(),
+        )?;
+        if source_rows.is_empty() {
+            return Ok(report);
+        }
+        apply_recent_update_chunk(&source_rows, mode, repair_target, &mut report)?;
+        start_after = Some(last_primary_key(&source_rows)?);
+        if source_rows.len() < chunk_size {
+            return Ok(report);
+        }
+    }
+}
+
+fn read_recent_update_chunk(
+    table: &SyncTable,
+    chunk_size: usize,
+    source: &impl SyncTableReader,
+    start_after: Option<Vec<String>>,
+    updated_since: UpdatedSince,
+) -> Result<Vec<SnapshotRow>, TableSyncError> {
+    source.read_rows(&sync_chunk_request_with_updated_since(
+        table,
+        start_after,
+        chunk_size,
+        updated_since,
+    ))
 }
 
 pub fn sync_table_with_progress_range(
@@ -227,13 +284,7 @@ where
     P: SyncProgressStore,
 {
     let end_at = last_primary_key(source_rows)?;
-    let target_rows = read_target_window(
-        context.table,
-        context.start_after.clone(),
-        Some(end_at.clone()),
-        context.chunk_size,
-        context.target,
-    )?;
+    let target_rows = read_source_bounded_target_window(context, &end_at)?;
     repair_chunk(
         source_rows,
         &target_rows,
@@ -242,14 +293,47 @@ where
         context.report,
         context.max_deletes,
     )?;
+    record_repaired_source_chunk(context, source_rows.len(), end_at.clone())?;
+    Ok(end_at)
+}
+
+fn read_source_bounded_target_window<S, T, R, P>(
+    context: &SyncChunkContext<'_, S, T, R, P>,
+    end_at: &[String],
+) -> Result<Vec<SnapshotRow>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    read_target_window(
+        context.table,
+        context.start_after.clone(),
+        Some(end_at.to_vec()),
+        context.chunk_size,
+        context.target,
+    )
+}
+
+fn record_repaired_source_chunk<S, T, R, P>(
+    context: &mut SyncChunkContext<'_, S, T, R, P>,
+    row_count: usize,
+    end_at: Vec<String>,
+) -> Result<(), TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
     record_sync_chunk(
         context.progress,
         context.report,
-        source_rows.len(),
-        end_at.clone(),
+        row_count,
+        end_at,
         context.progress_store,
-    )?;
-    Ok(end_at)
+    )
 }
 
 fn repair_target_tail<S, T, R, P>(
@@ -363,33 +447,87 @@ fn read_target_window(
 }
 
 pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, TableSyncError> {
+    validate_sync_table_config(config)?;
     let source = MySqlSyncReader::new(config.source.clone());
     let target = MySqlSyncReader::new(target_connection_config(config));
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
-        .map_err(|error| TableSyncError::Repair(error.to_string()))?;
     let mut progress_store =
         progress::MySqlSyncProgressStore::new(config.target.clone(), config.progress_table.clone());
-    let mut repair_target = crate::target::TargetMySqlWriter::from_snapshot_table(
-        &snapshot_table(&config.table),
-        executor,
-        crate::target::SnapshotInsertMode::IgnoreDuplicate,
-    );
-    let result = sync_table_with_progress_range(
-        &config.table,
-        config.chunk_size,
-        config.mode,
+    let mut repair_target = mysql_repair_target(config)?;
+    let result = run_sync_table_with_targets(
+        config,
         &source,
         &target,
         &mut repair_target,
         &mut progress_store,
-        config.start_after.clone(),
-        config.end_at.clone(),
-        config.max_deletes,
     );
     if let Err(error) = &result {
         progress_store.save_error(&config.table.name, error)?;
     }
     result
+}
+
+fn mysql_repair_target(
+    config: &SyncTableConfig,
+) -> Result<
+    crate::target::TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
+    TableSyncError,
+> {
+    let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
+        .map_err(|error| TableSyncError::Repair(error.to_string()))?;
+    Ok(crate::target::TargetMySqlWriter::from_snapshot_table(
+        &snapshot_table(&config.table),
+        executor,
+        sync_insert_mode(config),
+    ))
+}
+
+fn run_sync_table_with_targets(
+    config: &SyncTableConfig,
+    source: &impl SyncTableReader,
+    target: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableReport, TableSyncError> {
+    if let Some(updated_since) = &config.updated_since {
+        sync_recent_updates(
+            &config.table,
+            config.chunk_size,
+            config.mode,
+            source,
+            repair_target,
+            updated_since.clone(),
+        )
+    } else {
+        sync_table_with_progress_range(
+            &config.table,
+            config.chunk_size,
+            config.mode,
+            source,
+            target,
+            repair_target,
+            progress_store,
+            config.start_after.clone(),
+            config.end_at.clone(),
+            config.max_deletes,
+        )
+    }
+}
+
+fn validate_sync_table_config(config: &SyncTableConfig) -> Result<(), TableSyncError> {
+    if config.updated_since.is_some() && (config.start_after.is_some() || config.end_at.is_some()) {
+        return Err(TableSyncError::InvalidTable(
+            "updated_since cannot be combined with start_after or end_at".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn sync_insert_mode(config: &SyncTableConfig) -> crate::target::SnapshotInsertMode {
+    if config.updated_since.is_some() {
+        crate::target::SnapshotInsertMode::Upsert
+    } else {
+        crate::target::SnapshotInsertMode::IgnoreDuplicate
+    }
 }
 
 fn target_connection_config(
@@ -464,6 +602,18 @@ fn validate_sync_table(table: &SyncTable, chunk_size: usize) -> Result<(), Table
     Ok(())
 }
 
+fn sync_chunk_request_with_updated_since(
+    table: &SyncTable,
+    start_after: Option<Vec<String>>,
+    limit: usize,
+    updated_since: UpdatedSince,
+) -> SyncChunkRequest {
+    SyncChunkRequest {
+        updated_since: Some(updated_since),
+        ..sync_chunk_request(table, start_after, None, limit)
+    }
+}
+
 fn sync_chunk_request(
     table: &SyncTable,
     start_after: Option<Vec<String>>,
@@ -476,6 +626,7 @@ fn sync_chunk_request(
         columns: table.columns.clone(),
         start_after,
         end_at,
+        updated_since: None,
         limit,
     }
 }
@@ -547,6 +698,23 @@ fn repair_row_difference(
             context.report.extra_target_rows += 1;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn apply_recent_update_chunk(
+    source_rows: &[SnapshotRow],
+    mode: SyncMode,
+    repair_target: &mut impl SyncRepairTarget,
+    report: &mut SyncTableReport,
+) -> Result<(), TableSyncError> {
+    report.chunks += 1;
+    report.rows_scanned += source_rows.len() as u64;
+    report.updates += source_rows.len() as u64;
+    if mode == SyncMode::Apply {
+        for row in source_rows {
+            repair_target.insert_row(row)?;
+        }
     }
     Ok(())
 }
@@ -703,6 +871,62 @@ mod tests {
             "sync repair failed: delete safety threshold exceeded: max_deletes=0"
         );
         assert!(repair_target.deletes.borrow().is_empty());
+    }
+
+    #[test]
+    fn recent_update_sync_upserts_filtered_source_rows_without_deletes() {
+        let source = FakeReader::new(vec![
+            row_with_updated_at("1", "alpha", "2026-05-01 00:00:00"),
+            row_with_updated_at("2", "bravo", "2026-06-02 00:00:00"),
+        ]);
+        let mut repair_target = RecordingRepairTarget::default();
+
+        let report = sync_recent_updates(
+            &account_table_with_updated_at(),
+            10,
+            SyncMode::Apply,
+            &source,
+            &mut repair_target,
+            UpdatedSince {
+                column: "updated_at".to_string(),
+                value: "2026-06-01 00:00:00".to_string(),
+            },
+        )
+        .expect("recent sync");
+
+        assert_eq!(report.rows_scanned, 1);
+        assert_eq!(report.updates, 1);
+        assert_eq!(
+            repair_target.inserts.borrow().as_slice(),
+            &[row_with_updated_at("2", "bravo", "2026-06-02 00:00:00")]
+        );
+        assert!(repair_target.deletes.borrow().is_empty());
+    }
+
+    #[test]
+    fn core_config_rejects_updated_since_with_primary_key_bounds() {
+        let config = SyncTableConfig {
+            source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
+            target: crate::live::TargetMySqlConfig::default(),
+            table: account_table_with_updated_at(),
+            chunk_size: 10,
+            mode: SyncMode::DryRun,
+            progress_table: "cdc.table_sync_progress".to_string(),
+            start_after: Some(vec!["10".to_string()]),
+            end_at: None,
+            max_deletes: Some(0),
+            updated_since: Some(UpdatedSince {
+                column: "updated_at".to_string(),
+                value: "2026-06-01 00:00:00".to_string(),
+            }),
+        };
+
+        let error = validate_sync_table_config(&config).expect_err("conflicting config");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid sync table: updated_since cannot be combined with start_after or end_at"
+        );
     }
 
     #[test]
@@ -894,12 +1118,34 @@ mod tests {
             columns: vec!["id".to_string(), "name".to_string()],
             start_after: Some(vec!["10".to_string()]),
             end_at: Some(vec!["20".to_string()]),
+            updated_since: None,
             limit: 100,
         });
 
         assert_eq!(
             sql,
             "SELECT `id`, `name` FROM `accounts` WHERE (`id` > '10') AND NOT ((`id` > '20')) ORDER BY `id` LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn builds_sync_select_with_updated_since_filter() {
+        let sql = build_sync_select_sql(&SyncChunkRequest {
+            table: "accounts".to_string(),
+            primary_key: vec!["id".to_string()],
+            columns: vec!["id".to_string(), "updated_at".to_string()],
+            start_after: Some(vec!["10".to_string()]),
+            end_at: None,
+            updated_since: Some(UpdatedSince {
+                column: "updated_at".to_string(),
+                value: "2026-06-01 00:00:00".to_string(),
+            }),
+            limit: 100,
+        });
+
+        assert_eq!(
+            sql,
+            "SELECT `id`, `updated_at` FROM `accounts` WHERE (`id` > '10') AND `updated_at` >= '2026-06-01 00:00:00' ORDER BY `id` LIMIT 100"
         );
     }
 
@@ -911,12 +1157,35 @@ mod tests {
         }
     }
 
+    fn account_table_with_updated_at() -> SyncTable {
+        SyncTable {
+            name: "accounts".to_string(),
+            primary_key: vec!["id".to_string()],
+            columns: vec![
+                "id".to_string(),
+                "name".to_string(),
+                "updated_at".to_string(),
+            ],
+        }
+    }
+
     fn row(id: &str, name: &str) -> SnapshotRow {
         SnapshotRow {
             primary_key: vec![id.to_string()],
             values: BTreeMap::from([
                 ("id".to_string(), id.to_string()),
                 ("name".to_string(), name.to_string()),
+            ]),
+        }
+    }
+
+    fn row_with_updated_at(id: &str, name: &str, updated_at: &str) -> SnapshotRow {
+        SnapshotRow {
+            primary_key: vec![id.to_string()],
+            values: BTreeMap::from([
+                ("id".to_string(), id.to_string()),
+                ("name".to_string(), name.to_string()),
+                ("updated_at".to_string(), updated_at.to_string()),
             ]),
         }
     }
@@ -960,7 +1229,12 @@ mod tests {
             .end_at
             .as_ref()
             .is_none_or(|end| row.primary_key <= *end);
-        after_start && before_end
+        let after_update = request.updated_since.as_ref().is_none_or(|updated_since| {
+            row.values
+                .get(&updated_since.column)
+                .is_some_and(|value| value >= &updated_since.value)
+        });
+        after_start && before_end && after_update
     }
 
     #[derive(Default)]
