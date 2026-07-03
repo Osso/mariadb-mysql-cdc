@@ -174,13 +174,21 @@ impl TableSchemaResolver for SourceInventorySchemaResolver {
             .filter(|column| is_signed_integer_column(&column.data_type, &column.column_type))
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
+        let enum_columns = table
+            .columns
+            .iter()
+            .filter_map(|column| {
+                parse_enum_column_type(&column.column_type)
+                    .map(|values| (column.name.clone(), values))
+            })
+            .collect::<BTreeMap<_, _>>();
         validate_column_count(schema, &table.name, column_count, &columns)?;
         Ok(ResolvedTableSchema {
             columns,
             primary_key: table.primary_key.clone(),
             generated_columns,
             signed_columns,
-            enum_columns: BTreeMap::new(),
+            enum_columns,
         })
     }
 }
@@ -667,7 +675,15 @@ where
             .primary_key
             .clone(),
     };
-    let enum_columns = enum_columns_from_metadata(table_map, metadata, &columns)?;
+    let metadata_enum_columns = enum_columns_from_metadata(table_map, metadata, &columns)?;
+    let enum_columns = if metadata_enum_columns.is_empty() {
+        fallback_schema
+            .as_ref()
+            .map(|schema| schema.enum_columns.clone())
+            .unwrap_or_default()
+    } else {
+        metadata_enum_columns
+    };
     let (generated_columns, signed_columns) = fallback_schema
         .map(|schema| (schema.generated_columns, schema.signed_columns))
         .unwrap_or_default();
@@ -714,6 +730,45 @@ fn enum_columns_from_metadata(
             Ok((column, values.clone()))
         })
         .collect()
+}
+
+fn parse_enum_column_type(column_type: &str) -> Option<Vec<String>> {
+    let values = column_type.strip_prefix("enum(")?.strip_suffix(')')?;
+    Some(parse_sql_string_list(values))
+}
+
+fn parse_sql_string_list(values: &str) -> Vec<String> {
+    let mut parsed = Vec::new();
+    let mut chars = values.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\'' {
+            parsed.push(parse_sql_string_value(&mut chars));
+        }
+    }
+    parsed
+}
+
+fn parse_sql_string_value<I>(chars: &mut std::iter::Peekable<I>) -> String
+where
+    I: Iterator<Item = char>,
+{
+    let mut value = String::new();
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' if chars.peek() == Some(&'\'') => {
+                value.push('\'');
+                chars.next();
+            }
+            '\'' => break,
+            '\\' => {
+                if let Some(escaped) = chars.next() {
+                    value.push(escaped);
+                }
+            }
+            _ => value.push(character),
+        }
+    }
+    value
 }
 
 fn is_signed_integer_column(data_type: &str, column_type: &str) -> bool {

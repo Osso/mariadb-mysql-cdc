@@ -236,6 +236,53 @@ fn metadata_table_map_supplies_column_names_and_primary_keys() {
 }
 
 #[test]
+fn metadata_table_map_uses_inventory_enum_values_when_metadata_omits_them() {
+    let resolver = ReleasesSchemaResolver;
+    let table_map = MysqlCdcTableMapEvent {
+        table_id: 78,
+        database_name: "app".to_string(),
+        table_name: "releases".to_string(),
+        column_types: vec![3, MYSQL_COLUMN_TYPE_ENUM],
+        column_metadata: vec![0, 1],
+        null_bitmap: vec![false, true],
+        table_metadata: Some(TableMetadata {
+            signedness: None,
+            default_charset: None,
+            column_charsets: None,
+            column_names: Some(vec!["id".to_string(), "public_time_delta".to_string()]),
+            set_string_values: None,
+            enum_string_values: None,
+            geometry_types: None,
+            simple_primary_keys: Some(vec![0]),
+            primary_keys_with_prefix: None,
+            enum_and_set_default_charset: None,
+            enum_and_set_column_charsets: None,
+            column_visibility: None,
+        }),
+    };
+
+    let mapped = map_table_map_event(&stream_coordinate(100), &table_map, &resolver)
+        .expect("map table metadata");
+
+    assert_eq!(
+        mapped.table.enum_columns.get("public_time_delta"),
+        Some(&vec!["1".to_string(), "2".to_string(), "14".to_string()])
+    );
+}
+
+#[test]
+fn parses_enum_values_from_inventory_column_type() {
+    assert_eq!(
+        parse_enum_column_type("enum('1','2','14')"),
+        Some(vec!["1".to_string(), "2".to_string(), "14".to_string()])
+    );
+    assert_eq!(
+        parse_enum_column_type("enum('can''t','back\\\\slash')"),
+        Some(vec!["can't".to_string(), "back\\slash".to_string()])
+    );
+}
+
+#[test]
 fn fixture_row_events_apply_through_row_applier_with_schema_resolver() {
     let events = fixture_events("fixtures/mixed-binlog/mysql-bin.000001");
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
@@ -837,6 +884,31 @@ fn schema(columns: Vec<&str>) -> ResolvedTableSchema {
         generated_columns: Vec::new(),
         signed_columns: Vec::new(),
         enum_columns: BTreeMap::new(),
+    }
+}
+
+struct ReleasesSchemaResolver;
+
+impl TableSchemaResolver for ReleasesSchemaResolver {
+    fn resolve_table_schema(
+        &self,
+        schema: &str,
+        table: &str,
+        column_count: usize,
+    ) -> Result<ResolvedTableSchema, ApplyBinlogError> {
+        assert_eq!(schema, "app");
+        assert_eq!(table, "releases");
+        assert_eq!(column_count, 2);
+        Ok(ResolvedTableSchema {
+            columns: vec!["id".to_string(), "public_time_delta".to_string()],
+            primary_key: vec!["id".to_string()],
+            generated_columns: Vec::new(),
+            signed_columns: Vec::new(),
+            enum_columns: BTreeMap::from([(
+                "public_time_delta".to_string(),
+                vec!["1".to_string(), "2".to_string(), "14".to_string()],
+            )]),
+        })
     }
 }
 
