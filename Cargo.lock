@@ -636,8 +636,6 @@ dependencies = [
 [[package]]
 name = "mysql_cdc"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "907adf55305fdcf303883346c5450ca766aee90ff581cca346be8851e42db847"
 dependencies = [
  "byteorder",
  "hex",
