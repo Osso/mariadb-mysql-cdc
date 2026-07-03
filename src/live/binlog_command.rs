@@ -1,32 +1,17 @@
 use super::{ApplyBinlogConfig, ApplyBinlogError, SourceBinlogConfig};
-use std::process::Command;
 
 #[cfg(test)]
 const FNV_OFFSET_BASIS: u32 = 2_166_136_261;
 #[cfg(test)]
 const FNV_PRIME: u32 = 16_777_619;
 
-pub(super) fn read_remote_binlog(config: &ApplyBinlogConfig) -> Result<String, ApplyBinlogError> {
-    let args = binlog_args(&config.source);
-    let output = Command::new(&config.mariadb_binlog)
-        .args(args)
-        .output()
-        .map_err(|error| {
-            ApplyBinlogError::SourceCommand(format!("failed to run mariadb-binlog: {error}"))
-        })?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(ApplyBinlogError::SourceCommand(format!(
-            "mariadb-binlog exited with {}: {}",
-            output.status,
-            stderr.trim()
-        )))
-    }
+pub(super) fn read_remote_binlog(_config: &ApplyBinlogConfig) -> Result<String, ApplyBinlogError> {
+    Err(ApplyBinlogError::SourceCommand(
+        "apply-binlog text mode was removed; use stream-binlog native replication".to_string(),
+    ))
 }
 
+#[cfg(test)]
 fn binlog_args(source: &SourceBinlogConfig) -> Vec<String> {
     let mut args = vec![
         "--read-from-remote-server".to_string(),
