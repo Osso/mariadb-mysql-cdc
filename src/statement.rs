@@ -203,7 +203,7 @@ fn classify_statement(sql: &str) -> StatementDecision {
         return StatementDecision::Quarantine(QuarantineReason::EmptyStatement);
     }
 
-    if contains_multi_statement(sql) {
+    if contains_multi_statement(sql) && !is_compound_body_ddl(sql) {
         return StatementDecision::Quarantine(QuarantineReason::MultiStatement);
     }
 
@@ -311,7 +311,7 @@ fn find_unsafe_pattern(sql: &str) -> Option<String> {
         "INTO OUTFILE",
         "INTO DUMPFILE",
         "LOAD DATA",
-        "DEFINER=",
+        "DEFINER",
         "SQL SECURITY DEFINER",
     ];
 
@@ -436,24 +436,53 @@ fn is_known_compatible_dml(sql: &str) -> bool {
         || upper.starts_with("REPLACE INTO ")
 }
 
+const COMPATIBLE_DDL_PREFIXES: &[&str] = &[
+    "ALTER EVENT ",
+    "ALTER FUNCTION ",
+    "ALTER PROCEDURE ",
+    "ALTER TABLE ",
+    "ALTER VIEW ",
+    "CREATE DATABASE ",
+    "CREATE EVENT ",
+    "CREATE FUNCTION ",
+    "CREATE INDEX ",
+    "CREATE OR REPLACE VIEW ",
+    "CREATE PROCEDURE ",
+    "CREATE TABLE ",
+    "CREATE TRIGGER ",
+    "CREATE UNIQUE INDEX ",
+    "CREATE VIEW ",
+    "DROP DATABASE ",
+    "DROP EVENT ",
+    "DROP FUNCTION ",
+    "DROP INDEX ",
+    "DROP PROCEDURE ",
+    "DROP TABLE ",
+    "DROP TRIGGER ",
+    "DROP VIEW ",
+    "RENAME TABLE ",
+    "TRUNCATE ",
+];
+
+const COMPOUND_BODY_DDL_PREFIXES: &[&str] = &[
+    "ALTER EVENT ",
+    "CREATE EVENT ",
+    "CREATE FUNCTION ",
+    "CREATE PROCEDURE ",
+    "CREATE TRIGGER ",
+];
+
 fn is_known_compatible_ddl(sql: &str) -> bool {
+    starts_with_any_ci(sql, COMPATIBLE_DDL_PREFIXES)
+}
+
+fn is_compound_body_ddl(sql: &str) -> bool {
+    starts_with_any_ci(sql, COMPOUND_BODY_DDL_PREFIXES)
+}
+
+fn starts_with_any_ci(sql: &str, prefixes: &[&str]) -> bool {
     let upper = sql.to_ascii_uppercase();
-    upper.starts_with("ALTER TABLE ")
-        || upper.starts_with("ALTER VIEW ")
-        || upper.starts_with("CREATE DATABASE ")
-        || upper.starts_with("CREATE OR REPLACE VIEW ")
-        || upper.starts_with("CREATE TABLE ")
-        || upper.starts_with("CREATE TRIGGER ")
-        || upper.starts_with("CREATE VIEW ")
-        || upper.starts_with("DROP DATABASE ")
-        || upper.starts_with("DROP TABLE ")
-        || upper.starts_with("DROP TRIGGER ")
-        || upper.starts_with("DROP VIEW ")
-        || upper.starts_with("TRUNCATE ")
-        || upper.starts_with("CREATE INDEX ")
-        || upper.starts_with("CREATE UNIQUE INDEX ")
-        || upper.starts_with("DROP INDEX ")
-        || upper.starts_with("RENAME TABLE ")
+    prefixes.iter().any(|prefix| upper.starts_with(prefix))
 }
 
 pub fn is_schema_changing_statement(sql: &str) -> bool {
@@ -477,7 +506,7 @@ fn find_ddl_if_exists_pattern(sql: &str) -> Option<String> {
 
 // Replaying DDL is not idempotent; after a crash between apply and checkpoint,
 // the re-applied statement reports one of these already-applied server errors.
-const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 9] = [
+const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 13] = [
     "ERROR 1007", // database already exists
     "ERROR 1008", // unknown database (already dropped)
     "ERROR 1050", // table already exists
@@ -485,8 +514,12 @@ const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 9] = [
     "ERROR 1060", // duplicate column name (already added)
     "ERROR 1061", // duplicate key name (already added)
     "ERROR 1091", // cannot drop column or key (already dropped)
+    "ERROR 1304", // routine already exists
+    "ERROR 1305", // routine does not exist (already dropped)
     "ERROR 1359", // trigger already exists
     "ERROR 1360", // trigger does not exist (already dropped)
+    "ERROR 1537", // event already exists
+    "ERROR 1539", // event does not exist (already dropped)
 ];
 
 fn is_ddl_already_applied_error(sql: &str, error: &str) -> bool {
@@ -687,6 +720,28 @@ mod tests {
     }
 
     #[test]
+    fn replays_routine_and_event_ddl_with_compound_body_semicolons() {
+        for sql in [
+            "CREATE PROCEDURE refresh_accounts() BEGIN SELECT 1; SELECT 2; END",
+            "DROP PROCEDURE IF EXISTS refresh_accounts",
+            "CREATE FUNCTION one() RETURNS INT DETERMINISTIC RETURN 1",
+            "DROP FUNCTION IF EXISTS one",
+            "CREATE EVENT prune_accounts ON SCHEDULE EVERY 1 DAY DO BEGIN SELECT 1; END",
+            "ALTER EVENT prune_accounts DISABLE",
+            "DROP EVENT IF EXISTS prune_accounts",
+        ] {
+            let executor = RecordingExecutor::default();
+            let quarantine = RecordingQuarantine::default();
+            let applier = StatementApplier::new(executor, quarantine);
+
+            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+
+            assert_eq!(outcome, StatementOutcome::Replayed, "{sql}");
+            assert!(applier.quarantine.statements.borrow().is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
     fn replays_create_table_if_not_exists_with_semicolons_in_line_comments() {
         let executor = RecordingExecutor::default();
         let quarantine = RecordingQuarantine::default();
@@ -785,6 +840,39 @@ mod tests {
     }
 
     #[test]
+    fn tolerates_already_applied_routine_and_event_errors() {
+        for (sql, message) in [
+            (
+                "CREATE PROCEDURE refresh_accounts() SELECT 1",
+                "target mysql query failed: ERROR 1304 (42000): PROCEDURE refresh_accounts already exists",
+            ),
+            (
+                "DROP FUNCTION one",
+                "target mysql query failed: ERROR 1305 (42000): FUNCTION one does not exist",
+            ),
+            (
+                "CREATE EVENT prune_accounts ON SCHEDULE EVERY 1 DAY DO SELECT 1",
+                "target mysql query failed: ERROR 1537 (HY000): Event 'prune_accounts' already exists",
+            ),
+            (
+                "DROP EVENT prune_accounts",
+                "target mysql query failed: ERROR 1539 (HY000): Unknown event 'prune_accounts'",
+            ),
+        ] {
+            let executor = RecordingExecutor {
+                statements: RefCell::new(Vec::new()),
+                error: Some(TargetExecuteError::new(message)),
+            };
+            let quarantine = RecordingQuarantine::default();
+            let applier = StatementApplier::new(executor, quarantine);
+
+            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+
+            assert_eq!(outcome, StatementOutcome::AlreadyApplied, "{sql}");
+        }
+    }
+
+    #[test]
     fn does_not_tolerate_already_applied_errors_for_dml() {
         let executor = RecordingExecutor {
             statements: RefCell::new(Vec::new()),
@@ -818,6 +906,23 @@ mod tests {
             StatementOutcome::Quarantined(QuarantineReason::MariaDbOnlySyntax(
                 "RETURNING".to_string()
             ))
+        );
+        assert!(applier.executor.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn quarantines_definer_clause_with_optional_whitespace() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let outcome = applier
+            .apply(&statement("CREATE DEFINER = `root`@`%` VIEW v AS SELECT 1"))
+            .expect("apply statement");
+
+        assert_eq!(
+            outcome,
+            StatementOutcome::Quarantined(QuarantineReason::UnsafePattern("DEFINER".to_string()))
         );
         assert!(applier.executor.statements.borrow().is_empty());
     }

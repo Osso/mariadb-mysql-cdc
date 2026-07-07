@@ -44,6 +44,10 @@ Current supported slices:
 - Trigger DDL: `CREATE TRIGGER` and `DROP TRIGGER IF EXISTS` when the statement
   does not contain unsafe definer clauses, with retry idempotency for `ERROR
   1359` / `ERROR 1360`.
+- Routine/event DDL: `CREATE`/`ALTER`/`DROP PROCEDURE`, `CREATE`/`ALTER`/`DROP
+  FUNCTION`, and `CREATE`/`ALTER`/`DROP EVENT`, including compound bodies with
+  semicolons. Retry idempotency covers `ERROR 1304` / `ERROR 1305` and `ERROR
+  1537` / `ERROR 1539`.
 
 Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
 
