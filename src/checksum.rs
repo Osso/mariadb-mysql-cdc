@@ -67,7 +67,10 @@ fn normalized_value_expr(column: &ChecksumColumn) -> Result<String, String> {
             column.name, column.data_type
         )),
         "timestamp" => Ok(format!("UNIX_TIMESTAMP({quoted})")),
-        "decimal" | "numeric" => Ok(format!("CAST({quoted} AS {})", column.column_type)),
+        "decimal" | "numeric" => Ok(format!(
+            "CAST({quoted} AS {})",
+            castable_decimal_type(&column.column_type)
+        )),
         data_type if is_byte_stable_type(data_type) => Ok(quoted),
         _ => Ok(format!("CAST({quoted} AS CHAR)")),
     }
@@ -75,6 +78,10 @@ fn normalized_value_expr(column: &ChecksumColumn) -> Result<String, String> {
 
 fn byte_value_expr(value: &str) -> String {
     format!("CONVERT({value} USING binary)")
+}
+
+fn castable_decimal_type(column_type: &str) -> &str {
+    column_type.split_whitespace().next().unwrap_or(column_type)
 }
 
 fn is_byte_stable_type(data_type: &str) -> bool {
@@ -209,6 +216,25 @@ mod tests {
         assert!(sql.contains("CAST(`price` AS decimal(10,2))"));
         assert!(sql.contains("UNIX_TIMESTAMP(`updated_at`)"));
         assert!(sql.contains("WHERE (`id` > '10') AND NOT ((`id` > '20'))"));
+    }
+
+    #[test]
+    fn strips_unsigned_modifier_from_decimal_cast_type() {
+        let sql = build_chunk_checksum_sql(&ChecksumRequest {
+            table: "service_access_tokens".to_string(),
+            primary_key: vec!["id".to_string()],
+            columns: vec![column(
+                "gc_service_fee_percentage",
+                "decimal",
+                "decimal(5,2) unsigned",
+            )],
+            start_after: None,
+            end_at: None,
+        })
+        .expect("checksum sql");
+
+        assert!(sql.contains("CAST(`gc_service_fee_percentage` AS decimal(5,2))"));
+        assert!(!sql.contains("decimal(5,2) unsigned"));
     }
 
     #[test]
