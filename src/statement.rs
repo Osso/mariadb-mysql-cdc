@@ -443,9 +443,11 @@ fn is_known_compatible_ddl(sql: &str) -> bool {
         || upper.starts_with("CREATE DATABASE ")
         || upper.starts_with("CREATE OR REPLACE VIEW ")
         || upper.starts_with("CREATE TABLE ")
+        || upper.starts_with("CREATE TRIGGER ")
         || upper.starts_with("CREATE VIEW ")
         || upper.starts_with("DROP DATABASE ")
         || upper.starts_with("DROP TABLE ")
+        || upper.starts_with("DROP TRIGGER ")
         || upper.starts_with("DROP VIEW ")
         || upper.starts_with("TRUNCATE ")
         || upper.starts_with("CREATE INDEX ")
@@ -475,7 +477,7 @@ fn find_ddl_if_exists_pattern(sql: &str) -> Option<String> {
 
 // Replaying DDL is not idempotent; after a crash between apply and checkpoint,
 // the re-applied statement reports one of these already-applied server errors.
-const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 7] = [
+const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 9] = [
     "ERROR 1007", // database already exists
     "ERROR 1008", // unknown database (already dropped)
     "ERROR 1050", // table already exists
@@ -483,6 +485,8 @@ const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 7] = [
     "ERROR 1060", // duplicate column name (already added)
     "ERROR 1061", // duplicate key name (already added)
     "ERROR 1091", // cannot drop column or key (already dropped)
+    "ERROR 1359", // trigger already exists
+    "ERROR 1360", // trigger does not exist (already dropped)
 ];
 
 fn is_ddl_already_applied_error(sql: &str, error: &str) -> bool {
@@ -666,6 +670,23 @@ mod tests {
     }
 
     #[test]
+    fn replays_trigger_ddl() {
+        for sql in [
+            "CREATE TRIGGER account_bi BEFORE INSERT ON accounts FOR EACH ROW SET NEW.name = TRIM(NEW.name)",
+            "DROP TRIGGER IF EXISTS account_bi",
+        ] {
+            let executor = RecordingExecutor::default();
+            let quarantine = RecordingQuarantine::default();
+            let applier = StatementApplier::new(executor, quarantine);
+
+            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+
+            assert_eq!(outcome, StatementOutcome::Replayed, "{sql}");
+            assert!(applier.quarantine.statements.borrow().is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
     fn replays_create_table_if_not_exists_with_semicolons_in_line_comments() {
         let executor = RecordingExecutor::default();
         let quarantine = RecordingQuarantine::default();
@@ -736,6 +757,31 @@ mod tests {
         let outcome = applier.apply(&event).expect("apply statement");
 
         assert_eq!(outcome, StatementOutcome::AlreadyApplied);
+    }
+
+    #[test]
+    fn tolerates_already_applied_trigger_errors() {
+        for (sql, message) in [
+            (
+                "CREATE TRIGGER account_bi BEFORE INSERT ON accounts FOR EACH ROW SET NEW.name = TRIM(NEW.name)",
+                "target mysql query failed: ERROR 1359 (HY000): Trigger already exists",
+            ),
+            (
+                "DROP TRIGGER account_bi",
+                "target mysql query failed: ERROR 1360 (HY000): Trigger does not exist",
+            ),
+        ] {
+            let executor = RecordingExecutor {
+                statements: RefCell::new(Vec::new()),
+                error: Some(TargetExecuteError::new(message)),
+            };
+            let quarantine = RecordingQuarantine::default();
+            let applier = StatementApplier::new(executor, quarantine);
+
+            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+
+            assert_eq!(outcome, StatementOutcome::AlreadyApplied, "{sql}");
+        }
     }
 
     #[test]

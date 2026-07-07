@@ -41,6 +41,9 @@ Current supported slices:
 - View DDL: `CREATE VIEW`, `CREATE OR REPLACE VIEW`, `ALTER VIEW`, and
   `DROP VIEW IF EXISTS` when the statement does not contain unsafe definer
   clauses.
+- Trigger DDL: `CREATE TRIGGER` and `DROP TRIGGER IF EXISTS` when the statement
+  does not contain unsafe definer clauses, with retry idempotency for `ERROR
+  1359` / `ERROR 1360`.
 
 Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
 
