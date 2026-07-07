@@ -34,10 +34,9 @@ Current supported slices:
 
 - `CREATE TABLE IF NOT EXISTS ...` including MariaDB binlog QueryEvent text with
   semicolons inside SQL comments.
-- `CREATE DATABASE IF NOT EXISTS ...` with retry idempotency for `ERROR 1007`
-  (`database exists`).
-- `DROP DATABASE IF EXISTS ...` with retry idempotency for `ERROR 1008`
-  (`database doesn't exist`).
+- Database/schema DDL: `CREATE DATABASE IF NOT EXISTS`, `ALTER DATABASE`,
+  `DROP DATABASE IF EXISTS`, and their `SCHEMA` aliases. Retry idempotency
+  covers `ERROR 1007` / `ERROR 1008`.
 - View DDL: `CREATE VIEW`, `CREATE OR REPLACE VIEW`, `ALTER VIEW`, and
   `DROP VIEW IF EXISTS` when the statement does not contain unsafe definer
   clauses.

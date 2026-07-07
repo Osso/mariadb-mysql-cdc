@@ -437,9 +437,11 @@ fn is_known_compatible_dml(sql: &str) -> bool {
 }
 
 const COMPATIBLE_DDL_PREFIXES: &[&str] = &[
+    "ALTER DATABASE ",
     "ALTER EVENT ",
     "ALTER FUNCTION ",
     "ALTER PROCEDURE ",
+    "ALTER SCHEMA ",
     "ALTER TABLE ",
     "ALTER VIEW ",
     "CREATE DATABASE ",
@@ -448,6 +450,7 @@ const COMPATIBLE_DDL_PREFIXES: &[&str] = &[
     "CREATE INDEX ",
     "CREATE OR REPLACE VIEW ",
     "CREATE PROCEDURE ",
+    "CREATE SCHEMA ",
     "CREATE TABLE ",
     "CREATE TRIGGER ",
     "CREATE UNIQUE INDEX ",
@@ -457,6 +460,7 @@ const COMPATIBLE_DDL_PREFIXES: &[&str] = &[
     "DROP FUNCTION ",
     "DROP INDEX ",
     "DROP PROCEDURE ",
+    "DROP SCHEMA ",
     "DROP TABLE ",
     "DROP TRIGGER ",
     "DROP VIEW ",
@@ -681,6 +685,25 @@ mod tests {
 
         assert_eq!(outcome, StatementOutcome::Replayed);
         assert!(applier.quarantine.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn replays_database_and_schema_ddl_aliases() {
+        for sql in [
+            "ALTER DATABASE archive DEFAULT CHARACTER SET utf8mb4",
+            "CREATE SCHEMA IF NOT EXISTS archive DEFAULT CHARACTER SET utf8mb4",
+            "ALTER SCHEMA archive DEFAULT CHARACTER SET utf8mb4",
+            "DROP SCHEMA IF EXISTS archive",
+        ] {
+            let executor = RecordingExecutor::default();
+            let quarantine = RecordingQuarantine::default();
+            let applier = StatementApplier::new(executor, quarantine);
+
+            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+
+            assert_eq!(outcome, StatementOutcome::Replayed, "{sql}");
+            assert!(applier.quarantine.statements.borrow().is_empty(), "{sql}");
+        }
     }
 
     #[test]
