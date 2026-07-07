@@ -234,8 +234,9 @@ fn normalize_statement(sql: &str) -> String {
 fn contains_multi_statement(sql: &str) -> bool {
     let mut quote = None;
     let mut escaped = false;
+    let mut chars = sql.char_indices().peekable();
 
-    for (index, character) in sql.char_indices() {
+    while let Some((index, character)) = chars.next() {
         if let Some(quote_character) = quote {
             if escaped {
                 escaped = false;
@@ -249,12 +250,44 @@ fn contains_multi_statement(sql: &str) -> bool {
 
         match character {
             '\'' | '"' => quote = Some(character),
+            '-' if chars.peek().is_some_and(|(_, next)| *next == '-') => {
+                chars.next();
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next)| *next == '*') => {
+                chars.next();
+                skip_block_comment(&mut chars);
+            }
             ';' if !sql[index + 1..].trim().is_empty() => return true,
             _ => {}
         }
     }
 
     false
+}
+
+fn skip_line_comment<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    for (_, character) in chars.by_ref() {
+        if character == '\n' || character == '\r' {
+            break;
+        }
+    }
+}
+
+fn skip_block_comment<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let mut previous = None;
+    for (_, character) in chars.by_ref() {
+        if previous == Some('*') && character == '/' {
+            break;
+        }
+        previous = Some(character);
+    }
 }
 
 fn find_mariadb_only_pattern(sql: &str) -> Option<String> {
@@ -576,6 +609,28 @@ mod tests {
         let outcome = applier.apply(&event).expect("apply statement");
 
         assert_eq!(outcome, StatementOutcome::Replayed);
+        assert!(applier.quarantine.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn replays_create_table_if_not_exists_with_semicolons_in_line_comments() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+        let ddl = [
+            "CREATE TABLE IF NOT EXISTS `kg_credits` (",
+            "  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,",
+            "  `creator_name_hash` CHAR(40) NOT NULL, -- sha1 of normalized name; ALWAYS set",
+            "  `source` VARCHAR(16) NOT NULL, -- ingest | cover; gap-fill source",
+            "  PRIMARY KEY (`id`)",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        ]
+        .join("\n");
+
+        let outcome = applier.apply(&statement(&ddl)).expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::Replayed);
+        assert_eq!(applier.executor.statements.borrow()[0].sql, ddl);
         assert!(applier.quarantine.statements.borrow().is_empty());
     }
 
