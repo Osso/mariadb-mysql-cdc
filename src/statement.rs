@@ -235,7 +235,32 @@ fn classify_statement(sql: &str) -> StatementDecision {
 }
 
 fn normalize_statement(sql: &str) -> String {
-    sql.trim().trim_end_matches(';').trim().to_string()
+    strip_leading_comments(sql)
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string()
+}
+
+fn strip_leading_comments(sql: &str) -> &str {
+    let mut remaining = sql.trim_start();
+    while let Some(stripped) = strip_one_leading_comment(remaining) {
+        remaining = stripped.trim_start();
+    }
+    remaining
+}
+
+fn strip_one_leading_comment(sql: &str) -> Option<&str> {
+    if let Some(comment) = sql.strip_prefix("--") {
+        return Some(comment.split_once('\n').map_or("", |(_, rest)| rest));
+    }
+    if let Some(comment) = sql.strip_prefix('#') {
+        return Some(comment.split_once('\n').map_or("", |(_, rest)| rest));
+    }
+    if sql.starts_with("/*") && !sql.starts_with("/*!") {
+        return sql.split_once("*/").map(|(_, rest)| rest);
+    }
+    None
 }
 
 fn contains_multi_statement(sql: &str) -> bool {
@@ -873,6 +898,26 @@ mod tests {
 
         assert_eq!(outcome, StatementOutcome::Replayed);
         assert_eq!(applier.executor.statements.borrow()[0].sql, ddl);
+        assert!(applier.quarantine.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn replays_alter_table_after_leading_line_comments() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+        let ddl = [
+            "-- Non-unique lookup key backing app-level upserts",
+            "-- The UNIQUE version lands after data is backfilled.",
+            "ALTER TABLE `kg_characters`",
+            "  ADD KEY `idx_artist_canonical_hash` (`artist_id`, `canonical_name_hash`),",
+            "  ALGORITHM=INPLACE, LOCK=NONE",
+        ]
+        .join("\n");
+
+        let outcome = applier.apply(&statement(&ddl)).expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::Replayed);
         assert!(applier.quarantine.statements.borrow().is_empty());
     }
 
