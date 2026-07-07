@@ -439,10 +439,14 @@ fn is_known_compatible_dml(sql: &str) -> bool {
 fn is_known_compatible_ddl(sql: &str) -> bool {
     let upper = sql.to_ascii_uppercase();
     upper.starts_with("ALTER TABLE ")
+        || upper.starts_with("ALTER VIEW ")
         || upper.starts_with("CREATE DATABASE ")
+        || upper.starts_with("CREATE OR REPLACE VIEW ")
         || upper.starts_with("CREATE TABLE ")
+        || upper.starts_with("CREATE VIEW ")
         || upper.starts_with("DROP DATABASE ")
         || upper.starts_with("DROP TABLE ")
+        || upper.starts_with("DROP VIEW ")
         || upper.starts_with("TRUNCATE ")
         || upper.starts_with("CREATE INDEX ")
         || upper.starts_with("CREATE UNIQUE INDEX ")
@@ -640,6 +644,25 @@ mod tests {
 
         assert_eq!(outcome, StatementOutcome::Replayed);
         assert!(applier.quarantine.statements.borrow().is_empty());
+    }
+
+    #[test]
+    fn replays_view_ddl() {
+        for sql in [
+            "CREATE VIEW active_accounts AS SELECT id FROM accounts WHERE active = 1",
+            "CREATE OR REPLACE VIEW active_accounts AS SELECT id FROM accounts WHERE active = 1",
+            "ALTER VIEW active_accounts AS SELECT id FROM accounts WHERE active = 1",
+            "DROP VIEW IF EXISTS active_accounts",
+        ] {
+            let executor = RecordingExecutor::default();
+            let quarantine = RecordingQuarantine::default();
+            let applier = StatementApplier::new(executor, quarantine);
+
+            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+
+            assert_eq!(outcome, StatementOutcome::Replayed, "{sql}");
+            assert!(applier.quarantine.statements.borrow().is_empty(), "{sql}");
+        }
     }
 
     #[test]

@@ -38,6 +38,9 @@ Current supported slices:
   (`database exists`).
 - `DROP DATABASE IF EXISTS ...` with retry idempotency for `ERROR 1008`
   (`database doesn't exist`).
+- View DDL: `CREATE VIEW`, `CREATE OR REPLACE VIEW`, `ALTER VIEW`, and
+  `DROP VIEW IF EXISTS` when the statement does not contain unsafe definer
+  clauses.
 
 Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
 
