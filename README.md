@@ -24,6 +24,19 @@ The first read-only probe is available. It connects to a MariaDB source, records
 the current binlog coordinates with `SHOW MASTER STATUS`, then uses
 `mariadb-binlog` to read and classify events without writing to a target.
 
+## DDL Replay Support
+
+DDL replay is allowlisted one operation at a time. Supported DDL is applied to
+the MySQL target and treated as already applied when a retry sees the expected
+idempotency error.
+
+Current supported slice:
+
+- `CREATE TABLE IF NOT EXISTS ...` including MariaDB binlog QueryEvent text with
+  semicolons inside SQL comments.
+
+Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
+
 ## Commands
 
 ```bash
