@@ -439,6 +439,7 @@ fn is_known_compatible_dml(sql: &str) -> bool {
 fn is_known_compatible_ddl(sql: &str) -> bool {
     let upper = sql.to_ascii_uppercase();
     upper.starts_with("ALTER TABLE ")
+        || upper.starts_with("CREATE DATABASE ")
         || upper.starts_with("CREATE TABLE ")
         || upper.starts_with("DROP TABLE ")
         || upper.starts_with("TRUNCATE ")
@@ -469,7 +470,8 @@ fn find_ddl_if_exists_pattern(sql: &str) -> Option<String> {
 
 // Replaying DDL is not idempotent; after a crash between apply and checkpoint,
 // the re-applied statement reports one of these already-applied server errors.
-const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 5] = [
+const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 6] = [
+    "ERROR 1007", // database already exists
     "ERROR 1050", // table already exists
     "ERROR 1051", // unknown table (already dropped)
     "ERROR 1060", // duplicate column name (already added)
@@ -613,6 +615,19 @@ mod tests {
     }
 
     #[test]
+    fn replays_create_database_if_not_exists() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let event = statement("CREATE DATABASE IF NOT EXISTS archive DEFAULT CHARSET=utf8mb4");
+        let outcome = applier.apply(&event).expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::Replayed);
+        assert!(applier.quarantine.statements.borrow().is_empty());
+    }
+
+    #[test]
     fn replays_create_table_if_not_exists_with_semicolons_in_line_comments() {
         let executor = RecordingExecutor::default();
         let quarantine = RecordingQuarantine::default();
@@ -646,6 +661,23 @@ mod tests {
         let applier = StatementApplier::new(executor, quarantine);
 
         let event = statement("ALTER TABLE accounts DROP COLUMN handle");
+        let outcome = applier.apply(&event).expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::AlreadyApplied);
+    }
+
+    #[test]
+    fn tolerates_already_applied_create_database_error() {
+        let executor = RecordingExecutor {
+            statements: RefCell::new(Vec::new()),
+            error: Some(TargetExecuteError::new(
+                "target mysql query failed: ERROR 1007 (HY000): Can't create database 'archive'; database exists",
+            )),
+        };
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let event = statement("CREATE DATABASE archive DEFAULT CHARSET=utf8mb4");
         let outcome = applier.apply(&event).expect("apply statement");
 
         assert_eq!(outcome, StatementOutcome::AlreadyApplied);

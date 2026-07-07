@@ -30,10 +30,12 @@ DDL replay is allowlisted one operation at a time. Supported DDL is applied to
 the MySQL target and treated as already applied when a retry sees the expected
 idempotency error.
 
-Current supported slice:
+Current supported slices:
 
 - `CREATE TABLE IF NOT EXISTS ...` including MariaDB binlog QueryEvent text with
   semicolons inside SQL comments.
+- `CREATE DATABASE IF NOT EXISTS ...` with retry idempotency for `ERROR 1007`
+  (`database exists`).
 
 Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
 
