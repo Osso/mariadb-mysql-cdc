@@ -32,8 +32,10 @@ idempotency error.
 
 Current supported slices:
 
-- `CREATE TABLE IF NOT EXISTS ...` including MariaDB binlog QueryEvent text with
-  semicolons inside SQL comments.
+- Table/index DDL: `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE`,
+  `DROP TABLE IF EXISTS`, `TRUNCATE TABLE`, `RENAME TABLE`, `CREATE INDEX`,
+  `CREATE UNIQUE INDEX`, and `DROP INDEX`, including MariaDB binlog QueryEvent
+  text with semicolons inside SQL comments.
 - Database/schema DDL: `CREATE DATABASE IF NOT EXISTS`, `ALTER DATABASE`,
   `DROP DATABASE IF EXISTS`, and their `SCHEMA` aliases. Retry idempotency
   covers `ERROR 1007` / `ERROR 1008`.

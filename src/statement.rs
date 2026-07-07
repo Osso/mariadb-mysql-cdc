@@ -604,6 +604,27 @@ mod tests {
     }
 
     #[test]
+    fn replays_table_and_index_ddl() {
+        for sql in [
+            "DROP TABLE IF EXISTS accounts_archive",
+            "TRUNCATE TABLE accounts_archive",
+            "RENAME TABLE accounts TO accounts_archive",
+            "CREATE INDEX idx_accounts_name ON accounts (name)",
+            "CREATE UNIQUE INDEX uq_accounts_name ON accounts (name)",
+            "DROP INDEX idx_accounts_name ON accounts",
+        ] {
+            let executor = RecordingExecutor::default();
+            let quarantine = RecordingQuarantine::default();
+            let applier = StatementApplier::new(executor, quarantine);
+
+            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+
+            assert_eq!(outcome, StatementOutcome::Replayed, "{sql}");
+            assert!(applier.quarantine.statements.borrow().is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
     fn quarantines_unsupported_statement_with_binlog_coordinate() {
         let executor = RecordingExecutor::default();
         let quarantine = RecordingQuarantine::default();
