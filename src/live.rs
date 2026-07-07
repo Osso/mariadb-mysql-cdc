@@ -530,19 +530,7 @@ fn is_binlog_metadata_line(line: &str) -> bool {
 
 fn starts_sql_statement(line: &str) -> bool {
     let cleaned = cleanup_binlog_sql_line(line);
-    let upper = cleaned.to_ascii_uppercase();
-    upper.starts_with("INSERT INTO ")
-        || upper.starts_with("UPDATE ")
-        || upper.starts_with("DELETE FROM ")
-        || upper.starts_with("REPLACE INTO ")
-        || upper.starts_with("CREATE TABLE ")
-        || upper.starts_with("CREATE TEMPORARY TABLE ")
-        || upper.starts_with("ALTER TABLE ")
-        || upper.starts_with("DROP TABLE ")
-        || upper.starts_with("DROP DATABASE ")
-        || upper.starts_with("DROP SCHEMA ")
-        || upper.starts_with("DROP VIEW ")
-        || upper.starts_with("TRUNCATE TABLE ")
+    crate::statement::is_supported_statement_start(&cleaned)
 }
 
 fn is_statement_terminator(line: &str) -> bool {

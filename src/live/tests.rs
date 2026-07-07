@@ -169,6 +169,36 @@ CREATE TABLE accounts (id INT PRIMARY KEY)/*!*/;
 }
 
 #[test]
+fn extracts_supported_schema_ddl_statements() {
+    let events = extract_statement_events(
+        "\
+# at 100
+use `test_cdc`/*!*/;
+CREATE DATABASE IF NOT EXISTS archive/*!*/;
+# at 200
+CREATE VIEW active_accounts AS SELECT id FROM accounts/*!*/;
+# at 300
+CREATE PROCEDURE refresh_accounts() BEGIN SELECT 1; SELECT 2; END/*!*/;
+",
+        &BinlogCoordinate {
+            file: "mysqld-bin.000001".to_string(),
+            position: 4,
+        },
+    );
+
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].sql, "CREATE DATABASE IF NOT EXISTS archive");
+    assert_eq!(
+        events[1].sql,
+        "CREATE VIEW active_accounts AS SELECT id FROM accounts"
+    );
+    assert_eq!(
+        events[2].sql,
+        "CREATE PROCEDURE refresh_accounts() BEGIN SELECT 1; SELECT 2; END"
+    );
+}
+
+#[test]
 fn applies_extracted_compatible_statements() {
     let events = vec![StatementEvent {
         coordinate: BinlogCoordinate {

@@ -428,12 +428,11 @@ fn is_sql_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+const COMPATIBLE_DML_PREFIXES: &[&str] =
+    &["DELETE FROM ", "INSERT INTO ", "REPLACE INTO ", "UPDATE "];
+
 fn is_known_compatible_dml(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
-    upper.starts_with("INSERT INTO ")
-        || upper.starts_with("UPDATE ")
-        || upper.starts_with("DELETE FROM ")
-        || upper.starts_with("REPLACE INTO ")
+    starts_with_any_ci(sql, COMPATIBLE_DML_PREFIXES)
 }
 
 const COMPATIBLE_DDL_PREFIXES: &[&str] = &[
@@ -487,6 +486,10 @@ fn is_compound_body_ddl(sql: &str) -> bool {
 fn starts_with_any_ci(sql: &str, prefixes: &[&str]) -> bool {
     let upper = sql.to_ascii_uppercase();
     prefixes.iter().any(|prefix| upper.starts_with(prefix))
+}
+
+pub(crate) fn is_supported_statement_start(sql: &str) -> bool {
+    is_known_compatible_dml(sql) || is_known_compatible_ddl(sql)
 }
 
 pub fn is_schema_changing_statement(sql: &str) -> bool {

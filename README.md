@@ -50,6 +50,10 @@ Current supported slices:
   semicolons. Retry idempotency covers `ERROR 1304` / `ERROR 1305` and `ERROR
   1537` / `ERROR 1539`.
 
+The text `apply-binlog` extractor and structured stream path use the same
+supported statement prefix list, so one-shot replays and live stream classify DDL
+consistently.
+
 Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
 
 ## Commands
