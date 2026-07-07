@@ -441,6 +441,7 @@ fn is_known_compatible_ddl(sql: &str) -> bool {
     upper.starts_with("ALTER TABLE ")
         || upper.starts_with("CREATE DATABASE ")
         || upper.starts_with("CREATE TABLE ")
+        || upper.starts_with("DROP DATABASE ")
         || upper.starts_with("DROP TABLE ")
         || upper.starts_with("TRUNCATE ")
         || upper.starts_with("CREATE INDEX ")
@@ -470,8 +471,9 @@ fn find_ddl_if_exists_pattern(sql: &str) -> Option<String> {
 
 // Replaying DDL is not idempotent; after a crash between apply and checkpoint,
 // the re-applied statement reports one of these already-applied server errors.
-const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 6] = [
+const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 7] = [
     "ERROR 1007", // database already exists
+    "ERROR 1008", // unknown database (already dropped)
     "ERROR 1050", // table already exists
     "ERROR 1051", // unknown table (already dropped)
     "ERROR 1060", // duplicate column name (already added)
@@ -628,6 +630,19 @@ mod tests {
     }
 
     #[test]
+    fn replays_drop_database_if_exists() {
+        let executor = RecordingExecutor::default();
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let event = statement("DROP DATABASE IF EXISTS archive");
+        let outcome = applier.apply(&event).expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::Replayed);
+        assert!(applier.quarantine.statements.borrow().is_empty());
+    }
+
+    #[test]
     fn replays_create_table_if_not_exists_with_semicolons_in_line_comments() {
         let executor = RecordingExecutor::default();
         let quarantine = RecordingQuarantine::default();
@@ -678,6 +693,23 @@ mod tests {
         let applier = StatementApplier::new(executor, quarantine);
 
         let event = statement("CREATE DATABASE archive DEFAULT CHARSET=utf8mb4");
+        let outcome = applier.apply(&event).expect("apply statement");
+
+        assert_eq!(outcome, StatementOutcome::AlreadyApplied);
+    }
+
+    #[test]
+    fn tolerates_already_applied_drop_database_error() {
+        let executor = RecordingExecutor {
+            statements: RefCell::new(Vec::new()),
+            error: Some(TargetExecuteError::new(
+                "target mysql query failed: ERROR 1008 (HY000): Can't drop database 'archive'; database doesn't exist",
+            )),
+        };
+        let quarantine = RecordingQuarantine::default();
+        let applier = StatementApplier::new(executor, quarantine);
+
+        let event = statement("DROP DATABASE archive");
         let outcome = applier.apply(&event).expect("apply statement");
 
         assert_eq!(outcome, StatementOutcome::AlreadyApplied);

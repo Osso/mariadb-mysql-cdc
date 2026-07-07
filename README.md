@@ -36,6 +36,8 @@ Current supported slices:
   semicolons inside SQL comments.
 - `CREATE DATABASE IF NOT EXISTS ...` with retry idempotency for `ERROR 1007`
   (`database exists`).
+- `DROP DATABASE IF EXISTS ...` with retry idempotency for `ERROR 1008`
+  (`database doesn't exist`).
 
 Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
 
