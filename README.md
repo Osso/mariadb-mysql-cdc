@@ -54,6 +54,10 @@ The text `apply-binlog` extractor and structured stream path use the same
 supported statement prefix list, so one-shot replays and live stream classify DDL
 consistently.
 
+Administrative DDL that should not be replayed into managed MySQL is supported
+as a checkpointed skip: users, roles, grants, tablespaces, servers, and resource
+groups advance the stream without mutating the target.
+
 Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
 
 ## Commands

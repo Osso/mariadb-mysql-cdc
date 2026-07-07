@@ -808,6 +808,7 @@ where
             );
             Ok(EventPolicy::CommitTransaction)
         }
+        Ok(StatementOutcome::Skipped) => Ok(EventPolicy::CommitTransaction),
         Ok(StatementOutcome::Quarantined(_)) => Err(ApplyBinlogError::Quarantined(
             statement_applier
                 .quarantine_recorder()

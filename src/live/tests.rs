@@ -224,6 +224,31 @@ fn applies_extracted_compatible_statements() {
 }
 
 #[test]
+fn skips_administrative_ddl_as_applied_without_target_statement() {
+    let events = vec![StatementEvent {
+        coordinate: BinlogCoordinate {
+            file: "mysqld-bin.000001".to_string(),
+            position: 100,
+        },
+        resume_position: 180,
+        default_database: Some("test_cdc".to_string()),
+        sql: "GRANT SELECT ON app.* TO 'reader'@'%'".to_string(),
+    }];
+    let executor = RecordingExecutor::default();
+
+    let report =
+        apply_statement_events(events, executor, RecordingQuarantine::default()).expect("apply");
+
+    assert_eq!(
+        report,
+        ApplyBinlogReport {
+            applied_statements: 1,
+            quarantined_statements: 0,
+        }
+    );
+}
+
+#[test]
 fn refuses_quarantined_statements() {
     let events = vec![StatementEvent {
         coordinate: BinlogCoordinate {
@@ -232,7 +257,7 @@ fn refuses_quarantined_statements() {
         },
         resume_position: 180,
         default_database: Some("test_cdc".to_string()),
-        sql: "GRANT SELECT ON accounts TO 'reader'@'%'".to_string(),
+        sql: "ANALYZE FORMAT=JSON SELECT * FROM accounts".to_string(),
     }];
     let executor = RecordingExecutor::default();
 

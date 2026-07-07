@@ -54,6 +54,7 @@ pub enum QuarantineReason {
 pub enum StatementOutcome {
     Replayed,
     AlreadyApplied,
+    Skipped,
     Quarantined(QuarantineReason),
 }
 
@@ -142,6 +143,7 @@ where
 
         match decision {
             StatementDecision::Replay => self.replay(event, normalized_sql),
+            StatementDecision::Skip => Ok(StatementOutcome::Skipped),
             StatementDecision::Quarantine(reason) => self.quarantine(event, normalized_sql, reason),
         }
     }
@@ -195,6 +197,7 @@ where
 
 enum StatementDecision {
     Replay,
+    Skip,
     Quarantine(QuarantineReason),
 }
 
@@ -221,6 +224,10 @@ fn classify_statement(sql: &str) -> StatementDecision {
 
     if is_known_compatible_dml(sql) || is_known_compatible_ddl(sql) {
         return StatementDecision::Replay;
+    }
+
+    if is_skipped_administrative_ddl(sql) {
+        return StatementDecision::Skip;
     }
 
     let keyword = first_keyword(sql).unwrap_or("unknown").to_string();
@@ -475,6 +482,27 @@ const COMPOUND_BODY_DDL_PREFIXES: &[&str] = &[
     "CREATE TRIGGER ",
 ];
 
+const SKIPPED_ADMINISTRATIVE_DDL_PREFIXES: &[&str] = &[
+    "ALTER RESOURCE GROUP ",
+    "ALTER ROLE ",
+    "ALTER SERVER ",
+    "ALTER TABLESPACE ",
+    "ALTER USER ",
+    "CREATE RESOURCE GROUP ",
+    "CREATE ROLE ",
+    "CREATE SERVER ",
+    "CREATE TABLESPACE ",
+    "CREATE USER ",
+    "DROP RESOURCE GROUP ",
+    "DROP ROLE ",
+    "DROP SERVER ",
+    "DROP TABLESPACE ",
+    "DROP USER ",
+    "GRANT ",
+    "RENAME USER ",
+    "REVOKE ",
+];
+
 fn is_known_compatible_ddl(sql: &str) -> bool {
     starts_with_any_ci(sql, COMPATIBLE_DDL_PREFIXES)
 }
@@ -483,13 +511,19 @@ fn is_compound_body_ddl(sql: &str) -> bool {
     starts_with_any_ci(sql, COMPOUND_BODY_DDL_PREFIXES)
 }
 
+fn is_skipped_administrative_ddl(sql: &str) -> bool {
+    starts_with_any_ci(sql, SKIPPED_ADMINISTRATIVE_DDL_PREFIXES)
+}
+
 fn starts_with_any_ci(sql: &str, prefixes: &[&str]) -> bool {
     let upper = sql.to_ascii_uppercase();
     prefixes.iter().any(|prefix| upper.starts_with(prefix))
 }
 
 pub(crate) fn is_supported_statement_start(sql: &str) -> bool {
-    is_known_compatible_dml(sql) || is_known_compatible_ddl(sql)
+    is_known_compatible_dml(sql)
+        || is_known_compatible_ddl(sql)
+        || is_skipped_administrative_ddl(sql)
 }
 
 pub fn is_schema_changing_statement(sql: &str) -> bool {
@@ -628,18 +662,50 @@ mod tests {
     }
 
     #[test]
+    fn skips_administrative_ddl_without_target_mutation_or_quarantine() {
+        for sql in [
+            "CREATE USER IF NOT EXISTS 'reader'@'%' IDENTIFIED BY 'secret'",
+            "ALTER USER 'reader'@'%' ACCOUNT LOCK",
+            "DROP USER IF EXISTS 'reader'@'%'",
+            "CREATE ROLE IF NOT EXISTS app_reader",
+            "DROP ROLE IF EXISTS app_reader",
+            "GRANT SELECT ON app.* TO 'reader'@'%'",
+            "REVOKE SELECT ON app.* FROM 'reader'@'%'",
+            "CREATE TABLESPACE ts ADD DATAFILE 'ts.ibd'",
+            "ALTER TABLESPACE ts RENAME TO ts2",
+            "DROP TABLESPACE ts",
+            "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (HOST '127.0.0.1')",
+            "ALTER SERVER s OPTIONS (HOST '127.0.0.1')",
+            "DROP SERVER s",
+            "CREATE RESOURCE GROUP rg TYPE = USER VCPU = 0",
+            "ALTER RESOURCE GROUP rg VCPU = 0",
+            "DROP RESOURCE GROUP rg",
+        ] {
+            let executor = RecordingExecutor::default();
+            let quarantine = RecordingQuarantine::default();
+            let applier = StatementApplier::new(executor, quarantine);
+
+            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+
+            assert_eq!(outcome, StatementOutcome::Skipped, "{sql}");
+            assert!(applier.executor.statements.borrow().is_empty(), "{sql}");
+            assert!(applier.quarantine.statements.borrow().is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
     fn quarantines_unsupported_statement_with_binlog_coordinate() {
         let executor = RecordingExecutor::default();
         let quarantine = RecordingQuarantine::default();
         let applier = StatementApplier::new(executor, quarantine);
 
-        let event = statement("GRANT SELECT ON accounts TO 'reader'@'%'");
+        let event = statement("ANALYZE FORMAT=JSON SELECT * FROM accounts");
         let outcome = applier.apply(&event).expect("apply statement");
 
         assert_eq!(
             outcome,
             StatementOutcome::Quarantined(QuarantineReason::UnsupportedStatementType(
-                "GRANT".to_string()
+                "ANALYZE".to_string()
             ))
         );
         assert!(applier.executor.statements.borrow().is_empty());
@@ -648,8 +714,8 @@ mod tests {
             &[QuarantinedStatement {
                 coordinate: event.coordinate,
                 default_database: Some("app".to_string()),
-                sql: "GRANT SELECT ON accounts TO 'reader'@'%'".to_string(),
-                reason: QuarantineReason::UnsupportedStatementType("GRANT".to_string()),
+                sql: "ANALYZE FORMAT=JSON SELECT * FROM accounts".to_string(),
+                reason: QuarantineReason::UnsupportedStatementType("ANALYZE".to_string()),
             }]
         );
     }
