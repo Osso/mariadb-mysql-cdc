@@ -1,5 +1,5 @@
 use crate::snapshot::SnapshotRow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 mod mysql;
@@ -415,6 +415,7 @@ fn load_sync_progress(
     progress_store.ensure()?;
     let mut progress = progress_store
         .load(&table.name)?
+        .filter(|progress| progress.status != SyncProgressStatus::Complete)
         .unwrap_or_else(|| SyncTableProgress::started(table.name.clone(), mode));
     progress.mark_running(mode);
     progress_store.save(&progress)?;
@@ -663,56 +664,70 @@ fn repair_chunk(
     let source_by_key = rows_by_key(source_rows);
     let target_by_key = rows_by_key(target_rows);
 
-    for primary_key in row_keys(&source_by_key, &target_by_key) {
-        repair_row_difference(RowDifferenceContext {
-            primary_key: &primary_key,
-            source: source_by_key.get(&primary_key).copied(),
-            target: target_by_key.get(&primary_key).copied(),
-            mode,
-            repair_target,
-            report,
-            max_deletes,
-        })?;
-    }
+    repair_extra_rows(
+        &source_by_key,
+        &target_by_key,
+        mode,
+        repair_target,
+        report,
+        max_deletes,
+    )?;
+    repair_changed_rows(&source_by_key, &target_by_key, mode, repair_target, report)?;
+    repair_missing_rows(&source_by_key, &target_by_key, mode, repair_target, report)?;
 
     Ok(())
 }
 
-struct RowDifferenceContext<'a, R>
-where
-    R: SyncRepairTarget,
-{
-    primary_key: &'a [String],
-    source: Option<&'a SnapshotRow>,
-    target: Option<&'a SnapshotRow>,
+fn repair_extra_rows(
+    source_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
+    target_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
     mode: SyncMode,
-    repair_target: &'a mut R,
-    report: &'a mut SyncTableReport,
+    repair_target: &mut impl SyncRepairTarget,
+    report: &mut SyncTableReport,
     max_deletes: Option<u64>,
+) -> Result<(), TableSyncError> {
+    for primary_key in target_by_key
+        .keys()
+        .filter(|primary_key| !source_by_key.contains_key(*primary_key))
+    {
+        ensure_delete_allowed(report.extra_target_rows, max_deletes, mode)?;
+        apply_delete(primary_key, mode, repair_target)?;
+        report.extra_target_rows += 1;
+    }
+    Ok(())
 }
 
-fn repair_row_difference(
-    context: RowDifferenceContext<'_, impl SyncRepairTarget>,
+fn repair_changed_rows(
+    source_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
+    target_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
+    mode: SyncMode,
+    repair_target: &mut impl SyncRepairTarget,
+    report: &mut SyncTableReport,
 ) -> Result<(), TableSyncError> {
-    match (context.source, context.target) {
-        (Some(source), Some(target)) if source.values != target.values => {
-            apply_update(source, context.mode, context.repair_target)?;
-            context.report.updates += 1;
+    for (primary_key, source) in source_by_key {
+        if target_by_key
+            .get(primary_key)
+            .is_some_and(|target| source.values != target.values)
+        {
+            apply_update(source, mode, repair_target)?;
+            report.updates += 1;
         }
-        (Some(source), None) => {
-            apply_insert(source, context.mode, context.repair_target)?;
-            context.report.inserts += 1;
+    }
+    Ok(())
+}
+
+fn repair_missing_rows(
+    source_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
+    target_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
+    mode: SyncMode,
+    repair_target: &mut impl SyncRepairTarget,
+    report: &mut SyncTableReport,
+) -> Result<(), TableSyncError> {
+    for (primary_key, source) in source_by_key {
+        if !target_by_key.contains_key(primary_key) {
+            apply_insert(source, mode, repair_target)?;
+            report.inserts += 1;
         }
-        (None, Some(_target)) => {
-            ensure_delete_allowed(
-                context.report.extra_target_rows,
-                context.max_deletes,
-                context.mode,
-            )?;
-            apply_delete(context.primary_key, context.mode, context.repair_target)?;
-            context.report.extra_target_rows += 1;
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -738,13 +753,6 @@ fn rows_by_key(rows: &[SnapshotRow]) -> BTreeMap<Vec<String>, &SnapshotRow> {
     rows.iter()
         .map(|row| (row.primary_key.clone(), row))
         .collect()
-}
-
-fn row_keys(
-    source: &BTreeMap<Vec<String>, &SnapshotRow>,
-    target: &BTreeMap<Vec<String>, &SnapshotRow>,
-) -> BTreeSet<Vec<String>> {
-    source.keys().chain(target.keys()).cloned().collect()
 }
 
 fn ensure_delete_allowed(
@@ -1043,6 +1051,28 @@ mod tests {
     }
 
     #[test]
+    fn apply_releases_unique_conflicts_before_inserting_missing_rows() {
+        let source = FakeReader::new(vec![row("10", "shared"), row("20", "correct")]);
+        let target = FakeReader::new(vec![row("20", "shared")]);
+        let mut repair_target = RecordingRepairTarget::default();
+
+        sync_table(
+            &account_table(),
+            10,
+            SyncMode::Apply,
+            &source,
+            &target,
+            &mut repair_target,
+        )
+        .expect("sync report");
+
+        assert_eq!(
+            repair_target.operations.borrow().as_slice(),
+            &["update:20".to_string(), "insert:10".to_string()]
+        );
+    }
+
+    #[test]
     fn target_read_is_bounded_by_source_chunk_end() {
         let source = FakeReader::new(vec![row("1", "alpha"), row("2", "bravo"), row("3", "coda")]);
         let target = FakeReader::new(vec![]);
@@ -1133,6 +1163,43 @@ mod tests {
             saved.last().expect("saved progress").status,
             progress::SyncProgressStatus::Complete
         );
+    }
+
+    #[test]
+    fn completed_progress_starts_a_fresh_full_scan() {
+        let source = FakeReader::new(vec![row("1", "alpha")]);
+        let target = FakeReader::new(vec![]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::with_progress(SyncTableProgress {
+            table: "accounts".to_string(),
+            last_primary_key: Some(vec!["99".to_string()]),
+            chunks: 4,
+            rows_scanned: 99,
+            total_rows: Some(99),
+            inserts: 10,
+            updates: 20,
+            extra_target_rows: 3,
+            mode: SyncMode::Apply,
+            status: progress::SyncProgressStatus::Complete,
+            last_error: None,
+        });
+
+        let report = sync_table_with_progress(
+            &account_table(),
+            10,
+            SyncMode::Apply,
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+        )
+        .expect("fresh sync report");
+
+        assert_eq!(source.requests.borrow()[0].start_after, None);
+        assert_eq!(report.rows_scanned, 1);
+        assert_eq!(report.inserts, 1);
+        assert_eq!(report.updates, 0);
+        assert_eq!(report.extra_target_rows, 0);
     }
 
     #[test]
@@ -1267,21 +1334,31 @@ mod tests {
         inserts: RefCell<Vec<SnapshotRow>>,
         updates: RefCell<Vec<SnapshotRow>>,
         deletes: RefCell<Vec<Vec<String>>>,
+        operations: RefCell<Vec<String>>,
     }
 
     impl SyncRepairTarget for RecordingRepairTarget {
         fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
             self.inserts.borrow_mut().push(row.clone());
+            self.operations
+                .borrow_mut()
+                .push(format!("insert:{}", row.primary_key.join(",")));
             Ok(())
         }
 
         fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
             self.updates.borrow_mut().push(row.clone());
+            self.operations
+                .borrow_mut()
+                .push(format!("update:{}", row.primary_key.join(",")));
             Ok(())
         }
 
         fn delete_row(&mut self, primary_key: &[String]) -> Result<(), TableSyncError> {
             self.deletes.borrow_mut().push(primary_key.to_vec());
+            self.operations
+                .borrow_mut()
+                .push(format!("delete:{}", primary_key.join(",")));
             Ok(())
         }
     }
