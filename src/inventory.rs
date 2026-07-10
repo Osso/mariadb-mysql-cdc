@@ -1,8 +1,10 @@
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder, Row, Value};
+use mysql::{Conn, DriverError, Opts, OptsBuilder, Row, SslOpts, Value};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 const BASE_TABLE_TYPE: &str = "BASE TABLE";
 
@@ -83,12 +85,30 @@ pub trait InventoryReader {
     fn read_events(&self, schema: &str) -> Result<Vec<EventRow>, InventoryError>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InventoryEndpointRole {
+    Source,
+    Target,
+}
+
+impl InventoryEndpointRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Target => "target",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct InventoryConfig {
     pub host: String,
     pub port: u16,
     pub user: String,
     pub password: String,
+    pub endpoint_role: InventoryEndpointRole,
+    pub use_tls: bool,
+    pub max_connection_age: Duration,
 }
 
 impl Default for InventoryConfig {
@@ -98,74 +118,215 @@ impl Default for InventoryConfig {
             port: 3306,
             user: String::new(),
             password: String::new(),
+            endpoint_role: InventoryEndpointRole::Source,
+            use_tls: false,
+            max_connection_age: Duration::from_secs(300),
         }
     }
 }
 
-#[derive(Debug)]
+trait InventoryQueryConnection {
+    fn query_rows(&mut self, query: &str) -> Result<Vec<Vec<String>>, mysql::Error>;
+}
+
+trait InventoryConnectionFactory {
+    fn connect(
+        &self,
+        config: &InventoryConfig,
+    ) -> Result<Box<dyn InventoryQueryConnection>, mysql::Error>;
+}
+
+struct MySqlInventoryConnection(Conn);
+
+impl InventoryQueryConnection for MySqlInventoryConnection {
+    fn query_rows(&mut self, query: &str) -> Result<Vec<Vec<String>>, mysql::Error> {
+        let rows = self.0.query::<Row, _>(query)?;
+        Ok(rows.into_iter().map(row_to_inventory_fields).collect())
+    }
+}
+
+struct MySqlInventoryConnectionFactory;
+
+impl InventoryConnectionFactory for MySqlInventoryConnectionFactory {
+    fn connect(
+        &self,
+        config: &InventoryConfig,
+    ) -> Result<Box<dyn InventoryQueryConnection>, mysql::Error> {
+        Conn::new(inventory_opts(config)).map(|conn| {
+            Box::new(MySqlInventoryConnection(conn)) as Box<dyn InventoryQueryConnection>
+        })
+    }
+}
+
+struct InventoryConnectionState {
+    connection: Box<dyn InventoryQueryConnection>,
+    connected_at: Instant,
+}
+
+struct InventoryQueryFailure {
+    error: mysql::Error,
+    connection_age: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+enum InventoryQueryStage {
+    Tables,
+    Columns,
+    PrimaryKeys,
+    Views,
+    Triggers,
+    Routines,
+    Events,
+}
+
+impl InventoryQueryStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tables => "tables",
+            Self::Columns => "columns",
+            Self::PrimaryKeys => "primary_keys",
+            Self::Views => "views",
+            Self::Triggers => "triggers",
+            Self::Routines => "routines",
+            Self::Events => "events",
+        }
+    }
+}
+
 pub struct MariaDbInventoryReader {
     config: InventoryConfig,
-    conn: RefCell<Option<Conn>>,
+    conn: RefCell<Option<InventoryConnectionState>>,
+    factory: Rc<dyn InventoryConnectionFactory>,
 }
 
 impl MariaDbInventoryReader {
     pub fn new(config: InventoryConfig) -> Self {
+        Self::with_factory(config, Rc::new(MySqlInventoryConnectionFactory))
+    }
+
+    fn with_factory(config: InventoryConfig, factory: Rc<dyn InventoryConnectionFactory>) -> Self {
         Self {
             config,
             conn: RefCell::new(None),
+            factory,
         }
     }
 
-    fn query_rows(&self, query: &str) -> Result<Vec<Vec<String>>, InventoryError> {
-        let mut conn = self.ensure_conn()?;
-        let rows = conn.query::<Row, _>(query).map_err(inventory_query_error)?;
-        Ok(rows.into_iter().map(row_to_inventory_fields).collect())
+    fn query_rows(
+        &self,
+        stage: InventoryQueryStage,
+        schema: &str,
+        query: &str,
+    ) -> Result<Vec<Vec<String>>, InventoryError> {
+        match self.query_once(query) {
+            Ok(rows) => Ok(rows),
+            Err(first_failure) if is_retryable_inventory_error(&first_failure.error) => {
+                self.conn.replace(None);
+                log_inventory_connection_reset(stage, schema, &self.config, &first_failure);
+                self.query_once(query).map_err(|retry_failure| {
+                    inventory_retry_error(stage, schema, &self.config, first_failure, retry_failure)
+                })
+            }
+            Err(failure) => Err(inventory_attempt_error(
+                stage,
+                schema,
+                &self.config,
+                failure,
+            )),
+        }
     }
 
-    fn ensure_conn(&self) -> Result<std::cell::RefMut<'_, Conn>, InventoryError> {
-        if self.conn.borrow().is_none() {
-            let conn = open_inventory_conn(&self.config)?;
-            self.conn.replace(Some(conn));
+    fn query_once(&self, query: &str) -> Result<Vec<Vec<String>>, InventoryQueryFailure> {
+        self.expire_connection();
+        self.ensure_connection()?;
+        let mut connection = self.conn.borrow_mut();
+        let state = connection
+            .as_mut()
+            .expect("inventory connection initialized");
+        let connection_age = state.connected_at.elapsed();
+        state
+            .connection
+            .query_rows(query)
+            .map_err(|error| InventoryQueryFailure {
+                error,
+                connection_age: Some(connection_age),
+            })
+    }
+
+    fn expire_connection(&self) {
+        let expired =
+            self.conn.borrow().as_ref().is_some_and(|state| {
+                state.connected_at.elapsed() >= self.config.max_connection_age
+            });
+        if expired {
+            self.conn.replace(None);
         }
-        Ok(std::cell::RefMut::map(self.conn.borrow_mut(), |conn| {
-            conn.as_mut().expect("inventory connection initialized")
-        }))
+    }
+
+    fn ensure_connection(&self) -> Result<(), InventoryQueryFailure> {
+        if self.conn.borrow().is_some() {
+            return Ok(());
+        }
+        let connection =
+            self.factory
+                .connect(&self.config)
+                .map_err(|error| InventoryQueryFailure {
+                    error,
+                    connection_age: None,
+                })?;
+        self.conn.replace(Some(InventoryConnectionState {
+            connection,
+            connected_at: Instant::now(),
+        }));
+        Ok(())
     }
 }
 
 impl InventoryReader for MariaDbInventoryReader {
     fn read_tables(&self, schema: &str) -> Result<Vec<TableRow>, InventoryError> {
-        let rows = self.query_rows(&tables_query(schema))?;
+        let rows = self.query_rows(InventoryQueryStage::Tables, schema, &tables_query(schema))?;
         rows.iter().map(|row| parse_table_row(row)).collect()
     }
 
     fn read_columns(&self, schema: &str) -> Result<Vec<ColumnRow>, InventoryError> {
-        let rows = self.query_rows(&columns_query(schema))?;
+        let rows = self.query_rows(InventoryQueryStage::Columns, schema, &columns_query(schema))?;
         rows.iter().map(|row| parse_column_row(row)).collect()
     }
 
     fn read_primary_keys(&self, schema: &str) -> Result<Vec<PrimaryKeyRow>, InventoryError> {
-        let rows = self.query_rows(&primary_keys_query(schema))?;
+        let rows = self.query_rows(
+            InventoryQueryStage::PrimaryKeys,
+            schema,
+            &primary_keys_query(schema),
+        )?;
         rows.iter().map(|row| parse_primary_key_row(row)).collect()
     }
 
     fn read_views(&self, schema: &str) -> Result<Vec<ViewRow>, InventoryError> {
-        let rows = self.query_rows(&views_query(schema))?;
+        let rows = self.query_rows(InventoryQueryStage::Views, schema, &views_query(schema))?;
         rows.iter().map(|row| parse_view_row(row)).collect()
     }
 
     fn read_triggers(&self, schema: &str) -> Result<Vec<TriggerRow>, InventoryError> {
-        let rows = self.query_rows(&triggers_query(schema))?;
+        let rows = self.query_rows(
+            InventoryQueryStage::Triggers,
+            schema,
+            &triggers_query(schema),
+        )?;
         rows.iter().map(|row| parse_trigger_row(row)).collect()
     }
 
     fn read_routines(&self, schema: &str) -> Result<Vec<RoutineRow>, InventoryError> {
-        let rows = self.query_rows(&routines_query(schema))?;
+        let rows = self.query_rows(
+            InventoryQueryStage::Routines,
+            schema,
+            &routines_query(schema),
+        )?;
         rows.iter().map(|row| parse_routine_row(row)).collect()
     }
 
     fn read_events(&self, schema: &str) -> Result<Vec<EventRow>, InventoryError> {
-        let rows = self.query_rows(&events_query(schema))?;
+        let rows = self.query_rows(InventoryQueryStage::Events, schema, &events_query(schema))?;
         rows.iter().map(|row| parse_event_row(row)).collect()
     }
 }
@@ -266,18 +427,23 @@ pub fn build_inventory(
     })
 }
 
-fn open_inventory_conn(config: &InventoryConfig) -> Result<Conn, InventoryError> {
-    Conn::new(inventory_opts(config)).map_err(inventory_connect_error)
-}
-
 fn inventory_opts(config: &InventoryConfig) -> Opts {
-    let builder = OptsBuilder::default()
+    let mut builder = OptsBuilder::default()
         .ip_or_hostname(Some(&config.host))
         .tcp_port(config.port)
         .user(Some(&config.user))
         .pass(Some(&config.password))
         .prefer_socket(false);
+    if config.use_tls {
+        builder = builder.ssl_opts(insecure_inventory_ssl_opts());
+    }
     Opts::from(builder)
+}
+
+fn insecure_inventory_ssl_opts() -> SslOpts {
+    SslOpts::default()
+        .with_danger_skip_domain_validation(true)
+        .with_danger_accept_invalid_certs(true)
 }
 
 fn row_to_inventory_fields(row: Row) -> Vec<String> {
@@ -339,12 +505,90 @@ fn format_time(
     }
 }
 
-fn inventory_connect_error(error: mysql::Error) -> InventoryError {
-    InventoryError::new(format!("failed to connect to source mysql: {error}"))
+fn is_retryable_inventory_error(error: &mysql::Error) -> bool {
+    match error {
+        mysql::Error::IoError(_) | mysql::Error::CodecError(_) | mysql::Error::TlsError(_) => true,
+        mysql::Error::DriverError(driver_error) => matches!(
+            driver_error,
+            DriverError::ConnectTimeout
+                | DriverError::CouldNotConnect(_)
+                | DriverError::PacketOutOfSync
+                | DriverError::UnexpectedPacket
+                | DriverError::SetupError
+                | DriverError::Timeout
+        ),
+        _ => false,
+    }
 }
 
-fn inventory_query_error(error: mysql::Error) -> InventoryError {
-    InventoryError::new(format!("source inventory query failed: {error}"))
+fn log_inventory_connection_reset(
+    stage: InventoryQueryStage,
+    schema: &str,
+    config: &InventoryConfig,
+    failure: &InventoryQueryFailure,
+) {
+    eprintln!(
+        "{}",
+        format_inventory_reset_log(stage, schema, config, failure)
+    );
+}
+
+fn format_inventory_reset_log(
+    stage: InventoryQueryStage,
+    schema: &str,
+    config: &InventoryConfig,
+    failure: &InventoryQueryFailure,
+) -> String {
+    format!(
+        "cdc_inventory_connection_reset role={} stage={} schema={} attempt=1/2 tls={} reset=true connection_age_ms={} error={}",
+        config.endpoint_role.as_str(),
+        stage.as_str(),
+        schema,
+        config.use_tls,
+        format_connection_age(failure.connection_age),
+        failure.error,
+    )
+}
+
+fn inventory_attempt_error(
+    stage: InventoryQueryStage,
+    schema: &str,
+    config: &InventoryConfig,
+    failure: InventoryQueryFailure,
+) -> InventoryError {
+    InventoryError::new(format!(
+        "inventory query failed role={} stage={} schema={} attempt=1/2 tls={} reset=false connection_age_ms={} error={}",
+        config.endpoint_role.as_str(),
+        stage.as_str(),
+        schema,
+        config.use_tls,
+        format_connection_age(failure.connection_age),
+        failure.error,
+    ))
+}
+
+fn inventory_retry_error(
+    stage: InventoryQueryStage,
+    schema: &str,
+    config: &InventoryConfig,
+    first_failure: InventoryQueryFailure,
+    retry_failure: InventoryQueryFailure,
+) -> InventoryError {
+    InventoryError::new(format!(
+        "inventory query failed role={} stage={} schema={} attempt=2/2 tls={} reset=true connection_age_ms={} original_error={} retry_error={}",
+        config.endpoint_role.as_str(),
+        stage.as_str(),
+        schema,
+        config.use_tls,
+        format_connection_age(retry_failure.connection_age),
+        first_failure.error,
+        retry_failure.error,
+    ))
+}
+
+fn format_connection_age(age: Option<Duration>) -> String {
+    age.map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
 }
 
 fn parse_table_row(fields: &[String]) -> Result<TableRow, InventoryError> {

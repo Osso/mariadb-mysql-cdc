@@ -1,4 +1,6 @@
-use crate::inventory::{InventoryConfig, InventoryError, MariaDbInventoryReader, build_inventory};
+use crate::inventory::{
+    InventoryConfig, InventoryEndpointRole, InventoryError, MariaDbInventoryReader, build_inventory,
+};
 use crate::live::TargetMySqlConfig;
 use crate::mysql_client::{PersistentMySqlSource, PersistentProgressWriter};
 use crate::snapshot::{
@@ -591,6 +593,9 @@ fn read_snapshot_tables(
         port: config.source.port,
         user: config.source.user.clone(),
         password: config.source.password.clone(),
+        endpoint_role: InventoryEndpointRole::Source,
+        use_tls: false,
+        ..InventoryConfig::default()
     };
     let reader = MariaDbInventoryReader::new(inventory_config);
     let inventory = build_inventory(&config.source.database, &reader)?;

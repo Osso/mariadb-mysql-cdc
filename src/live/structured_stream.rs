@@ -2,7 +2,10 @@ use super::{
     ApplyBinlogConfig, ApplyBinlogError, QuarantineRecorder, RecordingQuarantine,
     SourceBinlogConfig,
 };
-use crate::inventory::{InventoryConfig, MariaDbInventoryReader, SchemaInventory, build_inventory};
+use crate::inventory::{
+    InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
+    build_inventory,
+};
 use crate::probe::BinlogCoordinate;
 use crate::row::{DeleteRowsEvent, RowApplier, RowImage, RowTableMap, RowUpdate, TableMapEvent};
 use crate::statement::{StatementApplier, StatementEvent, StatementOutcome};
@@ -1416,6 +1419,9 @@ fn target_inventory_config(config: &ApplyBinlogConfig) -> InventoryConfig {
         port: config.target.port,
         user: config.target.user.clone(),
         password: config.target.password.clone(),
+        endpoint_role: InventoryEndpointRole::Target,
+        use_tls: true,
+        ..InventoryConfig::default()
     }
 }
 
