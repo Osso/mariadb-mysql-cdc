@@ -8,6 +8,8 @@ use std::cell::RefCell;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncTableProgress {
+    pub run_id: Option<String>,
+    pub run_spec_json: Option<String>,
     pub table: String,
     pub last_primary_key: Option<Vec<String>>,
     pub chunks: u64,
@@ -30,9 +32,15 @@ pub enum SyncProgressStatus {
 
 pub trait SyncProgressStore {
     fn ensure(&mut self) -> Result<(), TableSyncError>;
-    fn load(&self, table: &str) -> Result<Option<SyncTableProgress>, TableSyncError>;
+    fn acquire_run(&self, _run_id: &str) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+    fn release_run(&self, _run_id: &str) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+    fn load(&self, run_id: &str) -> Result<Option<SyncTableProgress>, TableSyncError>;
     fn save(&mut self, progress: &SyncTableProgress) -> Result<(), TableSyncError>;
-    fn save_error(&mut self, table: &str, error: &TableSyncError) -> Result<(), TableSyncError>;
+    fn save_error(&mut self, run_id: &str, error: &TableSyncError) -> Result<(), TableSyncError>;
 }
 
 pub struct NoopSyncProgressStore;
@@ -42,7 +50,7 @@ impl SyncProgressStore for NoopSyncProgressStore {
         Ok(())
     }
 
-    fn load(&self, _table: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
+    fn load(&self, _run_id: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
         Ok(None)
     }
 
@@ -50,7 +58,7 @@ impl SyncProgressStore for NoopSyncProgressStore {
         Ok(())
     }
 
-    fn save_error(&mut self, _table: &str, _error: &TableSyncError) -> Result<(), TableSyncError> {
+    fn save_error(&mut self, _run_id: &str, _error: &TableSyncError) -> Result<(), TableSyncError> {
         Ok(())
     }
 }
@@ -83,17 +91,17 @@ impl SyncProgressStore for MySqlSyncProgressStore {
         ))
     }
 
-    fn load(&self, table: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
-        let output = self.query(build_progress_select_sql(&self.table, table))?;
-        parse_progress_row(table, &output)
+    fn load(&self, run_id: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
+        let output = self.query(build_progress_select_sql(&self.table, run_id))?;
+        parse_progress_row(run_id, &output)
     }
 
     fn save(&mut self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
         self.execute(build_progress_upsert_sql(&self.table, progress))
     }
 
-    fn save_error(&mut self, table: &str, error: &TableSyncError) -> Result<(), TableSyncError> {
-        self.execute(build_progress_error_sql(&self.table, table, error))
+    fn save_error(&mut self, run_id: &str, error: &TableSyncError) -> Result<(), TableSyncError> {
+        self.execute(build_progress_error_sql(&self.table, run_id, error))
     }
 }
 
@@ -117,9 +125,65 @@ impl MySqlSyncProgressStore {
     }
 }
 
-impl SyncTableProgress {
-    pub fn started(table: String, mode: SyncMode) -> Self {
+pub struct MySqlSyncRunProgressStore {
+    inner: MySqlSyncProgressStore,
+}
+
+impl MySqlSyncRunProgressStore {
+    pub fn new(target: TargetMySqlConfig, table: String) -> Self {
         Self {
+            inner: MySqlSyncProgressStore::new(target, table),
+        }
+    }
+}
+
+impl SyncProgressStore for MySqlSyncRunProgressStore {
+    fn ensure(&mut self) -> Result<(), TableSyncError> {
+        if let Some(schema_sql) = build_create_progress_schema_sql(&self.inner.table) {
+            self.inner.execute(schema_sql)?;
+        }
+        self.inner
+            .execute(build_create_sync_run_table_sql(&self.inner.table))?;
+        let schema_count = self.inner.query(build_sync_run_schema_query(
+            &self.inner.target.database,
+            &self.inner.table,
+        ))?;
+        require_sync_run_schema(&self.inner.table, &schema_count)
+    }
+
+    fn acquire_run(&self, run_id: &str) -> Result<(), TableSyncError> {
+        let result = self.inner.query(build_acquire_run_lock_sql(run_id))?;
+        require_run_lock_result(run_id, &result)
+    }
+
+    fn release_run(&self, run_id: &str) -> Result<(), TableSyncError> {
+        let result = self.inner.query(build_release_run_lock_sql(run_id))?;
+        require_run_lock_release(run_id, &result)
+    }
+
+    fn load(&self, run_id: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
+        let output = self
+            .inner
+            .query(build_sync_run_select_sql(&self.inner.table, run_id))?;
+        parse_sync_run_row(run_id, &output)
+    }
+
+    fn save(&mut self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
+        self.inner
+            .execute(build_sync_run_upsert_sql(&self.inner.table, progress))
+    }
+
+    fn save_error(&mut self, run_id: &str, error: &TableSyncError) -> Result<(), TableSyncError> {
+        self.inner
+            .execute(build_sync_run_error_sql(&self.inner.table, run_id, error))
+    }
+}
+
+impl SyncTableProgress {
+    pub fn started(run_id: String, run_spec_json: String, table: String, mode: SyncMode) -> Self {
+        Self {
+            run_id: Some(run_id),
+            run_spec_json: Some(run_spec_json),
             table,
             last_primary_key: None,
             chunks: 0,
@@ -188,31 +252,6 @@ updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMEST
     )
 }
 
-pub(crate) fn build_add_total_rows_column_sql(
-    default_schema: &str,
-    progress_table: &str,
-) -> String {
-    let (schema, table) = qualified_table_parts(default_schema, progress_table);
-    let alter_table = format!(
-        "ALTER TABLE {} ADD COLUMN total_rows BIGINT UNSIGNED NULL AFTER rows_scanned",
-        quote_identifier_path(progress_table)
-    );
-    format!(
-        "SET @cdc_total_rows_ddl = (SELECT IF(COUNT(*) = 0, {}, 'SELECT 1') FROM information_schema.columns WHERE table_schema = {} AND table_name = {} AND column_name = 'total_rows'); PREPARE cdc_total_rows_stmt FROM @cdc_total_rows_ddl; EXECUTE cdc_total_rows_stmt; DEALLOCATE PREPARE cdc_total_rows_stmt",
-        quote_sql_literal(&alter_table),
-        quote_sql_literal(&schema),
-        quote_sql_literal(&table)
-    )
-}
-
-pub(crate) fn build_create_progress_schema_sql(table: &str) -> Option<String> {
-    let schema = table.split_once('.')?.0;
-    Some(format!(
-        "CREATE DATABASE IF NOT EXISTS {}",
-        quote_ident(schema)
-    ))
-}
-
 fn build_progress_select_sql(progress_table: &str, table: &str) -> String {
     format!(
         "SELECT COALESCE(last_primary_key_json, ''), chunks, rows_scanned, COALESCE(total_rows, ''), inserts_applied, updates_applied, extra_target_rows, mode, status, COALESCE(last_error, '') FROM {} WHERE table_name = {} LIMIT 1",
@@ -271,6 +310,8 @@ fn parse_progress_row(
     }
 
     Ok(Some(SyncTableProgress {
+        run_id: None,
+        run_spec_json: None,
         table: table.to_string(),
         last_primary_key: parse_primary_key_json(fields[0])?,
         chunks: parse_u64("chunks", fields[1])?,
@@ -282,6 +323,187 @@ fn parse_progress_row(
         mode: SyncMode::parse(fields[7])?,
         status: SyncProgressStatus::parse(fields[8])?,
         last_error: non_empty(fields[9]),
+    }))
+}
+
+pub(crate) fn build_create_sync_run_table_sql(table: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} (\
+run_id VARCHAR(128) NOT NULL PRIMARY KEY,\
+table_name VARCHAR(255) NOT NULL,\
+run_spec_json LONGTEXT NOT NULL,\
+last_primary_key_json TEXT NULL,\
+chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,\
+rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,\
+total_rows BIGINT UNSIGNED NULL,\
+inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,\
+updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,\
+extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,\
+mode VARCHAR(16) NOT NULL,\
+status VARCHAR(16) NOT NULL,\
+last_error TEXT NULL,\
+created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\
+)",
+        quote_identifier_path(table)
+    )
+}
+
+pub(crate) fn build_add_total_rows_column_sql(
+    default_schema: &str,
+    progress_table: &str,
+) -> String {
+    let (schema, table) = qualified_table_parts(default_schema, progress_table);
+    let alter_table = format!(
+        "ALTER TABLE {} ADD COLUMN total_rows BIGINT UNSIGNED NULL AFTER rows_scanned",
+        quote_identifier_path(progress_table)
+    );
+    format!(
+        "SET @cdc_total_rows_ddl = (SELECT IF(COUNT(*) = 0, {}, 'SELECT 1') FROM information_schema.columns WHERE table_schema = {} AND table_name = {} AND column_name = 'total_rows'); PREPARE cdc_total_rows_stmt FROM @cdc_total_rows_ddl; EXECUTE cdc_total_rows_stmt; DEALLOCATE PREPARE cdc_total_rows_stmt",
+        quote_sql_literal(&alter_table),
+        quote_sql_literal(&schema),
+        quote_sql_literal(&table)
+    )
+}
+
+pub(crate) fn build_create_progress_schema_sql(table: &str) -> Option<String> {
+    let schema = table.split_once('.')?.0;
+    Some(format!(
+        "CREATE DATABASE IF NOT EXISTS {}",
+        quote_ident(schema)
+    ))
+}
+
+fn build_sync_run_schema_query(default_schema: &str, progress_table: &str) -> String {
+    let (schema, table) = qualified_table_parts(default_schema, progress_table);
+    format!(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = {} AND table_name = {} AND column_name IN ('run_id','run_spec_json')",
+        quote_sql_literal(&schema),
+        quote_sql_literal(&table)
+    )
+}
+
+fn require_sync_run_schema(table: &str, output: &str) -> Result<(), TableSyncError> {
+    if output.trim() == "2" {
+        return Ok(());
+    }
+    Err(TableSyncError::Progress(format!(
+        "progress table `{table}` is not a run-scoped progress table; use a new table such as `cdc.table_sync_runs`"
+    )))
+}
+
+fn build_acquire_run_lock_sql(run_id: &str) -> String {
+    format!("SELECT GET_LOCK(SHA2({},256),0)", quote_sql_literal(run_id))
+}
+
+fn build_release_run_lock_sql(run_id: &str) -> String {
+    format!(
+        "SELECT RELEASE_LOCK(SHA2({},256))",
+        quote_sql_literal(run_id)
+    )
+}
+
+fn require_run_lock_result(run_id: &str, output: &str) -> Result<(), TableSyncError> {
+    if output.trim() == "1" {
+        return Ok(());
+    }
+    Err(TableSyncError::Progress(format!(
+        "run id `{run_id}` is already active"
+    )))
+}
+
+fn require_run_lock_release(run_id: &str, output: &str) -> Result<(), TableSyncError> {
+    if output.trim() == "1" {
+        return Ok(());
+    }
+    Err(TableSyncError::Progress(format!(
+        "run id `{run_id}` lock was not owned by this connection"
+    )))
+}
+
+fn build_sync_run_select_sql(progress_table: &str, run_id: &str) -> String {
+    format!(
+        "SELECT table_name, run_spec_json, COALESCE(last_primary_key_json, ''), chunks, rows_scanned, COALESCE(total_rows, ''), inserts_applied, updates_applied, extra_target_rows, mode, status, COALESCE(last_error, '') FROM {} WHERE run_id = {} LIMIT 1",
+        quote_identifier_path(progress_table),
+        quote_sql_literal(run_id)
+    )
+}
+
+pub(crate) fn build_sync_run_upsert_sql(
+    progress_table: &str,
+    progress: &SyncTableProgress,
+) -> String {
+    let last_primary_key = progress
+        .last_primary_key
+        .as_ref()
+        .map(|values| json_string(values))
+        .unwrap_or_default();
+    format!(
+        "INSERT INTO {} (run_id,table_name,run_spec_json,last_primary_key_json,chunks,rows_scanned,total_rows,inserts_applied,updates_applied,extra_target_rows,mode,status,last_error) VALUES ({},{},{},{},{},{},{},{},{},{},{},{},NULL) ON DUPLICATE KEY UPDATE last_primary_key_json=VALUES(last_primary_key_json),chunks=VALUES(chunks),rows_scanned=VALUES(rows_scanned),total_rows=VALUES(total_rows),inserts_applied=VALUES(inserts_applied),updates_applied=VALUES(updates_applied),extra_target_rows=VALUES(extra_target_rows),status=VALUES(status),last_error=NULL",
+        quote_identifier_path(progress_table),
+        quote_sql_literal(
+            progress
+                .run_id
+                .as_deref()
+                .expect("sync run progress requires run id"),
+        ),
+        quote_sql_literal(&progress.table),
+        quote_sql_literal(
+            progress
+                .run_spec_json
+                .as_deref()
+                .expect("sync run progress requires run specification"),
+        ),
+        nullable_sql_literal(&last_primary_key),
+        progress.chunks,
+        progress.rows_scanned,
+        nullable_u64(progress.total_rows),
+        progress.inserts,
+        progress.updates,
+        progress.extra_target_rows,
+        quote_sql_literal(progress.mode.as_str()),
+        quote_sql_literal(progress.status.as_str())
+    )
+}
+
+fn build_sync_run_error_sql(progress_table: &str, run_id: &str, error: &TableSyncError) -> String {
+    format!(
+        "UPDATE {} SET status='error',last_error={} WHERE run_id={}",
+        quote_identifier_path(progress_table),
+        quote_sql_literal(&error.to_string()),
+        quote_sql_literal(run_id)
+    )
+}
+
+fn parse_sync_run_row(
+    run_id: &str,
+    output: &str,
+) -> Result<Option<SyncTableProgress>, TableSyncError> {
+    let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 12 {
+        return Err(TableSyncError::Progress(format!(
+            "progress row has {} fields, expected 12",
+            fields.len()
+        )));
+    }
+
+    Ok(Some(SyncTableProgress {
+        run_id: Some(run_id.to_string()),
+        table: fields[0].to_string(),
+        run_spec_json: Some(fields[1].to_string()),
+        last_primary_key: parse_primary_key_json(fields[2])?,
+        chunks: parse_u64("chunks", fields[3])?,
+        rows_scanned: parse_u64("rows_scanned", fields[4])?,
+        total_rows: parse_optional_u64("total_rows", fields[5])?,
+        inserts: parse_u64("inserts_applied", fields[6])?,
+        updates: parse_u64("updates_applied", fields[7])?,
+        extra_target_rows: parse_u64("extra_target_rows", fields[8])?,
+        mode: SyncMode::parse(fields[9])?,
+        status: SyncProgressStatus::parse(fields[10])?,
+        last_error: non_empty(fields[11]),
     }))
 }
 
@@ -380,9 +602,12 @@ mod tests {
 
     #[test]
     fn create_progress_table_sql_allows_cdc_schema_prefix() {
-        let sql = build_create_progress_table_sql("cdc.table_sync_progress");
+        let sql = build_create_sync_run_table_sql("cdc.table_sync_runs");
 
-        assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS `cdc`.`table_sync_progress`"));
+        assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS `cdc`.`table_sync_runs`"));
+        assert!(sql.contains("run_id VARCHAR(128) NOT NULL PRIMARY KEY"));
+        assert!(sql.contains("table_name VARCHAR(255) NOT NULL"));
+        assert!(sql.contains("run_spec_json LONGTEXT NOT NULL"));
         assert!(sql.contains("last_primary_key_json TEXT"));
         assert!(sql.contains("total_rows BIGINT UNSIGNED NULL"));
         assert!(sql.contains("status VARCHAR(16)"));
@@ -395,6 +620,27 @@ mod tests {
         assert!(sql.contains("information_schema.columns"));
         assert!(sql.contains("column_name = 'total_rows'"));
         assert!(sql.contains("ALTER TABLE `cdc`.`table_sync_progress` ADD COLUMN total_rows"));
+    }
+
+    #[test]
+    fn run_table_schema_query_requires_both_identity_columns() {
+        let sql = build_sync_run_schema_query("globalcomix", "cdc.table_sync_progress");
+
+        assert!(sql.contains("table_schema = 'cdc'"));
+        assert!(sql.contains("table_name = 'table_sync_progress'"));
+        assert!(sql.contains("column_name IN ('run_id','run_spec_json')"));
+    }
+
+    #[test]
+    fn run_lock_sql_uses_hashed_run_id_and_never_waits() {
+        assert_eq!(
+            build_acquire_run_lock_sql("repair-01"),
+            "SELECT GET_LOCK(SHA2('repair-01',256),0)"
+        );
+        assert_eq!(
+            build_release_run_lock_sql("repair-01"),
+            "SELECT RELEASE_LOCK(SHA2('repair-01',256))"
+        );
     }
 
     #[test]
@@ -412,6 +658,8 @@ mod tests {
     #[test]
     fn upsert_progress_sql_stores_last_primary_key_and_counts() {
         let progress = SyncTableProgress {
+            run_id: Some("repair-20260710-01".to_string()),
+            run_spec_json: Some("{\"table\":\"releases\"}".to_string()),
             table: "releases".to_string(),
             last_primary_key: Some(vec!["42".to_string()]),
             chunks: 2,
@@ -425,8 +673,10 @@ mod tests {
             last_error: None,
         };
 
-        let sql = build_progress_upsert_sql("cdc.table_sync_progress", &progress);
+        let sql = build_sync_run_upsert_sql("cdc.table_sync_runs", &progress);
 
+        assert!(sql.contains("'repair-20260710-01'"));
+        assert!(sql.contains("'{\"table\":\"releases\"}'"));
         assert!(sql.contains("'releases'"));
         assert!(sql.contains("'[\"42\"]'"));
         assert!(sql.contains("2,2000,5000,3,4,5"));
@@ -435,12 +685,17 @@ mod tests {
 
     #[test]
     fn parse_progress_row_restores_resume_state() {
-        let row = "[\"42\"]\t2\t2000\t5000\t3\t4\t5\tapply\trunning\t";
+        let row = "releases\t{\"table\":\"releases\"}\t[\"42\"]\t2\t2000\t5000\t3\t4\t5\tapply\trunning\t";
 
-        let progress = parse_progress_row("releases", row)
+        let progress = parse_sync_run_row("repair-20260710-01", row)
             .expect("parse progress")
             .expect("progress row");
 
+        assert_eq!(progress.run_id.as_deref(), Some("repair-20260710-01"));
+        assert_eq!(
+            progress.run_spec_json.as_deref(),
+            Some("{\"table\":\"releases\"}")
+        );
         assert_eq!(progress.table, "releases");
         assert_eq!(progress.last_primary_key, Some(vec!["42".to_string()]));
         assert_eq!(progress.chunks, 2);

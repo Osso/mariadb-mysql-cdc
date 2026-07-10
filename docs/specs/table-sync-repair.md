@@ -9,17 +9,29 @@ CDC stream has already been applying forward changes.
 - [x] Compare source and target rows by the configured primary-key columns.
 - [x] Report target inserts needed for source rows missing from the target.
 - [x] Report target updates needed for rows whose compared column values differ.
-- [x] Report extra target rows without deleting them.
+- [x] Report extra target rows and, in `apply` mode only, delete at most the explicit
+  `--max-deletes` allowance; the default allowance is zero.
 - [x] Support `dry-run` mode that reports repairs without applying them.
-- [x] Support `apply` mode that inserts missing rows and updates divergent rows.
+- [x] Support `apply` mode that inserts missing rows, updates divergent rows, and performs
+  only the allowed bounded orphan deletes.
 - [x] Read target rows through the source chunk end key so repair work stays
   bounded to one source chunk window.
 - [x] Allow extra target rows inside a source window to be detected.
-- [x] Parse source, target, table, column, chunk-size, and mode options from the
-  `sync-table` CLI command.
-- [x] Store resumable per-table sync progress in the target CDC database table,
-  defaulting to `cdc.table_sync_progress`.
-- [x] Auto-create the CDC progress schema/table when missing.
+- [x] Require `--run-id` for every `sync-table` invocation.
+- [x] Store resumable run-scoped progress in the target CDC database table, defaulting to
+  `cdc.table_sync_runs`, and auto-create that schema/table when missing.
+- [x] Allow a run ID to resume only the exact interrupted run: its immutable specification
+  includes source/target endpoints and databases, target write policy, table name,
+  primary-key and selected-column shape, mode, chunk size, range bounds, maximum deletes,
+  and the optional `updated-since` accelerator.
+- [x] Reject concurrent processes using the same run ID with a target-side named lock.
+- [x] Reject reuse of a completed run ID; recurring or changed repair work requires a new
+  run ID.
+- [x] Keep legacy `cdc.table_sync_progress` for snapshot catchup only; it is not a
+  `sync-table` run store.
+- [x] Make interrupted `--updated-since` retries restart from the beginning under the same
+  run ID, preventing newly eligible rows behind a saved primary key from being skipped;
+  upsert matching source rows without deleting target orphans.
 - [x] On stream target-apply failure for INSERT, UPDATE, or REPLACE, run table
   repair for the failed statement's table and checkpoint the event only after
   repair succeeds.
@@ -34,8 +46,8 @@ CDC stream has already been applying forward changes.
 
 - `src/table_sync.rs` - chunk comparison, repair reporting, MySQL row readers,
   and target repair adapter.
-- `src/table_sync/progress.rs` - target-side CDC progress table schema, loading,
-  saving, and error recording.
+- `src/table_sync/progress.rs` - legacy catchup progress schema plus run-scoped
+  table-sync progress schema, loading, saving, and error recording.
 - `src/sync_cli.rs` - `sync-table` option parsing and command dispatch.
 - `src/main.rs` - top-level command registration and shared option helpers.
 - `src/live.rs` - stream failure hook that runs table repair before checkpointing.
@@ -45,21 +57,20 @@ CDC stream has already been applying forward changes.
 
 - `src/table_sync.rs` - row comparison, dry-run/apply behavior, source-window
   target reads, and SQL generation tests.
-- `src/table_sync/progress.rs` - progress table DDL, upsert SQL, and load
-  parsing tests.
-- `src/sync_cli.rs` - `sync-table` parser tests.
+- `src/table_sync/progress.rs` - legacy and run-scoped progress-table DDL, upsert SQL,
+  and load parsing tests.
+- `src/sync_cli.rs` - `sync-table` parser and required run-ID tests.
 - `src/live/tests.rs` - stream target-failure repair and checkpoint tests.
 
 ## Known gaps (current cycle)
 
 - [ ] Automate multi-table scheduling from schema inventory.
-- [ ] Persist per-table sync progress for long repair runs.
 - [ ] Add row-level divergence output suitable for operator review.
 - [ ] Scope stream repairs to affected primary-key windows when the failed SQL
   allows safe key extraction.
 
 ## Out of scope
 
-- Deletes are out of scope for this first repair command; extra target rows are
-  reported so an operator can review them before destructive action.
+- Unbounded deletion is out of scope. Orphan deletion requires `apply` mode and an
+  explicit nonzero `--max-deletes` allowance.
 - Automatic cutover is out of scope. This command repairs rehearsal target drift.

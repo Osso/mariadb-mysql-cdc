@@ -67,3 +67,58 @@ mariadb-mysql-cdc catchup-progress \
 The durable progress state supports safe restart after a failed pod. Sequential
 catchup resumes from the table checkpoint; parallel catchup resumes from each
 worker range checkpoint.
+
+## Table Repair Runs
+
+Use `sync-table` after catchup or validation identifies a table-level drift. Every
+invocation requires `--run-id`; choose a new descriptive ID for each recurring
+repair. Reuse an ID only to resume the exact interrupted invocation. A completed
+ID is terminal, and changing source/target endpoint or database, target write
+policy, table shape, mode, chunk size, bounds, `--max-deletes`, or
+`--updated-since` requires a new ID. A target-side named lock rejects concurrent
+processes using the same ID.
+
+```bash
+mariadb-mysql-cdc sync-table \
+  --source-host 192.0.2.10 \
+  --source-user cdc_reader \
+  --source-password-env SOURCE_PASSWORD \
+  --source-database globalcomix \
+  --target-host target-mysql.example \
+  --target-port 25060 \
+  --target-user target_user \
+  --target-password-env TARGET_PASSWORD \
+  --target-database globalcomix \
+  --table releases \
+  --primary-key id \
+  --columns id,slug,title,updated_at \
+  --mode apply \
+  --run-id releases-repair-20260710-01
+```
+
+Run state defaults to `cdc.table_sync_runs`. It is separate from legacy
+`cdc.table_sync_progress`, which remains the catchup checkpoint store. Inspect a
+specific repair run with:
+
+```bash
+mariadb-mysql-cdc sync-progress ... \
+  --progress-table cdc.table_sync_runs \
+  --run-id releases-repair-20260710-01
+```
+
+For a recent-update accelerator, add both `--updated-at-column` and
+`--updated-since`. An interrupted retry with the same run ID restarts from the
+beginning rather than resuming by primary key, because a source row can become
+newly eligible behind a saved key. Idempotent upserts make that restart safe.
+These runs never delete target orphans and cannot be combined with primary-key
+range bounds.
+
+```bash
+mariadb-mysql-cdc sync-table ... \
+  --table releases --primary-key id --columns id,slug,title,updated_at \
+  --mode apply --run-id releases-updated-20260710-01 \
+  --updated-at-column updated_at --updated-since '2026-07-01 00:00:00'
+```
+
+Normal range repair reports extra target rows. Deletion requires `--mode apply`
+and an explicit nonzero `--max-deletes`; otherwise the default limit is zero.

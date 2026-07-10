@@ -65,6 +65,7 @@ fn aggregate_range_rows(
         .unwrap_or(1);
 
     SyncProgressRow {
+        run_id: String::new(),
         table: table.to_string(),
         rows_scanned,
         total_rows,
@@ -116,9 +117,10 @@ pub(super) fn format_progress_row(config: &SyncProgressConfig, row: &SyncProgres
     let eta_seconds = remaining.and_then(|remaining| eta(remaining, rows_per_second));
 
     format!(
-        "table={} status={} rows_scanned={} total_rows={} progress={} rows_per_second={:.2} inserts_per_second={:.2} eta={} last_pk={} inserts={} updates={} extras={} error={}",
+        "table={} status={} run_id={} rows_scanned={} total_rows={} progress={} rows_per_second={:.2} inserts_per_second={:.2} eta={} last_pk={} inserts={} updates={} extras={} error={}",
         row.table,
         row.status,
+        display_run_id(&row.run_id),
         row.rows_scanned,
         display_optional_u64(total_rows),
         display_percent(row.rows_scanned, total_rows),
@@ -131,6 +133,10 @@ pub(super) fn format_progress_row(config: &SyncProgressConfig, row: &SyncProgres
         row.extra_target_rows,
         display_error(&row.last_error)
     )
+}
+
+fn display_run_id(run_id: &str) -> &str {
+    if run_id.is_empty() { "-" } else { run_id }
 }
 
 pub(super) fn rate(count: u64, seconds: u64) -> f64 {

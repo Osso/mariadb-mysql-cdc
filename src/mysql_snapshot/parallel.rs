@@ -204,6 +204,8 @@ fn record_parallel_table_complete(
         .ensure()
         .and_then(|_| {
             mysql_store.save(&SyncTableProgress {
+                run_id: None,
+                run_spec_json: None,
                 table: table.name.clone(),
                 last_primary_key: None,
                 chunks: 0,

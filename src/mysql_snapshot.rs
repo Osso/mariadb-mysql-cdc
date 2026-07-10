@@ -396,6 +396,8 @@ fn save_mysql_snapshot_progress(
             continue;
         }
         mysql_store.save(&SyncTableProgress {
+            run_id: None,
+            run_spec_json: None,
             table: table.clone(),
             last_primary_key: table_progress.last_primary_key.clone(),
             chunks: 0,

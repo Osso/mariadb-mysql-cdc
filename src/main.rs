@@ -31,7 +31,7 @@ Usage:
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
   mariadb-mysql-cdc catchup-snapshot --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --progress-file PATH [options]
   mariadb-mysql-cdc catchup-progress --progress-file PATH
-  mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS [options]
+  mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS --run-id ID [options]
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -95,6 +95,10 @@ Catchup snapshot options:
   --target-database DB            MySQL target database.
   --progress-file PATH            Local fallback checkpoint file.
   --progress-table TABLE          Target checkpoint table. Defaults to cdc.table_sync_progress.
+
+Sync table options:
+  --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
+  --run-id ID                     Immutable repair run ID. Reuse only for interrupted runs; completed IDs are terminal.
   --start-after CSV               Primary-key lower bound for targeted sync-table repair.
   --end-at CSV                    Primary-key upper bound for targeted sync-table repair.
   --start-after-json JSON         Primary-key lower bound as JSON string array; use for values containing commas.
@@ -102,6 +106,11 @@ Catchup snapshot options:
   --max-deletes COUNT             Maximum target orphan deletes allowed in sync-table apply mode. Defaults to 0.
   --updated-at-column COLUMN      Source update timestamp column for update_time accelerator.
   --updated-since VALUE           Upsert source rows where updated-at column is >= VALUE. Does not delete orphans; run checksum validation after.
+
+Sync progress repair-run options:
+  --progress-table TABLE          Use cdc.table_sync_runs to inspect sync-table repair runs.
+  --run-id ID                     Filter the selected run-progress table by repair run ID.
+
   --chunk-size ROWS               Rows per chunk. Defaults to 10000.
   --throttle-ms MS                Sleep after each copied chunk. Defaults to 0.
 ";

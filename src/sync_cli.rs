@@ -59,7 +59,8 @@ fn default_sync_table_config() -> table_sync::SyncTableConfig {
         },
         chunk_size: 1000,
         mode: table_sync::SyncMode::DryRun,
-        progress_table: "cdc.table_sync_progress".to_string(),
+        progress_table: "cdc.table_sync_runs".to_string(),
+        run_id: String::new(),
         start_after: None,
         end_at: None,
         max_deletes: Some(0),
@@ -86,6 +87,7 @@ fn sync_table_option(
         "--chunk-size" => config.chunk_size = crate::parse_usize(flag, value)?,
         "--mode" => config.mode = parse_sync_mode(value)?,
         "--progress-table" => config.progress_table = value.to_string(),
+        "--run-id" => config.run_id = value.to_string(),
         "--start-after" => config.start_after = Some(parse_csv_columns(value)),
         "--end-at" => config.end_at = Some(parse_csv_columns(value)),
         "--start-after-json" => config.start_after = Some(parse_json_columns(flag, value)?),
@@ -174,6 +176,9 @@ fn validate_sync_table_config(config: &table_sync::SyncTableConfig) -> Result<()
     }
     if config.progress_table.is_empty() {
         return Err("progress table is required".to_string());
+    }
+    if config.run_id.is_empty() {
+        return Err("run id is required".to_string());
     }
     validate_bound_arity(
         &config.table.primary_key,
@@ -314,6 +319,8 @@ mod tests {
             "id",
             "--columns",
             "id, slug, title",
+            "--run-id",
+            "repair-20260710-01",
         ]))
         .expect("sync-table config");
 
@@ -326,8 +333,43 @@ mod tests {
         assert_eq!(config.table.columns, vec!["id", "slug", "title"]);
         assert_eq!(config.chunk_size, 1000);
         assert_eq!(config.mode, table_sync::SyncMode::DryRun);
-        assert_eq!(config.progress_table, "cdc.table_sync_progress");
+        assert_eq!(config.progress_table, "cdc.table_sync_runs");
+        assert_eq!(config.run_id, "repair-20260710-01");
         assert_eq!(config.max_deletes, Some(0));
+    }
+
+    #[test]
+    fn rejects_missing_run_id() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let error = parse_sync_table_config(args([
+            "--source-host",
+            "source-db",
+            "--source-user",
+            "source-user",
+            "--source-password-env",
+            "CDC_SYNC_SOURCE_PASSWORD",
+            "--source-database",
+            "globalcomix",
+            "--target-host",
+            "target-db",
+            "--target-user",
+            "target-user",
+            "--target-password-env",
+            "CDC_SYNC_TARGET_PASSWORD",
+            "--target-database",
+            "globalcomix",
+            "--table",
+            "releases",
+            "--primary-key",
+            "id",
+            "--columns",
+            "id,slug,title",
+        ]))
+        .expect_err("missing run id");
+
+        assert_eq!(error, "run id is required");
     }
 
     #[test]
@@ -523,6 +565,8 @@ mod tests {
             "id",
             "--columns",
             "id,slug,title",
+            "--run-id",
+            "test-run",
         ]);
         values.extend(args(extra));
         values

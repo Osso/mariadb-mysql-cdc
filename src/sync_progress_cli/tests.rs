@@ -36,6 +36,8 @@ fn parses_progress_config_with_checkpoint_and_source_counts() {
         "globalcomix",
         "--checkpoint-file",
         "/var/lib/cdc/stream-checkpoint.json",
+        "--run-id",
+        "repair-20260710-01",
     ]))
     .expect("progress config");
 
@@ -45,6 +47,7 @@ fn parses_progress_config_with_checkpoint_and_source_counts() {
     assert_eq!(config.source.password, "source-pass");
     assert_eq!(config.progress_table, "cdc.table_sync_progress");
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
+    assert_eq!(config.run_id.as_deref(), Some("repair-20260710-01"));
     assert_eq!(
         config.checkpoint_file,
         Some(PathBuf::from("/var/lib/cdc/stream-checkpoint.json"))
@@ -177,13 +180,14 @@ fn command_line_overrides_config_file_defaults() {
 
 #[test]
 fn parses_progress_rows() {
-    let row = "releases\t200\t1000\t10\t3\t1\trunning\t[\"42\"]\t20\t";
+    let row = "repair-20260710-01\treleases\t200\t1000\t10\t3\t1\trunning\t[\"42\"]\t20\t";
 
     let rows = parse_progress_rows(row).expect("progress rows");
 
     assert_eq!(
         rows,
         vec![SyncProgressRow {
+            run_id: "repair-20260710-01".to_string(),
             table: "releases".to_string(),
             rows_scanned: 200,
             total_rows: Some(1000),
@@ -218,6 +222,7 @@ fn formats_rate_and_eta_when_total_rows_are_known() {
 #[test]
 fn formats_progress_from_stored_total_rows_without_source_config() {
     let row = SyncProgressRow {
+        run_id: "repair-01".to_string(),
         table: "access_tokens".to_string(),
         rows_scanned: 21_000,
         total_rows: Some(42_000),
@@ -277,6 +282,20 @@ fn aggregates_running_range_progress_by_parent_table() {
             .iter()
             .any(|line| line.contains("sync_progress_section name=range_details"))
     );
+}
+
+#[test]
+fn builds_run_scoped_progress_query_with_run_id_filter() {
+    let sql = build_progress_query(
+        "cdc.table_sync_runs",
+        Some("releases"),
+        Some("repair-01"),
+        true,
+        true,
+    );
+
+    assert!(sql.starts_with("SELECT run_id, table_name"));
+    assert!(sql.contains("WHERE table_name = 'releases' AND run_id = 'repair-01'"));
 }
 
 #[test]
@@ -355,6 +374,7 @@ fn formats_stale_sync_progress_cache_with_age_and_reason() {
 
 fn progress_row(table: &str, status: &str) -> SyncProgressRow {
     SyncProgressRow {
+        run_id: String::new(),
         table: table.to_string(),
         rows_scanned: 10,
         total_rows: Some(100),
@@ -370,6 +390,7 @@ fn progress_row(table: &str, status: &str) -> SyncProgressRow {
 
 fn range_progress_row(table: &str, rows_scanned: u64, total_rows: u64) -> SyncProgressRow {
     SyncProgressRow {
+        run_id: String::new(),
         table: table.to_string(),
         rows_scanned,
         total_rows: Some(total_rows),

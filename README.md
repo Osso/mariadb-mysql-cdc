@@ -74,4 +74,33 @@ cargo run -- stream-binlog --source-host 127.0.0.1 --source-user repl \
   --source-password-env SOURCE_PASSWORD --source-database app \
   --target-host 127.0.0.1 --target-user writer \
   --target-password-env TARGET_PASSWORD --target-database app
+
+cargo run -- sync-table --source-host 127.0.0.1 --source-user reader \
+  --source-password-env SOURCE_PASSWORD --source-database app \
+  --target-host 127.0.0.1 --target-user writer \
+  --target-password-env TARGET_PASSWORD --target-database app \
+  --table accounts --primary-key id --columns id,email,updated_at \
+  --mode apply --run-id accounts-repair-20260710-01
 ```
+
+`sync-table` requires `--run-id` and stores resumable run state in
+`cdc.table_sync_runs` by default. Use a new ID for each recurrence; reuse an ID
+only for the exact interrupted run, because completed IDs are terminal. The
+immutable run specification covers source/target endpoints and databases, target
+write policy, mode, primary-key range, chunk size, table shape, maximum deletes,
+and `--updated-since` when present. A target-side named lock rejects concurrent
+processes using the same run ID.
+
+`cdc.table_sync_progress` remains the legacy catchup-only checkpoint table. An
+interrupted `--updated-since` retry safely restarts from the beginning because a
+row can become newly eligible behind a saved primary key; its idempotent upserts
+never delete target orphans. Inspect a specific repair with:
+
+```bash
+mariadb-mysql-cdc sync-progress ... \
+  --progress-table cdc.table_sync_runs \
+  --run-id releases-repair-20260710-01
+```
+
+See [Catchup Workflow](docs/catchup.md) for the repair runbook and bounded-delete
+rules.

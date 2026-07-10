@@ -1,4 +1,5 @@
 use crate::snapshot::SnapshotRow;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -10,8 +11,8 @@ use mysql::MySqlSyncReader;
 #[cfg(test)]
 pub(crate) use mysql::build_sync_select_sql;
 pub use progress::{
-    MySqlSyncProgressStore, NoopSyncProgressStore, SyncProgressStatus, SyncProgressStore,
-    SyncTableProgress,
+    MySqlSyncProgressStore, MySqlSyncRunProgressStore, NoopSyncProgressStore, SyncProgressStatus,
+    SyncProgressStore, SyncTableProgress,
 };
 pub use target::SyncRepairTarget;
 
@@ -23,12 +24,13 @@ pub struct SyncTableConfig {
     pub chunk_size: usize,
     pub mode: SyncMode,
     pub progress_table: String,
+    pub run_id: String,
     pub start_after: Option<Vec<String>>,
     pub end_at: Option<Vec<String>>,
     pub max_deletes: Option<u64>,
     pub updated_since: Option<UpdatedSince>,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SyncTable {
     pub name: String,
     pub primary_key: Vec<String>,
@@ -46,13 +48,14 @@ pub struct SyncChunkRequest {
     pub limit: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct UpdatedSince {
     pub column: String,
     pub value: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SyncMode {
     DryRun,
     Apply,
@@ -125,6 +128,8 @@ pub fn sync_table_with_progress(
     sync_table_with_progress_range(
         table,
         SyncRunOptions {
+            run_id: "ephemeral".to_string(),
+            run_scope: "ephemeral".to_string(),
             chunk_size,
             mode,
             start_after: None,
@@ -187,7 +192,32 @@ fn read_recent_update_chunk(
     ))
 }
 
+#[derive(Serialize)]
+struct SyncRunScope<'a> {
+    source_host: &'a str,
+    source_port: u16,
+    source_database: &'a str,
+    target_host: &'a str,
+    target_port: u16,
+    target_database: &'a str,
+    insert_conflict_policy: &'a str,
+}
+
+#[derive(Serialize)]
+struct SyncRunSpec<'a> {
+    scope: &'a str,
+    table: &'a SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    start_after: &'a Option<Vec<String>>,
+    end_at: &'a Option<Vec<String>>,
+    max_deletes: Option<u64>,
+    updated_since: Option<&'a UpdatedSince>,
+}
+
 pub struct SyncRunOptions {
+    pub run_id: String,
+    pub run_scope: String,
     pub chunk_size: usize,
     pub mode: SyncMode,
     pub start_after: Option<Vec<String>>,
@@ -204,6 +234,8 @@ pub fn sync_table_with_progress_range(
     progress_store: &mut impl SyncProgressStore,
 ) -> Result<SyncTableReport, TableSyncError> {
     let SyncRunOptions {
+        run_id,
+        run_scope,
         chunk_size,
         mode,
         start_after: range_start_after,
@@ -212,31 +244,66 @@ pub fn sync_table_with_progress_range(
     } = options;
     validate_sync_table(table, chunk_size)?;
     validate_sync_range(table, range_start_after.as_ref(), range_end_at.as_ref())?;
-    let mut progress = load_sync_progress(table, mode, progress_store)?;
+    let mut progress = load_range_sync_progress(
+        &run_id,
+        table,
+        &SyncRunOptions {
+            run_id: run_id.clone(),
+            run_scope,
+            chunk_size,
+            mode,
+            start_after: range_start_after.clone(),
+            end_at: range_end_at.clone(),
+            max_deletes,
+        },
+        progress_store,
+    )?;
     let mut report = progress.report();
     let mut start_after = progress.last_primary_key.clone().or(range_start_after);
 
-    loop {
-        let Some(next_start_after) = sync_next_chunk(SyncChunkContext {
-            table,
-            chunk_size,
-            mode,
-            start_after: start_after.clone(),
-            source,
-            target,
-            repair_target,
-            progress_store,
-            progress: &mut progress,
-            report: &mut report,
-            range_end_at: range_end_at.clone(),
-            max_deletes,
-        })?
-        else {
-            complete_sync_progress(&mut progress, progress_store)?;
-            return Ok(report);
-        };
-        start_after = Some(next_start_after);
-    }
+    let result = (|| {
+        loop {
+            let Some(next_start_after) = sync_next_chunk(SyncChunkContext {
+                table,
+                chunk_size,
+                mode,
+                start_after: start_after.clone(),
+                source,
+                target,
+                repair_target,
+                progress_store,
+                progress: &mut progress,
+                report: &mut report,
+                range_end_at: range_end_at.clone(),
+                max_deletes,
+            })?
+            else {
+                complete_sync_progress(&mut progress, progress_store)?;
+                return Ok(report);
+            };
+            start_after = Some(next_start_after);
+        }
+    })();
+    let result = persist_sync_run_error(&run_id, result, progress_store);
+    finish_sync_run(&run_id, result, progress_store)
+}
+
+fn load_range_sync_progress(
+    run_id: &str,
+    table: &SyncTable,
+    options: &SyncRunOptions,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableProgress, TableSyncError> {
+    let run_spec_json = build_run_spec_json(
+        &options.run_scope,
+        table,
+        options.chunk_size,
+        options.mode,
+        &options.start_after,
+        &options.end_at,
+        options.max_deletes,
+    )?;
+    load_sync_progress(run_id, &run_spec_json, table, options.mode, progress_store)
 }
 
 struct SyncChunkContext<'a, S, T, R, P>
@@ -407,18 +474,114 @@ fn record_sync_chunk(
     progress_store.save(progress)
 }
 
+fn build_run_spec_json(
+    run_scope: &str,
+    table: &SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    start_after: &Option<Vec<String>>,
+    end_at: &Option<Vec<String>>,
+    max_deletes: Option<u64>,
+) -> Result<String, TableSyncError> {
+    serde_json::to_string(&SyncRunSpec {
+        scope: run_scope,
+        table,
+        chunk_size,
+        mode,
+        start_after,
+        end_at,
+        max_deletes,
+        updated_since: None,
+    })
+    .map_err(|error| TableSyncError::Progress(format!("serialize run specification: {error}")))
+}
+
 fn load_sync_progress(
+    run_id: &str,
+    run_spec_json: &str,
     table: &SyncTable,
     mode: SyncMode,
     progress_store: &mut impl SyncProgressStore,
 ) -> Result<SyncTableProgress, TableSyncError> {
     progress_store.ensure()?;
-    let mut progress = progress_store
-        .load(&table.name)?
-        .filter(|progress| progress.status != SyncProgressStatus::Complete)
-        .unwrap_or_else(|| SyncTableProgress::started(table.name.clone(), mode));
-    progress.mark_running(mode);
-    progress_store.save(&progress)?;
+    progress_store.acquire_run(run_id)?;
+    let result = (|| {
+        let mut progress = match progress_store.load(run_id)? {
+            Some(progress) => validate_resumable_progress(progress, run_id, run_spec_json)?,
+            None => SyncTableProgress::started(
+                run_id.to_string(),
+                run_spec_json.to_string(),
+                table.name.clone(),
+                mode,
+            ),
+        };
+        progress.mark_running(mode);
+        progress_store.save(&progress)?;
+        Ok(progress)
+    })();
+    release_on_load_error(run_id, result, progress_store)
+}
+
+fn release_on_load_error(
+    run_id: &str,
+    result: Result<SyncTableProgress, TableSyncError>,
+    progress_store: &impl SyncProgressStore,
+) -> Result<SyncTableProgress, TableSyncError> {
+    if result.is_err() {
+        let _ = progress_store.release_run(run_id);
+    }
+    result
+}
+
+fn persist_sync_run_error<T>(
+    run_id: &str,
+    result: Result<T, TableSyncError>,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<T, TableSyncError> {
+    match result {
+        Err(error) if should_record_sync_run_error(&error) => {
+            if let Err(save_error) = progress_store.save_error(run_id, &error) {
+                return Err(TableSyncError::Progress(format!(
+                    "{error}; also failed to persist run error: {save_error}"
+                )));
+            }
+            Err(error)
+        }
+        other => other,
+    }
+}
+
+fn finish_sync_run<T>(
+    run_id: &str,
+    result: Result<T, TableSyncError>,
+    progress_store: &impl SyncProgressStore,
+) -> Result<T, TableSyncError> {
+    let release_result = progress_store.release_run(run_id);
+    match (result, release_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(release_error)) => Err(release_error),
+        (Err(error), Err(release_error)) => Err(TableSyncError::Progress(format!(
+            "{error}; also failed to release run lock: {release_error}"
+        ))),
+    }
+}
+
+fn validate_resumable_progress(
+    progress: SyncTableProgress,
+    run_id: &str,
+    run_spec_json: &str,
+) -> Result<SyncTableProgress, TableSyncError> {
+    if progress.run_spec_json.as_deref() != Some(run_spec_json) {
+        return Err(TableSyncError::Progress(format!(
+            "run id `{run_id}` already exists with a different immutable specification"
+        )));
+    }
+    if progress.status == SyncProgressStatus::Complete {
+        return Err(TableSyncError::Progress(format!(
+            "run id `{run_id}` is already complete; use a new run id"
+        )));
+    }
     Ok(progress)
 }
 
@@ -464,20 +627,22 @@ pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, Table
     validate_sync_table_config(config)?;
     let source = MySqlSyncReader::new(config.source.clone());
     let target = MySqlSyncReader::new(target_connection_config(config));
-    let mut progress_store =
-        progress::MySqlSyncProgressStore::new(config.target.clone(), config.progress_table.clone());
+    let mut progress_store = progress::MySqlSyncRunProgressStore::new(
+        config.target.clone(),
+        config.progress_table.clone(),
+    );
     let mut repair_target = mysql_repair_target(config)?;
-    let result = run_sync_table_with_targets(
+    run_sync_table_with_targets(
         config,
         &source,
         &target,
         &mut repair_target,
         &mut progress_store,
-    );
-    if let Err(error) = &result {
-        progress_store.save_error(&config.table.name, error)?;
-    }
-    result
+    )
+}
+
+fn should_record_sync_run_error(error: &TableSyncError) -> bool {
+    matches!(error, TableSyncError::Read(_) | TableSyncError::Repair(_))
 }
 
 fn mysql_repair_target(
@@ -495,6 +660,23 @@ fn mysql_repair_target(
     ))
 }
 
+fn build_sync_run_scope(config: &SyncTableConfig) -> Result<String, TableSyncError> {
+    let insert_conflict_policy = match config.target.insert_conflict_policy {
+        crate::live::InsertConflictPolicy::Error => "error",
+        crate::live::InsertConflictPolicy::IgnoreDuplicate => "ignore-duplicate",
+    };
+    serde_json::to_string(&SyncRunScope {
+        source_host: &config.source.host,
+        source_port: config.source.port,
+        source_database: &config.source.database,
+        target_host: &config.target.host,
+        target_port: config.target.port,
+        target_database: &config.target.database,
+        insert_conflict_policy,
+    })
+    .map_err(|error| TableSyncError::Progress(format!("serialize run scope: {error}")))
+}
+
 fn run_sync_table_with_targets(
     config: &SyncTableConfig,
     source: &impl SyncTableReader,
@@ -502,30 +684,212 @@ fn run_sync_table_with_targets(
     repair_target: &mut impl SyncRepairTarget,
     progress_store: &mut impl SyncProgressStore,
 ) -> Result<SyncTableReport, TableSyncError> {
-    if let Some(updated_since) = &config.updated_since {
-        sync_recent_updates(
-            &config.table,
-            config.chunk_size,
-            config.mode,
+    match &config.updated_since {
+        Some(updated_since) => run_recent_update_sync(
+            config,
             source,
-            repair_target,
-            updated_since.clone(),
-        )
-    } else {
-        sync_table_with_progress_range(
-            &config.table,
-            SyncRunOptions {
-                chunk_size: config.chunk_size,
-                mode: config.mode,
-                start_after: config.start_after.clone(),
-                end_at: config.end_at.clone(),
-                max_deletes: config.max_deletes,
-            },
-            source,
-            target,
             repair_target,
             progress_store,
-        )
+            updated_since.clone(),
+        ),
+        None => run_range_sync(config, source, target, repair_target, progress_store),
+    }
+}
+
+fn run_recent_update_sync(
+    config: &SyncTableConfig,
+    source: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    progress_store: &mut impl SyncProgressStore,
+    updated_since: UpdatedSince,
+) -> Result<SyncTableReport, TableSyncError> {
+    sync_recent_updates_with_progress(
+        &config.run_id,
+        &build_sync_run_scope(config)?,
+        &config.table,
+        config.chunk_size,
+        config.mode,
+        source,
+        repair_target,
+        progress_store,
+        updated_since,
+    )
+}
+
+fn run_range_sync(
+    config: &SyncTableConfig,
+    source: &impl SyncTableReader,
+    target: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableReport, TableSyncError> {
+    sync_table_with_progress_range(
+        &config.table,
+        SyncRunOptions {
+            run_id: config.run_id.clone(),
+            run_scope: build_sync_run_scope(config)?,
+            chunk_size: config.chunk_size,
+            mode: config.mode,
+            start_after: config.start_after.clone(),
+            end_at: config.end_at.clone(),
+            max_deletes: config.max_deletes,
+        },
+        source,
+        target,
+        repair_target,
+        progress_store,
+    )
+}
+
+fn sync_recent_updates_with_progress(
+    run_id: &str,
+    run_scope: &str,
+    table: &SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    source: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    progress_store: &mut impl SyncProgressStore,
+    updated_since: UpdatedSince,
+) -> Result<SyncTableReport, TableSyncError> {
+    let progress = load_recent_update_progress(
+        run_id,
+        run_scope,
+        table,
+        chunk_size,
+        mode,
+        &updated_since,
+        progress_store,
+    )?;
+    let result = sync_recent_update_chunks(
+        RecentUpdateSyncContext {
+            table,
+            chunk_size,
+            mode,
+            source,
+            repair_target,
+            progress_store,
+            updated_since,
+        },
+        progress,
+    );
+    let result = persist_sync_run_error(run_id, result, progress_store);
+    finish_sync_run(run_id, result, progress_store)
+}
+
+fn load_recent_update_progress(
+    run_id: &str,
+    run_scope: &str,
+    table: &SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    updated_since: &UpdatedSince,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableProgress, TableSyncError> {
+    validate_sync_table(table, chunk_size)?;
+    let run_spec_json =
+        recent_update_run_spec_json(run_scope, table, chunk_size, mode, updated_since)?;
+    restart_recent_update_progress(run_id, &run_spec_json, table, mode, progress_store)
+}
+
+fn restart_recent_update_progress(
+    run_id: &str,
+    run_spec_json: &str,
+    table: &SyncTable,
+    mode: SyncMode,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableProgress, TableSyncError> {
+    progress_store.ensure()?;
+    progress_store.acquire_run(run_id)?;
+    let result = (|| {
+        if let Some(progress) = progress_store.load(run_id)? {
+            validate_resumable_progress(progress, run_id, run_spec_json)?;
+        }
+        let progress = SyncTableProgress::started(
+            run_id.to_string(),
+            run_spec_json.to_string(),
+            table.name.clone(),
+            mode,
+        );
+        progress_store.save(&progress)?;
+        Ok(progress)
+    })();
+    release_on_load_error(run_id, result, progress_store)
+}
+
+fn recent_update_run_spec_json(
+    run_scope: &str,
+    table: &SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    updated_since: &UpdatedSince,
+) -> Result<String, TableSyncError> {
+    serde_json::to_string(&SyncRunSpec {
+        scope: run_scope,
+        table,
+        chunk_size,
+        mode,
+        start_after: &None,
+        end_at: &None,
+        max_deletes: None,
+        updated_since: Some(updated_since),
+    })
+    .map_err(|error| TableSyncError::Progress(format!("serialize run specification: {error}")))
+}
+
+struct RecentUpdateSyncContext<'a, S, R, P>
+where
+    S: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    table: &'a SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    source: &'a S,
+    repair_target: &'a mut R,
+    progress_store: &'a mut P,
+    updated_since: UpdatedSince,
+}
+
+fn sync_recent_update_chunks<S, R, P>(
+    context: RecentUpdateSyncContext<'_, S, R, P>,
+    mut progress: SyncTableProgress,
+) -> Result<SyncTableReport, TableSyncError>
+where
+    S: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let mut report = progress.report();
+    let mut start_after = progress.last_primary_key.clone();
+
+    loop {
+        let source_rows = read_recent_update_chunk(
+            context.table,
+            context.chunk_size,
+            context.source,
+            start_after,
+            context.updated_since.clone(),
+        )?;
+        if source_rows.is_empty() {
+            complete_sync_progress(&mut progress, context.progress_store)?;
+            return Ok(report);
+        }
+        apply_recent_update_chunk(
+            &source_rows,
+            context.mode,
+            context.repair_target,
+            &mut report,
+        )?;
+        let end_at = last_primary_key(&source_rows)?;
+        progress.record_chunk(&report, end_at.clone());
+        context.progress_store.save(&progress)?;
+        if source_rows.len() < context.chunk_size {
+            complete_sync_progress(&mut progress, context.progress_store)?;
+            return Ok(report);
+        }
+        start_after = Some(end_at);
     }
 }
 
@@ -840,6 +1204,8 @@ mod tests {
         let report = sync_table_with_progress_range(
             &account_table(),
             SyncRunOptions {
+                run_id: "test-run".to_string(),
+                run_scope: "test-scope".to_string(),
                 chunk_size: 10,
                 mode: SyncMode::Apply,
                 start_after: None,
@@ -880,6 +1246,8 @@ mod tests {
         let error = sync_table_with_progress_range(
             &account_table(),
             SyncRunOptions {
+                run_id: "test-run".to_string(),
+                run_scope: "test-scope".to_string(),
                 chunk_size: 10,
                 mode: SyncMode::Apply,
                 start_after: None,
@@ -931,6 +1299,70 @@ mod tests {
     }
 
     #[test]
+    fn recent_update_retry_restarts_from_beginning_to_catch_newly_eligible_rows() {
+        let table = account_table_with_updated_at();
+        let updated_since = UpdatedSince {
+            column: "updated_at".to_string(),
+            value: "2026-06-01 00:00:00".to_string(),
+        };
+        let run_spec_json = serde_json::to_string(&SyncRunSpec {
+            scope: "test-scope",
+            table: &table,
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: &None,
+            end_at: &None,
+            max_deletes: None,
+            updated_since: Some(&updated_since),
+        })
+        .expect("run spec");
+        let source = FakeReader::new(vec![
+            row_with_updated_at("1", "already-applied", "2026-06-02 00:00:00"),
+            row_with_updated_at("2", "resume-here", "2026-06-03 00:00:00"),
+        ]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::with_progress(SyncTableProgress {
+            run_id: Some("recent-01".to_string()),
+            run_spec_json: Some(run_spec_json),
+            table: "accounts".to_string(),
+            last_primary_key: Some(vec!["1".to_string()]),
+            chunks: 1,
+            rows_scanned: 1,
+            total_rows: None,
+            inserts: 0,
+            updates: 1,
+            extra_target_rows: 0,
+            mode: SyncMode::Apply,
+            status: progress::SyncProgressStatus::Running,
+            last_error: None,
+        });
+
+        let report = sync_recent_updates_with_progress(
+            "recent-01",
+            "test-scope",
+            &table,
+            10,
+            SyncMode::Apply,
+            &source,
+            &mut repair_target,
+            &mut progress_store,
+            updated_since,
+        )
+        .expect("resumed recent update run");
+
+        assert_eq!(source.requests.borrow()[0].start_after, None);
+        assert_eq!(report.rows_scanned, 2);
+        assert_eq!(report.updates, 2);
+        assert_eq!(
+            repair_target.inserts.borrow().as_slice(),
+            &[
+                row_with_updated_at("1", "already-applied", "2026-06-02 00:00:00"),
+                row_with_updated_at("2", "resume-here", "2026-06-03 00:00:00"),
+            ]
+        );
+    }
+
+    #[test]
     fn core_config_rejects_updated_since_with_primary_key_bounds() {
         let config = SyncTableConfig {
             source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
@@ -938,7 +1370,8 @@ mod tests {
             table: account_table_with_updated_at(),
             chunk_size: 10,
             mode: SyncMode::DryRun,
-            progress_table: "cdc.table_sync_progress".to_string(),
+            progress_table: "cdc.table_sync_runs".to_string(),
+            run_id: "test-run".to_string(),
             start_after: Some(vec!["10".to_string()]),
             end_at: None,
             max_deletes: Some(0),
@@ -971,6 +1404,8 @@ mod tests {
         let error = sync_table_with_progress_range(
             &table,
             SyncRunOptions {
+                run_id: "test-run".to_string(),
+                run_scope: "test-scope".to_string(),
                 chunk_size: 10,
                 mode: SyncMode::DryRun,
                 start_after: Some(vec!["1".to_string()]),
@@ -1000,6 +1435,8 @@ mod tests {
         let report = sync_table_with_progress_range(
             &account_table(),
             SyncRunOptions {
+                run_id: "test-run".to_string(),
+                run_scope: "test-scope".to_string(),
                 chunk_size: 10,
                 mode: SyncMode::Apply,
                 start_after: None,
@@ -1030,6 +1467,8 @@ mod tests {
         let report = sync_table_with_progress_range(
             &account_table(),
             SyncRunOptions {
+                run_id: "test-run".to_string(),
+                run_scope: "test-scope".to_string(),
                 chunk_size: 10,
                 mode: SyncMode::Apply,
                 start_after: Some(vec!["1".to_string()]),
@@ -1125,6 +1564,19 @@ mod tests {
         let target = FakeReader::new(vec![row("2", "bravo"), row("3", "coda")]);
         let mut repair_target = RecordingRepairTarget::default();
         let mut progress_store = RecordingProgressStore::with_progress(SyncTableProgress {
+            run_id: Some("ephemeral".to_string()),
+            run_spec_json: Some(
+                build_run_spec_json(
+                    "ephemeral",
+                    &account_table(),
+                    1,
+                    SyncMode::Apply,
+                    &None,
+                    &None,
+                    Some(0),
+                )
+                .expect("run spec"),
+            ),
             table: "accounts".to_string(),
             last_primary_key: Some(vec!["1".to_string()]),
             chunks: 1,
@@ -1166,11 +1618,134 @@ mod tests {
     }
 
     #[test]
-    fn completed_progress_starts_a_fresh_full_scan() {
+    fn run_scope_changes_with_endpoints_and_write_policy() {
+        let mut first = SyncTableConfig {
+            source: crate::mysql_snapshot::MySqlConnectionConfig {
+                host: "source-a".to_string(),
+                port: 3306,
+                user: "reader".to_string(),
+                password: "secret".to_string(),
+                database: "app".to_string(),
+            },
+            target: crate::live::TargetMySqlConfig {
+                host: "target-a".to_string(),
+                port: 25060,
+                user: "writer".to_string(),
+                password: "secret".to_string(),
+                database: "app".to_string(),
+                insert_conflict_policy: crate::live::InsertConflictPolicy::Error,
+            },
+            table: account_table(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            progress_table: "cdc.table_sync_runs".to_string(),
+            run_id: "repair-01".to_string(),
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+            updated_since: None,
+        };
+        let first_scope = build_sync_run_scope(&first).expect("first scope");
+        first.target.host = "target-b".to_string();
+        first.target.insert_conflict_policy = crate::live::InsertConflictPolicy::IgnoreDuplicate;
+
+        let changed_scope = build_sync_run_scope(&first).expect("changed scope");
+
+        assert_ne!(first_scope, changed_scope);
+        assert!(first_scope.contains("source-a"));
+        assert!(changed_scope.contains("target-b"));
+        assert!(changed_scope.contains("ignore-duplicate"));
+    }
+
+    #[test]
+    fn progress_validation_errors_do_not_replace_saved_run_status() {
+        assert!(!should_record_sync_run_error(&TableSyncError::Progress(
+            "run id is terminal".to_string()
+        )));
+        assert!(!should_record_sync_run_error(
+            &TableSyncError::InvalidTable("invalid bounds".to_string())
+        ));
+        assert!(should_record_sync_run_error(&TableSyncError::Repair(
+            "target write failed".to_string()
+        )));
+    }
+
+    #[test]
+    fn run_id_rejects_changed_immutable_specification() {
+        let source = FakeReader::new(vec![]);
+        let target = FakeReader::new(vec![]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::with_progress(SyncTableProgress {
+            run_id: Some("repair-01".to_string()),
+            run_spec_json: Some(
+                build_run_spec_json(
+                    "test-scope",
+                    &account_table(),
+                    10,
+                    SyncMode::Apply,
+                    &Some(vec!["10".to_string()]),
+                    &Some(vec!["20".to_string()]),
+                    Some(1),
+                )
+                .expect("saved run spec"),
+            ),
+            table: "accounts".to_string(),
+            last_primary_key: Some(vec!["15".to_string()]),
+            chunks: 1,
+            rows_scanned: 5,
+            total_rows: None,
+            inserts: 0,
+            updates: 0,
+            extra_target_rows: 0,
+            mode: SyncMode::Apply,
+            status: progress::SyncProgressStatus::Running,
+            last_error: None,
+        });
+
+        let error = sync_table_with_progress_range(
+            &account_table(),
+            SyncRunOptions {
+                run_id: "repair-01".to_string(),
+                run_scope: "different-scope".to_string(),
+                chunk_size: 10,
+                mode: SyncMode::Apply,
+                start_after: Some(vec!["100".to_string()]),
+                end_at: Some(vec!["200".to_string()]),
+                max_deletes: Some(1),
+            },
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+        )
+        .expect_err("changed run specification");
+
+        assert_eq!(
+            error.to_string(),
+            "sync progress failed: run id `repair-01` already exists with a different immutable specification"
+        );
+        assert!(source.requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn completed_run_id_is_terminal() {
         let source = FakeReader::new(vec![row("1", "alpha")]);
         let target = FakeReader::new(vec![]);
         let mut repair_target = RecordingRepairTarget::default();
         let mut progress_store = RecordingProgressStore::with_progress(SyncTableProgress {
+            run_id: Some("ephemeral".to_string()),
+            run_spec_json: Some(
+                build_run_spec_json(
+                    "ephemeral",
+                    &account_table(),
+                    10,
+                    SyncMode::Apply,
+                    &None,
+                    &None,
+                    Some(0),
+                )
+                .expect("run spec"),
+            ),
             table: "accounts".to_string(),
             last_primary_key: Some(vec!["99".to_string()]),
             chunks: 4,
@@ -1184,7 +1759,7 @@ mod tests {
             last_error: None,
         });
 
-        let report = sync_table_with_progress(
+        let error = sync_table_with_progress(
             &account_table(),
             10,
             SyncMode::Apply,
@@ -1193,13 +1768,21 @@ mod tests {
             &mut repair_target,
             &mut progress_store,
         )
-        .expect("fresh sync report");
+        .expect_err("completed run id must be terminal");
 
-        assert_eq!(source.requests.borrow()[0].start_after, None);
-        assert_eq!(report.rows_scanned, 1);
-        assert_eq!(report.inserts, 1);
-        assert_eq!(report.updates, 0);
-        assert_eq!(report.extra_target_rows, 0);
+        assert_eq!(
+            error.to_string(),
+            "sync progress failed: run id `ephemeral` is already complete; use a new run id"
+        );
+        assert!(source.requests.borrow().is_empty());
+        assert_eq!(
+            progress_store.acquired_run_ids.borrow().as_slice(),
+            &["ephemeral".to_string()]
+        );
+        assert_eq!(
+            progress_store.released_run_ids.borrow().as_slice(),
+            &["ephemeral".to_string()]
+        );
     }
 
     #[test]
@@ -1367,6 +1950,8 @@ mod tests {
     struct RecordingProgressStore {
         loaded: Option<SyncTableProgress>,
         saved: RefCell<Vec<SyncTableProgress>>,
+        acquired_run_ids: RefCell<Vec<String>>,
+        released_run_ids: RefCell<Vec<String>>,
     }
 
     impl RecordingProgressStore {
@@ -1374,12 +1959,24 @@ mod tests {
             Self {
                 loaded: Some(progress),
                 saved: RefCell::new(Vec::new()),
+                acquired_run_ids: RefCell::new(Vec::new()),
+                released_run_ids: RefCell::new(Vec::new()),
             }
         }
     }
 
     impl SyncProgressStore for RecordingProgressStore {
         fn ensure(&mut self) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn acquire_run(&self, run_id: &str) -> Result<(), TableSyncError> {
+            self.acquired_run_ids.borrow_mut().push(run_id.to_string());
+            Ok(())
+        }
+
+        fn release_run(&self, run_id: &str) -> Result<(), TableSyncError> {
+            self.released_run_ids.borrow_mut().push(run_id.to_string());
             Ok(())
         }
 

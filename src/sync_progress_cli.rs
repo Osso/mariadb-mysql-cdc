@@ -41,11 +41,13 @@ struct SyncProgressConfig {
     progress_table: String,
     checkpoint_table: String,
     table: Option<String>,
+    run_id: Option<String>,
     checkpoint_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SyncProgressRow {
+    run_id: String,
     table: String,
     rows_scanned: u64,
     total_rows: Option<u64>,
@@ -100,6 +102,7 @@ fn default_sync_progress_config() -> SyncProgressConfig {
         progress_table: "cdc.table_sync_progress".to_string(),
         checkpoint_table: default_stream_checkpoint_table(),
         table: None,
+        run_id: None,
         checkpoint_file: None,
     }
 }
@@ -191,6 +194,7 @@ fn sync_progress_option(
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--checkpoint-file" => config.checkpoint_file = Some(PathBuf::from(value)),
         "--table" => config.table = Some(value.to_string()),
+        "--run-id" => config.run_id = Some(value.to_string()),
         other => return Err(format!("unknown sync-progress option: {other}")),
     }
 
@@ -343,10 +347,19 @@ fn query_progress_rows(
         return Ok(None);
     }
     let has_total_rows = reader.progress_table_has_total_rows(&config.progress_table)?;
+    let has_run_id = reader.progress_table_has_run_id(&config.progress_table)?;
+    if config.run_id.is_some() && !has_run_id {
+        return Err(format!(
+            "progress table `{}` has no run_id column; select a run-scoped table such as `cdc.table_sync_runs`",
+            config.progress_table
+        ));
+    }
     let sql = build_progress_query(
         &config.progress_table,
         config.table.as_deref(),
+        config.run_id.as_deref(),
         has_total_rows,
+        has_run_id,
     );
     reader.query_progress_rows(&sql).map(Some)
 }
@@ -376,28 +389,57 @@ fn read_stream_checkpoint(
     reader.read_stream_checkpoint(&config.checkpoint_table)
 }
 
-fn build_progress_query(progress_table: &str, table: Option<&str>, has_total_rows: bool) -> String {
-    let table_filter = table
-        .map(|table| format!(" WHERE table_name = {}", quote_sql_literal(table)))
-        .unwrap_or_default();
+fn build_progress_query(
+    progress_table: &str,
+    table: Option<&str>,
+    run_id: Option<&str>,
+    has_total_rows: bool,
+    has_run_id: bool,
+) -> String {
+    let mut filters = Vec::new();
+    if let Some(table) = table {
+        filters.push(format!("table_name = {}", quote_sql_literal(table)));
+    }
+    if let Some(run_id) = run_id {
+        filters.push(format!("run_id = {}", quote_sql_literal(run_id)));
+    }
+    let progress_filter = if filters.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", filters.join(" AND "))
+    };
     let total_rows_expression = if has_total_rows {
         "COALESCE(total_rows, '')"
     } else {
         "''"
     };
+    let run_id_expression = if has_run_id { "run_id" } else { "''" };
     format!(
-        "SELECT table_name, rows_scanned, {total_rows_expression}, inserts_applied, updates_applied, extra_target_rows, status, COALESCE(last_primary_key_json,''), GREATEST(1,TIMESTAMPDIFF(SECOND,created_at,IF(status='running',NOW(),updated_at))), COALESCE(last_error,'') FROM {}{} ORDER BY FIELD(status,'running','error','complete'), updated_at DESC, table_name",
+        "SELECT {run_id_expression}, table_name, rows_scanned, {total_rows_expression}, inserts_applied, updates_applied, extra_target_rows, status, COALESCE(last_primary_key_json,''), GREATEST(1,TIMESTAMPDIFF(SECOND,created_at,IF(status='running',NOW(),updated_at))), COALESCE(last_error,'') FROM {}{} ORDER BY FIELD(status,'running','error','complete'), updated_at DESC, table_name",
         quote_identifier_path(progress_table),
-        table_filter
+        progress_filter
     )
 }
 
+fn build_progress_run_id_exists_query(default_schema: &str, progress_table: &str) -> String {
+    build_progress_column_exists_query(default_schema, progress_table, "run_id")
+}
+
 fn build_progress_total_rows_exists_query(default_schema: &str, progress_table: &str) -> String {
+    build_progress_column_exists_query(default_schema, progress_table, "total_rows")
+}
+
+fn build_progress_column_exists_query(
+    default_schema: &str,
+    progress_table: &str,
+    column: &str,
+) -> String {
     let (schema, table) = qualified_table_parts(default_schema, progress_table);
     format!(
-        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = {} AND table_name = {} AND column_name = 'total_rows'",
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = {} AND table_name = {} AND column_name = {}",
         quote_sql_literal(&schema),
-        quote_sql_literal(&table)
+        quote_sql_literal(&table),
+        quote_sql_literal(column)
     )
 }
 
@@ -422,28 +464,30 @@ fn parse_progress_rows(output: &str) -> Result<Vec<SyncProgressRow>, String> {
 #[cfg(test)]
 fn parse_progress_row(line: &str) -> Result<SyncProgressRow, String> {
     let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 10 {
+    if fields.len() != 11 {
         return Err(format!(
-            "progress row has {} fields, expected 10",
+            "progress row has {} fields, expected 11",
             fields.len()
         ));
     }
 
     Ok(SyncProgressRow {
-        table: fields[0].to_string(),
-        rows_scanned: parse_u64_field("rows_scanned", fields[1])?,
-        total_rows: parse_optional_u64_field("total_rows", fields[2])?,
-        inserts: parse_u64_field("inserts_applied", fields[3])?,
-        updates: parse_u64_field("updates_applied", fields[4])?,
-        extra_target_rows: parse_u64_field("extra_target_rows", fields[5])?,
-        status: fields[6].to_string(),
-        last_primary_key: fields[7].to_string(),
-        elapsed_seconds: parse_u64_field("elapsed_seconds", fields[8])?,
-        last_error: fields[9].to_string(),
+        run_id: fields[0].to_string(),
+        table: fields[1].to_string(),
+        rows_scanned: parse_u64_field("rows_scanned", fields[2])?,
+        total_rows: parse_optional_u64_field("total_rows", fields[3])?,
+        inserts: parse_u64_field("inserts_applied", fields[4])?,
+        updates: parse_u64_field("updates_applied", fields[5])?,
+        extra_target_rows: parse_u64_field("extra_target_rows", fields[6])?,
+        status: fields[7].to_string(),
+        last_primary_key: fields[8].to_string(),
+        elapsed_seconds: parse_u64_field("elapsed_seconds", fields[9])?,
+        last_error: fields[10].to_string(),
     })
 }
 
 type ProgressDbRow = (
+    String,
     String,
     u64,
     String,
@@ -483,6 +527,11 @@ impl TargetProgressReader {
         self.query_count(&sql).map(|count| count == 1)
     }
 
+    fn progress_table_has_run_id(&mut self, progress_table: &str) -> Result<bool, String> {
+        let sql = build_progress_run_id_exists_query(&self.default_database, progress_table);
+        self.query_count(&sql).map(|count| count == 1)
+    }
+
     fn query_progress_rows(&mut self, sql: &str) -> Result<Vec<SyncProgressRow>, String> {
         let rows = self
             .conn
@@ -518,16 +567,17 @@ impl TargetProgressReader {
 
 fn sync_progress_row_from_db(row: ProgressDbRow) -> Result<SyncProgressRow, String> {
     Ok(SyncProgressRow {
-        table: row.0,
-        rows_scanned: row.1,
-        total_rows: parse_optional_u64_field("total_rows", &row.2)?,
-        inserts: row.3,
-        updates: row.4,
-        extra_target_rows: row.5,
-        status: row.6,
-        last_primary_key: row.7,
-        elapsed_seconds: row.8,
-        last_error: row.9,
+        run_id: row.0,
+        table: row.1,
+        rows_scanned: row.2,
+        total_rows: parse_optional_u64_field("total_rows", &row.3)?,
+        inserts: row.4,
+        updates: row.5,
+        extra_target_rows: row.6,
+        status: row.7,
+        last_primary_key: row.8,
+        elapsed_seconds: row.9,
+        last_error: row.10,
     })
 }
 
