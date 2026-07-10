@@ -9,20 +9,26 @@ a standalone migration/CDC tool.
 
 ## Design Constraints
 
-- Keep the source server on its existing `binlog_format=MIXED`.
-- Do not require switching production replication to row-based binlogs.
+- Consume production `binlog_format=ROW` with `binlog_row_image=FULL` so source
+  primary keys and complete before/after row images are authoritative.
 - Snapshot table data first, then stream MariaDB binlogs from a recorded
   position.
-- Apply known-compatible changes to the MySQL target.
+- Apply row changes by source primary key; a secondary-unique conflict must not
+  mutate a different target primary key.
+- Allow observable conflict skips so checksum-driven repair can provide eventual
+  consistency without blocking the live stream.
 - Stop or quarantine on unsupported data-changing events with exact binlog
   file/position/GTID.
-- Keep the target out of service until repeated rehearsals prove compatibility.
+- Keep the target out of service until repeated reconciliation proves data and
+  schema parity.
 
 ## Current Status
 
-The first read-only probe is available. It connects to a MariaDB source, records
-the current binlog coordinates with `SHOW MASTER STATUS`, then uses
-`mariadb-binlog` to read and classify events without writing to a target.
+The structured stream consumes native MariaDB row events, persists its checkpoint
+in the target transaction, and replays allowlisted DDL query events. Snapshot,
+drift-check, checksum localization, and primary-key table repair commands support
+rehearsal and eventual convergence. The legacy `probe` text-binlog path is not a
+supported health check.
 
 ## DDL Replay Support
 
@@ -64,6 +70,8 @@ Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
 
 ```bash
 cargo run -- plan
-cargo run -- probe --host 127.0.0.1 --user repl --password-env SOURCE_PASSWORD \
-  --start-position 4 --stop-position 1000 --binlog-file mysql-bin.000001
+cargo run -- stream-binlog --source-host 127.0.0.1 --source-user repl \
+  --source-password-env SOURCE_PASSWORD --source-database app \
+  --target-host 127.0.0.1 --target-user writer \
+  --target-password-env TARGET_PASSWORD --target-database app
 ```

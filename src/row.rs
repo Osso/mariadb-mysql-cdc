@@ -1,5 +1,5 @@
 use crate::probe::BinlogCoordinate;
-use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
+use crate::target::{SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor};
 use mysql::Value;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -91,14 +91,21 @@ where
     pub fn apply_write_rows(&self, event: &WriteRowsEvent) -> RowResult<()> {
         let table = self.resolve_table(event.table_id, &event.coordinate)?;
         validate_rows_have_primary_keys(table, &event.rows, &event.coordinate)?;
-        let statement = build_insert_statement(table, &event.rows);
-        execute_row_statement(
-            &self.executor,
-            statement,
-            &event.coordinate,
-            table,
-            RowOperation::Insert,
-        )
+
+        for row in &event.rows {
+            let statement = build_insert_statement(table, row);
+            let primary_key = primary_key_values(table, row, &event.coordinate)?;
+            execute_row_statement(
+                &self.executor,
+                statement,
+                &event.coordinate,
+                table,
+                RowOperation::Insert,
+                &primary_key,
+            )?;
+        }
+
+        Ok(())
     }
 
     pub fn apply_update_rows(&self, event: &UpdateRowsEvent) -> RowResult<()> {
@@ -109,12 +116,14 @@ where
             let Some(statement) = build_update_statement(table, update, &event.coordinate)? else {
                 continue;
             };
+            let primary_key = primary_key_values(table, &update.after, &event.coordinate)?;
             execute_row_statement(
                 &self.executor,
                 statement,
                 &event.coordinate,
                 table,
                 RowOperation::Update,
+                &primary_key,
             )?;
         }
 
@@ -126,12 +135,14 @@ where
 
         for row in &event.rows {
             let statement = build_delete_statement(table, row, &event.coordinate)?;
+            let primary_key = primary_key_values(table, row, &event.coordinate)?;
             execute_row_statement(
                 &self.executor,
                 statement,
                 &event.coordinate,
                 table,
                 RowOperation::Delete,
+                &primary_key,
             )?;
         }
 
@@ -169,6 +180,13 @@ where
         statement: &crate::target::SqlStatement,
     ) -> Result<(), crate::target::TargetExecuteError> {
         (*self).execute(statement)
+    }
+
+    fn execute_row_change(
+        &self,
+        statement: &SqlStatement,
+    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+        (*self).execute_row_change(statement)
     }
 }
 
@@ -355,28 +373,22 @@ fn primary_key_value(
     })
 }
 
-fn build_insert_statement(table: &RowTableMap, rows: &[RowImage]) -> SqlStatement {
+fn build_insert_statement(table: &RowTableMap, row: &RowImage) -> SqlStatement {
     let writable_columns = writable_columns(table);
     let column_list = writable_columns
         .iter()
         .map(|column| quote_ident(column))
         .collect::<Vec<_>>();
-    let placeholders = row_placeholders(writable_columns.len(), rows.len());
-    let update_list = update_assignments(&writable_columns, &table.primary_key);
-    let params = rows
-        .iter()
-        .flat_map(|row| ordered_values(row, &writable_columns))
-        .collect();
+    let placeholders = vec!["?"; writable_columns.len()].join(", ");
 
     SqlStatement {
         sql: format!(
-            "INSERT INTO {} ({}) VALUES {} ON DUPLICATE KEY UPDATE {}",
+            "INSERT INTO {} ({}) VALUES ({})",
             quote_ident(&table.table),
             column_list.join(", "),
             placeholders,
-            update_list.join(", ")
         ),
-        params,
+        params: ordered_values(row, &writable_columns),
     }
 }
 
@@ -442,13 +454,39 @@ fn execute_row_statement<E>(
     coordinate: &BinlogCoordinate,
     table: &RowTableMap,
     operation: RowOperation,
+    primary_key: &[Value],
 ) -> RowResult<()>
 where
     E: TargetExecutor,
 {
-    executor
-        .execute(&statement)
-        .map_err(|source| target_error(coordinate, table, operation, source))
+    let outcome = executor
+        .execute_row_change(&statement)
+        .map_err(|source| target_error(coordinate, table, operation, source))?;
+    if outcome == TargetExecutionOutcome::DuplicateIgnored {
+        println!(
+            "{}",
+            format_row_conflict_skipped(operation, table, coordinate, primary_key)
+        );
+    }
+    Ok(())
+}
+
+fn format_row_conflict_skipped(
+    operation: RowOperation,
+    table: &RowTableMap,
+    coordinate: &BinlogCoordinate,
+    primary_key: &[Value],
+) -> String {
+    let primary_key = primary_key
+        .iter()
+        .cloned()
+        .map(crate::mysql_client::value_to_string)
+        .collect::<Vec<_>>();
+    let primary_key = serde_json::to_string(&primary_key).expect("primary key JSON encoding");
+    format!(
+        "cdc_row_conflict_skipped operation={operation} schema={} table={} source_file={} source_position={} primary_key={primary_key}",
+        table.schema, table.table, coordinate.file, coordinate.position,
+    )
 }
 
 fn writable_columns(table: &RowTableMap) -> Vec<String> {
@@ -464,18 +502,6 @@ fn ordered_values(row: &RowImage, columns: &[String]) -> Vec<Value> {
     columns
         .iter()
         .map(|column| row.get(column).cloned().unwrap_or(Value::NULL))
-        .collect()
-}
-
-fn row_placeholders(column_count: usize, row_count: usize) -> String {
-    let row_placeholder = format!("({})", vec!["?"; column_count].join(", "));
-    vec![row_placeholder; row_count].join(", ")
-}
-
-fn update_assignments(columns: &[String], primary_key: &[String]) -> Vec<String> {
-    non_primary_columns(columns, primary_key)
-        .iter()
-        .map(|column| format!("{} = VALUES({})", quote_ident(column), quote_ident(column)))
         .collect()
 }
 
@@ -520,11 +546,12 @@ fn row_error(error: RowApplyError) -> Box<RowApplyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::{SqlStatement, TargetExecuteError};
+    use crate::target::{SqlStatement, TargetExecuteError, TargetExecutionOutcome};
     use std::cell::RefCell;
+    use std::collections::VecDeque;
 
     #[test]
-    fn applies_write_rows_as_batched_insert() {
+    fn applies_write_rows_as_independent_plain_inserts() {
         let applier = applier_with_accounts_table();
         let event = WriteRowsEvent {
             coordinate: coordinate(120),
@@ -535,12 +562,61 @@ mod tests {
         applier.apply_write_rows(&event).expect("apply write rows");
 
         let statements = applier.executor().statements.borrow();
-        assert_eq!(statements.len(), 1);
+        assert_eq!(statements.len(), 2);
         assert_eq!(
-            statements[0].sql,
-            "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?), (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"
+            statements[0],
+            SqlStatement {
+                sql: "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?)".to_string(),
+                params: values(["1", "alpha"]),
+            }
         );
-        assert_eq!(statements[0].params, values(["1", "alpha", "2", "beta"]));
+        assert_eq!(
+            statements[1],
+            SqlStatement {
+                sql: "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?)".to_string(),
+                params: values(["2", "beta"]),
+            }
+        );
+    }
+
+    #[test]
+    fn continues_after_one_duplicate_insert_is_ignored() {
+        let executor = RecordingExecutor {
+            row_outcomes: RefCell::new(VecDeque::from([
+                TargetExecutionOutcome::DuplicateIgnored,
+                TargetExecutionOutcome::Applied,
+            ])),
+            ..RecordingExecutor::default()
+        };
+        let mut applier = RowApplier::new(executor);
+        applier.apply_table_map(accounts_table_map());
+        let event = WriteRowsEvent {
+            coordinate: coordinate(130),
+            table_id: 7,
+            rows: vec![row("1", "conflict"), row("2", "applied")],
+        };
+
+        applier.apply_write_rows(&event).expect("apply write rows");
+
+        let statements = applier.executor().statements.borrow();
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0].params, values(["1", "conflict"]));
+        assert_eq!(statements[1].params, values(["2", "applied"]));
+    }
+
+    #[test]
+    fn formats_ignored_conflict_with_table_coordinate_and_primary_key() {
+        let message = format_row_conflict_skipped(
+            RowOperation::Insert,
+            &accounts_table_map().table,
+            &coordinate(130),
+            &[value("1")],
+        );
+
+        assert_eq!(
+            message,
+            "cdc_row_conflict_skipped operation=insert schema=app table=accounts source_file=mysql-bin.000001 source_position=130 primary_key=[\"1\"]"
+        );
     }
 
     #[test]
@@ -616,7 +692,7 @@ mod tests {
         assert_eq!(statements.len(), 1);
         assert_eq!(
             statements[0].sql,
-            "INSERT INTO `releases` (`id`, `slug`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `slug` = VALUES(`slug`)"
+            "INSERT INTO `releases` (`id`, `slug`) VALUES (?, ?)"
         );
         assert_eq!(statements[0].params, values(["1", "alpha"]));
     }
@@ -777,6 +853,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingExecutor {
         statements: RefCell<Vec<SqlStatement>>,
+        row_outcomes: RefCell<VecDeque<TargetExecutionOutcome>>,
         error: Option<TargetExecuteError>,
     }
 
@@ -788,6 +865,21 @@ mod tests {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
             }
+        }
+
+        fn execute_row_change(
+            &self,
+            statement: &SqlStatement,
+        ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+            self.statements.borrow_mut().push(statement.clone());
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            Ok(self
+                .row_outcomes
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(TargetExecutionOutcome::Applied))
         }
     }
 }

@@ -28,8 +28,22 @@ impl PrimaryKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetExecutionOutcome {
+    Applied,
+    DuplicateIgnored,
+}
+
 pub trait TargetExecutor {
     fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError>;
+
+    fn execute_row_change(
+        &self,
+        statement: &SqlStatement,
+    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+        self.execute(statement)?;
+        Ok(TargetExecutionOutcome::Applied)
+    }
 }
 
 pub trait TransactionalTargetExecutor: TargetExecutor {

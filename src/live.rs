@@ -21,7 +21,9 @@ mod structured_stream;
 #[cfg(test)]
 use crate::target::{SqlStatement, TargetExecuteError};
 use binlog_command::read_remote_binlog;
-pub use insert_conflict::{InsertConflictPolicy, should_ignore_duplicate_insert};
+pub use insert_conflict::{
+    InsertConflictPolicy, should_ignore_duplicate_insert, should_ignore_duplicate_row_change,
+};
 pub use mysql_cli::MysqlCliExecutor;
 #[cfg(test)]
 use mysql_cli::{

@@ -1,5 +1,8 @@
 use crate::checkpoint::Checkpoint;
-use crate::live::{InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert};
+use crate::live::{
+    InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
+    should_ignore_duplicate_row_change,
+};
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::mysql_support::{quote_ident, quote_identifier_path, quote_sql_literal};
 use crate::snapshot::{
@@ -12,8 +15,8 @@ use crate::table_sync::progress::{
 };
 use crate::table_sync::{SyncTableProgress, TableSyncError};
 use crate::target::{
-    SqlStatement, TargetExecuteError, TargetExecutor, TransactionalTargetExecutor,
-    render_sql_statement,
+    SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor,
+    TransactionalTargetExecutor, render_sql_statement,
 };
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Params, SslOpts, Value};
@@ -160,6 +163,28 @@ impl TargetExecutor for PersistentTargetExecutor {
         match result {
             Ok(()) => Ok(()),
             Err(error) => self.retry_or_return_error(statement, error),
+        }
+    }
+
+    fn execute_row_change(
+        &self,
+        statement: &SqlStatement,
+    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+        match self.execute_statement(statement) {
+            Ok(()) => Ok(TargetExecutionOutcome::Applied),
+            Err(error)
+                if should_ignore_duplicate_row_change(
+                    self.insert_conflict_policy,
+                    &statement.sql,
+                    &error.to_string(),
+                ) =>
+            {
+                Ok(TargetExecutionOutcome::DuplicateIgnored)
+            }
+            Err(error) => {
+                self.retry_or_return_error(statement, error)?;
+                Ok(TargetExecutionOutcome::Applied)
+            }
         }
     }
 }
