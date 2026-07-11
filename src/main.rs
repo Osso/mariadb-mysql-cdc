@@ -10,6 +10,7 @@ pub mod mysql_snapshot;
 pub mod mysql_support;
 mod probe;
 pub mod rehearsal;
+pub mod repair_drift;
 pub mod row;
 pub mod snapshot;
 mod snapshot_ranges;
@@ -34,6 +35,7 @@ Usage:
   mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS --run-id ID [options]
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
+  mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
 
@@ -50,6 +52,8 @@ Commands:
           Print table sync progress, stream checkpoint, rates, and ETA when source counts are supplied.
   drift-check
           Read-only source/target COUNT(*) drift check for selected tables, or all source base tables when no --table is supplied.
+  repair-drift
+          Inventory both endpoints, count-check source tables, and run bounded sync-table repairs only for drifted tables.
   apply-binlog
           Read remote MariaDB binlog text and apply compatible statements.
   stream-binlog
@@ -115,6 +119,14 @@ Sync progress repair-run options:
 
   --chunk-size ROWS               Rows per chunk. Defaults to 10000.
   --throttle-ms MS                Sleep after each copied chunk. Defaults to 0.
+
+Repair drift options:
+  --table TABLE                   Limit repair to a source table; repeat for multiple tables.
+  --parent-first TABLES           Comma-separated table order prefix; remaining tables sort lexically.
+  --mode MODE                     dry-run (default) or apply.
+  --max-deletes COUNT             Required explicitly in apply mode; bounds target orphan deletes.
+  --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
+  --run-id-prefix PREFIX          Prefix for the fresh run-scoped repair ID.
 ";
 
 fn main() {
@@ -132,6 +144,7 @@ fn main() {
             sync_progress_cli::run_sync_progress_command(args.collect(), USAGE)
         }
         Some("drift-check") => run_drift_check_command(args.collect()),
+        Some("repair-drift") => repair_drift::run_repair_drift_command(args.collect(), USAGE),
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),
         Some("stream-binlog") => run_stream_binlog_command(args.collect()),
         Some("-h" | "--help") | None => print!("{USAGE}"),

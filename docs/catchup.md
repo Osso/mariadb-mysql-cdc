@@ -77,6 +77,32 @@ The durable progress state supports safe restart after a failed pod. Sequential
 catchup resumes from the table checkpoint; parallel catchup resumes from each
 worker range checkpoint.
 
+## Recurring Drift Repair
+
+Use `repair-drift` for a fresh bounded orchestration run. It inventories both
+endpoints, compares counts for the selected source tables, and invokes
+`sync-table` only for tables with count drift and compatible primary-key/column
+inventories. The command generates a fresh run ID for every invocation and
+scopes each table repair beneath it.
+
+```bash
+mariadb-mysql-cdc repair-drift \
+  --source-host 192.0.2.10 --source-user cdc_reader \
+  --source-password-env SOURCE_PASSWORD --source-database globalcomix \
+  --target-host target-mysql.example \
+  --target-port 25060 --target-user target_user \
+  --target-password-env TARGET_PASSWORD --target-database globalcomix \
+  --mode apply --max-deletes 25 \
+  --parent-first users,applications_users
+```
+
+Dry-run is the default. Apply mode rejects missing `--max-deletes`; zero is a
+valid explicit allowance when no orphan deletes are permitted. `--parent-first`
+takes a comma-separated deterministic prefix; all remaining inventoried tables
+are ordered lexically. Missing target tables, missing primary keys, and
+source/target primary-key or column incompatibilities are reported as skipped,
+never sent to `sync-table`.
+
 ## Table Repair Runs
 
 Use `sync-table` after catchup or validation identifies a table-level drift. Every

@@ -88,6 +88,24 @@ write policy, mode, primary-key range, chunk size, table shape, maximum deletes,
 and `--updated-since` when present. A target-side named lock rejects concurrent
 processes using the same run ID.
 
+`repair-drift` runs the recurring bounded orchestration: it inventories source
+and target tables, compares counts, creates a fresh run ID, and invokes
+`sync-table` only for count-drifted tables with compatible primary-key and column
+inventories. Dry-run is the default. Apply mode requires an explicit
+`--max-deletes` allowance; without it, orphan deletion remains disabled. Use
+repeated `--table` options to limit scope and `--parent-first parent_a,parent_b`
+to force a deterministic parent-first prefix before lexical ordering of remaining
+tables. Each table repair receives a child run ID under the fresh orchestration ID.
+
+```bash
+mariadb-mysql-cdc repair-drift \
+  --source-host 127.0.0.1 --source-user reader \
+  --source-password-env SOURCE_PASSWORD --source-database app \
+  --target-host 127.0.0.1 --target-user writer \
+  --target-password-env TARGET_PASSWORD --target-database app \
+  --mode apply --max-deletes 25 --parent-first accounts,authors
+```
+
 `cdc.table_sync_progress` remains the legacy catchup-only checkpoint table. An
 interrupted `--updated-since` retry safely restarts from the beginning because a
 row can become newly eligible behind a saved primary key; its idempotent upserts
