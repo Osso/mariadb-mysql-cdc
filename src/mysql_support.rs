@@ -14,7 +14,9 @@ pub fn ssl_opts_from_ca(ca_file: Option<&str>) -> SslOpts {
     if let Some(ca_file) = ca_file
         && std::path::Path::new(ca_file).exists()
     {
-        ssl = ssl.with_root_cert_path(Some(PathBuf::from(ca_file)));
+        ssl = ssl
+            .with_root_cert_path(Some(PathBuf::from(ca_file)))
+            .with_danger_skip_domain_validation(true);
     }
     ssl
 }
@@ -64,6 +66,21 @@ pub fn quote_sql_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssl_opts_from_existing_ca_skips_hostname_validation_but_keeps_ca_path() {
+        let ca_path =
+            std::env::temp_dir().join(format!("mariadb-mysql-cdc-test-ca-{}", std::process::id()));
+        std::fs::write(&ca_path, b"test ca").unwrap();
+
+        let ssl = ssl_opts_from_ca(ca_path.to_str());
+
+        assert_eq!(ssl.root_cert_path(), Some(ca_path.as_path()));
+        assert!(ssl.skip_domain_validation());
+        assert!(!ssl.accept_invalid_certs());
+
+        std::fs::remove_file(ca_path).unwrap();
+    }
 
     #[test]
     fn target_mysql_args_disable_server_cert_verification_for_do_mysql() {
