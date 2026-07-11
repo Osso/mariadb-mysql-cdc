@@ -68,15 +68,27 @@ of the static `--binlog-file` and `--start-position` arguments. Those initial
 coordinates are still required for a new source identity with no checkpoint.
 Pass the same `--source-identity` to `sync-progress` when inspecting stream
 checkpoint freshness. The source CA file must contain the reviewed MariaDB server certificate/CA. The
-client verifies that chain but intentionally skips hostname matching because the
-current self-signed certificate identity is `MariaDB Server`, while the stream
-connects over the private IP. It never accepts an untrusted certificate.
+native client verifies that chain and pins the certificate fingerprint, but
+intentionally skips hostname matching because the current self-signed certificate
+identity is `MariaDB Server`, while the stream connects over the private IP. It
+never accepts an untrusted certificate. Other catchup source SQL connections are
+currently non-TLS.
 
-Transient source stream
-loss such as TLS connection reset triggers in-process reconnect with bounded
-backoff. A stale/purged binlog fails without changing the checkpoint; an operator
-must repair the gap explicitly. Non-transient source errors, target write
-failures, quarantined SQL, and pending manual DDL resolution still fail the
-process. A resolved DDL ledger row
-advances the checkpoint to the event end position without executing the source
-DDL; see [DDL Resolution Runbook](ddl-resolution.md).
+All target-side MySQL connections request TLS and use
+`/etc/mariadb-mysql-cdc/do-ca.pem` when that file exists. A missing file is not a
+proof of target trust: the client falls back to the MySQL driver's default TLS
+options. Mount and inspect the reviewed DigitalOcean CA bundle before treating a
+run as CA-verified; the current catchup manifest does not mount this file.
+
+Transient source stream loss such as TLS connection reset triggers in-process
+reconnect with bounded backoff. A stale/purged binlog fails without changing the
+checkpoint; an operator must repair the gap explicitly. Non-transient source
+errors, target write failures, quarantined SQL, and pending manual DDL resolution
+still fail the process. A resolved DDL ledger row advances the checkpoint to the
+event end position without executing the source DDL; see [DDL Resolution
+Runbook](ddl-resolution.md).
+
+The live stream currently writes file/position checkpoints with `gtid: null`;
+GTID persistence and resume are not implemented. A duplicate conflict skipped
+under `ignore-duplicate` does not block the event checkpoint, so the affected row
+must be reconciled separately.

@@ -29,8 +29,15 @@ checkpoint in the target transaction. Source schema-changing `QueryEvent` record
 are a manual migration boundary: the stream flushes earlier DML, writes a pending
 row to a target-side DDL ledger, and stops without checkpointing past the event.
 Snapshot, drift-check, checksum localization, and primary-key table repair
-commands support rehearsal and eventual convergence. The legacy `probe`
-text-binlog path is not a supported health check.
+commands support rehearsal and eventual convergence. Skipped duplicate conflicts
+are observable reconciliation debt; the stream does not schedule repairs
+automatically. The legacy `probe` text-binlog path is not a supported health check.
+
+Target-side MySQL connections use TLS and load the DigitalOcean CA bundle from
+`/etc/mariadb-mysql-cdc/do-ca.pem` when that file is mounted. The native source
+binlog connection requires a CA file and verifies the pinned certificate; the
+catchup source SQL connection currently does not use TLS. These paths are
+rehearsal tooling, not evidence of production schema/data parity.
 
 ## DDL Resolution
 
@@ -43,8 +50,9 @@ exact match and advances the checkpoint without re-executing the DDL.
 
 Generic target errors—including already-exists and missing-object errors—never
 count as DDL success. Resolving before target apply and validation causes schema
-divergence because the stream will checkpoint past the source DDL. See [DDL
-Resolution Runbook](docs/ddl-resolution.md).
+divergence because the stream will checkpoint past the source DDL. Startup also
+fails closed when the configured ledger schema, guards, or runtime grants do not
+match the bootstrap contract. See [DDL Resolution Runbook](docs/ddl-resolution.md).
 
 ## Commands
 

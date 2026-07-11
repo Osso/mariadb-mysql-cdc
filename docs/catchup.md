@@ -21,6 +21,15 @@ Updates and deletes still replay normally. Unsupported SQL is still quarantined.
 
 This keeps the workflow simple: no staging tables, no per-row touched-key
 overlay, and no assumption that source statements stay inside chunk boundaries.
+It is not a parity proof: `INSERT IGNORE` preserves target rows already written by
+CDC, but does not overwrite divergent values or remove target orphans. A skipped
+live duplicate conflict remains reconciliation debt.
+
+Target writes use TLS and the DigitalOcean CA path described in
+[Checkpoints](checkpoints.md). The catchup source SQL reader currently uses
+non-TLS connections, and the Kubernetes catchup manifest does not mount the DO
+CA file; do not report a catchup run as explicitly CA-verified until that is fixed
+and checked.
 
 ## Resumable Snapshot Catchup
 
@@ -122,3 +131,8 @@ mariadb-mysql-cdc sync-table ... \
 
 Normal range repair reports extra target rows. Deletion requires `--mode apply`
 and an explicit nonzero `--max-deletes`; otherwise the default limit is zero.
+Repair is operator-scheduled, not automatically triggered by live-stream
+conflicts. Use a fresh run ID for each recurring repair; reuse an ID only for the
+same interrupted run. A completed run ID is terminal, and an `--updated-since`
+retry restarts from the beginning because rows can become newly eligible behind a
+saved primary key.

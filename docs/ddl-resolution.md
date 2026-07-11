@@ -14,9 +14,11 @@ The ledger defaults to `cdc.ddl_events`. Set a different qualified table only wh
 
 Before first startup, stop the stream and run
 [`ddl-control-plane-bootstrap.sql`](ddl-control-plane-bootstrap.sql) with
-resolver/admin credentials. Startup validates exact columns, defaults,
-`ON UPDATE`, status constraint, primary key, and both trigger shapes. Its immutable
-primary key is:
+resolver/admin credentials. The stream does not create or repair this control
+plane. On every startup, before source replication begins, it validates exact
+columns, defaults, `ON UPDATE`, status constraint, primary key, both trigger
+shapes, and runtime grants; any mismatch fails closed. Its immutable primary key
+is:
 
 ```text
 (source_identity, binlog_file, event_start_position)
@@ -188,7 +190,7 @@ WHERE source_identity = 'prod-db.example:3306#server-id=123'
 
 Restart the stream with the unchanged checkpoint and identical `--ddl-ledger-table` configuration. It re-reads the ledger record, verifies that its raw SQL exactly matches the source event, advances the checkpoint to `event_end_position`, invalidates its schema cache, and does not replay the DDL.
 
-Confirm the checkpoint has advanced to the recorded `event_end_position`, then monitor for the next event or boundary.
+Confirm the checkpoint has advanced to the recorded `event_end_position`, then monitor for the next event or boundary. This proves only that this DDL boundary was acknowledged; it does not prove whole-database schema or data parity.
 
 ## Pending-ledger monitoring
 

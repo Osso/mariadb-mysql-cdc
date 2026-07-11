@@ -83,7 +83,10 @@ source connection loss without replaying from static startup coordinates.
 - `src/checkpoint.rs` — file-backed durable checkpoint model.
 - `src/main.rs` — CLI options for live streaming.
 - `deployment/stream-manifest` in the deployment repository —
-  Kubernetes Deployment currently passing static startup coordinates.
+  Kubernetes Deployment passes the source identity and target checkpoint table.
+  A new source identity still requires an explicitly reviewed binlog file and
+  position; the current test manifest relies on a pre-seeded target checkpoint
+  and is not a bootstrap proof.
 
 ## Tests asserting this spec
 
@@ -100,6 +103,8 @@ source connection loss without replaying from static startup coordinates.
 
 ## Known gaps (current cycle)
 
+- [ ] Document and verify the reviewed bootstrap-coordinate provisioning path for
+  a new source identity in the Kubernetes deployment.
 - [ ] Add a failing test where stream input exits after applying events and the
   next stream resumes from the saved checkpoint.
 - [x] Add a failing test where process startup reads an existing checkpoint and

@@ -50,6 +50,7 @@
 
 ## Known gaps (current cycle)
 
+- [ ] Add an end-to-end startup test proving a real target with a missing or mismatched ledger guard fails before source replication begins.
 - [x] Add a test that a resolved ledger row with non-identical raw SQL fails without checkpointing.
 - [ ] Add an end-to-end test proving a real target DDL error cannot turn a pending row into `resolved`.
 - [x] Document the inspect-apply-validate-resolve-restart sequence with immutable-coordinate and exact-SQL guards.

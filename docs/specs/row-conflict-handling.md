@@ -8,6 +8,7 @@ The structured CDC stream applies MariaDB ROW binlog events to a MySQL-compatibl
 - [x] Never generate `ON DUPLICATE KEY UPDATE` for a source row insert.
 - [x] Under `ignore-duplicate`, skip only the row whose target insert or update reports MySQL error 1062 and continue applying later rows from the event.
 - [x] Emit a parseable `cdc_row_conflict_skipped` event containing operation, schema, table, source coordinate, and source primary key.
+- [x] Advance the event checkpoint after the remaining rows apply even when a duplicate conflict is skipped; the skipped row becomes reconciliation debt.
 - [x] Preserve fail-fast behavior for duplicate row changes under the default conflict policy.
 - [x] Keep generated target columns out of row insert and update statements.
 
