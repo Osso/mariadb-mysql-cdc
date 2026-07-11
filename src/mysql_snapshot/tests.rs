@@ -175,6 +175,7 @@ fn valid_catchup_config() -> CatchupSnapshotConfig {
             user: "reader".to_string(),
             password: "secret".to_string(),
             database: "globalcomix".to_string(),
+            tls_ca_file: None,
         },
         target: TargetMySqlConfig {
             host: "target".to_string(),

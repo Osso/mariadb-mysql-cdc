@@ -5,7 +5,7 @@ use crate::live::{
 };
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::mysql_support::{
-    quote_ident, quote_identifier_path, quote_sql_literal, target_ssl_opts,
+    TARGET_TLS_CA_FILE, quote_ident, quote_identifier_path, quote_sql_literal, ssl_opts_from_ca,
 };
 use crate::snapshot::{
     ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource,
@@ -48,7 +48,7 @@ impl PersistentMySqlSource {
             &config.user,
             &config.password,
             &config.database,
-            false,
+            config.tls_ca_file.as_deref(),
         );
         let conn = open_conn(opts).map_err(snapshot_connect_error)?;
         Ok(Self {
@@ -140,7 +140,7 @@ impl PersistentTargetExecutor {
             &config.user,
             &config.password,
             &config.database,
-            true,
+            Some(TARGET_TLS_CA_FILE),
         );
         let mut conn = open_conn(opts).map_err(target_connect_error)?;
         conn.query_drop(crate::live::target_session_init_command())
@@ -310,7 +310,7 @@ impl PersistentProgressWriter {
             &config.user,
             &config.password,
             &config.database,
-            true,
+            Some(TARGET_TLS_CA_FILE),
         );
         let mut conn = open_conn(opts).map_err(progress_connect_error)?;
         conn.query_drop(crate::live::target_session_init_command())
@@ -447,7 +447,7 @@ fn base_opts(
     user: &str,
     password: &str,
     database: &str,
-    use_tls: bool,
+    tls_ca_file: Option<&str>,
 ) -> Opts {
     let mut builder = OptsBuilder::default()
         .ip_or_hostname(Some(host))
@@ -456,8 +456,8 @@ fn base_opts(
         .pass(Some(password))
         .db_name(Some(database))
         .prefer_socket(false);
-    if use_tls {
-        builder = builder.ssl_opts(target_ssl_opts());
+    if let Some(ca_file) = tls_ca_file {
+        builder = builder.ssl_opts(ssl_opts_from_ca(Some(ca_file)));
     }
     Opts::from(builder)
 }
@@ -682,10 +682,34 @@ mod tests {
             &target.user,
             &target.password,
             &target.database,
-            true,
+            Some(TARGET_TLS_CA_FILE),
         );
 
         assert!(opts.get_ssl_opts().is_some());
+    }
+
+    #[test]
+    fn connection_opts_use_explicit_ca_for_tls() {
+        let ca_path = std::env::temp_dir().join(format!(
+            "mariadb-mysql-cdc-target-reader-ca-{}",
+            std::process::id()
+        ));
+        std::fs::write(&ca_path, b"test ca").expect("write CA fixture");
+
+        let opts = base_opts(
+            "target",
+            25060,
+            "target_user",
+            "secret",
+            "globalcomix",
+            ca_path.to_str(),
+        );
+        let ssl = opts.get_ssl_opts().expect("TLS opts");
+
+        assert_eq!(ssl.root_cert_path(), Some(ca_path.as_path()));
+        assert!(ssl.skip_domain_validation());
+
+        std::fs::remove_file(ca_path).expect("remove CA fixture");
     }
 
     #[test]

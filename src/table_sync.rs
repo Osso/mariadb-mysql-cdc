@@ -909,6 +909,7 @@ fn target_connection_config(
         user: config.target.user.clone(),
         password: config.target.password.clone(),
         database: config.target.database.clone(),
+        tls_ca_file: Some(crate::mysql_support::TARGET_TLS_CA_FILE.to_string()),
     }
 }
 
@@ -1160,6 +1161,37 @@ fn apply_delete(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn target_connection_config_uses_target_ca_for_reader_tls() {
+        let config = SyncTableConfig {
+            source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
+            target: crate::live::TargetMySqlConfig {
+                host: "target".to_string(),
+                port: 25060,
+                user: "target_user".to_string(),
+                password: "secret".to_string(),
+                database: "globalcomix".to_string(),
+                insert_conflict_policy: crate::live::InsertConflictPolicy::IgnoreDuplicate,
+            },
+            table: account_table(),
+            chunk_size: 10,
+            mode: SyncMode::DryRun,
+            progress_table: "cdc.table_sync_runs".to_string(),
+            run_id: "test-run".to_string(),
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+            updated_since: None,
+        };
+
+        let target = target_connection_config(&config);
+
+        assert_eq!(
+            target.tls_ca_file.as_deref(),
+            Some(crate::mysql_support::TARGET_TLS_CA_FILE)
+        );
+    }
 
     #[test]
     fn dry_run_reports_repairs_without_applying_them() {
@@ -1618,6 +1650,7 @@ mod tests {
                 user: "reader".to_string(),
                 password: "secret".to_string(),
                 database: "app".to_string(),
+                tls_ca_file: None,
             },
             target: crate::live::TargetMySqlConfig {
                 host: "target-a".to_string(),
