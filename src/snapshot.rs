@@ -146,6 +146,14 @@ pub enum SnapshotError {
     Decode(serde_json::Error),
     Encode(serde_json::Error),
     InvalidTable(String),
+    ProgressSchemaEnsure {
+        progress_table: String,
+        source: Box<SnapshotError>,
+    },
+    ProgressRowRead {
+        progress_table: String,
+        source: Box<SnapshotError>,
+    },
     Read {
         path: PathBuf,
         source: io::Error,
@@ -178,6 +186,20 @@ impl std::fmt::Display for SnapshotError {
                 write!(formatter, "failed to encode snapshot progress: {source}")
             }
             Self::InvalidTable(message) => formatter.write_str(message),
+            Self::ProgressSchemaEnsure {
+                progress_table,
+                source,
+            } => write!(
+                formatter,
+                "progress schema ensure failed progress_table={progress_table}: {source}"
+            ),
+            Self::ProgressRowRead {
+                progress_table,
+                source,
+            } => write!(
+                formatter,
+                "progress row read failed progress_table={progress_table}: {source}"
+            ),
             Self::Read { path, source } => {
                 write!(formatter, "failed to read {}: {source}", path.display())
             }
@@ -572,25 +594,49 @@ impl RetryContext {
     }
 }
 
+fn format_snapshot_retry(context: &RetryContext, attempt: u32, error: &SnapshotError) -> String {
+    let (operation, progress_table, phase) = retry_metadata(context.operation, error);
+    let progress_context = match (progress_table, phase) {
+        (Some(progress_table), Some(phase)) => {
+            format!(" progress_table={progress_table} phase={phase}")
+        }
+        _ => String::new(),
+    };
+    format!(
+        "snapshot_retry operation={operation} table={}{} attempt={} attempts={} start_after={} error={error}",
+        context.table, progress_context, attempt, SNAPSHOT_RETRY_ATTEMPTS, context.start_after,
+    )
+}
+
 fn log_snapshot_retry(context: &RetryContext, attempt: u32, error: &SnapshotError) {
-    eprintln!(
-        "snapshot_retry operation={} table={} attempt={} attempts={} start_after={} error={}",
-        context.operation,
-        context.table,
-        attempt,
-        SNAPSHOT_RETRY_ATTEMPTS,
-        context.start_after,
-        error
-    );
+    eprintln!("{}", format_snapshot_retry(context, attempt, error));
 }
 
 fn retry_error(context: &RetryContext, source: SnapshotError) -> SnapshotError {
+    let (operation, _, _) = retry_metadata(context.operation, &source);
     SnapshotError::Retry {
-        operation: context.operation.to_string(),
+        operation: operation.to_string(),
         table: context.table.clone(),
         attempts: SNAPSHOT_RETRY_ATTEMPTS,
         start_after: context.start_after.clone(),
         source: Box::new(source),
+    }
+}
+
+fn retry_metadata<'a>(
+    default_operation: &'static str,
+    error: &'a SnapshotError,
+) -> (&'static str, Option<&'a str>, Option<&'static str>) {
+    match error {
+        SnapshotError::ProgressSchemaEnsure { progress_table, .. } => (
+            "progress_ensure",
+            Some(progress_table),
+            Some("schema_ensure"),
+        ),
+        SnapshotError::ProgressRowRead { progress_table, .. } => {
+            ("progress_load", Some(progress_table), Some("row_read"))
+        }
+        _ => (default_operation, None, None),
     }
 }
 

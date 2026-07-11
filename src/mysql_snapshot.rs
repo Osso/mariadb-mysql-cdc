@@ -277,6 +277,7 @@ fn catchup_progress_store(
     Ok(CatchupProgressStore {
         file_store: FileSnapshotProgressStore::new(&config.progress_file),
         mysql_store,
+        progress_table: config.progress_table.clone(),
         total_rows: RefCell::new(BTreeMap::new()),
         mysql_save_state: RefCell::new(BTreeMap::new()),
     })
@@ -310,6 +311,7 @@ impl CatchupMysqlProgressStore for PersistentProgressWriter {
 struct CatchupProgressStore<M = PersistentProgressWriter> {
     file_store: FileSnapshotProgressStore,
     mysql_store: M,
+    progress_table: String,
     total_rows: RefCell<BTreeMap<String, u64>>,
     mysql_save_state: RefCell<BTreeMap<String, MysqlProgressSaveState>>,
 }
@@ -341,8 +343,16 @@ where
     fn load_mysql_progress(&self) -> Result<SnapshotProgress, SnapshotError> {
         self.mysql_store
             .ensure()
-            .and_then(|_| self.mysql_store.load_snapshot_progress())
-            .map_err(|error| SnapshotError::InvalidTable(error.to_string()))
+            .map_err(|error| SnapshotError::ProgressSchemaEnsure {
+                progress_table: self.progress_table.clone(),
+                source: Box::new(SnapshotError::InvalidTable(error.to_string())),
+            })?;
+        self.mysql_store
+            .load_snapshot_progress()
+            .map_err(|error| SnapshotError::ProgressRowRead {
+                progress_table: self.progress_table.clone(),
+                source: Box::new(SnapshotError::InvalidTable(error.to_string())),
+            })
     }
 
     fn record_total_rows(&self, table: &str, total_rows: u64) {

@@ -224,6 +224,39 @@ fn reports_retry_context_after_repeated_failure() {
 }
 
 #[test]
+fn formats_progress_schema_ensure_retry_as_distinct_operation() {
+    let context = RetryContext::new("progress_load", "accounts", None);
+    let error = SnapshotError::ProgressSchemaEnsure {
+        progress_table: "cdc.snapshot_progress".to_string(),
+        source: Box::new(test_error("permission denied")),
+    };
+
+    let line = format_snapshot_retry(&context, 1, &error);
+
+    assert!(line.contains("operation=progress_ensure"));
+    assert!(!line.contains("operation=progress_load"));
+    assert!(line.contains("progress_table=cdc.snapshot_progress"));
+    assert!(line.contains("phase=schema_ensure"));
+    assert!(line.contains("error=progress schema ensure failed"));
+}
+
+#[test]
+fn formats_progress_row_read_retry_as_progress_load() {
+    let context = RetryContext::new("progress_load", "accounts", None);
+    let error = SnapshotError::ProgressRowRead {
+        progress_table: "cdc.snapshot_progress".to_string(),
+        source: Box::new(test_error("connection reset")),
+    };
+
+    let line = format_snapshot_retry(&context, 1, &error);
+
+    assert!(line.contains("operation=progress_load"));
+    assert!(line.contains("progress_table=cdc.snapshot_progress"));
+    assert!(line.contains("phase=row_read"));
+    assert!(line.contains("error=progress row read failed"));
+}
+
+#[test]
 fn skips_completed_table_on_rerun() {
     let table = accounts_table();
     let progress_store = MemoryProgressStore::default();

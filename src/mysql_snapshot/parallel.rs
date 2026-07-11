@@ -151,6 +151,7 @@ fn mysql_only_progress_store(
     );
     Ok(MysqlOnlyCatchupProgressStore {
         mysql_store,
+        progress_table: config.progress_table.clone(),
         total_rows,
         mysql_save_state: RefCell::new(BTreeMap::new()),
     })
@@ -225,6 +226,7 @@ fn record_parallel_table_complete(
 
 struct MysqlOnlyCatchupProgressStore {
     mysql_store: PersistentProgressWriter,
+    progress_table: String,
     total_rows: BTreeMap<String, u64>,
     mysql_save_state: RefCell<BTreeMap<String, MysqlProgressSaveState>>,
 }
@@ -233,8 +235,16 @@ impl SnapshotProgressStore for MysqlOnlyCatchupProgressStore {
     fn load(&self) -> Result<SnapshotProgress, SnapshotError> {
         self.mysql_store
             .ensure()
-            .and_then(|_| self.mysql_store.load_snapshot_progress())
-            .map_err(|error| SnapshotError::InvalidTable(error.to_string()))
+            .map_err(|error| SnapshotError::ProgressSchemaEnsure {
+                progress_table: self.progress_table.clone(),
+                source: Box::new(SnapshotError::InvalidTable(error.to_string())),
+            })?;
+        self.mysql_store
+            .load_snapshot_progress()
+            .map_err(|error| SnapshotError::ProgressRowRead {
+                progress_table: self.progress_table.clone(),
+                source: Box::new(SnapshotError::InvalidTable(error.to_string())),
+            })
     }
 
     fn save(&self, progress: &SnapshotProgress) -> Result<(), SnapshotError> {

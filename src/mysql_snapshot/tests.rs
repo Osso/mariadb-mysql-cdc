@@ -258,6 +258,34 @@ fn catchup_progress_loads_mysql_progress_when_file_is_empty() {
 }
 
 #[test]
+fn catchup_progress_load_classifies_schema_ensure_failure() {
+    let path = unique_path("ensure-error.json");
+    let store = catchup_progress_store_for_test(&path, SnapshotProgress::default());
+    *store.mysql_store.ensure_error.borrow_mut() = Some("permission denied".to_string());
+
+    let error = store.load().expect_err("ensure error");
+
+    assert_eq!(
+        error.to_string(),
+        "progress schema ensure failed progress_table=cdc.snapshot_progress: sync progress failed: permission denied"
+    );
+}
+
+#[test]
+fn catchup_progress_load_classifies_row_read_failure() {
+    let path = unique_path("row-read-error.json");
+    let store = catchup_progress_store_for_test(&path, SnapshotProgress::default());
+    *store.mysql_store.load_error.borrow_mut() = Some("connection reset".to_string());
+
+    let error = store.load().expect_err("row read error");
+
+    assert_eq!(
+        error.to_string(),
+        "progress row read failed progress_table=cdc.snapshot_progress: sync progress failed: connection reset"
+    );
+}
+
+#[test]
 fn catchup_progress_prefers_file_progress_over_mysql_progress() {
     let path = unique_path("file-progress.json");
     let file_store = FileSnapshotProgressStore::new(path.clone());
@@ -298,6 +326,7 @@ fn catchup_progress_store_for_test(
     CatchupProgressStore {
         file_store: FileSnapshotProgressStore::new(path),
         mysql_store: FakeMysqlProgressStore::new(mysql_progress),
+        progress_table: "cdc.snapshot_progress".to_string(),
         total_rows: RefCell::new(BTreeMap::new()),
         mysql_save_state: RefCell::new(BTreeMap::new()),
     }
@@ -335,6 +364,8 @@ struct FakeMysqlProgressStore {
     progress: SnapshotProgress,
     ensure_calls: RefCell<u32>,
     load_calls: RefCell<u32>,
+    ensure_error: RefCell<Option<String>>,
+    load_error: RefCell<Option<String>>,
     saved: RefCell<Vec<SyncTableProgress>>,
     errors: RefCell<Vec<(String, String)>>,
 }
@@ -345,6 +376,8 @@ impl FakeMysqlProgressStore {
             progress,
             ensure_calls: RefCell::new(0),
             load_calls: RefCell::new(0),
+            ensure_error: RefCell::new(None),
+            load_error: RefCell::new(None),
             saved: RefCell::new(Vec::new()),
             errors: RefCell::new(Vec::new()),
         }
@@ -354,11 +387,17 @@ impl FakeMysqlProgressStore {
 impl CatchupMysqlProgressStore for FakeMysqlProgressStore {
     fn ensure(&self) -> Result<(), TableSyncError> {
         *self.ensure_calls.borrow_mut() += 1;
+        if let Some(message) = self.ensure_error.borrow().as_deref() {
+            return Err(TableSyncError::Progress(message.to_string()));
+        }
         Ok(())
     }
 
     fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError> {
         *self.load_calls.borrow_mut() += 1;
+        if let Some(message) = self.load_error.borrow().as_deref() {
+            return Err(TableSyncError::Progress(message.to_string()));
+        }
         Ok(self.progress.clone())
     }
 
