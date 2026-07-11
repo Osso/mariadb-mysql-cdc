@@ -1,5 +1,7 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use openssl::hash::MessageDigest;
 use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode};
+use openssl::x509::X509;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
@@ -124,12 +126,31 @@ fn build_ssl_connector(mode: SslMode, ca_file: Option<&str>) -> Result<SslConnec
     builder.set_verify(verify_mode);
     if verify_mode == SslVerifyMode::PEER {
         if let Some(ca_file) = ca_file {
-            builder.set_ca_file(ca_file)?;
+            let expected_fingerprint = pinned_certificate_fingerprint(ca_file)?;
+            builder.set_verify_callback(SslVerifyMode::PEER, move |preverified, context| {
+                if preverified {
+                    return true;
+                }
+                let matches_leaf = context.error_depth() == 0
+                    && context.current_cert().is_some_and(|certificate| {
+                        certificate
+                            .digest(MessageDigest::sha256())
+                            .map(|digest| digest.as_ref() == expected_fingerprint.as_slice())
+                            .unwrap_or(false)
+                    });
+                matches_leaf
+            });
         } else {
             builder.set_default_verify_paths()?;
         }
     }
     Ok(builder.build())
+}
+
+fn pinned_certificate_fingerprint(path: &str) -> Result<Vec<u8>, Error> {
+    let bytes = std::fs::read(path)?;
+    let certificate = X509::from_pem(&bytes).or_else(|_| X509::from_der(&bytes))?;
+    Ok(certificate.digest(MessageDigest::sha256())?.to_vec())
 }
 
 fn ssl_verify_mode(mode: SslMode) -> SslVerifyMode {
