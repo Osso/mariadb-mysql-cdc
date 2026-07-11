@@ -149,50 +149,20 @@ impl MySqlDdlEventLedger {
 
     fn validate_schema(&self, conn: &mut Conn) -> Result<(), String> {
         let (schema, table) = ledger_schema_and_table(&self.table, &self.target.database);
-        let columns = conn
-            .query::<(String, String, String, String, String), _>(format!(
-                "SELECT column_name,LOWER(column_type),is_nullable,LOWER(COALESCE(CAST(column_default AS CHAR),'<null>')),LOWER(extra) FROM information_schema.columns WHERE table_schema={} AND table_name={} ORDER BY ordinal_position",
-                quote_sql_literal(schema),
-                quote_sql_literal(table),
-            ))
-            .map_err(ddl_ledger_mysql_error)?;
+
+        let columns = query_ddl_ledger_columns(conn, schema, table)?;
         validate_ddl_ledger_columns(&columns)?;
 
-        let primary_key = conn
-            .query::<String, _>(format!(
-                "SELECT column_name FROM information_schema.key_column_usage WHERE table_schema={} AND table_name={} AND constraint_name='PRIMARY' ORDER BY ordinal_position",
-                quote_sql_literal(schema),
-                quote_sql_literal(table),
-            ))
-            .map_err(ddl_ledger_mysql_error)?;
+        let primary_key = query_ddl_ledger_primary_key(conn, schema, table)?;
         validate_ddl_ledger_primary_key(&primary_key)?;
 
-        let constraints = conn
-            .query::<(String, String), _>(format!(
-                "SELECT constraint_type,enforced FROM information_schema.table_constraints WHERE table_schema={} AND table_name={} ORDER BY constraint_type,constraint_name",
-                quote_sql_literal(schema),
-                quote_sql_literal(table),
-            ))
-            .map_err(ddl_ledger_mysql_error)?;
+        let constraints = query_ddl_ledger_constraints(conn, schema, table)?;
         validate_ddl_constraints(&constraints)?;
 
-        let status_checks = conn
-            .query::<String, _>(format!(
-                "SELECT cc.check_clause FROM information_schema.table_constraints tc JOIN information_schema.check_constraints cc ON cc.constraint_schema=tc.constraint_schema AND cc.constraint_name=tc.constraint_name WHERE tc.table_schema={} AND tc.table_name={} AND tc.constraint_type='CHECK'",
-                quote_sql_literal(schema),
-                quote_sql_literal(table),
-            ))
-            .map_err(ddl_ledger_mysql_error)?;
+        let status_checks = query_ddl_status_checks(conn, schema, table)?;
         validate_ddl_status_checks(&status_checks)?;
 
-        let trigger_inventory = conn
-            .query::<TriggerMetadata, _>(build_ddl_trigger_inventory_call_sql(&self.table))
-            .map_err(|error| {
-                format!(
-                    "DDL ledger trigger inventory routine {} failed: {error}",
-                    ddl_trigger_inventory_routine_path(&self.table),
-                )
-            })?;
+        let trigger_inventory = query_ddl_trigger_inventory(conn, &self.table)?;
         let (insert_triggers, update_triggers) =
             validate_trigger_inventory_metadata(schema, table, &trigger_inventory)?;
         validate_pending_trigger_inventory(&pending_only_trigger_name(table), &insert_triggers)
@@ -277,6 +247,71 @@ fn ledger_schema_and_table<'a>(table: &'a str, default_schema: &'a str) -> (&'a 
     table.split_once('.').unwrap_or((default_schema, table))
 }
 
+fn query_ddl_ledger_columns(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<(String, String, String, String, String)>, String> {
+    conn.query(format!(
+        "SELECT column_name,LOWER(column_type),is_nullable,LOWER(COALESCE(CAST(column_default AS CHAR),'<null>')),LOWER(extra) FROM information_schema.columns WHERE table_schema={} AND table_name={} ORDER BY ordinal_position",
+        quote_sql_literal(schema),
+        quote_sql_literal(table),
+    ))
+    .map_err(ddl_ledger_mysql_error)
+}
+
+fn query_ddl_ledger_primary_key(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, String> {
+    conn.query(format!(
+        "SELECT column_name FROM information_schema.key_column_usage WHERE table_schema={} AND table_name={} AND constraint_name='PRIMARY' ORDER BY ordinal_position",
+        quote_sql_literal(schema),
+        quote_sql_literal(table),
+    ))
+    .map_err(ddl_ledger_mysql_error)
+}
+
+fn query_ddl_ledger_constraints(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<(String, String)>, String> {
+    conn.query(format!(
+        "SELECT constraint_type,enforced FROM information_schema.table_constraints WHERE table_schema={} AND table_name={} ORDER BY constraint_type,constraint_name",
+        quote_sql_literal(schema),
+        quote_sql_literal(table),
+    ))
+    .map_err(ddl_ledger_mysql_error)
+}
+
+fn query_ddl_status_checks(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, String> {
+    conn.query(format!(
+        "SELECT cc.check_clause FROM information_schema.table_constraints tc JOIN information_schema.check_constraints cc ON cc.constraint_schema=tc.constraint_schema AND cc.constraint_name=tc.constraint_name WHERE tc.table_schema={} AND tc.table_name={} AND tc.constraint_type='CHECK'",
+        quote_sql_literal(schema),
+        quote_sql_literal(table),
+    ))
+    .map_err(ddl_ledger_mysql_error)
+}
+
+fn query_ddl_trigger_inventory(
+    conn: &mut Conn,
+    table: &str,
+) -> Result<Vec<TriggerMetadata>, String> {
+    conn.query(build_ddl_trigger_inventory_call_sql(table))
+        .map_err(|error| {
+            format!(
+                "DDL ledger trigger inventory routine {} failed: {error}",
+                ddl_trigger_inventory_routine_path(table),
+            )
+        })
+}
+
 fn expected_ddl_ledger_columns() -> Vec<(String, String, String, String, String)> {
     [
         ("source_identity", "varchar(384)", "NO", "<null>", ""),
@@ -357,31 +392,34 @@ fn validate_trigger_inventory_metadata(
     expected_table: &str,
     rows: &[TriggerMetadata],
 ) -> Result<(Vec<TriggerShape>, Vec<TriggerShape>), String> {
-    let mut insert_triggers = Vec::new();
-    let mut update_triggers = Vec::new();
-    for row in rows {
-        validate_trigger_metadata_row(expected_schema, expected_table, row)?;
-        let (
-            trigger_name,
-            _trigger_schema,
-            _trigger_table,
-            event_manipulation,
-            _action_timing,
-            action_statement,
-            action_order,
-        ) = row;
-        let trigger = (
-            trigger_name.clone(),
-            action_statement.clone(),
-            *action_order,
-        );
-        match event_manipulation.as_str() {
-            "INSERT" => insert_triggers.push(trigger),
-            "UPDATE" => update_triggers.push(trigger),
-            _ => unreachable!("trigger event validated above"),
-        }
-    }
+    let validated = rows
+        .iter()
+        .map(|row| {
+            validate_trigger_metadata_row(expected_schema, expected_table, row)?;
+            Ok((row.3.clone(), trigger_shape(row)))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let (insert_triggers, update_triggers) = validated
+        .into_iter()
+        .partition::<Vec<_>, _>(|(event_manipulation, _)| event_manipulation == "INSERT");
+    let insert_triggers = insert_triggers
+        .into_iter()
+        .map(|(_, trigger)| trigger)
+        .collect();
+    let update_triggers = update_triggers
+        .into_iter()
+        .map(|(_, trigger)| trigger)
+        .collect();
     Ok((insert_triggers, update_triggers))
+}
+
+fn trigger_shape(row: &TriggerMetadata) -> TriggerShape {
+    let (trigger_name, _, _, _, _, action_statement, action_order) = row;
+    (
+        trigger_name.clone(),
+        action_statement.clone(),
+        *action_order,
+    )
 }
 
 fn validate_trigger_metadata_row(
