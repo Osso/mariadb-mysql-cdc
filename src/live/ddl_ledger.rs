@@ -47,6 +47,7 @@ PRIMARY KEY (source_identity,binlog_file,event_start_position)\
 const PENDING_ONLY_TRIGGER_BODY: &str = "BEGIN IF NEW.status <> 'pending' OR NEW.resolution_note IS NOT NULL THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'DDL events may only be inserted pending'; END IF; END";
 const MONOTONIC_RESOLUTION_TRIGGER_BODY: &str = "BEGIN IF NOT (OLD.source_identity <=> NEW.source_identity) OR NOT (OLD.source_server_id <=> NEW.source_server_id) OR NOT (OLD.binlog_file <=> NEW.binlog_file) OR NOT (OLD.event_start_position <=> NEW.event_start_position) OR NOT (OLD.event_end_position <=> NEW.event_end_position) OR NOT (OLD.schema_name <=> NEW.schema_name) OR NOT (OLD.raw_sql <=> NEW.raw_sql) OR OLD.status <> 'pending' OR NEW.status <> 'resolved' OR NEW.resolution_note IS NULL OR NEW.resolution_note = '' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'DDL resolution must preserve coordinates and transition pending to resolved once'; END IF; END";
 
+type DdlLedgerColumn = (String, String, String, String, String);
 type TriggerMetadata = (String, String, String, String, String, String, u64);
 type TriggerShape = (String, String, u64);
 
@@ -251,7 +252,7 @@ fn query_ddl_ledger_columns(
     conn: &mut Conn,
     schema: &str,
     table: &str,
-) -> Result<Vec<(String, String, String, String, String)>, String> {
+) -> Result<Vec<DdlLedgerColumn>, String> {
     conn.query(format!(
         "SELECT column_name,LOWER(column_type),is_nullable,LOWER(COALESCE(CAST(column_default AS CHAR),'<null>')),LOWER(extra) FROM information_schema.columns WHERE table_schema={} AND table_name={} ORDER BY ordinal_position",
         quote_sql_literal(schema),
@@ -312,7 +313,7 @@ fn query_ddl_trigger_inventory(
         })
 }
 
-fn expected_ddl_ledger_columns() -> Vec<(String, String, String, String, String)> {
+fn expected_ddl_ledger_columns() -> Vec<DdlLedgerColumn> {
     [
         ("source_identity", "varchar(384)", "NO", "<null>", ""),
         ("source_server_id", "int unsigned", "NO", "<null>", ""),
@@ -357,9 +358,7 @@ fn expected_ddl_ledger_columns() -> Vec<(String, String, String, String, String)
     .collect()
 }
 
-fn validate_ddl_ledger_columns(
-    columns: &[(String, String, String, String, String)],
-) -> Result<(), String> {
+fn validate_ddl_ledger_columns(columns: &[DdlLedgerColumn]) -> Result<(), String> {
     let expected = expected_ddl_ledger_columns();
     if columns == expected {
         return Ok(());
