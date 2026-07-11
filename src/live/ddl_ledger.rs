@@ -528,14 +528,27 @@ fn grant_can_mutate_ledger(grant: &str, ledger_table: &str) -> bool {
     {
         return true;
     }
+
+    let ledger_table = ledger_table.replace('`', "").to_ascii_uppercase();
+    let Some((ledger_schema, ledger_table_name)) = ledger_table.split_once('.') else {
+        return true;
+    };
+    if privileges.contains(&"EXECUTE") {
+        let expected_inventory_procedure = format!(
+            "PROCEDURE {ledger_schema}.{}",
+            ddl_trigger_inventory_routine_name(ledger_table_name).to_ascii_uppercase(),
+        );
+        let is_exact_inventory_grant =
+            privileges.len() == 1 && scope == expected_inventory_procedure;
+        if !is_exact_inventory_grant {
+            return true;
+        }
+        return false;
+    }
     if scope == "*.*" {
         return privileges != ["USAGE"];
     }
 
-    let ledger_table = ledger_table.replace('`', "").to_ascii_uppercase();
-    let Some((ledger_schema, _)) = ledger_table.split_once('.') else {
-        return true;
-    };
     let scope_covers_ledger = scope == ledger_table || scope == format!("{ledger_schema}.*");
     if !scope_covers_ledger {
         return false;
@@ -826,6 +839,34 @@ mod tests {
         ));
         assert!(!grant_can_mutate_ledger(
             "GRANT USAGE ON *.* TO `cdc`@`%`",
+            "cdc.ddl_events"
+        ));
+        assert!(grant_can_mutate_ledger(
+            "GRANT EXECUTE ON PROCEDURE `cdc`.`other_routine` TO `cdc`@`%`",
+            "cdc.ddl_events"
+        ));
+        assert!(grant_can_mutate_ledger(
+            "GRANT EXECUTE ON `cdc`.* TO `cdc`@`%`",
+            "cdc.ddl_events"
+        ));
+        assert!(grant_can_mutate_ledger(
+            "GRANT EXECUTE ON *.* TO `cdc`@`%`",
+            "cdc.ddl_events"
+        ));
+        assert!(grant_can_mutate_ledger(
+            "GRANT EXECUTE ON FUNCTION `cdc`.`ddl_events_trigger_inventory` TO `cdc`@`%`",
+            "cdc.ddl_events"
+        ));
+        assert!(grant_can_mutate_ledger(
+            "GRANT EXECUTE ON PROCEDURE `other`.`ddl_events_trigger_inventory` TO `cdc`@`%`",
+            "cdc.ddl_events"
+        ));
+        assert!(grant_can_mutate_ledger(
+            "GRANT EXECUTE ON PROCEDURE `cdc`.`ddl_events_trigger_inventory_extra` TO `cdc`@`%`",
+            "cdc.ddl_events"
+        ));
+        assert!(!grant_can_mutate_ledger(
+            "GRANT EXECUTE ON PROCEDURE `cdc`.`ddl_events_trigger_inventory` TO `cdc`@`%`",
             "cdc.ddl_events"
         ));
     }
