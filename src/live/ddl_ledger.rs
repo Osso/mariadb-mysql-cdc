@@ -350,6 +350,7 @@ fn validate_ddl_constraints(constraints: &[(String, String)]) -> Result<(), Stri
 fn normalize_sql_guard(sql: &str) -> String {
     sql.replace('`', "")
         .replace("_utf8mb4", "")
+        .replace("\\'", "'")
         .split_whitespace()
         .collect::<String>()
         .to_ascii_lowercase()
@@ -604,6 +605,16 @@ mod tests {
                     1,
                 )],
             )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_escaped_status_literals_returned_by_information_schema() {
+        assert!(
+            validate_ddl_status_checks(&[
+                "(`status` in (_utf8mb4\\'pending\\',_utf8mb4\\'resolved'))".to_string()
+            ])
             .is_ok()
         );
     }
