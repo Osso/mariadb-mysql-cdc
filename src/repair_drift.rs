@@ -19,6 +19,7 @@ pub struct RepairDriftConfig {
     pub target: TargetMySqlConfig,
     pub tables: Vec<String>,
     pub parent_first: Vec<String>,
+    pub content_check: bool,
     pub mode: SyncMode,
     pub chunk_size: usize,
     pub progress_table: String,
@@ -104,14 +105,9 @@ pub fn run_repair_drift(config: &RepairDriftConfig) -> Result<RepairDriftReport,
         });
     }
 
-    let drift_report = drift_check::run_drift_check(&DriftCheckConfig {
-        source: config.source.clone(),
-        target: config.target.clone(),
-        tables: ordered_tables.clone(),
-        content_check: false,
-        chunk_size: config.chunk_size,
-    })
-    .map_err(|error| RepairDriftError::DriftCheck(error.to_string()))?;
+    let drift_report =
+        drift_check::run_drift_check(&build_drift_check_config(config, ordered_tables.clone()))
+            .map_err(|error| RepairDriftError::DriftCheck(error.to_string()))?;
 
     let source_by_name = source_inventory
         .tables
@@ -259,6 +255,7 @@ fn default_repair_drift_config() -> RepairDriftConfig {
         target: TargetMySqlConfig::default(),
         tables: Vec::new(),
         parent_first: Vec::new(),
+        content_check: true,
         mode: SyncMode::DryRun,
         chunk_size: 1000,
         progress_table: "cdc.table_sync_runs".to_string(),
@@ -286,6 +283,7 @@ fn repair_drift_option(
         "--target-database" => config.target.database = value.to_string(),
         "--table" => config.tables.push(value.to_string()),
         "--parent-first" => config.parent_first.extend(parse_csv(value)),
+        "--content-check" => config.content_check = crate::parse_bool(flag, value)?,
         "--mode" => config.mode = parse_sync_mode(value)?,
         "--chunk-size" => config.chunk_size = crate::parse_usize(flag, value)?,
         "--progress-table" => config.progress_table = value.to_string(),
@@ -471,6 +469,16 @@ fn compatible_sync_table(
     })
 }
 
+fn build_drift_check_config(config: &RepairDriftConfig, tables: Vec<String>) -> DriftCheckConfig {
+    DriftCheckConfig {
+        source: config.source.clone(),
+        target: config.target.clone(),
+        tables,
+        content_check: config.content_check,
+        chunk_size: config.chunk_size,
+    }
+}
+
 fn sync_config(config: &RepairDriftConfig, table: SyncTable, run_id: String) -> SyncTableConfig {
     SyncTableConfig {
         source: config.source.clone(),
@@ -576,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_only_count_drifted_tables() {
+    fn selects_count_or_content_drifted_tables() {
         let comparisons = vec![
             DriftComparison {
                 table: "accounts".to_string(),
@@ -591,6 +599,15 @@ mod tests {
                 content: None,
             },
             DriftComparison {
+                table: "releases".to_string(),
+                source_count: Some(10),
+                target_count: Some(10),
+                content: Some(crate::drift_check::ContentDriftSummary {
+                    mismatched_chunks: 1,
+                    ..Default::default()
+                }),
+            },
+            DriftComparison {
                 table: "missing".to_string(),
                 source_count: Some(10),
                 target_count: None,
@@ -600,8 +617,23 @@ mod tests {
 
         assert_eq!(
             drifted_table_names(&comparisons),
-            vec!["children".to_string(), "missing".to_string()]
+            vec![
+                "children".to_string(),
+                "releases".to_string(),
+                "missing".to_string()
+            ]
         );
+    }
+
+    #[test]
+    fn passes_content_check_to_drift_check_config() {
+        let mut config = default_repair_drift_config();
+        config.content_check = false;
+
+        let drift_config = build_drift_check_config(&config, vec!["accounts".to_string()]);
+
+        assert!(!drift_config.content_check);
+        assert_eq!(drift_config.tables, vec!["accounts"]);
     }
 
     #[test]
@@ -624,15 +656,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_repeated_tables_and_parent_first_prefix() {
+    fn parses_repeated_tables_parent_first_prefix_and_content_check() {
         let mut config = default_repair_drift_config();
+        assert!(config.content_check);
         repair_drift_option(&mut config, "--table", "children").expect("table");
         repair_drift_option(&mut config, "--table", "accounts").expect("table");
         repair_drift_option(&mut config, "--parent-first", "accounts,authors").expect("order");
+        repair_drift_option(&mut config, "--content-check", "false").expect("content check");
         repair_drift_option(&mut config, "--max-deletes", "7").expect("deletes");
 
         assert_eq!(config.tables, vec!["children", "accounts"]);
         assert_eq!(config.parent_first, vec!["accounts", "authors"]);
+        assert!(!config.content_check);
         assert_eq!(config.max_deletes, Some(7));
         assert!(config.max_deletes_explicit);
     }

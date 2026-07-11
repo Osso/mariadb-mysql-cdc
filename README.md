@@ -89,13 +89,22 @@ and `--updated-since` when present. A target-side named lock rejects concurrent
 processes using the same run ID.
 
 `repair-drift` runs the recurring bounded orchestration: it inventories source
-and target tables, compares counts, creates a fresh run ID, and invokes
-`sync-table` only for count-drifted tables with compatible primary-key and column
-inventories. Dry-run is the default. Apply mode requires an explicit
+and target tables, compares counts plus bounded content checks, creates a fresh
+run ID, and invokes `sync-table` for count- or content-drifted tables with
+compatible primary-key and column inventories. Content checks default to enabled
+and can be disabled with `--content-check false`; they run only when source and
+target counts match. Dry-run is the default. Apply mode requires an explicit
 `--max-deletes` allowance; without it, orphan deletion remains disabled. Use
 repeated `--table` options to limit scope and `--parent-first parent_a,parent_b`
 to force a deterministic parent-first prefix before lexical ordering of remaining
 tables. Each table repair receives a child run ID under the fresh orchestration ID.
+
+Content checks split mismatches into primary-key ranges, but record at most 1,000
+mismatch ranges; `range_limit_exceeded=true` means further splitting was bounded.
+Floating-point columns are excluded from checksums because cross-server
+normalization is unsafe; skipped columns are reported, so content parity is not
+proven for those columns. Use `sync-table` with reviewed columns for targeted
+repair/validation when needed.
 
 ```bash
 mariadb-mysql-cdc repair-drift \

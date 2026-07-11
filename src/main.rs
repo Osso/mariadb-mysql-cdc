@@ -123,6 +123,7 @@ Sync progress repair-run options:
 Repair drift options:
   --table TABLE                   Limit repair to a source table; repeat for multiple tables.
   --parent-first TABLES           Comma-separated table order prefix; remaining tables sort lexically.
+  --content-check BOOL             Run bounded content checks when counts match. Defaults to true.
   --mode MODE                     dry-run (default) or apply.
   --max-deletes COUNT             Required explicitly in apply mode; bounds target orphan deletes.
   --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
@@ -403,7 +404,7 @@ fn parse_drift_check_config(args: Vec<String>) -> Result<drift_check::DriftCheck
         source: mysql_snapshot::MySqlConnectionConfig::default(),
         target: live::TargetMySqlConfig::default(),
         tables: Vec::new(),
-        content_check: false,
+        content_check: true,
         chunk_size: 10000,
     };
     let mut index = 0;
@@ -584,7 +585,7 @@ fn parse_nonzero_u32(flag: &str, value: &str) -> Result<u32, String> {
     Ok(parsed)
 }
 
-fn parse_bool(flag: &str, value: &str) -> Result<bool, String> {
+pub(crate) fn parse_bool(flag: &str, value: &str) -> Result<bool, String> {
     match value {
         "true" => Ok(true),
         "false" => Ok(false),

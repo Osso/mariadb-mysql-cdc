@@ -103,6 +103,13 @@ are ordered lexically. Missing target tables, missing primary keys, and
 source/target primary-key or column incompatibilities are reported as skipped,
 never sent to `sync-table`.
 
+`--content-check` defaults to `true`; set it to `false` only when a bounded
+checksum pass is not appropriate. Content checks run when counts match, split
+mismatches by primary-key range, and record at most 1,000 mismatch ranges. A
+`range_limit_exceeded=true` report means localization was deliberately bounded.
+Floating-point columns are skipped because cross-server numeric normalization is
+unsafe; the report lists skipped columns and does not prove parity for them.
+
 ## Table Repair Runs
 
 Use `sync-table` after catchup or validation identifies a table-level drift. Every

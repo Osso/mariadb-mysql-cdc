@@ -325,6 +325,34 @@ fn parses_drift_check_config_with_selected_tables() {
 }
 
 #[test]
+fn drift_check_content_check_defaults_enabled() {
+    set_env("DRIFT_DEFAULT_SOURCE_PASSWORD", "source-secret");
+    set_env("DRIFT_DEFAULT_TARGET_PASSWORD", "target-secret");
+
+    let config = parse_drift_check_config(args([
+        "--source-host",
+        "source.db",
+        "--source-user",
+        "reader",
+        "--source-password-env",
+        "DRIFT_DEFAULT_SOURCE_PASSWORD",
+        "--source-database",
+        "app",
+        "--target-host",
+        "target.db",
+        "--target-user",
+        "writer",
+        "--target-password-env",
+        "DRIFT_DEFAULT_TARGET_PASSWORD",
+        "--target-database",
+        "app",
+    ]))
+    .expect("drift config");
+
+    assert!(config.content_check);
+}
+
+#[test]
 fn rejects_apply_binlog_options_without_values() {
     let error = parse_apply_binlog_config(args(["--source-host"])).expect_err("missing value");
 
