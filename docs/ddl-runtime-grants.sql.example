@@ -14,7 +14,12 @@ GRANT SELECT, INSERT
     ON cdc.ddl_events
     TO 'cdc_stream'@'%';
 
+GRANT EXECUTE
+    ON PROCEDURE cdc.ddl_events_trigger_inventory
+    TO 'cdc_stream'@'%';
+
 -- Expected global grant is USAGE only. Do not grant roles, PROXY, ALL,
 -- ROLE_ADMIN, UPDATE/DELETE/ALTER/DROP/TRIGGER on cdc.ddl_events, or schema-wide
--- cdc privileges.
+-- cdc privileges. For a custom schema.table ledger, grant EXECUTE on the
+-- corresponding <table>_trigger_inventory procedure in that schema.
 SHOW GRANTS FOR 'cdc_stream'@'%';

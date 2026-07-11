@@ -47,6 +47,9 @@ PRIMARY KEY (source_identity,binlog_file,event_start_position)\
 const PENDING_ONLY_TRIGGER_BODY: &str = "BEGIN IF NEW.status <> 'pending' OR NEW.resolution_note IS NOT NULL THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'DDL events may only be inserted pending'; END IF; END";
 const MONOTONIC_RESOLUTION_TRIGGER_BODY: &str = "BEGIN IF NOT (OLD.source_identity <=> NEW.source_identity) OR NOT (OLD.source_server_id <=> NEW.source_server_id) OR NOT (OLD.binlog_file <=> NEW.binlog_file) OR NOT (OLD.event_start_position <=> NEW.event_start_position) OR NOT (OLD.event_end_position <=> NEW.event_end_position) OR NOT (OLD.schema_name <=> NEW.schema_name) OR NOT (OLD.raw_sql <=> NEW.raw_sql) OR OLD.status <> 'pending' OR NEW.status <> 'resolved' OR NEW.resolution_note IS NULL OR NEW.resolution_note = '' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'DDL resolution must preserve coordinates and transition pending to resolved once'; END IF; END";
 
+type TriggerMetadata = (String, String, String, String, String, String, u64);
+type TriggerShape = (String, String, u64);
+
 pub fn build_pending_only_ddl_trigger_sql(table: &str) -> String {
     let (schema, table_name) = table
         .split_once('.')
@@ -73,6 +76,25 @@ pub fn build_monotonic_ddl_resolution_trigger_sql(table: &str) -> String {
         quote_identifier_path(table),
         MONOTONIC_RESOLUTION_TRIGGER_BODY,
     )
+}
+
+fn ddl_trigger_inventory_routine_name(table_name: &str) -> String {
+    format!("{table_name}_trigger_inventory")
+}
+
+fn ddl_trigger_inventory_routine_path(table: &str) -> String {
+    let (schema, table_name) = table
+        .split_once('.')
+        .expect("DDL ledger table must be schema-qualified");
+    format!(
+        "{}.{}",
+        quote_ident(schema),
+        quote_ident(&ddl_trigger_inventory_routine_name(table_name))
+    )
+}
+
+fn build_ddl_trigger_inventory_call_sql(table: &str) -> String {
+    format!("CALL {}()", ddl_trigger_inventory_routine_path(table))
 }
 
 pub fn build_record_pending_ddl_sql(table: &str, event: &DdlEvent) -> String {
@@ -163,13 +185,16 @@ impl MySqlDdlEventLedger {
             .map_err(ddl_ledger_mysql_error)?;
         validate_ddl_status_checks(&status_checks)?;
 
-        let insert_triggers = conn
-            .query::<(String, String, u64), _>(format!(
-                "SELECT trigger_name,action_statement,action_order FROM information_schema.triggers WHERE trigger_schema={} AND event_object_table={} AND event_manipulation='INSERT' AND action_timing='BEFORE' ORDER BY action_order",
-                quote_sql_literal(schema),
-                quote_sql_literal(table),
-            ))
-            .map_err(ddl_ledger_mysql_error)?;
+        let trigger_inventory = conn
+            .query::<TriggerMetadata, _>(build_ddl_trigger_inventory_call_sql(&self.table))
+            .map_err(|error| {
+                format!(
+                    "DDL ledger trigger inventory routine {} failed: {error}",
+                    ddl_trigger_inventory_routine_path(&self.table),
+                )
+            })?;
+        let (insert_triggers, update_triggers) =
+            validate_trigger_inventory_metadata(schema, table, &trigger_inventory)?;
         validate_pending_trigger_inventory(&pending_only_trigger_name(table), &insert_triggers)
             .map_err(|error| {
                 format!(
@@ -178,13 +203,6 @@ impl MySqlDdlEventLedger {
                 )
             })?;
 
-        let update_triggers = conn
-            .query::<(String, String, u64), _>(format!(
-                "SELECT trigger_name,action_statement,action_order FROM information_schema.triggers WHERE trigger_schema={} AND event_object_table={} AND event_manipulation='UPDATE' AND action_timing='BEFORE' ORDER BY action_order",
-                quote_sql_literal(schema),
-                quote_sql_literal(table),
-            ))
-            .map_err(ddl_ledger_mysql_error)?;
         validate_resolution_trigger_inventory(
             &monotonic_resolution_trigger_name(table),
             &update_triggers,
@@ -332,6 +350,70 @@ fn pending_only_trigger_name(table_name: &str) -> String {
 
 fn monotonic_resolution_trigger_name(table_name: &str) -> String {
     format!("{table_name}_monotonic_resolution_guard")
+}
+
+fn validate_trigger_inventory_metadata(
+    expected_schema: &str,
+    expected_table: &str,
+    rows: &[TriggerMetadata],
+) -> Result<(Vec<TriggerShape>, Vec<TriggerShape>), String> {
+    let mut insert_triggers = Vec::new();
+    let mut update_triggers = Vec::new();
+    for row in rows {
+        validate_trigger_metadata_row(expected_schema, expected_table, row)?;
+        let (
+            trigger_name,
+            _trigger_schema,
+            _trigger_table,
+            event_manipulation,
+            _action_timing,
+            action_statement,
+            action_order,
+        ) = row;
+        let trigger = (
+            trigger_name.clone(),
+            action_statement.clone(),
+            *action_order,
+        );
+        match event_manipulation.as_str() {
+            "INSERT" => insert_triggers.push(trigger),
+            "UPDATE" => update_triggers.push(trigger),
+            _ => unreachable!("trigger event validated above"),
+        }
+    }
+    Ok((insert_triggers, update_triggers))
+}
+
+fn validate_trigger_metadata_row(
+    expected_schema: &str,
+    expected_table: &str,
+    row: &TriggerMetadata,
+) -> Result<(), String> {
+    let (
+        trigger_name,
+        trigger_schema,
+        trigger_table,
+        event_manipulation,
+        action_timing,
+        _action_statement,
+        _action_order,
+    ) = row;
+    if trigger_schema != expected_schema || trigger_table != expected_table {
+        return Err(format!(
+            "DDL ledger trigger metadata target mismatch: expected {expected_schema}.{expected_table}, found {trigger_schema}.{trigger_table}"
+        ));
+    }
+    if action_timing != "BEFORE" {
+        return Err(format!(
+            "DDL ledger trigger timing mismatch for {trigger_name}: expected BEFORE, found {action_timing}"
+        ));
+    }
+    if !matches!(event_manipulation.as_str(), "INSERT" | "UPDATE") {
+        return Err(format!(
+            "DDL ledger trigger event mismatch for {trigger_name}: unexpected {event_manipulation}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ddl_constraints(constraints: &[(String, String)]) -> Result<(), String> {
@@ -489,6 +571,76 @@ fn parse_ddl_status_fields(status: &str, raw_sql: String) -> Result<DdlEventStat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_trigger_inventory_call_from_schema_qualified_ledger_table() {
+        assert_eq!(
+            ddl_trigger_inventory_routine_name("ddl_events"),
+            "ddl_events_trigger_inventory"
+        );
+        assert_eq!(
+            build_ddl_trigger_inventory_call_sql("cdc.ddl_events"),
+            "CALL `cdc`.`ddl_events_trigger_inventory`()"
+        );
+        assert_eq!(
+            build_ddl_trigger_inventory_call_sql("custom.ddl_ledger"),
+            "CALL `custom`.`ddl_ledger_trigger_inventory`()"
+        );
+    }
+
+    #[test]
+    fn validates_trigger_inventory_returned_by_definer_routine() {
+        let rows = vec![
+            (
+                "ddl_events_pending_insert_guard".to_string(),
+                "cdc".to_string(),
+                "ddl_events".to_string(),
+                "INSERT".to_string(),
+                "BEFORE".to_string(),
+                PENDING_ONLY_TRIGGER_BODY.to_string(),
+                1,
+            ),
+            (
+                "ddl_events_monotonic_resolution_guard".to_string(),
+                "cdc".to_string(),
+                "ddl_events".to_string(),
+                "UPDATE".to_string(),
+                "BEFORE".to_string(),
+                MONOTONIC_RESOLUTION_TRIGGER_BODY.to_string(),
+                1,
+            ),
+        ];
+
+        let (insert_triggers, update_triggers) =
+            validate_trigger_inventory_metadata("cdc", "ddl_events", &rows)
+                .expect("trigger metadata");
+        assert_eq!(insert_triggers.len(), 1);
+        assert_eq!(update_triggers.len(), 1);
+        assert!(validate_pending_trigger_inventory(
+            "ddl_events_pending_insert_guard",
+            &insert_triggers,
+        )
+        .is_ok());
+        assert!(
+            validate_resolution_trigger_inventory(
+                "ddl_events_monotonic_resolution_guard",
+                &update_triggers,
+            )
+            .is_ok()
+        );
+
+        let mut wrong_table = rows.clone();
+        wrong_table[0].2 = "other_ledger".to_string();
+        assert!(validate_trigger_inventory_metadata("cdc", "ddl_events", &wrong_table).is_err());
+
+        let mut wrong_timing = rows.clone();
+        wrong_timing[0].4 = "AFTER".to_string();
+        assert!(validate_trigger_inventory_metadata("cdc", "ddl_events", &wrong_timing).is_err());
+
+        let mut wrong_event = rows;
+        wrong_event[0].3 = "DELETE".to_string();
+        assert!(validate_trigger_inventory_metadata("cdc", "ddl_events", &wrong_event).is_err());
+    }
 
     #[test]
     fn creates_manual_ddl_resolution_ledger() {

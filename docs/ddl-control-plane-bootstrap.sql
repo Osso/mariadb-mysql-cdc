@@ -58,4 +58,29 @@ BEGIN
             SET MESSAGE_TEXT = 'DDL resolution must preserve coordinates and transition pending to resolved once';
     END IF;
 END//
+
+-- The stream account cannot see information_schema.triggers directly because it
+-- correctly lacks TRIGGER. Keep this routine DEFINER-secured and grant only
+-- EXECUTE to the stream account. For a custom schema.table ledger, rename this
+-- routine to <table>_trigger_inventory and update the schema/table literals.
+DROP PROCEDURE IF EXISTS cdc.ddl_events_trigger_inventory//
+CREATE DEFINER=CURRENT_USER PROCEDURE cdc.ddl_events_trigger_inventory()
+SQL SECURITY DEFINER
+READS SQL DATA
+BEGIN
+    SELECT
+        trigger_name,
+        event_object_schema,
+        event_object_table,
+        event_manipulation,
+        action_timing,
+        action_statement,
+        action_order
+    FROM information_schema.triggers
+    WHERE event_object_schema = 'cdc'
+      AND event_object_table = 'ddl_events'
+    ORDER BY event_manipulation, action_order;
+END//
 DELIMITER ;
+
+GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';
