@@ -51,8 +51,14 @@ exact match and advances the checkpoint without re-executing the DDL.
 Generic target errors—including already-exists and missing-object errors—never
 count as DDL success. Resolving before target apply and validation causes schema
 divergence because the stream will checkpoint past the source DDL. Startup also
-fails closed when the configured ledger schema, guards, or runtime grants do not
-match the bootstrap contract. See [DDL Resolution Runbook](docs/ddl-resolution.md).
+fails closed when the configured ledger schema, guards, trigger-inventory
+routine, returned trigger metadata, or runtime grants do not match the bootstrap
+contract. The restricted `cdc_stream` account lacks `TRIGGER` and receives only
+`GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';`
+for the exact `SQL SECURITY DEFINER` inventory routine; it never reads
+`information_schema.triggers` directly. Bootstrap/resolver operators must
+independently inspect the routine definition and actual trigger rows. See
+[DDL Resolution Runbook](docs/ddl-resolution.md).
 
 ## Commands
 

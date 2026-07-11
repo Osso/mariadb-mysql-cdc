@@ -15,10 +15,15 @@ The ledger defaults to `cdc.ddl_events`. Set a different qualified table only wh
 Before first startup, stop the stream and run
 [`ddl-control-plane-bootstrap.sql`](ddl-control-plane-bootstrap.sql) with
 resolver/admin credentials. The stream does not create or repair this control
-plane. On every startup, before source replication begins, it validates exact
-columns, defaults, `ON UPDATE`, status constraint, primary key, both trigger
-shapes, and runtime grants; any mismatch fails closed. Its immutable primary key
-is:
+plane. `cdc_stream` intentionally lacks `TRIGGER` and must not inspect
+`information_schema.triggers` directly. For ledger table `schema.table`, the
+only trigger-inspection path available to the runtime is the exact
+`schema.<table>_trigger_inventory()` `SQL SECURITY DEFINER` procedure created by
+bootstrap. On every startup, before source replication begins, the runtime calls
+that exact procedure and validates the returned trigger metadata (target
+schema/table, `BEFORE` timing, `INSERT`/`UPDATE` event, exact guard names,
+statement bodies, and order); a missing, failing, or malformed routine/result
+fails closed. Its immutable primary key is:
 
 ```text
 (source_identity, binlog_file, event_start_position)
@@ -31,20 +36,48 @@ Provision the restricted account from
 the password and reviewing the application schema. Use separate credentials:
 
 - `cdc_stream`: target DML; `SELECT`, `INSERT`, and `UPDATE` on
-  `cdc.stream_checkpoint`; and `SELECT`, `INSERT` on `cdc.ddl_events`. It must not
-  have `UPDATE`, `DELETE`, `ALTER`, `DROP`, or `TRIGGER` on the ledger, global
-  `ALL`, or active role grants. Startup fails closed when those privileges could
+  `cdc.stream_checkpoint`; `SELECT`, `INSERT` on `cdc.ddl_events`; and the exact
+  `GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';`
+  (or the corresponding `<table>_trigger_inventory` procedure for a custom
+  ledger). It must not have
+  `UPDATE`, `DELETE`, `ALTER`, `DROP`, or `TRIGGER` on the ledger, global `ALL`,
+  or active role grants. Startup fails closed when those privileges could
   resolve or replace a ledger row. The validated trigger rejects any inserted
   ledger row whose status is not `pending` or whose resolution note is set.
 - Resolver/operator credential: reviewed access to apply target schema changes
   and update `cdc.ddl_events.status` and `resolution_note`.
 
-Provision both triggers using the bootstrap SQL or the exact SQL printed by a
-missing-trigger startup error. `cdc.ddl_events_pending_insert_guard` enforces
-pending-only inserts. `cdc.ddl_events_monotonic_resolution_guard` makes source
-identity, coordinates, schema, and raw SQL immutable and permits exactly one
-non-empty-note transition from `pending` to `resolved`. Retain both during schema
-reviews.
+Provision both triggers and the matching inventory routine using the bootstrap
+SQL or the exact SQL printed by a startup error. `cdc.ddl_events_pending_insert_guard`
+enforces pending-only inserts. `cdc.ddl_events_monotonic_resolution_guard` makes
+source identity, coordinates, schema, and raw SQL immutable and permits exactly
+one non-empty-note transition from `pending` to `resolved`. Retain both triggers
+and the routine during schema reviews.
+
+Bootstrap/resolver credentials must independently inspect the actual target
+objects before granting runtime access and after any control-plane change. Run
+these checks as an admin/resolver, never as `cdc_stream`:
+
+```sql
+SHOW CREATE PROCEDURE cdc.ddl_events_trigger_inventory\G
+
+SELECT
+    trigger_name,
+    event_object_schema,
+    event_object_table,
+    event_manipulation,
+    action_timing,
+    action_statement,
+    action_order
+FROM information_schema.triggers
+WHERE event_object_schema = 'cdc'
+  AND event_object_table = 'ddl_events'
+ORDER BY event_manipulation, action_order;
+```
+
+The routine definition and trigger rows must match the bootstrap contract. The
+runtime only executes `CALL cdc.ddl_events_trigger_inventory()` and validates its
+returned rows; it never directly reads `information_schema.triggers`.
 
 The stream acquires target named lock `cdc-stream:<target database>` without
 waiting. Only one stream may target a database; lock failure means another stream
@@ -155,7 +188,11 @@ WHERE table_schema = 'globalcomix'
 ORDER BY ordinal_position;
 ```
 
-For views, routines, triggers, events, or databases, use the corresponding `SHOW CREATE ...` / `information_schema` check. Record the applied target migration and validation evidence in the resolution note.
+For views, routines, triggers, events, or databases, use the corresponding
+`SHOW CREATE ...` / `information_schema` check with resolver/admin credentials.
+These operator checks are independent of the runtime trigger-inventory call.
+Record the applied target migration and validation evidence in the resolution
+note.
 
 **Do not treat a generic target error as success.** Errors such as “already exists”, “doesn't exist”, or “missing object” do not prove the target has the intended schema. They do not resolve the ledger row and do not authorize a checkpoint advance.
 

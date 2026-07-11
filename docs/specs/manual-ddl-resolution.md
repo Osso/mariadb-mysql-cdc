@@ -12,6 +12,9 @@
 - [x] Stop at a pending DDL boundary without checkpointing past it.
 - [x] Keep the exact source SQL, source server identity, schema, and event end position in the ledger record.
 - [x] Enforce pending-only inserts with a validated target trigger and reject runtime credentials that can update, delete, alter, drop, trigger, or role-bypass the ledger.
+- [x] Keep `cdc_stream` without `TRIGGER`; grant it only `EXECUTE` on the exact `<table>_trigger_inventory` `SQL SECURITY DEFINER` routine used for trigger inspection.
+- [x] Have bootstrap/resolver credentials independently inspect the actual trigger rows and `SHOW CREATE` routine definition; runtime never reads `information_schema.triggers` directly.
+- [x] Call the exact inventory routine during startup validation and fail closed when the routine is missing, fails, or returns missing/malformed trigger metadata.
 - [x] Enforce immutable event identity/coordinates/raw SQL and a single one-way `pending` to `resolved` transition with a validated `BEFORE UPDATE` trigger.
 - [x] Scope durable stream checkpoint rows to the base source identity so a replaced source cannot consume an earlier incarnation's coordinate.
 
@@ -37,7 +40,7 @@
 ## Implementation inventory
 
 - `src/live/structured_stream.rs` — detects schema-changing query events, flushes prior DML, gates progress on the ledger, and checkpoints resolved boundaries.
-- `src/live/ddl_ledger.rs` — creates and reads the target-side DDL ledger and records pending events.
+- `src/live/ddl_ledger.rs` — validates the ledger and runtime grants, calls the exact derived `<table>_trigger_inventory` routine, validates returned trigger metadata, and records pending events.
 - `src/live.rs` — owns the default ledger table and validates its configuration.
 - `src/main.rs` — exposes `--ddl-ledger-table`.
 - `src/statement.rs` — classifies source schema-changing statements.

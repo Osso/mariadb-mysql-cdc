@@ -18,6 +18,10 @@ GRANT EXECUTE
     ON PROCEDURE cdc.ddl_events_trigger_inventory
     TO 'cdc_stream'@'%';
 
+-- This exact EXECUTE grant is the runtime's only trigger-inventory access. The
+-- account intentionally lacks TRIGGER and must not query
+-- information_schema.triggers directly. The procedure must remain a
+-- SQL SECURITY DEFINER routine named <table>_trigger_inventory.
 -- Expected global grant is USAGE only. Do not grant roles, PROXY, ALL,
 -- ROLE_ADMIN, UPDATE/DELETE/ALTER/DROP/TRIGGER on cdc.ddl_events, or schema-wide
 -- cdc privileges. For a custom schema.table ledger, grant EXECUTE on the

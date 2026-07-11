@@ -84,3 +84,22 @@ END//
 DELIMITER ;
 
 GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';
+
+-- Bootstrap/resolver credentials must independently inspect the actual routine
+-- definition and trigger rows. The cdc_stream account lacks TRIGGER and does
+-- not run these information_schema.triggers checks; runtime only CALLs the
+-- exact DEFINER routine above and validates its returned metadata.
+SHOW CREATE PROCEDURE cdc.ddl_events_trigger_inventory;
+SELECT
+    trigger_name,
+    event_object_schema,
+    event_object_table,
+    event_manipulation,
+    action_timing,
+    action_statement,
+    action_order
+FROM information_schema.triggers
+WHERE event_object_schema = 'cdc'
+  AND event_object_table = 'ddl_events'
+ORDER BY event_manipulation, action_order;
+SHOW GRANTS FOR 'cdc_stream'@'%';
