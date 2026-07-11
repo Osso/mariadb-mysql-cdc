@@ -13,6 +13,9 @@ pub struct ReplicaOptions {
     /// Defines whether SSL/TLS must be used. Defaults to SslMode.DISABLED.
     pub ssl_mode: SslMode,
 
+    /// Optional PEM/DER CA certificate used to verify a self-signed server certificate.
+    pub ssl_ca_file: Option<String>,
+
     /// A database user which is used to register as a database slave.
     /// The user needs to have <c>REPLICATION SLAVE</c>, <c>REPLICATION CLIENT</c> privileges.
     pub username: String,
@@ -47,6 +50,7 @@ impl Default for ReplicaOptions {
             port: 3306,
             hostname: String::from("localhost"),
             ssl_mode: SslMode::Disabled,
+            ssl_ca_file: None,
             username: String::new(),
             password: String::new(),
             database: None,

@@ -32,15 +32,15 @@ CDC stream has already been applying forward changes.
 - [x] Make interrupted `--updated-since` retries restart from the beginning under the same
   run ID, preventing newly eligible rows behind a saved primary key from being skipped;
   upsert matching source rows without deleting target orphans.
-- [x] On stream target-apply failure for INSERT, UPDATE, or REPLACE, run table
-  repair for the failed statement's table and checkpoint the event only after
-  repair succeeds.
-- [x] Do not checkpoint a failed DELETE through table repair until target deletes
-  are supported by the repair path.
+- [ ] On stream target-apply failure for INSERT, UPDATE, or REPLACE, schedule a
+  bounded table repair for the affected table/window and checkpoint the event
+  only after repair succeeds.
+- [ ] Do not checkpoint a failed DELETE through repair until bounded target
+  deletes are supported by the live repair path.
 
 ## How it works
 
-- [Table sync repair wiki](../wiki/systems/table-sync-repair.md)
+- [Catchup and table repair runbook](../catchup.md)
 
 ## Implementation inventory
 
@@ -50,8 +50,8 @@ CDC stream has already been applying forward changes.
   table-sync progress schema, loading, saving, and error recording.
 - `src/sync_cli.rs` - `sync-table` option parsing and command dispatch.
 - `src/main.rs` - top-level command registration and shared option helpers.
-- `src/live.rs` - stream failure hook that runs table repair before checkpointing.
-- `src/live/repair.rs` - failed-statement table detection and table-sync repair.
+- `src/live/insert_conflict.rs` - observable live conflict classification; automatic
+  repair scheduling remains a known gap.
 
 ## Tests asserting this spec
 
@@ -60,7 +60,8 @@ CDC stream has already been applying forward changes.
 - `src/table_sync/progress.rs` - legacy and run-scoped progress-table DDL, upsert SQL,
   and load parsing tests.
 - `src/sync_cli.rs` - `sync-table` parser and required run-ID tests.
-- `src/live/tests.rs` - stream target-failure repair and checkpoint tests.
+- `src/live/insert_conflict.rs` and `src/row.rs` - secondary-unique conflict safety
+  and conflict log tests.
 
 ## Known gaps (current cycle)
 

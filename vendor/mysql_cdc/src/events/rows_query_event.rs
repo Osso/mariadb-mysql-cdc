@@ -41,7 +41,10 @@ mod tests {
 
     #[test]
     fn parse_mariadb_annotation_preserves_non_utf8_bytes_lossily() {
-        let bytes = [162, 115, 146, 171, 116, 13, 97, 107, 102, 172, 93, 36, 187, 4, 11, 70, 81, 244, 255, 170, 85, 181, 120, 171, 186, 118, 3, 196, 183, 63, 234, 164];
+        let bytes = [
+            162, 115, 146, 171, 116, 13, 97, 107, 102, 172, 93, 36, 187, 4, 11, 70, 81, 244, 255,
+            170, 85, 181, 120, 171, 186, 118, 3, 196, 183, 63, 234, 164,
+        ];
         let mut cursor = Cursor::new(bytes.as_slice());
 
         let event = RowsQueryEvent::parse_mariadb(&mut cursor).expect("lossy annotation parse");

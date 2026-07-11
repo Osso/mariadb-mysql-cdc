@@ -1,0 +1,20 @@
+-- Replace <strong-generated-password> before running with admin credentials.
+-- Review the application schema name if it is not globalcomix.
+CREATE USER 'cdc_stream'@'%' IDENTIFIED BY '<strong-generated-password>' REQUIRE SSL;
+
+GRANT SELECT, INSERT, UPDATE, DELETE
+    ON globalcomix.*
+    TO 'cdc_stream'@'%';
+
+GRANT SELECT, INSERT, UPDATE
+    ON cdc.stream_checkpoint
+    TO 'cdc_stream'@'%';
+
+GRANT SELECT, INSERT
+    ON cdc.ddl_events
+    TO 'cdc_stream'@'%';
+
+-- Expected global grant is USAGE only. Do not grant roles, PROXY, ALL,
+-- ROLE_ADMIN, UPDATE/DELETE/ALTER/DROP/TRIGGER on cdc.ddl_events, or schema-wide
+-- cdc privileges.
+SHOW GRANTS FOR 'cdc_stream'@'%';

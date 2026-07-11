@@ -8,7 +8,6 @@ use crate::providers::mariadb::mariadb_provider::replicate_mariadb;
 use crate::providers::mysql::gtid::gtid::Gtid as MySqlGtid;
 use crate::providers::mysql::mysql_provider::replicate_mysql;
 use crate::replica_options::ReplicaOptions;
-use crate::ssl_mode::SslMode;
 use crate::starting_strategy::StartingStrategy;
 
 /// MySql replication client streaming binlog events in real-time.
@@ -21,10 +20,6 @@ pub struct BinlogClient {
 
 impl BinlogClient {
     pub fn new(options: ReplicaOptions) -> Self {
-        if options.ssl_mode != SslMode::Disabled {
-            unimplemented!("Ssl encryption is not supported in this version");
-        }
-
         Self {
             options,
             transaction: false,
@@ -129,5 +124,23 @@ impl BinlogClient {
                 set.add_gtid(gtid.clone()).unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ssl_mode::SslMode;
+
+    #[test]
+    fn client_accepts_verified_tls_configuration() {
+        let options = ReplicaOptions {
+            ssl_mode: SslMode::RequireVerifyFull,
+            ..ReplicaOptions::default()
+        };
+
+        let client = BinlogClient::new(options);
+
+        assert_eq!(client.options.ssl_mode, SslMode::RequireVerifyFull);
     }
 }

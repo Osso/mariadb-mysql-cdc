@@ -1,10 +1,11 @@
+use super::ddl_ledger::{DdlEvent, DdlEventLedger, DdlEventStatus, MySqlDdlEventLedger};
 use super::{
     ApplyBinlogConfig, ApplyBinlogError, QuarantineRecorder, RecordingQuarantine,
     SourceBinlogConfig,
 };
 use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
-    build_inventory,
+    SourceBinlogSettings, build_inventory,
 };
 use crate::probe::BinlogCoordinate;
 use crate::row::{DeleteRowsEvent, RowApplier, RowImage, RowTableMap, RowUpdate, TableMapEvent};
@@ -136,9 +137,9 @@ trait TableSchemaResolver {
 }
 
 // Resolves row-event schemas from the TARGET database. The live source schema
-// can be ahead of the stream position (later DDL), while the target schema is
-// position-consistent because the stream replays DDL statements in binlog
-// order.
+// can be ahead of the stream position (later DDL), while the target schema stays
+// position-consistent because operators apply and resolve each DDL boundary
+// before the stream checkpoints past it.
 struct TargetInventorySchemaResolver {
     reader: MariaDbInventoryReader,
     source_database: Option<String>,
@@ -241,32 +242,29 @@ impl TargetInventorySchemaResolver {
 }
 
 pub(super) fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
-    match &config.checkpoint_file {
-        Some(path) => {
-            let checkpoint_store = crate::checkpoint::FileCheckpointStore::new(path);
-            stream_with_checkpoint_store(config, Some(&checkpoint_store), None)
-        }
-        None => {
-            let checkpoint_store = crate::stream_checkpoint::MySqlStreamCheckpointStore::new(
-                config.target.clone(),
-                config.checkpoint_table.clone(),
-            );
-            checkpoint_store
-                .ensure()
-                .map_err(ApplyBinlogError::Checkpoint)?;
-            stream_with_checkpoint_store(
-                config,
-                Some(&checkpoint_store),
-                Some(config.checkpoint_table.as_str()),
-            )
-        }
-    }
+    verify_source_binlog_contract(config)?;
+    let checkpoint_store = crate::stream_checkpoint::MySqlStreamCheckpointStore::new(
+        config.target.clone(),
+        config.checkpoint_table.clone(),
+        &config.source_identity,
+    );
+    let checkpoint_name = crate::stream_checkpoint::stream_checkpoint_name(&config.source_identity);
+    checkpoint_store
+        .ensure()
+        .map_err(ApplyBinlogError::Checkpoint)?;
+    stream_with_checkpoint_store(
+        config,
+        Some(&checkpoint_store),
+        Some(config.checkpoint_table.as_str()),
+        Some(checkpoint_name.as_str()),
+    )
 }
 
 fn stream_with_checkpoint_store<C>(
     config: &ApplyBinlogConfig,
     checkpoint_store: Option<&C>,
     transaction_checkpoint_table: Option<&str>,
+    transaction_checkpoint_name: Option<&str>,
 ) -> Result<(), ApplyBinlogError>
 where
     C: StreamCheckpointStore,
@@ -279,6 +277,7 @@ where
                 attempt_config,
                 checkpoint_store,
                 transaction_checkpoint_table,
+                transaction_checkpoint_name,
             )
         },
         thread::sleep,
@@ -289,10 +288,16 @@ fn stream_once(
     config: &ApplyBinlogConfig,
     checkpoint_store: Option<&impl StreamCheckpointStore>,
     transaction_checkpoint_table: Option<&str>,
+    transaction_checkpoint_name: Option<&str>,
 ) -> Result<(), ApplyBinlogError> {
     let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    executor
+        .acquire_stream_lease(&format!("cdc-stream:{}", config.target.database))
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
     let mut applier = RowApplier::new(executor);
+    let ddl_ledger = MySqlDdlEventLedger::new(&config.target, config.ddl_ledger_table.clone());
+    ddl_ledger.ensure().map_err(ApplyBinlogError::Statement)?;
     let schema_resolver = TargetInventorySchemaResolver::new(config);
     let mut client = BinlogClient::new(replica_options_from_source(&config.source)?);
     let events = client.replicate().map_err(source_error)?;
@@ -305,6 +310,7 @@ fn stream_once(
     });
     let mut target_transaction = TargetTransaction::default();
     let group_config = TargetTransactionGroupConfig::from_apply_config(config);
+    let source_identity = config.source_identity.clone();
 
     for result in event_receiver.iter() {
         let (header, event) = match result {
@@ -320,11 +326,23 @@ fn stream_once(
             target_transaction: &mut target_transaction,
             checkpoint_store,
             transaction_checkpoint_table,
+            transaction_checkpoint_name,
             current_file: &mut current_file,
             group_config,
         };
-        let outcome =
-            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?;
+        let outcome = match handle_manual_ddl_event(
+            applier.executor(),
+            &ddl_ledger,
+            &source_identity,
+            &mut context,
+            &header,
+            &event,
+        )? {
+            Some(outcome) => outcome,
+            None => {
+                apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?
+            }
+        };
         log_stream_progress(&mut progress, &outcome);
     }
 
@@ -334,6 +352,7 @@ fn stream_once(
         target_transaction: &mut target_transaction,
         checkpoint_store,
         transaction_checkpoint_table,
+        transaction_checkpoint_name,
         current_file: &mut current_file,
         group_config,
     };
@@ -427,23 +446,6 @@ impl TargetTransaction {
         Ok(())
     }
 
-    fn save_checkpoint_if_open<E>(
-        &self,
-        executor: &E,
-        checkpoint_table: &str,
-        checkpoint: &crate::checkpoint::Checkpoint,
-    ) -> Result<(), ApplyBinlogError>
-    where
-        E: TransactionalTargetExecutor,
-    {
-        if !self.open {
-            return Ok(());
-        }
-        executor
-            .save_transaction_checkpoint(checkpoint_table, checkpoint)
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))
-    }
-
     fn rollback_if_open<E>(&mut self, executor: &E) -> Result<(), ApplyBinlogError>
     where
         E: TransactionalTargetExecutor,
@@ -509,8 +511,263 @@ struct StreamEventContext<'a, R, C> {
     target_transaction: &'a mut TargetTransaction,
     checkpoint_store: Option<&'a C>,
     transaction_checkpoint_table: Option<&'a str>,
+    transaction_checkpoint_name: Option<&'a str>,
     current_file: &'a mut String,
     group_config: TargetTransactionGroupConfig,
+}
+
+fn handle_manual_ddl_event<E, R, C, D>(
+    executor: &E,
+    ledger: &D,
+    source_identity: &str,
+    context: &mut StreamEventContext<'_, R, C>,
+    header: &EventHeader,
+    event: &BinlogEvent,
+) -> Result<Option<StructuredEventOutcome>, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    R: TableSchemaResolver,
+    C: StreamCheckpointStore,
+    D: DdlEventLedger,
+{
+    let Some((query, ddl_event)) = manual_ddl_event(
+        source_identity,
+        context.current_file,
+        header,
+        event,
+        context.state,
+    ) else {
+        return Ok(None);
+    };
+
+    flush_grouped_transaction(executor, context)?;
+    let status = ledger
+        .read_status(&ddl_event)
+        .map_err(ApplyBinlogError::Statement)?;
+    handle_ddl_status(executor, ledger, context, event, query, ddl_event, status)
+}
+
+fn manual_ddl_event<'a>(
+    source_identity: &str,
+    current_file: &str,
+    header: &EventHeader,
+    event: &'a BinlogEvent,
+    state: &StructuredEventState,
+) -> Option<(&'a mysql_cdc::events::query_event::QueryEvent, DdlEvent)> {
+    let BinlogEvent::QueryEvent(query) = event else {
+        return None;
+    };
+    if !crate::statement::is_schema_changing_statement(&query.sql_statement) {
+        return None;
+    }
+    let may_target_source_schema = state.should_apply_schema(&query.database_name)
+        || query.database_name.is_empty()
+        || query_references_source_schema(state, &query.sql_statement);
+    if !may_target_source_schema {
+        return None;
+    }
+    Some((
+        query,
+        ddl_event(source_identity, current_file, header, query),
+    ))
+}
+
+fn handle_ddl_status<E, R, C, D>(
+    executor: &E,
+    ledger: &D,
+    context: &mut StreamEventContext<'_, R, C>,
+    event: &BinlogEvent,
+    query: &mysql_cdc::events::query_event::QueryEvent,
+    ddl_event: DdlEvent,
+    status: Option<DdlEventStatus>,
+) -> Result<Option<StructuredEventOutcome>, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    R: TableSchemaResolver,
+    C: StreamCheckpointStore,
+    D: DdlEventLedger,
+{
+    match status {
+        None => {
+            ledger
+                .record_pending(&ddl_event)
+                .map_err(ApplyBinlogError::Statement)?;
+            Err(pending_ddl_error(&ddl_event))
+        }
+        Some(DdlEventStatus::Pending { raw_sql }) => {
+            require_matching_ddl(&ddl_event, &raw_sql)?;
+            Err(pending_ddl_error(&ddl_event))
+        }
+        Some(DdlEventStatus::Resolved { raw_sql }) => {
+            require_matching_ddl(&ddl_event, &raw_sql)?;
+            checkpoint_resolved_ddl(executor, context, event, &ddl_event)?;
+            context
+                .schema_resolver
+                .invalidate_schema(&query.database_name);
+            context.state.clear_query_context();
+            Ok(Some(resolved_ddl_outcome(ddl_event)))
+        }
+    }
+}
+
+fn resolved_ddl_outcome(event: DdlEvent) -> StructuredEventOutcome {
+    StructuredEventOutcome {
+        policy: EventPolicy::CommitTransaction,
+        resume_coordinate: Some(BinlogCoordinate {
+            file: event.binlog_file,
+            position: event.event_end_position,
+        }),
+    }
+}
+
+fn ddl_event(
+    source_identity: &str,
+    current_file: &str,
+    header: &EventHeader,
+    query: &mysql_cdc::events::query_event::QueryEvent,
+) -> DdlEvent {
+    let event_end_position = u64::from(header.next_event_position);
+    let event_start_position = event_end_position.saturating_sub(u64::from(header.event_length));
+    DdlEvent {
+        source_identity: format!("{source_identity}#server-id={}", header.server_id),
+        source_server_id: header.server_id,
+        binlog_file: current_file.to_string(),
+        event_start_position,
+        event_end_position,
+        schema_name: query.database_name.clone(),
+        raw_sql: query.sql_statement.clone(),
+    }
+}
+
+fn require_matching_ddl(event: &DdlEvent, saved_sql: &str) -> Result<(), ApplyBinlogError> {
+    if saved_sql == event.raw_sql {
+        return Ok(());
+    }
+    Err(ApplyBinlogError::Statement(format!(
+        "DDL ledger SQL mismatch at {}:{} for source_server_id={}",
+        event.binlog_file, event.event_start_position, event.source_server_id
+    )))
+}
+
+fn pending_ddl_error(event: &DdlEvent) -> ApplyBinlogError {
+    ApplyBinlogError::Statement(format!(
+        "manual DDL resolution required source_server_id={} file={} start_position={} end_position={} schema={} sql={}",
+        event.source_server_id,
+        event.binlog_file,
+        event.event_start_position,
+        event.event_end_position,
+        event.schema_name,
+        event.raw_sql.replace(char::is_whitespace, " ")
+    ))
+}
+
+fn checkpoint_resolved_ddl<E, R, C>(
+    executor: &E,
+    context: &mut StreamEventContext<'_, R, C>,
+    event: &BinlogEvent,
+    ddl_event: &DdlEvent,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    C: StreamCheckpointStore,
+{
+    let coordinate = BinlogCoordinate {
+        file: ddl_event.binlog_file.clone(),
+        position: ddl_event.event_end_position,
+    };
+    ensure_resolved_ddl_checkpoint_advances(context.checkpoint_store, &coordinate)?;
+    let checkpoint = super::reconnect::coordinate_checkpoint(&coordinate, event_name(event));
+    if let (Some(table), Some(name)) = (
+        context.transaction_checkpoint_table,
+        context.transaction_checkpoint_name,
+    ) {
+        save_resolved_ddl_transaction_checkpoint(executor, table, name, &checkpoint)?;
+    } else if let Some(store) = context.checkpoint_store {
+        store.save_checkpoint(&checkpoint)?;
+    }
+    *context.current_file = coordinate.file;
+    Ok(())
+}
+
+fn ensure_resolved_ddl_checkpoint_advances(
+    checkpoint_store: Option<&impl StreamCheckpointStore>,
+    next: &BinlogCoordinate,
+) -> Result<(), ApplyBinlogError> {
+    let Some(store) = checkpoint_store else {
+        return Ok(());
+    };
+    let current = store.load_checkpoint()?;
+    ensure_coordinate_advances(current.as_ref(), next)
+}
+
+fn ensure_coordinate_advances(
+    current: Option<&crate::checkpoint::Checkpoint>,
+    next: &BinlogCoordinate,
+) -> Result<(), ApplyBinlogError> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let current_coordinate = BinlogCoordinate {
+        file: current.source_file.clone(),
+        position: current.source_position,
+    };
+    if binlog_coordinate_is_before(next, &current_coordinate) {
+        return Err(ApplyBinlogError::Checkpoint(format!(
+            "refusing checkpoint regression from {}:{} to {}:{}",
+            current_coordinate.file, current_coordinate.position, next.file, next.position
+        )));
+    }
+    Ok(())
+}
+
+fn binlog_coordinate_is_before(left: &BinlogCoordinate, right: &BinlogCoordinate) -> bool {
+    left.file < right.file || (left.file == right.file && left.position < right.position)
+}
+
+fn save_resolved_ddl_transaction_checkpoint(
+    executor: &impl TransactionalTargetExecutor,
+    table: &str,
+    checkpoint_name: &str,
+    checkpoint: &crate::checkpoint::Checkpoint,
+) -> Result<(), ApplyBinlogError> {
+    executor
+        .begin_transaction()
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    let save_result =
+        lock_validate_and_save_checkpoint(executor, table, checkpoint_name, checkpoint);
+    if let Err(error) = save_result {
+        executor
+            .rollback_transaction()
+            .map_err(|rollback_error| ApplyBinlogError::Target(rollback_error.to_string()))?;
+        return Err(error);
+    }
+    executor
+        .commit_transaction()
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))
+}
+
+fn lock_validate_and_save_checkpoint(
+    executor: &impl TransactionalTargetExecutor,
+    table: &str,
+    checkpoint_name: &str,
+    checkpoint: &crate::checkpoint::Checkpoint,
+) -> Result<(), ApplyBinlogError> {
+    let current = executor
+        .load_transaction_checkpoint_for_update(table, checkpoint_name)
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?
+        .ok_or_else(|| {
+            ApplyBinlogError::Checkpoint(format!(
+                "required source-scoped checkpoint `{checkpoint_name}` disappeared during target transaction"
+            ))
+        })?;
+    let next = BinlogCoordinate {
+        file: checkpoint.source_file.clone(),
+        position: checkpoint.source_position,
+    };
+    ensure_coordinate_advances(Some(&current), &next)?;
+    executor
+        .save_transaction_checkpoint(table, checkpoint_name, checkpoint)
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))
 }
 
 fn apply_stream_event_transactionally<E, R, C>(
@@ -643,25 +900,16 @@ fn event_can_write_target(event: &BinlogEvent, state: &StructuredEventState) -> 
         BinlogEvent::WriteRowsEvent(rows) => !state.is_ignored_table_id(rows.table_id),
         BinlogEvent::UpdateRowsEvent(rows) => !state.is_ignored_table_id(rows.table_id),
         BinlogEvent::DeleteRowsEvent(rows) => !state.is_ignored_table_id(rows.table_id),
-        BinlogEvent::QueryEvent(query) => state.should_apply_schema(&query.database_name),
+        BinlogEvent::QueryEvent(query) => {
+            state.should_apply_schema(&query.database_name)
+                && !crate::statement::is_data_changing_statement(&query.sql_statement)
+        }
         _ => false,
     }
 }
 
 fn stream_ended_error() -> ApplyBinlogError {
     ApplyBinlogError::SourceCommand("mysql_cdc binlog stream ended at EOF".to_string())
-}
-
-fn format_statement_already_applied(coordinate: &BinlogCoordinate, sql: &str) -> String {
-    format!(
-        "cdc_stream_statement_already_applied level=warn file={} position={} sql={}",
-        coordinate.file,
-        coordinate.position,
-        sql.replace(char::is_whitespace, "_")
-            .chars()
-            .take(160)
-            .collect::<String>()
-    )
 }
 
 fn log_stream_progress(progress: &mut StreamProgress, outcome: &StructuredEventOutcome) {
@@ -688,12 +936,16 @@ where
     };
 
     if context.target_transaction.is_open()
-        && let Some(checkpoint_table) = context.transaction_checkpoint_table
+        && let (Some(checkpoint_table), Some(checkpoint_name)) = (
+            context.transaction_checkpoint_table,
+            context.transaction_checkpoint_name,
+        )
     {
         let checkpoint = super::reconnect::coordinate_checkpoint(coordinate, event_name(event));
-        context.target_transaction.save_checkpoint_if_open(
+        lock_validate_and_save_checkpoint(
             executor,
             checkpoint_table,
+            checkpoint_name,
             &checkpoint,
         )?;
         *context.current_file = coordinate.file.clone();
@@ -785,7 +1037,22 @@ fn apply_query_event<E>(
 where
     E: TargetExecutor,
 {
+    let statement_dml = crate::statement::is_data_changing_statement(&query.sql_statement);
+    let may_target_source_schema = state.should_apply_schema(&query.database_name)
+        || query.database_name.is_empty()
+        || query_references_source_schema(state, &query.sql_statement);
+    if statement_dml && may_target_source_schema {
+        state.clear_query_context();
+        return Err(mapping_error(format!(
+            "ROW/FULL contract violation: source emitted statement DML QueryEvent: {}",
+            query.sql_statement.chars().take(120).collect::<String>()
+        )));
+    }
     if !state.should_apply_schema(&query.database_name) {
+        state.clear_query_context();
+        return Ok(EventPolicy::Ignore);
+    }
+    if is_transaction_control_query(&query.sql_statement) {
         state.clear_query_context();
         return Ok(EventPolicy::Ignore);
     }
@@ -804,13 +1071,6 @@ where
 
     let result = match statement_applier.apply(&event) {
         Ok(StatementOutcome::Replayed) => Ok(EventPolicy::CommitTransaction),
-        Ok(StatementOutcome::AlreadyApplied) => {
-            println!(
-                "{}",
-                format_statement_already_applied(coordinate, &query.sql_statement)
-            );
-            Ok(EventPolicy::CommitTransaction)
-        }
         Ok(StatementOutcome::Skipped) => Ok(EventPolicy::CommitTransaction),
         Ok(StatementOutcome::Quarantined(_)) => Err(ApplyBinlogError::Quarantined(
             statement_applier
@@ -873,8 +1133,104 @@ fn reject_ambiguous_query_database(sql: &str) -> Result<(), ApplyBinlogError> {
     Ok(())
 }
 
+fn query_references_source_schema(state: &StructuredEventState, sql: &str) -> bool {
+    state
+        .source_database
+        .as_deref()
+        .is_some_and(|schema| query_references_schema(sql, schema))
+}
+
+fn query_references_schema(sql: &str, schema: &str) -> bool {
+    let characters = sql.chars().collect::<Vec<_>>();
+    dots_outside_string_literals(&characters)
+        .into_iter()
+        .any(|index| {
+            identifier_before_dot(&characters, index)
+                .is_some_and(|identifier| identifier.eq_ignore_ascii_case(schema))
+        })
+}
+
 fn query_contains_qualified_identifier(sql: &str) -> bool {
-    sql.contains("`.`")
+    let characters = sql.chars().collect::<Vec<_>>();
+    dots_outside_string_literals(&characters)
+        .into_iter()
+        .any(|index| qualified_identifier_at(&characters, index))
+}
+
+fn dots_outside_string_literals(characters: &[char]) -> Vec<usize> {
+    let mut dots = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in characters.iter().copied().enumerate() {
+        if let Some(quote_character) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == quote_character {
+                quote = None;
+            }
+            continue;
+        }
+        if character == '\'' || character == '"' {
+            quote = Some(character);
+        } else if character == '.' {
+            dots.push(index);
+        }
+    }
+    dots
+}
+
+fn identifier_before_dot(characters: &[char], dot_index: usize) -> Option<String> {
+    let end = characters[..dot_index]
+        .iter()
+        .rposition(|character| !character.is_whitespace())?;
+    if characters[end] == '`' {
+        let start = characters[..end]
+            .iter()
+            .rposition(|character| *character == '`')?;
+        return Some(characters[start + 1..end].iter().collect());
+    }
+    let start = characters[..=end]
+        .iter()
+        .rposition(|character| !is_unquoted_identifier_character(*character))
+        .map_or(0, |index| index + 1);
+    (start <= end).then(|| characters[start..=end].iter().collect())
+}
+
+fn qualified_identifier_at(characters: &[char], dot_index: usize) -> bool {
+    let left = characters[..dot_index]
+        .iter()
+        .rev()
+        .copied()
+        .find(|candidate| !candidate.is_whitespace());
+    let right = characters[dot_index + 1..]
+        .iter()
+        .copied()
+        .find(|candidate| !candidate.is_whitespace());
+    let (Some(left), Some(right)) = (left, right) else {
+        return false;
+    };
+    let both_decimal_digits = left.is_ascii_digit() && right.is_ascii_digit();
+    !both_decimal_digits && is_identifier_edge(left) && is_identifier_edge(right)
+}
+
+fn is_unquoted_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+}
+
+fn is_identifier_edge(character: char) -> bool {
+    is_unquoted_identifier_character(character) || character == '`'
+}
+
+fn is_transaction_control_query(sql: &str) -> bool {
+    matches!(
+        sql.trim()
+            .trim_end_matches(';')
+            .to_ascii_uppercase()
+            .as_str(),
+        "BEGIN" | "COMMIT" | "ROLLBACK"
+    )
 }
 
 fn apply_table_map_event<E, R>(
@@ -989,7 +1345,8 @@ pub(crate) fn replica_options_from_source(
     Ok(ReplicaOptions {
         port: source.port,
         hostname: source.host.clone(),
-        ssl_mode: SslMode::Disabled,
+        ssl_mode: SslMode::RequireVerifyCa,
+        ssl_ca_file: Some(source.tls_ca_file.clone()),
         username: source.user.clone(),
         password: source.password.clone(),
         database: source.database.clone(),
@@ -1410,6 +1767,41 @@ fn resume_coordinate(
             })
         }
         _ => None,
+    }
+}
+
+fn verify_source_binlog_contract(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
+    let reader = MariaDbInventoryReader::new(source_inventory_config(config));
+    let settings = reader
+        .read_source_binlog_settings()
+        .map_err(|error| ApplyBinlogError::SourceCommand(error.to_string()))?;
+    validate_source_binlog_settings(&settings)
+}
+
+fn validate_source_binlog_settings(
+    settings: &SourceBinlogSettings,
+) -> Result<(), ApplyBinlogError> {
+    if settings.format.eq_ignore_ascii_case("ROW")
+        && settings.row_image.eq_ignore_ascii_case("FULL")
+    {
+        return Ok(());
+    }
+    Err(ApplyBinlogError::Config(format!(
+        "stream-binlog requires source binlog_format=ROW and binlog_row_image=FULL; found format={} row_image={}",
+        settings.format, settings.row_image
+    )))
+}
+
+fn source_inventory_config(config: &ApplyBinlogConfig) -> InventoryConfig {
+    InventoryConfig {
+        host: config.source.host.clone(),
+        port: config.source.port,
+        user: config.source.user.clone(),
+        password: config.source.password.clone(),
+        endpoint_role: InventoryEndpointRole::Source,
+        use_tls: true,
+        tls_ca_file: Some(config.source.tls_ca_file.clone()),
+        ..InventoryConfig::default()
     }
 }
 

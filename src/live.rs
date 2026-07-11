@@ -7,9 +7,9 @@ use crate::stream_checkpoint::default_stream_checkpoint_table;
 use crate::target::TargetExecutor;
 use std::cell::RefCell;
 use std::fmt;
-use std::path::PathBuf;
 
 mod binlog_command;
+mod ddl_ledger;
 mod insert_conflict;
 mod mysql_cli;
 mod progress;
@@ -33,12 +33,9 @@ pub(crate) use mysql_cli::{strip_insert_column_for_retry, target_session_init_co
 #[cfg(test)]
 use progress::{StreamProgress, format_stream_progress, format_stream_quarantine};
 #[cfg(test)]
-use reconnect::{
-    SourceCoordinateReader, is_stale_or_missing_binlog_error, resume_from_checkpoint,
-    run_stream_reconnect_loop_with_coordinate_reader, should_reconnect,
-};
-#[cfg(test)]
 use reconnect::{StreamCheckpointStore, run_stream_reconnect_loop, save_stream_checkpoint};
+#[cfg(test)]
+use reconnect::{is_stale_or_missing_binlog_error, resume_from_checkpoint, should_reconnect};
 #[cfg(test)]
 use repair::{FailedStatementRepairer, repair_failed_statement};
 pub(crate) use schema_recovery::mysql_compatible_create_table;
@@ -47,9 +44,10 @@ use schema_recovery::mysql_executor_with_recovery;
 #[derive(Clone, Debug)]
 pub struct ApplyBinlogConfig {
     pub source: SourceBinlogConfig,
+    pub source_identity: String,
     pub target: TargetMySqlConfig,
-    pub checkpoint_file: Option<PathBuf>,
     pub checkpoint_table: String,
+    pub ddl_ledger_table: String,
     pub max_reconnects: u32,
     pub reconnect_forever: bool,
     pub target_transaction_group_size: usize,
@@ -60,9 +58,10 @@ impl Default for ApplyBinlogConfig {
     fn default() -> Self {
         Self {
             source: SourceBinlogConfig::default(),
+            source_identity: String::new(),
             target: TargetMySqlConfig::default(),
-            checkpoint_file: None,
             checkpoint_table: default_stream_checkpoint_table(),
+            ddl_ledger_table: "cdc.ddl_events".to_string(),
             max_reconnects: 12,
             reconnect_forever: false,
             target_transaction_group_size: 1,
@@ -76,14 +75,38 @@ impl ApplyBinlogConfig {
         if self.source.host.is_empty() {
             return Err(config_error("source host is required"));
         }
+        if self.source_identity.is_empty() {
+            return Err(config_error("source identity is required"));
+        }
+        if self.source_identity.len() > 363 {
+            return Err(config_error(
+                "source identity must be at most 363 bytes before the server-id suffix",
+            ));
+        }
         if self.source.user.is_empty() {
             return Err(config_error("source user is required"));
         }
         if self.source.password.is_empty() {
             return Err(config_error("source password is required"));
         }
-        if self.checkpoint_file.is_none() && self.checkpoint_table.is_empty() {
-            self.source.validate_start_coordinate()?;
+        if self.source.tls_ca_file.is_empty() {
+            return Err(config_error("source TLS CA file is required"));
+        }
+        if self.checkpoint_table.is_empty() {
+            return Err(config_error("checkpoint table is required"));
+        }
+        if !is_schema_qualified_table(&self.checkpoint_table) {
+            return Err(config_error(
+                "checkpoint table must be a schema-qualified schema.table path",
+            ));
+        }
+        if self.ddl_ledger_table.is_empty() {
+            return Err(config_error("DDL ledger table is required"));
+        }
+        if !is_schema_qualified_table(&self.ddl_ledger_table) {
+            return Err(config_error(
+                "DDL ledger table must be a schema-qualified schema.table path",
+            ));
         }
         self.source.validate_stop_never_slave_server_id()?;
         if self.target_transaction_group_size == 0 {
@@ -102,6 +125,7 @@ pub struct SourceBinlogConfig {
     pub user: String,
     pub password: String,
     pub database: Option<String>,
+    pub tls_ca_file: String,
     pub binlog_file: String,
     pub start_position: u64,
     pub stop_position: Option<u64>,
@@ -116,6 +140,7 @@ impl Default for SourceBinlogConfig {
             user: String::new(),
             password: String::new(),
             database: None,
+            tls_ca_file: "/etc/mariadb-mysql-cdc/source-ca.pem".to_string(),
             binlog_file: String::new(),
             start_position: 4,
             stop_position: None,
@@ -271,9 +296,9 @@ where
 
     for event in &events {
         match applier.apply(event) {
-            Ok(StatementOutcome::Replayed)
-            | Ok(StatementOutcome::AlreadyApplied)
-            | Ok(StatementOutcome::Skipped) => applied_statements += 1,
+            Ok(StatementOutcome::Replayed) | Ok(StatementOutcome::Skipped) => {
+                applied_statements += 1
+            }
             Ok(StatementOutcome::Quarantined(_)) => quarantined_statements += 1,
             Err(error) => return Err(ApplyBinlogError::Statement(error.to_string())),
         }
@@ -339,9 +364,7 @@ where
     R: FailedStatementRepairer,
 {
     match applier.apply(event) {
-        Ok(StatementOutcome::Replayed)
-        | Ok(StatementOutcome::AlreadyApplied)
-        | Ok(StatementOutcome::Skipped) => {
+        Ok(StatementOutcome::Replayed) | Ok(StatementOutcome::Skipped) => {
             save_stream_checkpoint(checkpoint_store, event)?;
             if progress.record_applied(&event.resume_coordinate()) {
                 println!("{}", format_stream_progress(progress));
@@ -551,6 +574,13 @@ fn cleanup_binlog_sql_line(line: &str) -> String {
         .trim_end_matches(';')
         .trim()
         .to_string()
+}
+
+fn is_schema_qualified_table(table: &str) -> bool {
+    let Some((schema, table_name)) = table.split_once('.') else {
+        return false;
+    };
+    !schema.is_empty() && !table_name.is_empty() && !table_name.contains('.')
 }
 
 fn config_error(message: &str) -> ApplyBinlogError {

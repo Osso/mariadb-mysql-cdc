@@ -190,17 +190,60 @@ impl TargetExecutor for PersistentTargetExecutor {
 }
 
 impl TransactionalTargetExecutor for PersistentTargetExecutor {
+    fn acquire_stream_lease(&self, lease_name: &str) -> Result<(), TargetExecuteError> {
+        let sql = build_stream_lease_sql(lease_name);
+        let acquired = self
+            .conn
+            .borrow_mut()
+            .query_first::<u8, _>(sql)
+            .map_err(target_query_error)?
+            .unwrap_or(0);
+        if acquired == 1 {
+            return Ok(());
+        }
+        Err(TargetExecuteError::new(format!(
+            "stream lease `{lease_name}` is already held"
+        )))
+    }
+
     fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
         self.execute_transaction_control("BEGIN")
+    }
+
+    fn load_transaction_checkpoint_for_update(
+        &self,
+        checkpoint_table: &str,
+        checkpoint_name: &str,
+    ) -> Result<Option<Checkpoint>, TargetExecuteError> {
+        let sql = crate::stream_checkpoint::build_checkpoint_select_for_update_sql(
+            checkpoint_table,
+            checkpoint_name,
+        );
+        let checkpoint_json = self
+            .conn
+            .borrow_mut()
+            .query_first::<String, _>(sql)
+            .map_err(target_query_error)?;
+        checkpoint_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    TargetExecuteError::new(format!(
+                        "invalid locked stream checkpoint JSON: {error}"
+                    ))
+                })
+            })
+            .transpose()
     }
 
     fn save_transaction_checkpoint(
         &self,
         checkpoint_table: &str,
+        checkpoint_name: &str,
         checkpoint: &Checkpoint,
     ) -> Result<(), TargetExecuteError> {
         let sql = crate::stream_checkpoint::build_checkpoint_upsert_sql_for_checkpoint(
             checkpoint_table,
+            checkpoint_name,
             checkpoint,
         )
         .map_err(TargetExecuteError::new)?;
@@ -412,15 +455,9 @@ fn base_opts(
         .db_name(Some(database))
         .prefer_socket(false);
     if use_tls {
-        builder = builder.ssl_opts(insecure_ssl_opts());
+        builder = builder.ssl_opts(SslOpts::default());
     }
     Opts::from(builder)
-}
-
-fn insecure_ssl_opts() -> SslOpts {
-    SslOpts::default()
-        .with_danger_skip_domain_validation(true)
-        .with_danger_accept_invalid_certs(true)
 }
 
 fn open_conn(opts: Opts) -> mysql::Result<Conn> {
@@ -585,6 +622,13 @@ fn snapshot_query_error(error: mysql::Error) -> SnapshotError {
     SnapshotError::InvalidTable(format!("source mysql query failed: {error}"))
 }
 
+fn build_stream_lease_sql(lease_name: &str) -> String {
+    format!(
+        "SELECT GET_LOCK(SHA2({},256),0)",
+        quote_sql_literal(lease_name)
+    )
+}
+
 fn target_connect_error(error: mysql::Error) -> TargetExecuteError {
     TargetExecuteError::new(format!("failed to connect to target mysql: {error}"))
 }
@@ -620,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn target_opts_use_insecure_tls_for_do_mysql() {
+    fn target_opts_require_authenticated_tls() {
         let target = TargetMySqlConfig {
             host: "target".to_string(),
             port: 25060,
@@ -640,6 +684,14 @@ mod tests {
         );
 
         assert!(opts.get_ssl_opts().is_some());
+    }
+
+    #[test]
+    fn stream_lease_uses_nonblocking_hashed_mysql_lock() {
+        assert_eq!(
+            build_stream_lease_sql("cdc-stream:globalcomix"),
+            "SELECT GET_LOCK(SHA2('cdc-stream:globalcomix',256),0)"
+        );
     }
 
     #[test]

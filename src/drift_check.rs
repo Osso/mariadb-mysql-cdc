@@ -874,11 +874,7 @@ fn connection_opts(config: &QueryConnectionConfig) -> Opts {
         .pass(Some(&config.password))
         .db_name(Some(&config.database))
         .prefer_socket(false)
-        .ssl_opts(
-            SslOpts::default()
-                .with_danger_skip_domain_validation(true)
-                .with_danger_accept_invalid_certs(true),
-        );
+        .ssl_opts(SslOpts::default());
     Opts::from(builder)
 }
 

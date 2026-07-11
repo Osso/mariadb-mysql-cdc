@@ -46,7 +46,7 @@ impl BinlogClient {
                 let ssl_command = SslRequestCommand::new(UTF8_MB4_GENERAL_CI);
                 channel.write_packet(&ssl_command.serialize()?, seq_num)?;
                 seq_num += 1;
-                channel.upgrade_to_ssl();
+                channel.upgrade_to_ssl()?;
                 use_ssl = true;
             }
         }

@@ -47,10 +47,19 @@ pub trait TargetExecutor {
 }
 
 pub trait TransactionalTargetExecutor: TargetExecutor {
+    fn acquire_stream_lease(&self, _lease_name: &str) -> Result<(), TargetExecuteError> {
+        Ok(())
+    }
     fn begin_transaction(&self) -> Result<(), TargetExecuteError>;
+    fn load_transaction_checkpoint_for_update(
+        &self,
+        checkpoint_table: &str,
+        checkpoint_name: &str,
+    ) -> Result<Option<Checkpoint>, TargetExecuteError>;
     fn save_transaction_checkpoint(
         &self,
         checkpoint_table: &str,
+        checkpoint_name: &str,
         checkpoint: &Checkpoint,
     ) -> Result<(), TargetExecuteError>;
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
@@ -61,16 +70,29 @@ impl<E> TransactionalTargetExecutor for &E
 where
     E: TransactionalTargetExecutor,
 {
+    fn acquire_stream_lease(&self, lease_name: &str) -> Result<(), TargetExecuteError> {
+        (*self).acquire_stream_lease(lease_name)
+    }
+
     fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
         (*self).begin_transaction()
+    }
+
+    fn load_transaction_checkpoint_for_update(
+        &self,
+        checkpoint_table: &str,
+        checkpoint_name: &str,
+    ) -> Result<Option<Checkpoint>, TargetExecuteError> {
+        (*self).load_transaction_checkpoint_for_update(checkpoint_table, checkpoint_name)
     }
 
     fn save_transaction_checkpoint(
         &self,
         checkpoint_table: &str,
+        checkpoint_name: &str,
         checkpoint: &Checkpoint,
     ) -> Result<(), TargetExecuteError> {
-        (*self).save_transaction_checkpoint(checkpoint_table, checkpoint)
+        (*self).save_transaction_checkpoint(checkpoint_table, checkpoint_name, checkpoint)
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {

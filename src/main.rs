@@ -53,7 +53,7 @@ Commands:
   apply-binlog
           Read remote MariaDB binlog text and apply compatible statements.
   stream-binlog
-          Continuously stream remote MariaDB binlog text and apply compatible statements.
+          Stream native MariaDB ROW/FULL binlog events with transactional target checkpoints and manual DDL boundaries.
 
 Probe options:
   --host HOST                 MariaDB source host.
@@ -69,6 +69,7 @@ Apply options:
   --source-user USER              MariaDB replication user.
   --source-password-env ENV       Environment variable containing source password.
   --source-database DB            Limit source binlog statements to this database.
+  --source-identity ID            Required immutable source-incarnation ID; change after source rebuild/reset.
   --binlog-file FILE              Source binlog file.
   --start-position POSITION       Source binlog start position.
   --stop-position POSITION        Stop reading at source binlog position.
@@ -77,6 +78,7 @@ Apply options:
   --target-user USER              MySQL target user.
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
+  --ddl-ledger-table TABLE         Manual DDL resolution ledger. Defaults to cdc.ddl_events.
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
   --reconnect-forever BOOL        Ignore reconnect cap for transient source loss. Defaults to false.
@@ -242,7 +244,7 @@ fn print_plan() {
 Goal: migrate MariaDB to MySQL-compatible targets with minimal downtime.
 
 Constraints:
-- Keep production MariaDB binlog_format=MIXED.
+- Require and preflight MariaDB binlog_format=ROW with binlog_row_image=FULL for production streaming.
 - Do not require DigitalOcean Managed MySQL to serve traffic before rehearsals pass.
 - Treat incompatible SQL as migration bugs to capture and fix before cutover.
 
@@ -461,8 +463,9 @@ fn apply_binlog_option(
     }
 
     match flag {
-        "--checkpoint-file" => config.checkpoint_file = Some(PathBuf::from(value)),
+        "--source-identity" => config.source_identity = value.to_string(),
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
+        "--ddl-ledger-table" => config.ddl_ledger_table = value.to_string(),
         "--max-reconnects" => config.max_reconnects = parse_u32(flag, value)?,
         "--reconnect-forever" => config.reconnect_forever = parse_bool(flag, value)?,
         "--target-transaction-group-size" => {
@@ -491,6 +494,7 @@ fn apply_source_option(
         "--source-user" => source.user = value.to_string(),
         "--source-password-env" => source.password = read_env_password(value)?,
         "--source-database" => source.database = Some(value.to_string()),
+        "--source-tls-ca-file" => source.tls_ca_file = value.to_string(),
         "--binlog-file" => source.binlog_file = value.to_string(),
         "--start-position" => source.start_position = parse_u64(flag, value)?,
         "--stop-position" => source.stop_position = Some(parse_u64(flag, value)?),

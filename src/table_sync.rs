@@ -706,13 +706,15 @@ fn run_recent_update_sync(
     sync_recent_updates_with_progress(
         &config.run_id,
         &build_sync_run_scope(config)?,
-        &config.table,
-        config.chunk_size,
-        config.mode,
-        source,
-        repair_target,
-        progress_store,
-        updated_since,
+        RecentUpdateSyncContext {
+            table: &config.table,
+            chunk_size: config.chunk_size,
+            mode: config.mode,
+            source,
+            repair_target,
+            progress_store,
+            updated_since,
+        },
     )
 }
 
@@ -741,40 +743,28 @@ fn run_range_sync(
     )
 }
 
-fn sync_recent_updates_with_progress(
+fn sync_recent_updates_with_progress<S, R, P>(
     run_id: &str,
     run_scope: &str,
-    table: &SyncTable,
-    chunk_size: usize,
-    mode: SyncMode,
-    source: &impl SyncTableReader,
-    repair_target: &mut impl SyncRepairTarget,
-    progress_store: &mut impl SyncProgressStore,
-    updated_since: UpdatedSince,
-) -> Result<SyncTableReport, TableSyncError> {
+    mut context: RecentUpdateSyncContext<'_, S, R, P>,
+) -> Result<SyncTableReport, TableSyncError>
+where
+    S: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
     let progress = load_recent_update_progress(
         run_id,
         run_scope,
-        table,
-        chunk_size,
-        mode,
-        &updated_since,
-        progress_store,
+        context.table,
+        context.chunk_size,
+        context.mode,
+        &context.updated_since,
+        context.progress_store,
     )?;
-    let result = sync_recent_update_chunks(
-        RecentUpdateSyncContext {
-            table,
-            chunk_size,
-            mode,
-            source,
-            repair_target,
-            progress_store,
-            updated_since,
-        },
-        progress,
-    );
-    let result = persist_sync_run_error(run_id, result, progress_store);
-    finish_sync_run(run_id, result, progress_store)
+    let result = sync_recent_update_chunks(&mut context, progress);
+    let result = persist_sync_run_error(run_id, result, context.progress_store);
+    finish_sync_run(run_id, result, context.progress_store)
 }
 
 fn load_recent_update_progress(
@@ -853,7 +843,7 @@ where
 }
 
 fn sync_recent_update_chunks<S, R, P>(
-    context: RecentUpdateSyncContext<'_, S, R, P>,
+    context: &mut RecentUpdateSyncContext<'_, S, R, P>,
     mut progress: SyncTableProgress,
 ) -> Result<SyncTableReport, TableSyncError>
 where
@@ -1340,13 +1330,15 @@ mod tests {
         let report = sync_recent_updates_with_progress(
             "recent-01",
             "test-scope",
-            &table,
-            10,
-            SyncMode::Apply,
-            &source,
-            &mut repair_target,
-            &mut progress_store,
-            updated_since,
+            RecentUpdateSyncContext {
+                table: &table,
+                chunk_size: 10,
+                mode: SyncMode::Apply,
+                source: &source,
+                repair_target: &mut repair_target,
+                progress_store: &mut progress_store,
+                updated_since,
+            },
         )
         .expect("resumed recent update run");
 

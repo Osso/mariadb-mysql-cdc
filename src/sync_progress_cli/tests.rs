@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
-fn parses_progress_config_with_checkpoint_and_source_counts() {
+fn parses_progress_config_with_source_scoped_checkpoint_and_counts() {
     let _guard = env_lock();
     disable_file_config();
     set_env("SYNC_PROGRESS_TARGET_PASSWORD", "target-pass");
@@ -34,8 +34,8 @@ fn parses_progress_config_with_checkpoint_and_source_counts() {
         "SYNC_PROGRESS_SOURCE_PASSWORD",
         "--source-database",
         "globalcomix",
-        "--checkpoint-file",
-        "/var/lib/cdc/stream-checkpoint.json",
+        "--source-identity",
+        "production-source",
         "--run-id",
         "repair-20260710-01",
     ]))
@@ -49,8 +49,8 @@ fn parses_progress_config_with_checkpoint_and_source_counts() {
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
     assert_eq!(config.run_id.as_deref(), Some("repair-20260710-01"));
     assert_eq!(
-        config.checkpoint_file,
-        Some(PathBuf::from("/var/lib/cdc/stream-checkpoint.json"))
+        config.source_identity.as_deref(),
+        Some("production-source")
     );
 }
 
@@ -69,13 +69,39 @@ fn parses_progress_config_without_source_or_checkpoint_file() {
         "SYNC_PROGRESS_TARGET_PASSWORD_ONLY",
         "--target-database",
         "globalcomix",
+        "--source-identity",
+        "production-source",
     ]))
     .expect("progress config");
 
     assert_eq!(config.progress_table, "cdc.table_sync_progress");
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
-    assert_eq!(config.checkpoint_file, None);
+    assert_eq!(
+        config.source_identity.as_deref(),
+        Some("production-source")
+    );
     assert_eq!(config.source.host, "");
+}
+
+#[test]
+fn cache_key_changes_with_source_and_target_identity() {
+    let mut left = default_sync_progress_config();
+    left.target.host = "target-a".to_string();
+    left.target.database = "globalcomix".to_string();
+    left.source_identity = Some("source-a".to_string());
+    let mut right = left.clone();
+    right.source_identity = Some("source-b".to_string());
+    assert_ne!(
+        sync_progress_cache_key(&left),
+        sync_progress_cache_key(&right)
+    );
+
+    right = left.clone();
+    right.target.host = "target-b".to_string();
+    assert_ne!(
+        sync_progress_cache_key(&left),
+        sync_progress_cache_key(&right)
+    );
 }
 
 #[test]

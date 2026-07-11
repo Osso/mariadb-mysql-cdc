@@ -13,6 +13,31 @@ use mysql_cdc::starting_strategy::StartingStrategy;
 use std::fs::File;
 
 #[test]
+fn source_binlog_contract_requires_row_and_full() {
+    assert!(
+        validate_source_binlog_settings(&crate::inventory::SourceBinlogSettings {
+            format: "ROW".to_string(),
+            row_image: "FULL".to_string(),
+        })
+        .is_ok()
+    );
+    assert!(
+        validate_source_binlog_settings(&crate::inventory::SourceBinlogSettings {
+            format: "MIXED".to_string(),
+            row_image: "FULL".to_string(),
+        })
+        .is_err()
+    );
+    assert!(
+        validate_source_binlog_settings(&crate::inventory::SourceBinlogSettings {
+            format: "ROW".to_string(),
+            row_image: "MINIMAL".to_string(),
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn builds_mysql_cdc_replica_options_from_source_position() {
     let source = SourceBinlogConfig {
         host: "10.0.0.2".to_string(),
@@ -32,6 +57,11 @@ fn builds_mysql_cdc_replica_options_from_source_position() {
     assert_eq!(options.port, 3307);
     assert_eq!(options.username, "cdc");
     assert_eq!(options.password, "secret");
+    assert_eq!(options.ssl_mode, SslMode::RequireVerifyCa);
+    assert_eq!(
+        options.ssl_ca_file.as_deref(),
+        Some("/etc/mariadb-mysql-cdc/source-ca.pem")
+    );
     assert_eq!(options.database, Some("app".to_string()));
     assert_eq!(options.server_id, 4242);
     assert!(options.blocking);
@@ -107,6 +137,331 @@ fn source_query_ddl_is_replayed_as_checkpointed_statement() {
 }
 
 #[test]
+fn qualified_ddl_with_different_default_database_still_requires_manual_resolution() {
+    let state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "other_db".to_string(),
+        sql_statement: "ALTER TABLE fixture_cdc . accounts ADD COLUMN handle varchar(64)"
+            .to_string(),
+    });
+
+    let manual = manual_ddl_event(
+        "production-source",
+        "mysqld-bin.000777",
+        &event_header(2, 180),
+        &event,
+        &state,
+    );
+
+    assert!(manual.is_some());
+}
+
+#[test]
+fn transactional_stream_records_ddl_pending_without_executing_or_checkpointing() {
+    let executor = TransactionRecordingExecutor::default();
+    let ledger = RecordingDdlLedger::default();
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let error = handle_manual_ddl_event(
+        &executor,
+        &ledger,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect_err("unresolved DDL must stop");
+
+    assert!(error.to_string().contains("manual DDL resolution required"));
+    assert!(executor.operations().is_empty());
+    let recorded = ledger.recorded.borrow();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].source_identity,
+        "production-source#server-id=1"
+    );
+    assert_eq!(recorded[0].event_start_position, 161);
+    assert_eq!(recorded[0].event_end_position, 180);
+}
+
+#[test]
+fn resolved_ddl_advances_checkpoint_without_reexecuting_sql() {
+    let executor = TransactionRecordingExecutor::default();
+    let ledger = RecordingDdlLedger::resolved("CREATE TABLE now_manual (id int)");
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let outcome = handle_manual_ddl_event(
+        &executor,
+        &ledger,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect("resolved DDL")
+    .expect("DDL outcome");
+
+    assert_eq!(
+        outcome.resume_coordinate,
+        Some(BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 180,
+        })
+    );
+    assert_eq!(
+        executor.operations(),
+        vec!["BEGIN", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
+    );
+}
+
+#[test]
+fn resolved_ddl_with_different_raw_sql_does_not_advance_checkpoint() {
+    let executor = TransactionRecordingExecutor::default();
+    let ledger = RecordingDdlLedger::resolved("ALTER TABLE now_manual ADD COLUMN changed int");
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let error = handle_manual_ddl_event(
+        &executor,
+        &ledger,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect_err("different ledger SQL must block checkpoint advancement");
+
+    assert!(error.to_string().contains("DDL ledger SQL mismatch"));
+    assert!(executor.operations().is_empty());
+}
+
+#[test]
+fn resolved_ddl_refuses_to_move_checkpoint_backward() {
+    let executor = TransactionRecordingExecutor::default();
+    let ledger = RecordingDdlLedger::resolved("CREATE TABLE now_manual (id int)");
+    let checkpoint_store = FixedCheckpointStore {
+        checkpoint: crate::checkpoint::Checkpoint {
+            source_file: "mysqld-bin.000777".to_string(),
+            source_position: 200,
+            gtid: None,
+            event_timestamp: 0,
+            last_event: crate::checkpoint::LastEvent {
+                event_type: "XidEvent".to_string(),
+                description: "later checkpoint".to_string(),
+            },
+        },
+    };
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&checkpoint_store),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let error = handle_manual_ddl_event(
+        &executor,
+        &ledger,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect_err("checkpoint regression must block");
+
+    assert!(error.to_string().contains("refusing checkpoint regression"));
+    assert!(executor.operations().is_empty());
+}
+
+#[test]
+fn resolved_ddl_locks_and_rejects_a_concurrently_advanced_checkpoint() {
+    let executor =
+        TransactionRecordingExecutor::with_locked_checkpoint(crate::checkpoint::Checkpoint {
+            source_file: "mysqld-bin.000777".to_string(),
+            source_position: 200,
+            gtid: None,
+            event_timestamp: 0,
+            last_event: crate::checkpoint::LastEvent {
+                event_type: "XidEvent".to_string(),
+                description: "concurrent later checkpoint".to_string(),
+            },
+        });
+    let ledger = RecordingDdlLedger::resolved("CREATE TABLE now_manual (id int)");
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: None::<&NoopCheckpointStore>,
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let error = handle_manual_ddl_event(
+        &executor,
+        &ledger,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect_err("concurrent checkpoint advance must block regression");
+
+    assert!(error.to_string().contains("refusing checkpoint regression"));
+    assert_eq!(
+        executor.operations(),
+        vec!["BEGIN", "LOCK_CHECKPOINT", "ROLLBACK"]
+    );
+}
+
+#[test]
+fn grouped_dml_checkpoint_rejects_a_concurrently_advanced_checkpoint() {
+    let executor =
+        TransactionRecordingExecutor::with_locked_checkpoint(crate::checkpoint::Checkpoint {
+            source_file: "mysqld-bin.000777".to_string(),
+            source_position: 200,
+            gtid: None,
+            event_timestamp: 0,
+            last_event: crate::checkpoint::LastEvent {
+                event_type: "XidEvent".to_string(),
+                description: "concurrent later checkpoint".to_string(),
+            },
+        });
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    transaction
+        .begin_if_needed(&executor)
+        .expect("begin target transaction");
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: None::<&NoopCheckpointStore>,
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "INSERT INTO accounts VALUES (1)".to_string(),
+    });
+    let outcome = StructuredEventOutcome {
+        policy: EventPolicy::CommitTransaction,
+        resume_coordinate: Some(BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 180,
+        }),
+    };
+
+    let error = save_outcome_checkpoint(&executor, &mut context, &event, &outcome)
+        .expect_err("concurrent checkpoint advance must block DML regression");
+
+    assert!(error.to_string().contains("refusing checkpoint regression"));
+    assert_eq!(executor.operations(), vec!["BEGIN", "LOCK_CHECKPOINT"]);
+}
+
+#[test]
 fn source_query_mariadb_only_ddl_is_quarantined_without_checkpointing_past_it() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
@@ -135,7 +490,7 @@ fn source_query_mariadb_only_ddl_is_quarantined_without_checkpointing_past_it() 
 }
 
 #[test]
-fn source_query_dml_is_applied_as_checkpointed_statement_transaction() {
+fn source_query_dml_is_rejected_as_row_full_contract_violation() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -148,7 +503,7 @@ fn source_query_dml_is_applied_as_checkpointed_statement_transaction() {
         sql_statement: "INSERT INTO accounts (id, name) VALUES (999, 'query-event')".to_string(),
     });
 
-    let outcome = handle_structured_event(
+    let error = handle_structured_event(
         &mut applier,
         &resolver,
         &mut state,
@@ -156,22 +511,10 @@ fn source_query_dml_is_applied_as_checkpointed_statement_transaction() {
         &event_header(99, 180),
         &event,
     )
-    .expect("source DML should apply");
+    .expect_err("statement DML must not replay under ROW/FULL");
 
-    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
-    assert_eq!(
-        outcome.resume_coordinate,
-        Some(BinlogCoordinate {
-            file: "mysqld-bin.000777".to_string(),
-            position: 180,
-        })
-    );
-    let statements = applier.executor().statements.borrow();
-    assert_eq!(statements.len(), 1);
-    assert_eq!(
-        statements[0].sql,
-        "INSERT INTO accounts (id, name) VALUES (999, 'query-event')"
-    );
+    assert!(error.to_string().contains("ROW/FULL contract violation"));
+    assert!(applier.executor().statements.borrow().is_empty());
 }
 
 #[test]
@@ -243,6 +586,7 @@ fn wraps_target_writes_and_checkpoint_in_source_xid_transaction() {
                 target_transaction: &mut transaction,
                 checkpoint_store: Some(&NoopCheckpointStore),
                 transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
                 current_file: &mut current_file,
                 group_config: TargetTransactionGroupConfig::default(),
             };
@@ -264,12 +608,12 @@ fn wraps_target_writes_and_checkpoint_in_source_xid_transaction() {
 
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "CHECKPOINT", "COMMIT"]
+        ["BEGIN", "EXEC", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
     );
 }
 
 #[test]
-fn query_dml_checkpoints_and_commits_as_statement_transaction() {
+fn query_dml_does_not_open_or_checkpoint_target_transaction() {
     let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -290,17 +634,16 @@ fn query_dml_checkpoints_and_commits_as_statement_transaction() {
         target_transaction: &mut transaction,
         checkpoint_store: Some(&NoopCheckpointStore),
         transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
         current_file: &mut current_file,
         group_config: TargetTransactionGroupConfig::default(),
     };
 
-    apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
-        .expect("query dml");
+    let error = apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        .expect_err("statement DML must fail before target transaction");
 
-    assert_eq!(
-        applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "CHECKPOINT", "COMMIT"]
-    );
+    assert!(error.to_string().contains("ROW/FULL contract violation"));
+    assert!(applier.executor().operations().is_empty());
     assert_eq!(current_file, "mysqld-bin.000777");
 }
 
@@ -322,6 +665,7 @@ fn file_checkpoint_waits_until_after_target_commit() {
                 target_transaction: &mut transaction,
                 checkpoint_store: Some(&checkpoint_store),
                 transaction_checkpoint_table: None,
+                transaction_checkpoint_name: None,
                 current_file: &mut current_file,
                 group_config: TargetTransactionGroupConfig::default(),
             };
@@ -368,6 +712,7 @@ fn groups_multiple_xids_in_one_mysql_target_transaction() {
                 target_transaction: &mut transaction,
                 checkpoint_store: Some(&NoopCheckpointStore),
                 transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
                 current_file: &mut current_file,
                 group_config,
             };
@@ -398,8 +743,10 @@ fn groups_multiple_xids_in_one_mysql_target_transaction() {
         [
             "BEGIN",
             "EXEC",
+            "LOCK_CHECKPOINT",
             "CHECKPOINT",
             "EXEC",
+            "LOCK_CHECKPOINT",
             "CHECKPOINT",
             "COMMIT"
         ]
@@ -428,6 +775,7 @@ fn grouped_file_checkpoint_saves_last_xid_after_group_commit() {
                 target_transaction: &mut transaction,
                 checkpoint_store: Some(&checkpoint_store),
                 transaction_checkpoint_table: None,
+                transaction_checkpoint_name: None,
                 current_file: &mut current_file,
                 group_config,
             };
@@ -481,6 +829,7 @@ fn rotate_flushes_open_group_before_rotate_checkpoint() {
                 target_transaction: &mut transaction,
                 checkpoint_store: Some(&checkpoint_store),
                 transaction_checkpoint_table: None,
+                transaction_checkpoint_name: None,
                 current_file: &mut current_file,
                 group_config,
             };
@@ -531,6 +880,7 @@ fn rolls_back_open_target_transaction_when_row_apply_fails() {
                 target_transaction: &mut transaction,
                 checkpoint_store: None::<&NoopCheckpointStore>,
                 transaction_checkpoint_table: None,
+                transaction_checkpoint_name: None,
                 current_file: &mut current_file,
                 group_config: TargetTransactionGroupConfig::default(),
             };
@@ -821,7 +1171,7 @@ fn structured_rows_preserve_null_and_blob_values_as_mysql_params() {
 }
 
 #[test]
-fn query_dml_applies_insert_id_intvar_before_statement() {
+fn query_dml_contract_violation_does_not_apply_insert_id_intvar() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -847,7 +1197,7 @@ fn query_dml_applies_insert_id_intvar_before_statement() {
         &intvar,
     )
     .expect("record intvar");
-    handle_structured_event(
+    let error = handle_structured_event(
         &mut applier,
         &resolver,
         &mut state,
@@ -855,16 +1205,10 @@ fn query_dml_applies_insert_id_intvar_before_statement() {
         &event_header(99, 180),
         &query,
     )
-    .expect("apply query with intvar");
+    .expect_err("statement DML must fail under ROW/FULL");
 
-    let statements = applier.executor().statements.borrow();
-    assert_eq!(statements.len(), 2);
-    assert_eq!(statements[0].sql, "SET INSERT_ID = ?");
-    assert_eq!(statements[0].params, vec![Value::UInt(42)]);
-    assert_eq!(
-        statements[1].sql,
-        "INSERT INTO accounts (name) VALUES ('query-event')"
-    );
+    assert!(error.to_string().contains("ROW/FULL contract violation"));
+    assert!(applier.executor().statements.borrow().is_empty());
 }
 
 #[test]
@@ -904,8 +1248,24 @@ fn query_with_user_variables_is_rejected_before_checkpoint() {
     )
     .expect_err("uservar query should not replay");
 
-    assert!(error.to_string().contains("user variables"));
+    assert!(error.to_string().contains("ROW/FULL contract violation"));
     assert!(applier.executor().statements.borrow().is_empty());
+}
+
+#[test]
+fn detects_qualified_identifiers_across_mysql_quoting_forms() {
+    for sql in [
+        "INSERT INTO other_db.accounts VALUES (1)",
+        "INSERT INTO `other_db`.accounts VALUES (1)",
+        "INSERT INTO other_db.`accounts` VALUES (1)",
+        "INSERT INTO `other_db`.`accounts` VALUES (1)",
+        "INSERT INTO other_db . accounts VALUES (1)",
+    ] {
+        assert!(query_contains_qualified_identifier(sql), "missed {sql}");
+    }
+    assert!(!query_contains_qualified_identifier(
+        "INSERT INTO accounts (amount, note) VALUES (1.5, 'other_db.accounts')"
+    ));
 }
 
 #[test]
@@ -918,8 +1278,8 @@ fn qualified_query_dml_is_rejected_as_ambiguous() {
         duration: 0,
         error_code: 0,
         status_variables: Vec::new(),
-        database_name: "fixture_cdc".to_string(),
-        sql_statement: "INSERT INTO `other_db`.`accounts` (id) VALUES (1)".to_string(),
+        database_name: "other_db".to_string(),
+        sql_statement: "INSERT INTO `fixture_cdc`.`accounts` (id) VALUES (1)".to_string(),
     });
 
     let error = handle_structured_event(
@@ -932,7 +1292,63 @@ fn qualified_query_dml_is_rejected_as_ambiguous() {
     )
     .expect_err("qualified query should not replay");
 
-    assert!(error.to_string().contains("qualified identifier"));
+    assert!(error.to_string().contains("ROW/FULL contract violation"));
+    assert!(applier.executor().statements.borrow().is_empty());
+}
+
+#[test]
+fn unrelated_qualified_statement_dml_is_ignored_with_source_filter() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "other_db".to_string(),
+        sql_statement: "UPDATE other_db.accounts SET name='safe' WHERE id=1".to_string(),
+    });
+
+    let outcome = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(99, 180),
+        &event,
+    )
+    .expect("unrelated database DML should be ignored");
+
+    assert_eq!(outcome.policy, EventPolicy::Ignore);
+    assert!(applier.executor().statements.borrow().is_empty());
+}
+
+#[test]
+fn transaction_control_query_is_ignored_without_source_database_filter() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(None);
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: String::new(),
+        sql_statement: "BEGIN".to_string(),
+    });
+
+    let outcome = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.000777",
+        &event_header(99, 180),
+        &event,
+    )
+    .expect("BEGIN should be ignored under ROW/FULL");
+
+    assert_eq!(outcome.policy, EventPolicy::Ignore);
     assert!(applier.executor().statements.borrow().is_empty());
 }
 
@@ -1326,6 +1742,23 @@ impl TableSchemaResolver for ReleasesSchemaResolver {
 
 struct NoopCheckpointStore;
 
+struct FixedCheckpointStore {
+    checkpoint: crate::checkpoint::Checkpoint,
+}
+
+impl StreamCheckpointStore for FixedCheckpointStore {
+    fn load_checkpoint(&self) -> Result<Option<crate::checkpoint::Checkpoint>, ApplyBinlogError> {
+        Ok(Some(self.checkpoint.clone()))
+    }
+
+    fn save_checkpoint(
+        &self,
+        _checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> Result<(), ApplyBinlogError> {
+        panic!("regressing checkpoint must not be saved")
+    }
+}
+
 struct RecordingCheckpointStore {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
 }
@@ -1379,9 +1812,63 @@ impl TableSchemaResolver for EmptySchemaResolver {
 }
 
 #[derive(Default)]
+struct RecordingDdlLedger {
+    status: RefCell<Option<DdlEventStatus>>,
+    recorded: RefCell<Vec<DdlEvent>>,
+}
+
+impl RecordingDdlLedger {
+    fn resolved(sql: &str) -> Self {
+        Self {
+            status: RefCell::new(Some(DdlEventStatus::Resolved {
+                raw_sql: sql.to_string(),
+            })),
+            recorded: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl DdlEventLedger for RecordingDdlLedger {
+    fn ensure(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn read_status(&self, _event: &DdlEvent) -> Result<Option<DdlEventStatus>, String> {
+        Ok(self.status.borrow().clone())
+    }
+
+    fn record_pending(&self, event: &DdlEvent) -> Result<(), String> {
+        self.recorded.borrow_mut().push(event.clone());
+        *self.status.borrow_mut() = Some(DdlEventStatus::Pending {
+            raw_sql: event.raw_sql.clone(),
+        });
+        Ok(())
+    }
+}
+
 struct TransactionRecordingExecutor {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     fail_execute: bool,
+    locked_checkpoint: Option<crate::checkpoint::Checkpoint>,
+}
+
+impl Default for TransactionRecordingExecutor {
+    fn default() -> Self {
+        Self {
+            operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            fail_execute: false,
+            locked_checkpoint: Some(crate::checkpoint::Checkpoint {
+                source_file: "mysqld-bin.000000".to_string(),
+                source_position: 4,
+                gtid: None,
+                event_timestamp: 0,
+                last_event: crate::checkpoint::LastEvent {
+                    event_type: "Bootstrap".to_string(),
+                    description: "test checkpoint".to_string(),
+                },
+            }),
+        }
+    }
 }
 
 impl TransactionRecordingExecutor {
@@ -1389,6 +1876,14 @@ impl TransactionRecordingExecutor {
         Self {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: true,
+            locked_checkpoint: None,
+        }
+    }
+
+    fn with_locked_checkpoint(checkpoint: crate::checkpoint::Checkpoint) -> Self {
+        Self {
+            locked_checkpoint: Some(checkpoint),
+            ..Self::default()
         }
     }
 
@@ -1420,9 +1915,19 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
         Ok(())
     }
 
+    fn load_transaction_checkpoint_for_update(
+        &self,
+        _checkpoint_table: &str,
+        _checkpoint_name: &str,
+    ) -> Result<Option<crate::checkpoint::Checkpoint>, crate::target::TargetExecuteError> {
+        self.operations.borrow_mut().push("LOCK_CHECKPOINT");
+        Ok(self.locked_checkpoint.clone())
+    }
+
     fn save_transaction_checkpoint(
         &self,
         _checkpoint_table: &str,
+        _checkpoint_name: &str,
         _checkpoint: &crate::checkpoint::Checkpoint,
     ) -> Result<(), crate::target::TargetExecuteError> {
         self.operations.borrow_mut().push("CHECKPOINT");

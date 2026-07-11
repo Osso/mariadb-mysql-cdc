@@ -3,6 +3,7 @@ use mysql::{Conn, DriverError, Opts, OptsBuilder, Row, SslOpts, Value};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,7 @@ pub struct InventoryConfig {
     pub password: String,
     pub endpoint_role: InventoryEndpointRole,
     pub use_tls: bool,
+    pub tls_ca_file: Option<String>,
     pub max_connection_age: Duration,
 }
 
@@ -120,6 +122,7 @@ impl Default for InventoryConfig {
             password: String::new(),
             endpoint_role: InventoryEndpointRole::Source,
             use_tls: false,
+            tls_ca_file: None,
             max_connection_age: Duration::from_secs(300),
         }
     }
@@ -177,6 +180,7 @@ enum InventoryQueryStage {
     Triggers,
     Routines,
     Events,
+    BinlogSettings,
 }
 
 impl InventoryQueryStage {
@@ -189,6 +193,7 @@ impl InventoryQueryStage {
             Self::Triggers => "triggers",
             Self::Routines => "routines",
             Self::Events => "events",
+            Self::BinlogSettings => "binlog_settings",
         }
     }
 }
@@ -263,6 +268,30 @@ impl MariaDbInventoryReader {
         }
     }
 
+    pub fn read_source_binlog_settings(&self) -> Result<SourceBinlogSettings, InventoryError> {
+        let rows = self.query_rows(
+            InventoryQueryStage::BinlogSettings,
+            "global",
+            "SELECT @@global.binlog_format, @@global.binlog_row_image",
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(InventoryError::new(format!(
+                "expected one source binlog settings row, found {}",
+                rows.len()
+            )));
+        };
+        let [format, row_image] = row.as_slice() else {
+            return Err(InventoryError::new(format!(
+                "expected source binlog format and row image, found {} columns",
+                row.len()
+            )));
+        };
+        Ok(SourceBinlogSettings {
+            format: format.clone(),
+            row_image: row_image.clone(),
+        })
+    }
+
     fn ensure_connection(&self) -> Result<(), InventoryQueryFailure> {
         if self.conn.borrow().is_some() {
             return Ok(());
@@ -329,6 +358,12 @@ impl InventoryReader for MariaDbInventoryReader {
         let rows = self.query_rows(InventoryQueryStage::Events, schema, &events_query(schema))?;
         rows.iter().map(|row| parse_event_row(row)).collect()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceBinlogSettings {
+    pub format: String,
+    pub row_image: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -435,15 +470,15 @@ fn inventory_opts(config: &InventoryConfig) -> Opts {
         .pass(Some(&config.password))
         .prefer_socket(false);
     if config.use_tls {
-        builder = builder.ssl_opts(insecure_inventory_ssl_opts());
+        let mut ssl = SslOpts::default();
+        if let Some(ca_file) = &config.tls_ca_file {
+            ssl = ssl
+                .with_root_cert_path(Some(PathBuf::from(ca_file)))
+                .with_danger_skip_domain_validation(true);
+        }
+        builder = builder.ssl_opts(ssl);
     }
     Opts::from(builder)
-}
-
-fn insecure_inventory_ssl_opts() -> SslOpts {
-    SslOpts::default()
-        .with_danger_skip_domain_validation(true)
-        .with_danger_accept_invalid_certs(true)
 }
 
 fn row_to_inventory_fields(row: Row) -> Vec<String> {

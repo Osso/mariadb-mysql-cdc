@@ -6,8 +6,10 @@ DigitalOcean Managed MySQL online migration supports MySQL 8 sources, but not
 MariaDB sources. MariaDB and MySQL also differ at both the SQL layer and the
 replication/binlog layer.
 
-The tool should move data from MariaDB to a MySQL-compatible target without
-requiring production to switch from mixed binlogs to row binlogs.
+The tool moves data from MariaDB to a MySQL-compatible target. Production
+streaming requires `binlog_format=ROW` and `binlog_row_image=FULL`; the source
+must not be switched from the existing MariaDB `MIXED` format until the CDC
+migration window explicitly enables and verifies that stream contract.
 
 ## Approach
 
@@ -21,9 +23,11 @@ The target is not trusted until rehearsals show low or zero divergence.
 
 ## Event Handling
 
-The source may emit both statement and row events.
+Offline fixtures and `apply-binlog` may contain statement and row events.
+Production `stream-binlog` requires ROW/FULL, while still treating source DDL
+`QueryEvent` boundaries manually.
 
-- Statement events are replayed only when known compatible with MySQL.
+- Compatible statements are replayed only by offline/application paths.
 - Row events are applied as target DML once table metadata is available.
 - Unsupported data-changing events stop the applier or enter quarantine with
   exact coordinates.
@@ -31,12 +35,9 @@ The source may emit both statement and row events.
 
 ## Parser Strategy
 
-Start with the smallest reliable reader that can handle MariaDB mixed binlogs.
-Candidates:
-
-- `mysql_cdc` as a pure Rust replication client.
-- `mariadb-binlog` as the initial read-only decoder and fallback subprocess.
-- Captured binlog files as fixtures for parser compatibility tests.
+`stream-binlog` uses the vendored `mysql_cdc` native replication client with
+verified TLS. Captured binlog files remain parser compatibility fixtures;
+`mariadb-binlog` text decoding belongs only to explicit offline/apply workflows.
 
 The first probe uses `mariadb` for `SHOW MASTER STATUS` and `mariadb-binlog`
 for read-only remote binlog streaming. It classifies event text into broad
@@ -68,12 +69,15 @@ through a trait-backed writer. Snapshot rows use batched upserts, while CDC
 updates/deletes use primary-key predicates. See `docs/target-writer.md`.
 
 Statement events pass through a conservative allowlist before replay. Narrow
-DML is replayed; DDL, MariaDB-only syntax, unsafe file/definer patterns, and
-unknown statement types are quarantined with source coordinates. See
-`docs/statement-events.md`.
+DML is replayed; source schema-changing DDL is recorded in a manual-resolution
+ledger and stops the stream before its checkpoint, while MariaDB-only syntax,
+unsafe file/definer patterns, and unknown non-DDL statement types are quarantined
+with source coordinates. See `docs/statement-events.md` and
+`docs/ddl-resolution.md`.
 
-Row events are applied from table-map metadata. Inserts are batched as target
-upserts, updates use after images, and deletes use primary-key values from
+Row events are applied from table-map metadata. Each insert is a plain target
+`INSERT` with the explicit source primary key, updates use after images, and
+deletes use primary-key values from
 before images. Missing table maps or primary-key values fail with source
 coordinates. See `docs/row-events.md`.
 

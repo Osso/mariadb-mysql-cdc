@@ -148,14 +148,8 @@ fn source_opts(source: &SourceBinlogConfig) -> Opts {
         .user(Some(&source.user))
         .pass(Some(&source.password))
         .prefer_socket(false)
-        .ssl_opts(insecure_ssl_opts());
+        .ssl_opts(SslOpts::default());
     Opts::from(builder)
-}
-
-fn insecure_ssl_opts() -> SslOpts {
-    SslOpts::default()
-        .with_danger_skip_domain_validation(true)
-        .with_danger_accept_invalid_certs(true)
 }
 
 fn missing_target_table_name(error: &str) -> Option<String> {

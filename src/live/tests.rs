@@ -7,6 +7,44 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 #[test]
+fn stream_requires_schema_qualified_checkpoint_and_ddl_tables() {
+    let mut config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            host: "source-db".to_string(),
+            user: "cdc_reader".to_string(),
+            password: "secret".to_string(),
+            database: Some("globalcomix".to_string()),
+            binlog_file: "mysqld-bin.000001".to_string(),
+            ..SourceBinlogConfig::default()
+        },
+        source_identity: "production-source".to_string(),
+        target: TargetMySqlConfig {
+            host: "target-db".to_string(),
+            user: "cdc_stream".to_string(),
+            password: "secret".to_string(),
+            database: "globalcomix".to_string(),
+            ..TargetMySqlConfig::default()
+        },
+        ..ApplyBinlogConfig::default()
+    };
+
+    config.ddl_ledger_table = "ddl_events".to_string();
+    assert!(config.validate().is_err());
+
+    config.ddl_ledger_table = "cdc.ddl_events".to_string();
+    config.checkpoint_table = "stream_checkpoint".to_string();
+    assert!(config.validate().is_err());
+
+    for malformed in [".stream_checkpoint", "cdc.", "cdc.stream.checkpoint"] {
+        config.checkpoint_table = malformed.to_string();
+        assert!(
+            config.validate().is_err(),
+            "accepted malformed table {malformed}"
+        );
+    }
+}
+
+#[test]
 fn extracts_statement_events_with_coordinates_and_database() {
     let events = extract_statement_events(
         "\
@@ -650,7 +688,8 @@ fn reconnect_forever_allows_unlimited_transient_reconnects() {
 
 #[test]
 fn reconnect_loop_resumes_from_checkpoint_after_transient_loss() {
-    let checkpoint_store = MemoryCheckpointStore::default();
+    let checkpoint_store =
+        MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.000001", 4));
     let config = ApplyBinlogConfig {
         source: SourceBinlogConfig {
             binlog_file: "mysqld-bin.000001".to_string(),
@@ -705,7 +744,6 @@ fn reconnect_loop_requires_checkpoint_when_static_coordinates_are_absent() {
             start_position: 0,
             ..SourceBinlogConfig::default()
         },
-        checkpoint_file: Some("/var/lib/cdc/checkpoint.json".into()),
         ..ApplyBinlogConfig::default()
     };
 
@@ -717,7 +755,10 @@ fn reconnect_loop_requires_checkpoint_when_static_coordinates_are_absent() {
     )
     .expect_err("missing checkpoint coordinate");
 
-    assert_eq!(error.to_string(), "binlog file is required");
+    assert_eq!(
+        error.to_string(),
+        "checkpoint failed: required source-scoped stream checkpoint is missing"
+    );
 }
 
 #[test]

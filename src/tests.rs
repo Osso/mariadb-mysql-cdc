@@ -23,6 +23,8 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "SRC_PASSWORD",
         "--source-database",
         "app",
+        "--source-identity",
+        "production-source",
         "--binlog-file",
         "mysqld-bin.000777",
         "--start-position",
@@ -41,10 +43,10 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "app_target",
         "--insert-conflict-policy",
         "ignore-duplicate",
-        "--checkpoint-file",
-        "/var/lib/mariadb-mysql-cdc/stream-checkpoint.json",
         "--checkpoint-table",
         "cdc.stream_checkpoint",
+        "--ddl-ledger-table",
+        "cdc.manual_ddl_events",
         "--max-reconnects",
         "3",
         "--reconnect-forever",
@@ -62,6 +64,7 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
     assert_eq!(config.source.port, 3307);
     assert_eq!(config.source.password, "source-secret");
     assert_eq!(config.source.database.as_deref(), Some("app"));
+    assert_eq!(config.source_identity, "production-source");
     assert_eq!(config.source.binlog_file, "mysqld-bin.000777");
     assert_eq!(config.source.start_position, 12345);
     assert_eq!(config.source.stop_position, Some(45678));
@@ -73,13 +76,8 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         config.target.insert_conflict_policy,
         live::InsertConflictPolicy::IgnoreDuplicate
     );
-    assert_eq!(
-        config.checkpoint_file,
-        Some(PathBuf::from(
-            "/var/lib/mariadb-mysql-cdc/stream-checkpoint.json"
-        ))
-    );
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
+    assert_eq!(config.ddl_ledger_table, "cdc.manual_ddl_events");
     assert_eq!(config.max_reconnects, 3);
     assert!(config.reconnect_forever);
     assert_eq!(config.target_transaction_group_size, 25);
@@ -99,6 +97,8 @@ fn rejects_zero_stop_never_slave_server_id() {
         "cdc",
         "--source-password-env",
         "SOURCE_PASSWORD",
+        "--source-identity",
+        "test-source-incarnation",
         "--binlog-file",
         "mysqld-bin.000777",
         "--target-host",
@@ -132,6 +132,8 @@ fn parses_zero_max_reconnects_as_disabled_retry_cap() {
         "cdc",
         "--source-password-env",
         "SOURCE_PASSWORD",
+        "--source-identity",
+        "test-source-incarnation",
         "--binlog-file",
         "mysqld-bin.000777",
         "--target-host",
@@ -163,6 +165,8 @@ fn parses_reconnect_forever_for_unlimited_stream_retries() {
         "cdc",
         "--source-password-env",
         "SOURCE_PASSWORD",
+        "--source-identity",
+        "test-source-incarnation",
         "--binlog-file",
         "mysqld-bin.000777",
         "--target-host",

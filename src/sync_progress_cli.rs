@@ -1,4 +1,3 @@
-use crate::checkpoint::FileCheckpointStore;
 use crate::mysql_support::qualified_table_parts;
 use crate::stream_checkpoint::default_stream_checkpoint_table;
 use crate::{live, mysql_snapshot};
@@ -40,9 +39,9 @@ struct SyncProgressConfig {
     source: mysql_snapshot::MySqlConnectionConfig,
     progress_table: String,
     checkpoint_table: String,
+    source_identity: Option<String>,
     table: Option<String>,
     run_id: Option<String>,
-    checkpoint_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +92,7 @@ struct FileSyncProgressConfig {
     target_database: Option<String>,
     progress_table: Option<String>,
     checkpoint_table: Option<String>,
+    source_identity: Option<String>,
 }
 
 fn default_sync_progress_config() -> SyncProgressConfig {
@@ -101,9 +101,9 @@ fn default_sync_progress_config() -> SyncProgressConfig {
         source: mysql_snapshot::MySqlConnectionConfig::default(),
         progress_table: "cdc.table_sync_progress".to_string(),
         checkpoint_table: default_stream_checkpoint_table(),
+        source_identity: None,
         table: None,
         run_id: None,
-        checkpoint_file: None,
     }
 }
 
@@ -154,6 +154,7 @@ fn apply_file_config(
     apply_optional_string(&mut config.target.database, sync_progress.target_database);
     apply_optional_string(&mut config.progress_table, sync_progress.progress_table);
     apply_optional_string(&mut config.checkpoint_table, sync_progress.checkpoint_table);
+    config.source_identity = sync_progress.source_identity;
     Ok(())
 }
 
@@ -192,7 +193,7 @@ fn sync_progress_option(
     match flag {
         "--progress-table" => config.progress_table = value.to_string(),
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
-        "--checkpoint-file" => config.checkpoint_file = Some(PathBuf::from(value)),
+        "--source-identity" => config.source_identity = Some(value.to_string()),
         "--table" => config.table = Some(value.to_string()),
         "--run-id" => config.run_id = Some(value.to_string()),
         other => return Err(format!("unknown sync-progress option: {other}")),
@@ -288,7 +289,7 @@ fn has_source_count_config(config: &SyncProgressConfig) -> bool {
 
 fn read_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
     let (sender, receiver) = mpsc::channel();
-    let cache_key = format!("v2-{}", config.table.as_deref().unwrap_or("all"));
+    let cache_key = sync_progress_cache_key(config);
     let live_config = config.clone();
     thread::spawn(move || {
         let _ = sender.send(read_live_sync_progress(&live_config));
@@ -299,6 +300,7 @@ fn read_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
             cache::write_sync_progress_cache(&cache_key, &report);
             Ok(report)
         }
+        Ok(Err(error)) if is_authoritative_checkpoint_error(&error) => Err(error),
         Ok(Err(error)) => cache::read_sync_progress_cache(&cache_key)
             .map(|cached| cache::format_cached_sync_progress(&cached, &error))
             .ok_or(error),
@@ -311,6 +313,31 @@ fn read_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
             Err("sync-progress worker exited without a result".to_string())
         }
     }
+}
+
+fn sync_progress_cache_key(config: &SyncProgressConfig) -> String {
+    let identity = format!(
+        "target={}:{}:{};progress={};checkpoint={}:{};table={};run={}",
+        config.target.host,
+        config.target.port,
+        config.target.database,
+        config.progress_table,
+        config.checkpoint_table,
+        config.source_identity.as_deref().unwrap_or(""),
+        config.table.as_deref().unwrap_or(""),
+        config.run_id.as_deref().unwrap_or(""),
+    );
+    format!("v3-{:016x}", fnv1a64(identity.as_bytes()))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn is_authoritative_checkpoint_error(error: &str) -> bool {
+    error.starts_with("authoritative_checkpoint_error")
 }
 
 fn read_live_sync_progress(config: &SyncProgressConfig) -> Result<String, String> {
@@ -381,12 +408,20 @@ fn read_stream_checkpoint(
     config: &SyncProgressConfig,
     reader: &mut TargetProgressReader,
 ) -> Result<Option<crate::checkpoint::Checkpoint>, String> {
-    if let Some(path) = &config.checkpoint_file {
-        return FileCheckpointStore::new(path)
-            .load()
-            .map_err(|error| error.to_string());
-    }
-    reader.read_stream_checkpoint(&config.checkpoint_table)
+    let Some(source_identity) = &config.source_identity else {
+        return Ok(None);
+    };
+    let checkpoint_name = crate::stream_checkpoint::stream_checkpoint_name(source_identity);
+    reader
+        .read_stream_checkpoint(&config.checkpoint_table, &checkpoint_name)
+        .map_err(|error| format!("authoritative_checkpoint_error {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "authoritative_checkpoint_error missing table={} checkpoint_name={checkpoint_name}",
+                config.checkpoint_table
+            )
+        })
+        .map(Some)
 }
 
 fn build_progress_query(
@@ -545,8 +580,9 @@ impl TargetProgressReader {
     fn read_stream_checkpoint(
         &mut self,
         checkpoint_table: &str,
+        checkpoint_name: &str,
     ) -> Result<Option<crate::checkpoint::Checkpoint>, String> {
-        let sql = build_checkpoint_json_select_sql(checkpoint_table);
+        let sql = build_checkpoint_json_select_sql(checkpoint_table, checkpoint_name);
         let json = match self.conn.query_first::<String, _>(sql) {
             Ok(json) => json,
             Err(error) if is_missing_table_error(&error) => return Ok(None),
@@ -581,10 +617,11 @@ fn sync_progress_row_from_db(row: ProgressDbRow) -> Result<SyncProgressRow, Stri
     })
 }
 
-fn build_checkpoint_json_select_sql(table: &str) -> String {
+fn build_checkpoint_json_select_sql(table: &str, checkpoint_name: &str) -> String {
     format!(
-        "SELECT checkpoint_json FROM {} WHERE checkpoint_name = 'stream-binlog' LIMIT 1",
-        quote_identifier_path(table)
+        "SELECT checkpoint_json FROM {} WHERE checkpoint_name = {} LIMIT 1",
+        quote_identifier_path(table),
+        crate::mysql_support::quote_sql_literal(checkpoint_name),
     )
 }
 
@@ -638,11 +675,7 @@ fn mysql_opts(host: &str, port: u16, user: &str, password: &str, database: &str)
         .tcp_connect_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
         .read_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
         .write_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
-        .ssl_opts(
-            SslOpts::default()
-                .with_danger_skip_domain_validation(true)
-                .with_danger_accept_invalid_certs(true),
-        );
+        .ssl_opts(SslOpts::default());
     Opts::from(builder)
 }
 

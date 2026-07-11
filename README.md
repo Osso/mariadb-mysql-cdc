@@ -24,47 +24,27 @@ a standalone migration/CDC tool.
 
 ## Current Status
 
-The structured stream consumes native MariaDB row events, persists its checkpoint
-in the target transaction, and replays allowlisted DDL query events. Snapshot,
-drift-check, checksum localization, and primary-key table repair commands support
-rehearsal and eventual convergence. The legacy `probe` text-binlog path is not a
-supported health check.
+The structured stream consumes native MariaDB row events and persists its
+checkpoint in the target transaction. Source schema-changing `QueryEvent` records
+are a manual migration boundary: the stream flushes earlier DML, writes a pending
+row to a target-side DDL ledger, and stops without checkpointing past the event.
+Snapshot, drift-check, checksum localization, and primary-key table repair
+commands support rehearsal and eventual convergence. The legacy `probe`
+text-binlog path is not a supported health check.
 
-## DDL Replay Support
+## DDL Resolution
 
-DDL replay is allowlisted one operation at a time. Supported DDL is applied to
-the MySQL target and treated as already applied when a retry sees the expected
-idempotency error.
+The stream never auto-executes source schema-changing DDL. The default ledger is
+`cdc.ddl_events`; use `--ddl-ledger-table TABLE` to configure another qualified
+table. An operator must review the recorded exact source SQL, apply and validate
+the intended target schema change, then update the same ledger row to `resolved`
+with a resolution note. On restart, the stream verifies the ledger raw SQL is an
+exact match and advances the checkpoint without re-executing the DDL.
 
-Current supported slices:
-
-- Table/index DDL: `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE`,
-  `DROP TABLE IF EXISTS`, `TRUNCATE TABLE`, `RENAME TABLE`, `CREATE INDEX`,
-  `CREATE UNIQUE INDEX`, and `DROP INDEX`, including MariaDB binlog QueryEvent
-  text with semicolons inside SQL comments.
-- Database/schema DDL: `CREATE DATABASE IF NOT EXISTS`, `ALTER DATABASE`,
-  `DROP DATABASE IF EXISTS`, and their `SCHEMA` aliases. Retry idempotency
-  covers `ERROR 1007` / `ERROR 1008`.
-- View DDL: `CREATE VIEW`, `CREATE OR REPLACE VIEW`, `ALTER VIEW`, and
-  `DROP VIEW IF EXISTS` when the statement does not contain unsafe definer
-  clauses.
-- Trigger DDL: `CREATE TRIGGER` and `DROP TRIGGER IF EXISTS` when the statement
-  does not contain unsafe definer clauses, with retry idempotency for `ERROR
-  1359` / `ERROR 1360`.
-- Routine/event DDL: `CREATE`/`ALTER`/`DROP PROCEDURE`, `CREATE`/`ALTER`/`DROP
-  FUNCTION`, and `CREATE`/`ALTER`/`DROP EVENT`, including compound bodies with
-  semicolons. Retry idempotency covers `ERROR 1304` / `ERROR 1305` and `ERROR
-  1537` / `ERROR 1539`.
-
-The text `apply-binlog` extractor and structured stream path use the same
-supported statement prefix list, so one-shot replays and live stream classify DDL
-consistently.
-
-Administrative DDL that should not be replayed into managed MySQL is supported
-as a checkpointed skip: users, roles, grants, tablespaces, servers, and resource
-groups advance the stream without mutating the target.
-
-Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
+Generic target errors—including already-exists and missing-object errors—never
+count as DDL success. Resolving before target apply and validation causes schema
+divergence because the stream will checkpoint past the source DDL. See [DDL
+Resolution Runbook](docs/ddl-resolution.md).
 
 ## Commands
 
@@ -72,7 +52,10 @@ Unsupported or unsafe DDL still quarantines with exact binlog coordinates.
 cargo run -- plan
 cargo run -- stream-binlog --source-host 127.0.0.1 --source-user repl \
   --source-password-env SOURCE_PASSWORD --source-database app \
-  --target-host 127.0.0.1 --target-user writer \
+  --source-tls-ca-file /etc/mariadb-mysql-cdc/source-ca.pem \
+  --source-identity app-mariadb-20260710 \
+  --binlog-file mysql-bin.000001 --start-position 4 \
+  --target-host 127.0.0.1 --target-user cdc_stream \
   --target-password-env TARGET_PASSWORD --target-database app
 
 cargo run -- sync-table --source-host 127.0.0.1 --source-user reader \
@@ -99,7 +82,8 @@ never delete target orphans. Inspect a specific repair with:
 ```bash
 mariadb-mysql-cdc sync-progress ... \
   --progress-table cdc.table_sync_runs \
-  --run-id releases-repair-20260710-01
+  --run-id releases-repair-20260710-01 \
+  --source-identity production-source
 ```
 
 See [Catchup Workflow](docs/catchup.md) for the repair runbook and bounded-delete

@@ -53,7 +53,6 @@ pub enum QuarantineReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatementOutcome {
     Replayed,
-    AlreadyApplied,
     Skipped,
     Quarantined(QuarantineReason),
 }
@@ -159,9 +158,6 @@ where
         };
         match self.executor.execute(&statement) {
             Ok(()) => Ok(StatementOutcome::Replayed),
-            Err(source) if is_ddl_already_applied_error(&sql, &source.to_string()) => {
-                Ok(StatementOutcome::AlreadyApplied)
-            }
             Err(source) => Err(StatementApplyError::Target {
                 coordinate: event.coordinate.clone(),
                 sql,
@@ -552,7 +548,18 @@ pub(crate) fn is_supported_statement_start(sql: &str) -> bool {
 }
 
 pub fn is_schema_changing_statement(sql: &str) -> bool {
-    is_known_compatible_ddl(&normalize_statement(sql))
+    is_known_compatible_ddl(&normalize_policy_whitespace(sql))
+}
+
+pub(crate) fn is_data_changing_statement(sql: &str) -> bool {
+    is_known_compatible_dml(&normalize_policy_whitespace(sql))
+}
+
+fn normalize_policy_whitespace(sql: &str) -> String {
+    normalize_statement(sql)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // MySQL 8 does not accept IF [NOT] EXISTS on ALTER TABLE clauses or index DDL;
@@ -568,31 +575,6 @@ fn find_ddl_if_exists_pattern(sql: &str) -> Option<String> {
     }
 
     find_pattern(&upper, &["IF NOT EXISTS", "IF EXISTS"])
-}
-
-// Replaying DDL is not idempotent; after a crash between apply and checkpoint,
-// the re-applied statement reports one of these already-applied server errors.
-const DDL_ALREADY_APPLIED_ERROR_CODES: [&str; 13] = [
-    "ERROR 1007", // database already exists
-    "ERROR 1008", // unknown database (already dropped)
-    "ERROR 1050", // table already exists
-    "ERROR 1051", // unknown table (already dropped)
-    "ERROR 1060", // duplicate column name (already added)
-    "ERROR 1061", // duplicate key name (already added)
-    "ERROR 1091", // cannot drop column or key (already dropped)
-    "ERROR 1304", // routine already exists
-    "ERROR 1305", // routine does not exist (already dropped)
-    "ERROR 1359", // trigger already exists
-    "ERROR 1360", // trigger does not exist (already dropped)
-    "ERROR 1537", // event already exists
-    "ERROR 1539", // event does not exist (already dropped)
-];
-
-fn is_ddl_already_applied_error(sql: &str, error: &str) -> bool {
-    is_known_compatible_ddl(sql)
-        && DDL_ALREADY_APPLIED_ERROR_CODES
-            .iter()
-            .any(|code| error.contains(code))
 }
 
 fn first_keyword(sql: &str) -> Option<&str> {
@@ -922,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_already_applied_ddl_replay_error() {
+    fn already_applied_ddl_error_remains_blocking() {
         let executor = RecordingExecutor {
             statements: RefCell::new(Vec::new()),
             error: Some(TargetExecuteError::new(
@@ -933,13 +915,15 @@ mod tests {
         let applier = StatementApplier::new(executor, quarantine);
 
         let event = statement("ALTER TABLE accounts DROP COLUMN handle");
-        let outcome = applier.apply(&event).expect("apply statement");
+        let error = applier
+            .apply(&event)
+            .expect_err("ambiguous DDL error must block");
 
-        assert_eq!(outcome, StatementOutcome::AlreadyApplied);
+        assert!(error.to_string().contains("ERROR 1091"));
     }
 
     #[test]
-    fn tolerates_already_applied_create_database_error() {
+    fn create_database_already_exists_error_remains_blocking() {
         let executor = RecordingExecutor {
             statements: RefCell::new(Vec::new()),
             error: Some(TargetExecuteError::new(
@@ -950,13 +934,15 @@ mod tests {
         let applier = StatementApplier::new(executor, quarantine);
 
         let event = statement("CREATE DATABASE archive DEFAULT CHARSET=utf8mb4");
-        let outcome = applier.apply(&event).expect("apply statement");
+        let error = applier
+            .apply(&event)
+            .expect_err("ambiguous CREATE DATABASE must block");
 
-        assert_eq!(outcome, StatementOutcome::AlreadyApplied);
+        assert!(error.to_string().contains("ERROR 1007"));
     }
 
     #[test]
-    fn tolerates_already_applied_drop_database_error() {
+    fn drop_database_missing_error_remains_blocking() {
         let executor = RecordingExecutor {
             statements: RefCell::new(Vec::new()),
             error: Some(TargetExecuteError::new(
@@ -967,13 +953,15 @@ mod tests {
         let applier = StatementApplier::new(executor, quarantine);
 
         let event = statement("DROP DATABASE archive");
-        let outcome = applier.apply(&event).expect("apply statement");
+        let error = applier
+            .apply(&event)
+            .expect_err("ambiguous DROP DATABASE must block");
 
-        assert_eq!(outcome, StatementOutcome::AlreadyApplied);
+        assert!(error.to_string().contains("ERROR 1008"));
     }
 
     #[test]
-    fn tolerates_already_applied_trigger_errors() {
+    fn trigger_already_exists_or_missing_errors_remain_blocking() {
         for (sql, message) in [
             (
                 "CREATE TRIGGER account_bi BEFORE INSERT ON accounts FOR EACH ROW SET NEW.name = TRIM(NEW.name)",
@@ -991,14 +979,19 @@ mod tests {
             let quarantine = RecordingQuarantine::default();
             let applier = StatementApplier::new(executor, quarantine);
 
-            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+            let error = applier
+                .apply(&statement(sql))
+                .expect_err("ambiguous trigger DDL must block");
 
-            assert_eq!(outcome, StatementOutcome::AlreadyApplied, "{sql}");
+            assert!(
+                error.to_string().contains("target mysql query failed"),
+                "{sql}"
+            );
         }
     }
 
     #[test]
-    fn tolerates_already_applied_routine_and_event_errors() {
+    fn routine_and_event_already_exists_or_missing_errors_remain_blocking() {
         for (sql, message) in [
             (
                 "CREATE PROCEDURE refresh_accounts() SELECT 1",
@@ -1024,9 +1017,14 @@ mod tests {
             let quarantine = RecordingQuarantine::default();
             let applier = StatementApplier::new(executor, quarantine);
 
-            let outcome = applier.apply(&statement(sql)).expect("apply statement");
+            let error = applier
+                .apply(&statement(sql))
+                .expect_err("ambiguous routine or event DDL must block");
 
-            assert_eq!(outcome, StatementOutcome::AlreadyApplied, "{sql}");
+            assert!(
+                error.to_string().contains("target mysql query failed"),
+                "{sql}"
+            );
         }
     }
 
