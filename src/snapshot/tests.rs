@@ -379,8 +379,8 @@ fn accounts_table() -> SnapshotTable {
 
 fn row(id: &str, name: &str) -> SnapshotRow {
     let mut values = BTreeMap::new();
-    values.insert("id".to_string(), id.to_string());
-    values.insert("name".to_string(), name.to_string());
+    values.insert("id".to_string(), Some(id.to_string()));
+    values.insert("name".to_string(), Some(name.to_string()));
 
     SnapshotRow {
         primary_key: vec![id.to_string()],

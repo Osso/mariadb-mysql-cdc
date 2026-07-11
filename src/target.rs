@@ -364,7 +364,10 @@ fn build_delete_statement(
 fn ordered_values(row: &SnapshotRow, columns: &[String]) -> Vec<Value> {
     columns
         .iter()
-        .map(|column| string_param(row.values.get(column).cloned().unwrap_or_default()))
+        .map(|column| match row.values.get(column).cloned().flatten() {
+            Some(value) => string_param(value),
+            None => Value::NULL,
+        })
         .collect()
 }
 
@@ -452,6 +455,36 @@ mod tests {
             "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?), (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"
         );
         assert_eq!(executed[0].params, values(["1", "alpha", "2", "beta"]));
+    }
+
+    #[test]
+    fn writes_null_snapshot_values_as_sql_null() {
+        let executor = RecordingExecutor::default();
+        let writer = TargetMySqlWriter::new(
+            "access_tokens",
+            vec!["id"],
+            vec!["id", "artist_id", "name"],
+            executor,
+        );
+        let row = SnapshotRow {
+            primary_key: vec!["7".to_string()],
+            values: BTreeMap::from([
+                ("id".to_string(), Some("7".to_string())),
+                ("artist_id".to_string(), None),
+                ("name".to_string(), Some("NULL".to_string())),
+            ]),
+        };
+
+        writer.update_row(&row).expect("update row");
+
+        assert_eq!(
+            writer.executor.statements.borrow()[0].params,
+            vec![
+                Value::NULL,
+                Value::Bytes(b"NULL".to_vec()),
+                Value::Bytes(b"7".to_vec())
+            ]
+        );
     }
 
     #[test]
@@ -582,8 +615,8 @@ mod tests {
 
     fn row(id: &str, name: &str) -> SnapshotRow {
         let mut values = BTreeMap::new();
-        values.insert("id".to_string(), id.to_string());
-        values.insert("name".to_string(), name.to_string());
+        values.insert("id".to_string(), Some(id.to_string()));
+        values.insert("name".to_string(), Some(name.to_string()));
 
         SnapshotRow {
             primary_key: vec![id.to_string()],
@@ -605,7 +638,7 @@ mod tests {
     fn wide_row(row_number: usize, columns: &[String]) -> SnapshotRow {
         let values = columns
             .iter()
-            .map(|column| (column.clone(), format!("{column}-{row_number}")))
+            .map(|column| (column.clone(), Some(format!("{column}-{row_number}"))))
             .collect();
 
         SnapshotRow {

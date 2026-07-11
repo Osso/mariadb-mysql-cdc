@@ -1873,8 +1873,8 @@ mod tests {
         SnapshotRow {
             primary_key: vec![id.to_string()],
             values: BTreeMap::from([
-                ("id".to_string(), id.to_string()),
-                ("name".to_string(), name.to_string()),
+                ("id".to_string(), Some(id.to_string())),
+                ("name".to_string(), Some(name.to_string())),
             ]),
         }
     }
@@ -1883,9 +1883,9 @@ mod tests {
         SnapshotRow {
             primary_key: vec![id.to_string()],
             values: BTreeMap::from([
-                ("id".to_string(), id.to_string()),
-                ("name".to_string(), name.to_string()),
-                ("updated_at".to_string(), updated_at.to_string()),
+                ("id".to_string(), Some(id.to_string())),
+                ("name".to_string(), Some(name.to_string())),
+                ("updated_at".to_string(), Some(updated_at.to_string())),
             ]),
         }
     }
@@ -1932,7 +1932,8 @@ mod tests {
         let after_update = request.updated_since.as_ref().is_none_or(|updated_since| {
             row.values
                 .get(&updated_since.column)
-                .is_some_and(|value| value >= &updated_since.value)
+                .and_then(Option::as_deref)
+                .is_some_and(|value| value >= updated_since.value.as_str())
         });
         after_start && before_end && after_update
     }

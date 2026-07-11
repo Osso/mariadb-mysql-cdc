@@ -17,7 +17,7 @@ impl MySqlSyncReader {
         }
     }
 
-    fn query_rows(&self, sql: &str) -> Result<Vec<Vec<String>>, TableSyncError> {
+    fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
         self.ensure_source()?
             .query_rows_as_strings(sql)
             .map_err(snapshot_error_to_table_sync)
@@ -100,7 +100,7 @@ fn updated_since_predicate(updated_since: &UpdatedSince) -> String {
 fn parse_sync_rows(
     columns: &[String],
     primary_key: &[String],
-    rows: Vec<Vec<String>>,
+    rows: Vec<Vec<Option<String>>>,
 ) -> Result<Vec<SnapshotRow>, TableSyncError> {
     rows.into_iter()
         .map(|fields| parse_sync_row(columns, primary_key, fields))
@@ -110,7 +110,7 @@ fn parse_sync_rows(
 fn parse_sync_row(
     columns: &[String],
     primary_key: &[String],
-    fields: Vec<String>,
+    fields: Vec<Option<String>>,
 ) -> Result<SnapshotRow, TableSyncError> {
     if fields.len() != columns.len() {
         return Err(TableSyncError::Read(format!(
@@ -134,13 +134,16 @@ fn parse_sync_row(
 
 fn primary_key_values(
     primary_key: &[String],
-    values: &BTreeMap<String, String>,
+    values: &BTreeMap<String, Option<String>>,
 ) -> Result<Vec<String>, TableSyncError> {
     primary_key
         .iter()
         .map(|column| {
-            values.get(column).cloned().ok_or_else(|| {
+            let value = values.get(column).cloned().ok_or_else(|| {
                 TableSyncError::Read(format!("primary key column `{column}` missing from row"))
+            })?;
+            value.ok_or_else(|| {
+                TableSyncError::Read(format!("primary key column `{column}` was NULL"))
             })
         })
         .collect()
@@ -202,4 +205,41 @@ fn quote_ident(identifier: &str) -> String {
 
 fn quote_sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn columns() -> Vec<String> {
+        vec![
+            "id".to_string(),
+            "artist_id".to_string(),
+            "name".to_string(),
+        ]
+    }
+
+    #[test]
+    fn preserves_null_values_and_rejects_null_primary_keys() {
+        let rows = parse_sync_rows(
+            &columns(),
+            &["id".to_string()],
+            vec![vec![Some("1".to_string()), None, Some("NULL".to_string())]],
+        )
+        .expect("row");
+
+        assert_eq!(rows[0].values["artist_id"], None);
+        assert_eq!(rows[0].values["name"], Some("NULL".to_string()));
+
+        let error = parse_sync_rows(
+            &columns(),
+            &["id".to_string()],
+            vec![vec![None, Some("2".to_string()), Some("name".to_string())]],
+        )
+        .expect_err("null primary key");
+        assert_eq!(
+            error.to_string(),
+            "sync read failed: primary key column `id` was NULL"
+        );
+    }
 }

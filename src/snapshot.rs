@@ -36,7 +36,7 @@ impl From<&crate::inventory::TableInventory> for SnapshotTable {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnapshotRow {
     pub primary_key: Vec<String>,
-    pub values: BTreeMap<String, String>,
+    pub values: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

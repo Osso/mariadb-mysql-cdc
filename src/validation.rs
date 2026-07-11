@@ -70,8 +70,8 @@ pub enum RowDivergenceKind {
     MissingTarget,
     ValueMismatch {
         differing_columns: Vec<String>,
-        source: BTreeMap<String, String>,
-        target: BTreeMap<String, String>,
+        source: BTreeMap<String, Option<String>>,
+        target: BTreeMap<String, Option<String>>,
     },
 }
 
@@ -335,8 +335,8 @@ fn value_mismatch(
 }
 
 fn differing_columns(
-    source: &BTreeMap<String, String>,
-    target: &BTreeMap<String, String>,
+    source: &BTreeMap<String, Option<String>>,
+    target: &BTreeMap<String, Option<String>>,
 ) -> Vec<String> {
     source
         .keys()
@@ -509,8 +509,8 @@ mod tests {
         SnapshotRow {
             primary_key: vec![id.to_string()],
             values: BTreeMap::from([
-                ("id".to_string(), id.to_string()),
-                ("name".to_string(), name.to_string()),
+                ("id".to_string(), Some(id.to_string())),
+                ("name".to_string(), Some(name.to_string())),
             ]),
         }
     }

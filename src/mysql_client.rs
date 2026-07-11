@@ -91,7 +91,19 @@ impl PersistentMySqlSource {
             .ok_or_else(|| {
                 SnapshotError::InvalidTable(format!("{} boundary was empty", table.name))
             })?;
-        Ok(row.unwrap().into_iter().map(value_to_string).collect())
+        row.unwrap()
+            .into_iter()
+            .map(value_to_string)
+            .enumerate()
+            .map(|(index, value)| {
+                value.ok_or_else(|| {
+                    SnapshotError::InvalidTable(format!(
+                        "primary-key column {} was NULL",
+                        table.primary_key[index]
+                    ))
+                })
+            })
+            .collect()
     }
 
     pub fn read_create_table(&self, table: &str) -> Result<String, SnapshotError> {
@@ -107,7 +119,7 @@ impl PersistentMySqlSource {
     pub(crate) fn query_rows_as_strings(
         &self,
         sql: &str,
-    ) -> Result<Vec<Vec<String>>, SnapshotError> {
+    ) -> Result<Vec<Vec<Option<String>>>, SnapshotError> {
         let rows = self
             .conn
             .borrow_mut()
@@ -387,6 +399,7 @@ fn row_to_tsv(row: mysql::Row) -> String {
     row.unwrap()
         .into_iter()
         .map(value_to_string)
+        .map(|value| value.unwrap_or_default())
         .collect::<Vec<_>>()
         .join("\t")
 }
@@ -485,10 +498,13 @@ fn snapshot_row_from_mysql_row(
         .primary_key
         .iter()
         .map(|column| {
-            values_by_column.get(column).cloned().ok_or_else(|| {
+            let value = values_by_column.get(column).cloned().ok_or_else(|| {
                 SnapshotError::InvalidTable(format!(
                     "primary-key column `{column}` was not selected"
                 ))
+            })?;
+            value.ok_or_else(|| {
+                SnapshotError::InvalidTable(format!("primary-key column `{column}` was NULL"))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -498,23 +514,23 @@ fn snapshot_row_from_mysql_row(
     })
 }
 
-fn row_to_strings(row: mysql::Row) -> Vec<String> {
+fn row_to_strings(row: mysql::Row) -> Vec<Option<String>> {
     row.unwrap().into_iter().map(value_to_string).collect()
 }
 
-pub(crate) fn value_to_string(value: Value) -> String {
+pub(crate) fn value_to_string(value: Value) -> Option<String> {
     match value {
-        Value::NULL => "NULL".to_string(),
-        Value::Bytes(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-        Value::Int(value) => value.to_string(),
-        Value::UInt(value) => value.to_string(),
-        Value::Float(value) => value.to_string(),
-        Value::Double(value) => value.to_string(),
+        Value::NULL => None,
+        Value::Bytes(bytes) => Some(String::from_utf8_lossy(&bytes).to_string()),
+        Value::Int(value) => Some(value.to_string()),
+        Value::UInt(value) => Some(value.to_string()),
+        Value::Float(value) => Some(value.to_string()),
+        Value::Double(value) => Some(value.to_string()),
         Value::Date(year, month, day, hour, minute, second, micros) => {
-            format_date(year, month, day, hour, minute, second, micros)
+            Some(format_date(year, month, day, hour, minute, second, micros))
         }
         Value::Time(negative, days, hours, minutes, seconds, micros) => {
-            format_time(negative, days, hours, minutes, seconds, micros)
+            Some(format_time(negative, days, hours, minutes, seconds, micros))
         }
     }
 }
@@ -653,15 +669,20 @@ mod tests {
 
     #[test]
     fn formats_mysql_values_like_snapshot_text_rows() {
-        assert_eq!(value_to_string(Value::Int(-5)), "-5");
-        assert_eq!(value_to_string(Value::UInt(5)), "5");
+        assert_eq!(value_to_string(Value::NULL), None);
+        assert_eq!(
+            value_to_string(Value::Bytes(b"NULL".to_vec())),
+            Some("NULL".to_string())
+        );
+        assert_eq!(value_to_string(Value::Int(-5)), Some("-5".to_string()));
+        assert_eq!(value_to_string(Value::UInt(5)), Some("5".to_string()));
         assert_eq!(
             value_to_string(Value::Date(2026, 6, 22, 12, 3, 4, 0)),
-            "2026-06-22 12:03:04"
+            Some("2026-06-22 12:03:04".to_string())
         );
         assert_eq!(
             value_to_string(Value::Time(false, 1, 2, 3, 4, 0)),
-            "26:03:04"
+            Some("26:03:04".to_string())
         );
     }
 

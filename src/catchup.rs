@@ -242,8 +242,8 @@ mod tests {
         SnapshotRow {
             primary_key: vec![id.to_string()],
             values: BTreeMap::from([
-                ("id".to_string(), id.to_string()),
-                ("name".to_string(), name.to_string()),
+                ("id".to_string(), Some(id.to_string())),
+                ("name".to_string(), Some(name.to_string())),
             ]),
         }
     }

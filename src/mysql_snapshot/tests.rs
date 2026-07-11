@@ -64,7 +64,19 @@ fn parses_snapshot_rows_with_primary_key_values() {
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].primary_key, vec!["1"]);
-    assert_eq!(rows[1].values["name"], "beta");
+    assert_eq!(rows[1].values["name"], Some("beta".to_string()));
+}
+
+#[test]
+fn rejects_null_snapshot_primary_key() {
+    let values = BTreeMap::from([
+        ("id".to_string(), None),
+        ("name".to_string(), Some("value".to_string())),
+    ]);
+
+    let error = primary_key_values(&["id".to_string()], &values).expect_err("null primary key");
+
+    assert_eq!(error.to_string(), "primary-key column `id` was NULL");
 }
 
 #[test]

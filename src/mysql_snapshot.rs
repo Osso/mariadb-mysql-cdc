@@ -644,7 +644,7 @@ fn parse_snapshot_row(
     let values = columns
         .iter()
         .cloned()
-        .zip(fields)
+        .zip(fields.into_iter().map(Some))
         .collect::<BTreeMap<_, _>>();
     let primary_key = primary_key_values(primary_key, &values)?;
     Ok(crate::snapshot::SnapshotRow {
@@ -656,15 +656,18 @@ fn parse_snapshot_row(
 #[cfg(test)]
 fn primary_key_values(
     primary_key: &[String],
-    values: &BTreeMap<String, String>,
+    values: &BTreeMap<String, Option<String>>,
 ) -> Result<Vec<String>, SnapshotError> {
     primary_key
         .iter()
         .map(|column| {
-            values.get(column).cloned().ok_or_else(|| {
+            let value = values.get(column).cloned().ok_or_else(|| {
                 SnapshotError::InvalidTable(format!(
                     "primary-key column `{column}` was not selected"
                 ))
+            })?;
+            value.ok_or_else(|| {
+                SnapshotError::InvalidTable(format!("primary-key column `{column}` was NULL"))
             })
         })
         .collect()
