@@ -526,7 +526,7 @@ fn fresh_run_id(prefix: &str) -> String {
         .unwrap_or_default()
         .as_millis();
     let sequence = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{millis}-{sequence}")
+    format!("{prefix}-{millis}-{}-{sequence}", std::process::id())
 }
 
 fn child_run_id(run_id: &str, table: &str) -> String {
