@@ -1,7 +1,8 @@
 use super::{ApplyBinlogConfig, MysqlCliExecutor, SourceBinlogConfig};
+use crate::mysql_support::ssl_opts_from_ca;
 use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder, SslOpts};
+use mysql::{Conn, Opts, OptsBuilder};
 use std::cell::RefCell;
 
 pub trait SourceSchemaReader {
@@ -148,7 +149,7 @@ fn source_opts(source: &SourceBinlogConfig) -> Opts {
         .user(Some(&source.user))
         .pass(Some(&source.password))
         .prefer_socket(false)
-        .ssl_opts(SslOpts::default());
+        .ssl_opts(ssl_opts_from_ca(Some(&source.tls_ca_file)));
     Opts::from(builder)
 }
 

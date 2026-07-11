@@ -7,6 +7,7 @@ use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
     SourceBinlogSettings, build_inventory,
 };
+use crate::mysql_support::TARGET_TLS_CA_FILE;
 use crate::probe::BinlogCoordinate;
 use crate::row::{DeleteRowsEvent, RowApplier, RowImage, RowTableMap, RowUpdate, TableMapEvent};
 use crate::statement::{StatementApplier, StatementEvent, StatementOutcome};
@@ -1813,6 +1814,7 @@ fn target_inventory_config(config: &ApplyBinlogConfig) -> InventoryConfig {
         password: config.target.password.clone(),
         endpoint_role: InventoryEndpointRole::Target,
         use_tls: true,
+        tls_ca_file: Some(TARGET_TLS_CA_FILE.to_string()),
         ..InventoryConfig::default()
     }
 }

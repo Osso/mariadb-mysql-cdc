@@ -2,9 +2,9 @@ use crate::checkpoint::Checkpoint;
 use crate::live::TargetMySqlConfig;
 #[cfg(test)]
 use crate::mysql_support::quote_ident;
-use crate::mysql_support::{quote_identifier_path, quote_sql_literal};
+use crate::mysql_support::{quote_identifier_path, quote_sql_literal, target_ssl_opts};
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder, SslOpts};
+use mysql::{Conn, Opts, OptsBuilder};
 use std::cell::{Cell, RefCell};
 
 const STREAM_CHECKPOINT_PREFIX: &str = "stream-binlog:";
@@ -269,7 +269,7 @@ fn target_opts(target: &TargetMySqlConfig) -> Opts {
         .pass(Some(&target.password))
         .db_name(Some(&target.database))
         .prefer_socket(false)
-        .ssl_opts(SslOpts::default());
+        .ssl_opts(target_ssl_opts());
     Opts::from(builder)
 }
 

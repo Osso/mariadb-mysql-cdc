@@ -1,8 +1,8 @@
-use crate::mysql_support::qualified_table_parts;
+use crate::mysql_support::{qualified_table_parts, target_ssl_opts};
 use crate::stream_checkpoint::default_stream_checkpoint_table;
 use crate::{live, mysql_snapshot};
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder, SslOpts};
+use mysql::{Conn, Opts, OptsBuilder};
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
@@ -675,7 +675,7 @@ fn mysql_opts(host: &str, port: u16, user: &str, password: &str, database: &str)
         .tcp_connect_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
         .read_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
         .write_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
-        .ssl_opts(SslOpts::default());
+        .ssl_opts(target_ssl_opts());
     Opts::from(builder)
 }
 

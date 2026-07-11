@@ -1,7 +1,9 @@
 use super::{TargetMySqlConfig, target_session_init_command};
-use crate::mysql_support::{quote_ident, quote_identifier_path, quote_sql_literal};
+use crate::mysql_support::{
+    quote_ident, quote_identifier_path, quote_sql_literal, target_ssl_opts,
+};
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder, SslOpts};
+use mysql::{Conn, Opts, OptsBuilder};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DdlEvent {
@@ -236,7 +238,7 @@ impl DdlEventLedger for MySqlDdlEventLedger {
 }
 
 fn target_opts(target: &TargetMySqlConfig) -> Opts {
-    let ssl = SslOpts::default();
+    let ssl = target_ssl_opts();
     Opts::from(
         OptsBuilder::default()
             .ip_or_hostname(Some(&target.host))

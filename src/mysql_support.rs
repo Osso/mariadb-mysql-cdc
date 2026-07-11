@@ -1,4 +1,22 @@
 use crate::live::TargetMySqlConfig;
+use mysql::SslOpts;
+use std::path::PathBuf;
+
+pub const TARGET_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/do-ca.pem";
+
+pub fn target_ssl_opts() -> SslOpts {
+    ssl_opts_from_ca(Some(TARGET_TLS_CA_FILE))
+}
+
+pub fn ssl_opts_from_ca(ca_file: Option<&str>) -> SslOpts {
+    let mut ssl = SslOpts::default();
+    if let Some(ca_file) = ca_file
+        && std::path::Path::new(ca_file).exists()
+    {
+        ssl = ssl.with_root_cert_path(Some(PathBuf::from(ca_file)));
+    }
+    ssl
+}
 
 pub fn target_mysql_args(target: &TargetMySqlConfig) -> Vec<String> {
     vec![

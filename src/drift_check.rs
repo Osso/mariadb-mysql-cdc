@@ -1,9 +1,9 @@
 use crate::checksum::{ChecksumColumn, ChecksumRequest, build_chunk_checksum_sql};
 use crate::live::TargetMySqlConfig;
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::{quote_ident, quote_sql_literal};
+use crate::mysql_support::{quote_ident, quote_sql_literal, target_ssl_opts};
 use mysql::prelude::{FromRow, Queryable};
-use mysql::{Conn, Opts, OptsBuilder, Row, SslOpts, Value};
+use mysql::{Conn, Opts, OptsBuilder, Row, Value};
 use std::cell::RefCell;
 use std::fmt;
 
@@ -874,7 +874,7 @@ fn connection_opts(config: &QueryConnectionConfig) -> Opts {
         .pass(Some(&config.password))
         .db_name(Some(&config.database))
         .prefer_socket(false)
-        .ssl_opts(SslOpts::default());
+        .ssl_opts(target_ssl_opts());
     Opts::from(builder)
 }
 

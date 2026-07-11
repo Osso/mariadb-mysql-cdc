@@ -4,7 +4,9 @@ use crate::live::{
     should_ignore_duplicate_row_change,
 };
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::{quote_ident, quote_identifier_path, quote_sql_literal};
+use crate::mysql_support::{
+    quote_ident, quote_identifier_path, quote_sql_literal, target_ssl_opts,
+};
 use crate::snapshot::{
     ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource,
     TableSnapshotProgress,
@@ -19,7 +21,7 @@ use crate::target::{
     TransactionalTargetExecutor, render_sql_statement,
 };
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder, Params, SslOpts, Value};
+use mysql::{Conn, Opts, OptsBuilder, Params, Value};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -455,7 +457,7 @@ fn base_opts(
         .db_name(Some(database))
         .prefer_socket(false);
     if use_tls {
-        builder = builder.ssl_opts(SslOpts::default());
+        builder = builder.ssl_opts(target_ssl_opts());
     }
     Opts::from(builder)
 }
