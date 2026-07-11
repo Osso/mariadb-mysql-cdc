@@ -1,7 +1,9 @@
 use crate::checksum::{ChecksumColumn, ChecksumRequest, build_chunk_checksum_sql};
 use crate::live::TargetMySqlConfig;
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::{quote_ident, quote_sql_literal, target_ssl_opts};
+use crate::mysql_support::{
+    SOURCE_TLS_CA_FILE, TARGET_TLS_CA_FILE, quote_ident, quote_sql_literal, ssl_opts_from_ca,
+};
 use mysql::prelude::{FromRow, Queryable};
 use mysql::{Conn, Opts, OptsBuilder, Row, Value};
 use std::cell::RefCell;
@@ -874,7 +876,7 @@ fn connection_opts(config: &QueryConnectionConfig) -> Opts {
         .pass(Some(&config.password))
         .db_name(Some(&config.database))
         .prefer_socket(false)
-        .ssl_opts(target_ssl_opts());
+        .ssl_opts(ssl_opts_from_ca(Some(&config.tls_ca_file)));
     Opts::from(builder)
 }
 
@@ -885,6 +887,7 @@ struct QueryConnectionConfig {
     user: String,
     password: String,
     database: String,
+    tls_ca_file: String,
 }
 
 fn source_query_config(config: &MySqlConnectionConfig) -> QueryConnectionConfig {
@@ -894,6 +897,7 @@ fn source_query_config(config: &MySqlConnectionConfig) -> QueryConnectionConfig 
         user: config.user.clone(),
         password: config.password.clone(),
         database: config.database.clone(),
+        tls_ca_file: SOURCE_TLS_CA_FILE.to_string(),
     }
 }
 
@@ -904,6 +908,7 @@ fn target_query_config(target: &TargetMySqlConfig) -> QueryConnectionConfig {
         user: target.user.clone(),
         password: target.password.clone(),
         database: target.database.clone(),
+        tls_ca_file: TARGET_TLS_CA_FILE.to_string(),
     }
 }
 
@@ -1268,5 +1273,62 @@ mod tests {
         assert!(!is_missing_table_error(
             "ERROR 1051 (42S02): Unknown table 'db.accounts'"
         ));
+    }
+
+    #[test]
+    fn drift_check_uses_endpoint_specific_tls_ca_paths() {
+        assert_eq!(
+            source_query_config(&MySqlConnectionConfig::default()).tls_ca_file,
+            SOURCE_TLS_CA_FILE
+        );
+        assert_eq!(
+            target_query_config(&TargetMySqlConfig::default()).tls_ca_file,
+            TARGET_TLS_CA_FILE
+        );
+
+        let source_ca = temporary_ca_path("source");
+        let target_ca = temporary_ca_path("target");
+        std::fs::write(&source_ca, b"source-ca").expect("write source CA fixture");
+        std::fs::write(&target_ca, b"target-ca").expect("write target CA fixture");
+
+        let source = QueryConnectionConfig {
+            host: "source".to_string(),
+            port: 3306,
+            user: "source-user".to_string(),
+            password: "source-password".to_string(),
+            database: "source-db".to_string(),
+            tls_ca_file: source_ca.to_string_lossy().into_owned(),
+        };
+        let target = QueryConnectionConfig {
+            host: "target".to_string(),
+            port: 3306,
+            user: "target-user".to_string(),
+            password: "target-password".to_string(),
+            database: "target-db".to_string(),
+            tls_ca_file: target_ca.to_string_lossy().into_owned(),
+        };
+
+        let source_opts = connection_opts(&source);
+        let target_opts = connection_opts(&target);
+        let source_root = source_opts
+            .get_ssl_opts()
+            .and_then(|ssl| ssl.root_cert_path());
+        let target_root = target_opts
+            .get_ssl_opts()
+            .and_then(|ssl| ssl.root_cert_path());
+
+        assert_eq!(source_root, Some(source_ca.as_path()));
+        assert_eq!(target_root, Some(target_ca.as_path()));
+        assert_ne!(source_root, target_root);
+
+        let _ = std::fs::remove_file(source_ca);
+        let _ = std::fs::remove_file(target_ca);
+    }
+
+    fn temporary_ca_path(endpoint: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "mariadb-mysql-cdc-drift-check-{endpoint}-{}-ca.pem",
+            std::process::id()
+        ))
     }
 }

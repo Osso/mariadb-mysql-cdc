@@ -2,6 +2,7 @@ use crate::live::TargetMySqlConfig;
 use mysql::SslOpts;
 use std::path::PathBuf;
 
+pub const SOURCE_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/source-ca.pem";
 pub const TARGET_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/do-ca.pem";
 
 pub fn target_ssl_opts() -> SslOpts {
