@@ -262,6 +262,20 @@ pub fn sync_table_with_progress_range(
     let mut start_after = progress.last_primary_key.clone().or(range_start_after);
 
     let result = (|| {
+        preflight_delete_budget(
+            DeletePreflightOptions {
+                table,
+                chunk_size,
+                mode,
+                start_after: start_after.clone(),
+                range_end_at: range_end_at.clone(),
+                existing_deletes: report.extra_target_rows,
+                max_deletes,
+            },
+            source,
+            target,
+        )?;
+
         loop {
             let Some(next_start_after) = sync_next_chunk(SyncChunkContext {
                 table,
@@ -351,6 +365,116 @@ where
     } else {
         Ok(Some(end_at))
     }
+}
+
+struct DeletePreflightOptions<'a> {
+    table: &'a SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    start_after: Option<Vec<String>>,
+    range_end_at: Option<Vec<String>>,
+    existing_deletes: u64,
+    max_deletes: Option<u64>,
+}
+
+fn preflight_delete_budget<S, T>(
+    options: DeletePreflightOptions<'_>,
+    source: &S,
+    target: &T,
+) -> Result<(), TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+{
+    if options.mode != SyncMode::Apply || options.max_deletes.is_none() {
+        return Ok(());
+    }
+
+    let extra_target_rows = count_total_extra_rows(
+        options.table,
+        options.chunk_size,
+        options.start_after,
+        options.range_end_at,
+        source,
+        target,
+    )?;
+    ensure_delete_allowed(
+        options.existing_deletes + extra_target_rows,
+        options.max_deletes,
+        options.mode,
+    )
+}
+
+fn count_total_extra_rows<S, T>(
+    table: &SyncTable,
+    chunk_size: usize,
+    mut start_after: Option<Vec<String>>,
+    range_end_at: Option<Vec<String>>,
+    source: &S,
+    target: &T,
+) -> Result<u64, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+{
+    let mut extra_target_rows = 0;
+    loop {
+        let source_rows = source.read_rows(&sync_chunk_request(
+            table,
+            start_after.clone(),
+            range_end_at.clone(),
+            chunk_size,
+        ))?;
+        if source_rows.is_empty() {
+            let tail_extra_rows =
+                count_target_tail_extra_rows(table, start_after, range_end_at, chunk_size, target)?;
+            return Ok(extra_target_rows + tail_extra_rows);
+        }
+
+        let end_at = last_primary_key(&source_rows)?;
+        extra_target_rows += count_source_window_extra_rows(
+            table,
+            start_after.clone(),
+            end_at.clone(),
+            chunk_size,
+            &source_rows,
+            target,
+        )?;
+        if source_rows.len() < chunk_size {
+            let tail_extra_rows = count_target_tail_extra_rows(
+                table,
+                Some(end_at),
+                range_end_at,
+                chunk_size,
+                target,
+            )?;
+            return Ok(extra_target_rows + tail_extra_rows);
+        }
+        start_after = Some(end_at);
+    }
+}
+
+fn count_source_window_extra_rows(
+    table: &SyncTable,
+    start_after: Option<Vec<String>>,
+    end_at: Vec<String>,
+    chunk_size: usize,
+    source_rows: &[SnapshotRow],
+    target: &impl SyncTableReader,
+) -> Result<u64, TableSyncError> {
+    let target_rows = read_target_window(table, start_after, Some(end_at), chunk_size, target)?;
+    Ok(count_extra_target_rows(source_rows, &target_rows))
+}
+
+fn count_target_tail_extra_rows(
+    table: &SyncTable,
+    start_after: Option<Vec<String>>,
+    range_end_at: Option<Vec<String>>,
+    chunk_size: usize,
+    target: &impl SyncTableReader,
+) -> Result<u64, TableSyncError> {
+    let target_rows = read_target_window(table, start_after, range_end_at, chunk_size, target)?;
+    Ok(count_extra_target_rows(&[], &target_rows))
 }
 
 fn repair_source_chunk<S, T, R, P>(
@@ -1041,11 +1165,17 @@ fn repair_extra_rows(
     report: &mut SyncTableReport,
     max_deletes: Option<u64>,
 ) -> Result<(), TableSyncError> {
-    for primary_key in target_by_key
+    let extra_primary_keys: Vec<_> = target_by_key
         .keys()
         .filter(|primary_key| !source_by_key.contains_key(*primary_key))
-    {
-        ensure_delete_allowed(report.extra_target_rows, max_deletes, mode)?;
+        .collect();
+    ensure_delete_allowed(
+        report.extra_target_rows + extra_primary_keys.len() as u64,
+        max_deletes,
+        mode,
+    )?;
+
+    for primary_key in extra_primary_keys {
         apply_delete(primary_key, mode, repair_target)?;
         report.extra_target_rows += 1;
     }
@@ -1110,12 +1240,20 @@ fn rows_by_key(rows: &[SnapshotRow]) -> BTreeMap<Vec<String>, &SnapshotRow> {
         .collect()
 }
 
+fn count_extra_target_rows(source_rows: &[SnapshotRow], target_rows: &[SnapshotRow]) -> u64 {
+    let source_by_key = rows_by_key(source_rows);
+    rows_by_key(target_rows)
+        .keys()
+        .filter(|primary_key| !source_by_key.contains_key(*primary_key))
+        .count() as u64
+}
+
 fn ensure_delete_allowed(
-    existing_deletes: u64,
+    total_deletes: u64,
     max_deletes: Option<u64>,
     mode: SyncMode,
 ) -> Result<(), TableSyncError> {
-    if mode == SyncMode::Apply && max_deletes.is_some_and(|limit| existing_deletes >= limit) {
+    if mode == SyncMode::Apply && max_deletes.is_some_and(|limit| total_deletes > limit) {
         return Err(TableSyncError::Repair(format!(
             "delete safety threshold exceeded: max_deletes={}",
             max_deletes.expect("checked max deletes")
@@ -1510,6 +1648,85 @@ mod tests {
         assert_eq!(
             repair_target.deletes.borrow().as_slice(),
             &[vec!["2".to_string()]]
+        );
+    }
+
+    #[test]
+    fn apply_rejects_total_extra_rows_before_any_mutation() {
+        let source = FakeReader::new(vec![
+            row("1", "new"),
+            row("2", "missing"),
+            row("3", "missing"),
+            row("6", "missing"),
+        ]);
+        let target = FakeReader::new(vec![row("1", "old"), row("4", "extra"), row("5", "extra")]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::default();
+
+        let error = sync_table_with_progress_range(
+            &account_table(),
+            SyncRunOptions {
+                run_id: "test-run".to_string(),
+                run_scope: "test-scope".to_string(),
+                chunk_size: 2,
+                mode: SyncMode::Apply,
+                start_after: None,
+                end_at: None,
+                max_deletes: Some(1),
+            },
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+        )
+        .expect_err("delete ceiling");
+
+        assert_eq!(
+            error.to_string(),
+            "sync repair failed: delete safety threshold exceeded: max_deletes=1"
+        );
+        assert!(repair_target.inserts.borrow().is_empty());
+        assert!(repair_target.updates.borrow().is_empty());
+        assert!(repair_target.deletes.borrow().is_empty());
+        assert!(repair_target.operations.borrow().is_empty());
+    }
+
+    #[test]
+    fn apply_accepts_exact_total_extra_row_ceiling() {
+        let source = FakeReader::new(vec![
+            row("1", "new"),
+            row("2", "missing"),
+            row("3", "missing"),
+            row("6", "missing"),
+        ]);
+        let target = FakeReader::new(vec![row("1", "old"), row("4", "extra"), row("5", "extra")]);
+        let mut repair_target = RecordingRepairTarget::default();
+        let mut progress_store = RecordingProgressStore::default();
+
+        let report = sync_table_with_progress_range(
+            &account_table(),
+            SyncRunOptions {
+                run_id: "test-run".to_string(),
+                run_scope: "test-scope".to_string(),
+                chunk_size: 2,
+                mode: SyncMode::Apply,
+                start_after: None,
+                end_at: None,
+                max_deletes: Some(2),
+            },
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+        )
+        .expect("sync report");
+
+        assert_eq!(report.extra_target_rows, 2);
+        assert_eq!(
+            repair_target.operations.borrow().as_slice(),
+            &[
+                "update:1", "insert:2", "delete:4", "delete:5", "insert:3", "insert:6",
+            ]
         );
     }
 

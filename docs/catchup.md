@@ -164,8 +164,10 @@ mariadb-mysql-cdc sync-table ... \
 
 Normal range repair reports extra target rows. Deletion requires `--mode apply`
 and an explicit nonzero `--max-deletes`; otherwise the default limit is zero.
-Repair is operator-scheduled, not automatically triggered by live-stream
-conflicts. Use a fresh run ID for each recurring repair; reuse an ID only for the
-same interrupted run. A completed run ID is terminal, and an `--updated-since`
-retry restarts from the beginning because rows can become newly eligible behind a
-saved primary key.
+Apply mode preflights all target extras in the selected range before mutating: if
+the total exceeds the ceiling, the run fails without inserts, updates, or
+deletes. An exact ceiling succeeds. Repair is operator-scheduled, not
+automatically triggered by live-stream conflicts. Use a fresh run ID for each
+recurring repair; reuse an ID only for the same interrupted run. A completed run
+ID is terminal, and an `--updated-since` retry restarts from the beginning because
+rows can become newly eligible behind a saved primary key.

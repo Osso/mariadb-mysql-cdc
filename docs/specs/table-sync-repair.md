@@ -11,6 +11,8 @@ CDC stream has already been applying forward changes.
 - [x] Report target updates needed for rows whose compared column values differ.
 - [x] Report extra target rows and, in `apply` mode only, delete at most the explicit
   `--max-deletes` allowance; the default allowance is zero.
+- [x] Preflight the total target extras for an apply run before mutating; reject an
+  over-ceiling run with zero inserts, updates, or deletes, while accepting an exact ceiling.
 - [x] Support `dry-run` mode that reports repairs without applying them.
 - [x] Support `apply` mode that inserts missing rows, updates divergent rows, and performs
   only the allowed bounded orphan deletes.
