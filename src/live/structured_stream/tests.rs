@@ -137,6 +137,100 @@ fn source_query_ddl_is_replayed_as_checkpointed_statement() {
 }
 
 #[test]
+fn supported_ddl_replays_without_manual_resolution() {
+    let executor = TransactionRecordingExecutor::default();
+    let mut applier = crate::row::RowApplier::new(executor);
+    let ledger = RecordingDdlLedger::default();
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "ALTER TABLE home_feed_panel_candidates ADD COLUMN filter_prompt_version VARCHAR(64) DEFAULT NULL AFTER filter_reason, ADD COLUMN filtered_time DATETIME NULL DEFAULT NULL AFTER filter_prompt_version".to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let outcome = handle_automatic_ddl_event(
+        &mut applier,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect("compatible DDL replay")
+    .expect("automatic DDL outcome");
+
+    assert_eq!(
+        outcome.resume_coordinate,
+        Some(BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 180,
+        })
+    );
+    assert_eq!(
+        applier.executor().operations(),
+        vec!["EXEC", "BEGIN", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
+    );
+    assert!(ledger.recorded.borrow().is_empty());
+}
+
+#[test]
+fn failed_supported_ddl_replay_does_not_checkpoint() {
+    let executor = TransactionRecordingExecutor::failing();
+    let mut applier = crate::row::RowApplier::new(executor);
+    let ledger = RecordingDdlLedger::default();
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "ALTER TABLE accounts ADD COLUMN handle varchar(64)".to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let error = handle_automatic_ddl_event(
+        &mut applier,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect_err("target DDL failure must stop replay");
+
+    assert!(error.to_string().contains("failed to replay statement"));
+    assert_eq!(applier.executor().operations(), vec!["EXEC"]);
+    assert!(ledger.recorded.borrow().is_empty());
+}
+
+#[test]
 fn qualified_ddl_with_different_default_database_still_requires_manual_resolution() {
     let state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let event = BinlogEvent::QueryEvent(QueryEvent {
@@ -147,6 +241,29 @@ fn qualified_ddl_with_different_default_database_still_requires_manual_resolutio
         database_name: "other_db".to_string(),
         sql_statement: "ALTER TABLE fixture_cdc . accounts ADD COLUMN handle varchar(64)"
             .to_string(),
+    });
+
+    let manual = manual_ddl_event(
+        "production-source",
+        "mysqld-bin.000777",
+        &event_header(2, 180),
+        &event,
+        &state,
+    );
+
+    assert!(manual.is_some());
+}
+
+#[test]
+fn mariadb_only_ddl_requires_manual_resolution() {
+    let state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE SEQUENCE invoice_numbers".to_string(),
     });
 
     let manual = manual_ddl_event(
@@ -174,7 +291,7 @@ fn transactional_stream_records_ddl_pending_without_executing_or_checkpointing()
         error_code: 0,
         status_variables: Vec::new(),
         database_name: "fixture_cdc".to_string(),
-        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int) WITH SYSTEM VERSIONING".to_string(),
     });
     let mut context = StreamEventContext {
         schema_resolver: &resolver,
@@ -212,7 +329,8 @@ fn transactional_stream_records_ddl_pending_without_executing_or_checkpointing()
 #[test]
 fn resolved_ddl_advances_checkpoint_without_reexecuting_sql() {
     let executor = TransactionRecordingExecutor::default();
-    let ledger = RecordingDdlLedger::resolved("CREATE TABLE now_manual (id int)");
+    let ledger =
+        RecordingDdlLedger::resolved("CREATE TABLE now_manual (id int) WITH SYSTEM VERSIONING");
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let mut current_file = "mysqld-bin.000777".to_string();
@@ -223,7 +341,7 @@ fn resolved_ddl_advances_checkpoint_without_reexecuting_sql() {
         error_code: 0,
         status_variables: Vec::new(),
         database_name: "fixture_cdc".to_string(),
-        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int) WITH SYSTEM VERSIONING".to_string(),
     });
     let mut context = StreamEventContext {
         schema_resolver: &resolver,
@@ -274,7 +392,7 @@ fn resolved_ddl_with_different_raw_sql_does_not_advance_checkpoint() {
         error_code: 0,
         status_variables: Vec::new(),
         database_name: "fixture_cdc".to_string(),
-        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int) WITH SYSTEM VERSIONING".to_string(),
     });
     let mut context = StreamEventContext {
         schema_resolver: &resolver,
@@ -304,7 +422,8 @@ fn resolved_ddl_with_different_raw_sql_does_not_advance_checkpoint() {
 #[test]
 fn resolved_ddl_refuses_to_move_checkpoint_backward() {
     let executor = TransactionRecordingExecutor::default();
-    let ledger = RecordingDdlLedger::resolved("CREATE TABLE now_manual (id int)");
+    let ledger =
+        RecordingDdlLedger::resolved("CREATE TABLE now_manual (id int) WITH SYSTEM VERSIONING");
     let checkpoint_store = FixedCheckpointStore {
         checkpoint: crate::checkpoint::Checkpoint {
             source_file: "mysqld-bin.000777".to_string(),
@@ -327,7 +446,7 @@ fn resolved_ddl_refuses_to_move_checkpoint_backward() {
         error_code: 0,
         status_variables: Vec::new(),
         database_name: "fixture_cdc".to_string(),
-        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int) WITH SYSTEM VERSIONING".to_string(),
     });
     let mut context = StreamEventContext {
         schema_resolver: &resolver,
@@ -367,7 +486,8 @@ fn resolved_ddl_locks_and_rejects_a_concurrently_advanced_checkpoint() {
                 description: "concurrent later checkpoint".to_string(),
             },
         });
-    let ledger = RecordingDdlLedger::resolved("CREATE TABLE now_manual (id int)");
+    let ledger =
+        RecordingDdlLedger::resolved("CREATE TABLE now_manual (id int) WITH SYSTEM VERSIONING");
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let mut current_file = "mysqld-bin.000777".to_string();
@@ -378,7 +498,7 @@ fn resolved_ddl_locks_and_rejects_a_concurrently_advanced_checkpoint() {
         error_code: 0,
         status_variables: Vec::new(),
         database_name: "fixture_cdc".to_string(),
-        sql_statement: "CREATE TABLE now_manual (id int)".to_string(),
+        sql_statement: "CREATE TABLE now_manual (id int) WITH SYSTEM VERSIONING".to_string(),
     });
     let mut context = StreamEventContext {
         schema_resolver: &resolver,

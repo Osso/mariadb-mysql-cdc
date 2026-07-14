@@ -1,8 +1,8 @@
 # DDL Resolution Runbook
 
-`stream-binlog` never auto-executes a source schema-changing `QueryEvent` on the MySQL target. It flushes earlier DML, records the DDL boundary in a target-side ledger, and stops before checkpointing past it. This is intentional: MariaDB source DDL can be incompatible with the target or require an operational migration plan.
+`stream-binlog` automatically executes source schema-changing `QueryEvent` SQL covered by its MySQL-compatible allowlist. Recognized DDL rejected by compatibility policy, or whose qualified identifiers make the target schema ambiguous, becomes a manual boundary: the stream flushes earlier DML, records the event in a target-side ledger, and stops before checkpointing past it.
 
-The durable contract is [Manual DDL Resolution](specs/manual-ddl-resolution.md).
+The durable contract is [DDL Replay and Manual Resolution](specs/manual-ddl-resolution.md).
 
 ## Configuration
 
@@ -141,9 +141,9 @@ stores `source_server_id`, `event_end_position`, `schema_name`, exact `raw_sql`,
 
 ## Required procedure
 
-### 1. Stop at the DDL boundary
+### 1. Stop at the manual DDL boundary
 
-When the stream exits with `manual DDL resolution required`, retain the emitted `source_server_id`, `file`, `start_position`, `end_position`, schema, and SQL. Earlier DML has already been flushed. The DDL has **not** been executed and the checkpoint has **not** advanced past it.
+Compatible DDL is replayed automatically and never reaches this procedure. When the stream exits with `manual DDL resolution required`, retain the emitted `source_server_id`, `file`, `start_position`, `end_position`, schema, and SQL. Earlier DML has already been flushed. The rejected or ambiguous DDL has **not** been executed and the checkpoint has **not** advanced past it.
 
 Do not restart repeatedly while the row is pending. It will stop at the same boundary.
 

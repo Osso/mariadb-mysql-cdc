@@ -23,15 +23,15 @@ The target is not trusted until rehearsals show low or zero divergence.
 
 ## Event Handling
 
-Offline fixtures and `apply-binlog` may contain statement and row events.
-Production `stream-binlog` requires ROW/FULL, while still treating source DDL
-`QueryEvent` boundaries manually.
+Production `stream-binlog` requires ROW/FULL while automatically replaying DDL
+approved by the MySQL compatibility policy. The removed `apply-binlog` text mode
+is not a supported execution path.
 
-- Compatible statements are replayed only by offline/application paths.
+- Compatible DDL is replayed by the production stream path.
 - Row events are applied as target DML once table metadata is available.
 - Unsupported data-changing events stop the applier or enter quarantine with
   exact coordinates.
-- DDL is initially treated as a cutover blocker, not an automatic operation.
+- Recognized unsafe, MariaDB-only, or ambiguous DDL uses manual resolution.
 
 ## Parser Strategy
 
@@ -68,11 +68,12 @@ Target writes are generated as parameterized MySQL statements and executed
 through a trait-backed writer. Snapshot rows use batched upserts, while CDC
 updates/deletes use primary-key predicates. See `docs/target-writer.md`.
 
-Statement events pass through a conservative allowlist before replay. Narrow
-DML is replayed; source schema-changing DDL is recorded in a manual-resolution
-ledger and stops the stream before its checkpoint, while MariaDB-only syntax,
-unsafe file/definer patterns, and unknown non-DDL statement types are quarantined
-with source coordinates. See `docs/statement-events.md` and
+Statement events pass through a conservative allowlist before replay. Production
+streaming rejects statement DML but automatically replays compatible DDL.
+Recognized schema-changing DDL rejected by compatibility policy or made ambiguous
+by qualified identifiers is recorded in a manual-resolution ledger and stops the
+stream before its checkpoint. Unknown statements are quarantined with source
+coordinates. See `docs/statement-events.md` and
 `docs/ddl-resolution.md`.
 
 Row events are applied from table-map metadata. Each insert is a plain target

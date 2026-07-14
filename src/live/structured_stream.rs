@@ -331,18 +331,27 @@ fn stream_once(
             current_file: &mut current_file,
             group_config,
         };
-        let outcome = match handle_manual_ddl_event(
-            applier.executor(),
-            &ddl_ledger,
+        let outcome = match handle_automatic_ddl_event(
+            &mut applier,
             &source_identity,
             &mut context,
             &header,
             &event,
         )? {
             Some(outcome) => outcome,
-            None => {
-                apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?
-            }
+            None => match handle_manual_ddl_event(
+                applier.executor(),
+                &ddl_ledger,
+                &source_identity,
+                &mut context,
+                &header,
+                &event,
+            )? {
+                Some(outcome) => outcome,
+                None => {
+                    apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?
+                }
+            },
         };
         log_stream_progress(&mut progress, &outcome);
     }
@@ -517,6 +526,44 @@ struct StreamEventContext<'a, R, C> {
     group_config: TargetTransactionGroupConfig,
 }
 
+fn handle_automatic_ddl_event<E, R, C>(
+    applier: &mut RowApplier<E>,
+    source_identity: &str,
+    context: &mut StreamEventContext<'_, R, C>,
+    header: &EventHeader,
+    event: &BinlogEvent,
+) -> Result<Option<StructuredEventOutcome>, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    R: TableSchemaResolver,
+    C: StreamCheckpointStore,
+{
+    let Some((query, ddl_event)) = automatically_handled_ddl_event(
+        source_identity,
+        context.current_file,
+        header,
+        event,
+        context.state,
+    ) else {
+        return Ok(None);
+    };
+
+    flush_grouped_transaction(applier.executor(), context)?;
+    let outcome = handle_structured_event(
+        applier,
+        context.schema_resolver,
+        context.state,
+        context.current_file,
+        header,
+        event,
+    )?;
+    checkpoint_resolved_ddl(applier.executor(), context, event, &ddl_event)?;
+    context
+        .schema_resolver
+        .invalidate_schema(&query.database_name);
+    Ok(Some(outcome))
+}
+
 fn handle_manual_ddl_event<E, R, C, D>(
     executor: &E,
     ledger: &D,
@@ -548,6 +595,28 @@ where
     handle_ddl_status(executor, ledger, context, event, query, ddl_event, status)
 }
 
+fn automatically_handled_ddl_event<'a>(
+    source_identity: &str,
+    current_file: &str,
+    header: &EventHeader,
+    event: &'a BinlogEvent,
+    state: &StructuredEventState,
+) -> Option<(&'a mysql_cdc::events::query_event::QueryEvent, DdlEvent)> {
+    let BinlogEvent::QueryEvent(query) = event else {
+        return None;
+    };
+    let can_handle_automatically = state.should_apply_schema(&query.database_name)
+        && !query_contains_qualified_identifier(&query.sql_statement)
+        && crate::statement::is_automatically_handled_schema_change(&query.sql_statement);
+    if !can_handle_automatically {
+        return None;
+    }
+    Some((
+        query,
+        ddl_event(source_identity, current_file, header, query),
+    ))
+}
+
 fn manual_ddl_event<'a>(
     source_identity: &str,
     current_file: &str,
@@ -565,6 +634,11 @@ fn manual_ddl_event<'a>(
         || query.database_name.is_empty()
         || query_references_source_schema(state, &query.sql_statement);
     if !may_target_source_schema {
+        return None;
+    }
+    if automatically_handled_ddl_event(source_identity, current_file, header, event, state)
+        .is_some()
+    {
         return None;
     }
     Some((

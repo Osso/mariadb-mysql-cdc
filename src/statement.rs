@@ -548,7 +548,23 @@ pub(crate) fn is_supported_statement_start(sql: &str) -> bool {
 }
 
 pub fn is_schema_changing_statement(sql: &str) -> bool {
-    is_known_compatible_ddl(&normalize_policy_whitespace(sql))
+    let normalized_sql = normalize_policy_whitespace(sql);
+    matches!(
+        first_keyword(&normalized_sql),
+        Some("ALTER" | "CREATE" | "DROP" | "RENAME" | "TRUNCATE")
+    )
+}
+
+pub(crate) fn is_automatically_handled_schema_change(sql: &str) -> bool {
+    if !is_schema_changing_statement(sql) {
+        return false;
+    }
+
+    let normalized_sql = normalize_statement(sql);
+    matches!(
+        classify_statement(&normalized_sql),
+        StatementDecision::Replay | StatementDecision::Skip
+    )
 }
 
 pub(crate) fn is_data_changing_statement(sql: &str) -> bool {

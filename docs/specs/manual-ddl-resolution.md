@@ -1,15 +1,24 @@
-# Manual DDL Resolution
+# DDL Replay and Manual Resolution
 
-`stream-binlog` treats source schema-changing `QueryEvent` records as an operator-controlled migration boundary. The stream contract is described here; [the DDL resolution runbook](../ddl-resolution.md) describes the ledger and operator procedure.
+`stream-binlog` automatically replays schema changes covered by the compatible statement allowlist and uses an operator-controlled ledger for DDL that cannot be replayed safely. The [DDL resolution runbook](../ddl-resolution.md) describes the ledger and operator procedure.
 
 ## What it must do
 
-### Stream safety
+### Automatic replay
 
-- [x] Never auto-execute a source schema-changing `QueryEvent` on the target.
-- [x] Flush all earlier grouped DML and their checkpoints before handling the DDL boundary.
-- [x] Record an unseen DDL boundary as `pending` in the target DDL ledger, keyed by base source incarnation identity plus event server ID, binlog file, and event start position.
-- [x] Stop at a pending DDL boundary without checkpointing past it.
+- [x] Automatically execute source schema-changing `QueryEvent` SQL when the statement classifier identifies it as compatible with the MySQL target.
+- [x] Automatically replay compatible `ALTER TABLE` statements, including multiple `ADD COLUMN` clauses and ordinary `DEFAULT`, `COMMENT`, and `AFTER` clauses.
+- [x] Route compatible DDL through normal checkpoint handling and invalidate cached target schema state after replay.
+- [x] Do not require a DDL ledger entry or operator intervention for automatically replayable DDL.
+- [x] Keep statement DML forbidden in production `ROW`/`FULL` streaming even though compatible DDL is replayed.
+
+### Manual-resolution safety
+
+- [x] Require manual resolution when a recognized schema-changing statement is rejected by compatibility policy because it is unsafe, MariaDB-only, or contains a disallowed multi-statement sequence.
+- [x] Require manual resolution when the event cannot be safely associated with the configured source schema, including qualified-identifier ambiguity.
+- [x] Flush all earlier grouped DML and their checkpoints before handling a manual DDL boundary.
+- [x] Record an unseen manual DDL boundary as `pending` in the target DDL ledger, keyed by base source incarnation identity plus event server ID, binlog file, and event start position.
+- [x] Stop at a pending manual DDL boundary without checkpointing past it.
 - [x] Keep the exact source SQL, source server identity, schema, and event end position in the ledger record.
 - [x] Enforce pending-only inserts with a validated target trigger and reject runtime credentials that can update, delete, alter, drop, trigger, or role-bypass the ledger.
 - [x] Keep `cdc_stream` without `TRIGGER`; grant it only `EXECUTE` on the exact `<table>_trigger_inventory` `SQL SECURITY DEFINER` routine used for trigger inspection.
@@ -20,11 +29,11 @@
 
 ### Manual resolution and restart
 
-- [x] Resume past a DDL boundary only when its existing ledger row is `resolved`.
+- [x] Resume past a manual DDL boundary only when its existing ledger row is `resolved`.
 - [x] Require the ledger row's raw SQL to exactly equal the replayed source SQL before advancing.
-- [x] Advance the checkpoint to the DDL event end position without executing the DDL again.
+- [x] Advance the checkpoint to the manually resolved DDL event end position without executing the DDL again.
 - [x] Invalidate cached target schema state after a resolved boundary.
-- [x] Never treat target errors such as object already exists or object missing as resolution. They cannot resolve or checkpoint a DDL boundary; an operator must apply and validate the exact DDL, then explicitly resolve the ledger row.
+- [x] Never treat target errors such as object already exists or object missing as manual resolution.
 
 ### Operator interface
 
@@ -39,27 +48,26 @@
 
 ## Implementation inventory
 
-- `src/live/structured_stream.rs` — detects schema-changing query events, flushes prior DML, gates progress on the ledger, and checkpoints resolved boundaries.
-- `src/live/ddl_ledger.rs` — validates the ledger and runtime grants, calls the exact derived `<table>_trigger_inventory` routine, validates returned trigger metadata, and records pending events.
+- `src/live/structured_stream.rs` — routes compatible DDL to automatic replay and incompatible or ambiguous DDL to the manual ledger.
+- `src/live/ddl_ledger.rs` — validates the ledger and runtime grants, validates trigger metadata, and records pending events.
 - `src/live.rs` — owns the default ledger table and validates its configuration.
 - `src/main.rs` — exposes `--ddl-ledger-table`.
-- `src/statement.rs` — classifies source schema-changing statements.
+- `src/statement.rs` — classifies automatically replayable and manually resolved schema changes.
 
 ## Tests asserting this spec
 
-- `src/live/structured_stream/tests.rs` — pending DDL does not execute SQL or checkpoint; resolved DDL advances only to the end position without executing SQL.
+- `src/live/structured_stream/tests.rs` — compatible DDL bypasses manual resolution; automatic replay failure does not checkpoint; unsafe and ambiguous DDL remains pending; resolved manual DDL enforces exact SQL and checkpoint monotonicity before advancing without re-execution.
+- `src/statement.rs` — compatible, unsafe, MariaDB-only, and unsupported statement classification.
 - `src/live/ddl_ledger.rs` — ledger schema, immutable coordinate lookup, and pending insert behavior.
 - `src/tests.rs` — parses `--ddl-ledger-table` into stream configuration.
 
 ## Known gaps (current cycle)
 
 - [ ] Add an end-to-end startup test proving a real target with a missing or mismatched ledger guard fails before source replication begins.
-- [x] Add a test that a resolved ledger row with non-identical raw SQL fails without checkpointing.
 - [ ] Add an end-to-end test proving a real target DDL error cannot turn a pending row into `resolved`.
-- [x] Document the inspect-apply-validate-resolve-restart sequence with immutable-coordinate and exact-SQL guards.
 
 ## Out of scope
 
-- Automatically translating, applying, or retrying source DDL on the target.
-- Declaring a DDL safe from a generic target error such as already-exists or missing-object.
+- Automatically translating SQL that the compatibility policy rejects.
+- Treating target errors as proof that a manual DDL boundary was applied correctly.
 - Resolving target schema divergence caused by an operator marking a row resolved before applying and validating the DDL.

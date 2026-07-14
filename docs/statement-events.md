@@ -7,10 +7,11 @@ is a contract violation and stops without checkpointing.
 
 ## Replay Policy
 
-`apply-binlog` can replay the compatible statement allowlist used for fixture and
-offline application, including compatible DDL. Production `stream-binlog`
-rejects statement DML and intercepts every recognized schema-changing
-`QueryEvent` before that applier, using manual DDL resolution instead.
+Production `stream-binlog` replays the compatible DDL allowlist while rejecting
+statement DML because its source contract requires `ROW` binlogs with `FULL` row
+images. The removed `apply-binlog` text mode is not a supported execution path. Recognized schema changes
+rejected by compatibility policy or whose target schema is ambiguous use manual
+DDL resolution instead.
 
 The narrow DML allowlist includes:
 
@@ -25,12 +26,17 @@ no parameters because they came from the source binlog text.
 
 ## Schema-changing Query Events
 
-In `stream-binlog`, source schema-changing `QueryEvent` records are not replayed
-or quarantined as ordinary statements. The live stream flushes earlier DML,
-records the exact event
-in the target DDL ledger as `pending`, and exits without checkpointing past it.
-An operator must apply and validate the target schema change, then resolve the
-same ledger record before restart. See [DDL Resolution Runbook](ddl-resolution.md).
+In `stream-binlog`, compatible source schema-changing `QueryEvent` records are
+executed automatically and checkpointed through normal stream handling. This
+includes compatible `ALTER TABLE` statements with multiple column additions and
+ordinary column-position or comment clauses.
+
+When compatibility policy rejects a recognized schema change, or qualified identifiers make
+the target schema ambiguous, the live stream flushes earlier DML, records the
+exact event in the target DDL ledger as `pending`, and exits without checkpointing
+past it. An operator must apply and validate that target schema change, then
+resolve the same ledger record before restart. See the [DDL Resolution
+Runbook](ddl-resolution.md).
 
 ## Quarantine Policy
 

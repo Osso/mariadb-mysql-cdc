@@ -25,9 +25,11 @@ a standalone migration/CDC tool.
 ## Current Status
 
 The structured stream consumes native MariaDB row events and persists its
-checkpoint in the target transaction. Source schema-changing `QueryEvent` records
-are a manual migration boundary: the stream flushes earlier DML, writes a pending
-row to a target-side DDL ledger, and stops without checkpointing past the event.
+checkpoint in the target transaction. It automatically replays schema-changing
+`QueryEvent` records approved by the MySQL compatibility policy. Recognized DDL
+that is unsafe, MariaDB-only, or ambiguous becomes a manual boundary: the stream
+flushes earlier DML, writes a pending row to a target-side DDL ledger, and stops
+without checkpointing past the event.
 Snapshot, drift-check, checksum localization, and primary-key table repair
 commands support rehearsal and eventual convergence. Skipped duplicate conflicts
 are observable reconciliation debt; the stream does not schedule repairs
@@ -41,11 +43,12 @@ rehearsal tooling, not evidence of production schema/data parity.
 
 ## DDL Resolution
 
-The stream never auto-executes source schema-changing DDL. The default ledger is
-`cdc.ddl_events`; use `--ddl-ledger-table TABLE` to configure another qualified
-table. An operator must review the recorded exact source SQL, apply and validate
-the intended target schema change, then update the same ledger row to `resolved`
-with a resolution note. On restart, the stream verifies the ledger raw SQL is an
+The stream automatically executes DDL approved by its compatibility policy.
+Recognized DDL rejected by that policy, or whose target schema is ambiguous, uses
+the default `cdc.ddl_events` ledger; use `--ddl-ledger-table TABLE` to configure
+another qualified table. An operator must review the recorded exact source SQL,
+apply and validate the intended target schema change, then update the same ledger
+row to `resolved` with a resolution note. On restart, the stream verifies the ledger raw SQL is an
 exact match and advances the checkpoint without re-executing the DDL.
 
 Generic target errors—including already-exists and missing-object errors—never
