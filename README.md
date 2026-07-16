@@ -24,12 +24,18 @@ a standalone migration/CDC tool.
 
 ## Current Status
 
-The structured stream consumes native MariaDB row events and persists its
-checkpoint in the target transaction. It automatically replays schema-changing
-`QueryEvent` records approved by the MySQL compatibility policy. Recognized DDL
-that is unsafe, MariaDB-only, or ambiguous becomes a manual boundary: the stream
-flushes earlier DML, writes a pending row to a target-side DDL ledger, and stops
-without checkpointing past the event.
+The structured stream consumes native MariaDB row events and persists grouped
+row-event checkpoints in the target transaction. Automatic DDL is executed
+separately and its checkpoint is saved only after successful execution; the DDL
+and checkpoint update are not atomic as one operation. It automatically replays
+unqualified, compatible application-schema `QueryEvent` DDL: tables, indexes,
+views, routines,
+events, triggers, `RENAME TABLE`, `TRUNCATE TABLE`, and `DROP` operations.
+Database/schema DDL remains manual because the target requires global database
+DDL privileges. Qualified or cross-schema DDL, unsafe `DEFINER`/`SQL SECURITY
+DEFINER` syntax, MariaDB-only syntax, and other rejected DDL become a manual
+boundary: the stream flushes earlier DML, writes a pending row to a target-side
+DDL ledger, and stops without checkpointing past the event.
 Snapshot, drift-check, checksum localization, and primary-key table repair
 commands support rehearsal and eventual convergence. Skipped duplicate conflicts
 are observable reconciliation debt; the stream does not schedule repairs
@@ -43,22 +49,26 @@ rehearsal tooling, not evidence of production schema/data parity.
 
 ## DDL Resolution
 
-The stream automatically executes DDL approved by its compatibility policy.
-Recognized DDL rejected by that policy, or whose target schema is ambiguous, uses
-the default `cdc.ddl_events` ledger; use `--ddl-ledger-table TABLE` to configure
-another qualified table. An operator must review the recorded exact source SQL,
-apply and validate the intended target schema change, then update the same ledger
-row to `resolved` with a resolution note. On restart, the stream verifies the ledger raw SQL is an
-exact match and advances the checkpoint without re-executing the DDL.
+The stream automatically executes only unqualified, compatible application-schema
+DDL. Recognized database/schema DDL, qualified or cross-schema DDL, unsafe
+`DEFINER`/`SQL SECURITY DEFINER` syntax, MariaDB-only syntax, and other rejected
+DDL use the default `cdc.ddl_events` ledger; use `--ddl-ledger-table TABLE` to
+configure another qualified table. An operator must review the recorded exact
+source SQL, apply and validate the intended target schema change, then update the
+same ledger row to `resolved` with a resolution note. On restart, the stream
+verifies the ledger raw SQL is an exact match and advances the checkpoint without
+re-executing the DDL.
 
 Generic target errors—including already-exists and missing-object errors—never
 count as DDL success. Resolving before target apply and validation causes schema
 divergence because the stream will checkpoint past the source DDL. Startup also
 fails closed when the configured ledger schema, guards, trigger-inventory
 routine, returned trigger metadata, or runtime grants do not match the bootstrap
-contract. The restricted `cdc_stream` account lacks `TRIGGER` and receives only
+contract. The restricted `cdc_stream` account has application-schema `TRIGGER`
+for source trigger replay but lacks `TRIGGER` and other mutation privileges on
+the `cdc` ledger. It receives only
 `GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';`
-for the exact `SQL SECURITY DEFINER` inventory routine; it never reads
+for the exact `SQL SECURITY DEFINER` inventory routine and never reads
 `information_schema.triggers` directly. Bootstrap/resolver operators must
 independently inspect the routine definition and actual trigger rows. See
 [DDL Resolution Runbook](docs/ddl-resolution.md).

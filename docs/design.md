@@ -27,11 +27,16 @@ Production `stream-binlog` requires ROW/FULL while automatically replaying DDL
 approved by the MySQL compatibility policy. The removed `apply-binlog` text mode
 is not a supported execution path.
 
-- Compatible DDL is replayed by the production stream path.
+- Compatible, unqualified application-object DDL is replayed by the production
+  stream path: tables, indexes, views, routines, events, triggers, `RENAME
+  TABLE`, `TRUNCATE TABLE`, and `DROP` operations.
+- Database/schema DDL is manual because the target would require global database
+  DDL privileges.
+- Qualified or cross-schema DDL, unsafe `DEFINER`/`SQL SECURITY DEFINER` syntax,
+  MariaDB-only syntax, and disallowed multi-statement DDL use manual resolution.
 - Row events are applied as target DML once table metadata is available.
 - Unsupported data-changing events stop the applier or enter quarantine with
   exact coordinates.
-- Recognized unsafe, MariaDB-only, or ambiguous DDL uses manual resolution.
 
 ## Parser Strategy
 
@@ -46,7 +51,8 @@ tool starts applying anything to a target.
 
 ## Safety
 
-- Checkpoint every committed target transaction.
+- Checkpoint every committed target DML transaction; automatic DDL checkpoints
+  only after successful execution.
 - Make writes idempotent where possible.
 - Validate table counts and sampled checksums during rehearsal.
 - Keep exact binlog coordinates in every error.
@@ -69,12 +75,12 @@ through a trait-backed writer. Snapshot rows use batched upserts, while CDC
 updates/deletes use primary-key predicates. See `docs/target-writer.md`.
 
 Statement events pass through a conservative allowlist before replay. Production
-streaming rejects statement DML but automatically replays compatible DDL.
-Recognized schema-changing DDL rejected by compatibility policy or made ambiguous
-by qualified identifiers is recorded in a manual-resolution ledger and stops the
-stream before its checkpoint. Unknown statements are quarantined with source
-coordinates. See `docs/statement-events.md` and
-`docs/ddl-resolution.md`.
+streaming rejects statement DML but automatically replays compatible, unqualified
+application-object DDL. Recognized database/schema, qualified or cross-schema,
+unsafe, MariaDB-only, or otherwise rejected DDL is recorded in a
+manual-resolution ledger and stops the stream before its checkpoint. Unknown
+statements are quarantined with source coordinates. See
+`docs/statement-events.md` and `docs/ddl-resolution.md`.
 
 Row events are applied from table-map metadata. Each insert is a plain target
 `INSERT` with the explicit source primary key, updates use after images, and

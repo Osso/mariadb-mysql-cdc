@@ -60,8 +60,10 @@ BEGIN
 END//
 
 -- The stream account cannot see information_schema.triggers directly because it
--- correctly lacks TRIGGER. Keep this routine DEFINER-secured and grant only
--- EXECUTE to the stream account. For a custom schema.table ledger, rename this
+-- lacks TRIGGER on the ledger and other ledger mutation privileges. The
+-- application-schema grant intentionally includes TRIGGER for automatic source
+-- trigger replay. Keep this routine DEFINER-secured and grant only EXECUTE to
+-- the stream account. For a custom schema.table ledger, rename this
 -- routine to <table>_trigger_inventory and update the schema/table literals.
 DROP PROCEDURE IF EXISTS cdc.ddl_events_trigger_inventory//
 CREATE DEFINER=CURRENT_USER PROCEDURE cdc.ddl_events_trigger_inventory()
@@ -86,9 +88,9 @@ DELIMITER ;
 GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';
 
 -- Bootstrap/resolver credentials must independently inspect the actual routine
--- definition and trigger rows. The cdc_stream account lacks TRIGGER and does
--- not run these information_schema.triggers checks; runtime only CALLs the
--- exact DEFINER routine above and validates its returned metadata.
+-- definition and trigger rows. The cdc_stream account lacks ledger TRIGGER
+-- and does not run these information_schema.triggers checks; runtime only CALLs
+-- the exact DEFINER routine above and validates its returned metadata.
 SHOW CREATE PROCEDURE cdc.ddl_events_trigger_inventory;
 SELECT
     trigger_name,

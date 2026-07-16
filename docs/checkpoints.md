@@ -44,6 +44,21 @@ the same transaction as grouped target DML. `stream-binlog` rejects
 coordinate is the event end position, so reconnect starts after the applied
 event.
 
+Automatic compatible application-schema DDL is processed after grouped DML is
+flushed. The DDL executes first; only after successful execution does the stream
+save the checkpoint for that QueryEvent's `end_log_pos` in a separate target
+transaction and invalidate the target schema cache. Automatic DDL does not create
+a ledger row. DDL execution and checkpoint persistence are not one atomic
+operation: a failure between them can leave the target DDL applied while the
+durable checkpoint remains before the DDL. If target execution fails, the stream
+stops and the checkpoint remains before the DDL.
+
+Manual DDL is different: the stream flushes earlier DML, inserts the exact event
+and coordinates into `cdc.ddl_events` as `pending`, and stops without advancing
+past it. After an operator applies and validates the target change and marks the
+same row `resolved`, restart requires an exact raw-SQL match and advances the
+checkpoint to the recorded event end position without re-executing the DDL.
+
 ```bash
 mariadb-mysql-cdc stream-binlog \
   --source-host 192.0.2.10 \

@@ -495,6 +495,15 @@ const COMPATIBLE_DDL_PREFIXES: &[&str] = &[
     "TRUNCATE ",
 ];
 
+const DATABASE_DDL_PREFIXES: &[&str] = &[
+    "ALTER DATABASE ",
+    "ALTER SCHEMA ",
+    "CREATE DATABASE ",
+    "CREATE SCHEMA ",
+    "DROP DATABASE ",
+    "DROP SCHEMA ",
+];
+
 const COMPOUND_BODY_DDL_PREFIXES: &[&str] = &[
     "ALTER EVENT ",
     "CREATE EVENT ",
@@ -561,6 +570,10 @@ pub(crate) fn is_automatically_handled_schema_change(sql: &str) -> bool {
     }
 
     let normalized_sql = normalize_statement(sql);
+    if starts_with_any_ci(&normalized_sql, DATABASE_DDL_PREFIXES) {
+        return false;
+    }
+
     matches!(
         classify_statement(&normalized_sql),
         StatementDecision::Replay | StatementDecision::Skip
@@ -601,6 +614,73 @@ fn first_keyword(sql: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn automatically_handles_full_application_schema_ddl_only() {
+        for sql in [
+            "CREATE TABLE accounts (id BIGINT PRIMARY KEY)",
+            "ALTER TABLE accounts ADD COLUMN handle VARCHAR(64)",
+            "CREATE VIEW active_accounts AS SELECT id FROM accounts",
+            "ALTER VIEW active_accounts AS SELECT id FROM accounts WHERE id > 0",
+            "DROP VIEW active_accounts",
+            "CREATE INDEX idx_handle ON accounts (handle)",
+            "DROP INDEX idx_handle ON accounts",
+            "RENAME TABLE accounts TO accounts_archive",
+            "TRUNCATE TABLE accounts_archive",
+            "DROP TABLE accounts_archive",
+            "CREATE PROCEDURE refresh_accounts() SELECT 1",
+            "ALTER PROCEDURE refresh_accounts COMMENT 'refresh'",
+            "DROP PROCEDURE refresh_accounts",
+            "CREATE FUNCTION account_count() RETURNS INT RETURN 1",
+            "ALTER FUNCTION account_count COMMENT 'count'",
+            "DROP FUNCTION account_count",
+            "CREATE EVENT prune_accounts ON SCHEDULE EVERY 1 DAY DO DELETE FROM accounts WHERE id < 0",
+            "ALTER EVENT prune_accounts DISABLE",
+            "DROP EVENT prune_accounts",
+            "CREATE TRIGGER accounts_before_insert BEFORE INSERT ON accounts FOR EACH ROW SET NEW.id = NEW.id",
+            "DROP TRIGGER accounts_before_insert",
+        ] {
+            assert!(is_automatically_handled_schema_change(sql), "{sql}");
+        }
+
+        for sql in [
+            "CREATE DATABASE archive",
+            "CREATE SCHEMA archive",
+            "ALTER DATABASE globalcomix CHARACTER SET utf8mb4",
+            "ALTER SCHEMA globalcomix CHARACTER SET utf8mb4",
+            "DROP DATABASE archive",
+            "DROP SCHEMA archive",
+        ] {
+            assert!(!is_automatically_handled_schema_change(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn runtime_grants_cover_full_application_schema_ddl_without_global_ddl() {
+        let grants = include_str!("../docs/ddl-runtime-grants.sql.example");
+
+        for privilege in [
+            "CREATE",
+            "ALTER",
+            "DROP",
+            "INDEX",
+            "REFERENCES",
+            "CREATE VIEW",
+            "SHOW VIEW",
+            "CREATE ROUTINE",
+            "ALTER ROUTINE",
+            "EXECUTE",
+            "EVENT",
+            "TRIGGER",
+        ] {
+            assert!(grants.contains(privilege), "missing {privilege}");
+        }
+        assert!(grants.contains("ON globalcomix.*"));
+        assert!(!grants.contains("ON *.*"));
+        assert!(!grants.contains("GRANT ALL"));
+        assert!(!grants.contains("WITH GRANT OPTION"));
+        assert!(!grants.contains("\n    CREATE USER,"));
+    }
 
     #[test]
     fn replays_known_compatible_dml() {

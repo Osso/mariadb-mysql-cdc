@@ -570,6 +570,10 @@ fn grant_can_mutate_ledger(grant: &str, ledger_table: &str) -> bool {
     let Some((ledger_schema, ledger_table_name)) = ledger_table.split_once('.') else {
         return true;
     };
+    if scope == "*.*" {
+        return privileges != ["USAGE"];
+    }
+
     if privileges.contains(&"EXECUTE") {
         let expected_inventory_procedure = format!(
             "PROCEDURE {ledger_schema}.{}",
@@ -577,13 +581,14 @@ fn grant_can_mutate_ledger(grant: &str, ledger_table: &str) -> bool {
         );
         let is_exact_inventory_grant =
             privileges.len() == 1 && scope == expected_inventory_procedure;
-        if !is_exact_inventory_grant {
-            return true;
+        if is_exact_inventory_grant {
+            return false;
         }
-        return false;
-    }
-    if scope == "*.*" {
-        return privileges != ["USAGE"];
+
+        let is_non_ledger_schema_wide = scope
+            .strip_suffix(".*")
+            .is_some_and(|schema| schema != ledger_schema);
+        return !is_non_ledger_schema_wide;
     }
 
     let scope_covers_ledger = scope == ledger_table || scope == format!("{ledger_schema}.*");
@@ -830,6 +835,14 @@ mod tests {
         assert!(sql.contains("'pending'"));
         assert!(sql.contains("ALTER TABLE accounts ADD COLUMN handle varchar(64)"));
         assert!(!sql.contains("ON DUPLICATE KEY UPDATE"));
+    }
+
+    #[test]
+    fn accepts_full_application_schema_ddl_grants() {
+        assert!(!grant_can_mutate_ledger(
+            "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, REFERENCES, INDEX, ALTER, EXECUTE, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EVENT, TRIGGER ON `globalcomix`.* TO `cdc_stream`@`%`",
+            "cdc.ddl_events"
+        ));
     }
 
     #[test]

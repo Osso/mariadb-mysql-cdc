@@ -1,6 +1,16 @@
 # DDL Resolution Runbook
 
-`stream-binlog` automatically executes source schema-changing `QueryEvent` SQL covered by its MySQL-compatible allowlist. Recognized DDL rejected by compatibility policy, or whose qualified identifiers make the target schema ambiguous, becomes a manual boundary: the stream flushes earlier DML, records the event in a target-side ledger, and stops before checkpointing past it.
+`stream-binlog` automatically executes compatible, unqualified application-object
+DDL in the configured source schema: tables, indexes, views, routines, events,
+triggers, `RENAME TABLE`, `TRUNCATE TABLE`, and `DROP` operations. Database/schema
+DDL is manual even when its statement prefix is recognized, because the target
+would require global database DDL privileges.
+
+Any qualified or cross-schema DDL, unsafe `DEFINER` or `SQL SECURITY DEFINER`
+syntax, MariaDB-only syntax, or disallowed multi-statement DDL is also manual.
+For a manual boundary, the stream flushes earlier DML, records the exact event
+in the target-side ledger, does not execute the source SQL, and stops before
+checkpointing past it.
 
 The durable contract is [DDL Replay and Manual Resolution](specs/manual-ddl-resolution.md).
 
@@ -15,8 +25,10 @@ The ledger defaults to `cdc.ddl_events`. Set a different qualified table only wh
 Before first startup, stop the stream and run
 [`ddl-control-plane-bootstrap.sql`](ddl-control-plane-bootstrap.sql) with
 resolver/admin credentials. The stream does not create or repair this control
-plane. `cdc_stream` intentionally lacks `TRIGGER` and must not inspect
-`information_schema.triggers` directly. For ledger table `schema.table`, the
+plane. `cdc_stream` lacks `TRIGGER` and other mutation privileges on the ledger
+but retains application-schema `TRIGGER` for automatic source trigger replay; it
+must not inspect `information_schema.triggers` directly. For ledger table
+`schema.table`, the
 only trigger-inspection path available to the runtime is the exact
 `schema.<table>_trigger_inventory()` `SQL SECURITY DEFINER` procedure created by
 bootstrap. On every startup, before source replication begins, the runtime calls
@@ -35,15 +47,23 @@ Provision the restricted account from
 [`ddl-runtime-grants.sql.example`](ddl-runtime-grants.sql.example) after replacing
 the password and reviewing the application schema. Use separate credentials:
 
-- `cdc_stream`: target DML; `SELECT`, `INSERT`, and `UPDATE` on
+- `cdc_stream`: `SELECT`, `INSERT`, `UPDATE`, and `DELETE` for target DML plus
+  schema-scoped `CREATE`, `ALTER`, `DROP`, `INDEX`, `REFERENCES`, `CREATE VIEW`,
+  `SHOW VIEW`, `CREATE ROUTINE`, `ALTER ROUTINE`, `EXECUTE`, `EVENT`, and
+  `TRIGGER` on the application schema. This supports automatic table, index,
+  view, routine, event, trigger, rename, truncate, and drop replay.
+  Database/schema DDL remains manual because it would require global DDL
+  privileges. The account also receives `SELECT`, `INSERT`, and `UPDATE` on
   `cdc.stream_checkpoint`; `SELECT`, `INSERT` on `cdc.ddl_events`; and the exact
   `GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';`
   (or the corresponding `<table>_trigger_inventory` procedure for a custom
-  ledger). It must not have
-  `UPDATE`, `DELETE`, `ALTER`, `DROP`, or `TRIGGER` on the ledger, global `ALL`,
-  or active role grants. Startup fails closed when those privileges could
-  resolve or replace a ledger row. The validated trigger rejects any inserted
-  ledger row whose status is not `pending` or whose resolution note is set.
+  ledger). It must not have `UPDATE`, `DELETE`, `ALTER`, `DROP`, or `TRIGGER` on
+  the ledger, global `ALL`, global DDL, `GRANT OPTION`, `PROXY`, account/role/
+  server/resource-group/tablespace administration, or active role grants.
+  Startup fails closed when those privileges could resolve or replace a ledger
+  row. The
+  validated trigger rejects any inserted ledger row whose status is not
+  `pending` or whose resolution note is set.
 - Resolver/operator credential: reviewed access to apply target schema changes
   and update `cdc.ddl_events.status` and `resolution_note`.
 
@@ -143,7 +163,14 @@ stores `source_server_id`, `event_end_position`, `schema_name`, exact `raw_sql`,
 
 ### 1. Stop at the manual DDL boundary
 
-Compatible DDL is replayed automatically and never reaches this procedure. When the stream exits with `manual DDL resolution required`, retain the emitted `source_server_id`, `file`, `start_position`, `end_position`, schema, and SQL. Earlier DML has already been flushed. The rejected or ambiguous DDL has **not** been executed and the checkpoint has **not** advanced past it.
+Compatible, unqualified application-object DDL is replayed automatically and
+never reaches this procedure. Database/schema DDL, qualified or cross-schema
+DDL, unsafe `DEFINER`/`SQL SECURITY DEFINER` DDL, MariaDB-only forms, and
+otherwise rejected DDL do reach it. When the stream exits with `manual DDL
+resolution required`, retain the emitted `source_server_id`, `file`,
+`start_position`, `end_position`, schema, and SQL. Earlier DML has already been
+flushed. The rejected DDL has **not** been executed and the checkpoint has **not**
+advanced past it.
 
 Do not restart repeatedly while the row is pending. It will stop at the same boundary.
 
