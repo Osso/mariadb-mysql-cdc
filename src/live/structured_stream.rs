@@ -1236,7 +1236,30 @@ fn dots_outside_string_literals(characters: &[char]) -> Vec<usize> {
     let mut dots = Vec::new();
     let mut quote = None;
     let mut escaped = false;
-    for (index, character) in characters.iter().copied().enumerate() {
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut index = 0;
+
+    while index < characters.len() {
+        let character = characters[index];
+        let next = characters.get(index + 1).copied();
+
+        if in_line_comment {
+            if character == '\n' {
+                in_line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_block_comment {
+            if character == '*' && next == Some('/') {
+                in_block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
         if let Some(quote_character) = quote {
             if escaped {
                 escaped = false;
@@ -1245,12 +1268,32 @@ fn dots_outside_string_literals(characters: &[char]) -> Vec<usize> {
             } else if character == quote_character {
                 quote = None;
             }
+            index += 1;
             continue;
         }
-        if character == '\'' || character == '"' {
-            quote = Some(character);
-        } else if character == '.' {
-            dots.push(index);
+
+        match (character, next) {
+            ('-', Some('-')) => {
+                in_line_comment = true;
+                index += 2;
+            }
+            ('#', _) => {
+                in_line_comment = true;
+                index += 1;
+            }
+            ('/', Some('*')) => {
+                in_block_comment = true;
+                index += 2;
+            }
+            ('\'' | '"', _) => {
+                quote = Some(character);
+                index += 1;
+            }
+            ('.', _) => {
+                dots.push(index);
+                index += 1;
+            }
+            _ => index += 1,
         }
     }
     dots
@@ -1295,7 +1338,7 @@ fn is_unquoted_identifier_character(character: char) -> bool {
 }
 
 fn is_identifier_edge(character: char) -> bool {
-    is_unquoted_identifier_character(character) || character == '`'
+    is_unquoted_identifier_character(character) || matches!(character, '`' | '"')
 }
 
 fn is_transaction_control_query(sql: &str) -> bool {

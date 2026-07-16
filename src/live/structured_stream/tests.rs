@@ -1379,12 +1379,19 @@ fn detects_qualified_identifiers_across_mysql_quoting_forms() {
         "INSERT INTO `other_db`.accounts VALUES (1)",
         "INSERT INTO other_db.`accounts` VALUES (1)",
         "INSERT INTO `other_db`.`accounts` VALUES (1)",
+        "INSERT INTO \"other_db\".\"accounts\" VALUES (1)",
         "INSERT INTO other_db . accounts VALUES (1)",
     ] {
         assert!(query_contains_qualified_identifier(sql), "missed {sql}");
     }
     assert!(!query_contains_qualified_identifier(
         "INSERT INTO accounts (amount, note) VALUES (1.5, 'other_db.accounts')"
+    ));
+    assert!(!query_contains_qualified_identifier(
+        "-- Sentence ending here. NULL remains valid.\r\nALTER TABLE `accounts` ADD COLUMN `variant_id` SMALLINT"
+    ));
+    assert!(!query_contains_qualified_identifier(
+        "/* prose mentions other_db.accounts but is not SQL */ ALTER TABLE `accounts` ADD COLUMN `variant_id` SMALLINT"
     ));
 }
 

@@ -18,10 +18,13 @@ Database/schema DDL (`CREATE|ALTER|DROP DATABASE` or `SCHEMA`) is never automati
 even though those prefixes are recognized; it is a manual boundary because the
 MySQL target would require global database DDL privileges.
 
-Any explicit qualified identifier (`schema.object`), cross-schema reference,
-unsafe `DEFINER` or `SQL SECURITY DEFINER` clause, MariaDB-only syntax, or
-otherwise disallowed multi-statement DDL is manual resolution, not automatic
-replay. The manual path preserves the exact source SQL in the DDL ledger.
+Any explicit qualified identifier (`schema.object`), including backtick and
+ANSI_QUOTES double-quoted forms, cross-schema reference, unsafe `DEFINER` or
+`SQL SECURITY DEFINER` clause, MariaDB-only syntax, or otherwise disallowed
+multi-statement DDL is manual resolution, not automatic replay. Qualification
+scanning ignores line and block comment text, so prose punctuation cannot turn
+an unqualified DDL statement into a false manual boundary. The manual path
+preserves the exact source SQL in the DDL ledger.
 
 The narrow DML allowlist includes:
 
