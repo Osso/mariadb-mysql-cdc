@@ -96,7 +96,7 @@ mod tests {
             user: "cdc".to_string(),
             password: "secret".to_string(),
             database: Some("app".to_string()),
-            tls_ca_file: "/etc/mariadb-mysql-cdc/source-ca.pem".to_string(),
+            tls_ca_file: String::new(),
             binlog_file: "mysqld-bin.000777".to_string(),
             start_position: 12345,
             stop_position: Some(45678),

@@ -250,7 +250,7 @@ fn core_config_accepts_plaintext_source_without_tls_ca() {
 #[test]
 fn core_config_rejects_updated_since_with_primary_key_bounds() {
     let source = crate::mysql_snapshot::MySqlConnectionConfig {
-        tls_ca_file: Some(crate::mysql_support::SOURCE_TLS_CA_FILE.to_string()),
+        tls_ca_file: None,
         ..Default::default()
     };
     let config = SyncTableConfig {

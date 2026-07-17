@@ -1,10 +1,9 @@
-use crate::live::{SourceBinlogConfig, TargetMySqlConfig};
+use crate::live::TargetMySqlConfig;
 use mysql::{Opts, OptsBuilder, SslOpts};
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-pub const SOURCE_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/source-ca.pem";
 pub const TARGET_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/do-ca.pem";
 
 pub fn target_mysql_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
@@ -32,17 +31,6 @@ pub fn target_ssl_opts(target: &TargetMySqlConfig) -> Result<SslOpts, String> {
         ),
         &target.host,
         &target.tls_ca_file,
-    )
-}
-
-pub fn source_ssl_opts(source: &SourceBinlogConfig) -> Result<SslOpts, String> {
-    ssl_opts_from_ca(
-        &format!(
-            "source TLS CA file endpoint `{}`:{}",
-            source.host, source.port
-        ),
-        &source.host,
-        &source.tls_ca_file,
     )
 }
 
