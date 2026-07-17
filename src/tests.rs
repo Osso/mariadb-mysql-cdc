@@ -41,6 +41,8 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "TARGET_PASSWORD",
         "--target-database",
         "app_target",
+        "--target-tls-ca-file",
+        "/tmp/custom-target-ca.pem",
         "--insert-conflict-policy",
         "ignore-duplicate",
         "--checkpoint-table",
@@ -72,6 +74,7 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
     assert_eq!(config.target.port, 25060);
     assert_eq!(config.target.password, "target-secret");
     assert_eq!(config.target.database, "app_target");
+    assert_eq!(config.target.tls_ca_file, "/tmp/custom-target-ca.pem");
     assert_eq!(
         config.target.insert_conflict_policy,
         live::InsertConflictPolicy::IgnoreDuplicate

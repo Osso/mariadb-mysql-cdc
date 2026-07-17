@@ -82,6 +82,7 @@ Apply options:
   --target-user USER              MySQL target user.
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
+  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --ddl-ledger-table TABLE         Manual DDL resolution ledger. Defaults to cdc.ddl_events.
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
@@ -99,6 +100,7 @@ Catchup snapshot options:
   --target-user USER              MySQL target user.
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
+  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --progress-file PATH            Local fallback checkpoint file.
   --progress-table TABLE          Target checkpoint table. Defaults to cdc.table_sync_progress.
 
@@ -529,6 +531,7 @@ fn apply_target_option(
         "--target-user" => target.user = value.to_string(),
         "--target-password-env" => target.password = read_env_password(value)?,
         "--target-database" => target.database = value.to_string(),
+        "--target-tls-ca-file" => target.tls_ca_file = value.to_string(),
         "--insert-conflict-policy" => target.insert_conflict_policy = parse_insert_policy(value)?,
         _ => return Ok(false),
     }
