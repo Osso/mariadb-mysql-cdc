@@ -33,20 +33,12 @@ GRANT SELECT, INSERT, UPDATE
     ON cdc.row_conflicts
     TO 'cdc_stream'@'%';
 
-GRANT SELECT, INSERT
-    ON cdc.ddl_events
-    TO 'cdc_stream'@'%';
-
 GRANT SELECT, INSERT, UPDATE
     ON cdc.ddl_replay_journal
     TO 'cdc_stream'@'%';
 
 GRANT EXECUTE
     ON PROCEDURE cdc.row_conflicts_trigger_inventory
-    TO 'cdc_stream'@'%';
-
-GRANT EXECUTE
-    ON PROCEDURE cdc.ddl_events_trigger_inventory
     TO 'cdc_stream'@'%';
 
 GRANT EXECUTE
@@ -59,9 +51,8 @@ GRANT EXECUTE
 -- * global scope: USAGE only;
 -- * exact checkpoint SELECT/INSERT/UPDATE;
 -- * exact row-conflicts SELECT/INSERT/UPDATE;
--- * exact manual-ledger SELECT/INSERT;
 -- * exact journal SELECT/INSERT/UPDATE;
--- * EXECUTE only on the three reviewed trigger-inventory procedures;
+-- * EXECUTE only on the two reviewed trigger-inventory procedures;
 -- * no GRANT OPTION, PROXY, roles, ALL, global mutation, schema-wide cdc
 --   mutation/object creation, or ledger/journal DELETE/ALTER/DROP/TRIGGER.
 --
