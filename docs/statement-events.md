@@ -9,19 +9,27 @@ statement DML QueryEvent is a contract violation.
 Statement DML is never replayed in the production stream. The removed
 `apply-binlog` text path is not a supported health check.
 
-Automatic DDL admission is only an explicitly named, unqualified, visible,
-non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX` whose key parts and
-options are completely modeled and whose FK dependency is disproven from the
-fenced target inventory. The parser rejects comments, ambiguous/incomplete syntax, double-quoted
-identifiers when ANSI_QUOTES mode is not captured, qualified names (including
-backtick-qualified names), generated names, `IF EXISTS`,
-unique/fulltext/spatial/invisible forms, and unmodeled options. Unqualified
-backtick identifiers are tokenized; their real-MySQL coverage remains unchecked.
+Automatic DDL admission currently has two slices:
 
-Tables, `ALTER TABLE`, views, routines, events, triggers, `RENAME`, `TRUNCATE`,
-non-admitted `DROP` forms, database/schema DDL, qualified/cross-schema
-references, definer/security clauses, MariaDB-only syntax, and multi-object or
-multi-statement forms are manual boundaries. The stream flushes earlier DML,
+- explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE
+  INDEX` or `DROP INDEX` whose key parts and options are completely modeled and
+  whose FK dependency is disproven from the fenced target inventory;
+- the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
+  COLUMN IF EXISTS ...` form, which is token-parsed and transformed from target
+  column pre-state into deterministic MySQL 8 SQL.
+
+The index parser rejects comments, ambiguous/incomplete syntax, double-quoted
+identifiers when ANSI_QUOTES mode is not captured, qualified names (including
+backtick-qualified names), generated names, `IF EXISTS`, unique/fulltext/spatial/
+invisible forms, and unmodeled options. Unqualified backtick identifiers are
+tokenized; their real-MySQL coverage remains unchecked. The rename translator
+removes `IF EXISTS`; absent old columns become a proven no-op, while old/new
+coexistence fails closed.
+
+Other tables, `ALTER TABLE`, views, routines, events, triggers, `RENAME`,
+`TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
+qualified/cross-schema references, definer/security clauses, MariaDB-only syntax,
+and multi-object or multi-statement forms are manual boundaries. The stream flushes earlier DML,
 records exact SQL/coordinates in `cdc.ddl_events`, and stops before advancing.
 
 Qualifier handling is fail-closed. Tokenization removes comments from syntax

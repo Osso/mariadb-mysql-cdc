@@ -13,7 +13,8 @@ plane.
 
 Automatic DDL is not a separate execute-then-checkpoint shortcut. The journal
 (`cdc.ddl_replay_journal`) is distinct from the manual DDL ledger
-(`cdc.ddl_events`). For an admitted index event the order is:
+(`cdc.ddl_events`). For an admitted DDL event (including the current rename
+translator slice), the order is:
 
 1. Validate bootstrap objects, exact grants, the single-writer nonblocking
    `GET_LOCK(SHA2(<lease-name>,256),0)`, and startup barrier. This is a
@@ -22,7 +23,7 @@ Automatic DDL is not a separate execute-then-checkpoint shortcut. The journal
    post-state is derived from that recorded pre-state plus the translated AST;
    current source metadata is never substituted.
 3. Insert one immutable journal row as `prepared`.
-4. Execute the admitted DDL.
+4. Execute the admitted DDL or generated transformed SQL.
 5. Capture and validate the complete affected target state.
 6. Transition `prepared -> applied`.
 7. In one target transaction, lock and require the exact predecessor checkpoint,

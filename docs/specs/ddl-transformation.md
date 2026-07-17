@@ -26,6 +26,17 @@ allowlist.
       generated MySQL SQL, transformation version, source coordinate, pre-state,
       expected post-state, and observed post-state.
 
+### Current implemented slice
+
+- [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form.
+- [x] Select executable rename clauses from immutable target-column pre-state; an absent old column is omitted, while old/new coexistence fails closed.
+- [x] Emit deterministic MySQL 8 SQL without `IF EXISTS`, return a proven no-op when no clause is executable, and record transformation version `mariadb-mysql8-v1`.
+- [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
+
+This is one translator slice, not the full MariaDB-to-MySQL 8 transformation
+pipeline. Unsupported DDL still follows the existing manual-resolution boundary;
+manual-ledger removal and deployment remain future work.
+
 ### Execution and recovery
 
 - [ ] Execute transformed DDL through the durable replay journal before advancing
@@ -66,25 +77,38 @@ allowlist.
 
 - `src/live/structured_stream.rs` — reads ordered QueryEvents and enforces the
   checkpoint barrier.
-- `src/live/ddl_semantics.rs` — current narrow index parser; must be replaced or
-  expanded into the canonical MariaDB DDL transformation layer.
+- `src/live/ddl_semantics.rs` — dispatches current DDL transformations and
+  captures semantic evidence.
+- `src/live/ddl_semantics/transform.rs` — first `RENAME COLUMN IF EXISTS`
+  translator slice, including target pre-state selection and versioned SQL
+  emission.
+- `src/live/structured_stream/ddl.rs` — prepares the journal, executes generated
+  target SQL, and preserves checkpoint ordering.
 - `src/live/ddl_replay_journal.rs` — durable evidence, crash reconciliation, and
   checkpoint ordering.
-- `src/live/ddl_ledger.rs` — legacy manual-resolution path to remove; it is not
-  part of the target architecture.
+- `src/live/ddl_ledger.rs` — legacy manual-resolution path for unsupported DDL;
+  removal is not part of this slice.
 - `scripts/cdc-integration-harness.py` — real MariaDB/MySQL compatibility and
   crash matrix.
 
 ## Tests asserting this spec
 
-No test currently proves the full transformation contract. Existing journal,
-index, grant, and crash tests cover reusable safety infrastructure only; they do
-not satisfy the unchecked transformation requirements above.
+The current slice is covered by:
+
+- [x] `src/live/ddl_semantics/tests.rs` — deterministic multi-clause MySQL 8
+      output, proven no-op when old columns are absent, and fail-closed behavior
+      when old and new columns coexist.
+- [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
+      generated SQL without `IF EXISTS` and leaves the journal prepared when
+      target execution fails.
+
+These tests prove only the current rename slice. They do not prove the full
+transformation contract, real MariaDB/MySQL compatibility, or deployment safety.
 
 ## Known gaps (current cycle)
 
-- [ ] Replace index-only admission with the canonical MariaDB DDL parser and
-      MySQL 8 transformation pipeline.
+- [ ] Extend the current translator beyond the production-observed rename slice
+      into the canonical MariaDB DDL parser and MySQL 8 transformation pipeline.
 - [ ] Remove the manual-resolution runtime, schema, grants, documentation, and
       operational workflow.
 - [ ] Build the production-derived DDL corpus and real MariaDB/MySQL 8 parity

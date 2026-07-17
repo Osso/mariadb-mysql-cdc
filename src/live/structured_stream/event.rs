@@ -26,6 +26,7 @@ pub(super) fn event_policy(event: &BinlogEvent) -> EventPolicy {
     }
 }
 
+#[cfg(test)]
 pub(super) fn handle_structured_event<E, R>(
     applier: &mut RowApplier<E>,
     schema_resolver: &R,

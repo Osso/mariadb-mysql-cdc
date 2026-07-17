@@ -18,23 +18,27 @@ target with minimal downtime.
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in
-the target. Automatic DDL admission is intentionally narrow: only an explicitly
-named, unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or
-`DROP INDEX` is eligible, and only when every key part/option is modeled and the
-operation is proven not to support or depend on a foreign key.
+the target. Automatic DDL admission currently has two narrow slices: an
+explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE INDEX`
+or `DROP INDEX` when every key part/option is modeled and the operation is proven
+not to support or depend on a foreign key; and the production-observed
+unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form.
+The rename slice uses target column pre-state, emits deterministic MySQL 8 SQL
+without `IF EXISTS`, treats absent old columns as a proven no-op, and fails closed
+when old and new columns coexist.
 
-Every other DDL form is manual: tables, `ALTER TABLE`, views, routines, events,
-triggers, `RENAME`, `TRUNCATE`, `DROP` object families other than the admitted
-index form, qualified or cross-schema references, comments, backtick-qualified or
-ANSI_QUOTES double-quoted identifiers where mode is not captured, incomplete or
-ambiguous syntax, definer/security clauses, MariaDB-only syntax, and
-multi-object/multi-statement forms.
+Every other DDL form is manual: tables, other `ALTER TABLE`, views, routines,
+events, triggers, `RENAME`, `TRUNCATE`, `DROP` object families other than the
+admitted index form, qualified or cross-schema references, comments,
+backtick-qualified or ANSI_QUOTES double-quoted identifiers where mode is not
+captured, incomplete or ambiguous syntax, definer/security clauses, MariaDB-only
+syntax, and multi-object/multi-statement forms.
 
-Before an admitted index executes, the stream captures immutable evidence from a
+Before an admitted DDL executes, the stream captures immutable evidence from a
 fenced target pre-state and the translated parsed AST. The target-side journal
-records `prepared`, executes the DDL, validates the complete affected state,
-then records `applied` and atomically transitions the journal to `checkpointed`
-with the predecessor checkpoint update. `prepared` and `blocked` rows form a
+records `prepared`, executes the admitted or generated target SQL, validates the
+complete affected state, then records `applied` and atomically transitions the
+journal to `checkpointed` with the predecessor checkpoint update. `prepared` and `blocked` rows form a
 startup no-overtake barrier. A crash is never blind replay: only an exact,
 unique expected post-state can finalize; pre-state, both/neither, mixed, or
 unavailable proof blocks. Target binlog receipt is unavailable, so this is

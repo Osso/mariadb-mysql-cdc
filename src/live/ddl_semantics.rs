@@ -10,6 +10,7 @@ mod parser;
 #[cfg(test)]
 mod tests;
 mod tokenizer;
+mod transform;
 
 #[cfg(test)]
 pub(super) use canonical::canonical_absent_state;
@@ -22,8 +23,13 @@ pub(super) use parser::parse_simple_index_ddl;
 pub use parser::{parse_ddl_operation, supports_automatic_index_ddl};
 #[cfg(test)]
 pub(super) use tokenizer::tokenize_ddl;
+pub use transform::{
+    DdlTransformation, supports_rename_columns_if_exists, transform_rename_columns_if_exists,
+};
 
 pub trait DdlSemanticInventory {
+    fn transform_sql(&self, sql: &str) -> Result<DdlTransformation, String>;
+
     fn capture_evidence(
         &self,
         sql: &str,
@@ -95,6 +101,41 @@ fn read_affected_runtime(
 }
 
 impl DdlSemanticInventory for LiveDdlSemanticInventory {
+    fn transform_sql(&self, sql: &str) -> Result<DdlTransformation, String> {
+        if supports_automatic_index_ddl(sql) {
+            return Ok(DdlTransformation {
+                version: transform::DDL_TRANSFORMATION_VERSION,
+                target_sql: Some(sql.trim().trim_end_matches(';').trim().to_string()),
+            });
+        }
+        if !supports_rename_columns_if_exists(sql) {
+            return Err("MariaDB DDL translator does not support this statement".to_string());
+        }
+        let operation = parse_ddl_operation(sql)?;
+        let inventory = build_inventory(&self.target_schema, &self.target).map_err(|error| {
+            format!(
+                "failed to build target inventory for DDL transformation in {}: {error}",
+                self.target_schema
+            )
+        })?;
+        let table = inventory
+            .tables
+            .iter()
+            .find(|table| table.name == operation.primary_object)
+            .ok_or_else(|| {
+                format!(
+                    "target table {}.{} is missing for DDL transformation",
+                    self.target_schema, operation.primary_object
+                )
+            })?;
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        transform_rename_columns_if_exists(sql, &columns)
+    }
+
     fn capture_evidence(
         &self,
         sql: &str,

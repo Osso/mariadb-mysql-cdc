@@ -1,4 +1,6 @@
 use super::*;
+use crate::live::ddl_semantics::{DdlTransformation, supports_rename_columns_if_exists};
+use crate::target::SqlStatement;
 
 pub(super) fn handle_automatic_ddl_event<E, R, C, J, S, D>(
     applier: &mut RowApplier<E>,
@@ -98,9 +100,12 @@ where
 {
     let AutomaticDdlInput {
         context,
-        header,
+        header: _,
         event,
     } = input;
+    let transformation = semantic_inventory
+        .transform_sql(&ddl_event.raw_sql)
+        .map_err(ApplyBinlogError::Statement)?;
     let evidence = capture_automatic_ddl_evidence(semantic_inventory, ledger, ddl_event)?;
     journal
         .prepare(ddl_event, &evidence)
@@ -111,14 +116,7 @@ where
         "after-journal-prepare",
     );
 
-    let outcome = handle_structured_event(
-        applier,
-        context.schema_resolver,
-        context.state,
-        context.current_file,
-        header,
-        event,
-    )?;
+    let outcome = execute_transformed_ddl(applier.executor(), ddl_event, transformation)?;
     #[cfg(feature = "integration-failpoints")]
     super::super::wait_for_integration_barrier(
         super::super::IntegrationFailpoint::TargetConnectionLoss,
@@ -141,6 +139,27 @@ where
     );
     finalize_automatic_ddl_checkpoint(applier.executor(), journal, context, event, ddl_event)?;
     Ok(outcome)
+}
+
+fn execute_transformed_ddl(
+    executor: &impl TransactionalTargetExecutor,
+    ddl_event: &DdlEvent,
+    transformation: DdlTransformation,
+) -> Result<StructuredEventOutcome, ApplyBinlogError> {
+    if let Some(target_sql) = transformation.target_sql {
+        executor
+            .execute(&SqlStatement {
+                sql: target_sql.clone(),
+                params: Vec::new(),
+            })
+            .map_err(|error| {
+                ApplyBinlogError::Statement(format!(
+                    "failed transformed DDL at {}:{} version={} target_sql={target_sql}: {error}",
+                    ddl_event.binlog_file, ddl_event.event_start_position, transformation.version,
+                ))
+            })?;
+    }
+    Ok(resolved_ddl_outcome(ddl_event.clone()))
 }
 
 pub(super) fn capture_automatic_ddl_evidence<S, D>(
@@ -306,6 +325,7 @@ pub(super) fn automatically_handled_ddl_event<'a>(
         return None;
     };
     let operation = parse_ddl_operation(&query.sql_statement).ok();
+    let supports_transformation = supports_rename_columns_if_exists(&query.sql_statement);
     let supports_automatic_operation = operation.as_ref().is_some_and(|operation| {
         if operation.family == DdlFamily::Index {
             supports_automatic_index_ddl(&query.sql_statement)
@@ -313,10 +333,12 @@ pub(super) fn automatically_handled_ddl_event<'a>(
             supports_automatic_semantic_recovery(operation)
         }
     });
+    let supported_by_runtime = supports_transformation
+        || (crate::statement::is_automatically_handled_schema_change(&query.sql_statement)
+            && supports_automatic_operation);
     let can_handle_automatically = state.should_apply_schema(&query.database_name)
         && !query_contains_qualified_identifier(&query.sql_statement)
-        && crate::statement::is_automatically_handled_schema_change(&query.sql_statement)
-        && supports_automatic_operation;
+        && supported_by_runtime;
     if !can_handle_automatically {
         return None;
     }

@@ -719,3 +719,61 @@ fn fixture_event(row_count: u64) -> EventInventory {
         definition: format!("delete from accounts where id <= {row_count}"),
     }
 }
+
+#[test]
+fn transforms_mariadb_multi_clause_rename_column_if_exists_for_mysql8() {
+    let columns = ["arc_start_order", "arc_end_order"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let transformation = transform_rename_columns_if_exists(
+        "ALTER TABLE `home_feed_captions`\n\
+         RENAME COLUMN IF EXISTS `arc_start_order` TO `deprecated_arc_start_order`,\n\
+         RENAME COLUMN IF EXISTS `arc_end_order` TO `deprecated_arc_end_order`",
+        &columns,
+    )
+    .expect("MariaDB rename transformation");
+
+    assert_eq!(transformation.version, "mariadb-mysql8-v1");
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `home_feed_captions` \
+             RENAME COLUMN `arc_start_order` TO `deprecated_arc_start_order`, \
+             RENAME COLUMN `arc_end_order` TO `deprecated_arc_end_order`"
+        )
+    );
+}
+
+#[test]
+fn rename_column_if_exists_becomes_proven_noop_when_source_columns_are_absent() {
+    let columns = ["deprecated_arc_start_order", "deprecated_arc_end_order"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let transformation = transform_rename_columns_if_exists(
+        "ALTER TABLE home_feed_captions \
+         RENAME COLUMN IF EXISTS arc_start_order TO deprecated_arc_start_order, \
+         RENAME COLUMN IF EXISTS arc_end_order TO deprecated_arc_end_order",
+        &columns,
+    )
+    .expect("proven no-op transformation");
+
+    assert_eq!(transformation.target_sql, None);
+}
+
+#[test]
+fn rename_column_if_exists_fails_closed_when_old_and_new_columns_both_exist() {
+    let columns = ["arc_start_order", "deprecated_arc_start_order"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let error = transform_rename_columns_if_exists(
+        "ALTER TABLE home_feed_captions \
+         RENAME COLUMN IF EXISTS arc_start_order TO deprecated_arc_start_order",
+        &columns,
+    )
+    .expect_err("target drift must block transformation");
+
+    assert!(error.contains("both exist"), "{error}");
+}

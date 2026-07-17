@@ -115,6 +115,61 @@ fn supported_ddl_replays_without_manual_resolution() {
 }
 
 #[test]
+fn mariadb_rename_column_if_exists_executes_generated_mysql8_sql() {
+    let executor = TransactionRecordingExecutor::failing();
+    let mut applier = crate::row::RowApplier::new(executor);
+    let ledger = RecordingDdlLedger::default();
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "ALTER TABLE home_feed_captions RENAME COLUMN IF EXISTS arc_start_order TO deprecated_arc_start_order".to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    let journal = RecordingDdlReplayJournal::default();
+
+    let error = handle_automatic_ddl_event(
+        &mut applier,
+        AutomaticDdlDependencies {
+            journal: &journal,
+            semantic_inventory: &RecordingSemanticInventory::default(),
+            ledger: &ledger,
+            source_identity: "production-source",
+        },
+        AutomaticDdlInput {
+            context: &mut context,
+            header: &event_header(2, 180),
+            event: &event,
+        },
+    )
+    .expect_err("forced target failure must expose generated SQL");
+
+    let message = error.to_string();
+    assert!(message.contains("ALTER TABLE `home_feed_captions` RENAME COLUMN `arc_start_order` TO `deprecated_arc_start_order`"), "{message}");
+    assert!(
+        !message.contains("IF EXISTS"),
+        "source MariaDB SQL reached target: {message}"
+    );
+    assert_eq!(*journal.status.borrow(), Some(DdlReplayStatus::Prepared));
+    assert!(ledger.recorded.borrow().is_empty());
+}
+
+#[test]
 fn unsupported_index_ddl_is_manual_before_journal_prepare_or_execution() {
     for sql in [
         "CREATE UNIQUE INDEX idx_handle ON accounts (handle)",
@@ -508,7 +563,7 @@ fn failed_supported_ddl_replay_does_not_checkpoint() {
     )
     .expect_err("target DDL failure must stop replay");
 
-    assert!(error.to_string().contains("failed to replay statement"));
+    assert!(error.to_string().contains("failed transformed DDL"));
     assert_eq!(applier.executor().operations(), vec!["EXEC"]);
     assert_eq!(journal.operations.borrow().as_slice(), &["PREPARE"]);
     assert_eq!(*journal.status.borrow(), Some(DdlReplayStatus::Prepared));

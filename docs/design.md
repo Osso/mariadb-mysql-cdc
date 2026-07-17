@@ -17,9 +17,12 @@ MariaDB and MySQL differ in SQL, metadata, and binlog behavior.
 Production streaming requires `binlog_format=ROW` and
 `binlog_row_image=FULL`. Row events apply by source primary key.
 
-Automatic DDL admission is intentionally index-only: explicitly named,
+Automatic DDL admission currently covers two slices: explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX`
-with complete parsed options and no FK dependency. All other DDL is manual.
+with complete parsed options and no FK dependency, plus the production-observed
+unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form.
+The rename slice selects executable clauses from target pre-state and emits
+MySQL 8 SQL without `IF EXISTS`; all other DDL remains manual.
 The manual path uses `cdc.ddl_events`; automatic admitted DDL uses the separate
 `cdc.ddl_replay_journal` with immutable pre-state/AST evidence, a prepared/applied/
 checkpointed/blocked state machine, startup barrier, and atomic applied-to-

@@ -2,9 +2,11 @@
 
 `stream-binlog` has two DDL paths:
 
-- **Automatic journal:** only strict named, unqualified, visible, non-unique
-  secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed metadata and
-  no FK dependency. It uses `cdc.ddl_replay_journal`.
+- **Automatic journal:** strict named, unqualified, visible, non-unique secondary
+  BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed metadata and no FK
+  dependency, plus the current production-observed unqualified multi-clause
+  `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator slice. It uses
+  `cdc.ddl_replay_journal`.
 - **Manual ledger:** every other DDL form. It uses `cdc.ddl_events`.
 
 The stream does not create or repair either control-plane object. Bootstrap must
@@ -68,9 +70,9 @@ prepared -> blocked
 ```
 
 The stream captures target pre-state and canonical AST before execution, inserts
-`prepared`, executes the index DDL, validates the complete affected target state,
-marks `applied`, then atomically performs the journal checkpoint transition and
-predecessor checkpoint update. `prepared` and `blocked` prevent later source
+`prepared`, executes the admitted or generated target DDL, validates the complete
+affected target state, marks `applied`, then atomically performs the journal
+checkpoint transition and predecessor checkpoint update. `prepared` and `blocked` prevent later source
 coordinates from overtaking the event.
 
 A restart never blindly replays `prepared`. It finalizes only an exact unique
@@ -98,9 +100,10 @@ design keeps static validation at startup/bootstrap only.
 ## Manual boundary procedure
 
 Every table/view/routine/event/trigger/rename/truncate/non-admitted drop,
-`ALTER TABLE`, database/schema DDL, qualified or cross-schema reference,
-comments, backtick-qualified or ANSI_QUOTES-ambiguous identifiers,
-definer/security clause, MariaDB-only form, incomplete form, or
+other than the supported unqualified multi-clause `ALTER TABLE ... RENAME COLUMN
+IF EXISTS ...` slice, plus other `ALTER TABLE`, database/schema DDL, qualified or
+cross-schema reference, comments, backtick-qualified or ANSI_QUOTES-ambiguous
+identifiers, definer/security clause, MariaDB-only form, incomplete form, or
 multi-object/multi-statement form reaches the manual ledger. Unqualified
 backtick identifiers are tokenized by the current parser but lack real-MySQL
 coverage proof.

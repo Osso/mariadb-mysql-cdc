@@ -254,6 +254,24 @@ impl Default for RecordingSemanticInventory {
 }
 
 impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInventory {
+    fn transform_sql(
+        &self,
+        sql: &str,
+    ) -> Result<super::super::ddl_semantics::DdlTransformation, String> {
+        let target_sql = if sql.to_ascii_uppercase().contains("RENAME COLUMN IF EXISTS") {
+            Some(
+                "ALTER TABLE `home_feed_captions` RENAME COLUMN `arc_start_order` TO `deprecated_arc_start_order`"
+                    .to_string(),
+            )
+        } else {
+            Some(sql.to_string())
+        };
+        Ok(super::super::ddl_semantics::DdlTransformation {
+            version: "test-v1",
+            target_sql,
+        })
+    }
+
     fn capture_evidence(
         &self,
         _sql: &str,
