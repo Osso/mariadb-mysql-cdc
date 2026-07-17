@@ -87,8 +87,11 @@ phases with immutable child runs, cycle/schema blocking, explicit delete ceiling
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
 conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 33 executable scenarios,
 including `catchup-snapshot-tls` as real MariaDB/MySQL coverage of configured-CA
-chain validation over literal IP endpoints and resumable snapshot convergence.
-Its `create-table-crash-restart` scenario passes the differing-default fixture
+chain validation over literal IP endpoints. It rejects a wrong `sync-table` source
+CA and wrong catchup source or target CA before catchup target rows or progress
+mutate, then proves a valid four-row copy and a completed-run no-op. It does not
+prove interrupted parallel-range resume or DNS/hostname identity coverage. Its
+`create-table-crash-restart` scenario passes the differing-default fixture
 through post-DDL/pre-applied crash recovery, prepared-state restart, exact
 checkpointing, and idempotent replay; its `production-alter-table` scenario passes
 five checkpointed ALTER events,

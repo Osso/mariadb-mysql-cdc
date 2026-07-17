@@ -76,8 +76,9 @@ in [catchup.md](../catchup.md).
 
 - `scripts/cdc-integration-harness.py --scenario catchup-snapshot-tls` — real
   MariaDB 11.4/MySQL 8.0 connections using configured CAs on literal IP
-  endpoints; proves unrelated source and target CAs fail before target mutation,
-  then proves four-row copy, target progress, and a completed-run no-op. It does
+  endpoints; rejects a wrong `sync-table` source CA and wrong catchup source or
+  target CA before catchup target rows or progress mutate, then proves a valid
+  four-row copy and target progress. A completed rerun proves a no-op; it does
   not claim interrupted parallel-range resume or DNS/hostname identity coverage.
 - `src/mysql_snapshot/tests.rs`
 - `src/mysql_snapshot/parallel.rs`
