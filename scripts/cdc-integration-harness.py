@@ -1542,7 +1542,11 @@ class Harness:
                 user=TARGET_USER,
                 password=TARGET_PASSWORD,
             ).strip()
-            if debt != "resolved\tconflict-resolution-run\tverified source/target table equality":
+            expected_debt = (
+                "resolved\tconflict-resolution-run\t"
+                "verified source/target equality for table `repair_conflicts` across full-table scope"
+            )
+            if debt != expected_debt:
                 raise HarnessError(f"conflict debt did not resolve with evidence: {debt!r}")
             unresolved = self.query(self.target, f"SELECT COUNT(*) FROM cdc.row_conflicts WHERE source_identity={sql_literal(SOURCE_IDENTITY)} AND table_name={sql_literal(table)} AND status='unresolved';", user=TARGET_USER, password=TARGET_PASSWORD).strip()
             if unresolved != "0":
