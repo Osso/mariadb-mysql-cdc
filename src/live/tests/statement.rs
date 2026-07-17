@@ -273,7 +273,7 @@ fn extracts_sanitized_production_query_shapes() {
         },
     );
 
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 6);
     assert_eq!(events[0].coordinate.position, 955857729);
     assert_eq!(
         events[0].sql,
@@ -289,6 +289,16 @@ fn extracts_sanitized_production_query_shapes() {
             .contains("INSERT INTO `users_search_queries_history`")
     );
     assert!(events[2].sql.contains("\\\"semantic\\\":true"));
+    assert_eq!(events[3].coordinate.position, 960000100);
+    assert!(events[3].sql.contains("ADD COLUMN `filter_prompt_version`"));
+    assert_eq!(events[4].coordinate.position, 960001000);
+    assert!(
+        events[4]
+            .sql
+            .contains("ADD KEY `idx_hfb_variant_status_published`")
+    );
+    assert_eq!(events[5].coordinate.position, 960002000);
+    assert!(events[5].sql.contains("RENAME COLUMN IF EXISTS"));
 }
 
 #[test]
