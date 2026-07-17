@@ -187,6 +187,113 @@ fn applies_update_rows_using_after_image_and_primary_key() {
 }
 
 #[test]
+fn applies_primary_key_change_using_before_key_predicate() {
+    let applier = applier_with_accounts_table();
+    let event = UpdateRowsEvent {
+        coordinate: coordinate(145),
+        table_id: 7,
+        rows: vec![RowUpdate {
+            before: row("A", "before"),
+            after: row("B", "after"),
+        }],
+    };
+
+    applier
+        .apply_update_rows(&event)
+        .expect("apply primary-key change");
+
+    let statements = applier.executor().statements.borrow();
+    assert_eq!(statements.len(), 1);
+    assert_eq!(
+        statements[0].sql,
+        "UPDATE `accounts` SET `id` = ?, `name` = ? WHERE `id` = ?"
+    );
+    assert_eq!(statements[0].params, values(["B", "after", "A"]));
+}
+
+#[test]
+fn primary_key_change_assigns_every_writable_after_image_column() {
+    let mut applier = RowApplier::new(RecordingExecutor::default());
+    applier.apply_table_map(TableMapEvent {
+        coordinate: coordinate(100),
+        table: RowTableMap {
+            table_id: 9,
+            schema: "app".to_string(),
+            table: "accounts_with_status".to_string(),
+            columns: vec![
+                "id".to_string(),
+                "name".to_string(),
+                "status".to_string(),
+                "generated_label".to_string(),
+            ],
+            primary_key: vec!["id".to_string()],
+            generated_columns: vec!["generated_label".to_string()],
+            signed_columns: Vec::new(),
+            enum_columns: BTreeMap::new(),
+        },
+    });
+    let event = UpdateRowsEvent {
+        coordinate: coordinate(147),
+        table_id: 9,
+        rows: vec![RowUpdate {
+            before: BTreeMap::from([
+                ("id".to_string(), value("A")),
+                ("name".to_string(), value("before")),
+                ("status".to_string(), value("active")),
+                ("generated_label".to_string(), value("old-generated")),
+            ]),
+            after: BTreeMap::from([
+                ("id".to_string(), value("B")),
+                ("name".to_string(), value("after")),
+                ("status".to_string(), value("active")),
+                ("generated_label".to_string(), value("new-generated")),
+            ]),
+        }],
+    };
+
+    applier
+        .apply_update_rows(&event)
+        .expect("apply complete primary-key transition");
+
+    let statements = applier.executor().statements.borrow();
+    assert_eq!(statements.len(), 1);
+    assert_eq!(
+        statements[0].sql,
+        "UPDATE `accounts_with_status` SET `id` = ?, `name` = ?, `status` = ? WHERE `id` = ?"
+    );
+    assert_eq!(statements[0].params, values(["B", "after", "active", "A"]));
+}
+
+#[test]
+fn applies_composite_primary_key_change_using_complete_before_key() {
+    let mut applier = RowApplier::new(RecordingExecutor::default());
+    applier.apply_table_map(composite_accounts_table_map());
+    let event = UpdateRowsEvent {
+        coordinate: coordinate(150),
+        table_id: 8,
+        rows: vec![RowUpdate {
+            before: composite_row("tenant-a", "1", "before"),
+            after: composite_row("tenant-b", "1", "after"),
+        }],
+    };
+
+    applier
+        .apply_update_rows(&event)
+        .expect("apply composite primary-key change");
+
+    let statements = applier.executor().statements.borrow();
+    assert_eq!(statements.len(), 1);
+    assert_eq!(
+        statements[0].sql,
+        "UPDATE `composite_accounts` SET `tenant_id` = ?, `id` = ?, `name` = ? WHERE `tenant_id` = ? AND `id` = ?"
+    );
+    assert_eq!(
+        statements[0].params,
+        values(["tenant-b", "1", "after", "tenant-a", "1"])
+    );
+}
+
+#[test]
 fn excludes_generated_columns_from_write_and_update_statements() {
     let mut applier = RowApplier::new(RecordingExecutor::default());
     applier.apply_table_map(TableMapEvent {
@@ -372,6 +479,34 @@ fn accounts_table_map() -> TableMapEvent {
 
 fn row(id: &str, name: &str) -> RowImage {
     BTreeMap::from([
+        ("id".to_string(), value(id)),
+        ("name".to_string(), value(name)),
+    ])
+}
+
+fn composite_accounts_table_map() -> TableMapEvent {
+    TableMapEvent {
+        coordinate: coordinate(100),
+        table: RowTableMap {
+            table_id: 8,
+            schema: "app".to_string(),
+            table: "composite_accounts".to_string(),
+            columns: vec![
+                "tenant_id".to_string(),
+                "id".to_string(),
+                "name".to_string(),
+            ],
+            primary_key: vec!["tenant_id".to_string(), "id".to_string()],
+            generated_columns: Vec::new(),
+            signed_columns: Vec::new(),
+            enum_columns: BTreeMap::new(),
+        },
+    }
+}
+
+fn composite_row(tenant_id: &str, id: &str, name: &str) -> RowImage {
+    BTreeMap::from([
+        ("tenant_id".to_string(), value(tenant_id)),
         ("id".to_string(), value(id)),
         ("name".to_string(), value(name)),
     ])

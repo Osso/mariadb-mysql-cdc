@@ -1,13 +1,12 @@
 use super::conflict::{execute_row_statement, record_duplicate_conflict};
 use super::model::{
-    DeleteRowsEvent, DuplicateConflictInput, RowConflictContext, RowImage, RowOperation, RowResult,
-    RowTableMap, RowUpdate, TableMapEvent, TableMapRegistry, UpdateRowsEvent, WriteRowsEvent,
-    row_error,
+    row_error, DeleteRowsEvent, DuplicateConflictInput, RowConflictContext, RowImage, RowOperation,
+    RowResult, RowTableMap, RowUpdate, TableMapEvent, TableMapRegistry, UpdateRowsEvent,
+    WriteRowsEvent,
 };
 use super::sql::{
     build_delete_statement, build_insert_statement, build_update_statement, primary_key_values,
     validate_row_has_primary_key, validate_rows_have_primary_keys,
-    validate_updates_have_stable_primary_keys,
 };
 use crate::probe::BinlogCoordinate;
 use crate::target::{SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor};
@@ -179,7 +178,7 @@ fn update_rows_input(event: &UpdateRowsEvent) -> RowEventInput<'_, RowUpdate> {
         &event.coordinate,
         &event.rows,
         RowOperation::Update,
-        validate_updates_have_stable_primary_keys,
+        no_preflight,
         update_change,
     )
 }

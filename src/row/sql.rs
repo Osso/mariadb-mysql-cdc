@@ -1,4 +1,4 @@
-use super::model::{RowApplyError, RowImage, RowResult, RowTableMap, RowUpdate, row_error};
+use super::model::{row_error, RowApplyError, RowImage, RowResult, RowTableMap, RowUpdate};
 use crate::probe::BinlogCoordinate;
 use crate::target::SqlStatement;
 use mysql::Value;
@@ -58,28 +58,6 @@ fn primary_key_value(
     })
 }
 
-
-pub(crate) fn validate_updates_have_stable_primary_keys(
-    table: &RowTableMap,
-    updates: &[RowUpdate],
-    coordinate: &BinlogCoordinate,
-) -> RowResult<()> {
-    for update in updates {
-        let before = primary_key_values(table, &update.before, coordinate)?;
-        let after = primary_key_values(table, &update.after, coordinate)?;
-        if before != after {
-            return Err(row_error(RowApplyError::PrimaryKeyChanged {
-                coordinate: coordinate.clone(),
-                schema: table.schema.clone(),
-                table: table.table.clone(),
-                before_primary_key: before.iter().map(super::conflict::value_to_conflict_key).collect(),
-                after_primary_key: after.iter().map(super::conflict::value_to_conflict_key).collect(),
-            }));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn build_insert_statement(table: &RowTableMap, row: &RowImage) -> SqlStatement {
     let writable_columns = writable_columns(table);
     let column_list = writable_columns
@@ -104,22 +82,25 @@ pub(crate) fn build_update_statement(
     update: &RowUpdate,
     coordinate: &BinlogCoordinate,
 ) -> RowResult<Option<SqlStatement>> {
-    let writable_columns = writable_columns(table)
-        .into_iter()
-        .filter(|column| !table.primary_key.contains(column))
-        .collect::<Vec<_>>();
-    let changed_columns = changed_columns(&writable_columns, update);
-    if changed_columns.is_empty() {
+    let writable_columns = writable_columns(table);
+    let before_primary_key = primary_key_values(table, &update.before, coordinate)?;
+    let after_primary_key = primary_key_values(table, &update.after, coordinate)?;
+    let assignment_columns = if before_primary_key == after_primary_key {
+        changed_columns(&writable_columns, update)
+    } else {
+        writable_columns
+    };
+    if assignment_columns.is_empty() {
         return Ok(None);
     }
 
-    let assignments = changed_columns
+    let assignments = assignment_columns
         .iter()
         .map(|column| format!("{} = ?", quote_ident(column)))
         .collect::<Vec<_>>();
     let predicates = primary_key_predicates(&table.primary_key);
-    let mut params = ordered_values(&update.after, &changed_columns);
-    params.extend(primary_key_values(table, &update.after, coordinate)?);
+    let mut params = ordered_values(&update.after, &assignment_columns);
+    params.extend(before_primary_key);
 
     Ok(Some(SqlStatement {
         sql: format!(
