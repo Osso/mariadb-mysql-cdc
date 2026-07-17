@@ -1,5 +1,4 @@
 use super::{ApplyBinlogConfig, MysqlCliExecutor, SourceBinlogConfig};
-use crate::mysql_support::source_ssl_opts;
 use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
@@ -148,8 +147,7 @@ fn source_opts(source: &SourceBinlogConfig) -> Result<Opts, String> {
         .tcp_port(source.port)
         .user(Some(&source.user))
         .pass(Some(&source.password))
-        .prefer_socket(false)
-        .ssl_opts(source_ssl_opts(source)?);
+        .prefer_socket(false);
     Ok(Opts::from(builder))
 }
 
@@ -205,6 +203,24 @@ fn quote_mysql_ident(identifier: &str) -> String {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn source_schema_recovery_connection_uses_plaintext_without_ca() {
+        let source = SourceBinlogConfig {
+            host: "source-db".to_string(),
+            port: 3306,
+            user: "cdc_reader".to_string(),
+            password: "secret".to_string(),
+            tls_ca_file: String::new(),
+            ..SourceBinlogConfig::default()
+        };
+
+        let opts = source_opts(&source).expect("plaintext source schema connection opts");
+
+        assert_eq!(opts.get_ip_or_hostname().as_ref(), "source-db");
+        assert_eq!(opts.get_tcp_port(), 3306);
+        assert!(opts.get_ssl_opts().is_none());
+    }
 
     #[test]
     fn creates_missing_target_table_from_source_ddl_and_retries_statement() {

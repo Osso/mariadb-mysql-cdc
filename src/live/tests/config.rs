@@ -57,7 +57,9 @@ fn stream_accepts_plaintext_source_without_tls_ca() {
         ..ApplyBinlogConfig::default()
     };
 
-    config.validate().expect("plaintext source without CA should be accepted");
+    config
+        .validate()
+        .expect("plaintext source without CA should be accepted");
 }
 
 #[test]

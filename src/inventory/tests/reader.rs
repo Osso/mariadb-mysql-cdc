@@ -32,12 +32,15 @@ fn inventory_options_enable_tls_when_configured() {
         ..InventoryConfig::default()
     };
 
-    assert!(
-        inventory_opts(&config)
-            .expect("inventory TLS options")
-            .get_ssl_opts()
-            .is_some()
+    let opts = inventory_opts(&config).expect("inventory TLS options");
+    let ssl = opts.get_ssl_opts().expect("target inventory TLS options");
+
+    assert_eq!(
+        ssl.root_cert_path(),
+        Some(std::path::Path::new(config.tls_ca_file.as_deref().unwrap()))
     );
+    assert!(!ssl.accept_invalid_certs());
+    assert!(!ssl.skip_domain_validation());
 }
 
 #[test]

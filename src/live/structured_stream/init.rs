@@ -488,8 +488,8 @@ pub(super) fn source_inventory_config(config: &ApplyBinlogConfig) -> InventoryCo
         user: config.source.user.clone(),
         password: config.source.password.clone(),
         endpoint_role: InventoryEndpointRole::Source,
-        use_tls: true,
-        tls_ca_file: Some(config.source.tls_ca_file.clone()),
+        use_tls: false,
+        tls_ca_file: None,
         ..InventoryConfig::default()
     }
 }

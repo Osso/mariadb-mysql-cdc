@@ -1,4 +1,5 @@
 use super::*;
+use crate::live::TargetMySqlConfig;
 
 #[test]
 fn source_binlog_contract_requires_row_and_full() {
@@ -101,6 +102,53 @@ fn bounded_completion_flushes_completed_grouped_target_work() {
 
     assert_eq!(applier.executor().operations(), vec!["BEGIN", "COMMIT"]);
     assert!(!transaction.is_open());
+}
+
+#[test]
+fn source_inventory_uses_explicit_plaintext_without_ca() {
+    let config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            host: "source-db".to_string(),
+            port: 3307,
+            user: "cdc_reader".to_string(),
+            password: "secret".to_string(),
+            tls_ca_file: String::new(),
+            ..SourceBinlogConfig::default()
+        },
+        ..ApplyBinlogConfig::default()
+    };
+
+    let inventory = source_inventory_config(&config);
+
+    assert_eq!(inventory.endpoint_role, InventoryEndpointRole::Source);
+    assert!(!inventory.use_tls);
+    assert_eq!(inventory.tls_ca_file, None);
+}
+
+#[test]
+fn target_inventory_keeps_tls_ca_for_verified_connection() {
+    let config = ApplyBinlogConfig {
+        target: TargetMySqlConfig {
+            host: "target-mysql.internal.example"
+                .to_string(),
+            port: 25060,
+            user: "target_user".to_string(),
+            password: "secret".to_string(),
+            database: "globalcomix".to_string(),
+            tls_ca_file: "/etc/mariadb-mysql-cdc/do-ca.pem".to_string(),
+            ..TargetMySqlConfig::default()
+        },
+        ..ApplyBinlogConfig::default()
+    };
+
+    let inventory = target_inventory_config(&config);
+
+    assert_eq!(inventory.endpoint_role, InventoryEndpointRole::Target);
+    assert!(inventory.use_tls);
+    assert_eq!(
+        inventory.tls_ca_file.as_deref(),
+        Some("/etc/mariadb-mysql-cdc/do-ca.pem")
+    );
 }
 
 #[test]
