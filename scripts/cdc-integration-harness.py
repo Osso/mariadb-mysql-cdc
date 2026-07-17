@@ -787,10 +787,10 @@ class Harness:
         first = run(args, env=env, timeout=90, check=False)
         require_success(first, "catchup snapshot TLS")
         expected_rows = (
-            "1\\tone@example.test\\tone\\n"
-            "2\\ttwo@example.test\\ttwo\\n"
-            "3\\tthree@example.test\\tthree\\n"
-            "4\\tfour@example.test\\tfour"
+            "1\tone@example.test\tone\n"
+            "2\ttwo@example.test\ttwo\n"
+            "3\tthree@example.test\tthree\n"
+            "4\tfour@example.test\tfour"
         )
         copied_rows = self.query(
             self.target,
@@ -810,7 +810,7 @@ class Harness:
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         ).strip()
-        if progress_row != "accounts\\tcomplete\\t4":
+        if progress_row != "accounts\tcomplete\t4":
             raise HarnessError(f"catchup TLS progress row mismatch: {progress_row!r}")
 
         self.admin_sql(
