@@ -4,7 +4,7 @@ use crate::snapshot::{SnapshotError, SnapshotRow};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-pub(super) struct MySqlSyncReader {
+pub(crate) struct MySqlSyncReader {
     config: crate::mysql_snapshot::MySqlConnectionConfig,
     source: RefCell<Option<PersistentMySqlSource>>,
 }
