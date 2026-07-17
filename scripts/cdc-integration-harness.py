@@ -1277,7 +1277,7 @@ class Harness:
             self.target,
             "SELECT source_identity,source_server_id,binlog_file,event_start_position,"
             "event_end_position,schema_name,raw_sql,transformation_version,generated_sql,canonical_ast,"
-            "pre_state,expected_post_state,status "
+            "pre_state,expected_post_state,status,created_at,updated_at "
             "FROM cdc.ddl_replay_journal "
             "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
             "ORDER BY event_start_position;",
@@ -1287,7 +1287,7 @@ class Harness:
         rows = [line.split("\t") for line in output.splitlines() if line.strip()]
         if len(rows) != 1:
             raise HarnessError(f"expected exactly one immutable journal row, got {output}")
-        if len(rows[0]) != 13:
+        if len(rows[0]) != 15:
             raise HarnessError(f"immutable journal row column mismatch count={len(rows[0])} output={output!r}")
         names = [
             "source_identity",
@@ -1303,6 +1303,8 @@ class Harness:
             "pre_state",
             "expected_post_state",
             "status",
+            "created_at",
+            "updated_at",
         ]
         return dict(zip(names, rows[0], strict=True))
 
@@ -1369,15 +1371,19 @@ class Harness:
             "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;",
         )
         self.replace_journal_row(row)
+        inserted_row = self.journal_full_row()
+        for field_name, expected_value in row.items():
+            if inserted_row[field_name] != expected_value:
+                raise HarnessError(
+                    f"{scenario} replacement row mismatch field={field_name}: "
+                    f"expected={expected_value!r} actual={inserted_row[field_name]!r}"
+                )
         result = self.run_stream(start, final_stop)
         mutation_attempts = self.admin_query(
             self.target,
             "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
-            "AND command_type IN ('Query','Prepare','Execute') AND ("
-            "argument LIKE 'CREATE INDEX%' OR argument LIKE 'DROP INDEX%' "
-            "OR argument LIKE 'ALTER TABLE%' OR argument LIKE 'CREATE TABLE%' "
-            "OR argument LIKE 'INSERT%accounts%' OR argument LIKE 'UPDATE%accounts%' "
-            "OR argument LIKE 'DELETE%accounts%');",
+            "AND command_type IN ('Query','Prepare','Execute') "
+            "AND UPPER(argument) REGEXP '^[[:space:]]*(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP|TRUNCATE|RENAME)[[:space:]]';",
         ).strip()
         self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
         output = f"{result.stdout}\\n{result.stderr}".lower()
@@ -1398,9 +1404,9 @@ class Harness:
         if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
             raise HarnessError(f"{scenario} advanced checkpoint after identity rejection: {checkpoint}")
         retained = self.journal_full_row()
-        if retained != row:
+        if retained != inserted_row:
             raise HarnessError(
-                f"{scenario} changed immutable journal row: expected={row} retained={retained}"
+                f"{scenario} changed inserted journal row: expected={inserted_row} retained={retained}"
             )
         print(f"{scenario}_blocked identity_mismatch={field} no_overtake=true evidence_retained=true")
 
