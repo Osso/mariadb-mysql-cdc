@@ -529,24 +529,20 @@ fn target_inventory_must_be_stable_across_evidence_capture() {
 }
 
 #[test]
-fn ordinary_table_ddl_evidence_ignores_unrelated_row_count_changes() {
+fn add_column_evidence_derives_post_state_without_live_source_snapshot() {
     let target = semantic_snapshot(7, Some(8));
-    let mut source = target.clone();
-    source.table_runtime.insert(
-        "accounts".to_string(),
-        TableRuntimeState {
-            row_count: 9,
-            auto_increment: Some(10),
-        },
-    );
-    let operation =
-        parse_ddl_operation("ALTER TABLE accounts ADD COLUMN handle varchar(64)").expect("alter");
+    let operation = parse_ddl_operation(
+        "ALTER TABLE accounts ADD COLUMN profile_slug VARCHAR(64) DEFAULT NULL AFTER handle",
+    )
+    .expect("alter");
 
-    let evidence = build_semantic_evidence(&operation, &target, &source).expect("table evidence");
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("table evidence");
 
-    assert_eq!(evidence.pre_state, evidence.expected_post_state);
+    assert_ne!(evidence.pre_state, evidence.expected_post_state);
+    assert!(evidence.canonical_ast.contains("profile_slug"));
+    assert!(evidence.expected_post_state.contains("profile_slug"));
     assert!(!evidence.pre_state.contains("\"row_count\":"));
-    assert!(!evidence.pre_state.contains("\"auto_increment\":"));
+    assert!(!evidence.expected_post_state.contains("\"row_count\":"));
 }
 
 #[test]
