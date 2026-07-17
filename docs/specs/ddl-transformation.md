@@ -32,17 +32,25 @@ allowlist.
 - [x] Transform the observed `ADD COLUMN` forms for `VARCHAR(length)`, `DATETIME`, and `SMALLINT UNSIGNED`, with the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options.
 - [x] Transform a named, non-unique composite `ADD KEY` over ordinary columns as a BTREE index; broader index and clause options remain outside this slice.
 - [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
-- [x] Derive the expected post-state by applying the event AST to a fenced target pre-state snapshot; this translated ALTER path does not require a live source snapshot or source head at the event coordinate.
+- [x] Derive the expected post-state for the explicitly supported ALTER slice by applying the event AST to a fenced target pre-state snapshot.
+- [x] Fail closed as `translation_pending` before target execution when syntax, context, dependencies, or semantics fall outside that explicit slice; the stream checkpoint and later-event barrier must remain unchanged.
 - [x] Emit deterministic MySQL 8 SQL and record transformation version `mariadb-mysql8-v1`.
 - [x] Set journal `transformation_version` and nullable `generated_sql` from the actual transformation before `prepared`; proven no-ops persist `generated_sql = NULL`.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
 
 This is a production-derived ALTER TABLE slice, not full ALTER TABLE or the full
-MariaDB-to-MySQL 8 transformation pipeline. Unsupported DDL now enters the same
-durable journal as `translation_pending` with sentinel/no evidence and blocks
-checkpoint/overtake. When translator code becomes available, the same row
-promotes once to `prepared`, fills immutable evidence, executes generated SQL,
-and checkpoints automatically. Evidence-capture failure uses the same barrier.
+MariaDB-to-MySQL 8 transformation pipeline. Coordinate-anchored reconstruction
+of historical source schema lineage is explicitly excluded from the current
+cycle. The translator may use only semantics completely represented by the
+admitted event AST and fenced target pre-state; it must not infer unmodeled
+historical source state.
+
+Unsupported or ambiguous DDL enters the durable journal as
+`translation_pending` with sentinel/no execution evidence. It performs no target
+DDL, does not advance the stream checkpoint, and blocks later events from
+overtaking it. When translator code later supports the exact event, the same row
+may promote once to `prepared`, fill immutable evidence, execute generated SQL,
+and checkpoint automatically. Evidence-capture failure uses the same barrier.
 The event handler has no supported manual-ledger workflow, but
 config/bootstrap/grant/harness cleanup is still open and this contract is not
 deployment-ready.
@@ -135,6 +143,9 @@ MariaDB/MySQL matrix, or deployment safety.
       parity matrix; the current two-event ALTER scenario is only a slice proof.
 - [ ] Define transformation-version compatibility after the first production
       deployment establishes a real schema upgrade boundary.
+- [ ] Extend the canonical AST and renderer one production-derived unsupported
+      ALTER shape at a time; each shape must first prove `translation_pending`,
+      no target execution, unchanged checkpoint, and no-overtake behavior.
 
 ## Out of scope
 
@@ -145,3 +156,7 @@ MariaDB/MySQL matrix, or deployment safety.
   listed in the implemented slice.
 - Silently dropping, weakening, or approximating source schema semantics.
 - Cross-schema mutation outside the configured application schema.
+- Coordinate-anchored historical source semantic lineage reconstruction or a
+  durable source-model head in the current cycle. Events needing that history
+  remain `translation_pending` rather than guessed from current source or target
+  state.
