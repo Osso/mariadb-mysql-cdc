@@ -75,10 +75,10 @@ in [catchup.md](../catchup.md).
 ## Tests asserting this spec
 
 - `scripts/cdc-integration-harness.py --scenario catchup-snapshot-tls` — real
-  MariaDB 11.4/MySQL 8.0 connections using the configured CA on literal IP
-  endpoints; proves CA/chain validation, four-row copy, target progress, and
-  idempotent resume. This scenario does not claim DNS/hostname identity
-  coverage.
+  MariaDB 11.4/MySQL 8.0 connections using configured CAs on literal IP
+  endpoints; proves unrelated source and target CAs fail before target mutation,
+  then proves four-row copy, target progress, and a completed-run no-op. It does
+  not claim interrupted parallel-range resume or DNS/hostname identity coverage.
 - `src/mysql_snapshot/tests.rs`
 - `src/mysql_snapshot/parallel.rs`
 - `src/snapshot/tests.rs`

@@ -151,9 +151,9 @@ cargo run -- catchup-snapshot \
 ## TLS policy
 
 All target-using commands accept `--target-tls-ca-file PATH`; it defaults to
-`/etc/mariadb-mysql-cdc/do-ca.pem`. Source/binlog commands accept
-`--source-tls-ca-file PATH`; it defaults to `/etc/mariadb-mysql-cdc/source-ca.pem`.
-`catchup-snapshot` requires an explicit `--source-tls-ca-file PATH`. The CA is
+`/etc/mariadb-mysql-cdc/do-ca.pem`. Stream source connections default to
+`/etc/mariadb-mysql-cdc/source-ca.pem`; `catchup-snapshot` and `sync-table`
+require an explicit `--source-tls-ca-file PATH`. The CA is
 always required, the certificate chain is always validated, and a missing,
 unreadable, or invalid CA fails before the driver runs. DNS/hostname endpoints
 require certificate identity matching. Literal IP endpoints skip hostname/IP

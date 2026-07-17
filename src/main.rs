@@ -33,7 +33,7 @@ Usage:
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
   mariadb-mysql-cdc catchup-snapshot --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-tls-ca-file CA --target-host HOST --target-user USER --target-password-env ENV --target-database DB --progress-file PATH [options]
   mariadb-mysql-cdc catchup-progress --progress-file PATH
-  mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS --run-id ID [options]
+  mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-tls-ca-file CA --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS --run-id ID [options]
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -106,6 +106,7 @@ Catchup snapshot options:
   --progress-table TABLE          Target checkpoint table. Defaults to cdc.table_sync_progress.
 
 Sync table options:
+  --source-tls-ca-file PATH        Required source CA certificate bundle.
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
   --run-id ID                     Immutable repair run ID. Reuse only for interrupted runs; completed IDs are terminal.
