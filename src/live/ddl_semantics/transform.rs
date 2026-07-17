@@ -15,6 +15,21 @@ struct RenameColumnClause {
     new_name: String,
 }
 
+pub fn supports_add_columns(source_sql: &str) -> bool {
+    tokenize_ddl(source_sql)
+        .ok()
+        .is_some_and(|tokens| parse_add_columns(&tokens).is_ok())
+}
+
+pub fn transform_add_columns(source_sql: &str) -> Result<DdlTransformation, String> {
+    let tokens = tokenize_ddl(source_sql)?;
+    parse_add_columns(&tokens)?;
+    Ok(DdlTransformation {
+        version: DDL_TRANSFORMATION_VERSION,
+        target_sql: Some(normalize_ddl_sql(source_sql)?),
+    })
+}
+
 pub fn supports_rename_columns_if_exists(source_sql: &str) -> bool {
     tokenize_ddl(source_sql)
         .ok()
@@ -34,6 +49,179 @@ pub fn transform_rename_columns_if_exists(
         version: DDL_TRANSFORMATION_VERSION,
         target_sql,
     })
+}
+
+fn parse_add_columns(tokens: &[String]) -> Result<(), String> {
+    require_keyword(tokens, 0, "ALTER")?;
+    require_keyword(tokens, 1, "TABLE")?;
+    require_identifier(tokens, 2, "ALTER TABLE name")?;
+    let mut index = 3;
+    let mut clause_count = 0;
+    while index < tokens.len() {
+        require_keyword(tokens, index, "ADD")?;
+        require_keyword(tokens, index + 1, "COLUMN")?;
+        require_identifier(tokens, index + 2, "added column")?;
+        index += 3;
+        index = parse_observed_column_type(tokens, index)?;
+        index = parse_observed_column_options(tokens, index)?;
+        clause_count += 1;
+        if index == tokens.len() {
+            break;
+        }
+        if tokens.get(index).map(String::as_str) != Some(",") {
+            return Err(format!(
+                "expected comma between ADD COLUMN clauses, found {:?}",
+                tokens.get(index)
+            ));
+        }
+        index += 1;
+    }
+    if clause_count == 0 {
+        return Err("ALTER TABLE has no ADD COLUMN clauses".to_string());
+    }
+    Ok(())
+}
+
+fn parse_observed_column_type(tokens: &[String], mut index: usize) -> Result<usize, String> {
+    let column_type = require_identifier(tokens, index, "added column type")?;
+    if !matches!(column_type.to_ascii_uppercase().as_str(), "VARCHAR" | "DATETIME" | "SMALLINT") {
+        return Err(format!("unsupported production ADD COLUMN type {column_type}"));
+    }
+    index += 1;
+    if tokens.get(index).map(String::as_str) == Some("(") {
+        require_identifier(tokens, index + 1, "column type length")?;
+        require_keyword(tokens, index + 2, ")")?;
+        index += 3;
+    }
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("UNSIGNED"))
+    {
+        index += 1;
+    }
+    Ok(index)
+}
+
+fn parse_observed_column_options(tokens: &[String], mut index: usize) -> Result<usize, String> {
+    while index < tokens.len() && tokens[index] != "," {
+        if tokens[index].eq_ignore_ascii_case("NULL") {
+            index += 1;
+        } else if tokens[index].eq_ignore_ascii_case("DEFAULT") {
+            require_keyword(tokens, index + 1, "NULL")?;
+            index += 2;
+        } else if tokens[index].eq_ignore_ascii_case("COMMENT") {
+            require_keyword(tokens, index + 1, "<string>")?;
+            index += 2;
+        } else if tokens[index].eq_ignore_ascii_case("AFTER") {
+            require_identifier(tokens, index + 1, "AFTER column")?;
+            index += 2;
+        } else {
+            return Err(format!(
+                "unsupported production ADD COLUMN option {:?}",
+                tokens.get(index)
+            ));
+        }
+    }
+    Ok(index)
+}
+
+fn normalize_ddl_sql(source_sql: &str) -> Result<String, String> {
+    let characters = source_sql.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut quote = None;
+    let mut pending_space = false;
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if let Some(active_quote) = quote {
+            output.push(character);
+            if character == active_quote {
+                if characters.get(index + 1) == Some(&active_quote) {
+                    output.push(active_quote);
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            } else if character == '\\' && active_quote == '\'' {
+                if let Some(escaped) = characters.get(index + 1) {
+                    output.push(*escaped);
+                    index += 2;
+                    continue;
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(character, '`' | '\'' | '"') {
+            if pending_space && !output.is_empty() && !output.ends_with([' ', '(', '.']) {
+                output.push(' ');
+            }
+            pending_space = false;
+            quote = Some(character);
+            output.push(character);
+            index += 1;
+            continue;
+        }
+        if character == '/' && characters.get(index + 1) == Some(&'*') {
+            index += 2;
+            while index + 1 < characters.len()
+                && !(characters[index] == '*' && characters[index + 1] == '/')
+            {
+                index += 1;
+            }
+            if index + 1 >= characters.len() {
+                return Err("unterminated DDL block comment".to_string());
+            }
+            index += 2;
+            pending_space = true;
+            continue;
+        }
+        if character == '#'
+            || (character == '-'
+                && characters.get(index + 1) == Some(&'-')
+                && characters
+                    .get(index + 2)
+                    .is_none_or(|after| after.is_whitespace() || after.is_control()))
+        {
+            while characters
+                .get(index)
+                .is_some_and(|current| *current != '\n')
+            {
+                index += 1;
+            }
+            pending_space = true;
+            continue;
+        }
+        if character.is_whitespace() {
+            pending_space = true;
+            index += 1;
+            continue;
+        }
+        if character == ',' {
+            while output.ends_with(' ') {
+                output.pop();
+            }
+            output.push(',');
+            output.push(' ');
+            pending_space = false;
+            index += 1;
+            continue;
+        }
+        if pending_space
+            && !output.is_empty()
+            && !output.ends_with([' ', '(', '.'])
+            && !matches!(character, ')' | '.' | ';')
+        {
+            output.push(' ');
+        }
+        pending_space = false;
+        output.push(character);
+        index += 1;
+    }
+    if quote.is_some() {
+        return Err("unterminated DDL quote".to_string());
+    }
+    Ok(output.trim().trim_end_matches(';').trim().to_string())
 }
 
 fn parse_rename_columns_if_exists(

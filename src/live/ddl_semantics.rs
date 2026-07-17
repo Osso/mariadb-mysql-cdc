@@ -24,7 +24,8 @@ pub use parser::{parse_ddl_operation, supports_automatic_index_ddl};
 #[cfg(test)]
 pub(super) use tokenizer::tokenize_ddl;
 pub use transform::{
-    DdlTransformation, supports_rename_columns_if_exists, transform_rename_columns_if_exists,
+    DdlTransformation, supports_add_columns, supports_rename_columns_if_exists,
+    transform_add_columns, transform_rename_columns_if_exists,
 };
 
 pub trait DdlSemanticInventory {
@@ -107,6 +108,9 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
                 version: transform::DDL_TRANSFORMATION_VERSION,
                 target_sql: Some(sql.trim().trim_end_matches(';').trim().to_string()),
             });
+        }
+        if supports_add_columns(sql) {
+            return transform_add_columns(sql);
         }
         if !supports_rename_columns_if_exists(sql) {
             return Err("MariaDB DDL translator does not support this statement".to_string());
