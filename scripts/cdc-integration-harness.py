@@ -868,13 +868,13 @@ class Harness:
             unique_metadata.append(
                 self.admin_query(
                     endpoint,
-                    "SELECT index_name,non_unique,seq_in_index,column_name,index_type "
+                    "SELECT index_name,non_unique,seq_in_index,column_name,sub_part,index_type "
                     "FROM information_schema.statistics WHERE table_schema='globalcomix' "
                     "AND table_name='accounts' AND index_name='uq_accounts_email' "
                     "ORDER BY seq_in_index;",
                 ).strip()
             )
-        expected_unique_metadata = "uq_accounts_email\t0\t1\temail\tBTREE"
+        expected_unique_metadata = "uq_accounts_email\t0\t1\temail\tNULL\tBTREE"
         if unique_metadata != [expected_unique_metadata, expected_unique_metadata]:
             raise HarnessError(f"production ADD UNIQUE KEY metadata parity failed: {unique_metadata}")
         duplicate_sql = "INSERT INTO accounts VALUES (2, 'existing@example.test');"
@@ -899,17 +899,38 @@ class Harness:
             raise HarnessError(f"production ALTER TABLE journal mismatch: {journal}")
         unique_evidence = self.query(
             self.target,
-            "SELECT generated_sql FROM cdc.ddl_replay_journal "
+            "SELECT status,transformation_version,generated_sql,"
+            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.table')),"
+            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.clauses[0].kind')),"
+            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.clauses[0].index.name')),"
+            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.clauses[0].index.unique')),"
+            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.clauses[0].index.key_parts[0].column')),"
+            "JSON_LENGTH(JSON_EXTRACT(pre_state,'$.indexes')),"
+            "JSON_LENGTH(JSON_EXTRACT(expected_post_state,'$.indexes')),"
+            "JSON_UNQUOTE(JSON_EXTRACT(expected_post_state,'$.indexes[0].name')),"
+            "JSON_UNQUOTE(JSON_EXTRACT(expected_post_state,'$.indexes[0].unique')) "
+            "FROM cdc.ddl_replay_journal "
             "WHERE raw_sql LIKE 'ALTER TABLE accounts ADD UNIQUE KEY%';",
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         ).strip()
-        if unique_evidence != "ALTER TABLE `accounts` ADD UNIQUE KEY `uq_accounts_email` (`email`)":
+        expected_unique_evidence = (
+            "checkpointed\tmariadb-mysql8-v1\t"
+            "ALTER TABLE `accounts` ADD UNIQUE KEY `uq_accounts_email` (`email`)\t"
+            "accounts\tadd_key\tuq_accounts_email\ttrue\temail\t0\t1\tuq_accounts_email\ttrue"
+        )
+        if unique_evidence != expected_unique_evidence:
             raise HarnessError(f"production ADD UNIQUE KEY evidence mismatch: {unique_evidence!r}")
         checkpoint = self.checkpoint()
         if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
             raise HarnessError(f"production ALTER TABLE checkpoint mismatch: {checkpoint}")
+        supported_checkpoint = checkpoint
 
+        self.admin_sql(
+            self.target,
+            "SET GLOBAL general_log=OFF; TRUNCATE TABLE mysql.general_log; "
+            "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;",
+        )
         self.admin_sql(
             self.source,
             "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email_prefix (email(8));",
@@ -924,7 +945,19 @@ class Harness:
             "AND index_name='uq_accounts_email_prefix';",
         ).strip()
         if pending_index != "0":
-            raise HarnessError("unsupported unique-key option executed target DDL")
+            raise HarnessError("unsupported unique-key option mutated target schema")
+        target_execution_attempts = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
+            "AND command_type='Query' "
+            "AND argument LIKE 'ALTER TABLE%uq_accounts_email_prefix%';",
+        ).strip()
+        self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
+        if target_execution_attempts != "0":
+            raise HarnessError(
+                "unsupported unique-key option reached target execution: "
+                f"attempts={target_execution_attempts}"
+            )
         pending_rows = self.query(
             self.target,
             "SELECT status,transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state "
@@ -935,11 +968,10 @@ class Harness:
         if pending_rows != ["translation_pending\ttranslator-unavailable\tNULL\t\t\t"]:
             raise HarnessError(f"unsupported unique-key journal evidence mismatch: {pending_rows}")
         pending_checkpoint = self.checkpoint()
-        if pending_checkpoint.get("source_file") != stop.file or int(
-            pending_checkpoint.get("source_position", 0)
-        ) != stop.position:
+        if pending_checkpoint != supported_checkpoint:
             raise HarnessError(
-                f"unsupported unique-key option advanced checkpoint: {pending_checkpoint}"
+                "unsupported unique-key option changed checkpoint: "
+                f"before={supported_checkpoint} after={pending_checkpoint}"
             )
         print(
             f"production_alter_table_ok coordinate={stop.file}:{stop.position} "
