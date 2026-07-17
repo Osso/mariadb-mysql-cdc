@@ -16,7 +16,7 @@ fn assert_operation_cases(cases: &[(&str, DdlFamily, DdlObjectKind, &str, Option
                 primary_object: (*primary).to_string(),
                 secondary_object: secondary.map(str::to_string),
                 index_ast: parse_simple_index_ddl(sql).ok(),
-                alter_table_ast: None,
+                alter_table_ast: parse_production_alter_table_ast(sql).ok(),
             },
             "{sql}",
         );

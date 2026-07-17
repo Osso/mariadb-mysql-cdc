@@ -1,6 +1,7 @@
 use super::super::ddl_replay_journal::DdlFamily;
 use super::model::{DdlObjectKind, DdlOperation, ParsedIndexAst, ParsedIndexKeyPart};
 use super::tokenizer::{ddl_contains_comments, tokenize_ddl};
+use super::transform::parse_production_alter_table_ast;
 
 pub fn parse_simple_index_ddl(sql: &str) -> Result<ParsedIndexAst, String> {
     if ddl_contains_comments(sql) {
@@ -280,6 +281,9 @@ pub fn parse_ddl_operation(sql: &str) -> Result<DdlOperation, String> {
     }?;
     if operation.object_kind == DdlObjectKind::Index {
         operation.index_ast = Some(parse_simple_index_ddl(sql)?);
+    }
+    if command == "ALTER" && operation.object_kind == DdlObjectKind::Table {
+        operation.alter_table_ast = parse_production_alter_table_ast(sql).ok();
     }
     Ok(operation)
 }
