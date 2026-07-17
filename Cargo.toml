@@ -3,6 +3,10 @@ name = "mariadb-mysql-cdc"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+integration-failpoints = []
+
 [dependencies]
 mysql = { version = "28.0.0", features = ["native-tls"] }
 native-tls = "0.2.18"
