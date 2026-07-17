@@ -121,6 +121,7 @@ class Harness:
         self.source: Endpoint | None = None
         self.target: Endpoint | None = None
         self.ca_file = self.tempdir / "ca.pem"
+        self.unrelated_ca_file = self.tempdir / "unrelated-ca.pem"
         self.cert_file = self.tempdir / "server-cert.pem"
         self.key_file = self.tempdir / "server-key.pem"
 
@@ -174,6 +175,24 @@ class Harness:
                 str(ca_key),
                 "-out",
                 str(self.ca_file),
+            ]
+        )
+        run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "2",
+                "-subj",
+                "/CN=cdc-harness-unrelated-ca",
+                "-keyout",
+                str(self.tempdir / "unrelated-ca-key.pem"),
+                "-out",
+                str(self.unrelated_ca_file),
             ]
         )
         run(
@@ -503,8 +522,17 @@ class Harness:
             check=False,
         )
 
-    def _catchup_args(self, binary: Path, progress_file: Path) -> list[str]:
+    def _catchup_args(
+        self,
+        binary: Path,
+        progress_file: Path,
+        *,
+        source_ca_file: Path | None = None,
+        target_ca_file: Path | None = None,
+    ) -> list[str]:
         assert self.source and self.target
+        source_ca_file = source_ca_file or self.ca_file
+        target_ca_file = target_ca_file or self.ca_file
         return [
             str(binary),
             "catchup-snapshot",
@@ -519,7 +547,7 @@ class Harness:
             "--source-database",
             APP_SCHEMA,
             "--source-tls-ca-file",
-            str(self.ca_file),
+            str(source_ca_file),
             "--target-host",
             "127.0.0.1",
             "--target-port",
@@ -531,7 +559,7 @@ class Harness:
             "--target-database",
             APP_SCHEMA,
             "--target-tls-ca-file",
-            str(self.ca_file),
+            str(target_ca_file),
             "--progress-file",
             str(progress_file),
             "--progress-table",
@@ -764,6 +792,50 @@ class Harness:
         self.admin_sql(self.source, schema)
         self.admin_sql(self.target, schema)
 
+    def _assert_catchup_target_unchanged(self) -> None:
+        assert self.target
+        row_count = self.admin_query(self.target, "SELECT COUNT(*) FROM accounts;").strip()
+        progress_count = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM globalcomix.table_sync_progress "
+            "WHERE table_name='accounts';",
+        ).strip()
+        if row_count != "0" or progress_count != "0":
+            raise HarnessError(
+                "rejected catchup mutated target: "
+                f"rows={row_count!r} progress_rows={progress_count!r}"
+            )
+
+    def _assert_catchup_ca_rejected(
+        self,
+        binary: Path,
+        progress_file: Path,
+        env: dict[str, str],
+        *,
+        source_ca_file: Path,
+        target_ca_file: Path,
+        label: str,
+    ) -> None:
+        result = run(
+            self._catchup_args(
+                binary,
+                progress_file,
+                source_ca_file=source_ca_file,
+                target_ca_file=target_ca_file,
+            ),
+            env=env,
+            timeout=90,
+            check=False,
+        )
+        if result.returncode == 0:
+            raise HarnessError(f"catchup accepted {label}")
+        diagnostic = f"{result.stdout}\n{result.stderr}".lower()
+        if not any(marker in diagnostic for marker in ("certificate", "ssl", "tls")):
+            raise HarnessError(
+                f"catchup {label} lacked TLS diagnostic: {diagnostic!r}"
+            )
+        self._assert_catchup_target_unchanged()
+
     def run_catchup_snapshot_tls(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
@@ -783,6 +855,23 @@ class Harness:
             "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
             "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
         }
+
+        self._assert_catchup_ca_rejected(
+            binary,
+            progress_file,
+            env,
+            source_ca_file=self.unrelated_ca_file,
+            target_ca_file=self.ca_file,
+            label="untrusted source CA",
+        )
+        self._assert_catchup_ca_rejected(
+            binary,
+            progress_file,
+            env,
+            source_ca_file=self.ca_file,
+            target_ca_file=self.unrelated_ca_file,
+            label="untrusted target CA",
+        )
 
         first = run(args, env=env, timeout=90, check=False)
         require_success(first, "catchup snapshot TLS")
@@ -823,10 +912,11 @@ class Harness:
             "AND UPPER(argument) LIKE 'INSERT%ACCOUNTS%';",
         ).strip()
         self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
-        require_success(replay, "catchup snapshot TLS resume")
+        require_success(replay, "catchup snapshot TLS completed rerun")
         if account_insert_attempts != "0":
             raise HarnessError(
-                f"catchup TLS resume attempted account inserts: {account_insert_attempts}"
+                "catchup TLS completed rerun attempted account inserts: "
+                f"{account_insert_attempts}"
             )
         replayed_rows = self.query(
             self.target,
@@ -835,10 +925,13 @@ class Harness:
             password=TARGET_PASSWORD,
         ).strip()
         if replayed_rows != expected_rows:
-            raise HarnessError(f"catchup TLS resume changed rows: {replayed_rows!r}")
+            raise HarnessError(
+                f"catchup TLS completed rerun changed rows: {replayed_rows!r}"
+            )
         print(
             "catchup_snapshot_tls_converged rows=4 source_ca=true target_ca=true "
-            "parallel_workers=2 resume_idempotent=true"
+            "wrong_source_ca_rejected=true wrong_target_ca_rejected=true "
+            "parallel_workers=2 completed_rerun_noop=true"
         )
 
     def run_strict_secondary_btree(self) -> None:
