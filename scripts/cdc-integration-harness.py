@@ -949,6 +949,7 @@ class Harness:
                 "table": "accounts",
                 "clauses": [{"kind": "add_key", "index": expected_index_ast}],
             },
+            "parsed_create_table": None,
         }
         canonical_ast = json.loads(ast_json)
         if canonical_ast != expected_ast:
