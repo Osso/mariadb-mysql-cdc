@@ -1,0 +1,6 @@
+CREATE DATABASE IF NOT EXISTS globalcomix;
+
+CREATE USER IF NOT EXISTS 'cdc_reader'@'%' IDENTIFIED BY 'cdc-reader-password' REQUIRE SSL;
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc_reader'@'%';
+GRANT SELECT, SHOW VIEW ON globalcomix.* TO 'cdc_reader'@'%';
+FLUSH PRIVILEGES;
