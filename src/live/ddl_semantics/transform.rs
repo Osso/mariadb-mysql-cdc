@@ -83,6 +83,42 @@ fn quote_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+pub fn supports_drop_columns_if_exists(source_sql: &str) -> bool {
+    tokenize_ddl(source_sql)
+        .ok()
+        .and_then(|tokens| parse_drop_columns_if_exists(&tokens).ok())
+        .is_some()
+}
+
+pub fn transform_drop_columns_if_exists(
+    source_sql: &str,
+    target_columns: &BTreeSet<String>,
+) -> Result<DdlTransformation, String> {
+    let tokens = tokenize_ddl(source_sql)?;
+    let (table, columns) = parse_drop_columns_if_exists(&tokens)?;
+    let executable_columns = columns
+        .into_iter()
+        .filter(|column| target_columns.contains(column))
+        .collect::<Vec<_>>();
+    let target_sql = if executable_columns.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "ALTER TABLE {} {}",
+            quote_identifier(&table),
+            executable_columns
+                .iter()
+                .map(|column| format!("DROP COLUMN {}", quote_identifier(column)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    };
+    Ok(DdlTransformation {
+        version: DDL_TRANSFORMATION_VERSION,
+        target_sql,
+    })
+}
+
 pub fn supports_rename_columns_if_exists(source_sql: &str) -> bool {
     tokenize_ddl(source_sql)
         .ok()
@@ -344,6 +380,31 @@ fn extract_single_quoted_literals(source_sql: &str) -> Result<Vec<String>, Strin
         literals.push(literal);
     }
     Ok(literals)
+}
+
+fn parse_drop_columns_if_exists(tokens: &[String]) -> Result<(String, Vec<String>), String> {
+    require_keyword(tokens, 0, "ALTER")?;
+    require_keyword(tokens, 1, "TABLE")?;
+    let table = require_identifier(tokens, 2, "ALTER TABLE name")?;
+    let mut columns = Vec::new();
+    let mut index = 3;
+    while index < tokens.len() {
+        require_keyword(tokens, index, "DROP")?;
+        require_keyword(tokens, index + 1, "COLUMN")?;
+        require_keyword(tokens, index + 2, "IF")?;
+        require_keyword(tokens, index + 3, "EXISTS")?;
+        columns.push(require_identifier(tokens, index + 4, "dropped column")?);
+        index += 5;
+        if index == tokens.len() {
+            break;
+        }
+        require_keyword(tokens, index, ",")?;
+        index += 1;
+    }
+    if columns.is_empty() {
+        return Err("ALTER TABLE has no DROP COLUMN IF EXISTS clauses".to_string());
+    }
+    Ok((table, columns))
 }
 
 fn parse_rename_columns_if_exists(

@@ -30,6 +30,7 @@ allowlist.
 ### Current implemented slice
 
 - [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`, named `ADD KEY`, and named `ADD UNIQUE KEY` clauses.
+- [x] Convert MariaDB `ALTER TABLE ... DROP COLUMN IF EXISTS ...` into MySQL 8 `DROP COLUMN` clauses selected from target column presence; an entirely absent set is a proven no-op.
 - [x] Transform the observed `ADD COLUMN` forms for `VARCHAR(length)`, `DATETIME`, and `SMALLINT UNSIGNED`, with the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options.
 - [x] Transform named composite `ADD KEY` and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; broader index and clause options remain outside this slice.
 - [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
@@ -103,7 +104,8 @@ broader DDL coverage and operational proof gaps listed below.
 - `src/live/ddl_semantics.rs` — dispatches current DDL transformations and
   captures semantic evidence.
 - `src/live/ddl_semantics/transform.rs` — production-derived `ADD COLUMN`,
-  `ADD KEY`, `ADD UNIQUE KEY`, and `RENAME COLUMN IF EXISTS` translators,
+  `ADD KEY`, `ADD UNIQUE KEY`, `DROP COLUMN IF EXISTS`, and
+  `RENAME COLUMN IF EXISTS` translators,
   including deterministic SQL emission.
 - `src/live/ddl_semantics/canonical.rs` — typed ALTER clause AST encoding and
   expected post-state derivation from the fenced target pre-state.
@@ -119,9 +121,9 @@ broader DDL coverage and operational proof gaps listed below.
 The current slice is covered by:
 
 - [x] `src/live/ddl_semantics/tests.rs` — deterministic production `ADD COLUMN`,
-      `ADD KEY`, and `ADD UNIQUE KEY` SQL, typed AST parsing, post-state
-      derivation from fenced target pre-state, plus the existing rename
-      boundaries.
+      `ADD KEY`, `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` SQL/no-op behavior,
+      typed AST parsing, post-state derivation from fenced target pre-state, plus
+      the existing rename boundaries.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
       generated SQL and preserves journal/checkpoint ordering.
 - [x] `scripts/cdc-integration-harness.py --scenario production-alter-table` —
@@ -156,8 +158,8 @@ MariaDB/MySQL matrix, or deployment safety.
 
 - Manual target-SQL authoring or operator resolution as a CDC fallback.
 - Index-only automatic replay as the target DDL architecture.
-- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`, `ADD KEY`, and
-  `ADD UNIQUE KEY` forms.
+- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`, `ADD KEY`,
+  `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` forms.
 - Additional column types, defaults, clauses, index options, and DDL families not
   listed in the implemented slice.
 - Silently dropping, weakening, or approximating parsed DDL clauses.

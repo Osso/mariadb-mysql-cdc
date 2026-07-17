@@ -24,7 +24,8 @@ pub use parser::{parse_ddl_operation, supports_automatic_index_ddl};
 #[cfg(test)]
 pub(super) use tokenizer::tokenize_ddl;
 pub use transform::{
-    DdlTransformation, supports_production_alter_table, supports_rename_columns_if_exists,
+    DdlTransformation, supports_drop_columns_if_exists, supports_production_alter_table,
+    supports_rename_columns_if_exists, transform_drop_columns_if_exists,
     transform_production_alter_table, transform_rename_columns_if_exists,
 };
 
@@ -112,7 +113,9 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         if supports_production_alter_table(sql) {
             return transform_production_alter_table(sql);
         }
-        if !supports_rename_columns_if_exists(sql) {
+        let drops_if_exists = supports_drop_columns_if_exists(sql);
+        let renames_if_exists = supports_rename_columns_if_exists(sql);
+        if !drops_if_exists && !renames_if_exists {
             return Err("MariaDB DDL translator does not support this statement".to_string());
         }
         let operation = parse_ddl_operation(sql)?;
@@ -137,7 +140,11 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
             .iter()
             .map(|column| column.name.clone())
             .collect();
-        transform_rename_columns_if_exists(sql, &columns)
+        if drops_if_exists {
+            transform_drop_columns_if_exists(sql, &columns)
+        } else {
+            transform_rename_columns_if_exists(sql, &columns)
+        }
     }
 
     fn capture_evidence(
