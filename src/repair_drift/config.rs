@@ -1,7 +1,6 @@
 use super::RepairDriftConfig;
 use crate::live::TargetMySqlConfig;
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::SOURCE_TLS_CA_FILE;
 use crate::table_sync::SyncMode;
 
 pub(crate) fn parse_repair_drift_config(args: Vec<String>) -> Result<RepairDriftConfig, String> {
@@ -20,12 +19,8 @@ pub(crate) fn parse_repair_drift_config(args: Vec<String>) -> Result<RepairDrift
 }
 
 pub(crate) fn default_repair_drift_config() -> RepairDriftConfig {
-    let source = MySqlConnectionConfig {
-        tls_ca_file: Some(SOURCE_TLS_CA_FILE.to_string()),
-        ..MySqlConnectionConfig::default()
-    };
     RepairDriftConfig {
-        source,
+        source: MySqlConnectionConfig::default(),
         source_identity: String::new(),
         target: TargetMySqlConfig::default(),
         tables: Vec::new(),
@@ -77,7 +72,6 @@ fn apply_repair_source_option(
         "--source-port" => config.source.port = crate::parse_u16(flag, value)?,
         "--source-user" => config.source.user = value.to_string(),
         "--source-password-env" => config.source.password = crate::read_env_password(value)?,
-        "--source-tls-ca-file" => config.source.tls_ca_file = Some(value.to_string()),
         "--source-database" => config.source.database = value.to_string(),
         "--source-identity" => config.source_identity = value.to_string(),
         _ => return Ok(false),

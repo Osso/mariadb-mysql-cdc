@@ -6,7 +6,6 @@ use crate::inventory::{
     build_canonical_foreign_key_inventory,
 };
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::SOURCE_TLS_CA_FILE;
 use crate::table_sync::SyncTable;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -312,15 +311,11 @@ fn build_source_repair_inventory(
     config: &RepairDriftConfig,
     inventory: &SchemaInventory,
 ) -> Result<RepairInventory, RepairDriftError> {
-    let tls_ca_file = config
-        .source
-        .tls_ca_file
-        .as_deref()
-        .unwrap_or(SOURCE_TLS_CA_FILE);
     build_repair_inventory(
         &config.source,
         InventoryEndpointRole::Source,
-        tls_ca_file,
+        false,
+        None,
         inventory,
     )
     .map_err(|error| RepairDriftError::Inventory(error.to_string()))
@@ -334,7 +329,8 @@ fn build_target_repair_inventory(
     let mut repair_inventory = build_repair_inventory(
         &target_source,
         InventoryEndpointRole::Target,
-        &config.target.tls_ca_file,
+        true,
+        Some(&config.target.tls_ca_file),
         inventory,
     )
     .map_err(|error| RepairDriftError::Inventory(error.to_string()))?;
@@ -397,7 +393,8 @@ pub(crate) fn ordered_candidate_tables(
 fn build_repair_inventory(
     source: &MySqlConnectionConfig,
     endpoint_role: InventoryEndpointRole,
-    tls_ca_file: &str,
+    use_tls: bool,
+    tls_ca_file: Option<&str>,
     inventory: &SchemaInventory,
 ) -> Result<RepairInventory, crate::inventory::InventoryError> {
     let reader = crate::inventory::MariaDbInventoryReader::new(InventoryConfig {
@@ -406,8 +403,8 @@ fn build_repair_inventory(
         user: source.user.clone(),
         password: source.password.clone(),
         endpoint_role,
-        use_tls: true,
-        tls_ca_file: Some(tls_ca_file.to_string()),
+        use_tls,
+        tls_ca_file: tls_ca_file.map(str::to_string),
         ..InventoryConfig::default()
     });
     Ok(RepairInventory {

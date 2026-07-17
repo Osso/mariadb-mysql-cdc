@@ -1,7 +1,7 @@
 use super::config::{
     default_repair_drift_config, repair_drift_option, validate_repair_drift_config,
 };
-use super::plan::{exclude_progress_table, order_table_names};
+use super::plan::{build_runtime_repair_plan, exclude_progress_table, order_table_names};
 use super::run::{
     build_drift_check_config, can_resolve_verified_conflicts,
     can_resolve_verified_conflicts_after_verify, fresh_run_id, sync_config,
@@ -9,6 +9,7 @@ use super::run::{
 };
 use super::*;
 use crate::drift_check::{ContentDriftSummary, DriftComparison};
+use crate::mysql_support::target_mysql_opts;
 use crate::table_sync::SyncPhase;
 
 #[test]
@@ -135,6 +136,19 @@ fn valid_config() -> RepairDriftConfig {
     config
 }
 
+fn empty_schema_inventory() -> crate::inventory::SchemaInventory {
+    crate::inventory::SchemaInventory {
+        schema: "database".to_string(),
+        tables: Vec::new(),
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        views: Vec::new(),
+        triggers: Vec::new(),
+        routines: Vec::new(),
+        events: Vec::new(),
+    }
+}
+
 #[test]
 fn bounded_windows_defer_table_wide_conflict_resolution() {
     let mut config = default_repair_drift_config();
@@ -204,8 +218,9 @@ fn parses_selected_primary_key_window_for_bounded_repair() {
 }
 
 #[test]
-fn default_source_ca_reaches_child_sync_config() {
-    let config = default_repair_drift_config();
+fn omitted_source_ca_reaches_child_sync_config_as_plaintext() {
+    let mut config = default_repair_drift_config();
+    config.source.tls_ca_file = None;
     let child = sync_config(
         &config,
         table_sync::SyncTable {
@@ -217,22 +232,53 @@ fn default_source_ca_reaches_child_sync_config() {
         "plan-hash",
     );
 
-    assert_eq!(
-        config.source.tls_ca_file.as_deref(),
-        Some(crate::mysql_support::SOURCE_TLS_CA_FILE)
-    );
-    assert_eq!(child.source.tls_ca_file, config.source.tls_ca_file);
+    assert_eq!(child.source.tls_ca_file, None);
 }
 
 #[test]
-fn parses_source_tls_ca_file_for_real_endpoint_orchestration() {
-    let mut config = default_repair_drift_config();
-    repair_drift_option(&mut config, "--source-tls-ca-file", "/tmp/harness-ca.pem")
-        .expect("source TLS CA file");
-    assert_eq!(
-        config.source.tls_ca_file.as_deref(),
-        Some("/tmp/harness-ca.pem")
-    );
+fn validates_omitted_source_ca_for_plaintext_repair() {
+    let mut config = valid_config();
+    config.source.tls_ca_file = None;
+
+    validate_repair_drift_config(&config).expect("plaintext source without CA should be accepted");
+}
+
+#[test]
+fn repair_source_inventory_uses_plaintext_without_tls_ca() {
+    let mut config = valid_config();
+    config.source.host = "127.0.0.1".to_string();
+    config.source.port = 1;
+    config.source.tls_ca_file = None;
+
+    let inventory = empty_schema_inventory();
+    let error = build_runtime_repair_plan(&config, "repair-run", &inventory, &inventory)
+        .expect_err("source inventory connection should fail");
+    let message = error.to_string();
+
+    assert!(message.contains("repair drift inventory failed"));
+    assert!(!message.contains("TLS CA file"));
+}
+
+#[test]
+fn repair_target_still_requires_tls_ca() {
+    let mut config = valid_config();
+    config.target.tls_ca_file = String::new();
+
+    let error = validate_repair_drift_config(&config).expect_err("missing target TLS CA");
+
+    assert_eq!(error, "target TLS CA file is required");
+}
+
+#[test]
+fn repair_target_dns_keeps_hostname_verification() {
+    let mut target = valid_config().target;
+    target.tls_ca_file = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string();
+
+    let opts = target_mysql_opts(&target).expect("target TLS opts");
+    let ssl = opts.get_ssl_opts().expect("target TLS configured");
+
+    assert!(!ssl.skip_domain_validation());
+    assert!(!ssl.accept_invalid_certs());
 }
 
 #[test]
