@@ -50,14 +50,17 @@ where
     let outcome = executor.execute_row_change(&statement).map_err(|source| {
         row_target_error(coordinate, table, operation, RowError::Target(source))
     })?;
-    if let TargetExecutionOutcome::DuplicateIgnored(conflict) = outcome {
-        println!(
-            "{}",
-            format_row_conflict_skipped(operation, table, coordinate, primary_key)
-        );
-        record_skipped_conflict(context, coordinate, table, operation, primary_key, conflict)?;
+    match outcome {
+        TargetExecutionOutcome::Applied => Ok(()),
+        TargetExecutionOutcome::DuplicateIgnored(conflict)
+        | TargetExecutionOutcome::ConstraintConflict(conflict) => {
+            println!(
+                "{}",
+                format_row_conflict_skipped(operation, table, coordinate, primary_key)
+            );
+            record_skipped_conflict(context, coordinate, table, operation, primary_key, conflict)
+        }
     }
-    Ok(())
 }
 
 fn record_skipped_conflict(
@@ -71,6 +74,7 @@ fn record_skipped_conflict(
     let Some(context) = context else {
         return Ok(());
     };
+    let conflict_error = conflict.error_text.clone();
     let observation =
         skipped_conflict_observation(context, coordinate, table, operation, primary_key, conflict);
     context
@@ -82,7 +86,14 @@ fn record_skipped_conflict(
         .unresolved_count_result()
         .map_err(|error| conflict_store_error(coordinate, table, operation, "read", error))?;
     println!("cdc_row_conflict_progress unresolved_count={unresolved_count}");
-    Ok(())
+    Err(row_target_error(
+        coordinate,
+        table,
+        operation,
+        RowError::Target(TargetExecuteError::new(format!(
+            "row conflict persisted for repair: {conflict_error}"
+        ))),
+    ))
 }
 
 fn skipped_conflict_observation(

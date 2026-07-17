@@ -1,8 +1,5 @@
 use crate::checkpoint::Checkpoint;
-use crate::live::{
-    InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
-    should_ignore_duplicate_row_change,
-};
+use crate::live::{InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert};
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::mysql_support::{
     TARGET_TLS_CA_FILE, quote_ident, quote_identifier_path, quote_sql_literal, ssl_opts_from_ca,
@@ -186,25 +183,34 @@ impl TargetExecutor for PersistentTargetExecutor {
     ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
         match self.execute_statement(statement) {
             Ok(()) => Ok(TargetExecutionOutcome::Applied),
-            Err(error)
-                if should_ignore_duplicate_row_change(
-                    self.insert_conflict_policy,
-                    &statement.sql,
-                    &error.to_string(),
-                ) =>
-            {
-                Ok(TargetExecutionOutcome::DuplicateIgnored(DuplicateConflict {
+            Err(error) if error.mysql_code() == Some(1062) => Ok(
+                TargetExecutionOutcome::DuplicateIgnored(DuplicateConflict {
                     error_code: 1062,
                     error_text: error.to_string(),
                     duplicate_index: crate::target::duplicate_index_from_error(&error.to_string()),
-                }))
-            }
+                }),
+            ),
             Err(error) => {
+                if let Some(conflict) = constraint_conflict_from_error(&error) {
+                    return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
+                }
                 self.retry_or_return_error(statement, error)?;
                 Ok(TargetExecutionOutcome::Applied)
             }
         }
     }
+}
+
+fn constraint_conflict_from_error(error: &TargetExecuteError) -> Option<DuplicateConflict> {
+    let code = error.mysql_code()?;
+    if !matches!(code, 1048 | 1451 | 1452 | 3819 | 4025) {
+        return None;
+    }
+    Some(DuplicateConflict {
+        error_code: code,
+        error_text: error.to_string(),
+        duplicate_index: None,
+    })
 }
 
 impl TransactionalTargetExecutor for PersistentTargetExecutor {
@@ -656,7 +662,13 @@ fn target_connect_error(error: mysql::Error) -> TargetExecuteError {
 }
 
 fn target_query_error(error: mysql::Error) -> TargetExecuteError {
-    TargetExecuteError::new(format!("target mysql query failed: {error}"))
+    let message = format!("target mysql query failed: {error}");
+    match error {
+        mysql::Error::MySqlError(server_error) => {
+            TargetExecuteError::from_mysql(server_error.code, message)
+        }
+        _ => TargetExecuteError::new(message),
+    }
 }
 
 fn progress_connect_error(error: mysql::Error) -> TableSyncError {
@@ -744,6 +756,22 @@ mod tests {
             build_stream_lease_sql("cdc-stream:globalcomix"),
             "SELECT GET_LOCK(SHA2('cdc-stream:globalcomix',256),0)"
         );
+    }
+
+    #[test]
+    fn classifies_supported_mysql_constraint_errors_for_durable_evidence() {
+        for code in [1048, 1451, 1452, 3819, 4025] {
+            let error = TargetExecuteError::from_mysql(code, format!("constraint failure {code}"));
+            let conflict = constraint_conflict_from_error(&error).expect("constraint conflict");
+            assert_eq!(conflict.error_code, code);
+            assert_eq!(conflict.duplicate_index, None);
+        }
+    }
+
+    #[test]
+    fn rejects_non_constraint_mysql_errors_as_conflict_evidence() {
+        let error = TargetExecuteError::from_mysql(1142, "permission denied");
+        assert_eq!(constraint_conflict_from_error(&error), None);
     }
 
     #[test]

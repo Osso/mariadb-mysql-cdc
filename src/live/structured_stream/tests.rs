@@ -733,6 +733,66 @@ fn wraps_target_writes_and_checkpoint_in_source_xid_transaction() {
 }
 
 #[test]
+fn duplicate_rolls_back_multi_row_transaction_without_checkpoint_and_persists_idempotent_evidence()
+{
+    let executor = TransactionRecordingExecutor::with_duplicate_second_row_change();
+    let mut applier = crate::row::RowApplier::new(executor);
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
+                current_file: &mut current_file,
+                group_config: TargetTransactionGroupConfig::default(),
+            };
+            apply_stream_event_transactionally_with_conflicts(
+                &mut applier,
+                &mut context,
+                &header,
+                &event,
+                "test-source",
+                &mut conflicts,
+            )
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+
+    for _attempt in 0..2 {
+        process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("first row");
+        let error = process_event!(event_header(31, 240), write_rows_event(18, 2, "beta"))
+            .expect_err("duplicate second row must abort source transaction");
+        assert!(error.to_string().contains("conflict persisted for repair"));
+    }
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        [
+            "BEGIN", "EXEC", "EXEC", "ROLLBACK", "BEGIN", "EXEC", "EXEC", "ROLLBACK"
+        ]
+    );
+    assert!(!applier.executor().operations().contains(&"CHECKPOINT"));
+    assert!(!applier.executor().operations().contains(&"COMMIT"));
+    assert_eq!(conflicts.records().len(), 1);
+    assert_eq!(conflicts.records()[0].attempt_count, 2);
+}
+
+#[test]
 fn query_dml_does_not_open_or_checkpoint_target_transaction() {
     let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
@@ -1976,6 +2036,8 @@ impl DdlEventLedger for RecordingDdlLedger {
 struct TransactionRecordingExecutor {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     fail_execute: bool,
+    duplicate_row_change_number: Option<usize>,
+    row_change_count: std::cell::Cell<usize>,
     locked_checkpoint: Option<crate::checkpoint::Checkpoint>,
 }
 
@@ -1984,6 +2046,8 @@ impl Default for TransactionRecordingExecutor {
         Self {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: false,
+            duplicate_row_change_number: None,
+            row_change_count: std::cell::Cell::new(0),
             locked_checkpoint: Some(crate::checkpoint::Checkpoint {
                 source_file: "mysqld-bin.000000".to_string(),
                 source_position: 4,
@@ -2003,6 +2067,8 @@ impl TransactionRecordingExecutor {
         Self {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: true,
+            duplicate_row_change_number: None,
+            row_change_count: std::cell::Cell::new(0),
             locked_checkpoint: None,
         }
     }
@@ -2010,6 +2076,13 @@ impl TransactionRecordingExecutor {
     fn with_locked_checkpoint(checkpoint: crate::checkpoint::Checkpoint) -> Self {
         Self {
             locked_checkpoint: Some(checkpoint),
+            ..Self::default()
+        }
+    }
+
+    fn with_duplicate_second_row_change() -> Self {
+        Self {
+            duplicate_row_change_number: Some(2),
             ..Self::default()
         }
     }
@@ -2033,6 +2106,28 @@ impl TargetExecutor for TransactionRecordingExecutor {
             return Err(crate::target::TargetExecuteError::new("forced failure"));
         }
         Ok(())
+    }
+
+    fn execute_row_change(
+        &self,
+        statement: &crate::target::SqlStatement,
+    ) -> Result<crate::target::TargetExecutionOutcome, crate::target::TargetExecuteError> {
+        self.execute(statement)?;
+        let row_change_number = self.row_change_count.get() + 1;
+        self.row_change_count.set(row_change_number);
+        if self
+            .duplicate_row_change_number
+            .is_some_and(|interval| row_change_number.is_multiple_of(interval))
+        {
+            return Ok(crate::target::TargetExecutionOutcome::DuplicateIgnored(
+                crate::target::DuplicateConflict {
+                    error_code: 1062,
+                    error_text: "Duplicate entry for key 'uq_accounts_name'".to_string(),
+                    duplicate_index: Some("uq_accounts_name".to_string()),
+                },
+            ));
+        }
+        Ok(crate::target::TargetExecutionOutcome::Applied)
     }
 }
 

@@ -39,6 +39,7 @@ pub struct DuplicateConflict {
 pub enum TargetExecutionOutcome {
     Applied,
     DuplicateIgnored(DuplicateConflict),
+    ConstraintConflict(DuplicateConflict),
 }
 
 pub trait TargetExecutor {
@@ -216,13 +217,26 @@ where
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetExecuteError {
     message: String,
+    mysql_code: Option<u16>,
 }
 
 impl TargetExecuteError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            mysql_code: None,
         }
+    }
+
+    pub fn from_mysql(code: u16, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            mysql_code: Some(code),
+        }
+    }
+
+    pub fn mysql_code(&self) -> Option<u16> {
+        self.mysql_code
     }
 }
 
