@@ -5,15 +5,20 @@ execution to a `TargetExecutor`.
 
 Supported operations:
 
-- batched insert/upsert for snapshot rows
+- batched insert for snapshot rows, with either upsert or duplicate-ignore mode
 - update by primary key
 - delete by primary key
 
-The writer emits:
+The snapshot writer emits either a plain multi-row `INSERT`, an upsert, or an
+ignore-duplicate insert according to its configured mode. The native ROW applier
+uses a separate plain `INSERT` path and emits:
 
-- `INSERT ... VALUES (...), (...) ON DUPLICATE KEY UPDATE ...`
 - `UPDATE ... SET ... WHERE <primary-key predicates>`
 - `DELETE FROM ... WHERE <primary-key predicates>`
+
+For a ROW update that changes its primary key, the assignments cover every
+writable, non-generated after-image column and the predicates cover every
+before-image primary-key column.
 
 Errors include:
 

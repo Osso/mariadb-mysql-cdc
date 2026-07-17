@@ -8,7 +8,9 @@ target with minimal downtime.
 - Consume production `binlog_format=ROW` with `binlog_row_image=FULL`.
 - Snapshot table data first, then stream from a recorded binlog position.
 - Apply row changes by source primary key; a secondary-unique conflict never
-  mutates another target primary key.
+  mutates another target primary key. For a primary-key-changing ROW update,
+  assign every writable, non-generated after-image column and predicate on every
+  before-image primary-key column.
 - Keep skipped conflicts observable and reconcile them before cutover.
 - Stop or quarantine unsupported data-changing events with exact coordinates.
 - Keep the target out of service until repeated reconciliation proves parity.
@@ -43,14 +45,20 @@ manual ledger, and stops before checkpoint advancement. The ledger and the
 automatic journal are separate control-plane objects.
 
 The code contains a durable row-conflict ledger wired into the live stream and
-an FK-aware phased repair planner. Startup fail-closes unless the admin-bootstrapped
-`cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory procedure, and exact table/procedure grants validate;
-runtime never creates the table. `repair-drift` now invokes the planner for
-child-first deletes, parent-first inserts, cycle/schema blocking, immutable
-resumption, bounded PK windows, and evidence-backed conflict resolution. The
-disposable MariaDB 11.4/MySQL 8.0 harness defines 30 executable scenarios covering
-bootstrap/grants, DDL journal crash recovery, reconnect/lease behavior, and FK-aware
-repair/conflict resolution. Those are local Docker proofs, not live cutover proof;
+an FK-aware phased repair planner. Duplicate and supported constraint conflicts
+persist evidence through an independent control-plane connection before the row
+failure rolls back the target transaction; guarded observation upserts are
+idempotent, and the live target checkpoint does not advance. The admin-bootstrapped
+`cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory
+procedure, and exact table/procedure grants must validate at startup; runtime never
+creates the table. Different source primary keys remain different conflict
+identities. `repair-drift` now invokes the planner for child-first deletes,
+parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
+windows, a non-mutating full-scope Verify equality phase, and evidence-backed
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 30
+executable scenarios covering bootstrap/grants, DDL journal crash recovery,
+reconnect/GET_LOCK behavior, and FK-aware repair/conflict resolution. Those are
+local Docker proofs, not live cutover proof;
 recurring conflict scheduling and full cutover proof remain unchecked.
 
 Deployment remains blocked pending real-MySQL/live proof, exact grant/bootstrap
@@ -58,7 +66,7 @@ review, bounded repair convergence, and ops rollout gates. Ops proof still needs
 fresh immutable image tags, suspended repair/catchup rollout review, replacement
 or justification of privileged catchup credentials, unique recurring run IDs,
 bounded delete evidence, FK-safe ordering, CA/config-map verification, journal
-arguments, and single-replica lease/fence proof. No ops or deployment action is
+arguments, and single-writer `GET_LOCK` proof. No ops or deployment action is
 part of this worktree. The legacy `probe` text-binlog path is not a supported
 health check.
 

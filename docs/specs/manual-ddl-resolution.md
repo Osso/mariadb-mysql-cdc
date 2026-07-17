@@ -55,8 +55,10 @@ objects.
       CALL-returned trigger inventory rows, and effective runtime grants at startup.
 - [x] Keep SHOW CREATE PROCEDURE and direct trigger-row review in the separate
       admin/resolver bootstrap evidence path; runtime requires exact EXECUTE only.
-- [x] Insert only complete immutable `prepared` identity/evidence/lease/fence
-      rows.
+- [x] Insert only complete immutable `prepared` identity/evidence rows.
+- [x] Acquire only the nonblocking single-writer MySQL named lock
+      `GET_LOCK(SHA2(<lease-name>,256),0)`; no multi-writer fence, CAS, or
+      fencing-token protocol is implemented or required.
 - [x] Permit only `prepared -> applied|blocked` and `applied -> checkpointed`.
 - [x] Enforce startup no-overtake for the earliest `prepared` or `blocked` row.
 - [x] Fail closed when a prepared row lacks unique expected-post proof; do not
@@ -76,7 +78,10 @@ cutover readiness.
 The static control-plane contract is exact: global `USAGE` only; checkpoint
 `SELECT,INSERT,UPDATE`; row-conflict ledger `SELECT,INSERT,UPDATE`; manual
 ledger `SELECT,INSERT`; journal `SELECT,INSERT,UPDATE`; and `EXECUTE` only on the
-three exact definer-safe trigger-inventory procedures. Reject global mutation,
+three exact definer-safe trigger-inventory procedures. The separate application
+schema grant includes `SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP,
+INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE,
+EXECUTE, EVENT, TRIGGER`. Reject control-plane/global/admin mutation,
 `ALL`, `GRANT OPTION`, `PROXY`, roles, broad `cdc.*`, and mutation of
 manual-ledger/journal guards. Validate this contract once during
 startup/bootstrap and fail fast on drift.
@@ -111,5 +116,5 @@ boundary are documented in the [DDL Resolution Runbook](../ddl-resolution.md#pri
 
 The unchecked syntax rows above are intentional real-MySQL coverage gaps. The
 30-scenario Docker harness covers the implemented journal/bootstrap, recovery,
-lease, reconnect, and repair boundaries but does not turn those rows into a
+GET_LOCK, reconnect, and repair boundaries but does not turn those rows into a
 live-target proof.

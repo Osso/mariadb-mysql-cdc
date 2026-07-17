@@ -31,7 +31,9 @@ The old text-binlog probe path is not a production health check.
 Static control-plane prerequisites are validated once during admin/bootstrap and
 startup, before source replication; see the [DDL Resolution Runbook](ddl-resolution.md#startupbootstrap-validation-boundary).
 That validation covers effective grants, control-plane schema, guards, triggers,
-procedures, and checkpoint/lease prerequisites as deployment-drift detection.
+procedures, and checkpoint plus single-writer `GET_LOCK` prerequisites as
+deployment-drift detection. There is no multi-writer fence, CAS, or fencing-token
+protocol.
 Binlog DDL remains untrusted input and is classified per event. After admission,
 CDC-generated SQL is trusted internal program behavior: event handling executes
 known operations directly, keeps only event-specific state/evidence checks, and
@@ -43,20 +45,25 @@ duplicate allowlists.
 The code contains a durable conflict schema contract wired into live row-event
 handling and an FK-aware phased planner. `cdc.row_conflicts` uses a lowercase
 ASCII SHA-256 `conflict_identity` primary key over the canonical full source
-identity tuple while retaining every source field for collision checks. Startup
-validates the admin-bootstrap schema, guards, constraints, and exact table grant
-before opening the source stream; runtime never creates the table. `repair-drift`
-now invokes FK-aware phases with immutable child runs, cycle/schema blocking,
-explicit delete ceilings, selected PK windows, and evidence-backed conflict
-resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 30 executable
-scenarios; its local proofs pass for the implemented boundaries. Live recurring
-scheduling, deployment, and cutover gates remain unchecked.
+identity tuple while retaining every source field for collision checks. This
+SHA-256 statement is limited to conflict identities; it does not claim that
+FNV-based sync-progress IDs migrated. Conflict evidence is persisted on an
+independent connection before the target transaction rolls back, and the live
+target checkpoint does not advance. Startup validates the admin-bootstrap schema,
+guards, constraints, and exact table/application grants before opening the source
+stream; runtime never creates the table. `repair-drift` now invokes FK-aware
+phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,
+selected PK windows, and a full-scope Verify equality phase before evidence-backed
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 30
+executable scenarios; its local proofs pass for the implemented boundaries. Live
+recurring scheduling, deployment, and cutover gates remain unchecked.
 
 ## Safety and validation
 
 - Checkpoint grouped target DML transactions.
-- Validate journal/ledger schema, guards, routines, grants, and lease/fence
-  state once before source replication; do not repeat this static policy per event.
+- Validate journal/ledger schema, guards, routines, exact grants, and the
+  single-writer `GET_LOCK` state once before source replication; do not repeat
+  this static policy per event.
 - Use stable primary-key windows for count/content checks.
 - Treat unresolved conflicts, quarantine, manual ledger rows, journal barriers,
   schema drift, and CA/grant gaps as blockers.

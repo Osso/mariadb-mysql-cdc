@@ -15,7 +15,9 @@ Automatic DDL is not a separate execute-then-checkpoint shortcut. The journal
 (`cdc.ddl_replay_journal`) is distinct from the manual DDL ledger
 (`cdc.ddl_events`). For an admitted index event the order is:
 
-1. Validate bootstrap objects, grants, the single-writer stream lock, and startup barrier.
+1. Validate bootstrap objects, exact grants, the single-writer nonblocking
+   `GET_LOCK(SHA2(<lease-name>,256),0)`, and startup barrier. This is a
+   single-writer lock only; there is no multi-writer fence, CAS, or fencing token.
 2. Capture immutable target pre-state and the parsed/canonical AST. The expected
    post-state is derived from that recorded pre-state plus the translated AST;
    current source metadata is never substituted.

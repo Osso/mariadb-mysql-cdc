@@ -18,14 +18,18 @@ mariadb --defaults-extra-file=/path/admin.cnf < docs/ddl-replay-journal-bootstra
 
 The two files together must match the target fixture contract: exact
 `cdc.row_conflicts` `SELECT, INSERT, UPDATE`, checkpoint/journal/ledger scopes,
-application-schema grants, and `EXECUTE` only on the three trigger-inventory
-procedures.
+and application-schema `SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP,
+INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE,
+EXECUTE, EVENT, TRIGGER` grants. Control-plane `EXECUTE` is only on the three
+exact trigger-inventory procedures; control-plane/global/admin mutation is
+rejected.
 
 ## Startup/bootstrap validation boundary
 
 Bootstrap and startup validate external administrative state once, before source
 replication: control-plane columns, keys, checks, guards, trigger-inventory
-procedure call results, effective grants, and checkpoint/lease prerequisites.
+procedure call results, effective grants, and checkpoint plus the
+single-writer `GET_LOCK` prerequisite.
 Admin/resolver bootstrap separately reviews `SHOW CREATE PROCEDURE` and direct
 trigger rows.
 A mismatch is deployment drift and fails fast. The runtime does not recreate or
@@ -169,7 +173,7 @@ invalidates the schema cache, and does not execute the DDL again.
 
 ## Runtime grant contract
 
-Required control-plane scopes:
+Required control-plane scopes (separate from the application-schema grant):
 
 - global `USAGE` only;
 - `SELECT, INSERT, UPDATE` on `cdc.stream_checkpoint`;
@@ -178,7 +182,7 @@ Required control-plane scopes:
 - `SELECT, INSERT, UPDATE` on `cdc.ddl_replay_journal`;
 - `EXECUTE` only on the exact definer-safe `cdc.row_conflicts_trigger_inventory`, `cdc.ddl_events_trigger_inventory`, and `cdc.ddl_replay_journal_trigger_inventory` procedures.
 
-Reject global mutation, `ALL`, `GRANT OPTION`, `PROXY`, roles, broad `cdc.*`,
+Reject control-plane/global/admin mutation, `ALL`, `GRANT OPTION`, `PROXY`, roles, broad `cdc.*`,
 and row-conflict `DELETE`, `ALTER`, or `DROP` privileges. The startup/bootstrap
 validator fails before source streaming when the table, guards, constraints,
 procedures, or effective exact grant is missing or widened. Application-schema

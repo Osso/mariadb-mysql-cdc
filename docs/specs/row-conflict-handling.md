@@ -41,11 +41,15 @@ bootstrap separately reviews `SHOW CREATE PROCEDURE` and the direct trigger rows
 The identity is lowercase SHA-256 over an ordered, length-prefixed tuple of
 `source_identity`, server ID, binlog file, start position, schema, table,
 operation, and the complete source primary-key JSON. All identity fields remain
-stored. Duplicate-key upserts compare every hashed field; a mismatch fails via
+stored. Conflict-observation UPSERTs compare every hashed field; a mismatch fails via
 the immutable-identity guard instead of merging a theoretical hash collision.
 
 The runtime grant is exact table scope: `SELECT, INSERT, UPDATE` only, plus
-EXECUTE on the exact inventory procedure. DELETE, ALTER, DROP, other CDC
+`EXECUTE` on the exact inventory procedure. Separately, the reviewed application
+schema grant includes `SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP,
+INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE,
+EXECUTE, EVENT, TRIGGER`; application `EXECUTE` is required, while control-plane
+or global/admin mutation is rejected. DELETE, ALTER, DROP, other CDC
 EXECUTE/schema scopes, schema-wide/global/admin/role/grant-option access is
 rejected.
 Observations use a guarded UPSERT that increments unresolved attempts but never
@@ -58,12 +62,15 @@ or to select a target row by the secondary key.
 ## Live wiring and remaining proof
 
 The structured live stream persists row-conflict observations to this durable
-ledger before returning the row failure. The target data transaction and its
-checkpoint then roll back together, while the independently persisted evidence
-survives. Startup validates the ledger schema, guards, trigger inventory, and
-exact grants before source replication. `repair-drift` resolves rows only after
-verified equality and records the run ID plus evidence. The Docker harness proves
-multi-row rollback, durable idempotent evidence, different-primary-key isolation,
+ledger before returning the row failure. The target data transaction rolls back
+and the live target checkpoint does not advance, while the independently persisted
+evidence survives. Replaying the same source identity is idempotent: it updates
+attempt evidence rather than creating a second row; a different source primary
+key remains a distinct identity. Startup validates the ledger schema, guards,
+trigger inventory, and exact grants before source replication. `repair-drift`
+resolves rows only after its non-mutating Verify phase proves full-scope equality,
+then records the run ID plus evidence. The Docker harness proves multi-row
+rollback, durable idempotent evidence, different-primary-key isolation,
 unchanged checkpoints, and zero unresolved debt for repaired scope.
 
 - [ ] Schedule recurring repair from unresolved records.

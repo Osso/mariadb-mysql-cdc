@@ -23,8 +23,8 @@ are resolved only after verified equality.
 - [x] Provide and wire an FK-aware phased repair path with canonical child/parent
       columns, cross-engine rule normalization, inventory/plan hashes, global
       delete preflight, child-first deletes, parent-first inserts, resumable
-      per-operation state, cycle/schema-mismatch blocking, PK-window bounds, and
-      real Docker proof.
+      per-operation state, cycle/schema-mismatch blocking, PK-window bounds, a
+      non-mutating full-scope Verify equality phase, and real Docker proof.
 
 ## Remaining boundaries
 
@@ -44,7 +44,9 @@ are resolved only after verified equality.
 5. Insert missing rows parent-first.
 6. Update divergent rows after blockers are removed; handle FK/unique key changes
    explicitly.
-7. Verify counts, content, orphans, constraints, and conflict resolution evidence.
+7. Run the real Verify phase: reread the full configured scope, make no target
+   mutations, and fail on any missing, extra, or divergent row before recording
+   conflict resolution evidence.
 8. Run a fresh second pass and require zero actionable mismatches and unresolved
    conflict/manual/journal debt.
 

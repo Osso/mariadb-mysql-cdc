@@ -31,6 +31,10 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
       fields, and the real harness proves zero unresolved debt for scope.
 - [x] Secondary-unique collisions remain primary-key scoped and do not mutate the
       conflicting owner row.
+- [x] Execute DeleteExtras, InsertMissing, UpdateDivergent, then a non-mutating
+      Verify phase. Verify rereads the full configured scope and fails on any
+      missing, extra, or divergent row; conflict resolution runs only after zero
+      Verify mismatches.
 - [x] Individual MariaDB 11.4 → MySQL 8.0 Docker scenarios pass.
 
 Remaining eventual-consistency gates are recurring scheduling from unresolved
