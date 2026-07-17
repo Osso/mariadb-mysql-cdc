@@ -33,7 +33,7 @@ pub(crate) trait InventoryConnectionFactory {
     fn connect(
         &self,
         config: &InventoryConfig,
-    ) -> Result<Box<dyn InventoryQueryConnection>, String>;
+    ) -> Result<Box<dyn InventoryQueryConnection>, InventoryQueryFailure>;
 }
 
 struct MySqlInventoryConnection(Conn);
@@ -51,16 +51,23 @@ impl InventoryConnectionFactory for MySqlInventoryConnectionFactory {
     fn connect(
         &self,
         config: &InventoryConfig,
-    ) -> Result<Box<dyn InventoryQueryConnection>, String> {
-        Conn::new(inventory_opts(config)?)
+    ) -> Result<Box<dyn InventoryQueryConnection>, InventoryQueryFailure> {
+        let opts = inventory_opts(config).map_err(|error| InventoryQueryFailure {
+            error,
+            retryable: false,
+            connection_age: None,
+        })?;
+        Conn::new(opts)
             .map(|conn| {
                 Box::new(MySqlInventoryConnection(conn)) as Box<dyn InventoryQueryConnection>
             })
-            .map_err(|error| {
-                format!(
+            .map_err(|error| InventoryQueryFailure {
+                retryable: is_retryable_inventory_error(&error),
+                error: format!(
                     "{} inventory connection failed: {error}",
                     config.endpoint_role.as_str()
-                )
+                ),
+                connection_age: None,
             })
     }
 }
@@ -249,14 +256,7 @@ impl MariaDbInventoryReader {
         if self.conn.borrow().is_some() {
             return Ok(());
         }
-        let connection =
-            self.factory
-                .connect(&self.config)
-                .map_err(|error| InventoryQueryFailure {
-                    error,
-                    retryable: false,
-                    connection_age: None,
-                })?;
+        let connection = self.factory.connect(&self.config)?;
         self.conn.replace(Some(InventoryConnectionState {
             connection,
             connected_at: Instant::now(),

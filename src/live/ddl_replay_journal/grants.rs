@@ -255,6 +255,7 @@ fn validate_required_runtime_scopes(
         (&policy.journal_scope, JOURNAL_PRIVILEGES),
         (&policy.conflict_scope, JOURNAL_PRIVILEGES),
         (&policy.inventory_scope, EXECUTE_PRIVILEGES),
+        (&policy.application_scope, APPLICATION_DML_PRIVILEGES),
         (&policy.application_scope, APPLICATION_DDL_PRIVILEGES),
     ];
     for (scope, privileges) in required {

@@ -276,20 +276,22 @@ fn assert_missing_conflict_update_is_rejected(grant_rows: &[String]) {
 }
 
 fn assert_missing_application_privilege_is_rejected(grant_rows: &[String]) {
-    let mut missing = grant_rows.to_vec();
-    missing[1] = missing[1].replace(", EXECUTE", "");
-    assert!(
-        validate_runtime_grants(
+    for privilege in ["SELECT", "INSERT", "UPDATE", "DELETE", "EXECUTE"] {
+        let mut missing = grant_rows.to_vec();
+        missing[1] = missing[1].replace(&format!("{privilege}, "), "");
+        missing[1] = missing[1].replace(&format!(", {privilege}"), "");
+        let error = validate_runtime_grants(
             &missing,
             "globalcomix",
             "cdc.stream_checkpoint",
             "cdc.ddl_events",
             "cdc.ddl_replay_journal",
             "cdc.row_conflicts",
-            "cdc.ddl_replay_journal_trigger_inventory"
+            "cdc.ddl_replay_journal_trigger_inventory",
         )
-        .is_err()
-    );
+        .expect_err("missing application privilege must fail startup grant validation");
+        assert!(error.contains(privilege), "missing {privilege}: {error}");
+    }
 }
 
 fn assert_bad_grants_are_rejected(grant_rows: &[String]) {

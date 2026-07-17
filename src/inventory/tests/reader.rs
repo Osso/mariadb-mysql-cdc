@@ -76,6 +76,24 @@ fn inventory_query_reconnects_once_after_packet_desynchronization() {
 }
 
 #[test]
+fn inventory_query_retries_initial_connection_failure_once() {
+    let factory = Rc::new(FailFirstConnectionFactory {
+        attempts: Cell::new(0),
+        connection: RefCell::new(Some(ScriptedInventoryConnection {
+            results: vec![Ok(vec![table_fields("accounts")])].into(),
+        })),
+    });
+    let reader = MariaDbInventoryReader::with_factory(target_config(), factory.clone());
+
+    let tables = reader
+        .read_tables("globalcomix")
+        .expect("initial connection failure retried");
+
+    assert_eq!(tables[0].table_name, "accounts");
+    assert_eq!(factory.attempts.get(), 2);
+}
+
+#[test]
 fn inventory_query_does_not_retry_server_sql_errors() {
     let factory = Rc::new(ScriptedConnectionFactory::new(vec![vec![Err(
         mysql::Error::MySqlError(MySqlError {
@@ -132,6 +150,37 @@ impl InventoryQueryConnection for ScriptedInventoryConnection {
     }
 }
 
+struct FailFirstConnectionFactory {
+    attempts: Cell<usize>,
+    connection: RefCell<Option<ScriptedInventoryConnection>>,
+}
+
+impl InventoryConnectionFactory for FailFirstConnectionFactory {
+    fn connect(
+        &self,
+        _config: &InventoryConfig,
+    ) -> Result<Box<dyn InventoryQueryConnection>, InventoryQueryFailure> {
+        let attempt = self.attempts.get() + 1;
+        self.attempts.set(attempt);
+        if attempt == 1 {
+            return Err(InventoryQueryFailure {
+                error: "target inventory connection failed: connection refused".to_string(),
+                retryable: true,
+                connection_age: None,
+            });
+        }
+        self.connection
+            .borrow_mut()
+            .take()
+            .map(|connection| Box::new(connection) as Box<dyn InventoryQueryConnection>)
+            .ok_or_else(|| InventoryQueryFailure {
+                error: "scripted inventory connection exhausted".to_string(),
+                retryable: false,
+                connection_age: None,
+            })
+    }
+}
+
 struct ScriptedConnectionFactory {
     connections: RefCell<VecDeque<ScriptedInventoryConnection>>,
     opens: Cell<usize>,
@@ -157,13 +206,17 @@ impl InventoryConnectionFactory for ScriptedConnectionFactory {
     fn connect(
         &self,
         _config: &InventoryConfig,
-    ) -> Result<Box<dyn InventoryQueryConnection>, String> {
+    ) -> Result<Box<dyn InventoryQueryConnection>, InventoryQueryFailure> {
         self.opens.set(self.opens.get() + 1);
         self.connections
             .borrow_mut()
             .pop_front()
             .map(|connection| Box::new(connection) as Box<dyn InventoryQueryConnection>)
-            .ok_or_else(|| "scripted inventory connection exhausted".to_string())
+            .ok_or_else(|| InventoryQueryFailure {
+                error: "scripted inventory connection exhausted".to_string(),
+                retryable: false,
+                connection_age: None,
+            })
     }
 }
 
