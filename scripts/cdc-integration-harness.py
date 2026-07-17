@@ -1276,8 +1276,8 @@ class Harness:
         output = self.query(
             self.target,
             "SELECT source_identity,source_server_id,binlog_file,event_start_position,"
-            "event_end_position,schema_name,raw_sql,transformation_version,canonical_ast,pre_state,"
-            "expected_post_state,status "
+            "event_end_position,schema_name,raw_sql,transformation_version,generated_sql,canonical_ast,"
+            "pre_state,expected_post_state,status "
             "FROM cdc.ddl_replay_journal "
             "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
             "ORDER BY event_start_position;",
@@ -1287,7 +1287,7 @@ class Harness:
         rows = [line.split("\t") for line in output.splitlines() if line.strip()]
         if len(rows) != 1:
             raise HarnessError(f"expected exactly one immutable journal row, got {output}")
-        if len(rows[0]) != 12:
+        if len(rows[0]) != 13:
             raise HarnessError(f"immutable journal row column mismatch count={len(rows[0])} output={output!r}")
         names = [
             "source_identity",
@@ -1298,6 +1298,7 @@ class Harness:
             "schema_name",
             "raw_sql",
             "transformation_version",
+            "generated_sql",
             "canonical_ast",
             "pre_state",
             "expected_post_state",
@@ -1318,12 +1319,13 @@ class Harness:
             self.target,
             "INSERT INTO cdc.ddl_replay_journal "
             "(source_identity,source_server_id,binlog_file,event_start_position,event_end_position,"
-            "schema_name,raw_sql,transformation_version,canonical_ast,pre_state,expected_post_state,status) VALUES ("
+            "schema_name,raw_sql,transformation_version,generated_sql,canonical_ast,pre_state,"
+            "expected_post_state,status) VALUES ("
             f"{sql_literal(row['source_identity'])},{row['source_server_id']},"
             f"{sql_literal(row['binlog_file'])},{row['event_start_position']},{row['event_end_position']},"
             f"{sql_literal(row['schema_name'])},{sql_literal(row['raw_sql'])},"
-            f"{sql_literal(row['transformation_version'])},{sql_literal(row['canonical_ast'])},"
-            f"{sql_literal(row['pre_state'])},"
+            f"{sql_literal(row['transformation_version'])},{sql_literal(row['generated_sql'])},"
+            f"{sql_literal(row['canonical_ast'])},{sql_literal(row['pre_state'])},"
             f"{sql_literal(row['expected_post_state'])},{sql_literal(row['status'])});",
         )
 
@@ -1380,6 +1382,7 @@ class Harness:
         if (
             retained[field] != row[field]
             or retained["transformation_version"] != row["transformation_version"]
+            or retained["generated_sql"] != row["generated_sql"]
             or retained["canonical_ast"] != row["canonical_ast"]
             or retained["pre_state"] != row["pre_state"]
             or retained["expected_post_state"] != row["expected_post_state"]
