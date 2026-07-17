@@ -437,6 +437,44 @@ fn range_progress_row(table: &str, rows_scanned: u64, total_rows: u64) -> SyncPr
     }
 }
 
+#[test]
+fn source_progress_opts_use_plaintext_without_ca() {
+    let source = mysql_snapshot::MySqlConnectionConfig {
+        host: "source-db".to_string(),
+        user: "reader".to_string(),
+        password: "secret".to_string(),
+        database: "globalcomix".to_string(),
+        tls_ca_file: None,
+        ..Default::default()
+    };
+
+    let opts = source_opts(&source).expect("plaintext source options");
+
+    assert!(opts.get_ssl_opts().is_none());
+}
+
+#[test]
+fn target_progress_opts_keep_configured_ca_and_hostname_verification() {
+    let target = live::TargetMySqlConfig {
+        host: "target-db.example".to_string(),
+        user: "writer".to_string(),
+        password: "secret".to_string(),
+        database: "globalcomix".to_string(),
+        tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
+        ..Default::default()
+    };
+
+    let opts = target_opts(&target).expect("target TLS options");
+    let ssl = opts.get_ssl_opts().expect("target TLS configured");
+
+    assert_eq!(
+        ssl.root_cert_path(),
+        Some(std::path::Path::new(&target.tls_ca_file))
+    );
+    assert!(!ssl.skip_domain_validation());
+    assert!(!ssl.accept_invalid_certs());
+}
+
 fn args<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.into_iter().map(str::to_string).collect()
 }

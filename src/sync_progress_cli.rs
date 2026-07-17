@@ -1,4 +1,4 @@
-use crate::mysql_support::{SOURCE_TLS_CA_FILE, qualified_table_parts};
+use crate::mysql_support::qualified_table_parts;
 use crate::stream_checkpoint::default_stream_checkpoint_table;
 use crate::{live, mysql_snapshot};
 use mysql::prelude::Queryable;
@@ -666,16 +666,17 @@ fn target_opts(target: &live::TargetMySqlConfig) -> Result<Opts, String> {
 }
 
 fn source_opts(source: &mysql_snapshot::MySqlConnectionConfig) -> Result<Opts, String> {
-    let endpoint = format!("source `{}`:{}", source.host, source.port);
-    mysql_opts(
-        &source.host,
-        source.port,
-        &source.user,
-        &source.password,
-        &source.database,
-        SOURCE_TLS_CA_FILE,
-        &endpoint,
-    )
+    let builder = OptsBuilder::default()
+        .ip_or_hostname(Some(&source.host))
+        .tcp_port(source.port)
+        .user(Some(&source.user))
+        .pass(Some(&source.password))
+        .db_name(Some(&source.database))
+        .prefer_socket(false)
+        .tcp_connect_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
+        .read_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
+        .write_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT));
+    Ok(Opts::from(builder))
 }
 
 fn mysql_opts(
