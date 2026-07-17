@@ -17,7 +17,7 @@ use crate::table_sync::progress::{
 };
 use crate::table_sync::{SyncTableProgress, TableSyncError};
 use crate::target::{
-    SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor,
+    DuplicateConflict, SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor,
     TransactionalTargetExecutor, render_sql_statement,
 };
 use mysql::prelude::Queryable;
@@ -193,7 +193,11 @@ impl TargetExecutor for PersistentTargetExecutor {
                     &error.to_string(),
                 ) =>
             {
-                Ok(TargetExecutionOutcome::DuplicateIgnored)
+                Ok(TargetExecutionOutcome::DuplicateIgnored(DuplicateConflict {
+                    error_code: 1062,
+                    error_text: error.to_string(),
+                    duplicate_index: crate::target::duplicate_index_from_error(&error.to_string()),
+                }))
             }
             Err(error) => {
                 self.retry_or_return_error(statement, error)?;

@@ -28,10 +28,17 @@ impl PrimaryKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DuplicateConflict {
+    pub error_code: u16,
+    pub error_text: String,
+    pub duplicate_index: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TargetExecutionOutcome {
     Applied,
-    DuplicateIgnored,
+    DuplicateIgnored(DuplicateConflict),
 }
 
 pub trait TargetExecutor {
@@ -252,6 +259,15 @@ impl fmt::Display for TargetWriteError {
 }
 
 impl std::error::Error for TargetWriteError {}
+
+pub fn duplicate_index_from_error(error_text: &str) -> Option<String> {
+    let marker = " for key '";
+    let start = error_text.find(marker)? + marker.len();
+    let remainder = &error_text[start..];
+    let end = remainder.find('\'')?;
+    let key = &remainder[..end];
+    (!key.is_empty()).then(|| key.to_string())
+}
 
 pub fn render_sql_statement(statement: &SqlStatement) -> Result<String, TargetExecuteError> {
     if statement.params.is_empty() {
