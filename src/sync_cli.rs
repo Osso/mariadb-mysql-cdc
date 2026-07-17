@@ -136,7 +136,6 @@ fn source_option(
         "--source-user" => source.user = value.to_string(),
         "--source-password-env" => source.password = crate::read_env_password(value)?,
         "--source-database" => source.database = value.to_string(),
-        "--source-tls-ca-file" => source.tls_ca_file = Some(value.to_string()),
         _ => return Ok(false),
     }
 
@@ -334,8 +333,6 @@ mod tests {
             "CDC_SYNC_SOURCE_PASSWORD",
             "--source-database",
             "globalcomix",
-            "--source-tls-ca-file",
-            "/tmp/source-ca.pem",
             "--target-host",
             "target-db",
             "--target-user",
@@ -385,7 +382,6 @@ mod tests {
             ("--source-user", "source-user"),
             ("--source-password-env", "CDC_SYNC_SOURCE_PASSWORD"),
             ("--source-database", "source_database"),
-            ("--source-tls-ca-file", "/tmp/source-ca.pem"),
             ("--target-host", "target-db"),
             ("--target-port", "3311"),
             ("--target-user", "target-user"),
@@ -478,20 +474,18 @@ mod tests {
     }
 
     #[test]
-    fn accepts_omitted_source_tls_ca_file() {
+    fn rejects_source_tls_ca_file_option() {
         set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
         set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
 
-        let mut values = required_args([]);
-        let index = values
-            .iter()
-            .position(|value| value == "--source-tls-ca-file")
-            .expect("source TLS CA option");
-        values.drain(index..=index + 1);
+        let error = parse_sync_table_config({
+            let mut values = required_args([]);
+            values.extend(args(["--source-tls-ca-file", "/tmp/source-ca.pem"]));
+            values
+        })
+        .expect_err("source CA option");
 
-        let config = parse_sync_table_config(values).expect("omitted source CA should be accepted");
-
-        assert_eq!(config.source.tls_ca_file, None);
+        assert_eq!(error, "unknown sync-table option: --source-tls-ca-file");
     }
 
     #[test]
@@ -508,6 +502,21 @@ mod tests {
     }
 
     #[test]
+    fn target_cli_config_keeps_dns_hostname_verification() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let mut config = parse_sync_table_config(required_args([])).expect("sync config");
+        config.target.tls_ca_file =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string();
+        let opts = crate::mysql_support::target_mysql_opts(&config.target).expect("target TLS");
+        let ssl = opts.get_ssl_opts().expect("target TLS configured");
+
+        assert!(!ssl.skip_domain_validation());
+        assert!(!ssl.accept_invalid_certs());
+    }
+
+    #[test]
     fn rejects_missing_run_id() {
         set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
         set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
@@ -521,8 +530,6 @@ mod tests {
             "CDC_SYNC_SOURCE_PASSWORD",
             "--source-database",
             "globalcomix",
-            "--source-tls-ca-file",
-            "/tmp/source-ca.pem",
             "--target-host",
             "target-db",
             "--target-user",
@@ -722,8 +729,6 @@ mod tests {
             "CDC_SYNC_SOURCE_PASSWORD",
             "--source-database",
             "globalcomix",
-            "--source-tls-ca-file",
-            "/tmp/source-ca.pem",
             "--target-host",
             "target-db",
             "--target-user",
