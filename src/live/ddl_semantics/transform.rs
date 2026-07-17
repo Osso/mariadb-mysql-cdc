@@ -15,15 +15,15 @@ struct RenameColumnClause {
     new_name: String,
 }
 
-pub fn supports_add_columns(source_sql: &str) -> bool {
+pub fn supports_production_alter_table(source_sql: &str) -> bool {
     tokenize_ddl(source_sql)
         .ok()
-        .is_some_and(|tokens| parse_add_columns(&tokens).is_ok())
+        .is_some_and(|tokens| parse_production_alter_table(&tokens).is_ok())
 }
 
-pub fn transform_add_columns(source_sql: &str) -> Result<DdlTransformation, String> {
+pub fn transform_production_alter_table(source_sql: &str) -> Result<DdlTransformation, String> {
     let tokens = tokenize_ddl(source_sql)?;
-    parse_add_columns(&tokens)?;
+    parse_production_alter_table(&tokens)?;
     Ok(DdlTransformation {
         version: DDL_TRANSFORMATION_VERSION,
         target_sql: Some(normalize_ddl_sql(source_sql)?),
@@ -51,7 +51,7 @@ pub fn transform_rename_columns_if_exists(
     })
 }
 
-fn parse_add_columns(tokens: &[String]) -> Result<(), String> {
+fn parse_production_alter_table(tokens: &[String]) -> Result<(), String> {
     require_keyword(tokens, 0, "ALTER")?;
     require_keyword(tokens, 1, "TABLE")?;
     require_identifier(tokens, 2, "ALTER TABLE name")?;
@@ -59,27 +59,71 @@ fn parse_add_columns(tokens: &[String]) -> Result<(), String> {
     let mut clause_count = 0;
     while index < tokens.len() {
         require_keyword(tokens, index, "ADD")?;
-        require_keyword(tokens, index + 1, "COLUMN")?;
-        require_identifier(tokens, index + 2, "added column")?;
-        index += 3;
-        index = parse_observed_column_type(tokens, index)?;
-        index = parse_observed_column_options(tokens, index)?;
+        index = if tokens
+            .get(index + 1)
+            .is_some_and(|token| token.eq_ignore_ascii_case("COLUMN"))
+        {
+            parse_add_column_clause(tokens, index)?
+        } else if tokens
+            .get(index + 1)
+            .is_some_and(|token| token.eq_ignore_ascii_case("KEY"))
+        {
+            parse_add_key_clause(tokens, index)?
+        } else {
+            return Err(format!(
+                "unsupported production ALTER TABLE clause {:?}",
+                tokens.get(index + 1)
+            ));
+        };
         clause_count += 1;
         if index == tokens.len() {
             break;
         }
         if tokens.get(index).map(String::as_str) != Some(",") {
             return Err(format!(
-                "expected comma between ADD COLUMN clauses, found {:?}",
+                "expected comma between ALTER TABLE clauses, found {:?}",
                 tokens.get(index)
             ));
         }
         index += 1;
     }
     if clause_count == 0 {
-        return Err("ALTER TABLE has no ADD COLUMN clauses".to_string());
+        return Err("ALTER TABLE has no supported clauses".to_string());
     }
     Ok(())
+}
+
+fn parse_add_column_clause(tokens: &[String], index: usize) -> Result<usize, String> {
+    require_keyword(tokens, index + 1, "COLUMN")?;
+    require_identifier(tokens, index + 2, "added column")?;
+    let type_start = index + 3;
+    let options_start = parse_observed_column_type(tokens, type_start)?;
+    parse_observed_column_options(tokens, options_start)
+}
+
+fn parse_add_key_clause(tokens: &[String], index: usize) -> Result<usize, String> {
+    require_keyword(tokens, index + 1, "KEY")?;
+    require_identifier(tokens, index + 2, "added key name")?;
+    require_keyword(tokens, index + 3, "(")?;
+    let mut column_index = index + 4;
+    let mut column_count = 0;
+    loop {
+        require_identifier(tokens, column_index, "added key column")?;
+        column_count += 1;
+        column_index += 1;
+        match tokens.get(column_index).map(String::as_str) {
+            Some(",") => column_index += 1,
+            Some(")") => return Ok(column_index + 1),
+            actual => {
+                return Err(format!(
+                    "expected comma or closing parenthesis in ADD KEY, found {actual:?}"
+                ));
+            }
+        }
+        if column_count > tokens.len() {
+            return Err("ADD KEY column list did not terminate".to_string());
+        }
+    }
 }
 
 fn parse_observed_column_type(tokens: &[String], mut index: usize) -> Result<usize, String> {
