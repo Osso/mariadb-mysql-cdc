@@ -207,6 +207,21 @@ fn command_line_overrides_config_file_defaults() {
 }
 
 #[test]
+fn rejects_empty_target_tls_ca_file() {
+    let mut config = default_sync_progress_config();
+    config.target.host = "target".to_string();
+    config.target.user = "cdc".to_string();
+    config.target.password = "secret".to_string();
+    config.target.database = "globalcomix".to_string();
+    config.target.tls_ca_file.clear();
+
+    assert_eq!(
+        validate_required_target(&config).expect_err("empty target CA must fail"),
+        "target TLS CA file is required"
+    );
+}
+
+#[test]
 fn parses_progress_rows() {
     let row = "repair-20260710-01\treleases\t200\t1000\t10\t3\t1\trunning\t[\"42\"]\t20\t";
 

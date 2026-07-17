@@ -264,6 +264,9 @@ fn validate_required_target(config: &SyncProgressConfig) -> Result<(), String> {
     if config.target.database.is_empty() {
         return Err("target database is required".to_string());
     }
+    if config.target.tls_ca_file.is_empty() {
+        return Err("target TLS CA file is required".to_string());
+    }
     Ok(())
 }
 
