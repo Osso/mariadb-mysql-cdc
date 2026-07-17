@@ -90,6 +90,7 @@ struct FileSyncProgressConfig {
     target_password: Option<String>,
     target_password_env: Option<String>,
     target_database: Option<String>,
+    target_tls_ca_file: Option<String>,
     progress_table: Option<String>,
     checkpoint_table: Option<String>,
     source_identity: Option<String>,
@@ -152,6 +153,10 @@ fn apply_file_config(
         )?;
     }
     apply_optional_string(&mut config.target.database, sync_progress.target_database);
+    apply_optional_string(
+        &mut config.target.tls_ca_file,
+        sync_progress.target_tls_ca_file,
+    );
     apply_optional_string(&mut config.progress_table, sync_progress.progress_table);
     apply_optional_string(&mut config.checkpoint_table, sync_progress.checkpoint_table);
     config.source_identity = sync_progress.source_identity;
@@ -213,6 +218,7 @@ fn target_option(
         "--target-user" => target.user = value.to_string(),
         "--target-password-env" => target.password = crate::read_env_password(value)?,
         "--target-database" => target.database = value.to_string(),
+        "--target-tls-ca-file" => target.tls_ca_file = value.to_string(),
         _ => return Ok(false),
     }
 
