@@ -53,7 +53,7 @@ SCENARIOS = (
     ScenarioSpec("missing-conflict-grant", True),
     ScenarioSpec("broad-conflict-grant", True),
     ScenarioSpec("journal-outage", True),
-    ScenarioSpec("unsupported-manual-routing", True),
+    ScenarioSpec("translation-pending-barrier", True),
     ScenarioSpec("prepare-failure", True),
     ScenarioSpec("post-ddl-pre-applied", True),
     ScenarioSpec("applied-pre-checkpoint", True),
@@ -315,9 +315,7 @@ class Harness:
                 (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.stream_checkpoint"),
                 (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.row_conflicts"),
                 (frozenset({"EXECUTE"}), "PROCEDURE cdc.row_conflicts_trigger_inventory"),
-                (frozenset({"SELECT", "INSERT"}), "cdc.ddl_events"),
                 (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.ddl_replay_journal"),
-                (frozenset({"EXECUTE"}), "PROCEDURE cdc.ddl_events_trigger_inventory"),
                 (frozenset({"EXECUTE"}), "PROCEDURE cdc.ddl_replay_journal_trigger_inventory"),
             },
             TARGET_USER,
@@ -775,12 +773,12 @@ class Harness:
             raise HarnessError(f"DDL journal did not contain two checkpointed rows:\n{journal}")
         pending = self.query(
             self.target,
-            "SELECT COUNT(*) FROM cdc.ddl_events WHERE status='pending';",
+            "SELECT COUNT(*) FROM cdc.ddl_replay_journal WHERE status IN ('translation_pending','blocked');",
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         ).strip()
         if pending != "0":
-            raise HarnessError(f"unexpected manual DDL debt after strict replay: {pending}")
+            raise HarnessError(f"unexpected unresolved DDL journal debt after strict replay: {pending}")
         print(f"strict_secondary_btree_ok coordinate={stop.file}:{stop.position} journal_rows={len(rows)}")
 
     def ddl_journal_rows(self) -> list[list[str]]:
@@ -1075,12 +1073,12 @@ class Harness:
         )
         pending = self.query(
             self.target,
-            "SELECT COUNT(*) FROM cdc.ddl_events WHERE status='pending';",
+            "SELECT COUNT(*) FROM cdc.ddl_replay_journal WHERE status IN ('translation_pending','blocked');",
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         ).strip()
         if pending != "0":
-            raise HarnessError(f"{scenario} left manual DDL debt: {pending}")
+            raise HarnessError(f"{scenario} left unresolved DDL journal debt: {pending}")
         print(f"{scenario}_converged convergence=complete coordinate={final_stop.file}:{final_stop.position}")
 
     def wait_for_target_count(self, expected: str, timeout: float = 60.0) -> None:
@@ -1583,7 +1581,7 @@ class Harness:
     def run_bootstrap_contract(self) -> None:
         assert self.target
         self._assert_target_grants()
-        for table in ("stream_checkpoint", "row_conflicts", "ddl_events", "ddl_replay_journal"):
+        for table in ("stream_checkpoint", "row_conflicts", "ddl_replay_journal"):
             count = self.admin_query(
                 self.target,
                 f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='cdc' AND table_name={sql_literal(table)};",
@@ -1644,7 +1642,7 @@ class Harness:
             raise HarnessError(f"{scenario} mutated target before startup rejection: {rows}")
         print(f"{scenario}_rejected boundary={expected}")
 
-    def run_unsupported_manual_routing(self) -> None:
+    def run_translation_pending_barrier(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
         start = self.coordinate()
@@ -1655,7 +1653,12 @@ class Harness:
         )
         stop = self.coordinate()
         result = self.run_stream(start, stop)
-        require_manual_resolution_termination(result)
+        combined = (result.stdout + result.stderr).lower()
+        if result.returncode == 0 or "translator unavailable" not in combined:
+            raise HarnessError(
+                "unsupported DDL did not stop at the translation barrier:\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}"
+            )
         target_indexes = self.query(
             self.target,
             "SHOW INDEX FROM accounts;",
@@ -1663,19 +1666,20 @@ class Harness:
             password=TARGET_PASSWORD,
         )
         if "idx_accounts_email_unique" in target_indexes:
-            raise HarnessError("unsupported UNIQUE index mutated target")
-        pending = self.query(
+            raise HarnessError("translation-pending DDL mutated target")
+        rows = self.query(
             self.target,
-            "SELECT COUNT(*) FROM cdc.ddl_events WHERE status='pending';",
+            "SELECT status,transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state "
+            "FROM cdc.ddl_replay_journal ORDER BY event_start_position;",
             user=TARGET_USER,
             password=TARGET_PASSWORD,
-        ).strip()
-        if pending != "1":
-            raise HarnessError(f"unsupported DDL did not create one pending manual row: {pending}")
+        ).splitlines()
+        if rows != ["translation_pending\ttranslator-unavailable\tNULL\t\t\t"]:
+            raise HarnessError(f"unexpected translation-pending journal evidence: {rows}")
         checkpoint = self.checkpoint()
         if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
-            raise HarnessError(f"unsupported DDL advanced checkpoint: {checkpoint}")
-        print(f"unsupported_manual_routing_ok coordinate={start.file}:{start.position} pending=1")
+            raise HarnessError(f"translation-pending DDL advanced checkpoint: {checkpoint}")
+        print(f"translation_pending_barrier_ok coordinate={start.file}:{start.position} rows=1")
 
     def run_scenario(self, scenario: str) -> None:
         spec = SCENARIO_BY_NAME[scenario]
@@ -1698,8 +1702,8 @@ class Harness:
             "journal-outage",
         }:
             self.run_startup_rejection(scenario)
-        elif scenario == "unsupported-manual-routing":
-            self.run_unsupported_manual_routing()
+        elif scenario == "translation-pending-barrier":
+            self.run_translation_pending_barrier()
         elif scenario in {
             "prepare-failure",
             "post-ddl-pre-applied",
@@ -1852,13 +1856,13 @@ def require_success(result: CommandResult, operation: str) -> None:
         )
 
 
-def require_manual_resolution_termination(result: CommandResult) -> None:
+def require_translation_pending_termination(result: CommandResult) -> None:
     output = f"{result.stdout}\n{result.stderr}".lower()
     if result.returncode == 0:
-        raise HarnessError("bounded stream returned success without manual DDL block")
-    if "manual ddl resolution required" not in output:
+        raise HarnessError("bounded stream returned success without translation-pending block")
+    if "translator unavailable" not in output:
         raise HarnessError(
-            "unsupported manual DDL did not terminate at the manual-resolution boundary:\n"
+            "unsupported DDL did not terminate at the translation-pending boundary:\n"
             f"stdout={result.stdout}\nstderr={result.stderr}"
         )
 

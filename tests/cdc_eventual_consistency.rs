@@ -69,7 +69,7 @@ expected = {{
     'missing-trigger',
     'missing-grant',
     'journal-outage',
-    'unsupported-manual-routing',
+    'translation-pending-barrier',
     'prepare-failure',
     'post-ddl-pre-applied',
     'applied-pre-checkpoint',
@@ -93,7 +93,7 @@ assert expected.issubset(set(module.default_scenarios()))
 }
 
 #[test]
-fn harness_manual_resolution_requires_nonzero_bounded_termination() {
+fn harness_translation_pending_requires_nonzero_bounded_termination() {
     let script = harness_script();
     let code = format!(
         r#"
@@ -107,12 +107,12 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
-blocked = module.CommandResult(('stream-binlog',), 1, '', 'manual DDL resolution required')
-module.require_manual_resolution_termination(blocked)
+blocked = module.CommandResult(('stream-binlog',), 1, '', 'DDL translator unavailable')
+module.require_translation_pending_termination(blocked)
 
 success = module.CommandResult(('stream-binlog',), 0, '', '')
 try:
-    module.require_manual_resolution_termination(success)
+    module.require_translation_pending_termination(success)
 except module.HarnessError:
     pass
 else:
@@ -126,7 +126,7 @@ else:
         .expect("check manual-resolution harness behavior");
     assert!(
         output.status.success(),
-        "manual-resolution harness check failed:\n{}",
+        "translation-pending harness check failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

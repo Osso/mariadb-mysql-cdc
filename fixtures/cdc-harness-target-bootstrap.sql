@@ -34,22 +34,6 @@ CREATE TABLE IF NOT EXISTS cdc.stream_checkpoint (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS cdc.ddl_events (
-    source_identity VARCHAR(384) NOT NULL,
-    source_server_id INT UNSIGNED NOT NULL,
-    binlog_file VARCHAR(255) NOT NULL,
-    event_start_position BIGINT UNSIGNED NOT NULL,
-    event_end_position BIGINT UNSIGNED NOT NULL,
-    schema_name VARCHAR(255) NOT NULL,
-    raw_sql LONGTEXT NOT NULL,
-    status VARCHAR(32) NOT NULL,
-    resolution_note TEXT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    CHECK (status IN ('pending', 'resolved')),
-    PRIMARY KEY (source_identity, binlog_file, event_start_position)
-);
-
 CREATE TABLE IF NOT EXISTS cdc.ddl_replay_journal (
     source_identity VARCHAR(384) NOT NULL,
     source_server_id INT UNSIGNED NOT NULL,
@@ -66,7 +50,7 @@ CREATE TABLE IF NOT EXISTS cdc.ddl_replay_journal (
     status VARCHAR(32) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    CHECK (status IN ('prepared', 'applied', 'checkpointed', 'blocked')),
+    CHECK (status IN ('translation_pending', 'prepared', 'applied', 'checkpointed', 'blocked')),
     PRIMARY KEY (source_identity, binlog_file, event_start_position)
 ) ENGINE=InnoDB;
 
@@ -137,46 +121,27 @@ BEGIN
     END IF;
 END//
 
-DROP TRIGGER IF EXISTS cdc.ddl_events_pending_insert_guard//
-CREATE TRIGGER cdc.ddl_events_pending_insert_guard
-BEFORE INSERT ON cdc.ddl_events
-FOR EACH ROW
-BEGIN
-    IF NEW.status <> 'pending' OR NEW.resolution_note IS NOT NULL THEN
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'DDL events may only be inserted pending';
-    END IF;
-END//
-
-DROP TRIGGER IF EXISTS cdc.ddl_events_monotonic_resolution_guard//
-CREATE TRIGGER cdc.ddl_events_monotonic_resolution_guard
-BEFORE UPDATE ON cdc.ddl_events
-FOR EACH ROW
-BEGIN
-    IF NOT (OLD.source_identity <=> NEW.source_identity)
-       OR NOT (OLD.source_server_id <=> NEW.source_server_id)
-       OR NOT (OLD.binlog_file <=> NEW.binlog_file)
-       OR NOT (OLD.event_start_position <=> NEW.event_start_position)
-       OR NOT (OLD.event_end_position <=> NEW.event_end_position)
-       OR NOT (OLD.schema_name <=> NEW.schema_name)
-       OR NOT (OLD.raw_sql <=> NEW.raw_sql)
-       OR OLD.status <> 'pending'
-       OR NEW.status <> 'resolved'
-       OR NEW.resolution_note IS NULL
-       OR NEW.resolution_note = '' THEN
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'DDL resolution must preserve coordinates and transition pending to resolved once';
-    END IF;
-END//
-
 DROP TRIGGER IF EXISTS cdc.ddl_replay_journal_insert_guard//
 CREATE TRIGGER cdc.ddl_replay_journal_insert_guard
 BEFORE INSERT ON cdc.ddl_replay_journal
 FOR EACH ROW
 BEGIN
-    IF NEW.status <> 'prepared' THEN
+    IF NOT (
+        (NEW.status = 'translation_pending'
+         AND NEW.transformation_version = 'translator-unavailable'
+         AND NEW.generated_sql IS NULL
+         AND NEW.canonical_ast = ''
+         AND NEW.pre_state = ''
+         AND NEW.expected_post_state = '')
+        OR
+        (NEW.status = 'prepared'
+         AND NEW.transformation_version <> ''
+         AND NEW.canonical_ast <> ''
+         AND NEW.pre_state <> ''
+         AND NEW.expected_post_state <> '')
+    ) THEN
         SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'automatic DDL journal rows must begin prepared';
+            SET MESSAGE_TEXT = 'automatic DDL journal rows must begin translation_pending or prepared with valid evidence';
     END IF;
 END//
 
@@ -192,13 +157,27 @@ BEGIN
        OR NOT (OLD.event_end_position <=> NEW.event_end_position)
        OR NOT (OLD.schema_name <=> NEW.schema_name)
        OR NOT (OLD.raw_sql <=> NEW.raw_sql)
-       OR NOT (OLD.transformation_version <=> NEW.transformation_version)
-       OR NOT (OLD.generated_sql <=> NEW.generated_sql)
-       OR NOT (OLD.canonical_ast <=> NEW.canonical_ast)
-       OR NOT (OLD.pre_state <=> NEW.pre_state)
-       OR NOT (OLD.expected_post_state <=> NEW.expected_post_state)
-       OR NOT ((OLD.status = 'prepared' AND NEW.status IN ('applied', 'blocked'))
-           OR (OLD.status = 'applied' AND NEW.status = 'checkpointed')) THEN
+       OR NOT (
+           (OLD.status = 'translation_pending'
+            AND NEW.status = 'prepared'
+            AND OLD.transformation_version = 'translator-unavailable'
+            AND OLD.generated_sql IS NULL
+            AND OLD.canonical_ast = ''
+            AND OLD.pre_state = ''
+            AND OLD.expected_post_state = ''
+            AND NEW.transformation_version <> ''
+            AND NEW.canonical_ast <> ''
+            AND NEW.pre_state <> ''
+            AND NEW.expected_post_state <> '')
+           OR
+           ((OLD.transformation_version <=> NEW.transformation_version)
+            AND (OLD.generated_sql <=> NEW.generated_sql)
+            AND (OLD.canonical_ast <=> NEW.canonical_ast)
+            AND (OLD.pre_state <=> NEW.pre_state)
+            AND (OLD.expected_post_state <=> NEW.expected_post_state)
+            AND ((OLD.status = 'prepared' AND NEW.status IN ('applied', 'blocked'))
+                 OR (OLD.status = 'applied' AND NEW.status = 'checkpointed')))
+       ) THEN
         SIGNAL SQLSTATE '45000'
             SET MESSAGE_TEXT = 'automatic DDL journal identity/evidence is immutable and status transition is not allowed';
     END IF;
@@ -213,18 +192,6 @@ BEGIN
            event_manipulation, action_timing, action_statement, action_order
     FROM information_schema.triggers
     WHERE event_object_schema = 'cdc' AND event_object_table = 'row_conflicts'
-    ORDER BY event_manipulation, action_order;
-END//
-
-DROP PROCEDURE IF EXISTS cdc.ddl_events_trigger_inventory//
-CREATE DEFINER=CURRENT_USER PROCEDURE cdc.ddl_events_trigger_inventory()
-SQL SECURITY DEFINER
-READS SQL DATA
-BEGIN
-    SELECT trigger_name, event_object_schema, event_object_table,
-           event_manipulation, action_timing, action_statement, action_order
-    FROM information_schema.triggers
-    WHERE event_object_schema = 'cdc' AND event_object_table = 'ddl_events'
     ORDER BY event_manipulation, action_order;
 END//
 
@@ -246,9 +213,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES,
       ON globalcomix.* TO 'cdc_stream'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_stream'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.row_conflicts TO 'cdc_stream'@'%';
-GRANT SELECT, INSERT ON cdc.ddl_events TO 'cdc_stream'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.ddl_replay_journal TO 'cdc_stream'@'%';
 GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory TO 'cdc_stream'@'%';
-GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';
 GRANT EXECUTE ON PROCEDURE cdc.ddl_replay_journal_trigger_inventory TO 'cdc_stream'@'%';
 FLUSH PRIVILEGES;
