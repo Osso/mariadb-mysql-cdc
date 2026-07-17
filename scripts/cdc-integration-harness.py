@@ -1372,7 +1372,10 @@ class Harness:
         )
         self.replace_journal_row(row)
         inserted_row = self.journal_full_row()
+        generated_fields = {"created_at", "updated_at"}
         for field_name, expected_value in row.items():
+            if field_name in generated_fields:
+                continue
             if inserted_row[field_name] != expected_value:
                 raise HarnessError(
                     f"{scenario} replacement row mismatch field={field_name}: "
