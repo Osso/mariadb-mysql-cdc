@@ -65,11 +65,21 @@ broader DDL coverage and operational proof gaps listed below.
       AST and deterministic MySQL 8 renderer covering only `BIGINT`,
       `VARCHAR(length)`, `NOT NULL`, inline `PRIMARY KEY`, ordinary named `KEY`,
       and `ENGINE=InnoDB`.
-- [x] Production `LiveDdlSemanticInventory` does not yet admit that statement; it
-      remains `translation_pending` with zero target/checkpoint execution.
+- [x] Production `LiveDdlSemanticInventory` can capture this exact fixture's
+      source schema defaults only inside a fence whose before/after source master
+      coordinate exactly brackets the event file/end position; the target
+      inventory must also prove the table is absent before and after capture.
+- [x] The evidence persists source `character_set` and `collation` in the
+      canonical AST, emits explicit `DEFAULT CHARACTER SET ... COLLATE ...`
+      SQL, and derives a deterministic expected post-state from the typed AST
+      and captured defaults.
+- [x] Runtime transform/admission remains disabled for this fixture: the stream
+      stays `translation_pending` with zero target DDL and zero checkpoint
+      execution. This slice does not claim real-engine or deployment coverage;
+      any future admission must retain the target-absence and deterministic
+      post-state gates.
 
-This fixture-backed contract is not production-derived coverage and does not
-admit other `CREATE TABLE` syntax.
+This fixture-backed contract does not admit other `CREATE TABLE` syntax.
 
 ### Execution and recovery
 
@@ -135,8 +145,9 @@ The current slice is covered by:
 - [x] `src/live/ddl_semantics/tests.rs` — deterministic production `ADD COLUMN`,
       `ADD KEY`, `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` SQL/no-op behavior,
       typed ALTER AST/post-state behavior and rename boundaries, plus the exact
-      harness `CREATE TABLE` test-scoped AST/renderer contract that is not
-      production stream coverage.
+      harness `CREATE TABLE` typed AST/renderer, fenced source-default evidence,
+      exact-coordinate rejection, explicit charset/collation SQL, deterministic
+      post-state, and disabled runtime-admission contract.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
       generated SQL and preserves journal/checkpoint ordering; the fixture
       `CREATE TABLE` delegates to the production transformer and remains pending
@@ -150,9 +161,10 @@ The current slice is covered by:
       unique-prefix option remains `translation_pending` with zero target
       execution and unchanged checkpoint.
 
-These tests prove only the observed ALTER slice and existing narrow DDL paths.
-They do not prove full ALTER TABLE, the broader transformation contract, a full
-MariaDB/MySQL matrix, or deployment safety.
+These tests prove only the observed ALTER slice, the fixture evidence seam, and
+existing narrow DDL paths. They do not prove full ALTER TABLE, the broader
+transformation contract, real-engine compatibility, a full MariaDB/MySQL matrix,
+or deployment safety.
 
 ## Known gaps (current cycle)
 

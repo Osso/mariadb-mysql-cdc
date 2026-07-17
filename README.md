@@ -32,15 +32,24 @@ column pre-state, emits deterministic MySQL 8 SQL without `IF EXISTS`, treats
 absent old columns as a proven no-op, and fails closed when old and new columns
 coexist. Broader types/options and full ALTER TABLE remain unsupported.
 
-Every other DDL form—tables, other `ALTER TABLE`, views, routines, events,
-triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP`, qualified or cross-schema
-references, comments, ambiguous quoting, incomplete syntax, definer/security
-clauses, MariaDB-only syntax, and multi-object/multi-statement forms—enters the
-same automatic journal as `translation_pending`. It stores the exact source
-identity/coordinates and raw SQL with sentinel `translator-unavailable`, NULL
-generated SQL, and empty transformation evidence. It flushes earlier DML and
-blocks checkpoint/overtake. The removed manual ledger is not part of runtime,
-configuration, bootstrap, grants, or the harness.
+The exact fixture `CREATE TABLE accounts` has a production inventory/evidence
+seam, not runtime admission: source schema defaults are read only inside an
+exact event-coordinate fence, target absence is checked before and after the
+capture, and evidence persists source charset/collation, explicit generated
+`DEFAULT CHARACTER SET ... COLLATE ...` SQL, and deterministic expected
+post-state. Runtime transform/admission remains disabled, so the stream keeps
+this event `translation_pending` with zero target DDL and zero checkpoint
+execution. This is local fixture evidence, not real-engine or deployment proof.
+
+Every other unsupported DDL form—tables, other `ALTER TABLE`, views, routines,
+events, triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP`, qualified or
+cross-schema references, comments, ambiguous quoting, incomplete syntax,
+definer/security clauses, MariaDB-only syntax, and multi-object/multi-statement
+forms—enters the same automatic journal as `translation_pending`. It stores the
+exact source identity/coordinates and raw SQL with sentinel
+`translator-unavailable`, NULL generated SQL, and empty transformation evidence.
+It flushes earlier DML and blocks checkpoint/overtake. The removed manual ledger
+is not part of runtime, configuration, bootstrap, grants, or the harness.
 
 When translator code becomes available, reprocessing the same event captures
 immutable pre-state/AST/expected-post-state evidence and promotes that same row
