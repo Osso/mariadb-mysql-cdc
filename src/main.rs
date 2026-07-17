@@ -133,7 +133,6 @@ Drift check options:
 Repair drift options:
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --source-identity ID             Source incarnation ID for conflict resolution in apply mode.
-  --source-tls-ca-file PATH         Source CA certificate bundle for repair inventory.
   --table TABLE                    Limit repair to a source table; repeat for multiple tables.
   --parent-first TABLES            Comma-separated table order prefix; remaining tables sort lexically.
   --start-after CSV                Lower primary-key bound for the selected repair window.

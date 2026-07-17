@@ -1,5 +1,6 @@
 use super::config::{
-    default_repair_drift_config, repair_drift_option, validate_repair_drift_config,
+    default_repair_drift_config, parse_repair_drift_config, repair_drift_option,
+    validate_repair_drift_config,
 };
 use super::plan::{build_runtime_repair_plan, exclude_progress_table, order_table_names};
 use super::run::{
@@ -294,6 +295,39 @@ fn parses_repeated_tables_parent_first_prefix_and_content_check() {
     assert!(!config.content_check);
     assert_eq!(config.max_deletes, Some(7));
     assert!(config.max_deletes_explicit);
+}
+
+#[test]
+fn rejects_source_tls_ca_file_option() {
+    let args = [
+        "--source-tls-ca-file",
+        "/tmp/source-ca.pem",
+        "--source-host",
+        "source-db",
+        "--source-user",
+        "reader",
+        "--source-password-env",
+        "MISSING_SOURCE_PASSWORD",
+        "--source-database",
+        "globalcomix",
+        "--source-identity",
+        "source-identity",
+        "--target-host",
+        "target-db",
+        "--target-user",
+        "writer",
+        "--target-password-env",
+        "MISSING_TARGET_PASSWORD",
+        "--target-database",
+        "globalcomix",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    let error = parse_repair_drift_config(args).expect_err("source CA option");
+
+    assert_eq!(error, "unknown repair-drift option: --source-tls-ca-file");
 }
 
 #[test]
