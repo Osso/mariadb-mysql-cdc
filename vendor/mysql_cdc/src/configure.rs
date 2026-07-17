@@ -4,7 +4,7 @@ use crate::constants::checksum_type::ChecksumType;
 use crate::errors::Error;
 use crate::extensions::check_error_packet;
 use crate::packet_channel::PacketChannel;
-use crate::responses::response_type::ResponseType;
+use crate::responses::response_type;
 use crate::responses::result_set_row_packet::ResultSetRowPacket;
 use crate::starting_strategy::StartingStrategy;
 
@@ -74,7 +74,7 @@ impl BinlogClient {
         loop {
             // Skip through metadata
             let (packet, _) = channel.read_packet()?;
-            if packet[0] == ResponseType::END_OF_FILE {
+            if packet[0] == response_type::END_OF_FILE {
                 break;
             }
         }
@@ -83,7 +83,7 @@ impl BinlogClient {
         loop {
             let (packet, _) = channel.read_packet()?;
             check_error_packet(&packet, "Query result set error.")?;
-            if packet[0] == ResponseType::END_OF_FILE {
+            if packet[0] == response_type::END_OF_FILE {
                 break;
             }
             result_set.push(ResultSetRowPacket::parse(&packet)?);

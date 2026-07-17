@@ -2,7 +2,7 @@ use crate::constants::auth_plugin_names::AuthPlugin;
 use crate::constants::NULL_TERMINATOR;
 use crate::errors::Error;
 use crate::responses::error_packet::ErrorPacket;
-use crate::responses::response_type::ResponseType;
+use crate::responses::response_type;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -137,9 +137,9 @@ pub fn read_bitmap_big_endian(
 }
 
 pub fn check_error_packet(packet: &[u8], message: &str) -> Result<(), Error> {
-    if packet[0] == ResponseType::ERROR {
+    if packet[0] == response_type::ERROR {
         let error = ErrorPacket::parse(&packet[1..])?;
-        let message = format!("{} {:?}", message, error).to_string();
+        let message = format!("{message} {error}");
         return Err(Error::String(message));
     }
     return Ok(());

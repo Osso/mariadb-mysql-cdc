@@ -7,7 +7,7 @@ use crate::events::event_parser::EventParser;
 use crate::packet_channel::PacketChannel;
 use crate::responses::end_of_file_packet::EndOfFilePacket;
 use crate::responses::error_packet::ErrorPacket;
-use crate::responses::response_type::ResponseType;
+use crate::responses::response_type;
 
 pub struct BinlogEvents {
     pub channel: PacketChannel,
@@ -31,7 +31,7 @@ impl BinlogEvents {
 
     pub fn read_error(&mut self, packet: &[u8]) -> Result<(EventHeader, BinlogEvent), Error> {
         let error = ErrorPacket::parse(&packet[1..])?;
-        Err(Error::String(format!("Event stream error. {:?}", error)))
+        Err(Error::String(format!("Event stream error. {error}")))
     }
 }
 
@@ -46,9 +46,9 @@ impl Iterator for BinlogEvents {
             Err(e) => return Some(Err(Error::IoError(e))),
         };
         match packet[0] {
-            ResponseType::OK => Some(self.read_event(&packet)),
-            ResponseType::ERROR => Some(self.read_error(&packet)),
-            ResponseType::END_OF_FILE => {
+            response_type::OK => Some(self.read_event(&packet)),
+            response_type::ERROR => Some(self.read_error(&packet)),
+            response_type::END_OF_FILE => {
                 let _ = EndOfFilePacket::parse(&packet[1..]);
                 None
             }

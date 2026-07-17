@@ -1,4 +1,5 @@
 use byteorder::{LittleEndian, ReadBytesExt};
+use std::fmt;
 use std::io::{self, Cursor, Read};
 
 /// ERR_Packet indicates that an error occured.
@@ -8,6 +9,16 @@ pub struct ErrorPacket {
     pub error_code: u16,
     pub error_message: String,
     pub sql_state: Option<String>,
+}
+
+impl fmt::Display for ErrorPacket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MySQL error {}", self.error_code)?;
+        if let Some(sql_state) = &self.sql_state {
+            write!(formatter, " (SQLSTATE {sql_state})")?;
+        }
+        write!(formatter, ": {}", self.error_message)
+    }
 }
 
 impl ErrorPacket {

@@ -87,7 +87,7 @@ pub fn collapse_intervals(intervals: &mut Vec<Interval>) {
         let right_start = intervals[index + 1].start;
         let right_end = intervals[index + 1].end;
 
-        let mut left = &mut intervals[index];
+        let left = &mut intervals[index];
         if left.end + 1 == right_start {
             left.end = right_end;
             intervals.remove(index + 1);

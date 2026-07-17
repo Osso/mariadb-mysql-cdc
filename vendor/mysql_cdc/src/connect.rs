@@ -12,7 +12,7 @@ use crate::extensions::{check_error_packet, xor};
 use crate::packet_channel::PacketChannel;
 use crate::responses::auth_switch_packet::AuthPluginSwitchPacket;
 use crate::responses::handshake_packet::HandshakePacket;
-use crate::responses::response_type::ResponseType;
+use crate::responses::response_type;
 use crate::ssl_mode::SslMode;
 
 impl BinlogClient {
@@ -58,8 +58,8 @@ impl BinlogClient {
         check_error_packet(&packet, "Authentication error.")?;
 
         match packet[0] {
-            ResponseType::OK => return Ok(()),
-            ResponseType::AUTH_PLUGIN_SWITCH => {
+            response_type::OK => return Ok(()),
+            response_type::AUTH_PLUGIN_SWITCH => {
                 let switch_packet = AuthPluginSwitchPacket::parse(&packet[1..])?;
                 self.handle_auth_plugin_switch(channel, switch_packet, seq_num + 1, use_ssl)?;
                 Ok(())
@@ -88,7 +88,6 @@ impl BinlogClient {
         let auth_switch_command = AuthPluginSwitchCommand::new(
             &self.options.password,
             &switch_packet.auth_plugin_data,
-            &switch_packet.auth_plugin_name,
             auth_plugin,
         );
         channel.write_packet(&auth_switch_command.serialize()?, seq_num)?;
