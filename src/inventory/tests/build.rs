@@ -99,9 +99,11 @@ fn classifies_stored_generated_columns() {
         is_nullable: false,
         column_default: None,
         extra: "STORED GENERATED".to_string(),
+        column_comment: "copied balance".to_string(),
         generation_expression: Some("`balance`".to_string()),
     });
 
+    assert_eq!(column.comment, "copied balance");
     assert_eq!(
         column.generated,
         Some(GeneratedColumn {

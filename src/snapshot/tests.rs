@@ -434,6 +434,7 @@ fn inventory_column(name: &str) -> crate::inventory::ColumnInventory {
         is_nullable: false,
         default_value: None,
         extra: String::new(),
+        comment: String::new(),
         generated: None,
     }
 }

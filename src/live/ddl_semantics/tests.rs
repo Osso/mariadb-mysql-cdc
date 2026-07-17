@@ -645,6 +645,7 @@ fn fixture_columns() -> Vec<ColumnInventory> {
             is_nullable: false,
             default_value: None,
             extra: "auto_increment".to_string(),
+            comment: String::new(),
             generated: None,
         },
         ColumnInventory {
@@ -655,6 +656,7 @@ fn fixture_columns() -> Vec<ColumnInventory> {
             is_nullable: true,
             default_value: None,
             extra: String::new(),
+            comment: String::new(),
             generated: None,
         },
     ]

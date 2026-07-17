@@ -35,6 +35,8 @@ pub struct ColumnInventory {
     pub is_nullable: bool,
     pub default_value: Option<String>,
     pub extra: String,
+    #[serde(default)]
+    pub comment: String,
     pub generated: Option<GeneratedColumn>,
 }
 
@@ -203,6 +205,7 @@ pub struct ColumnRow {
     pub is_nullable: bool,
     pub column_default: Option<String>,
     pub extra: String,
+    pub column_comment: String,
     pub generation_expression: Option<String>,
 }
 

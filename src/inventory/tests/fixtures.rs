@@ -56,6 +56,7 @@ pub(crate) fn id_column() -> ColumnRow {
         is_nullable: false,
         column_default: None,
         extra: "auto_increment".to_string(),
+        column_comment: String::new(),
         generation_expression: None,
     }
 }
@@ -70,6 +71,7 @@ pub(crate) fn name_column() -> ColumnRow {
         is_nullable: false,
         column_default: None,
         extra: String::new(),
+        column_comment: String::new(),
         generation_expression: None,
     }
 }
@@ -84,6 +86,7 @@ pub(crate) fn balance_x2_column() -> ColumnRow {
         is_nullable: true,
         column_default: None,
         extra: "VIRTUAL GENERATED".to_string(),
+        column_comment: String::new(),
         generation_expression: Some("`balance` * 2".to_string()),
     }
 }
