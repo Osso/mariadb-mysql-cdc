@@ -181,7 +181,10 @@ fn parse_fixture_table_column(
         ("bigint".to_string(), index + 2)
     } else if data_type.eq_ignore_ascii_case("VARCHAR") {
         require_keyword(tokens, index + 2, "(")?;
-        let length = require_identifier(tokens, index + 3, "VARCHAR length")?;
+        let length = tokens
+            .get(index + 3)
+            .cloned()
+            .ok_or_else(|| "missing VARCHAR length".to_string())?;
         let parsed_length = length
             .parse::<u32>()
             .map_err(|_| format!("invalid VARCHAR length {length}"))?;
