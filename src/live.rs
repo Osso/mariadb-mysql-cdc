@@ -188,9 +188,6 @@ fn validate_source_settings(
     if source.password.is_empty() {
         return Err(config_error("source password is required"));
     }
-    if source.tls_ca_file.is_empty() {
-        return Err(config_error("source TLS CA file is required"));
-    }
     Ok(())
 }
 

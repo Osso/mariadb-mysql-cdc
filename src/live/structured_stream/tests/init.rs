@@ -123,11 +123,8 @@ fn builds_mysql_cdc_replica_options_from_source_position() {
     assert_eq!(options.port, 3307);
     assert_eq!(options.username, "cdc");
     assert_eq!(options.password, "secret");
-    assert_eq!(options.ssl_mode, SslMode::RequireVerifyCa);
-    assert_eq!(
-        options.ssl_ca_file.as_deref(),
-        Some("/etc/mariadb-mysql-cdc/source-ca.pem")
-    );
+    assert_eq!(options.ssl_mode, SslMode::Disabled);
+    assert_eq!(options.ssl_ca_file, None);
     assert_eq!(options.database, Some("app".to_string()));
     assert_eq!(options.server_id, 4242);
     assert!(options.blocking);
@@ -140,15 +137,17 @@ fn builds_mysql_cdc_replica_options_from_source_position() {
 }
 
 #[test]
-fn mysql_cdc_dns_source_requires_full_identity_verification() {
+fn mysql_cdc_dns_source_uses_explicit_plaintext_without_ca() {
     let source = SourceBinlogConfig {
         host: "db.internal.example".to_string(),
+        tls_ca_file: String::new(),
         ..SourceBinlogConfig::default()
     };
 
     let options = replica_options_from_source(&source).expect("options");
 
-    assert_eq!(options.ssl_mode, SslMode::RequireVerifyFull);
+    assert_eq!(options.ssl_mode, SslMode::Disabled);
+    assert_eq!(options.ssl_ca_file, None);
 }
 
 #[test]
