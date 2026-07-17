@@ -699,6 +699,7 @@ fn mysql_opts(
         .write_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
         .ssl_opts(crate::mysql_support::ssl_opts_from_ca(
             endpoint,
+            host,
             tls_ca_file,
         )?);
     Ok(Opts::from(builder))

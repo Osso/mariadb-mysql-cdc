@@ -73,7 +73,7 @@ fn connection_opts_use_explicit_ca_for_tls() {
     let ssl = opts.get_ssl_opts().expect("TLS opts");
 
     assert_eq!(ssl.root_cert_path(), Some(ca_path.as_path()));
-    assert!(ssl.skip_domain_validation());
+    assert!(!ssl.skip_domain_validation());
 
     std::fs::remove_file(ca_path).expect("remove CA fixture");
 }

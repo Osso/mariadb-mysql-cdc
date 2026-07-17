@@ -1,6 +1,7 @@
 use crate::live::{SourceBinlogConfig, TargetMySqlConfig};
 use mysql::{Opts, OptsBuilder, SslOpts};
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 pub const SOURCE_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/source-ca.pem";
@@ -29,6 +30,7 @@ pub fn target_ssl_opts(target: &TargetMySqlConfig) -> Result<SslOpts, String> {
             "target TLS CA file endpoint `{}`:{}",
             target.host, target.port
         ),
+        &target.host,
         &target.tls_ca_file,
     )
 }
@@ -39,11 +41,12 @@ pub fn source_ssl_opts(source: &SourceBinlogConfig) -> Result<SslOpts, String> {
             "source TLS CA file endpoint `{}`:{}",
             source.host, source.port
         ),
+        &source.host,
         &source.tls_ca_file,
     )
 }
 
-pub fn ssl_opts_from_ca(endpoint: &str, ca_file: &str) -> Result<SslOpts, String> {
+pub fn ssl_opts_from_ca(endpoint: &str, host: &str, ca_file: &str) -> Result<SslOpts, String> {
     if ca_file.is_empty() {
         return Err(format!("{endpoint} TLS CA file is required"));
     }
@@ -59,7 +62,7 @@ pub fn ssl_opts_from_ca(endpoint: &str, ca_file: &str) -> Result<SslOpts, String
 
     Ok(SslOpts::default()
         .with_root_cert_path(Some(PathBuf::from(ca_file)))
-        .with_danger_skip_domain_validation(true))
+        .with_danger_skip_domain_validation(host.parse::<IpAddr>().is_ok()))
 }
 
 fn validate_ca_certificate(endpoint: &str, ca_file: &str, contents: &[u8]) -> Result<(), String> {
@@ -83,7 +86,7 @@ fn validate_ca_certificate(endpoint: &str, ca_file: &str, contents: &[u8]) -> Re
 }
 
 pub fn target_mysql_args(target: &TargetMySqlConfig) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "--host".to_string(),
         target.host.clone(),
         "--port".to_string(),
@@ -93,11 +96,14 @@ pub fn target_mysql_args(target: &TargetMySqlConfig) -> Vec<String> {
         format!("--password={}", target.password),
         "--ssl".to_string(),
         format!("--ssl-ca={}", target.tls_ca_file),
-        "--ssl-verify-server-cert".to_string(),
         "--database".to_string(),
         target.database.clone(),
         "--default-character-set=utf8mb4".to_string(),
-    ]
+    ];
+    if target.host.parse::<IpAddr>().is_err() {
+        args.push("--ssl-verify-server-cert".to_string());
+    }
+    args
 }
 
 pub fn quote_identifier_path(identifier: &str) -> String {
@@ -153,7 +159,7 @@ mod tests {
             std::env::temp_dir().join(format!("mariadb-mysql-cdc-test-ca-{}", std::process::id()));
         std::fs::write(&ca_path, b"test ca").unwrap();
 
-        let error = ssl_opts_from_ca("target `db`:25060", ca_path.to_str().unwrap())
+        let error = ssl_opts_from_ca("target `db`:25060", "db", ca_path.to_str().unwrap())
             .expect_err("invalid CA");
 
         assert!(error.contains("target `db`:25060 TLS CA file"));
@@ -182,6 +188,21 @@ mod tests {
             Some(std::path::Path::new(&target.tls_ca_file))
         );
         assert!(!ssl.accept_invalid_certs());
+        assert!(!ssl.skip_domain_validation());
+    }
+
+    #[test]
+    fn target_ip_ssl_opts_skip_only_domain_validation() {
+        let target = TargetMySqlConfig {
+            host: "192.0.2.10".to_string(),
+            tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
+            ..TargetMySqlConfig::default()
+        };
+
+        let ssl = target_ssl_opts(&target).expect("configured target CA");
+
+        assert!(ssl.skip_domain_validation());
+        assert!(!ssl.accept_invalid_certs());
     }
 
     #[test]
@@ -199,6 +220,7 @@ mod tests {
             Some(std::path::Path::new(&target.tls_ca_file))
         );
         assert!(!ssl.accept_invalid_certs());
+        assert!(!ssl.skip_domain_validation());
     }
 
     #[test]

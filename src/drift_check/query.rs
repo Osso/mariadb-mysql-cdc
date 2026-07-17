@@ -260,7 +260,11 @@ pub(crate) fn connection_opts(config: &QueryConnectionConfig) -> Result<Opts, St
         .pass(Some(&config.password))
         .db_name(Some(&config.database))
         .prefer_socket(false)
-        .ssl_opts(ssl_opts_from_ca(&endpoint, &config.tls_ca_file)?);
+        .ssl_opts(ssl_opts_from_ca(
+            &endpoint,
+            &config.host,
+            &config.tls_ca_file,
+        )?);
     Ok(Opts::from(builder))
 }
 

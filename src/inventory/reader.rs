@@ -382,7 +382,11 @@ pub(crate) fn inventory_opts(config: &InventoryConfig) -> Result<Opts, String> {
             config.host,
             config.port
         );
-        builder = builder.ssl_opts(crate::mysql_support::ssl_opts_from_ca(&endpoint, ca_file)?);
+        builder = builder.ssl_opts(crate::mysql_support::ssl_opts_from_ca(
+            &endpoint,
+            &config.host,
+            ca_file,
+        )?);
     }
     Ok(Opts::from(builder))
 }

@@ -430,7 +430,11 @@ pub(super) fn replica_options_from_source(
     Ok(ReplicaOptions {
         port: source.port,
         hostname: source.host.clone(),
-        ssl_mode: SslMode::RequireVerifyCa,
+        ssl_mode: if source.host.parse::<std::net::IpAddr>().is_ok() {
+            SslMode::RequireVerifyCa
+        } else {
+            SslMode::RequireVerifyFull
+        },
         ssl_ca_file: Some(source.tls_ca_file.clone()),
         username: source.user.clone(),
         password: source.password.clone(),

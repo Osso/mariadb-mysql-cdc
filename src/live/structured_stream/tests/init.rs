@@ -140,6 +140,18 @@ fn builds_mysql_cdc_replica_options_from_source_position() {
 }
 
 #[test]
+fn mysql_cdc_dns_source_requires_full_identity_verification() {
+    let source = SourceBinlogConfig {
+        host: "db.internal.example".to_string(),
+        ..SourceBinlogConfig::default()
+    };
+
+    let options = replica_options_from_source(&source).expect("options");
+
+    assert_eq!(options.ssl_mode, SslMode::RequireVerifyFull);
+}
+
+#[test]
 fn rejects_mysql_cdc_start_positions_that_do_not_fit_crate_api() {
     let source = SourceBinlogConfig {
         binlog_file: "mysqld-bin.000777".to_string(),

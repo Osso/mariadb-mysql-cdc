@@ -21,7 +21,7 @@ pub(crate) fn base_opts(
         .db_name(Some(database))
         .prefer_socket(false);
     if let Some(ca_file) = tls_ca_file {
-        builder = builder.ssl_opts(ssl_opts_from_ca(endpoint, ca_file)?);
+        builder = builder.ssl_opts(ssl_opts_from_ca(endpoint, host, ca_file)?);
     }
     Ok(Opts::from(builder))
 }
