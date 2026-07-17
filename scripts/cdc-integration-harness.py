@@ -1425,7 +1425,7 @@ class Harness:
             self.admin_sql(self.source, f"INSERT INTO repair_resume VALUES {values};")
             run_id = "repair-resume-run"
             process, log_path = self.start_repair(
-                tables=["repair_resume"], max_deletes=0, run_id=run_id, chunk_size=1
+                tables=["repair_resume"], max_deletes=0, run_id=run_id, chunk_size=10
             )
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
@@ -1454,13 +1454,13 @@ class Harness:
                 log.close()
 
             changed = self.run_repair(
-                tables=["repair_resume"], max_deletes=1, run_id=run_id, chunk_size=1
+                tables=["repair_resume"], max_deletes=1, run_id=run_id, chunk_size=10
             )
             changed_output = f"{changed.stdout}\n{changed.stderr}".lower()
             if changed.returncode == 0 or "immutable specification" not in changed_output:
                 raise HarnessError(f"{scenario} accepted a changed plan hash: {changed}")
             resumed = self.run_repair(
-                tables=["repair_resume"], max_deletes=0, run_id=run_id, chunk_size=1, timeout=240
+                tables=["repair_resume"], max_deletes=0, run_id=run_id, chunk_size=10, timeout=240
             )
             require_success(resumed, f"{scenario} resume")
             count = self.query(self.target, "SELECT COUNT(*) FROM repair_resume;", user=TARGET_USER, password=TARGET_PASSWORD).strip()
