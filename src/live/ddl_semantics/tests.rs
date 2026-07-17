@@ -784,7 +784,7 @@ fn production_add_column_ddl_transforms_to_deterministic_mysql8_sql() {
     assert_eq!(
         transformation.target_sql.as_deref(),
         Some(
-            "ALTER TABLE `home_feed_panel_candidates` ADD COLUMN `filter_prompt_version` VARCHAR(64) DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_reason`, ADD COLUMN `filtered_time` DATETIME NULL DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_prompt_version`"
+            "ALTER TABLE `home_feed_panel_candidates` ADD COLUMN `filter_prompt_version` VARCHAR(64) NULL DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_reason`, ADD COLUMN `filtered_time` DATETIME NULL DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_prompt_version`"
         )
     );
 }
@@ -809,7 +809,7 @@ fn production_add_column_and_key_ddl_transforms_to_deterministic_mysql8_sql() {
     assert_eq!(
         transformation.target_sql.as_deref(),
         Some(
-            "ALTER TABLE `home_feed_bakes` ADD COLUMN `variant_id` SMALLINT UNSIGNED DEFAULT NULL AFTER `reading_direction`, ADD KEY `idx_hfb_variant_status_published` (`variant_id`, `status`, `published_time`)"
+            "ALTER TABLE `home_feed_bakes` ADD COLUMN `variant_id` SMALLINT UNSIGNED NULL DEFAULT NULL AFTER `reading_direction`, ADD KEY `idx_hfb_variant_status_published` (`variant_id`, `status`, `published_time`)"
         )
     );
 }
