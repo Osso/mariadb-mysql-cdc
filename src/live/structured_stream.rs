@@ -1,4 +1,4 @@
-use super::ddl_ledger::{DdlEvent, DdlEventLedger, DdlEventStatus, MySqlDdlEventLedger};
+use super::ddl_event::DdlEvent;
 use super::ddl_replay_journal::{
     DdlFamily, DdlReplayAction, DdlReplayJournal, DdlReplayStatus, MySqlDdlReplayJournal,
     PreparedReconciliation, prepared_reconciliation_block_reason, reconcile_prepared,
@@ -181,10 +181,9 @@ struct StreamEventContext<'a, R, C> {
     group_config: TargetTransactionGroupConfig,
 }
 
-struct AutomaticDdlDependencies<'a, J, S, D> {
+struct AutomaticDdlDependencies<'a, J, S> {
     journal: &'a J,
     semantic_inventory: &'a S,
-    ledger: &'a D,
     source_identity: &'a str,
 }
 

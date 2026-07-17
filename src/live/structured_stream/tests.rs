@@ -164,23 +164,6 @@ impl TableSchemaResolver for ReleasesSchemaResolver {
 
 struct NoopCheckpointStore;
 
-struct FixedCheckpointStore {
-    checkpoint: crate::checkpoint::Checkpoint,
-}
-
-impl StreamCheckpointStore for FixedCheckpointStore {
-    fn load_checkpoint(&self) -> Result<Option<crate::checkpoint::Checkpoint>, ApplyBinlogError> {
-        Ok(Some(self.checkpoint.clone()))
-    }
-
-    fn save_checkpoint(
-        &self,
-        _checkpoint: &crate::checkpoint::Checkpoint,
-    ) -> Result<(), ApplyBinlogError> {
-        panic!("regressing checkpoint must not be saved")
-    }
-}
-
 struct RecordingCheckpointStore {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
 }
@@ -237,6 +220,7 @@ struct RecordingSemanticInventory {
     evidence: super::super::ddl_semantics::DdlSemanticEvidence,
     observed_state: String,
     capture_error: Option<String>,
+    translator_available: std::cell::Cell<bool>,
 }
 
 impl Default for RecordingSemanticInventory {
@@ -251,6 +235,7 @@ impl Default for RecordingSemanticInventory {
             },
             observed_state: "after".to_string(),
             capture_error: None,
+            translator_available: std::cell::Cell::new(true),
         }
     }
 }
@@ -260,6 +245,9 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
         &self,
         sql: &str,
     ) -> Result<super::super::ddl_semantics::DdlTransformation, String> {
+        if !self.translator_available.get() {
+            return Err("translator implementation unavailable".to_string());
+        }
         let target_sql = if sql.to_ascii_uppercase().contains("RENAME COLUMN IF EXISTS") {
             Some(
                 "ALTER TABLE `home_feed_captions` RENAME COLUMN `arc_start_order` TO `deprecated_arc_start_order`"
@@ -331,12 +319,23 @@ impl DdlReplayJournal for RecordingDdlReplayJournal {
         Ok(self.evidence.borrow().clone())
     }
 
+    fn record_translation_pending(&self, _event: &DdlEvent) -> Result<(), String> {
+        self.operations.borrow_mut().push("TRANSLATION_PENDING");
+        *self.status.borrow_mut() = Some(DdlReplayStatus::TranslationPending);
+        Ok(())
+    }
+
     fn prepare(
         &self,
         _event: &DdlEvent,
         evidence: &super::super::ddl_semantics::DdlSemanticEvidence,
     ) -> Result<(), String> {
-        self.operations.borrow_mut().push("PREPARE");
+        let operation = if *self.status.borrow() == Some(DdlReplayStatus::TranslationPending) {
+            "PROMOTE"
+        } else {
+            "PREPARE"
+        };
+        self.operations.borrow_mut().push(operation);
         *self.status.borrow_mut() = Some(DdlReplayStatus::Prepared);
         *self.evidence.borrow_mut() = Some(evidence.clone());
         Ok(())
@@ -362,60 +361,6 @@ impl DdlReplayJournal for RecordingDdlReplayJournal {
             sql: "UPDATE cdc.ddl_replay_journal SET status='checkpointed'".to_string(),
             params: Vec::new(),
         })
-    }
-}
-
-#[derive(Default)]
-struct RecordingDdlLedger {
-    status: RefCell<Option<DdlEventStatus>>,
-    recorded: RefCell<Vec<DdlEvent>>,
-    ensure_calls: std::cell::Cell<usize>,
-    reject_revalidation: bool,
-}
-
-impl RecordingDdlLedger {
-    fn resolved(sql: &str) -> Self {
-        Self {
-            status: RefCell::new(Some(DdlEventStatus::Resolved {
-                raw_sql: sql.to_string(),
-            })),
-            recorded: RefCell::new(Vec::new()),
-            ensure_calls: std::cell::Cell::new(0),
-            reject_revalidation: false,
-        }
-    }
-
-    fn startup_validated(sql: &str) -> Self {
-        Self {
-            reject_revalidation: true,
-            ..Self::resolved(sql)
-        }
-    }
-}
-
-impl DdlEventLedger for RecordingDdlLedger {
-    fn ensure(&self) -> Result<(), String> {
-        let calls = self.ensure_calls.get() + 1;
-        self.ensure_calls.set(calls);
-        if self.reject_revalidation && calls > 1 {
-            return Err(
-                "SHOW GRANTS revalidation rejected control-plane scope during manual routing"
-                    .to_string(),
-            );
-        }
-        Ok(())
-    }
-
-    fn read_status(&self, _event: &DdlEvent) -> Result<Option<DdlEventStatus>, String> {
-        Ok(self.status.borrow().clone())
-    }
-
-    fn record_pending(&self, event: &DdlEvent) -> Result<(), String> {
-        self.recorded.borrow_mut().push(event.clone());
-        *self.status.borrow_mut() = Some(DdlEventStatus::Pending {
-            raw_sql: event.raw_sql.clone(),
-        });
-        Ok(())
     }
 }
 

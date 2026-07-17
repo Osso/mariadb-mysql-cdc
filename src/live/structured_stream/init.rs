@@ -33,8 +33,6 @@ pub(super) fn validate_startup_contract(
     executor
         .acquire_stream_lease(&format!("cdc-stream:{}", config.target.database))
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    let ddl_ledger = MySqlDdlEventLedger::new(&config.target, config.ddl_ledger_table.clone());
-    ddl_ledger.ensure().map_err(ApplyBinlogError::Statement)?;
     let ddl_replay_journal =
         MySqlDdlReplayJournal::new(&config.target, "cdc.ddl_replay_journal".to_string());
     ddl_replay_journal
@@ -115,7 +113,6 @@ pub(super) fn stream_once(
 pub(super) struct StreamRuntime {
     applier: RowApplier<crate::mysql_client::PersistentTargetExecutor>,
     conflict_store: MySqlConflictStore,
-    ddl_ledger: MySqlDdlEventLedger,
     ddl_replay_journal: MySqlDdlReplayJournal,
     semantic_inventory: LiveDdlSemanticInventory,
     schema_resolver: TargetInventorySchemaResolver,
@@ -131,15 +128,13 @@ pub(super) struct StreamRuntime {
 
 impl StreamRuntime {
     pub(super) fn initialize(config: &ApplyBinlogConfig) -> Result<Self, ApplyBinlogError> {
-        let (applier, conflict_store, ddl_ledger, ddl_replay_journal) =
-            initialize_target_services(config)?;
+        let (applier, conflict_store, ddl_replay_journal) = initialize_target_services(config)?;
         let semantic_inventory = initialize_semantic_inventory(config)?;
         let schema_resolver = TargetInventorySchemaResolver::new(config);
         let (event_receiver, current_file) = start_binlog_receiver(config)?;
         Ok(Self {
             applier,
             conflict_store,
-            ddl_ledger,
             ddl_replay_journal,
             semantic_inventory,
             schema_resolver,
@@ -164,7 +159,6 @@ fn initialize_target_services(
     (
         RowApplier<crate::mysql_client::PersistentTargetExecutor>,
         MySqlConflictStore,
-        MySqlDdlEventLedger,
         MySqlDdlReplayJournal,
     ),
     ApplyBinlogError,
@@ -177,11 +171,10 @@ fn initialize_target_services(
         .acquire_stream_lease(&format!("cdc-stream:{}", config.target.database))
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
     let applier = RowApplier::new(executor);
-    let ddl_ledger = MySqlDdlEventLedger::new(&config.target, config.ddl_ledger_table.clone());
     let ddl_replay_journal =
         MySqlDdlReplayJournal::new(&config.target, "cdc.ddl_replay_journal".to_string());
     validate_ddl_replay_barrier(&ddl_replay_journal, config)?;
-    Ok((applier, conflict_store, ddl_ledger, ddl_replay_journal))
+    Ok((applier, conflict_store, ddl_replay_journal))
 }
 
 fn validate_ddl_replay_barrier(
@@ -281,7 +274,6 @@ where
     let StreamRuntime {
         applier,
         conflict_store,
-        ddl_ledger,
         ddl_replay_journal,
         semantic_inventory,
         schema_resolver,
@@ -302,39 +294,24 @@ where
         current_file,
         group_config: *group_config,
     };
-    match handle_automatic_ddl_event(
+    match handle_ddl_event(
         applier,
-        AutomaticDdlDependencies {
-            journal: ddl_replay_journal,
-            semantic_inventory,
-            ledger: ddl_ledger,
-            source_identity,
-        },
-        AutomaticDdlInput {
-            context: &mut context,
-            header,
-            event,
-        },
+        ddl_replay_journal,
+        semantic_inventory,
+        source_identity,
+        &mut context,
+        header,
+        event,
     )? {
         Some(outcome) => Ok(outcome),
-        None => match handle_manual_ddl_event(
-            applier.executor(),
-            ddl_ledger,
-            source_identity,
+        None => apply_stream_event_transactionally_with_conflicts(
+            applier,
             &mut context,
             header,
             event,
-        )? {
-            Some(outcome) => Ok(outcome),
-            None => apply_stream_event_transactionally_with_conflicts(
-                applier,
-                &mut context,
-                header,
-                event,
-                source_identity,
-                conflict_store,
-            ),
-        },
+            source_identity,
+            conflict_store,
+        ),
     }
 }
 

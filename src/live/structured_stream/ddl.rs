@@ -2,9 +2,102 @@ use super::*;
 use crate::live::ddl_semantics::{DdlTransformation, supports_rename_columns_if_exists};
 use crate::target::SqlStatement;
 
-pub(super) fn handle_automatic_ddl_event<E, R, C, J, S, D>(
+pub(super) fn handle_ddl_event<E, R, C, J, S>(
     applier: &mut RowApplier<E>,
-    dependencies: AutomaticDdlDependencies<'_, J, S, D>,
+    journal: &J,
+    semantic_inventory: &S,
+    source_identity: &str,
+    context: &mut StreamEventContext<'_, R, C>,
+    header: &EventHeader,
+    event: &BinlogEvent,
+) -> Result<Option<StructuredEventOutcome>, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    R: TableSchemaResolver,
+    C: StreamCheckpointStore,
+    J: DdlReplayJournal,
+    S: DdlSemanticInventory,
+{
+    if let Some(outcome) = handle_automatic_ddl_event(
+        applier,
+        AutomaticDdlDependencies {
+            journal,
+            semantic_inventory,
+            source_identity,
+        },
+        AutomaticDdlInput {
+            context,
+            header,
+            event,
+        },
+    )? {
+        return Ok(Some(outcome));
+    }
+    handle_untranslated_ddl_event(
+        applier.executor(),
+        journal,
+        source_identity,
+        context,
+        header,
+        event,
+    )
+}
+
+fn handle_untranslated_ddl_event<E, R, C, J>(
+    executor: &E,
+    journal: &J,
+    source_identity: &str,
+    context: &mut StreamEventContext<'_, R, C>,
+    header: &EventHeader,
+    event: &BinlogEvent,
+) -> Result<Option<StructuredEventOutcome>, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    R: TableSchemaResolver,
+    C: StreamCheckpointStore,
+    J: DdlReplayJournal,
+{
+    let Some((_, ddl_event)) = manual_ddl_event(
+        source_identity,
+        context.current_file,
+        header,
+        event,
+        context.state,
+    ) else {
+        return Ok(None);
+    };
+    flush_grouped_transaction(executor, context)?;
+    ensure_translation_pending(journal, &ddl_event)?;
+    Err(ApplyBinlogError::Statement(format!(
+        "DDL translator unavailable at {}:{}; checkpoint remains blocked",
+        ddl_event.binlog_file, ddl_event.event_start_position
+    )))
+}
+
+fn ensure_translation_pending(
+    journal: &impl DdlReplayJournal,
+    event: &DdlEvent,
+) -> Result<(), ApplyBinlogError> {
+    match journal
+        .read_status(event)
+        .map_err(ApplyBinlogError::Statement)?
+    {
+        None => journal
+            .record_translation_pending(event)
+            .map_err(ApplyBinlogError::Statement),
+        Some(DdlReplayStatus::TranslationPending) => Ok(()),
+        Some(status) => Err(ApplyBinlogError::Statement(format!(
+            "cannot replace automatic DDL journal status {} with translation_pending at {}:{}",
+            status.as_str(),
+            event.binlog_file,
+            event.event_start_position
+        ))),
+    }
+}
+
+pub(super) fn handle_automatic_ddl_event<E, R, C, J, S>(
+    applier: &mut RowApplier<E>,
+    dependencies: AutomaticDdlDependencies<'_, J, S>,
     input: AutomaticDdlInput<'_, '_, R, C>,
 ) -> Result<Option<StructuredEventOutcome>, ApplyBinlogError>
 where
@@ -13,12 +106,10 @@ where
     C: StreamCheckpointStore,
     J: DdlReplayJournal,
     S: DdlSemanticInventory,
-    D: DdlEventLedger,
 {
     let AutomaticDdlDependencies {
         journal,
         semantic_inventory,
-        ledger,
         source_identity,
     } = dependencies;
     let AutomaticDdlInput {
@@ -58,7 +149,6 @@ where
                 applier,
                 journal,
                 semantic_inventory,
-                ledger,
                 AutomaticDdlInput {
                     context,
                     header,
@@ -82,11 +172,10 @@ where
     Ok(Some(outcome))
 }
 
-pub(super) fn prepare_and_execute_automatic_ddl<E, R, C, J, S, D>(
+pub(super) fn prepare_and_execute_automatic_ddl<E, R, C, J, S>(
     applier: &mut RowApplier<E>,
     journal: &J,
     semantic_inventory: &S,
-    ledger: &D,
     input: AutomaticDdlInput<'_, '_, R, C>,
     ddl_event: &DdlEvent,
 ) -> Result<StructuredEventOutcome, ApplyBinlogError>
@@ -96,17 +185,20 @@ where
     C: StreamCheckpointStore,
     J: DdlReplayJournal,
     S: DdlSemanticInventory,
-    D: DdlEventLedger,
 {
     let AutomaticDdlInput {
         context,
         header: _,
         event,
     } = input;
-    let transformation = semantic_inventory
-        .transform_sql(&ddl_event.raw_sql)
-        .map_err(ApplyBinlogError::Statement)?;
-    let mut evidence = capture_automatic_ddl_evidence(semantic_inventory, ledger, ddl_event)?;
+    let transformation = match semantic_inventory.transform_sql(&ddl_event.raw_sql) {
+        Ok(transformation) => transformation,
+        Err(error) => {
+            ensure_translation_pending(journal, ddl_event)?;
+            return Err(ApplyBinlogError::Statement(error));
+        }
+    };
+    let mut evidence = capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event)?;
     evidence.transformation_version = transformation.version.to_string();
     evidence.generated_sql = transformation.target_sql.clone();
     journal
@@ -164,14 +256,14 @@ fn execute_transformed_ddl(
     Ok(resolved_ddl_outcome(ddl_event.clone()))
 }
 
-pub(super) fn capture_automatic_ddl_evidence<S, D>(
+pub(super) fn capture_automatic_ddl_evidence<S, J>(
     semantic_inventory: &S,
-    ledger: &D,
+    journal: &J,
     ddl_event: &DdlEvent,
 ) -> Result<DdlSemanticEvidence, ApplyBinlogError>
 where
     S: DdlSemanticInventory,
-    D: DdlEventLedger,
+    J: DdlReplayJournal,
 {
     match semantic_inventory.capture_evidence(
         &ddl_event.raw_sql,
@@ -179,11 +271,12 @@ where
         ddl_event.event_end_position,
     ) {
         Ok(evidence) => Ok(evidence),
-        Err(_) => {
-            ledger
-                .record_pending(ddl_event)
-                .map_err(ApplyBinlogError::Statement)?;
-            Err(pending_ddl_error(ddl_event))
+        Err(error) => {
+            ensure_translation_pending(journal, ddl_event)?;
+            Err(ApplyBinlogError::Statement(format!(
+                "DDL transformation evidence unavailable at {}:{}: {error}",
+                ddl_event.binlog_file, ddl_event.event_start_position
+            )))
         }
     }
 }
@@ -285,37 +378,6 @@ where
     finalize_automatic_ddl_checkpoint(executor, journal, context, event, ddl_event)
 }
 
-pub(super) fn handle_manual_ddl_event<E, R, C, D>(
-    executor: &E,
-    ledger: &D,
-    source_identity: &str,
-    context: &mut StreamEventContext<'_, R, C>,
-    header: &EventHeader,
-    event: &BinlogEvent,
-) -> Result<Option<StructuredEventOutcome>, ApplyBinlogError>
-where
-    E: TransactionalTargetExecutor,
-    R: TableSchemaResolver,
-    C: StreamCheckpointStore,
-    D: DdlEventLedger,
-{
-    let Some((query, ddl_event)) = manual_ddl_event(
-        source_identity,
-        context.current_file,
-        header,
-        event,
-        context.state,
-    ) else {
-        return Ok(None);
-    };
-
-    flush_grouped_transaction(executor, context)?;
-    let status = ledger
-        .read_status(&ddl_event)
-        .map_err(ApplyBinlogError::Statement)?;
-    handle_ddl_status(executor, ledger, context, event, query, ddl_event, status)
-}
-
 pub(super) fn automatically_handled_ddl_event<'a>(
     source_identity: &str,
     current_file: &str,
@@ -380,44 +442,6 @@ pub(super) fn manual_ddl_event<'a>(
     ))
 }
 
-pub(super) fn handle_ddl_status<E, R, C, D>(
-    executor: &E,
-    ledger: &D,
-    context: &mut StreamEventContext<'_, R, C>,
-    event: &BinlogEvent,
-    query: &mysql_cdc::events::query_event::QueryEvent,
-    ddl_event: DdlEvent,
-    status: Option<DdlEventStatus>,
-) -> Result<Option<StructuredEventOutcome>, ApplyBinlogError>
-where
-    E: TransactionalTargetExecutor,
-    R: TableSchemaResolver,
-    C: StreamCheckpointStore,
-    D: DdlEventLedger,
-{
-    match status {
-        None => {
-            ledger
-                .record_pending(&ddl_event)
-                .map_err(ApplyBinlogError::Statement)?;
-            Err(pending_ddl_error(&ddl_event))
-        }
-        Some(DdlEventStatus::Pending { raw_sql }) => {
-            require_matching_ddl(&ddl_event, &raw_sql)?;
-            Err(pending_ddl_error(&ddl_event))
-        }
-        Some(DdlEventStatus::Resolved { raw_sql }) => {
-            require_matching_ddl(&ddl_event, &raw_sql)?;
-            checkpoint_resolved_ddl(executor, context, event, &ddl_event)?;
-            context
-                .schema_resolver
-                .invalidate_schema(&query.database_name);
-            context.state.clear_query_context();
-            Ok(Some(resolved_ddl_outcome(ddl_event)))
-        }
-    }
-}
-
 pub(super) fn resolved_ddl_outcome(event: DdlEvent) -> StructuredEventOutcome {
     StructuredEventOutcome {
         policy: EventPolicy::CommitTransaction,
@@ -445,31 +469,6 @@ pub(super) fn ddl_event(
         schema_name: query.database_name.clone(),
         raw_sql: query.sql_statement.clone(),
     }
-}
-
-pub(super) fn require_matching_ddl(
-    event: &DdlEvent,
-    saved_sql: &str,
-) -> Result<(), ApplyBinlogError> {
-    if saved_sql == event.raw_sql {
-        return Ok(());
-    }
-    Err(ApplyBinlogError::Statement(format!(
-        "DDL ledger SQL mismatch at {}:{} for source_server_id={}",
-        event.binlog_file, event.event_start_position, event.source_server_id
-    )))
-}
-
-pub(super) fn pending_ddl_error(event: &DdlEvent) -> ApplyBinlogError {
-    ApplyBinlogError::Statement(format!(
-        "manual DDL resolution required source_server_id={} file={} start_position={} end_position={} schema={} sql={}",
-        event.source_server_id,
-        event.binlog_file,
-        event.event_start_position,
-        event.event_end_position,
-        event.schema_name,
-        event.raw_sql.replace(char::is_whitespace, " ")
-    ))
 }
 
 pub(super) fn finalize_automatic_ddl_checkpoint<E, R, C, J>(
@@ -557,34 +556,6 @@ pub(super) fn ensure_automatic_ddl_checkpoint_predecessor(
     )))
 }
 
-pub(super) fn checkpoint_resolved_ddl<E, R, C>(
-    executor: &E,
-    context: &mut StreamEventContext<'_, R, C>,
-    event: &BinlogEvent,
-    ddl_event: &DdlEvent,
-) -> Result<(), ApplyBinlogError>
-where
-    E: TransactionalTargetExecutor,
-    C: StreamCheckpointStore,
-{
-    let coordinate = BinlogCoordinate {
-        file: ddl_event.binlog_file.clone(),
-        position: ddl_event.event_end_position,
-    };
-    ensure_resolved_ddl_checkpoint_advances(context.checkpoint_store, &coordinate)?;
-    let checkpoint = crate::live::reconnect::coordinate_checkpoint(&coordinate, event_name(event));
-    if let (Some(table), Some(name)) = (
-        context.transaction_checkpoint_table,
-        context.transaction_checkpoint_name,
-    ) {
-        save_resolved_ddl_transaction_checkpoint(executor, table, name, &checkpoint)?;
-    } else if let Some(store) = context.checkpoint_store {
-        store.save_checkpoint(&checkpoint)?;
-    }
-    *context.current_file = coordinate.file;
-    Ok(())
-}
-
 pub(super) fn ensure_resolved_ddl_checkpoint_advances(
     checkpoint_store: Option<&impl StreamCheckpointStore>,
     next: &BinlogCoordinate,
@@ -621,28 +592,6 @@ pub(super) fn binlog_coordinate_is_before(
     right: &BinlogCoordinate,
 ) -> bool {
     left.file < right.file || (left.file == right.file && left.position < right.position)
-}
-
-pub(super) fn save_resolved_ddl_transaction_checkpoint(
-    executor: &impl TransactionalTargetExecutor,
-    table: &str,
-    checkpoint_name: &str,
-    checkpoint: &crate::checkpoint::Checkpoint,
-) -> Result<(), ApplyBinlogError> {
-    executor
-        .begin_transaction()
-        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    let save_result =
-        lock_validate_and_save_checkpoint(executor, table, checkpoint_name, checkpoint);
-    if let Err(error) = save_result {
-        executor
-            .rollback_transaction()
-            .map_err(|rollback_error| ApplyBinlogError::Target(rollback_error.to_string()))?;
-        return Err(error);
-    }
-    executor
-        .commit_transaction()
-        .map_err(|error| ApplyBinlogError::Target(error.to_string()))
 }
 
 pub(super) fn lock_validate_and_save_checkpoint(

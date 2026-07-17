@@ -45,11 +45,10 @@ fn source_query_ddl_is_replayed_as_checkpointed_statement() {
 }
 
 #[test]
-fn supported_ddl_replays_without_manual_resolution() {
+fn supported_ddl_replays_without_translation_barrier() {
     let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let executor = TransactionRecordingExecutor::with_operations(operations.clone());
     let mut applier = crate::row::RowApplier::new(executor);
-    let ledger = RecordingDdlLedger::default();
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let mut current_file = "mysqld-bin.000777".to_string();
@@ -79,7 +78,6 @@ fn supported_ddl_replays_without_manual_resolution() {
         AutomaticDdlDependencies {
             journal: &journal,
             semantic_inventory: &RecordingSemanticInventory::default(),
-            ledger: &ledger,
             source_identity: "production-source",
         },
         AutomaticDdlInput {
@@ -111,14 +109,12 @@ fn supported_ddl_replays_without_manual_resolution() {
             "COMMIT",
         ]
     );
-    assert!(ledger.recorded.borrow().is_empty());
 }
 
 #[test]
 fn mariadb_rename_column_if_exists_executes_generated_mysql8_sql() {
     let executor = TransactionRecordingExecutor::failing();
     let mut applier = crate::row::RowApplier::new(executor);
-    let ledger = RecordingDdlLedger::default();
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let mut current_file = "mysqld-bin.000777".to_string();
@@ -148,7 +144,6 @@ fn mariadb_rename_column_if_exists_executes_generated_mysql8_sql() {
         AutomaticDdlDependencies {
             journal: &journal,
             semantic_inventory: &RecordingSemanticInventory::default(),
-            ledger: &ledger,
             source_identity: "production-source",
         },
         AutomaticDdlInput {
@@ -166,7 +161,96 @@ fn mariadb_rename_column_if_exists_executes_generated_mysql8_sql() {
         "source MariaDB SQL reached target: {message}"
     );
     assert_eq!(*journal.status.borrow(), Some(DdlReplayStatus::Prepared));
-    assert!(ledger.recorded.borrow().is_empty());
+}
+
+#[test]
+fn unsupported_ddl_persists_barrier_then_replays_after_translator_upgrade() {
+    let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let executor = TransactionRecordingExecutor::with_operations(operations.clone());
+    let mut applier = crate::row::RowApplier::new(executor);
+    let journal = RecordingDdlReplayJournal::with_operations(operations.clone());
+    let semantic_inventory = RecordingSemanticInventory::default();
+    semantic_inventory.translator_available.set(false);
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "ALTER TABLE home_feed_captions RENAME COLUMN IF EXISTS arc_start_order TO deprecated_arc_start_order".to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let first_error = handle_ddl_event(
+        &mut applier,
+        &journal,
+        &semantic_inventory,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect_err("missing translator must block the checkpoint");
+
+    assert!(
+        first_error
+            .to_string()
+            .contains("translator implementation unavailable")
+    );
+    assert_eq!(
+        *journal.status.borrow(),
+        Some(DdlReplayStatus::TranslationPending)
+    );
+    assert_eq!(operations.borrow().as_slice(), &["TRANSLATION_PENDING"]);
+
+    semantic_inventory.translator_available.set(true);
+    let outcome = handle_ddl_event(
+        &mut applier,
+        &journal,
+        &semantic_inventory,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect("translator upgrade must replay automatically")
+    .expect("DDL event outcome");
+
+    assert_eq!(
+        outcome
+            .resume_coordinate
+            .as_ref()
+            .map(|value| value.position),
+        Some(180)
+    );
+    assert_eq!(
+        operations.borrow().as_slice(),
+        &[
+            "TRANSLATION_PENDING",
+            "PROMOTE",
+            "EXEC",
+            "APPLIED",
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "EXEC",
+            "CHECKPOINT",
+            "COMMIT",
+        ]
+    );
+    assert_eq!(*journal.status.borrow(), Some(DdlReplayStatus::Applied));
 }
 
 #[test]
@@ -256,7 +340,6 @@ fn applied_only_restart_finalizes_journal_and_checkpoint_atomically_without_repl
         AutomaticDdlDependencies {
             journal: &journal,
             semantic_inventory: &RecordingSemanticInventory::default(),
-            ledger: &RecordingDdlLedger::default(),
             source_identity: "production-source",
         },
         AutomaticDdlInput {
@@ -310,7 +393,6 @@ fn prepared_restart_with_proven_post_state_finalizes_without_replay() {
         AutomaticDdlDependencies {
             journal: &journal,
             semantic_inventory: &RecordingSemanticInventory::default(),
-            ledger: &RecordingDdlLedger::default(),
             source_identity: "production-source",
         },
         AutomaticDdlInput {
@@ -375,7 +457,6 @@ fn prepared_restart_with_pre_state_blocks_without_replay_or_checkpoint() {
         AutomaticDdlDependencies {
             journal: &journal,
             semantic_inventory: &semantic_inventory,
-            ledger: &RecordingDdlLedger::default(),
             source_identity: "production-source",
         },
         AutomaticDdlInput {
@@ -443,7 +524,6 @@ fn automatic_ddl_checkpoint_predecessor_mismatch_rolls_back_before_journal_trans
         AutomaticDdlDependencies {
             journal: &journal,
             semantic_inventory: &RecordingSemanticInventory::default(),
-            ledger: &RecordingDdlLedger::default(),
             source_identity: "production-source",
         },
         AutomaticDdlInput {
@@ -462,11 +542,10 @@ fn automatic_ddl_checkpoint_predecessor_mismatch_rolls_back_before_journal_trans
 }
 
 #[test]
-fn event_position_evidence_failure_routes_ddl_to_manual_ledger() {
+fn event_position_evidence_failure_persists_translation_pending_barrier() {
     let executor = TransactionRecordingExecutor::default();
     let mut applier = crate::row::RowApplier::new(executor);
     let journal = RecordingDdlReplayJournal::default();
-    let ledger = RecordingDdlLedger::default();
     let semantic_inventory = RecordingSemanticInventory {
         capture_error: Some(
             "source semantic inventory is not event-position consistent".to_string(),
@@ -501,7 +580,6 @@ fn event_position_evidence_failure_routes_ddl_to_manual_ledger() {
         AutomaticDdlDependencies {
             journal: &journal,
             semantic_inventory: &semantic_inventory,
-            ledger: &ledger,
             source_identity: "production-source",
         },
         AutomaticDdlInput {
@@ -510,11 +588,21 @@ fn event_position_evidence_failure_routes_ddl_to_manual_ledger() {
             event: &event,
         },
     )
-    .expect_err("unfenced source inventory must route manual");
+    .expect_err("unfenced source inventory must block checkpoint advancement");
 
-    assert!(error.to_string().contains("manual DDL resolution required"));
-    assert_eq!(ledger.recorded.borrow().len(), 1);
-    assert!(journal.operations.borrow().is_empty());
+    assert!(
+        error
+            .to_string()
+            .contains("DDL transformation evidence unavailable")
+    );
+    assert_eq!(
+        *journal.status.borrow(),
+        Some(DdlReplayStatus::TranslationPending)
+    );
+    assert_eq!(
+        journal.operations.borrow().as_slice(),
+        &["TRANSLATION_PENDING"]
+    );
     assert!(applier.executor().operations().is_empty());
 }
 
@@ -522,7 +610,6 @@ fn event_position_evidence_failure_routes_ddl_to_manual_ledger() {
 fn failed_supported_ddl_replay_does_not_checkpoint() {
     let executor = TransactionRecordingExecutor::failing();
     let mut applier = crate::row::RowApplier::new(executor);
-    let ledger = RecordingDdlLedger::default();
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let mut current_file = "mysqld-bin.000777".to_string();
@@ -552,7 +639,6 @@ fn failed_supported_ddl_replay_does_not_checkpoint() {
         AutomaticDdlDependencies {
             journal: &journal,
             semantic_inventory: &RecordingSemanticInventory::default(),
-            ledger: &ledger,
             source_identity: "production-source",
         },
         AutomaticDdlInput {
@@ -567,11 +653,10 @@ fn failed_supported_ddl_replay_does_not_checkpoint() {
     assert_eq!(applier.executor().operations(), vec!["EXEC"]);
     assert_eq!(journal.operations.borrow().as_slice(), &["PREPARE"]);
     assert_eq!(*journal.status.borrow(), Some(DdlReplayStatus::Prepared));
-    assert!(ledger.recorded.borrow().is_empty());
 }
 
 #[test]
-fn qualified_ddl_with_different_default_database_still_requires_manual_resolution() {
+fn qualified_ddl_with_different_default_database_routes_to_translation_pending() {
     let state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let event = BinlogEvent::QueryEvent(QueryEvent {
         thread_id: 1,
@@ -595,7 +680,7 @@ fn qualified_ddl_with_different_default_database_still_requires_manual_resolutio
 }
 
 #[test]
-fn mariadb_only_ddl_requires_manual_resolution() {
+fn mariadb_only_ddl_routes_to_translation_pending() {
     let state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let event = BinlogEvent::QueryEvent(QueryEvent {
         thread_id: 1,
@@ -615,53 +700,4 @@ fn mariadb_only_ddl_requires_manual_resolution() {
     );
 
     assert!(manual.is_some());
-}
-
-#[test]
-fn transactional_stream_records_ddl_pending_without_executing_or_checkpointing() {
-    let executor = TransactionRecordingExecutor::default();
-    let ledger = RecordingDdlLedger::default();
-    let resolver = FixtureSchemaResolver;
-    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
-    let mut current_file = "mysqld-bin.000777".to_string();
-    let mut transaction = TargetTransaction::default();
-    let event = BinlogEvent::QueryEvent(QueryEvent {
-        thread_id: 1,
-        duration: 0,
-        error_code: 0,
-        status_variables: Vec::new(),
-        database_name: "fixture_cdc".to_string(),
-        sql_statement: "CREATE TABLE now_manual (id int) WITH SYSTEM VERSIONING".to_string(),
-    });
-    let mut context = StreamEventContext {
-        schema_resolver: &resolver,
-        state: &mut state,
-        target_transaction: &mut transaction,
-        checkpoint_store: Some(&NoopCheckpointStore),
-        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
-        transaction_checkpoint_name: Some("stream-binlog:test-source"),
-        current_file: &mut current_file,
-        group_config: TargetTransactionGroupConfig::default(),
-    };
-
-    let error = handle_manual_ddl_event(
-        &executor,
-        &ledger,
-        "production-source",
-        &mut context,
-        &event_header(2, 180),
-        &event,
-    )
-    .expect_err("unresolved DDL must stop");
-
-    assert!(error.to_string().contains("manual DDL resolution required"));
-    assert!(executor.operations().is_empty());
-    let recorded = ledger.recorded.borrow();
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(
-        recorded[0].source_identity,
-        "production-source#server-id=1"
-    );
-    assert_eq!(recorded[0].event_start_position, 161);
-    assert_eq!(recorded[0].event_end_position, 180);
 }
