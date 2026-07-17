@@ -54,9 +54,9 @@ may promote once to `prepared`, fill immutable evidence, execute generated SQL,
 and checkpoint automatically. Target execution failures caused by preexisting
 target schema or data differences are execution/reconciliation failures, not
 translator-unavailable events.
-The event handler has no supported manual-ledger workflow, but
-config/bootstrap/grant/harness cleanup is still open and this contract is not
-deployment-ready.
+The retired manual ledger is absent from runtime, configuration, bootstrap,
+grants, and harness behavior. This contract remains deployment-blocked by the
+broader DDL coverage and operational proof gaps listed below.
 
 ### Execution and recovery
 

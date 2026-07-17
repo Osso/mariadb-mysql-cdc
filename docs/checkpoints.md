@@ -98,10 +98,9 @@ instead of maintained as compatibility paths.
 - [ ] Schedule recurring repair from durable unresolved conflicts and prove
       repeated convergence before cutover.
 
-## Legacy test/config artifact
+## Retired manual ledger
 
-The current atomic code slice leaves `src/live/ddl_ledger.rs` behind
-`#[cfg(test)]`, along with legacy `ddl_ledger_table` configuration/parser symbols
-and tests. These are not a supported DDL workflow, but cleanup is incomplete:
-config/bootstrap/grants and harness/test dependencies remain open. Do not use
-manual SQL/status edits to clear a journal barrier.
+The manual ledger is absent from runtime, configuration, bootstrap, grants, and
+harness behavior. Do not use manual SQL/status edits to clear a journal barrier;
+unsupported syntax must remain in the automatic journal until translator support
+is deployed.

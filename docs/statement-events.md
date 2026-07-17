@@ -42,8 +42,8 @@ qualified/cross-schema references, definer/security clauses, MariaDB-only syntax
 and multi-object or multi-statement forms are translation boundaries in the
 stream event path. The intended behavior flushes earlier DML, records exact
 SQL/coordinates in `cdc.ddl_replay_journal` as `translation_pending`, and stops
-before advancing. Config/bootstrap/grant/harness cleanup remains open, so this
-is not yet a complete operational contract.
+before advancing. The retired manual ledger has no remaining runtime,
+configuration, bootstrap, grant, or harness dependency.
 
 Qualifier handling is fail-closed. Tokenization removes comments from syntax
 but preserves identifier/dot/identifier detection across inline comments; index
@@ -65,8 +65,8 @@ overtaking the event. Translation and evidence-capture failures use the same
 reconcile a crash; otherwise the row blocks.
 
 No operator-authored target SQL or manual journal status transition is a
-supported DDL resolution path in the event handler. Legacy ledger/config/test
-symbols and bootstrap/grant/harness dependencies remain open cleanup items.
+supported DDL resolution path in the event handler. The retired manual-ledger
+runtime, configuration, bootstrap, grants, and harness paths have been removed.
 
 ## Quarantine
 

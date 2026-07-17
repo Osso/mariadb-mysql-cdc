@@ -32,8 +32,8 @@ field. The normalized `visible` field therefore means “visible according to th
 portable reader,” not proof of MySQL target visibility. Before admitting affected
 index DDL automatically, inspect target-native visibility; otherwise the stream
 slice should leave the event in the journal's `translation_pending` barrier.
-Config/bootstrap/grant/harness cleanup for the retired manual-ledger contract
-remains open.
+The retired manual-ledger runtime, configuration, bootstrap, grants, and harness
+paths have been removed.
 
 Source and target inventory connections use endpoint-specific TLS CA settings
 when configured. Missing, unreadable, or invalid CA files fail with a
