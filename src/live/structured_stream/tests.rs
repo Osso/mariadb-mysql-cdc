@@ -221,6 +221,7 @@ struct RecordingSemanticInventory {
     observed_state: String,
     capture_error: Option<String>,
     translator_available: std::cell::Cell<bool>,
+    use_live_transform: bool,
 }
 
 impl Default for RecordingSemanticInventory {
@@ -236,6 +237,7 @@ impl Default for RecordingSemanticInventory {
             observed_state: "after".to_string(),
             capture_error: None,
             translator_available: std::cell::Cell::new(true),
+            use_live_transform: false,
         }
     }
 }
@@ -245,6 +247,15 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
         &self,
         sql: &str,
     ) -> Result<super::super::ddl_semantics::DdlTransformation, String> {
+        if self.use_live_transform {
+            let live = super::super::ddl_semantics::LiveDdlSemanticInventory::new(
+                crate::inventory::InventoryConfig::default(),
+                crate::inventory::InventoryConfig::default(),
+                "fixture_cdc".to_string(),
+                "fixture_cdc".to_string(),
+            );
+            return super::super::ddl_semantics::DdlSemanticInventory::transform_sql(&live, sql);
+        }
         if !self.translator_available.get() {
             return Err("translator implementation unavailable".to_string());
         }

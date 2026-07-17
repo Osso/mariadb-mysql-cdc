@@ -47,6 +47,24 @@ pub struct ParsedIndexAst {
     pub key_parts: Vec<ParsedIndexKeyPart>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedCreateColumnAst {
+    pub name: String,
+    pub column_type: String,
+    pub nullable: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedCreateTableAst {
+    pub name: String,
+    pub columns: Vec<ParsedCreateColumnAst>,
+    pub primary_key: Vec<String>,
+    pub indexes: Vec<ParsedIndexAst>,
+    pub engine: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedAddColumnAst {
     pub name: String,

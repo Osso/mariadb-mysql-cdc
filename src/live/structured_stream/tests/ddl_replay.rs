@@ -228,8 +228,10 @@ fn fixture_create_table_stays_translation_pending_without_target_or_checkpoint_e
     let executor = TransactionRecordingExecutor::default();
     let mut applier = crate::row::RowApplier::new(executor);
     let journal = RecordingDdlReplayJournal::default();
-    let semantic_inventory = RecordingSemanticInventory::default();
-    semantic_inventory.translator_available.set(false);
+    let semantic_inventory = RecordingSemanticInventory {
+        use_live_transform: true,
+        ..RecordingSemanticInventory::default()
+    };
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let mut current_file = "mysqld-bin.000777".to_string();

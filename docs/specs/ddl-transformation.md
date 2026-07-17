@@ -59,6 +59,18 @@ The retired manual ledger is absent from runtime, configuration, bootstrap,
 grants, and harness behavior. This contract remains deployment-blocked by the
 broader DDL coverage and operational proof gaps listed below.
 
+### Fixture-backed CREATE TABLE boundary
+
+- [x] The exact harness `CREATE TABLE accounts` statement has a test-scoped typed
+      AST and deterministic MySQL 8 renderer covering only `BIGINT`,
+      `VARCHAR(length)`, `NOT NULL`, inline `PRIMARY KEY`, ordinary named `KEY`,
+      and `ENGINE=InnoDB`.
+- [x] Production `LiveDdlSemanticInventory` does not yet admit that statement; it
+      remains `translation_pending` with zero target/checkpoint execution.
+
+This fixture-backed contract is not production-derived coverage and does not
+admit other `CREATE TABLE` syntax.
+
 ### Execution and recovery
 
 - [x] Execute transformed DDL through the durable replay journal before advancing
@@ -122,10 +134,13 @@ The current slice is covered by:
 
 - [x] `src/live/ddl_semantics/tests.rs` — deterministic production `ADD COLUMN`,
       `ADD KEY`, `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` SQL/no-op behavior,
-      typed AST parsing, post-state derivation from fenced target pre-state, plus
-      the existing rename boundaries.
+      typed ALTER AST/post-state behavior and rename boundaries, plus the exact
+      harness `CREATE TABLE` test-scoped AST/renderer contract that is not
+      production stream coverage.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
-      generated SQL and preserves journal/checkpoint ordering.
+      generated SQL and preserves journal/checkpoint ordering; the fixture
+      `CREATE TABLE` delegates to the production transformer and remains pending
+      without target/checkpoint execution.
 - [x] `scripts/cdc-integration-harness.py --scenario production-alter-table` —
       real MariaDB/MySQL replay of five checkpointed ALTER events, including
       VARCHAR/DATETIME/SMALLINT column parity, comments, non-unique and unique

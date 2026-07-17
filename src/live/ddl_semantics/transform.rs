@@ -2,6 +2,8 @@ use super::model::{
     ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedDropColumnAst,
     ParsedIndexAst, ParsedIndexKeyPart,
 };
+#[cfg(test)]
+use super::model::{ParsedCreateColumnAst, ParsedCreateTableAst};
 use super::tokenizer::{ddl_contains_comments, tokenize_ddl};
 use std::collections::BTreeSet;
 
@@ -92,6 +94,204 @@ fn render_add_key(index: &ParsedIndexAst) -> String {
 
 fn quote_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(test)]
+pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableAst, String> {
+    if ddl_contains_comments(source_sql) {
+        return Err("fixture CREATE TABLE comments are not supported".to_string());
+    }
+    if source_sql.contains('"') {
+        return Err("fixture CREATE TABLE double-quoted identifiers are not supported".to_string());
+    }
+    let tokens = tokenize_ddl(source_sql)?;
+    require_keyword(&tokens, 0, "CREATE")?;
+    require_keyword(&tokens, 1, "TABLE")?;
+    let name = require_identifier(&tokens, 2, "CREATE TABLE name")?;
+    require_keyword(&tokens, 3, "(")?;
+    let mut columns = Vec::new();
+    let mut primary_key = Vec::new();
+    let mut indexes = Vec::new();
+    let mut index = 4;
+    loop {
+        if tokens.get(index).map(String::as_str) == Some(")") {
+            index += 1;
+            break;
+        }
+        if tokens
+            .get(index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("KEY"))
+        {
+            let (parsed_index, next_index) = parse_fixture_table_key(&tokens, index, &name)?;
+            indexes.push(parsed_index);
+            index = next_index;
+        } else {
+            let (column, is_primary, next_index) = parse_fixture_table_column(&tokens, index)?;
+            if is_primary {
+                primary_key.push(column.name.clone());
+            }
+            columns.push(column);
+            index = next_index;
+        }
+        match tokens.get(index).map(String::as_str) {
+            Some(",") => index += 1,
+            Some(")") => {
+                index += 1;
+                break;
+            }
+            actual => {
+                return Err(format!(
+                    "expected comma or closing parenthesis in fixture CREATE TABLE, found {actual:?}"
+                ));
+            }
+        }
+    }
+    require_keyword(&tokens, index, "ENGINE")?;
+    require_keyword(&tokens, index + 1, "=")?;
+    let engine = require_identifier(&tokens, index + 2, "CREATE TABLE engine")?;
+    if !engine.eq_ignore_ascii_case("InnoDB") {
+        return Err(format!("unsupported fixture CREATE TABLE engine {engine}"));
+    }
+    index += 3;
+    if tokens.get(index).map(String::as_str) == Some(";") {
+        index += 1;
+    }
+    if index != tokens.len() {
+        return Err(format!(
+            "unsupported trailing fixture CREATE TABLE syntax {:?}",
+            &tokens[index..]
+        ));
+    }
+    if columns.is_empty() || primary_key.is_empty() {
+        return Err("fixture CREATE TABLE requires columns and an inline primary key".to_string());
+    }
+    Ok(ParsedCreateTableAst {
+        name,
+        columns,
+        primary_key,
+        indexes,
+        engine: "InnoDB".to_string(),
+    })
+}
+
+#[cfg(test)]
+fn parse_fixture_table_column(
+    tokens: &[String],
+    index: usize,
+) -> Result<(ParsedCreateColumnAst, bool, usize), String> {
+    let name = require_identifier(tokens, index, "CREATE TABLE column name")?;
+    let data_type = require_identifier(tokens, index + 1, "CREATE TABLE column type")?;
+    let (column_type, mut next_index) = if data_type.eq_ignore_ascii_case("BIGINT") {
+        ("bigint".to_string(), index + 2)
+    } else if data_type.eq_ignore_ascii_case("VARCHAR") {
+        require_keyword(tokens, index + 2, "(")?;
+        let length = require_identifier(tokens, index + 3, "VARCHAR length")?;
+        let parsed_length = length
+            .parse::<u32>()
+            .map_err(|_| format!("invalid VARCHAR length {length}"))?;
+        if parsed_length == 0 || parsed_length.to_string() != length {
+            return Err(format!("noncanonical VARCHAR length {length}"));
+        }
+        require_keyword(tokens, index + 4, ")")?;
+        (format!("varchar({parsed_length})"), index + 5)
+    } else {
+        return Err(format!("unsupported fixture CREATE TABLE type {data_type}"));
+    };
+    require_keyword(tokens, next_index, "NOT")?;
+    require_keyword(tokens, next_index + 1, "NULL")?;
+    next_index += 2;
+    let primary = tokens
+        .get(next_index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("PRIMARY"));
+    if primary {
+        require_keyword(tokens, next_index + 1, "KEY")?;
+        next_index += 2;
+    }
+    Ok((
+        ParsedCreateColumnAst {
+            name,
+            column_type,
+            nullable: false,
+        },
+        primary,
+        next_index,
+    ))
+}
+
+#[cfg(test)]
+fn parse_fixture_table_key(
+    tokens: &[String],
+    index: usize,
+    table: &str,
+) -> Result<(ParsedIndexAst, usize), String> {
+    require_keyword(tokens, index, "KEY")?;
+    let name = require_identifier(tokens, index + 1, "CREATE TABLE key name")?;
+    require_keyword(tokens, index + 2, "(")?;
+    let column = require_identifier(tokens, index + 3, "CREATE TABLE key column")?;
+    require_keyword(tokens, index + 4, ")")?;
+    Ok((
+        ParsedIndexAst {
+            create: true,
+            name,
+            table: table.to_string(),
+            unique: false,
+            index_type: "BTREE".to_string(),
+            visible: true,
+            comment: None,
+            key_parts: vec![ParsedIndexKeyPart {
+                column,
+                prefix_length: None,
+                order: "ASC".to_string(),
+                collation: Some("A".to_string()),
+            }],
+        },
+        index + 5,
+    ))
+}
+
+#[cfg(test)]
+pub fn transform_fixture_create_table(source_sql: &str) -> Result<DdlTransformation, String> {
+    let ast = parse_fixture_create_table(source_sql)?;
+    let mut definitions = ast
+        .columns
+        .iter()
+        .map(|column| {
+            format!(
+                "{} {} NOT NULL",
+                quote_identifier(&column.name),
+                column.column_type.to_ascii_uppercase()
+            )
+        })
+        .collect::<Vec<_>>();
+    definitions.push(format!(
+        "PRIMARY KEY ({})",
+        ast.primary_key
+            .iter()
+            .map(|column| quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    definitions.extend(ast.indexes.iter().map(|index| {
+        format!(
+            "KEY {} ({})",
+            quote_identifier(&index.name),
+            index
+                .key_parts
+                .iter()
+                .map(|part| quote_identifier(&part.column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }));
+    Ok(DdlTransformation {
+        version: DDL_TRANSFORMATION_VERSION,
+        target_sql: Some(format!(
+            "CREATE TABLE {} ({}) ENGINE={}",
+            quote_identifier(&ast.name),
+            definitions.join(", "),
+            ast.engine
+        )),
+    })
 }
 
 pub fn supports_drop_columns_if_exists(source_sql: &str) -> bool {
