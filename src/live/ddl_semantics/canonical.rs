@@ -324,17 +324,8 @@ fn apply_add_key(
     expected: &mut SemanticSchemaSnapshot,
     ast: &ParsedIndexAst,
 ) -> Result<(), String> {
-    validate_index_operation(
-        expected,
-        &DdlOperation {
-            family: DdlFamily::Index,
-            object_kind: DdlObjectKind::Index,
-            primary_object: ast.name.clone(),
-            secondary_object: Some(ast.table.clone()),
-            index_ast: Some(ast.clone()),
-            alter_table_ast: None,
-        },
-    )?;
+    let (table, indexes) = validate_index_table(expected, ast)?;
+    validate_create_index(ast, table, &indexes, &expected.inventory.foreign_keys, true)?;
     expected
         .inventory
         .indexes
@@ -419,7 +410,7 @@ fn validate_index_operation(
         .ok_or_else(|| "index DDL lacks parsed AST".to_string())?;
     let (table, indexes) = validate_index_table(target, ast)?;
     if ast.create {
-        validate_create_index(ast, table, &indexes, &target.inventory.foreign_keys)
+        validate_create_index(ast, table, &indexes, &target.inventory.foreign_keys, false)
     } else {
         validate_drop_index(ast, &indexes, &target.inventory.foreign_keys)
     }
@@ -449,8 +440,9 @@ fn validate_create_index(
     table: &crate::inventory::TableInventory,
     indexes: &[&crate::inventory::IndexInventory],
     foreign_keys: &[crate::inventory::ForeignKeyInventory],
+    allow_unique: bool,
 ) -> Result<(), String> {
-    validate_parsed_index_ast(ast, table, foreign_keys)?;
+    validate_parsed_index_ast(ast, table, foreign_keys, allow_unique)?;
     if indexes.iter().any(|index| index.name == ast.name) {
         return Err(format!(
             "index `{}` already exists in fenced target pre-state",
@@ -484,15 +476,16 @@ fn validate_parsed_index_ast(
     ast: &ParsedIndexAst,
     table: &crate::inventory::TableInventory,
     foreign_keys: &[crate::inventory::ForeignKeyInventory],
+    allow_unique: bool,
 ) -> Result<(), String> {
-    validate_index_ast_shape(ast)?;
+    validate_index_ast_shape(ast, allow_unique)?;
     let columns = validate_index_key_parts(ast, table)?;
     validate_index_foreign_key_dependencies(ast, &columns, foreign_keys)
 }
 
-fn validate_index_ast_shape(ast: &ParsedIndexAst) -> Result<(), String> {
+fn validate_index_ast_shape(ast: &ParsedIndexAst, allow_unique: bool) -> Result<(), String> {
     if !ast.create
-        || ast.unique
+        || (ast.unique && !allow_unique)
         || ast.index_type != "BTREE"
         || !ast.visible
         || ast.comment.is_some()

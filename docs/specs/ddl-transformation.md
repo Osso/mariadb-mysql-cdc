@@ -30,7 +30,7 @@ allowlist.
 
 - [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` and named `ADD KEY` clauses.
 - [x] Transform the observed `ADD COLUMN` forms for `VARCHAR(length)`, `DATETIME`, and `SMALLINT UNSIGNED`, with the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options.
-- [x] Transform a named, non-unique composite `ADD KEY` over ordinary columns as a BTREE index; broader index and clause options remain outside this slice.
+- [x] Transform named composite `ADD KEY` and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; broader index and clause options remain outside this slice.
 - [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
 - [x] Derive the expected post-state for the explicitly supported ALTER slice by applying the event AST to a fenced target pre-state snapshot.
 - [x] Fail closed as `translation_pending` before target execution when syntax, context, dependencies, or semantics fall outside that explicit slice; the stream checkpoint and later-event barrier must remain unchanged.
@@ -99,9 +99,9 @@ deployment-ready.
   checkpoint barrier.
 - `src/live/ddl_semantics.rs` — dispatches current DDL transformations and
   captures semantic evidence.
-- `src/live/ddl_semantics/transform.rs` — production-derived `ADD COLUMN`/`ADD KEY`
-  and `RENAME COLUMN IF EXISTS` translators, including deterministic SQL
-  emission.
+- `src/live/ddl_semantics/transform.rs` — production-derived `ADD COLUMN`,
+  `ADD KEY`, `ADD UNIQUE KEY`, and `RENAME COLUMN IF EXISTS` translators,
+  including deterministic SQL emission.
 - `src/live/ddl_semantics/canonical.rs` — typed ALTER clause AST encoding and
   expected post-state derivation from the fenced target pre-state.
 - `src/live/structured_stream/ddl.rs` — prepares the journal, executes generated
@@ -118,9 +118,10 @@ deployment-ready.
 
 The current slice is covered by:
 
-- [x] `src/live/ddl_semantics/tests.rs` — deterministic production `ADD COLUMN`
-      and `ADD KEY` SQL, typed AST parsing, post-state derivation without a live
-      source snapshot, plus the existing rename boundaries.
+- [x] `src/live/ddl_semantics/tests.rs` — deterministic production `ADD COLUMN`,
+      `ADD KEY`, and `ADD UNIQUE KEY` SQL, typed AST parsing, post-state
+      derivation from fenced target pre-state, plus the existing rename
+      boundaries.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
       generated SQL and preserves journal/checkpoint ordering.
 - [x] `scripts/cdc-integration-harness.py --scenario production-alter-table` —
@@ -135,8 +136,8 @@ MariaDB/MySQL matrix, or deployment safety.
 ## Known gaps (current cycle)
 
 - [ ] Extend the current translator beyond the production-observed
-      `ADD COLUMN`/`ADD KEY` and rename slices into the canonical MariaDB DDL
-      parser and MySQL 8 transformation pipeline.
+      `ADD COLUMN`/`ADD KEY`/`ADD UNIQUE KEY` and rename slices into the canonical
+      MariaDB DDL parser and MySQL 8 transformation pipeline.
 - [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
       retired manual DDL ledger without restoring manual replay.
 - [ ] Build the broader production-derived DDL corpus and real MariaDB/MySQL 8

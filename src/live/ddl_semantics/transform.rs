@@ -72,7 +72,11 @@ fn render_add_key(index: &ParsedIndexAst) -> String {
         .map(|part| quote_identifier(&part.column))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("ADD KEY {} ({columns})", quote_identifier(&index.name))
+    let key_kind = if index.unique { "UNIQUE KEY" } else { "KEY" };
+    format!(
+        "ADD {key_kind} {} ({columns})",
+        quote_identifier(&index.name)
+    )
 }
 
 fn quote_string_literal(value: &str) -> String {
@@ -140,7 +144,11 @@ fn parse_production_alter_clause(
         .map(|token| token.to_ascii_uppercase())
     {
         Some(kind) if kind == "COLUMN" => parse_add_column_clause(tokens, index, literals),
-        Some(kind) if kind == "KEY" => parse_add_key_clause(tokens, index, table),
+        Some(kind) if kind == "KEY" => parse_add_key_clause(tokens, index + 1, table, false),
+        Some(kind) if kind == "UNIQUE" => {
+            require_keyword(tokens, index + 2, "KEY")?;
+            parse_add_key_clause(tokens, index + 2, table, true)
+        }
         actual => Err(format!(
             "unsupported production ALTER TABLE clause {actual:?}"
         )),
@@ -179,13 +187,14 @@ fn parse_add_column_clause(
 
 fn parse_add_key_clause(
     tokens: &[String],
-    index: usize,
+    key_index: usize,
     table: &str,
+    unique: bool,
 ) -> Result<(ParsedAlterClause, usize), String> {
-    let name = require_identifier(tokens, index + 2, "added key name")?;
-    require_keyword(tokens, index + 3, "(")?;
+    let name = require_identifier(tokens, key_index + 1, "added key name")?;
+    require_keyword(tokens, key_index + 2, "(")?;
     let mut key_parts = Vec::new();
-    let mut column_index = index + 4;
+    let mut column_index = key_index + 3;
     loop {
         let column = require_identifier(tokens, column_index, "added key column")?;
         key_parts.push(ParsedIndexKeyPart {
@@ -202,7 +211,7 @@ fn parse_add_key_clause(
                     create: true,
                     name,
                     table: table.to_string(),
-                    unique: false,
+                    unique,
                     index_type: "BTREE".to_string(),
                     visible: true,
                     comment: None,

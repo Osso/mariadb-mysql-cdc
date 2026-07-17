@@ -236,7 +236,7 @@ fn canonical_evidence_covers_every_object_family() {
     let target = semantic_snapshot(7, Some(8));
     let source = semantic_snapshot(9, Some(10));
     for sql in [
-        "ALTER TABLE accounts ADD COLUMN handle varchar(64)",
+        "ALTER TABLE accounts ADD COLUMN email varchar(64)",
         "CREATE INDEX idx_new ON accounts (id)",
         "ALTER VIEW active_accounts AS SELECT id FROM accounts",
         "ALTER PROCEDURE refresh_accounts SQL SECURITY INVOKER",
