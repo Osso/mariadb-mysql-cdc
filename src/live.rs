@@ -211,6 +211,9 @@ impl TargetMySqlConfig {
         if self.database.is_empty() {
             return Err(config_error("target database is required"));
         }
+        if self.tls_ca_file.is_empty() {
+            return Err(config_error("target TLS CA file is required"));
+        }
 
         Ok(())
     }

@@ -7,6 +7,22 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 #[test]
+fn rejects_empty_target_tls_ca_file() {
+    let target = TargetMySqlConfig {
+        host: "target-db".to_string(),
+        user: "cdc_stream".to_string(),
+        password: "secret".to_string(),
+        database: "globalcomix".to_string(),
+        tls_ca_file: String::new(),
+        ..TargetMySqlConfig::default()
+    };
+
+    let error = target.validate().expect_err("empty target CA must fail");
+
+    assert!(error.to_string().contains("target TLS CA file is required"));
+}
+
+#[test]
 fn stream_requires_schema_qualified_checkpoint_and_ddl_tables() {
     let mut config = ApplyBinlogConfig {
         source: SourceBinlogConfig {
