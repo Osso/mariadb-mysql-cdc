@@ -835,8 +835,8 @@ class Harness:
         assert self.target
         output = self.query(
             self.target,
-            "SELECT source_identity,source_server_id,binlog_file,event_start_position," 
-            "event_end_position,schema_name,raw_sql,canonical_ast,pre_state," 
+            "SELECT source_identity,source_server_id,binlog_file,event_start_position,"
+            "event_end_position,schema_name,raw_sql,canonical_ast,pre_state,"
             "expected_post_state,status "
             "FROM cdc.ddl_replay_journal "
             "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
@@ -876,7 +876,7 @@ class Harness:
         self.admin_sql(
             self.target,
             "INSERT INTO cdc.ddl_replay_journal "
-            "(source_identity,source_server_id,binlog_file,event_start_position,event_end_position," 
+            "(source_identity,source_server_id,binlog_file,event_start_position,event_end_position,"
             "schema_name,raw_sql,canonical_ast,pre_state,expected_post_state,status) VALUES ("
             f"{sql_literal(row['source_identity'])},{row['source_server_id']},"
             f"{sql_literal(row['binlog_file'])},{row['event_start_position']},{row['event_end_position']},"
@@ -1490,10 +1490,10 @@ class Harness:
             self.admin_sql(
                 self.target,
                 "INSERT INTO cdc.row_conflicts "
-                "(conflict_identity,source_identity,source_server_id,source_file,source_start_position,source_end_position," 
-                "schema_name,table_name,operation,source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json," 
-                "error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status) VALUES (" 
-                f"{sql_literal(identity)},{sql_literal(SOURCE_IDENTITY)},101,{sql_literal(coordinate.file)},{coordinate.position},{coordinate.position + 1}," 
+                "(conflict_identity,source_identity,source_server_id,source_file,source_start_position,source_end_position,"
+                "schema_name,table_name,operation,source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json,"
+                "error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status) VALUES ("
+                f"{sql_literal(identity)},{sql_literal(SOURCE_IDENTITY)},101,{sql_literal(coordinate.file)},{coordinate.position},{coordinate.position + 1},"
                 f"'globalcomix',{sql_literal(table)},'update','[\\\"1\\\"]','uq_{table}_email','[\\\"2\\\"]',1062,"
                 f"'Duplicate entry duplicate@example.test for key uq_{table}_email',1,1,1,'unresolved');",
             )
