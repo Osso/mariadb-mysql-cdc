@@ -15,12 +15,7 @@ pub fn build_fenced_create_table_evidence(
     before: &crate::inventory::SourceMasterCoordinate,
     after: &crate::inventory::SourceMasterCoordinate,
 ) -> Result<DdlSemanticEvidence, String> {
-    super::validate_source_snapshot_coordinate(
-        expected_file,
-        expected_position,
-        before,
-        after,
-    )?;
+    super::validate_source_snapshot_coordinate(expected_file, expected_position, before, after)?;
     let ast = operation
         .create_table_ast
         .as_ref()
@@ -32,7 +27,8 @@ pub fn build_fenced_create_table_evidence(
             operation.primary_object
         ));
     }
-    let transformation = super::transform::transform_fixture_create_table_with_defaults(ast, defaults)?;
+    let transformation =
+        super::transform::transform_fixture_create_table_with_defaults(ast, defaults)?;
     let mut ast_value: serde_json::Value = serde_json::from_str(&canonical_ast(operation)?)
         .map_err(|error| format!("failed to decode canonical CREATE TABLE AST: {error}"))?;
     ast_value["source_schema_defaults"] = json!({
@@ -316,13 +312,15 @@ fn expected_create_table_post_state(
                 .key_parts
                 .iter()
                 .enumerate()
-                .map(|(part_index, part)| crate::inventory::IndexColumnInventory {
-                    name: part.column.clone(),
-                    sequence: (part_index + 1) as u32,
-                    prefix_length: part.prefix_length,
-                    collation: Some("A".to_string()),
-                    order: part.order.clone(),
-                })
+                .map(
+                    |(part_index, part)| crate::inventory::IndexColumnInventory {
+                        name: part.column.clone(),
+                        sequence: (part_index + 1) as u32,
+                        prefix_length: part.prefix_length,
+                        collation: Some("A".to_string()),
+                        order: part.order.clone(),
+                    },
+                )
                 .collect(),
         })
         .collect::<Vec<_>>();

@@ -933,11 +933,16 @@ fn fixture_create_table_evidence_captures_fenced_source_defaults_and_explicit_sq
     assert_eq!(evidence.pre_state, canonical_absent_state());
     assert_eq!(
         evidence.generated_sql.as_deref(),
-        Some("CREATE TABLE `accounts` (`id` BIGINT NOT NULL, `email` VARCHAR(255) NOT NULL, `payload` VARCHAR(64) NOT NULL, PRIMARY KEY (`id`), KEY `idx_accounts_payload` (`payload`)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        Some(
+            "CREATE TABLE `accounts` (`id` BIGINT NOT NULL, `email` VARCHAR(255) NOT NULL, `payload` VARCHAR(64) NOT NULL, PRIMARY KEY (`id`), KEY `idx_accounts_payload` (`payload`)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        )
     );
     let ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast).expect("AST JSON");
     assert_eq!(ast["source_schema_defaults"]["character_set"], "utf8mb4");
-    assert_eq!(ast["source_schema_defaults"]["collation"], "utf8mb4_unicode_ci");
+    assert_eq!(
+        ast["source_schema_defaults"]["collation"],
+        "utf8mb4_unicode_ci"
+    );
     let post: serde_json::Value =
         serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
     assert_eq!(post["definition"]["collation"], "utf8mb4_unicode_ci");

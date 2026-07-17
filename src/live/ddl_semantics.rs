@@ -13,9 +13,9 @@ mod tokenizer;
 mod transform;
 
 #[cfg(test)]
-pub(super) use canonical::canonical_absent_state;
-#[cfg(test)]
 pub(super) use canonical::build_fenced_create_table_evidence;
+#[cfg(test)]
+pub(super) use canonical::canonical_absent_state;
 pub use canonical::{
     build_semantic_evidence, observe_operation_state, supports_automatic_semantic_recovery,
 };
@@ -197,7 +197,9 @@ fn capture_fenced_create_table_evidence(
     let before = inventory
         .source
         .read_source_master_coordinate()
-        .map_err(|error| format!("failed to read source coordinate before schema defaults: {error}"))?;
+        .map_err(|error| {
+            format!("failed to read source coordinate before schema defaults: {error}")
+        })?;
     let defaults = inventory
         .source
         .read_schema_defaults(&inventory.source_schema)
@@ -210,7 +212,9 @@ fn capture_fenced_create_table_evidence(
     let after = inventory
         .source
         .read_source_master_coordinate()
-        .map_err(|error| format!("failed to read source coordinate after schema defaults: {error}"))?;
+        .map_err(|error| {
+            format!("failed to read source coordinate after schema defaults: {error}")
+        })?;
     let target_after =
         LiveDdlSemanticInventory::snapshot(&inventory.target, &inventory.target_schema, operation)?;
     validate_target_snapshot_consistency(target_before, &target_after)?;
