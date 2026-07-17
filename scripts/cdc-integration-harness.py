@@ -1228,7 +1228,7 @@ class Harness:
         for attempt in (1, 2):
             result = self.run_stream(start, stop)
             output = f"{result.stdout}\n{result.stderr}".lower()
-            if result.returncode == 0 or "duplicate conflict persisted for repair" not in output:
+            if result.returncode == 0 or "row conflict persisted for repair" not in output:
                 raise HarnessError(f"duplicate rollback attempt {attempt} did not fail durably: {output}")
             rows = self.admin_query(self.target, "SELECT id,email,payload FROM accounts ORDER BY id;").strip()
             if rows != "99\tduplicate@example.test\towner":
@@ -1244,6 +1244,39 @@ class Harness:
             expected = f'["2"]\t1062\t{attempt}\tunresolved'
             if evidence != expected:
                 raise HarnessError(f"duplicate evidence mismatch attempt={attempt}: {evidence!r}")
+
+        self.admin_sql(
+            self.target,
+            "INSERT INTO accounts VALUES (98, 'different-pk@example.test', 'different-pk-owner');",
+        )
+        different_pk_start = stop
+        self.write_checkpoint(different_pk_start)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO accounts VALUES (3, 'different-pk@example.test', 'different-pk');",
+        )
+        different_pk_stop = self.coordinate()
+        different_pk_result = self.run_stream(different_pk_start, different_pk_stop)
+        different_pk_output = f"{different_pk_result.stdout}\n{different_pk_result.stderr}".lower()
+        if different_pk_result.returncode == 0 or "row conflict persisted for repair" not in different_pk_output:
+            raise HarnessError(f"different-PK replay did not fail durably: {different_pk_output}")
+        rows = self.admin_query(self.target, "SELECT id,email,payload FROM accounts ORDER BY id;").strip()
+        expected_rows = (
+            "98\tdifferent-pk@example.test\tdifferent-pk-owner\n"
+            "99\tduplicate@example.test\towner"
+        )
+        if rows != expected_rows:
+            raise HarnessError(f"different-PK replay mutated owner rows: {rows!r}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != different_pk_start.file or int(checkpoint.get("source_position", 0)) != different_pk_start.position:
+            raise HarnessError(f"different-PK replay advanced checkpoint: {checkpoint}")
+        evidence = self.admin_query(
+            self.target,
+            "SELECT source_primary_key_json,attempt_count,status FROM cdc.row_conflicts "
+            "WHERE table_name='accounts' ORDER BY source_primary_key_json;",
+        ).strip().splitlines()
+        if evidence != ['["2"]\t2\tunresolved', '["3"]\t1\tunresolved']:
+            raise HarnessError(f"different-PK evidence was not isolated: {evidence!r}")
 
         for endpoint in (self.source, self.target):
             self.admin_sql(endpoint, "DROP TABLE IF EXISTS constraint_rows;")
@@ -1284,7 +1317,10 @@ class Harness:
             ).strip().split("\t")
             if len(evidence) != 4 or evidence[0] != '["11"]' or evidence[1] not in {"3819", "4025"} or evidence[2:] != [str(attempt), "unresolved"]:
                 raise HarnessError(f"constraint evidence mismatch attempt={attempt}: {evidence!r}")
-        print("row-conflict-rollback_ok duplicate_attempts=2 constraint_attempts=2 checkpoint_unchanged=true")
+        print(
+            "row-conflict-rollback_ok duplicate_attempts=2 different_pk_attempts=1 "
+            "constraint_attempts=2 checkpoint_unchanged=true"
+        )
 
     def assert_foreign_keys_enabled(self) -> None:
         assert self.source and self.target
