@@ -616,10 +616,7 @@ fn recovery_scenarios_are_executable_and_use_failpoint_binary() {
     ] {
         assert!(script.contains(&format!("ScenarioSpec(\"{scenario}\", True)")));
     }
-    for scenario in [
-        "source-connection-loss",
-        "target-connection-loss",
-    ] {
+    for scenario in ["source-connection-loss", "target-connection-loss"] {
         assert!(script.contains(&format!("ScenarioSpec(\"{scenario}\", True)")));
     }
     assert!(script.contains("self.run_recovery_scenario(scenario)"));

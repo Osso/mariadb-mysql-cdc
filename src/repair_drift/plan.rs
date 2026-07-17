@@ -1,0 +1,422 @@
+use super::{RepairDriftConfig, RepairDriftError, RepairDriftSkip};
+use crate::conflict_repair::{RepairInventory, RepairPlan, RepairPlanError, build_repair_plan};
+use crate::drift_check::DriftComparison;
+use crate::inventory::{
+    InventoryConfig, InventoryEndpointRole, SchemaInventory, TableInventory,
+    build_canonical_foreign_key_inventory,
+};
+use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_support::SOURCE_TLS_CA_FILE;
+use crate::table_sync::SyncTable;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) type RepairTableInputs = BTreeMap<String, (u64, u64, SyncTable)>;
+
+pub(crate) fn build_fk_aware_repair_plan(
+    run_id: &str,
+    source_identity: &str,
+    target_identity: &str,
+    source: &RepairInventory,
+    target: &RepairInventory,
+    max_deletes: u64,
+) -> Result<RepairPlan, RepairPlanError> {
+    build_repair_plan(
+        run_id,
+        source_identity,
+        target_identity,
+        source,
+        target,
+        max_deletes,
+    )
+}
+
+pub(crate) fn order_table_names(
+    all_tables: &[String],
+    parent_first: &[String],
+) -> Result<Vec<String>, String> {
+    let available = all_tables.iter().collect::<BTreeSet<_>>();
+    let mut ordered = explicit_parent_order(parent_first, &available)?;
+    let seen = ordered.iter().collect::<BTreeSet<_>>();
+    let mut remaining = all_tables
+        .iter()
+        .filter(|table| !seen.contains(table))
+        .cloned()
+        .collect::<Vec<_>>();
+    remaining.sort();
+    ordered.extend(remaining);
+    Ok(ordered)
+}
+
+fn explicit_parent_order(
+    parent_first: &[String],
+    available: &BTreeSet<&String>,
+) -> Result<Vec<String>, String> {
+    let mut ordered = Vec::new();
+    let mut seen = BTreeSet::new();
+    for table in parent_first {
+        if !available.contains(table) {
+            return Err(format!(
+                "parent-first table `{table}` is not in the repair inventory"
+            ));
+        }
+        if seen.insert(table) {
+            ordered.push(table.clone());
+        }
+    }
+    Ok(ordered)
+}
+
+pub(crate) fn drifted_table_names(comparisons: &[DriftComparison]) -> Vec<String> {
+    comparisons
+        .iter()
+        .filter(|comparison| !comparison.matches())
+        .map(|comparison| comparison.table.clone())
+        .collect()
+}
+
+pub(crate) fn candidate_table_names(
+    config: &RepairDriftConfig,
+    source: &SchemaInventory,
+) -> Result<Vec<String>, String> {
+    let source_names = source
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if config.tables.is_empty() {
+        return Ok(source_names.into_iter().map(str::to_string).collect());
+    }
+    selected_table_names(config, &source_names)
+}
+
+fn selected_table_names(
+    config: &RepairDriftConfig,
+    source_names: &BTreeSet<&str>,
+) -> Result<Vec<String>, String> {
+    let mut selected = Vec::new();
+    let mut seen = BTreeSet::new();
+    for table in &config.tables {
+        if !source_names.contains(table.as_str()) {
+            return Err(format!("table `{table}` is not in the source inventory"));
+        }
+        if seen.insert(table.as_str()) {
+            selected.push(table.clone());
+        }
+    }
+    Ok(selected)
+}
+
+pub(crate) fn compatible_sync_table(
+    source: &TableInventory,
+    target: &TableInventory,
+    skipped: &mut Vec<RepairDriftSkip>,
+) -> Option<SyncTable> {
+    if let Some(reason) = primary_key_compatibility_error(source, target) {
+        skipped.push(skip_table(source, reason));
+        return None;
+    }
+    let columns = sync_columns(source);
+    if let Some(reason) = missing_target_columns(&columns, target) {
+        skipped.push(skip_table(source, reason));
+        return None;
+    }
+    Some(SyncTable {
+        name: source.name.clone(),
+        primary_key: source.primary_key.clone(),
+        columns,
+    })
+}
+
+fn primary_key_compatibility_error(
+    source: &TableInventory,
+    target: &TableInventory,
+) -> Option<String> {
+    if source.primary_key.is_empty() {
+        return Some("source table has no primary key".to_string());
+    }
+    if source.primary_key != target.primary_key {
+        return Some("source and target primary keys differ".to_string());
+    }
+    None
+}
+
+fn sync_columns(source: &TableInventory) -> Vec<String> {
+    source
+        .columns
+        .iter()
+        .filter(|column| column.generated.is_none())
+        .map(|column| column.name.clone())
+        .collect()
+}
+
+fn missing_target_columns(columns: &[String], target: &TableInventory) -> Option<String> {
+    let target_columns = target
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing = columns
+        .iter()
+        .filter(|column| !target_columns.contains(column.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "target table is missing source columns: {}",
+            missing.join(", ")
+        )
+    })
+}
+
+fn skip_table(source: &TableInventory, reason: String) -> RepairDriftSkip {
+    RepairDriftSkip {
+        table: source.name.clone(),
+        reason,
+    }
+}
+
+pub(crate) fn collect_repair_table_inputs(
+    ordered_tables: &[String],
+    comparisons: &[DriftComparison],
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> (RepairTableInputs, Vec<RepairDriftSkip>) {
+    let source_by_name = index_inventory_tables(source_inventory);
+    let target_by_name = index_inventory_tables(target_inventory);
+    let mut inputs = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for table_name in ordered_tables {
+        collect_repair_table(
+            table_name,
+            comparisons,
+            &source_by_name,
+            &target_by_name,
+            &mut inputs,
+            &mut skipped,
+        );
+    }
+    (inputs, skipped)
+}
+
+fn collect_repair_table(
+    table_name: &str,
+    comparisons: &[DriftComparison],
+    source_by_name: &BTreeMap<&str, &TableInventory>,
+    target_by_name: &BTreeMap<&str, &TableInventory>,
+    inputs: &mut RepairTableInputs,
+    skipped: &mut Vec<RepairDriftSkip>,
+) {
+    let Some(comparison) = comparisons.iter().find(|item| item.table == table_name) else {
+        return;
+    };
+    if comparison.matches() {
+        return;
+    }
+    match collect_repair_table_input(comparison, source_by_name, target_by_name) {
+        Ok(Some(input)) => {
+            inputs.insert(comparison.table.clone(), input);
+        }
+        Ok(None) => {}
+        Err(skip) => skipped.push(skip),
+    }
+}
+
+fn index_inventory_tables(inventory: &SchemaInventory) -> BTreeMap<&str, &TableInventory> {
+    inventory
+        .tables
+        .iter()
+        .map(|table| (table.name.as_str(), table))
+        .collect()
+}
+
+fn collect_repair_table_input(
+    comparison: &DriftComparison,
+    source_by_name: &BTreeMap<&str, &TableInventory>,
+    target_by_name: &BTreeMap<&str, &TableInventory>,
+) -> Result<Option<(u64, u64, SyncTable)>, RepairDriftSkip> {
+    let source_count = required_count(
+        comparison.source_count,
+        comparison,
+        "source count unavailable",
+    )?;
+    let target_count = required_count(
+        comparison.target_count,
+        comparison,
+        "target table is missing from inventory",
+    )?;
+    let source_table = required_table(
+        source_by_name,
+        comparison,
+        "source table is missing from inventory",
+    )?;
+    let target_table = required_table(
+        target_by_name,
+        comparison,
+        "target table is missing from inventory",
+    )?;
+    let table = compatible_table_or_skip(comparison, source_table, target_table)?;
+    Ok(Some((source_count, target_count, table)))
+}
+
+fn compatible_table_or_skip(
+    comparison: &DriftComparison,
+    source: &TableInventory,
+    target: &TableInventory,
+) -> Result<SyncTable, RepairDriftSkip> {
+    let mut skips = Vec::new();
+    compatible_sync_table(source, target, &mut skips).ok_or_else(|| {
+        skips
+            .pop()
+            .unwrap_or_else(|| repair_drift_skip(comparison, "table is not repairable"))
+    })
+}
+
+fn required_count(
+    count: Option<u64>,
+    comparison: &DriftComparison,
+    reason: &str,
+) -> Result<u64, RepairDriftSkip> {
+    count.ok_or_else(|| repair_drift_skip(comparison, reason))
+}
+
+fn required_table<'a>(
+    tables: &'a BTreeMap<&str, &'a TableInventory>,
+    comparison: &DriftComparison,
+    reason: &str,
+) -> Result<&'a TableInventory, RepairDriftSkip> {
+    tables
+        .get(comparison.table.as_str())
+        .copied()
+        .ok_or_else(|| repair_drift_skip(comparison, reason))
+}
+
+fn repair_drift_skip(comparison: &DriftComparison, reason: &str) -> RepairDriftSkip {
+    RepairDriftSkip {
+        table: comparison.table.clone(),
+        reason: reason.to_string(),
+    }
+}
+
+pub(crate) fn build_runtime_repair_plan(
+    config: &RepairDriftConfig,
+    run_id: &str,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<RepairPlan, RepairDriftError> {
+    let source = build_source_repair_inventory(config, source_inventory)?;
+    let target = build_target_repair_inventory(config, target_inventory)?;
+    build_plan(config, run_id, source, target)
+}
+
+fn build_source_repair_inventory(
+    config: &RepairDriftConfig,
+    inventory: &SchemaInventory,
+) -> Result<RepairInventory, RepairDriftError> {
+    let tls_ca_file = config
+        .source
+        .tls_ca_file
+        .as_deref()
+        .unwrap_or(SOURCE_TLS_CA_FILE);
+    build_repair_inventory(
+        &config.source,
+        InventoryEndpointRole::Source,
+        tls_ca_file,
+        inventory,
+    )
+    .map_err(|error| RepairDriftError::Inventory(error.to_string()))
+}
+
+fn build_target_repair_inventory(
+    config: &RepairDriftConfig,
+    inventory: &SchemaInventory,
+) -> Result<RepairInventory, RepairDriftError> {
+    let target_source = target_as_connection_config(config);
+    let mut repair_inventory = build_repair_inventory(
+        &target_source,
+        InventoryEndpointRole::Target,
+        &config.target.tls_ca_file,
+        inventory,
+    )
+    .map_err(|error| RepairDriftError::Inventory(error.to_string()))?;
+    exclude_progress_table(&mut repair_inventory, &config.progress_table);
+    Ok(repair_inventory)
+}
+
+fn target_as_connection_config(config: &RepairDriftConfig) -> MySqlConnectionConfig {
+    MySqlConnectionConfig {
+        host: config.target.host.clone(),
+        port: config.target.port,
+        user: config.target.user.clone(),
+        password: config.target.password.clone(),
+        database: config.target.database.clone(),
+        tls_ca_file: Some(config.target.tls_ca_file.clone()),
+    }
+}
+
+fn build_plan(
+    config: &RepairDriftConfig,
+    run_id: &str,
+    source: RepairInventory,
+    target: RepairInventory,
+) -> Result<RepairPlan, RepairDriftError> {
+    build_fk_aware_repair_plan(
+        run_id,
+        &config.source_identity,
+        &format!("{}:{}", config.target.host, config.target.database),
+        &source,
+        &target,
+        config.max_deletes.unwrap_or(0),
+    )
+    .map_err(|error| RepairDriftError::Inventory(error.to_string()))
+}
+
+pub(crate) fn exclude_progress_table(inventory: &mut RepairInventory, progress_table: &str) {
+    let (schema, table) =
+        crate::mysql_support::qualified_table_parts(&inventory.schema, progress_table);
+    if schema == inventory.schema {
+        inventory.tables.retain(|name| name != &table);
+    }
+}
+
+pub(crate) fn ordered_candidate_tables(
+    config: &RepairDriftConfig,
+    source_inventory: &SchemaInventory,
+    plan: &RepairPlan,
+) -> Result<Vec<String>, RepairDriftError> {
+    let candidates =
+        candidate_table_names(config, source_inventory).map_err(RepairDriftError::Config)?;
+    let candidate_set = candidates.iter().collect::<BTreeSet<_>>();
+    Ok(plan
+        .insert_order
+        .iter()
+        .filter(|table| candidate_set.contains(table))
+        .cloned()
+        .collect())
+}
+
+fn build_repair_inventory(
+    source: &MySqlConnectionConfig,
+    endpoint_role: InventoryEndpointRole,
+    tls_ca_file: &str,
+    inventory: &SchemaInventory,
+) -> Result<RepairInventory, crate::inventory::InventoryError> {
+    let reader = crate::inventory::MariaDbInventoryReader::new(InventoryConfig {
+        host: source.host.clone(),
+        port: source.port,
+        user: source.user.clone(),
+        password: source.password.clone(),
+        endpoint_role,
+        use_tls: true,
+        tls_ca_file: Some(tls_ca_file.to_string()),
+        ..InventoryConfig::default()
+    });
+    Ok(RepairInventory {
+        schema: inventory.schema.clone(),
+        tables: inventory
+            .tables
+            .iter()
+            .map(|table| table.name.clone())
+            .collect(),
+        foreign_keys: build_canonical_foreign_key_inventory(&inventory.schema, &reader)?,
+    })
+}

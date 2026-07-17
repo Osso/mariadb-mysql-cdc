@@ -1,5 +1,5 @@
 use super::{ApplyBinlogConfig, MysqlCliExecutor, SourceBinlogConfig};
-use crate::mysql_support::ssl_opts_from_ca;
+use crate::mysql_support::source_ssl_opts;
 use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
@@ -137,20 +137,20 @@ fn required_source_database(source: &SourceBinlogConfig) -> Result<&str, TargetE
 }
 
 fn open_source_conn(source: &SourceBinlogConfig) -> Result<Conn, TargetExecuteError> {
-    Conn::new(source_opts(source)).map_err(|error| {
+    Conn::new(source_opts(source).map_err(TargetExecuteError::new)?).map_err(|error| {
         TargetExecuteError::new(format!("source schema connection failed: {error}"))
     })
 }
 
-fn source_opts(source: &SourceBinlogConfig) -> Opts {
+fn source_opts(source: &SourceBinlogConfig) -> Result<Opts, String> {
     let builder = OptsBuilder::default()
         .ip_or_hostname(Some(&source.host))
         .tcp_port(source.port)
         .user(Some(&source.user))
         .pass(Some(&source.password))
         .prefer_socket(false)
-        .ssl_opts(ssl_opts_from_ca(Some(&source.tls_ca_file)));
-    Opts::from(builder)
+        .ssl_opts(source_ssl_opts(source)?);
+    Ok(Opts::from(builder))
 }
 
 fn missing_target_table_name(error: &str) -> Option<String> {

@@ -89,6 +89,82 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
 }
 
 #[test]
+fn parses_apply_binlog_runtime_options_individually() {
+    let mut config = live::ApplyBinlogConfig::default();
+
+    apply_binlog_option(&mut config, "--conflict-table", "cdc.conflicts").expect("conflict table");
+    apply_binlog_option(&mut config, "--max-reconnects", "3").expect("max reconnects");
+    apply_binlog_option(&mut config, "--reconnect-forever", "true").expect("reconnect forever");
+    apply_binlog_option(&mut config, "--target-transaction-group-size", "25")
+        .expect("transaction group size");
+    apply_binlog_option(&mut config, "--target-transaction-group-timeout-ms", "500")
+        .expect("transaction group timeout");
+    apply_binlog_option(&mut config, "--stop-never-slave-server-id", "4242")
+        .expect("slave server id");
+
+    assert_eq!(config.conflict_table, "cdc.conflicts");
+    assert_eq!(config.max_reconnects, 3);
+    assert!(config.reconnect_forever);
+    assert_eq!(config.target_transaction_group_size, 25);
+    assert_eq!(config.target_transaction_group_timeout_ms, 500);
+    assert_eq!(config.source.stop_never_slave_server_id, Some(4242));
+}
+
+#[test]
+fn preserves_apply_binlog_option_parse_errors() {
+    let cases = [
+        (
+            "--max-reconnects",
+            "not-an-integer",
+            "--max-reconnects must be an integer",
+        ),
+        (
+            "--reconnect-forever",
+            "yes",
+            "--reconnect-forever must be true or false",
+        ),
+        (
+            "--target-transaction-group-size",
+            "0",
+            "--target-transaction-group-size must be greater than zero",
+        ),
+        (
+            "--stop-never-slave-server-id",
+            "0",
+            "--stop-never-slave-server-id must be greater than zero",
+        ),
+    ];
+
+    for (flag, value, expected) in cases {
+        let error = apply_binlog_option(&mut live::ApplyBinlogConfig::default(), flag, value)
+            .expect_err("invalid apply-binlog option");
+
+        assert_eq!(error, expected);
+    }
+}
+
+#[test]
+fn rejects_invalid_target_ca_before_connecting() {
+    set_env("SOURCE_PASSWORD", "source-secret");
+    set_env("TARGET_PASSWORD", "target-secret");
+
+    let target = live::TargetMySqlConfig {
+        host: "target.db".to_string(),
+        port: 3306,
+        user: "writer".to_string(),
+        password: "target-secret".to_string(),
+        database: "app".to_string(),
+        tls_ca_file: "/tmp/mariadb-mysql-cdc-invalid-target-ca.pem".to_string(),
+        insert_conflict_policy: live::InsertConflictPolicy::Error,
+    };
+
+    let error = mysql_support::target_mysql_opts(&target).expect_err("invalid target CA");
+
+    assert!(error.contains("target TLS CA file"));
+    assert!(error.contains("unreadable"));
+}
+
+#[test]
 fn rejects_zero_stop_never_slave_server_id() {
     set_env("SOURCE_PASSWORD", "source-secret");
     set_env("TARGET_PASSWORD", "target-secret");

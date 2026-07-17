@@ -1,4 +1,4 @@
-use crate::mysql_support::{qualified_table_parts, target_ssl_opts};
+use crate::mysql_support::{SOURCE_TLS_CA_FILE, qualified_table_parts};
 use crate::stream_checkpoint::default_stream_checkpoint_table;
 use crate::{live, mysql_snapshot};
 use mysql::prelude::Queryable;
@@ -551,7 +551,7 @@ struct TargetProgressReader {
 
 impl TargetProgressReader {
     fn new(target: &live::TargetMySqlConfig) -> Result<Self, String> {
-        let opts = target_opts(target);
+        let opts = target_opts(target)?;
         let mut conn = Conn::new(opts).map_err(mysql_error)?;
         conn.query_drop(live::target_session_init_command())
             .map_err(mysql_error)?;
@@ -646,34 +646,47 @@ fn source_count(config: &SyncProgressConfig, table: &str) -> Result<Option<u64>,
         return Ok(None);
     }
     let sql = format!("SELECT COUNT(*) FROM {}", quote_ident(table));
-    let mut conn = Conn::new(source_opts(&config.source)).map_err(mysql_error)?;
+    let mut conn = Conn::new(source_opts(&config.source)?).map_err(mysql_error)?;
     conn.query_first::<u64, _>(sql)
         .map_err(mysql_error)?
         .map(Some)
         .ok_or_else(|| format!("source count for {table} returned no rows"))
 }
 
-fn target_opts(target: &live::TargetMySqlConfig) -> Opts {
+fn target_opts(target: &live::TargetMySqlConfig) -> Result<Opts, String> {
     mysql_opts(
         &target.host,
         target.port,
         &target.user,
         &target.password,
         &target.database,
+        &target.tls_ca_file,
+        &format!("target `{}`:{}", target.host, target.port),
     )
 }
 
-fn source_opts(source: &mysql_snapshot::MySqlConnectionConfig) -> Opts {
+fn source_opts(source: &mysql_snapshot::MySqlConnectionConfig) -> Result<Opts, String> {
+    let endpoint = format!("source `{}`:{}", source.host, source.port);
     mysql_opts(
         &source.host,
         source.port,
         &source.user,
         &source.password,
         &source.database,
+        SOURCE_TLS_CA_FILE,
+        &endpoint,
     )
 }
 
-fn mysql_opts(host: &str, port: u16, user: &str, password: &str, database: &str) -> Opts {
+fn mysql_opts(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    database: &str,
+    tls_ca_file: &str,
+    endpoint: &str,
+) -> Result<Opts, String> {
     let builder = OptsBuilder::default()
         .ip_or_hostname(Some(host))
         .tcp_port(port)
@@ -684,8 +697,11 @@ fn mysql_opts(host: &str, port: u16, user: &str, password: &str, database: &str)
         .tcp_connect_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
         .read_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
         .write_timeout(Some(SYNC_PROGRESS_DB_TIMEOUT))
-        .ssl_opts(target_ssl_opts());
-    Opts::from(builder)
+        .ssl_opts(crate::mysql_support::ssl_opts_from_ca(
+            endpoint,
+            tls_ca_file,
+        )?);
+    Ok(Opts::from(builder))
 }
 
 fn mysql_error(error: mysql::Error) -> String {

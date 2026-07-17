@@ -1,4 +1,4 @@
-use super::model::{row_error, RowApplyError, RowImage, RowResult, RowTableMap, RowUpdate};
+use super::model::{RowApplyError, RowImage, RowResult, RowTableMap, RowUpdate, row_error};
 use crate::probe::BinlogCoordinate;
 use crate::target::SqlStatement;
 use mysql::Value;

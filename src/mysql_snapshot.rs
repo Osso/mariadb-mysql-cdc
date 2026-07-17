@@ -600,7 +600,6 @@ fn validate_target(target: &TargetMySqlConfig) -> Result<(), CatchupSnapshotErro
             "target TLS CA file is required".to_string(),
         ));
     }
-
     Ok(())
 }
 

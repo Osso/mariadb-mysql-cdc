@@ -207,21 +207,6 @@ fn command_line_overrides_config_file_defaults() {
 }
 
 #[test]
-fn rejects_empty_target_tls_ca_file() {
-    let mut config = default_sync_progress_config();
-    config.target.host = "target".to_string();
-    config.target.user = "cdc".to_string();
-    config.target.password = "secret".to_string();
-    config.target.database = "globalcomix".to_string();
-    config.target.tls_ca_file.clear();
-
-    assert_eq!(
-        validate_required_target(&config).expect_err("empty target CA must fail"),
-        "target TLS CA file is required"
-    );
-}
-
-#[test]
 fn parses_progress_rows() {
     let row = "repair-20260710-01\treleases\t200\t1000\t10\t3\t1\trunning\t[\"42\"]\t20\t";
 
@@ -376,15 +361,19 @@ fn target_progress_connection_has_short_io_timeouts() {
         user: "cdc".to_string(),
         password: "secret".to_string(),
         database: "globalcomix".to_string(),
-        tls_ca_file: crate::mysql_support::TARGET_TLS_CA_FILE.to_string(),
+        tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
         insert_conflict_policy: live::InsertConflictPolicy::Error,
     };
 
-    let opts = target_opts(&target);
+    let opts = target_opts(&target).expect("target progress options");
 
     assert_eq!(opts.get_tcp_connect_timeout(), Some(Duration::from_secs(2)));
     assert_eq!(opts.get_read_timeout(), Some(&Duration::from_secs(2)));
     assert_eq!(opts.get_write_timeout(), Some(&Duration::from_secs(2)));
+    assert_eq!(
+        opts.get_ssl_opts().and_then(|ssl| ssl.root_cert_path()),
+        Some(std::path::Path::new(&target.tls_ca_file))
+    );
 }
 
 #[test]

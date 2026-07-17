@@ -1,7 +1,7 @@
 pub mod catchup;
 pub mod checkpoint;
-pub mod conflict_repair;
 pub mod checksum;
+pub mod conflict_repair;
 pub mod cutover;
 pub mod drift_check;
 pub mod inventory;
@@ -84,6 +84,7 @@ Apply options:
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
+  --conflict-table TABLE           Durable row-conflict store. Defaults to cdc.row_conflicts.
   --ddl-ledger-table TABLE         Manual DDL resolution ledger. Defaults to cdc.ddl_events.
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
@@ -106,6 +107,7 @@ Catchup snapshot options:
   --progress-table TABLE          Target checkpoint table. Defaults to cdc.table_sync_progress.
 
 Sync table options:
+  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
   --run-id ID                     Immutable repair run ID. Reuse only for interrupted runs; completed IDs are terminal.
   --start-after CSV               Primary-key lower bound for targeted sync-table repair.
@@ -117,19 +119,33 @@ Sync table options:
   --updated-since VALUE           Upsert source rows where updated-at column is >= VALUE. Does not delete orphans; run checksum validation after.
 
 Sync progress repair-run options:
+  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --progress-table TABLE          Use cdc.table_sync_runs to inspect sync-table repair runs.
   --run-id ID                     Filter the selected run-progress table by repair run ID.
 
   --chunk-size ROWS               Rows per chunk. Defaults to 10000.
   --throttle-ms MS                Sleep after each copied chunk. Defaults to 0.
 
+Drift check options:
+  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
+  --table TABLE                   Limit drift check to a source table; repeat for multiple tables.
+  --content-check BOOL             Run bounded content checks. Defaults to true.
+
 Repair drift options:
-  --table TABLE                   Limit repair to a source table; repeat for multiple tables.
-  --parent-first TABLES           Comma-separated table order prefix; remaining tables sort lexically.
+  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
+  --source-identity ID             Source incarnation ID for conflict resolution in apply mode.
+  --source-tls-ca-file PATH         Source CA certificate bundle for repair inventory.
+  --table TABLE                    Limit repair to a source table; repeat for multiple tables.
+  --parent-first TABLES            Comma-separated table order prefix; remaining tables sort lexically.
+  --start-after CSV                Lower primary-key bound for the selected repair window.
+  --end-at CSV                     Upper primary-key bound for the selected repair window.
+  --start-after-json JSON          Lower primary-key bound as a JSON string array.
+  --end-at-json JSON               Upper primary-key bound as a JSON string array.
   --content-check BOOL             Run bounded content checks when counts match. Defaults to true.
   --mode MODE                     dry-run (default) or apply.
   --max-deletes COUNT             Required explicitly in apply mode; bounds target orphan deletes.
   --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
+  --run-id ID                     Reuse an interrupted repair run; plan hash must match.
   --run-id-prefix PREFIX          Prefix for the fresh run-scoped repair ID.
 ";
 
@@ -478,26 +494,97 @@ fn apply_binlog_option(
     if apply_target_option(&mut config.target, flag, value)? {
         return Ok(());
     }
+    if apply_binlog_runtime_option(config, flag, value)? {
+        return Ok(());
+    }
+    Err(format!("unknown apply-binlog option: {flag}"))
+}
 
+fn apply_binlog_runtime_option(
+    config: &mut live::ApplyBinlogConfig,
+    flag: &str,
+    value: &str,
+) -> Result<bool, String> {
+    if apply_binlog_identity_option(config, flag, value)? {
+        return Ok(true);
+    }
+    if apply_binlog_reconnect_option(config, flag, value)? {
+        return Ok(true);
+    }
+    if apply_binlog_transaction_option(config, flag, value)? {
+        return Ok(true);
+    }
+    if apply_binlog_source_server_option(config, flag, value)? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn apply_binlog_identity_option(
+    config: &mut live::ApplyBinlogConfig,
+    flag: &str,
+    value: &str,
+) -> Result<bool, String> {
     match flag {
         "--source-identity" => config.source_identity = value.to_string(),
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
+        "--conflict-table" => config.conflict_table = value.to_string(),
         "--ddl-ledger-table" => config.ddl_ledger_table = value.to_string(),
+        _ => return Ok(false),
+    }
+
+    Ok(true)
+}
+
+fn apply_binlog_reconnect_option(
+    config: &mut live::ApplyBinlogConfig,
+    flag: &str,
+    value: &str,
+) -> Result<bool, String> {
+    match flag {
         "--max-reconnects" => config.max_reconnects = parse_u32(flag, value)?,
         "--reconnect-forever" => config.reconnect_forever = parse_bool(flag, value)?,
+        _ => return Ok(false),
+    }
+
+    Ok(true)
+}
+
+fn apply_binlog_transaction_option(
+    config: &mut live::ApplyBinlogConfig,
+    flag: &str,
+    value: &str,
+) -> Result<bool, String> {
+    match flag {
         "--target-transaction-group-size" => {
             config.target_transaction_group_size = parse_nonzero_usize(flag, value)?;
         }
         "--target-transaction-group-timeout-ms" => {
             config.target_transaction_group_timeout_ms = parse_u64(flag, value)?;
         }
+        #[cfg(feature = "integration-failpoints")]
+        "--integration-failpoint" => {
+            config.integration_failpoint = Some(live::IntegrationFailpoint::parse(value)?);
+        }
+        _ => return Ok(false),
+    }
+
+    Ok(true)
+}
+
+fn apply_binlog_source_server_option(
+    config: &mut live::ApplyBinlogConfig,
+    flag: &str,
+    value: &str,
+) -> Result<bool, String> {
+    match flag {
         "--stop-never-slave-server-id" => {
             config.source.stop_never_slave_server_id = Some(parse_nonzero_u32(flag, value)?);
         }
-        other => return Err(format!("unknown apply-binlog option: {other}")),
+        _ => return Ok(false),
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn apply_source_option(

@@ -1,0 +1,682 @@
+use super::*;
+use crate::snapshot::SnapshotRow;
+
+pub fn sync_table_with_progress_range(
+    table: &SyncTable,
+    options: SyncRunOptions,
+    source: &impl SyncTableReader,
+    target: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableReport, TableSyncError> {
+    sync_table_with_progress_range_phase(
+        table,
+        options,
+        source,
+        target,
+        repair_target,
+        progress_store,
+        SyncPhase::All,
+    )
+}
+
+pub fn sync_table_with_progress_range_phase(
+    table: &SyncTable,
+    options: SyncRunOptions,
+    source: &impl SyncTableReader,
+    target: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    progress_store: &mut impl SyncProgressStore,
+    phase: SyncPhase,
+) -> Result<SyncTableReport, TableSyncError> {
+    let run_id = options.run_id.clone();
+    let (progress, report, start_after) = prepare_range_sync(table, &options, progress_store)?;
+    let result = execute_range_sync(RangeExecution {
+        table,
+        options: &options,
+        phase,
+        source,
+        target,
+        repair_target,
+        progress_store,
+        progress,
+        report,
+        start_after,
+    });
+    let result = persist_sync_run_error(&run_id, result, progress_store);
+    finish_sync_run(&run_id, result, progress_store)
+}
+
+fn prepare_range_sync(
+    table: &SyncTable,
+    options: &SyncRunOptions,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<(SyncTableProgress, SyncTableReport, Option<Vec<String>>), TableSyncError> {
+    validate_sync_table(table, options.chunk_size)?;
+    validate_sync_range(table, options.start_after.as_ref(), options.end_at.as_ref())?;
+    let progress = load_range_sync_progress(&options.run_id, table, options, progress_store)?;
+    let report = progress.report();
+    let start_after = progress
+        .last_primary_key
+        .clone()
+        .or(options.start_after.clone());
+    Ok((progress, report, start_after))
+}
+
+struct RangeExecution<'a, S, T, R, P>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    table: &'a SyncTable,
+    options: &'a SyncRunOptions,
+    phase: SyncPhase,
+    source: &'a S,
+    target: &'a T,
+    repair_target: &'a mut R,
+    progress_store: &'a mut P,
+    progress: SyncTableProgress,
+    report: SyncTableReport,
+    start_after: Option<Vec<String>>,
+}
+
+fn execute_range_sync<S, T, R, P>(
+    mut context: RangeExecution<'_, S, T, R, P>,
+) -> Result<SyncTableReport, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    if matches!(context.phase, SyncPhase::All | SyncPhase::DeleteExtras) {
+        preflight_delete_budget(
+            DeletePreflightOptions {
+                table: context.table,
+                chunk_size: context.options.chunk_size,
+                mode: context.options.mode,
+                start_after: context.start_after.clone(),
+                range_end_at: context.options.end_at.clone(),
+                existing_deletes: context.report.extra_target_rows,
+                max_deletes: context.options.max_deletes,
+            },
+            context.source,
+            context.target,
+        )?;
+    }
+    run_range_chunks(&mut context)
+}
+
+fn run_range_chunks<S, T, R, P>(
+    context: &mut RangeExecution<'_, S, T, R, P>,
+) -> Result<SyncTableReport, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    loop {
+        let next_start_after = sync_next_range_chunk(context)?;
+        let Some(next_start_after) = next_start_after else {
+            if context.phase == SyncPhase::Verify {
+                return verification_result(context);
+            }
+            complete_sync_progress(&mut context.progress, context.progress_store)?;
+            return Ok(context.report.clone());
+        };
+        context.start_after = Some(next_start_after);
+    }
+}
+
+fn sync_next_range_chunk<S, T, R, P>(
+    context: &mut RangeExecution<'_, S, T, R, P>,
+) -> Result<Option<Vec<String>>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    sync_next_chunk(SyncChunkContext {
+        table: context.table,
+        chunk_size: context.options.chunk_size,
+        mode: context.options.mode,
+        start_after: context.start_after.clone(),
+        source: context.source,
+        target: context.target,
+        repair_target: context.repair_target,
+        progress_store: context.progress_store,
+        progress: &mut context.progress,
+        report: &mut context.report,
+        range_end_at: context.options.end_at.clone(),
+        max_deletes: context.options.max_deletes,
+        phase: context.phase,
+    })
+}
+
+fn load_range_sync_progress(
+    run_id: &str,
+    table: &SyncTable,
+    options: &SyncRunOptions,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableProgress, TableSyncError> {
+    let run_spec_json = build_run_spec_json(
+        &options.run_scope,
+        table,
+        options.chunk_size,
+        options.mode,
+        &options.start_after,
+        &options.end_at,
+        options.max_deletes,
+    )?;
+    load_sync_progress(run_id, &run_spec_json, table, options.mode, progress_store)
+}
+
+struct SyncChunkContext<'a, S, T, R, P>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    table: &'a SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    start_after: Option<Vec<String>>,
+    source: &'a S,
+    target: &'a T,
+    repair_target: &'a mut R,
+    progress_store: &'a mut P,
+    progress: &'a mut SyncTableProgress,
+    report: &'a mut SyncTableReport,
+    range_end_at: Option<Vec<String>>,
+    max_deletes: Option<u64>,
+    phase: SyncPhase,
+}
+
+fn sync_next_chunk<S, T, R, P>(
+    mut context: SyncChunkContext<'_, S, T, R, P>,
+) -> Result<Option<Vec<String>>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let source_rows = read_source_chunk(&context)?;
+    if source_rows.is_empty() {
+        let tail_start_after = context.start_after.clone();
+        repair_target_tail(&mut context, tail_start_after)?;
+        return Ok(None);
+    }
+
+    let end_at = repair_source_chunk(&mut context, &source_rows)?;
+
+    if source_rows.len() < context.chunk_size {
+        repair_target_tail(&mut context, Some(end_at))?;
+        Ok(None)
+    } else {
+        Ok(Some(end_at))
+    }
+}
+
+struct DeletePreflightOptions<'a> {
+    table: &'a SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    start_after: Option<Vec<String>>,
+    range_end_at: Option<Vec<String>>,
+    existing_deletes: u64,
+    max_deletes: Option<u64>,
+}
+
+fn preflight_delete_budget<S, T>(
+    options: DeletePreflightOptions<'_>,
+    source: &S,
+    target: &T,
+) -> Result<(), TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+{
+    if options.mode != SyncMode::Apply || options.max_deletes.is_none() {
+        return Ok(());
+    }
+
+    let extra_target_rows = count_total_extra_rows(
+        ExtraRowCount {
+            table: options.table,
+            chunk_size: options.chunk_size,
+            range_end_at: options.range_end_at,
+            source,
+            target,
+        },
+        options.start_after,
+    )?;
+    ensure_delete_allowed(
+        options.existing_deletes + extra_target_rows,
+        options.max_deletes,
+        options.mode,
+    )
+}
+
+struct ExtraRowCount<'a, S, T>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+{
+    table: &'a SyncTable,
+    chunk_size: usize,
+    range_end_at: Option<Vec<String>>,
+    source: &'a S,
+    target: &'a T,
+}
+
+fn count_total_extra_rows<S, T>(
+    context: ExtraRowCount<'_, S, T>,
+    mut start_after: Option<Vec<String>>,
+) -> Result<u64, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+{
+    let mut extra_target_rows = 0;
+    loop {
+        let page = count_source_page_extra_rows(&context, start_after.clone())?;
+        let Some((page_extra, end_at, is_complete)) = page else {
+            return Ok(extra_target_rows + count_extra_tail(&context, start_after)?);
+        };
+        extra_target_rows += page_extra;
+        if is_complete {
+            return Ok(extra_target_rows + count_extra_tail(&context, Some(end_at))?);
+        }
+        start_after = Some(end_at);
+    }
+}
+
+fn count_extra_tail<S, T>(
+    context: &ExtraRowCount<'_, S, T>,
+    start_after: Option<Vec<String>>,
+) -> Result<u64, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+{
+    count_target_tail_extra_rows(
+        context.table,
+        start_after,
+        context.range_end_at.clone(),
+        context.chunk_size,
+        context.target,
+    )
+}
+
+fn count_source_page_extra_rows<S, T>(
+    context: &ExtraRowCount<'_, S, T>,
+    start_after: Option<Vec<String>>,
+) -> Result<Option<(u64, Vec<String>, bool)>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+{
+    let source_rows = context.source.read_rows(&sync_chunk_request(
+        context.table,
+        start_after.clone(),
+        context.range_end_at.clone(),
+        context.chunk_size,
+    ))?;
+    let Some(end_at) = last_primary_key(&source_rows).ok() else {
+        return Ok(None);
+    };
+    let extra_target_rows = count_source_window_extra_rows(
+        context.table,
+        start_after,
+        end_at.clone(),
+        context.chunk_size,
+        &source_rows,
+        context.target,
+    )?;
+    let is_complete = source_rows.len() < context.chunk_size;
+    Ok(Some((extra_target_rows, end_at, is_complete)))
+}
+
+fn count_source_window_extra_rows(
+    table: &SyncTable,
+    start_after: Option<Vec<String>>,
+    end_at: Vec<String>,
+    chunk_size: usize,
+    source_rows: &[SnapshotRow],
+    target: &dyn SyncTableReader,
+) -> Result<u64, TableSyncError> {
+    let target_rows = read_target_window(table, start_after, Some(end_at), chunk_size, target)?;
+    Ok(count_extra_target_rows(source_rows, &target_rows))
+}
+
+fn count_target_tail_extra_rows(
+    table: &SyncTable,
+    start_after: Option<Vec<String>>,
+    range_end_at: Option<Vec<String>>,
+    chunk_size: usize,
+    target: &dyn SyncTableReader,
+) -> Result<u64, TableSyncError> {
+    let target_rows = read_target_window(table, start_after, range_end_at, chunk_size, target)?;
+    Ok(count_extra_target_rows(&[], &target_rows))
+}
+
+fn repair_source_chunk<S, T, R, P>(
+    context: &mut SyncChunkContext<'_, S, T, R, P>,
+    source_rows: &[SnapshotRow],
+) -> Result<Vec<String>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let end_at = last_primary_key(source_rows)?;
+    let target_rows = read_source_bounded_target_window(context, &end_at)?;
+    repair_chunk(
+        source_rows,
+        &target_rows,
+        context.mode,
+        context.repair_target,
+        context.report,
+        context.max_deletes,
+        context.phase,
+    )?;
+    record_repaired_source_chunk(context, source_rows.len(), end_at.clone())?;
+    Ok(end_at)
+}
+
+fn read_source_bounded_target_window<S, T, R, P>(
+    context: &SyncChunkContext<'_, S, T, R, P>,
+    end_at: &[String],
+) -> Result<Vec<SnapshotRow>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    read_target_window(
+        context.table,
+        context.start_after.clone(),
+        Some(end_at.to_vec()),
+        context.chunk_size,
+        context.target,
+    )
+}
+
+fn record_repaired_source_chunk<S, T, R, P>(
+    context: &mut SyncChunkContext<'_, S, T, R, P>,
+    row_count: usize,
+    end_at: Vec<String>,
+) -> Result<(), TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    record_sync_chunk(
+        context.progress,
+        context.report,
+        row_count,
+        end_at,
+        context.progress_store,
+    )
+}
+
+fn repair_target_tail<S, T, R, P>(
+    context: &mut SyncChunkContext<'_, S, T, R, P>,
+    start_after: Option<Vec<String>>,
+) -> Result<(), TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let target_rows = read_target_window(
+        context.table,
+        start_after,
+        context.range_end_at.clone(),
+        context.chunk_size,
+        context.target,
+    )?;
+    repair_chunk(
+        &[],
+        &target_rows,
+        context.mode,
+        context.repair_target,
+        context.report,
+        context.max_deletes,
+        context.phase,
+    )
+}
+
+fn read_source_chunk<S, T, R, P>(
+    context: &SyncChunkContext<'_, S, T, R, P>,
+) -> Result<Vec<SnapshotRow>, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let request = sync_chunk_request(
+        context.table,
+        context.start_after.clone(),
+        context.range_end_at.clone(),
+        context.chunk_size,
+    );
+    context.source.read_rows(&request)
+}
+
+fn record_sync_chunk(
+    progress: &mut SyncTableProgress,
+    report: &mut SyncTableReport,
+    row_count: usize,
+    end_at: Vec<String>,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<(), TableSyncError> {
+    report.chunks += 1;
+    report.rows_scanned += row_count as u64;
+    progress.record_chunk(report, end_at);
+    progress_store.save(progress)
+}
+
+pub(crate) fn build_run_spec_json(
+    run_scope: &str,
+    table: &SyncTable,
+    chunk_size: usize,
+    mode: SyncMode,
+    start_after: &Option<Vec<String>>,
+    end_at: &Option<Vec<String>>,
+    max_deletes: Option<u64>,
+) -> Result<String, TableSyncError> {
+    serde_json::to_string(&SyncRunSpec {
+        scope: run_scope,
+        table,
+        chunk_size,
+        mode,
+        start_after,
+        end_at,
+        max_deletes,
+        updated_since: None,
+    })
+    .map_err(|error| TableSyncError::Progress(format!("serialize run specification: {error}")))
+}
+
+fn load_sync_progress(
+    run_id: &str,
+    run_spec_json: &str,
+    table: &SyncTable,
+    mode: SyncMode,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<SyncTableProgress, TableSyncError> {
+    progress_store.ensure()?;
+    progress_store.acquire_run(run_id)?;
+    let result = (|| {
+        let mut progress = match progress_store.load(run_id)? {
+            Some(progress) => validate_resumable_progress(progress, run_id, run_spec_json)?,
+            None => SyncTableProgress::started(
+                run_id.to_string(),
+                run_spec_json.to_string(),
+                table.name.clone(),
+                mode,
+            ),
+        };
+        progress.mark_running(mode);
+        progress_store.save(&progress)?;
+        Ok(progress)
+    })();
+    release_on_load_error(run_id, result, progress_store)
+}
+
+pub(crate) fn release_on_load_error(
+    run_id: &str,
+    result: Result<SyncTableProgress, TableSyncError>,
+    progress_store: &impl SyncProgressStore,
+) -> Result<SyncTableProgress, TableSyncError> {
+    if result.is_err() {
+        let _ = progress_store.release_run(run_id);
+    }
+    result
+}
+
+pub(crate) fn persist_sync_run_error<T>(
+    run_id: &str,
+    result: Result<T, TableSyncError>,
+    progress_store: &mut impl SyncProgressStore,
+) -> Result<T, TableSyncError> {
+    match result {
+        Err(error) if should_record_sync_run_error(&error) => {
+            if let Err(save_error) = progress_store.save_error(run_id, &error) {
+                return Err(TableSyncError::Progress(format!(
+                    "{error}; also failed to persist run error: {save_error}"
+                )));
+            }
+            Err(error)
+        }
+        other => other,
+    }
+}
+
+pub(crate) fn finish_sync_run<T>(
+    run_id: &str,
+    result: Result<T, TableSyncError>,
+    progress_store: &impl SyncProgressStore,
+) -> Result<T, TableSyncError> {
+    let release_result = progress_store.release_run(run_id);
+    match (result, release_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(release_error)) => Err(release_error),
+        (Err(error), Err(release_error)) => Err(TableSyncError::Progress(format!(
+            "{error}; also failed to release run lock: {release_error}"
+        ))),
+    }
+}
+
+pub(crate) fn validate_resumable_progress(
+    progress: SyncTableProgress,
+    run_id: &str,
+    run_spec_json: &str,
+) -> Result<SyncTableProgress, TableSyncError> {
+    if progress.run_spec_json.as_deref() != Some(run_spec_json) {
+        return Err(TableSyncError::Progress(format!(
+            "run id `{run_id}` already exists with a different immutable specification"
+        )));
+    }
+    if progress.status == SyncProgressStatus::Complete {
+        return Err(TableSyncError::Progress(format!(
+            "run id `{run_id}` is already complete; use a new run id"
+        )));
+    }
+    Ok(progress)
+}
+
+pub(crate) fn complete_sync_progress(
+    progress: &mut SyncTableProgress,
+    progress_store: &mut dyn SyncProgressStore,
+) -> Result<(), TableSyncError> {
+    progress.mark_complete();
+    progress_store.save(progress)
+}
+
+fn verification_result<S, T, R, P>(
+    context: &mut RangeExecution<'_, S, T, R, P>,
+) -> Result<SyncTableReport, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    if context.report.inserts > 0
+        || context.report.updates > 0
+        || context.report.extra_target_rows > 0
+    {
+        return Err(TableSyncError::Repair(format!(
+            "verification failed: table={} scope={} missing_rows={} extra_rows={} divergent_rows={}",
+            context.table.name,
+            verification_scope(context.options),
+            context.report.inserts,
+            context.report.extra_target_rows,
+            context.report.updates,
+        )));
+    }
+    complete_sync_progress(&mut context.progress, context.progress_store)?;
+    Ok(context.report.clone())
+}
+
+fn verification_scope(options: &SyncRunOptions) -> String {
+    if options.start_after.is_none() && options.end_at.is_none() {
+        return "full-table".to_string();
+    }
+    format!(
+        "primary-key-window start_after={} end_at={}",
+        format_bound(options.start_after.as_ref()),
+        format_bound(options.end_at.as_ref())
+    )
+}
+
+fn format_bound(values: Option<&Vec<String>>) -> String {
+    values
+        .map(|values| format!("{values:?}"))
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn read_target_window(
+    table: &SyncTable,
+    mut start_after: Option<Vec<String>>,
+    end_at: Option<Vec<String>>,
+    chunk_size: usize,
+    target: &dyn SyncTableReader,
+) -> Result<Vec<SnapshotRow>, TableSyncError> {
+    let mut rows = Vec::new();
+
+    loop {
+        let page = target.read_rows(&sync_chunk_request(
+            table,
+            start_after.clone(),
+            end_at.clone(),
+            chunk_size,
+        ))?;
+        if page.is_empty() {
+            return Ok(rows);
+        }
+
+        let page_is_complete = page.len() < chunk_size;
+        start_after = Some(last_primary_key(&page)?);
+        rows.extend(page);
+
+        if page_is_complete {
+            return Ok(rows);
+        }
+    }
+}

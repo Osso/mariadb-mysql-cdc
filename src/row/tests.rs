@@ -92,9 +92,14 @@ fn ignored_duplicate_row_is_persisted_before_apply_returns() {
         observed_at_ms: 100,
     };
 
-    applier
+    let error = applier
         .apply_write_rows_with_conflicts(&event, &mut context)
-        .expect("ignored duplicate should be recorded");
+        .expect_err("recorded duplicate must abort the target transaction");
+    assert!(
+        error
+            .to_string()
+            .contains("row conflict persisted for repair")
+    );
 
     let record = &ledger.records()[0];
     assert_eq!(record.key.coordinate.end_position, 200);

@@ -1,0 +1,1 @@
+(`status` in (_utf8mb4\'unresolved\',_utf8mb4\'resolved\'))

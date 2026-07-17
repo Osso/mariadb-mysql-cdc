@@ -10,6 +10,8 @@ use std::fmt;
 
 mod binlog_command;
 mod ddl_ledger;
+mod ddl_replay_journal;
+mod ddl_semantics;
 mod insert_conflict;
 mod mysql_cli;
 mod progress;
@@ -41,17 +43,102 @@ use repair::{FailedStatementRepairer, repair_failed_statement};
 pub(crate) use schema_recovery::mysql_compatible_create_table;
 use schema_recovery::mysql_executor_with_recovery;
 
+#[cfg(feature = "integration-failpoints")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegrationFailpoint {
+    PrepareFailure,
+    PostDdlPreApplied,
+    AppliedPreCheckpoint,
+    CheckpointTransaction,
+    SourceConnectionLoss,
+    TargetConnectionLoss,
+}
+
+#[cfg(feature = "integration-failpoints")]
+impl IntegrationFailpoint {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "prepare-failure" => Ok(Self::PrepareFailure),
+            "post-ddl-pre-applied" => Ok(Self::PostDdlPreApplied),
+            "applied-pre-checkpoint" => Ok(Self::AppliedPreCheckpoint),
+            "checkpoint-transaction" => Ok(Self::CheckpointTransaction),
+            "source-connection-loss" => Ok(Self::SourceConnectionLoss),
+            "target-connection-loss" => Ok(Self::TargetConnectionLoss),
+            other => Err(format!("unknown integration failpoint: {other}")),
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::PrepareFailure => 1,
+            Self::PostDdlPreApplied => 2,
+            Self::AppliedPreCheckpoint => 3,
+            Self::CheckpointTransaction => 4,
+            Self::SourceConnectionLoss => 5,
+            Self::TargetConnectionLoss => 6,
+        }
+    }
+}
+
+#[cfg(feature = "integration-failpoints")]
+pub(crate) fn wait_for_integration_barrier(failpoint: IntegrationFailpoint, boundary: &str) {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::Duration;
+
+    if !integration_failpoint_enabled(failpoint) {
+        return;
+    }
+
+    let Some(directory) = std::env::var_os("CDC_INTEGRATION_BARRIER_DIR") else {
+        eprintln!("cdc_integration_barrier_missing_dir boundary={boundary}");
+        std::process::exit(70);
+    };
+    let directory = PathBuf::from(directory);
+    fs::create_dir_all(&directory).expect("create integration barrier directory");
+    let ready = directory.join(format!("{boundary}.ready"));
+    let release = directory.join(format!("{boundary}.release"));
+    fs::write(&ready, b"ready").expect("write integration barrier readiness");
+    eprintln!("cdc_integration_barrier_ready boundary={boundary}");
+    while !release.exists() {
+        thread::sleep(Duration::from_millis(25));
+    }
+    eprintln!("cdc_integration_barrier_released boundary={boundary}");
+}
+
+#[cfg(feature = "integration-failpoints")]
+static INTEGRATION_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "integration-failpoints")]
+pub(crate) fn configure_integration_failpoint(failpoint: Option<IntegrationFailpoint>) {
+    use std::sync::atomic::Ordering;
+    INTEGRATION_FAILPOINT.store(
+        failpoint.map_or(0, IntegrationFailpoint::code),
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(feature = "integration-failpoints")]
+pub(crate) fn integration_failpoint_enabled(failpoint: IntegrationFailpoint) -> bool {
+    use std::sync::atomic::Ordering;
+    INTEGRATION_FAILPOINT.load(Ordering::Relaxed) == failpoint.code()
+}
+
 #[derive(Clone, Debug)]
 pub struct ApplyBinlogConfig {
     pub source: SourceBinlogConfig,
     pub source_identity: String,
     pub target: TargetMySqlConfig,
     pub checkpoint_table: String,
+    pub conflict_table: String,
     pub ddl_ledger_table: String,
     pub max_reconnects: u32,
     pub reconnect_forever: bool,
     pub target_transaction_group_size: usize,
     pub target_transaction_group_timeout_ms: u64,
+    #[cfg(feature = "integration-failpoints")]
+    pub integration_failpoint: Option<IntegrationFailpoint>,
 }
 
 impl Default for ApplyBinlogConfig {
@@ -61,61 +148,94 @@ impl Default for ApplyBinlogConfig {
             source_identity: String::new(),
             target: TargetMySqlConfig::default(),
             checkpoint_table: default_stream_checkpoint_table(),
+            conflict_table: "cdc.row_conflicts".to_string(),
             ddl_ledger_table: "cdc.ddl_events".to_string(),
             max_reconnects: 12,
             reconnect_forever: false,
             target_transaction_group_size: 1,
             target_transaction_group_timeout_ms: 0,
+            #[cfg(feature = "integration-failpoints")]
+            integration_failpoint: None,
         }
     }
 }
 
 impl ApplyBinlogConfig {
     pub fn validate(&self) -> Result<(), ApplyBinlogError> {
-        if self.source.host.is_empty() {
-            return Err(config_error("source host is required"));
-        }
-        if self.source_identity.is_empty() {
-            return Err(config_error("source identity is required"));
-        }
-        if self.source_identity.len() > 363 {
-            return Err(config_error(
-                "source identity must be at most 363 bytes before the server-id suffix",
-            ));
-        }
-        if self.source.user.is_empty() {
-            return Err(config_error("source user is required"));
-        }
-        if self.source.password.is_empty() {
-            return Err(config_error("source password is required"));
-        }
-        if self.source.tls_ca_file.is_empty() {
-            return Err(config_error("source TLS CA file is required"));
-        }
-        if self.checkpoint_table.is_empty() {
-            return Err(config_error("checkpoint table is required"));
-        }
-        if !is_schema_qualified_table(&self.checkpoint_table) {
-            return Err(config_error(
-                "checkpoint table must be a schema-qualified schema.table path",
-            ));
-        }
-        if self.ddl_ledger_table.is_empty() {
-            return Err(config_error("DDL ledger table is required"));
-        }
-        if !is_schema_qualified_table(&self.ddl_ledger_table) {
-            return Err(config_error(
-                "DDL ledger table must be a schema-qualified schema.table path",
-            ));
-        }
-        self.source.validate_stop_never_slave_server_id()?;
-        if self.target_transaction_group_size == 0 {
-            return Err(config_error(
-                "target transaction group size must be greater than zero",
-            ));
-        }
+        validate_source_settings(&self.source, &self.source_identity)?;
+        validate_apply_table_paths(self)?;
+        validate_apply_runtime_settings(self)?;
         self.target.validate()
     }
+}
+
+fn validate_source_settings(
+    source: &SourceBinlogConfig,
+    source_identity: &str,
+) -> Result<(), ApplyBinlogError> {
+    if source.host.is_empty() {
+        return Err(config_error("source host is required"));
+    }
+    if source_identity.is_empty() {
+        return Err(config_error("source identity is required"));
+    }
+    if source_identity.len() > 363 {
+        return Err(config_error(
+            "source identity must be at most 363 bytes before the server-id suffix",
+        ));
+    }
+    if source.user.is_empty() {
+        return Err(config_error("source user is required"));
+    }
+    if source.password.is_empty() {
+        return Err(config_error("source password is required"));
+    }
+    if source.tls_ca_file.is_empty() {
+        return Err(config_error("source TLS CA file is required"));
+    }
+    Ok(())
+}
+
+fn validate_apply_table_paths(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
+    validate_schema_qualified_table(
+        &config.checkpoint_table,
+        "checkpoint table is required",
+        "checkpoint table must be a schema-qualified schema.table path",
+    )?;
+    validate_schema_qualified_table(
+        &config.conflict_table,
+        "conflict table is required",
+        "conflict table must be a schema-qualified schema.table path",
+    )?;
+    validate_schema_qualified_table(
+        &config.ddl_ledger_table,
+        "DDL ledger table is required",
+        "DDL ledger table must be a schema-qualified schema.table path",
+    )
+}
+
+fn validate_schema_qualified_table(
+    table: &str,
+    required_error: &str,
+    qualification_error: &str,
+) -> Result<(), ApplyBinlogError> {
+    if table.is_empty() {
+        return Err(config_error(required_error));
+    }
+    if !is_schema_qualified_table(table) {
+        return Err(config_error(qualification_error));
+    }
+    Ok(())
+}
+
+fn validate_apply_runtime_settings(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
+    config.source.validate_stop_never_slave_server_id()?;
+    if config.target_transaction_group_size == 0 {
+        return Err(config_error(
+            "target transaction group size must be greater than zero",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -214,7 +334,6 @@ impl TargetMySqlConfig {
         if self.tls_ca_file.is_empty() {
             return Err(config_error("target TLS CA file is required"));
         }
-
         Ok(())
     }
 }

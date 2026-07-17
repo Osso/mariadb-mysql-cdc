@@ -96,6 +96,70 @@ fn wraps_target_writes_and_checkpoint_in_source_xid_transaction() {
 }
 
 #[test]
+fn duplicate_rolls_back_multi_row_transaction_without_checkpoint_and_persists_idempotent_evidence()
+{
+    let executor = TransactionRecordingExecutor::with_duplicate_second_row_change();
+    let mut applier = crate::row::RowApplier::new(executor);
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
+                current_file: &mut current_file,
+                group_config: TargetTransactionGroupConfig::default(),
+            };
+            apply_stream_event_transactionally_with_conflicts(
+                &mut applier,
+                &mut context,
+                &header,
+                &event,
+                "test-source",
+                &mut conflicts,
+            )
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+
+    for _attempt in 0..2 {
+        process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("first row");
+        let error = process_event!(event_header(31, 240), write_rows_event(18, 2, "beta"))
+            .expect_err("duplicate second row must abort source transaction");
+        assert!(
+            error
+                .to_string()
+                .contains("row conflict persisted for repair")
+        );
+    }
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        [
+            "BEGIN", "EXEC", "EXEC", "ROLLBACK", "BEGIN", "EXEC", "EXEC", "ROLLBACK"
+        ]
+    );
+    assert!(!applier.executor().operations().contains(&"CHECKPOINT"));
+    assert!(!applier.executor().operations().contains(&"COMMIT"));
+    assert_eq!(conflicts.records().len(), 1);
+    assert_eq!(conflicts.records()[0].attempt_count, 2);
+}
+
+#[test]
 fn query_dml_does_not_open_or_checkpoint_target_transaction() {
     let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
     let resolver = FixtureSchemaResolver;

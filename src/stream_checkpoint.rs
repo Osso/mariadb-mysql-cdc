@@ -2,9 +2,9 @@ use crate::checkpoint::Checkpoint;
 use crate::live::TargetMySqlConfig;
 #[cfg(test)]
 use crate::mysql_support::quote_ident;
-use crate::mysql_support::{quote_identifier_path, quote_sql_literal, target_ssl_opts};
+use crate::mysql_support::{quote_identifier_path, quote_sql_literal, target_mysql_opts};
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder};
+use mysql::{Conn, Opts};
 use std::cell::{Cell, RefCell};
 
 const STREAM_CHECKPOINT_PREFIX: &str = "stream-binlog:";
@@ -126,7 +126,7 @@ impl MySqlStreamCheckpointStore {
         query: impl FnOnce(&mut Conn) -> Result<T, String>,
     ) -> Result<T, String> {
         if self.conn.borrow().is_none() {
-            let conn = Conn::new(target_opts(&self.target)).map_err(mysql_error)?;
+            let conn = Conn::new(target_opts(&self.target)?).map_err(mysql_error)?;
             self.conn.replace(Some(conn));
         }
         let mut conn_ref = self.conn.borrow_mut();
@@ -261,16 +261,8 @@ fn validate_stream_checkpoint_constraints(constraints: &[(String, String)]) -> R
     ))
 }
 
-fn target_opts(target: &TargetMySqlConfig) -> Opts {
-    let builder = OptsBuilder::default()
-        .ip_or_hostname(Some(&target.host))
-        .tcp_port(target.port)
-        .user(Some(&target.user))
-        .pass(Some(&target.password))
-        .db_name(Some(&target.database))
-        .prefer_socket(false)
-        .ssl_opts(target_ssl_opts());
-    Opts::from(builder)
+fn target_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
+    target_mysql_opts(target)
 }
 
 fn mysql_error(error: mysql::Error) -> String {
@@ -280,6 +272,26 @@ fn mysql_error(error: mysql::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_target_connection_uses_configured_ca() {
+        let target = TargetMySqlConfig {
+            host: "target-db".to_string(),
+            port: 3306,
+            user: "cdc".to_string(),
+            password: "secret".to_string(),
+            database: "globalcomix".to_string(),
+            tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
+            insert_conflict_policy: crate::live::InsertConflictPolicy::Error,
+        };
+
+        let opts = target_opts(&target).expect("checkpoint target options");
+
+        assert_eq!(
+            opts.get_ssl_opts().and_then(|ssl| ssl.root_cert_path()),
+            Some(std::path::Path::new(&target.tls_ca_file))
+        );
+    }
 
     #[test]
     fn checkpoint_name_is_scoped_to_source_identity() {

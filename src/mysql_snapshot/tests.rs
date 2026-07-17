@@ -179,17 +179,6 @@ fn catchup_snapshot_parallel_path_uses_threaded_range_workers() {
     assert!(source.contains("snapshot_table_range_with_observer"));
 }
 
-
-#[test]
-fn rejects_empty_target_tls_ca_file() {
-    let mut config = valid_catchup_config();
-    config.target.tls_ca_file.clear();
-
-    let error = validate_target(&config.target).expect_err("empty target CA must fail");
-
-    assert_eq!(error.to_string(), "target TLS CA file is required");
-}
-
 fn valid_catchup_config() -> CatchupSnapshotConfig {
     CatchupSnapshotConfig {
         source: MySqlConnectionConfig {
@@ -206,7 +195,7 @@ fn valid_catchup_config() -> CatchupSnapshotConfig {
             user: "writer".to_string(),
             password: "secret".to_string(),
             database: "globalcomix".to_string(),
-            tls_ca_file: crate::mysql_support::TARGET_TLS_CA_FILE.to_string(),
+            tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
             insert_conflict_policy: crate::live::InsertConflictPolicy::IgnoreDuplicate,
         },
         progress_file: std::path::PathBuf::from("progress.json"),

@@ -65,6 +65,7 @@ fn default_sync_table_config() -> table_sync::SyncTableConfig {
         end_at: None,
         max_deletes: Some(0),
         updated_since: None,
+        plan_hash: None,
     }
 }
 
@@ -79,7 +80,20 @@ fn sync_table_option(
     if target_option(&mut config.target, flag, value)? {
         return Ok(());
     }
+    if apply_sync_table_identity_option(config, flag, value)? {
+        return Ok(());
+    }
+    if apply_sync_table_window_option(config, flag, value)? {
+        return Ok(());
+    }
+    Err(format!("unknown sync-table option: {flag}"))
+}
 
+fn apply_sync_table_identity_option(
+    config: &mut table_sync::SyncTableConfig,
+    flag: &str,
+    value: &str,
+) -> Result<bool, String> {
     match flag {
         "--table" => config.table.name = value.to_string(),
         "--primary-key" => config.table.primary_key = parse_csv_columns(value),
@@ -88,6 +102,17 @@ fn sync_table_option(
         "--mode" => config.mode = parse_sync_mode(value)?,
         "--progress-table" => config.progress_table = value.to_string(),
         "--run-id" => config.run_id = value.to_string(),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn apply_sync_table_window_option(
+    config: &mut table_sync::SyncTableConfig,
+    flag: &str,
+    value: &str,
+) -> Result<bool, String> {
+    match flag {
         "--start-after" => config.start_after = Some(parse_csv_columns(value)),
         "--end-at" => config.end_at = Some(parse_csv_columns(value)),
         "--start-after-json" => config.start_after = Some(parse_json_columns(flag, value)?),
@@ -95,10 +120,9 @@ fn sync_table_option(
         "--max-deletes" => config.max_deletes = Some(crate::parse_u64(flag, value)?),
         "--updated-at-column" => set_updated_since_column(config, value),
         "--updated-since" => set_updated_since_value(config, value),
-        other => return Err(format!("unknown sync-table option: {other}")),
+        _ => return Ok(false),
     }
-
-    Ok(())
+    Ok(true)
 }
 
 fn source_option(
@@ -129,6 +153,7 @@ fn target_option(
         "--target-user" => target.user = value.to_string(),
         "--target-password-env" => target.password = crate::read_env_password(value)?,
         "--target-database" => target.database = value.to_string(),
+        "--target-tls-ca-file" => target.tls_ca_file = value.to_string(),
         "--insert-conflict-policy" => {
             target.insert_conflict_policy = crate::parse_insert_policy(value)?
         }
@@ -261,6 +286,9 @@ fn validate_target_connection(target: &live::TargetMySqlConfig) -> Result<(), St
     if target.database.is_empty() {
         return Err("target database is required".to_string());
     }
+    if target.tls_ca_file.is_empty() {
+        return Err("target TLS CA file is required".to_string());
+    }
     Ok(())
 }
 
@@ -336,6 +364,105 @@ mod tests {
         assert_eq!(config.progress_table, "cdc.table_sync_runs");
         assert_eq!(config.run_id, "repair-20260710-01");
         assert_eq!(config.max_deletes, Some(0));
+    }
+
+    #[test]
+    fn parses_source_and_target_options_directly() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let mut config = default_sync_table_config();
+        for (flag, value) in [
+            ("--source-host", "source-db"),
+            ("--source-port", "3310"),
+            ("--source-user", "source-user"),
+            ("--source-password-env", "CDC_SYNC_SOURCE_PASSWORD"),
+            ("--source-database", "source_database"),
+            ("--target-host", "target-db"),
+            ("--target-port", "3311"),
+            ("--target-user", "target-user"),
+            ("--target-password-env", "CDC_SYNC_TARGET_PASSWORD"),
+            ("--target-database", "target_database"),
+            ("--target-tls-ca-file", "/tmp/target-ca.pem"),
+        ] {
+            sync_table_option(&mut config, flag, value).expect("connection option");
+        }
+
+        assert_eq!(config.source.host, "source-db");
+        assert_eq!(config.source.port, 3310);
+        assert_eq!(config.source.user, "source-user");
+        assert_eq!(config.source.password, "source-pass");
+        assert_eq!(config.source.database, "source_database");
+        assert_eq!(config.target.host, "target-db");
+        assert_eq!(config.target.port, 3311);
+        assert_eq!(config.target.user, "target-user");
+        assert_eq!(config.target.password, "target-pass");
+        assert_eq!(config.target.database, "target_database");
+        assert_eq!(config.target.tls_ca_file, "/tmp/target-ca.pem");
+    }
+
+    #[test]
+    fn parses_identity_and_window_options_directly() {
+        let mut config = default_sync_table_config();
+        for (flag, value) in [
+            ("--table", "releases"),
+            ("--primary-key", "tenant_id,id"),
+            ("--columns", "tenant_id,id,updated_at"),
+            ("--chunk-size", "250"),
+            ("--mode", "apply"),
+            ("--progress-table", "cdc.table_sync_progress"),
+            ("--run-id", "repair-20260716-01"),
+            ("--start-after-json", "[\"tenant,1\",\"10\"]"),
+            ("--end-at-json", "[\"tenant,1\",\"20\"]"),
+            ("--max-deletes", "5"),
+            ("--updated-at-column", "updated_at"),
+            ("--updated-since", "2026-07-16 00:00:00"),
+        ] {
+            sync_table_option(&mut config, flag, value).expect("sync-table option");
+        }
+
+        assert_eq!(config.table.name, "releases");
+        assert_eq!(config.table.primary_key, vec!["tenant_id", "id"]);
+        assert_eq!(config.table.columns, vec!["tenant_id", "id", "updated_at"]);
+        assert_eq!(config.chunk_size, 250);
+        assert_eq!(config.mode, table_sync::SyncMode::Apply);
+        assert_eq!(config.progress_table, "cdc.table_sync_progress");
+        assert_eq!(config.run_id, "repair-20260716-01");
+        assert_eq!(
+            config.start_after,
+            Some(vec!["tenant,1".to_string(), "10".to_string()])
+        );
+        assert_eq!(
+            config.end_at,
+            Some(vec!["tenant,1".to_string(), "20".to_string()])
+        );
+        assert_eq!(config.max_deletes, Some(5));
+        assert_eq!(
+            config.updated_since,
+            Some(table_sync::UpdatedSince {
+                column: "updated_at".to_string(),
+                value: "2026-07-16 00:00:00".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_direct_option_parser_errors() {
+        let mut config = default_sync_table_config();
+
+        assert_eq!(
+            sync_table_option(&mut config, "--chunk-size", "invalid").expect_err("chunk size"),
+            "--chunk-size must be an integer"
+        );
+        assert_eq!(
+            sync_table_option(&mut config, "--start-after-json", "invalid")
+                .expect_err("JSON bound"),
+            "--start-after-json must be a JSON string array: expected value at line 1 column 1"
+        );
+        assert_eq!(
+            sync_table_option(&mut config, "--bogus", "value").expect_err("unknown option"),
+            "unknown sync-table option: --bogus"
+        );
     }
 
     #[test]

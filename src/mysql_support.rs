@@ -1,6 +1,7 @@
-use crate::live::TargetMySqlConfig;
+use crate::live::{SourceBinlogConfig, TargetMySqlConfig};
 use mysql::{Opts, OptsBuilder, SslOpts};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub const SOURCE_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/source-ca.pem";
 pub const TARGET_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/do-ca.pem";
@@ -14,24 +15,71 @@ pub fn target_mysql_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
             .pass(Some(target.password.clone()))
             .db_name(Some(target.database.clone()))
             .prefer_socket(false)
-            .ssl_opts(Some(ssl_opts_from_ca(Some(&target.tls_ca_file)))),
+            .ssl_opts(Some(target_ssl_opts(target)?)),
     ))
 }
 
-pub fn target_ssl_opts() -> SslOpts {
-    ssl_opts_from_ca(Some(TARGET_TLS_CA_FILE))
+pub fn validate_target_tls_ca_file(target: &TargetMySqlConfig) -> Result<(), String> {
+    target_ssl_opts(target).map(|_| ())
 }
 
-pub fn ssl_opts_from_ca(ca_file: Option<&str>) -> SslOpts {
-    let mut ssl = SslOpts::default();
-    if let Some(ca_file) = ca_file
-        && std::path::Path::new(ca_file).exists()
-    {
-        ssl = ssl
-            .with_root_cert_path(Some(PathBuf::from(ca_file)))
-            .with_danger_skip_domain_validation(true);
+pub fn target_ssl_opts(target: &TargetMySqlConfig) -> Result<SslOpts, String> {
+    ssl_opts_from_ca(
+        &format!(
+            "target TLS CA file endpoint `{}`:{}",
+            target.host, target.port
+        ),
+        &target.tls_ca_file,
+    )
+}
+
+pub fn source_ssl_opts(source: &SourceBinlogConfig) -> Result<SslOpts, String> {
+    ssl_opts_from_ca(
+        &format!(
+            "source TLS CA file endpoint `{}`:{}",
+            source.host, source.port
+        ),
+        &source.tls_ca_file,
+    )
+}
+
+pub fn ssl_opts_from_ca(endpoint: &str, ca_file: &str) -> Result<SslOpts, String> {
+    if ca_file.is_empty() {
+        return Err(format!("{endpoint} TLS CA file is required"));
     }
-    ssl
+
+    let path = Path::new(ca_file);
+    let contents = fs::read(path)
+        .map_err(|error| format!("{endpoint} TLS CA file `{ca_file}` is unreadable: {error}"))?;
+    if contents.is_empty() {
+        return Err(format!("{endpoint} TLS CA file `{ca_file}` is empty"));
+    }
+
+    validate_ca_certificate(endpoint, ca_file, &contents)?;
+
+    Ok(SslOpts::default()
+        .with_root_cert_path(Some(PathBuf::from(ca_file)))
+        .with_danger_skip_domain_validation(true))
+}
+
+fn validate_ca_certificate(endpoint: &str, ca_file: &str, contents: &[u8]) -> Result<(), String> {
+    let is_pem = contents
+        .windows(b"-----BEGIN CERTIFICATE-----".len())
+        .any(|window| window == b"-----BEGIN CERTIFICATE-----");
+    if is_pem {
+        let certificates = native_tls::Certificate::stack_from_pem(contents)
+            .map_err(|error| format!("{endpoint} TLS CA file `{ca_file}` is invalid: {error}"))?;
+        if certificates.is_empty() {
+            return Err(format!(
+                "{endpoint} TLS CA file `{ca_file}` is invalid: contains no certificates"
+            ));
+        }
+        return Ok(());
+    }
+
+    native_tls::Certificate::from_der(contents)
+        .map(|_| ())
+        .map_err(|error| format!("{endpoint} TLS CA file `{ca_file}` is invalid: {error}"))
 }
 
 pub fn target_mysql_args(target: &TargetMySqlConfig) -> Vec<String> {
@@ -44,7 +92,8 @@ pub fn target_mysql_args(target: &TargetMySqlConfig) -> Vec<String> {
         target.user.clone(),
         format!("--password={}", target.password),
         "--ssl".to_string(),
-        "--ssl-verify-server-cert=0".to_string(),
+        format!("--ssl-ca={}", target.tls_ca_file),
+        "--ssl-verify-server-cert".to_string(),
         "--database".to_string(),
         target.database.clone(),
         "--default-character-set=utf8mb4".to_string(),
@@ -76,57 +125,130 @@ pub fn quote_sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
+/// Extracts the MySQL 8 `Create Procedure` column from admin-only SHOW CREATE
+/// PROCEDURE evidence without tuple conversion or panics on NULL/short rows.
+#[cfg(test)]
+pub(crate) fn parse_show_create_procedure_values(
+    values: &[Option<String>],
+) -> Result<String, String> {
+    values
+        .get(2)
+        .ok_or_else(|| {
+            format!(
+                "SHOW CREATE PROCEDURE returned {} columns; missing Create Procedure column",
+                values.len()
+            )
+        })?
+        .clone()
+        .ok_or_else(|| "SHOW CREATE PROCEDURE returned NULL Create Procedure metadata".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ssl_opts_from_existing_ca_skips_hostname_validation_but_keeps_ca_path() {
+    fn ssl_opts_from_invalid_ca_is_rejected() {
         let ca_path =
             std::env::temp_dir().join(format!("mariadb-mysql-cdc-test-ca-{}", std::process::id()));
         std::fs::write(&ca_path, b"test ca").unwrap();
 
-        let ssl = ssl_opts_from_ca(ca_path.to_str());
+        let error = ssl_opts_from_ca("target `db`:25060", ca_path.to_str().unwrap())
+            .expect_err("invalid CA");
 
-        assert_eq!(ssl.root_cert_path(), Some(ca_path.as_path()));
-        assert!(ssl.skip_domain_validation());
-        assert!(!ssl.accept_invalid_certs());
-
+        assert!(error.contains("target `db`:25060 TLS CA file"));
+        assert!(error.contains("invalid"));
         std::fs::remove_file(ca_path).unwrap();
     }
 
     #[test]
-    fn target_mysql_opts_uses_configured_ca() {
+    fn target_default_uses_reviewed_ca_path() {
+        assert_eq!(TargetMySqlConfig::default().tls_ca_file, TARGET_TLS_CA_FILE);
+    }
+
+    #[test]
+    fn target_mysql_opts_uses_configured_ca_without_driver_default_fallback() {
         let target = TargetMySqlConfig {
             host: "target".to_string(),
             tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
             ..TargetMySqlConfig::default()
         };
 
-        let opts = target_mysql_opts(&target).expect("target options");
+        let opts = target_mysql_opts(&target).expect("configured target CA");
+        let ssl = opts.get_ssl_opts().expect("target TLS options");
 
         assert_eq!(
-            opts.get_ssl_opts().and_then(|ssl| ssl.root_cert_path()),
+            ssl.root_cert_path(),
             Some(std::path::Path::new(&target.tls_ca_file))
         );
+        assert!(!ssl.accept_invalid_certs());
     }
 
     #[test]
-    fn target_mysql_args_disable_server_cert_verification_for_do_mysql() {
+    fn target_ssl_opts_uses_configured_ca_without_driver_default_fallback() {
+        let target = TargetMySqlConfig {
+            host: "target".to_string(),
+            tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
+            ..TargetMySqlConfig::default()
+        };
+
+        let ssl = target_ssl_opts(&target).expect("configured target CA");
+
+        assert_eq!(
+            ssl.root_cert_path(),
+            Some(std::path::Path::new(&target.tls_ca_file))
+        );
+        assert!(!ssl.accept_invalid_certs());
+    }
+
+    #[test]
+    fn target_tls_validation_rejects_missing_ca_before_connection() {
+        let target = TargetMySqlConfig {
+            host: "target-db".to_string(),
+            tls_ca_file: "/tmp/mariadb-mysql-cdc-no-such-target-ca.pem".to_string(),
+            ..TargetMySqlConfig::default()
+        };
+
+        let error = validate_target_tls_ca_file(&target).expect_err("missing target CA");
+
+        assert!(error.contains("target TLS CA file"));
+        assert!(error.contains("target-db"));
+        assert!(error.contains(&target.tls_ca_file));
+    }
+
+    #[test]
+    fn target_ssl_opts_rejects_missing_ca_with_endpoint_specific_diagnostic() {
+        let target = TargetMySqlConfig {
+            host: "target-db".to_string(),
+            tls_ca_file: "/tmp/mariadb-mysql-cdc-no-such-target-ca.pem".to_string(),
+            ..TargetMySqlConfig::default()
+        };
+
+        let error = target_ssl_opts(&target).expect_err("missing target CA");
+
+        assert!(error.contains("target TLS CA file"));
+        assert!(error.contains("target-db"));
+        assert!(error.contains(&target.tls_ca_file));
+    }
+
+    #[test]
+    fn target_mysql_args_use_configured_ca_and_server_verification() {
         let target = TargetMySqlConfig {
             host: "target".to_string(),
             port: 25060,
             user: "target_user".to_string(),
             password: "secret".to_string(),
             database: "globalcomix".to_string(),
-            tls_ca_file: TARGET_TLS_CA_FILE.to_string(),
-            insert_conflict_policy: crate::live::InsertConflictPolicy::IgnoreDuplicate,
+            tls_ca_file: "/tmp/custom-do-ca.pem".to_string(),
+            ..TargetMySqlConfig::default()
         };
 
         let args = target_mysql_args(&target);
 
         assert!(args.contains(&"--ssl".to_string()));
-        assert!(args.contains(&"--ssl-verify-server-cert=0".to_string()));
+        assert!(args.contains(&format!("--ssl-ca={}", target.tls_ca_file)));
+        assert!(args.contains(&"--ssl-verify-server-cert".to_string()));
+        assert!(!args.contains(&"--ssl-verify-server-cert=0".to_string()));
     }
 
     #[test]
@@ -148,5 +270,32 @@ mod tests {
             qualified_table_parts("globalcomix", "table_sync_progress"),
             ("globalcomix".to_string(), "table_sync_progress".to_string())
         );
+    }
+
+    #[test]
+    fn parses_mysql8_show_create_procedure_rows_without_panicking() {
+        let row = vec![
+            Some("row_conflicts_trigger_inventory".to_string()),
+            Some("".to_string()),
+            Some("CREATE PROCEDURE ...".to_string()),
+            Some("utf8mb4".to_string()),
+            Some("utf8mb4_0900_ai_ci".to_string()),
+            Some("utf8mb4_0900_ai_ci".to_string()),
+        ];
+        assert_eq!(
+            parse_show_create_procedure_values(&row).unwrap(),
+            "CREATE PROCEDURE ..."
+        );
+
+        let null_definition = vec![
+            Some("row_conflicts_trigger_inventory".to_string()),
+            Some("".to_string()),
+            None,
+            Some("utf8mb4".to_string()),
+            Some("utf8mb4_0900_ai_ci".to_string()),
+            Some("utf8mb4_0900_ai_ci".to_string()),
+        ];
+        assert!(parse_show_create_procedure_values(&null_definition).is_err());
+        assert!(parse_show_create_procedure_values(&row[..2]).is_err());
     }
 }

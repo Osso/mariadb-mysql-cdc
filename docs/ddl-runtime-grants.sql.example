@@ -1,9 +1,9 @@
--- Run this bootstrap example with admin/resolver credentials. The CREATE USER
--- statement is control-plane setup; it is not a runtime admin grant.
--- Replace <strong-generated-password> before running. Review the application
--- schema name if it is not globalcomix.
+-- Run with admin/resolver credentials. Replace the password and review the
+-- application schema before use. Runtime validation is fail-closed; it never
+-- creates or repairs control-plane objects.
 CREATE USER 'cdc_stream'@'%' IDENTIFIED BY '<strong-generated-password>' REQUIRE SSL;
 
+-- Application-schema DDL grant used by the reviewed automatic replay contract.
 GRANT
     SELECT,
     INSERT,
@@ -28,28 +28,52 @@ GRANT SELECT, INSERT, UPDATE
     ON cdc.stream_checkpoint
     TO 'cdc_stream'@'%';
 
+-- Durable row-conflict observations/resolutions: exact table scope only.
+GRANT SELECT, INSERT, UPDATE
+    ON cdc.row_conflicts
+    TO 'cdc_stream'@'%';
+
 GRANT SELECT, INSERT
     ON cdc.ddl_events
+    TO 'cdc_stream'@'%';
+
+GRANT SELECT, INSERT, UPDATE
+    ON cdc.ddl_replay_journal
+    TO 'cdc_stream'@'%';
+
+GRANT EXECUTE
+    ON PROCEDURE cdc.row_conflicts_trigger_inventory
     TO 'cdc_stream'@'%';
 
 GRANT EXECUTE
     ON PROCEDURE cdc.ddl_events_trigger_inventory
     TO 'cdc_stream'@'%';
 
--- This exact EXECUTE grant is the runtime's only ledger trigger-inventory
--- access. The account lacks TRIGGER on cdc.ddl_events (and other ledger
--- mutation privileges) and must not query information_schema.triggers directly.
--- The application-schema grant above intentionally includes TRIGGER so source
--- trigger DDL can replay automatically. The inventory procedure must remain a
--- SQL SECURITY DEFINER routine named <table>_trigger_inventory.
--- Expected global grant is USAGE only. The application-schema grant supports
--- automatic table, index, view, routine, event, trigger, rename, truncate, and
--- drop replay. Database/schema DDL remains a manual-ledger boundary because it
--- would require global CREATE/ALTER/DROP privileges.
+GRANT EXECUTE
+    ON PROCEDURE cdc.ddl_replay_journal_trigger_inventory
+    TO 'cdc_stream'@'%';
+
+-- Effective-grant acceptance contract. This is bootstrap/startup state and is
+-- validated once before source replication; event handling does not rerun SHOW
+-- GRANTS or a second grant-policy allowlist for each generated statement.
+-- * global scope: USAGE only;
+-- * exact checkpoint SELECT/INSERT/UPDATE;
+-- * exact row-conflicts SELECT/INSERT/UPDATE;
+-- * exact manual-ledger SELECT/INSERT;
+-- * exact journal SELECT/INSERT/UPDATE;
+-- * EXECUTE only on the three reviewed trigger-inventory procedures;
+-- * no GRANT OPTION, PROXY, roles, ALL, global mutation, schema-wide cdc
+--   mutation/object creation, or ledger/journal DELETE/ALTER/DROP/TRIGGER.
 --
--- Do not grant roles, PROXY, ALL, GRANT OPTION, CREATE USER, ROLE_ADMIN,
--- account/server/resource-group/tablespace administration, or schema-wide cdc
--- privileges. Do not grant UPDATE/DELETE/ALTER/DROP/TRIGGER on cdc.ddl_events.
--- For a custom schema.table ledger, grant EXECUTE on the corresponding
--- <table>_trigger_inventory procedure in that schema.
+-- The row-conflicts grant must never be widened to DELETE, ALTER, DROP, schema-wide,
+-- global, administrative, role, or GRANT OPTION access. Startup/bootstrap validates
+-- the exact table schema, guards, constraints, and effective grant before source
+-- streaming.
+--
+-- Startup calls the exact definer-safe procedure and validates its returned
+-- trigger rows. Event handling executes known internal operations directly and
+-- surfaces database errors; it does not rerun grant validation. Admin/resolver
+-- credentials independently review SHOW CREATE PROCEDURE and actual trigger
+-- rows; runtime does not require routine metadata privileges or a SHOW CREATE
+-- query.
 SHOW GRANTS FOR 'cdc_stream'@'%';

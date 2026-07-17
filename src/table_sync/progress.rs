@@ -231,11 +231,11 @@ impl SyncTableProgress {
     }
 }
 
-pub(crate) fn build_create_progress_table_sql(table: &str) -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS {} (\
-table_name VARCHAR(255) NOT NULL PRIMARY KEY,\
-last_primary_key_json TEXT NULL,\
+const CREATE_PROGRESS_TABLE_NAME_COLUMN: &str = "table_name VARCHAR(255) NOT NULL PRIMARY KEY";
+const CREATE_SYNC_RUN_TABLE_NAME_COLUMN: &str = "table_name VARCHAR(255) NOT NULL";
+const CREATE_RUN_ID_COLUMN: &str = "run_id VARCHAR(128) NOT NULL PRIMARY KEY";
+const CREATE_RUN_SPEC_COLUMN: &str = "run_spec_json LONGTEXT NOT NULL";
+const CREATE_PROGRESS_TABLE_COLUMNS: &str = "last_primary_key_json TEXT NULL,\
 chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,\
 rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,\
 total_rows BIGINT UNSIGNED NULL,\
@@ -246,9 +246,23 @@ mode VARCHAR(16) NOT NULL,\
 status VARCHAR(16) NOT NULL,\
 last_error TEXT NULL,\
 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
-updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\
-)",
-        quote_identifier_path(table)
+updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP";
+
+fn build_create_table_sql(table: &str, columns: &[&str]) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({})",
+        quote_identifier_path(table),
+        columns.join(",")
+    )
+}
+
+pub(crate) fn build_create_progress_table_sql(table: &str) -> String {
+    build_create_table_sql(
+        table,
+        &[
+            CREATE_PROGRESS_TABLE_NAME_COLUMN,
+            CREATE_PROGRESS_TABLE_COLUMNS,
+        ],
     )
 }
 
@@ -298,17 +312,9 @@ fn parse_progress_row(
     table: &str,
     output: &str,
 ) -> Result<Option<SyncTableProgress>, TableSyncError> {
-    let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+    let Some(fields) = parse_progress_fields(output, 10)? else {
         return Ok(None);
     };
-    let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 10 {
-        return Err(TableSyncError::Progress(format!(
-            "progress row has {} fields, expected 10",
-            fields.len()
-        )));
-    }
-
     Ok(Some(SyncTableProgress {
         run_id: None,
         run_spec_json: None,
@@ -326,26 +332,32 @@ fn parse_progress_row(
     }))
 }
 
+fn parse_progress_fields(
+    output: &str,
+    expected: usize,
+) -> Result<Option<Vec<&str>>, TableSyncError> {
+    let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != expected {
+        return Err(TableSyncError::Progress(format!(
+            "progress row has {} fields, expected {expected}",
+            fields.len()
+        )));
+    }
+    Ok(Some(fields))
+}
+
 pub(crate) fn build_create_sync_run_table_sql(table: &str) -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS {} (\
-run_id VARCHAR(128) NOT NULL PRIMARY KEY,\
-table_name VARCHAR(255) NOT NULL,\
-run_spec_json LONGTEXT NOT NULL,\
-last_primary_key_json TEXT NULL,\
-chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,\
-rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,\
-total_rows BIGINT UNSIGNED NULL,\
-inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,\
-updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,\
-extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,\
-mode VARCHAR(16) NOT NULL,\
-status VARCHAR(16) NOT NULL,\
-last_error TEXT NULL,\
-created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
-updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\
-)",
-        quote_identifier_path(table)
+    build_create_table_sql(
+        table,
+        &[
+            CREATE_RUN_ID_COLUMN,
+            CREATE_SYNC_RUN_TABLE_NAME_COLUMN,
+            CREATE_RUN_SPEC_COLUMN,
+            CREATE_PROGRESS_TABLE_COLUMNS,
+        ],
     )
 }
 
@@ -433,27 +445,13 @@ pub(crate) fn build_sync_run_upsert_sql(
     progress_table: &str,
     progress: &SyncTableProgress,
 ) -> String {
-    let last_primary_key = progress
-        .last_primary_key
-        .as_ref()
-        .map(|values| json_string(values))
-        .unwrap_or_default();
+    let (run_id, run_spec_json, last_primary_key) = sync_run_upsert_identity(progress);
     format!(
         "INSERT INTO {} (run_id,table_name,run_spec_json,last_primary_key_json,chunks,rows_scanned,total_rows,inserts_applied,updates_applied,extra_target_rows,mode,status,last_error) VALUES ({},{},{},{},{},{},{},{},{},{},{},{},NULL) ON DUPLICATE KEY UPDATE last_primary_key_json=VALUES(last_primary_key_json),chunks=VALUES(chunks),rows_scanned=VALUES(rows_scanned),total_rows=VALUES(total_rows),inserts_applied=VALUES(inserts_applied),updates_applied=VALUES(updates_applied),extra_target_rows=VALUES(extra_target_rows),status=VALUES(status),last_error=NULL",
         quote_identifier_path(progress_table),
-        quote_sql_literal(
-            progress
-                .run_id
-                .as_deref()
-                .expect("sync run progress requires run id"),
-        ),
+        quote_sql_literal(run_id),
         quote_sql_literal(&progress.table),
-        quote_sql_literal(
-            progress
-                .run_spec_json
-                .as_deref()
-                .expect("sync run progress requires run specification"),
-        ),
+        quote_sql_literal(run_spec_json),
         nullable_sql_literal(&last_primary_key),
         progress.chunks,
         progress.rows_scanned,
@@ -464,6 +462,23 @@ pub(crate) fn build_sync_run_upsert_sql(
         quote_sql_literal(progress.mode.as_str()),
         quote_sql_literal(progress.status.as_str())
     )
+}
+
+fn sync_run_upsert_identity(progress: &SyncTableProgress) -> (&str, &str, String) {
+    let run_id = progress
+        .run_id
+        .as_deref()
+        .expect("sync run progress requires run id");
+    let run_spec_json = progress
+        .run_spec_json
+        .as_deref()
+        .expect("sync run progress requires run specification");
+    let last_primary_key = progress
+        .last_primary_key
+        .as_ref()
+        .map(|values| json_string(values))
+        .unwrap_or_default();
+    (run_id, run_spec_json, last_primary_key)
 }
 
 fn build_sync_run_error_sql(progress_table: &str, run_id: &str, error: &TableSyncError) -> String {
@@ -479,17 +494,9 @@ fn parse_sync_run_row(
     run_id: &str,
     output: &str,
 ) -> Result<Option<SyncTableProgress>, TableSyncError> {
-    let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+    let Some(fields) = parse_progress_fields(output, 12)? else {
         return Ok(None);
     };
-    let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 12 {
-        return Err(TableSyncError::Progress(format!(
-            "progress row has {} fields, expected 12",
-            fields.len()
-        )));
-    }
-
     Ok(Some(SyncTableProgress {
         run_id: Some(run_id.to_string()),
         table: fields[0].to_string(),
@@ -601,16 +608,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_progress_table_sql_allows_cdc_schema_prefix() {
-        let sql = build_create_sync_run_table_sql("cdc.table_sync_runs");
-
-        assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS `cdc`.`table_sync_runs`"));
-        assert!(sql.contains("run_id VARCHAR(128) NOT NULL PRIMARY KEY"));
-        assert!(sql.contains("table_name VARCHAR(255) NOT NULL"));
-        assert!(sql.contains("run_spec_json LONGTEXT NOT NULL"));
-        assert!(sql.contains("last_primary_key_json TEXT"));
-        assert!(sql.contains("total_rows BIGINT UNSIGNED NULL"));
-        assert!(sql.contains("status VARCHAR(16)"));
+    fn create_table_sql_preserves_exact_contract() {
+        assert_eq!(
+            build_create_progress_table_sql("cdc.table_sync_progress"),
+            "CREATE TABLE IF NOT EXISTS `cdc`.`table_sync_progress` (table_name VARCHAR(255) NOT NULL PRIMARY KEY,last_primary_key_json TEXT NULL,chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,total_rows BIGINT UNSIGNED NULL,inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,mode VARCHAR(16) NOT NULL,status VARCHAR(16) NOT NULL,last_error TEXT NULL,created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)"
+        );
+        assert_eq!(
+            build_create_sync_run_table_sql("cdc.table_sync_runs"),
+            "CREATE TABLE IF NOT EXISTS `cdc`.`table_sync_runs` (run_id VARCHAR(128) NOT NULL PRIMARY KEY,table_name VARCHAR(255) NOT NULL,run_spec_json LONGTEXT NOT NULL,last_primary_key_json TEXT NULL,chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,total_rows BIGINT UNSIGNED NULL,inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,mode VARCHAR(16) NOT NULL,status VARCHAR(16) NOT NULL,last_error TEXT NULL,created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)"
+        );
     }
 
     #[test]

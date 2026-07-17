@@ -1,8 +1,8 @@
 use super::conflict::{execute_row_statement, record_duplicate_conflict};
 use super::model::{
-    row_error, DeleteRowsEvent, DuplicateConflictInput, RowConflictContext, RowImage, RowOperation,
-    RowResult, RowTableMap, RowUpdate, TableMapEvent, TableMapRegistry, UpdateRowsEvent,
-    WriteRowsEvent,
+    DeleteRowsEvent, DuplicateConflictInput, RowConflictContext, RowImage, RowOperation, RowResult,
+    RowTableMap, RowUpdate, TableMapEvent, TableMapRegistry, UpdateRowsEvent, WriteRowsEvent,
+    row_error,
 };
 use super::sql::{
     build_delete_statement, build_insert_statement, build_update_statement, primary_key_values,
