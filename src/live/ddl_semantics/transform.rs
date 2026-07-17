@@ -554,7 +554,10 @@ fn parse_observed_column_type(
     index += 1;
     let mut column_type = data_type.clone();
     if tokens.get(index).map(String::as_str) == Some("(") {
-        let length = require_identifier(tokens, index + 1, "column type length")?;
+        let length = tokens
+            .get(index + 1)
+            .cloned()
+            .ok_or_else(|| "missing column type length".to_string())?;
         let parsed_length = length
             .parse::<u32>()
             .map_err(|_| format!("invalid column type length {length}"))?;
