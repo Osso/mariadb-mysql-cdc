@@ -173,7 +173,7 @@ fn decodes_null_inventory_values_as_empty_optional_fields() {
 fn reports_malformed_inventory_rows_with_row_type() {
     let error = parse_column_row(&["accounts".to_string()]).expect_err("short column row");
 
-    assert_eq!(error.to_string(), "column row has 1 fields, expected 9");
+    assert_eq!(error.to_string(), "column row has 1 fields, expected 10");
 }
 
 #[test]
