@@ -271,9 +271,6 @@ fn validate_source_connection(
     if config.database.is_empty() {
         return Err("source database is required".to_string());
     }
-    if config.tls_ca_file.as_deref().is_none_or(str::is_empty) {
-        return Err("source TLS CA file is required".to_string());
-    }
     Ok(())
 }
 
@@ -481,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_source_tls_ca_file() {
+    fn accepts_omitted_source_tls_ca_file() {
         set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
         set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
 
@@ -492,9 +489,22 @@ mod tests {
             .expect("source TLS CA option");
         values.drain(index..=index + 1);
 
-        let error = parse_sync_table_config(values).expect_err("missing source TLS CA");
+        let config = parse_sync_table_config(values).expect("omitted source CA should be accepted");
 
-        assert_eq!(error, "source TLS CA file is required");
+        assert_eq!(config.source.tls_ca_file, None);
+    }
+
+    #[test]
+    fn rejects_missing_target_tls_ca_file() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let mut values = required_args([]);
+        values.extend(args(["--target-tls-ca-file", ""]));
+
+        let error = parse_sync_table_config(values).expect_err("missing target TLS CA");
+
+        assert_eq!(error, "target TLS CA file is required");
     }
 
     #[test]

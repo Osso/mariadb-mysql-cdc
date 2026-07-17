@@ -228,7 +228,7 @@ fn recent_update_retry_restarts_from_beginning_to_catch_newly_eligible_rows() {
 }
 
 #[test]
-fn core_config_rejects_missing_source_tls_ca_file() {
+fn core_config_accepts_plaintext_source_without_tls_ca() {
     let config = SyncTableConfig {
         source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
         target: crate::live::TargetMySqlConfig::default(),
@@ -244,12 +244,7 @@ fn core_config_rejects_missing_source_tls_ca_file() {
         plan_hash: None,
     };
 
-    let error = validate_sync_table_config(&config).expect_err("missing source TLS CA");
-
-    assert_eq!(
-        error.to_string(),
-        "invalid sync table: source TLS CA file is required"
-    );
+    validate_sync_table_config(&config).expect("plaintext source without CA should be accepted");
 }
 
 #[test]

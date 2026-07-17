@@ -21,6 +21,22 @@ fn formats_mysql_values_like_snapshot_text_rows() {
 }
 
 #[test]
+fn shared_source_opts_accept_plaintext_without_tls_ca() {
+    let opts = base_opts(
+        "source-db",
+        3306,
+        "reader",
+        "secret",
+        "globalcomix",
+        None,
+        "source `source-db`:3306",
+    )
+    .expect("plaintext source options");
+
+    assert!(opts.get_ssl_opts().is_none());
+}
+
+#[test]
 fn target_opts_require_authenticated_tls() {
     let target = TargetMySqlConfig {
         host: "target".to_string(),
@@ -43,7 +59,10 @@ fn target_opts_require_authenticated_tls() {
     )
     .expect("target TLS options");
 
-    assert!(opts.get_ssl_opts().is_some());
+    let ssl = opts.get_ssl_opts().expect("target TLS options");
+
+    assert!(!ssl.skip_domain_validation());
+    assert!(!ssl.accept_invalid_certs());
 }
 
 #[test]
