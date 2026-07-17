@@ -62,23 +62,28 @@ broader DDL coverage and operational proof gaps listed below.
 
 ### Fixture-backed CREATE TABLE boundary
 
-- [x] The exact unqualified harness `CREATE TABLE accounts` statement has a
-      typed AST and deterministic MySQL 8 renderer covering only `BIGINT`,
-      `VARCHAR(length)`, `NOT NULL`, inline `PRIMARY KEY`, a named ordinary
-      `KEY`, and `ENGINE=InnoDB`.
-- [x] Production `LiveDdlSemanticInventory` captures this exact fixture's source
-      schema charset/collation only between fences whose before/after source
-      master coordinate exactly brackets the event file/end position; the target
+- [x] The strict unqualified fixture `CREATE TABLE` grammar (the harness
+      exercises `accounts`) accepts identifiers matching
+      `[A-Za-z_][A-Za-z0-9_]*` after tokenization, with backtick quoting allowed,
+      comments/double quotes/qualification rejected, one or more `BIGINT` or
+      `VARCHAR(positive canonical decimal length)` `NOT NULL` columns with at
+      least one inline `PRIMARY KEY`, zero or more one-column named ordinary
+      `KEY` items, and `ENGINE=InnoDB` with an optional semicolon. It records a
+      typed AST and deterministic MySQL 8 SQL.
+- [x] Production `LiveDdlSemanticInventory` captures source schema
+      charset/collation only between fences whose before/after source master
+      coordinate exactly equals the event file/end position; the target
       inventory proves the table is absent before and after capture.
 - [x] The evidence persists source `character_set` and `collation`, renders
       explicit `DEFAULT CHARACTER SET ... COLLATE ...` SQL, and derives a
-      deterministic expected post-state from the typed AST and captured defaults.
-- [x] Runtime admission executes this exact fixture only after the evidence gates,
-      validates the exact observed post-state, and checkpoints it. Unsupported
-      `CREATE TABLE` syntax remains `translation_pending` with zero target DDL and
-      zero checkpoint execution.
+      deterministic expected post-state from the typed AST and captured defaults;
+      canonical table evidence sorts indexes by index name.
+- [x] Runtime admission executes an admitted grammar form only after the evidence
+      gates, validates the exact observed post-state, and checkpoints it.
+      Unsupported `CREATE TABLE` variants remain `translation_pending` with zero
+      target DDL and zero checkpoint execution.
 
-This fixture-backed contract does not admit other `CREATE TABLE` syntax.
+No other `CREATE TABLE` syntax is admitted.
 
 ### Execution and recovery
 
@@ -143,10 +148,11 @@ The current slice is covered by:
 
 - [x] `src/live/ddl_semantics/tests.rs` — deterministic production `ADD COLUMN`,
       `ADD KEY`, `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` SQL/no-op behavior,
-      typed ALTER AST/post-state behavior and rename boundaries, plus the exact
-      harness `CREATE TABLE` typed AST/renderer, fenced source-default evidence,
-      exact-coordinate rejection, explicit charset/collation SQL, deterministic
-      post-state, exact-grammar rejection, and runtime-admission contract.
+      typed ALTER AST/post-state behavior and rename boundaries, plus the strict
+      fixture `CREATE TABLE` grammar/typed AST/renderer, fenced source-default
+      evidence, exact-coordinate rejection, explicit charset/collation SQL,
+      deterministic post-state with sorted indexes, exact-grammar rejection, and
+      runtime-admission contract.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
       generated SQL and preserves journal/checkpoint ordering for the exact
       fixture; unsupported CREATE remains pending without target/checkpoint

@@ -19,11 +19,14 @@ Production streaming requires `binlog_format=ROW` and
 
 Automatic DDL admission currently covers four narrow slices: explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX`
-with complete parsed options and no FK dependency; the exact unqualified fixture
-`CREATE TABLE accounts` form with only `BIGINT`, `VARCHAR(length)`, `NOT NULL`,
-inline `PRIMARY KEY`, a named ordinary `KEY`, and `ENGINE=InnoDB`; the
-production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`
-for
+with complete parsed options and no FK dependency; a strict unqualified fixture
+`CREATE TABLE` grammar (the harness exercises `accounts`) whose identifiers match
+`[A-Za-z_][A-Za-z0-9_]*` after tokenization, with backtick quoting allowed,
+comments/double quotes/qualification rejected, one or more `BIGINT` or
+`VARCHAR(positive canonical decimal length)` `NOT NULL` columns with at least one
+inline `PRIMARY KEY`, zero or more one-column named ordinary `KEY` items, and
+`ENGINE=InnoDB` with an optional semicolon; the production-observed unqualified
+multi-clause `ALTER TABLE` form with `ADD COLUMN` for
 `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`,
 `NULL`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY` or
 `ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with ASCII-case-insensitive target
@@ -32,11 +35,11 @@ case-variant no-ops; and the production-observed unqualified multi-clause `ALTER
 COLUMN IF EXISTS ...` form. The implemented ALTER path records a canonical typed
 clause AST and derives expected post-state by applying that AST to a fenced target
 pre-state, so historical replay does not require a live source head at the event
-coordinate. For the exact CREATE fixture, source charset/collation are read
-between exact event-coordinate fences, persisted in evidence, rendered explicitly,
-and checked against target absence before and after capture plus the exact observed
-post-state. Unsupported CREATE syntax remains `translation_pending` with no target
-execution or checkpoint advance. The rename slice selects executable clauses from
+coordinate. For admitted CREATE TABLE, source charset/collation are read between exact
+event-coordinate fences, persisted in evidence, rendered explicitly, and checked
+against target absence before and after capture plus the exact observed post-state;
+canonical table evidence sorts indexes by index name. Unsupported CREATE variants
+remain `translation_pending` with no target execution or checkpoint advance. The rename slice selects executable clauses from
 target pre-state and emits MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
 `cdc.ddl_replay_journal` as `translation_pending` with sentinel/no evidence;
 translator availability promotes that same row once to `prepared`, after which
