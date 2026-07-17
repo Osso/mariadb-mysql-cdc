@@ -505,6 +505,30 @@ pub(crate) fn fresh_run_id(prefix: &str) -> String {
     format!("{prefix}-{millis}-{}-{sequence}", std::process::id())
 }
 
+fn phase_name(phase: SyncPhase) -> &'static str {
+    match phase {
+        SyncPhase::All => "all",
+        SyncPhase::DeleteExtras => "delete-extras",
+        SyncPhase::InsertMissing => "insert-missing",
+        SyncPhase::UpdateDivergent => "update-divergent",
+        SyncPhase::Verify => "verify",
+    }
+}
+
+fn child_run_id(run_id: &str, table: &str) -> String {
+    let slug = table
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("{run_id}-{slug}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,28 +579,4 @@ mod tests {
         assert!(!ssl.skip_domain_validation());
         assert!(!ssl.accept_invalid_certs());
     }
-}
-
-fn phase_name(phase: SyncPhase) -> &'static str {
-    match phase {
-        SyncPhase::All => "all",
-        SyncPhase::DeleteExtras => "delete-extras",
-        SyncPhase::InsertMissing => "insert-missing",
-        SyncPhase::UpdateDivergent => "update-divergent",
-        SyncPhase::Verify => "verify",
-    }
-}
-
-fn child_run_id(run_id: &str, table: &str) -> String {
-    let slug = table
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    format!("{run_id}-{slug}")
 }
