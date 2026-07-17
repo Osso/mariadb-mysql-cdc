@@ -136,6 +136,7 @@ fn source_option(
         "--source-user" => source.user = value.to_string(),
         "--source-password-env" => source.password = crate::read_env_password(value)?,
         "--source-database" => source.database = value.to_string(),
+        "--source-tls-ca-file" => source.tls_ca_file = Some(value.to_string()),
         _ => return Ok(false),
     }
 
@@ -270,6 +271,9 @@ fn validate_source_connection(
     if config.database.is_empty() {
         return Err("source database is required".to_string());
     }
+    if config.tls_ca_file.as_deref().is_none_or(str::is_empty) {
+        return Err("source TLS CA file is required".to_string());
+    }
     Ok(())
 }
 
@@ -333,6 +337,8 @@ mod tests {
             "CDC_SYNC_SOURCE_PASSWORD",
             "--source-database",
             "globalcomix",
+            "--source-tls-ca-file",
+            "/tmp/source-ca.pem",
             "--target-host",
             "target-db",
             "--target-user",
@@ -354,6 +360,10 @@ mod tests {
 
         assert_eq!(config.source.host, "source-db");
         assert_eq!(config.source.password, "source-pass");
+        assert_eq!(
+            config.source.tls_ca_file.as_deref(),
+            Some("/tmp/source-ca.pem")
+        );
         assert_eq!(config.target.host, "target-db");
         assert_eq!(config.target.password, "target-pass");
         assert_eq!(config.table.name, "releases");
@@ -378,6 +388,7 @@ mod tests {
             ("--source-user", "source-user"),
             ("--source-password-env", "CDC_SYNC_SOURCE_PASSWORD"),
             ("--source-database", "source_database"),
+            ("--source-tls-ca-file", "/tmp/source-ca.pem"),
             ("--target-host", "target-db"),
             ("--target-port", "3311"),
             ("--target-user", "target-user"),
@@ -393,6 +404,10 @@ mod tests {
         assert_eq!(config.source.user, "source-user");
         assert_eq!(config.source.password, "source-pass");
         assert_eq!(config.source.database, "source_database");
+        assert_eq!(
+            config.source.tls_ca_file.as_deref(),
+            Some("/tmp/source-ca.pem")
+        );
         assert_eq!(config.target.host, "target-db");
         assert_eq!(config.target.port, 3311);
         assert_eq!(config.target.user, "target-user");
@@ -466,6 +481,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_source_tls_ca_file() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let mut values = required_args([]);
+        let index = values
+            .iter()
+            .position(|value| value == "--source-tls-ca-file")
+            .expect("source TLS CA option");
+        values.drain(index..=index + 1);
+
+        let error = parse_sync_table_config(values).expect_err("missing source TLS CA");
+
+        assert_eq!(error, "source TLS CA file is required");
+    }
+
+    #[test]
     fn rejects_missing_run_id() {
         set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
         set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
@@ -479,6 +511,8 @@ mod tests {
             "CDC_SYNC_SOURCE_PASSWORD",
             "--source-database",
             "globalcomix",
+            "--source-tls-ca-file",
+            "/tmp/source-ca.pem",
             "--target-host",
             "target-db",
             "--target-user",
@@ -678,6 +712,8 @@ mod tests {
             "CDC_SYNC_SOURCE_PASSWORD",
             "--source-database",
             "globalcomix",
+            "--source-tls-ca-file",
+            "/tmp/source-ca.pem",
             "--target-host",
             "target-db",
             "--target-user",
