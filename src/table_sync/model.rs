@@ -127,6 +127,16 @@ pub struct SyncRunOptions {
 }
 
 pub(crate) fn validate_sync_table_config(config: &SyncTableConfig) -> Result<(), TableSyncError> {
+    if config
+        .source
+        .tls_ca_file
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(TableSyncError::InvalidTable(
+            "source TLS CA file is required".to_string(),
+        ));
+    }
     if config.updated_since.is_some() && (config.start_after.is_some() || config.end_at.is_some()) {
         return Err(TableSyncError::InvalidTable(
             "updated_since cannot be combined with start_after or end_at".to_string(),

@@ -228,6 +228,31 @@ fn recent_update_retry_restarts_from_beginning_to_catch_newly_eligible_rows() {
 }
 
 #[test]
+fn core_config_rejects_missing_source_tls_ca_file() {
+    let config = SyncTableConfig {
+        source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
+        target: crate::live::TargetMySqlConfig::default(),
+        table: account_table_with_updated_at(),
+        chunk_size: 10,
+        mode: SyncMode::DryRun,
+        progress_table: "cdc.table_sync_runs".to_string(),
+        run_id: "test-run".to_string(),
+        start_after: None,
+        end_at: None,
+        max_deletes: Some(0),
+        updated_since: None,
+        plan_hash: None,
+    };
+
+    let error = validate_sync_table_config(&config).expect_err("missing source TLS CA");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid sync table: source TLS CA file is required"
+    );
+}
+
+#[test]
 fn core_config_rejects_updated_since_with_primary_key_bounds() {
     let config = SyncTableConfig {
         source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
