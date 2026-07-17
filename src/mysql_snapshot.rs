@@ -570,12 +570,6 @@ fn validate_connection(
             "{role} database is required"
         )));
     }
-    if config.tls_ca_file.as_deref().is_none_or(str::is_empty) {
-        return Err(CatchupSnapshotError::Config(format!(
-            "{role} TLS CA file is required"
-        )));
-    }
-
     Ok(())
 }
 
@@ -617,8 +611,8 @@ fn read_snapshot_tables(
         user: config.source.user.clone(),
         password: config.source.password.clone(),
         endpoint_role: InventoryEndpointRole::Source,
-        use_tls: true,
-        tls_ca_file: config.source.tls_ca_file.clone(),
+        use_tls: false,
+        tls_ca_file: None,
         ..InventoryConfig::default()
     };
     let reader = MariaDbInventoryReader::new(inventory_config);

@@ -1,5 +1,7 @@
 use super::progress_log::format_catchup_chunk_progress;
 use super::*;
+use crate::mysql_client::PersistentMySqlSource;
+use crate::mysql_support::target_mysql_opts;
 use crate::snapshot::SnapshotChunkProgress;
 
 #[test]
@@ -115,13 +117,63 @@ fn catchup_table_mode_uses_parallel_only_when_requested() {
 }
 
 #[test]
-fn rejects_missing_source_tls_ca_file() {
+fn catchup_snapshot_accepts_plaintext_source_without_tls_ca() {
     let mut config = valid_catchup_config();
     config.source.tls_ca_file = None;
 
-    let error = validate_config(&config).expect_err("missing source TLS CA");
+    validate_config(&config).expect("plaintext source without CA should be accepted");
+}
 
-    assert_eq!(error.to_string(), "source TLS CA file is required");
+#[test]
+fn catchup_source_inventory_uses_plaintext_without_tls_ca() {
+    let mut config = valid_catchup_config();
+    config.source.host = "127.0.0.1".to_string();
+    config.source.port = 1;
+    config.source.tls_ca_file = None;
+
+    let error = read_snapshot_tables(&config).expect_err("source inventory connection should fail");
+    let message = error.to_string();
+
+    assert!(message.contains("inventory failed"));
+    assert!(!message.contains("TLS CA file"));
+}
+
+#[test]
+fn persistent_snapshot_source_uses_plaintext_without_tls_ca() {
+    let mut source = valid_catchup_config().source;
+    source.host = "127.0.0.1".to_string();
+    source.port = 1;
+    source.tls_ca_file = None;
+
+    let error = match PersistentMySqlSource::new(&source) {
+        Ok(_) => panic!("source connection should fail"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(message.contains("failed to connect to source mysql"));
+    assert!(!message.contains("TLS CA file"));
+}
+
+#[test]
+fn catchup_target_still_requires_tls_ca() {
+    let mut config = valid_catchup_config();
+    config.target.tls_ca_file = String::new();
+
+    let error = validate_config(&config).expect_err("missing target TLS CA");
+
+    assert_eq!(error.to_string(), "target TLS CA file is required");
+}
+
+#[test]
+fn catchup_target_dns_keeps_hostname_verification() {
+    let target = valid_catchup_config().target;
+
+    let opts = target_mysql_opts(&target).expect("target TLS opts");
+    let ssl = opts.get_ssl_opts().expect("target TLS configured");
+
+    assert!(!ssl.skip_domain_validation());
+    assert!(!ssl.accept_invalid_certs());
 }
 
 #[test]
