@@ -966,6 +966,127 @@ fn fixture_create_table_evidence_captures_fenced_source_defaults_and_explicit_sq
 }
 
 #[test]
+fn fixture_create_table_expected_post_state_matches_observed_inventory_exactly() {
+    let source_sql = "CREATE TABLE accounts (\
+        id BIGINT NOT NULL PRIMARY KEY, \
+        email VARCHAR(255) NOT NULL, \
+        payload VARCHAR(64) NOT NULL, \
+        KEY idx_accounts_payload (payload)\
+    ) ENGINE=InnoDB";
+    let operation = parse_ddl_operation(source_sql).expect("fixture CREATE TABLE operation");
+    let absent = SemanticSchemaSnapshot {
+        inventory: SchemaInventory {
+            schema: "fixture_cdc".to_string(),
+            tables: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            views: Vec::new(),
+            triggers: Vec::new(),
+            routines: Vec::new(),
+            events: Vec::new(),
+        },
+        table_runtime: Default::default(),
+    };
+    let coordinate = crate::inventory::SourceMasterCoordinate {
+        file: "mysqld-bin.000777".to_string(),
+        position: 180,
+    };
+    let defaults = crate::inventory::SchemaDefaults {
+        character_set: "utf8mb4".to_string(),
+        collation: "utf8mb4_unicode_ci".to_string(),
+    };
+    let evidence = build_fenced_create_table_evidence(
+        &operation,
+        &absent,
+        &defaults,
+        &coordinate.file,
+        coordinate.position,
+        &coordinate,
+        &coordinate,
+    )
+    .expect("fixture CREATE TABLE evidence");
+    let observed = SemanticSchemaSnapshot {
+        inventory: SchemaInventory {
+            schema: "fixture_cdc".to_string(),
+            tables: vec![TableInventory {
+                name: "accounts".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                engine: Some("InnoDB".to_string()),
+                collation: Some("utf8mb4_unicode_ci".to_string()),
+                primary_key: vec!["id".to_string()],
+                columns: vec![
+                    ColumnInventory {
+                        name: "id".to_string(),
+                        ordinal_position: 1,
+                        column_type: "bigint".to_string(),
+                        data_type: "bigint".to_string(),
+                        is_nullable: false,
+                        default_value: None,
+                        extra: String::new(),
+                        comment: String::new(),
+                        generated: None,
+                    },
+                    ColumnInventory {
+                        name: "email".to_string(),
+                        ordinal_position: 2,
+                        column_type: "varchar(255)".to_string(),
+                        data_type: "varchar".to_string(),
+                        is_nullable: false,
+                        default_value: None,
+                        extra: String::new(),
+                        comment: String::new(),
+                        generated: None,
+                    },
+                    ColumnInventory {
+                        name: "payload".to_string(),
+                        ordinal_position: 3,
+                        column_type: "varchar(64)".to_string(),
+                        data_type: "varchar".to_string(),
+                        is_nullable: false,
+                        default_value: None,
+                        extra: String::new(),
+                        comment: String::new(),
+                        generated: None,
+                    },
+                ],
+            }],
+            indexes: vec![IndexInventory {
+                table: "accounts".to_string(),
+                name: "idx_accounts_payload".to_string(),
+                unique: false,
+                index_type: "BTREE".to_string(),
+                visible: true,
+                comment: None,
+                columns: vec![IndexColumnInventory {
+                    name: "payload".to_string(),
+                    sequence: 1,
+                    prefix_length: None,
+                    collation: Some("A".to_string()),
+                    order: "ASC".to_string(),
+                }],
+            }],
+            foreign_keys: Vec::new(),
+            views: Vec::new(),
+            triggers: Vec::new(),
+            routines: Vec::new(),
+            events: Vec::new(),
+        },
+        table_runtime: Default::default(),
+    };
+
+    let observed_state = observe_operation_state(&observed, &operation)
+        .expect("observed CREATE TABLE post-state");
+    assert_eq!(observed_state, evidence.expected_post_state);
+
+    let mut drifted = observed;
+    drifted.inventory.tables[0].collation = Some("utf8mb4_general_ci".to_string());
+    assert_ne!(
+        observe_operation_state(&drifted, &operation).expect("drifted observed state"),
+        evidence.expected_post_state
+    );
+}
+
+#[test]
 fn fixture_create_accounts_table_has_typed_ast_and_deterministic_mysql8_sql() {
     let source_sql = "CREATE TABLE accounts (\
         id BIGINT NOT NULL PRIMARY KEY, \
