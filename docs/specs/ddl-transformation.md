@@ -40,7 +40,8 @@ allowlist.
 - [x] Set journal `transformation_version` and nullable `generated_sql` from the actual transformation before `prepared`; proven no-ops persist `generated_sql = NULL`.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
 
-This is a production-derived ALTER TABLE slice, not full ALTER TABLE or the full
+This is a production-derived ALTER TABLE slice plus one exact fixture CREATE
+TABLE admission, not full ALTER TABLE, generic CREATE TABLE, or the full
 MariaDB-to-MySQL 8 transformation pipeline. Coordinate-anchored reconstruction
 of historical source schema lineage is explicitly excluded from the current
 cycle. The translator may use only semantics completely represented by the
@@ -61,23 +62,21 @@ broader DDL coverage and operational proof gaps listed below.
 
 ### Fixture-backed CREATE TABLE boundary
 
-- [x] The exact harness `CREATE TABLE accounts` statement has a test-scoped typed
-      AST and deterministic MySQL 8 renderer covering only `BIGINT`,
-      `VARCHAR(length)`, `NOT NULL`, inline `PRIMARY KEY`, ordinary named `KEY`,
-      and `ENGINE=InnoDB`.
-- [x] Production `LiveDdlSemanticInventory` can capture this exact fixture's
-      source schema defaults only inside a fence whose before/after source master
-      coordinate exactly brackets the event file/end position; the target
-      inventory must also prove the table is absent before and after capture.
-- [x] The evidence persists source `character_set` and `collation` in the
-      canonical AST, emits explicit `DEFAULT CHARACTER SET ... COLLATE ...`
-      SQL, and derives a deterministic expected post-state from the typed AST
-      and captured defaults.
-- [x] Runtime transform/admission remains disabled for this fixture: the stream
-      stays `translation_pending` with zero target DDL and zero checkpoint
-      execution. This slice does not claim real-engine or deployment coverage;
-      any future admission must retain the target-absence and deterministic
-      post-state gates.
+- [x] The exact unqualified harness `CREATE TABLE accounts` statement has a
+      typed AST and deterministic MySQL 8 renderer covering only `BIGINT`,
+      `VARCHAR(length)`, `NOT NULL`, inline `PRIMARY KEY`, a named ordinary
+      `KEY`, and `ENGINE=InnoDB`.
+- [x] Production `LiveDdlSemanticInventory` captures this exact fixture's source
+      schema charset/collation only between fences whose before/after source
+      master coordinate exactly brackets the event file/end position; the target
+      inventory proves the table is absent before and after capture.
+- [x] The evidence persists source `character_set` and `collation`, renders
+      explicit `DEFAULT CHARACTER SET ... COLLATE ...` SQL, and derives a
+      deterministic expected post-state from the typed AST and captured defaults.
+- [x] Runtime admission executes this exact fixture only after the evidence gates,
+      validates the exact observed post-state, and checkpoints it. Unsupported
+      `CREATE TABLE` syntax remains `translation_pending` with zero target DDL and
+      zero checkpoint execution.
 
 This fixture-backed contract does not admit other `CREATE TABLE` syntax.
 
@@ -147,11 +146,16 @@ The current slice is covered by:
       typed ALTER AST/post-state behavior and rename boundaries, plus the exact
       harness `CREATE TABLE` typed AST/renderer, fenced source-default evidence,
       exact-coordinate rejection, explicit charset/collation SQL, deterministic
-      post-state, and disabled runtime-admission contract.
+      post-state, exact-grammar rejection, and runtime-admission contract.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
-      generated SQL and preserves journal/checkpoint ordering; the fixture
-      `CREATE TABLE` delegates to the production transformer and remains pending
-      without target/checkpoint execution.
+      generated SQL and preserves journal/checkpoint ordering for the exact
+      fixture; unsupported CREATE remains pending without target/checkpoint
+      execution.
+- [x] `scripts/cdc-integration-harness.py --scenario create-table-crash-restart` —
+      real differing-default MariaDB/MySQL fixture admission, target-absence
+      evidence, explicit charset/collation SQL, exact observed post-state,
+      post-DDL/pre-applied crash, prepared-state restart, exact checkpoint, and
+      idempotent replay with one target CREATE execution.
 - [x] `scripts/cdc-integration-harness.py --scenario production-alter-table` —
       real MariaDB/MySQL replay of five checkpointed ALTER events, including
       VARCHAR/DATETIME/SMALLINT column parity, comments, non-unique and unique
@@ -161,10 +165,10 @@ The current slice is covered by:
       unique-prefix option remains `translation_pending` with zero target
       execution and unchanged checkpoint.
 
-These tests prove only the observed ALTER slice, the fixture evidence seam, and
-existing narrow DDL paths. They do not prove full ALTER TABLE, the broader
-transformation contract, real-engine compatibility, a full MariaDB/MySQL matrix,
-or deployment safety.
+These tests prove only the observed ALTER slice, the exact fixture CREATE TABLE
+admission, the real differing-default crash/restart scenario, and existing narrow
+DDL paths. They do not prove full ALTER TABLE, generic CREATE TABLE, the broader
+transformation contract, a full MariaDB/MySQL matrix, or deployment safety.
 
 ## Known gaps (current cycle)
 
@@ -175,8 +179,8 @@ or deployment safety.
 - [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
       retired manual DDL ledger without restoring manual replay.
 - [ ] Build the broader production-derived DDL corpus and real MariaDB/MySQL 8
-      parity matrix; the current five-supported-event plus one pending-event ALTER
-      scenario is only a slice proof.
+      parity matrix; the current five-event ALTER scenario plus one exact CREATE
+      fixture crash/restart scenario remains only a slice proof.
 - [ ] Define transformation-version compatibility after the first production
       deployment establishes a real schema upgrade boundary.
 - [ ] Extend the canonical AST and renderer one production-derived unsupported

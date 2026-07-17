@@ -18,11 +18,14 @@ target with minimal downtime.
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in
-the target. Automatic DDL admission currently has three narrow slices: an explicitly named,
+the target. Automatic DDL admission currently has four narrow slices: an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
 when every key part/option is modeled and the operation is proven not to support
-or depend on a foreign key; the production-observed unqualified multi-clause
-`ALTER TABLE` form with `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or
+or depend on a foreign key; the exact unqualified fixture `CREATE TABLE
+accounts` form with only `BIGINT`, `VARCHAR(length)`, `NOT NULL`, inline
+`PRIMARY KEY`, a named ordinary `KEY`, and `ENGINE=InnoDB`; the
+production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`
+for `VARCHAR(length)`, `DATETIME`, or
 `SMALLINT UNSIGNED` and the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and
 `AFTER` options; named composite `ADD KEY` or `ADD UNIQUE KEY` clauses over
 ordinary columns; and `DROP COLUMN IF EXISTS`, which matches target column identifiers ASCII-case-insensitively, emits each matched target spelling once, and treats absent or repeated case-variant clauses as proven no-ops. The ALTER path records a typed clause AST and derives expected
@@ -32,16 +35,15 @@ column pre-state, emits deterministic MySQL 8 SQL without `IF EXISTS`, treats
 absent old columns as a proven no-op, and fails closed when old and new columns
 coexist. Broader types/options and full ALTER TABLE remain unsupported.
 
-The exact fixture `CREATE TABLE accounts` has a production inventory/evidence
-seam, not runtime admission: source schema defaults are read only inside an
-exact event-coordinate fence, target absence is checked before and after the
-capture, and evidence persists source charset/collation, explicit generated
-`DEFAULT CHARACTER SET ... COLLATE ...` SQL, and deterministic expected
-post-state. Runtime transform/admission remains disabled, so the stream keeps
-this event `translation_pending` with zero target DDL and zero checkpoint
-execution. This is local fixture evidence, not real-engine or deployment proof.
+For the exact fixture `CREATE TABLE accounts`, source schema charset/collation are
+read only between exact event-coordinate fences and persisted in immutable
+evidence; generated SQL renders them explicitly as `DEFAULT CHARACTER SET ...
+COLLATE ...`. The target must be absent before and after capture, and the exact
+observed post-state must match the deterministic expected post-state. This is the
+only admitted `CREATE TABLE` form; unsupported CREATE syntax remains
+`translation_pending` with no target execution or checkpoint advance.
 
-Every other unsupported DDL form—tables, other `ALTER TABLE`, views, routines,
+Every other unsupported DDL form—other `CREATE TABLE` syntax, other `ALTER TABLE`, views, routines,
 events, triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP`, qualified or
 cross-schema references, comments, ambiguous quoting, incomplete syntax,
 definer/security clauses, MariaDB-only syntax, and multi-object/multi-statement
@@ -76,10 +78,12 @@ creates the table. Different source primary keys remain different conflict
 identities. `repair-drift` now invokes the planner for child-first deletes,
 parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
 windows, a non-mutating full-scope Verify equality phase, and evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 31 executable scenarios
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 32 executable scenarios
 covering bootstrap/grants, DDL journal crash recovery, reconnect/GET_LOCK
-behavior, and FK-aware repair/conflict resolution. Its `production-alter-table`
-scenario passes five checkpointed ALTER events; checks column, comment,
+behavior, and FK-aware repair/conflict resolution. Its `create-table-crash-restart`
+scenario passes the differing-default MariaDB/MySQL fixture through post-DDL/pre-applied
+crash recovery, prepared-state restart, exact checkpointing, and idempotent replay;
+its `production-alter-table` scenario passes five checkpointed ALTER events; checks column, comment,
 non-unique and unique-index metadata, duplicate rejection parity, translated
 `DROP COLUMN IF EXISTS`, and its absent-column no-op; then proves
 an unsupported unique-prefix option remains `translation_pending` without target

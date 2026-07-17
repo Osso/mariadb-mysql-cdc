@@ -17,10 +17,13 @@ MariaDB and MySQL differ in SQL, metadata, and binlog behavior.
 Production streaming requires `binlog_format=ROW` and
 `binlog_row_image=FULL`. Row events apply by source primary key.
 
-Automatic DDL admission currently covers three narrow slices: explicitly named,
+Automatic DDL admission currently covers four narrow slices: explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX`
-with complete parsed options and no FK dependency; the production-observed
-unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` for
+with complete parsed options and no FK dependency; the exact unqualified fixture
+`CREATE TABLE accounts` form with only `BIGINT`, `VARCHAR(length)`, `NOT NULL`,
+inline `PRIMARY KEY`, a named ordinary `KEY`, and `ENGINE=InnoDB`; the
+production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`
+for
 `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`,
 `NULL`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY` or
 `ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with ASCII-case-insensitive target
@@ -29,8 +32,12 @@ case-variant no-ops; and the production-observed unqualified multi-clause `ALTER
 COLUMN IF EXISTS ...` form. The implemented ALTER path records a canonical typed
 clause AST and derives expected post-state by applying that AST to a fenced target
 pre-state, so historical replay does not require a live source head at the event
-coordinate. The rename slice selects executable clauses from target pre-state and
-emits MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
+coordinate. For the exact CREATE fixture, source charset/collation are read
+between exact event-coordinate fences, persisted in evidence, rendered explicitly,
+and checked against target absence before and after capture plus the exact observed
+post-state. Unsupported CREATE syntax remains `translation_pending` with no target
+execution or checkpoint advance. The rename slice selects executable clauses from
+target pre-state and emits MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
 `cdc.ddl_replay_journal` as `translation_pending` with sentinel/no evidence;
 translator availability promotes that same row once to `prepared`, after which
 generated SQL, postcondition evidence, and checkpointing proceed automatically.
@@ -69,8 +76,11 @@ guards, constraints, and exact table/application grants before opening the sourc
 stream; runtime never creates the table. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 31 executable scenarios;
-its `production-alter-table` scenario passes five checkpointed ALTER events,
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 32 executable scenarios;
+its `create-table-crash-restart` scenario passes the differing-default fixture
+through post-DDL/pre-applied crash recovery, prepared-state restart, exact
+checkpointing, and idempotent replay; its `production-alter-table` scenario passes
+five checkpointed ALTER events,
 checks column/comment/non-unique and unique-index metadata, duplicate rejection
 parity, translated `DROP COLUMN IF EXISTS`, and its absent-column no-op, and proves an unsupported unique-prefix option remains pending
 without target mutation or checkpoint advancement. These are local proofs for implemented
