@@ -1363,13 +1363,32 @@ class Harness:
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         ).strip()
+        self.admin_sql(
+            self.target,
+            "SET GLOBAL general_log=OFF; TRUNCATE TABLE mysql.general_log; "
+            "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;",
+        )
         self.replace_journal_row(row)
         result = self.run_stream(start, final_stop)
+        mutation_attempts = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
+            "AND command_type IN ('Query','Prepare','Execute') AND ("
+            "argument LIKE 'CREATE INDEX%' OR argument LIKE 'DROP INDEX%' "
+            "OR argument LIKE 'ALTER TABLE%' OR argument LIKE 'CREATE TABLE%' "
+            "OR argument LIKE 'INSERT%accounts%' OR argument LIKE 'UPDATE%accounts%' "
+            "OR argument LIKE 'DELETE%accounts%');",
+        ).strip()
+        self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
         output = f"{result.stdout}\\n{result.stderr}".lower()
         if result.returncode == 0 or "identity mismatch" not in output or field not in output:
             raise HarnessError(
                 f"{scenario} did not reject immutable-field reuse field={field}: "
                 f"exit={result.returncode} output={result.stdout} {result.stderr}"
+            )
+        if mutation_attempts != "0":
+            raise HarnessError(
+                f"{scenario} attempted target mutation before identity rejection: attempts={mutation_attempts}"
             )
         if self.query(self.target, "SHOW INDEX FROM accounts;", user=TARGET_USER, password=TARGET_PASSWORD) != baseline_indexes:
             raise HarnessError(f"{scenario} mutated target schema before identity rejection")
@@ -1379,15 +1398,10 @@ class Harness:
         if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
             raise HarnessError(f"{scenario} advanced checkpoint after identity rejection: {checkpoint}")
         retained = self.journal_full_row()
-        if (
-            retained[field] != row[field]
-            or retained["transformation_version"] != row["transformation_version"]
-            or retained["generated_sql"] != row["generated_sql"]
-            or retained["canonical_ast"] != row["canonical_ast"]
-            or retained["pre_state"] != row["pre_state"]
-            or retained["expected_post_state"] != row["expected_post_state"]
-        ):
-            raise HarnessError(f"{scenario} changed immutable journal evidence: {retained}")
+        if retained != row:
+            raise HarnessError(
+                f"{scenario} changed immutable journal row: expected={row} retained={retained}"
+            )
         print(f"{scenario}_blocked identity_mismatch={field} no_overtake=true evidence_retained=true")
 
     def run_journal_mismatch_scenario(self, scenario: str) -> None:
