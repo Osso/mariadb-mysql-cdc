@@ -595,6 +595,11 @@ fn validate_target(target: &TargetMySqlConfig) -> Result<(), CatchupSnapshotErro
             "target database is required".to_string(),
         ));
     }
+    if target.tls_ca_file.is_empty() {
+        return Err(CatchupSnapshotError::Config(
+            "target TLS CA file is required".to_string(),
+        ));
+    }
 
     Ok(())
 }
