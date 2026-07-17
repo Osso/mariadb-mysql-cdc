@@ -44,6 +44,7 @@ class ScenarioSpec:
 SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
     ScenarioSpec("production-alter-table", True),
+    ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("missing-checkpoint", True),
     ScenarioSpec("missing-trigger", True),
@@ -1087,6 +1088,140 @@ class Harness:
             "pending_unique_option=true"
         )
 
+    def run_create_table_crash_restart(self) -> None:
+        assert self.source and self.target
+        self.admin_sql(
+            self.source,
+            f"ALTER DATABASE {APP_SCHEMA} CHARACTER SET latin1 COLLATE latin1_swedish_ci;",
+        )
+        self.admin_sql(
+            self.target,
+            f"ALTER DATABASE {APP_SCHEMA} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+        )
+        source_default = self.admin_query(
+            self.source,
+            f"SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME={sql_literal(APP_SCHEMA)};",
+        ).strip()
+        target_default = self.admin_query(
+            self.target,
+            f"SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME={sql_literal(APP_SCHEMA)};",
+        ).strip()
+        if source_default != "latin1_swedish_ci" or target_default != "utf8mb4_0900_ai_ci":
+            raise HarnessError(
+                f"CREATE TABLE defaults were not intentionally different source={source_default!r} target={target_default!r}"
+            )
+
+        self.admin_sql(self.target, "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;")
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "CREATE TABLE accounts ("
+            "id BIGINT NOT NULL PRIMARY KEY, "
+            "email VARCHAR(255) NOT NULL, "
+            "payload VARCHAR(64) NOT NULL, "
+            "KEY idx_accounts_payload (payload)"
+            ") ENGINE=InnoDB;",
+        )
+        final_stop = self.coordinate()
+
+        crashed = self.run_stream(
+            start,
+            final_stop,
+            integration_failpoint="post-ddl-pre-applied",
+        )
+        crash_output = f"{crashed.stdout}\n{crashed.stderr}"
+        if crashed.returncode == 0 or "cdc_integration_failpoint" not in crash_output:
+            raise HarnessError(
+                f"CREATE TABLE stream did not crash after target execution: {crash_output}"
+            )
+        checkpoint_after_crash = self.checkpoint()
+        if (
+            checkpoint_after_crash.get("source_file") != start.file
+            or int(checkpoint_after_crash.get("source_position", 0)) != start.position
+        ):
+            raise HarnessError(
+                f"CREATE TABLE crash advanced checkpoint: {checkpoint_after_crash}"
+            )
+        table_count = self.admin_query(
+            self.target,
+            f"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='accounts';",
+        ).strip()
+        if table_count != "1":
+            raise HarnessError(f"CREATE TABLE crash produced target table count={table_count}")
+        target_collation = self.admin_query(
+            self.target,
+            f"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='accounts';",
+        ).strip()
+        if target_collation != source_default:
+            raise HarnessError(
+                f"CREATE TABLE did not preserve source collation source={source_default} target={target_collation}"
+            )
+        evidence = self.admin_query(
+            self.target,
+            "SELECT status,generated_sql,canonical_ast,pre_state,expected_post_state "
+            "FROM cdc.ddl_replay_journal "
+            "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
+            "ORDER BY event_start_position;",
+        )
+        evidence_rows = [line.split("\t") for line in evidence.splitlines() if line.strip()]
+        if len(evidence_rows) != 1 or len(evidence_rows[0]) != 5:
+            raise HarnessError(f"CREATE TABLE durable evidence row mismatch: {evidence!r}")
+        status, generated_sql, canonical_ast, pre_state, expected_post_state = evidence_rows[0]
+        if status != "prepared":
+            raise HarnessError(f"CREATE TABLE crash journal status={status!r}")
+        if "DEFAULT CHARACTER SET latin1 COLLATE latin1_swedish_ci" not in generated_sql:
+            raise HarnessError(f"CREATE TABLE generated SQL omitted source defaults: {generated_sql}")
+        if '"character_set":"latin1"' not in canonical_ast or '"collation":"latin1_swedish_ci"' not in canonical_ast:
+            raise HarnessError(f"CREATE TABLE canonical evidence omitted source defaults: {canonical_ast}")
+        if not pre_state or not expected_post_state or '"collation":"latin1_swedish_ci"' not in expected_post_state:
+            raise HarnessError("CREATE TABLE durable pre/post evidence is incomplete")
+
+        def target_create_count() -> str:
+            return self.admin_query(
+                self.target,
+                "SELECT COUNT(*) FROM mysql.general_log "
+                "WHERE command_type IN ('Query','Execute') "
+                "AND argument LIKE 'CREATE TABLE `accounts`%';",
+            ).strip()
+
+        if target_create_count() != "1":
+            raise HarnessError("CREATE TABLE target execution count was not exactly one after crash")
+
+        restarted = self.run_stream(start, final_stop)
+        require_success(restarted, "CREATE TABLE prepared-state restart")
+        if "cdc_ddl_reconcile_prepared" not in restarted.stdout:
+            raise HarnessError("CREATE TABLE restart did not reconcile prepared state")
+        checkpoint_after_restart = self.checkpoint()
+        if (
+            checkpoint_after_restart.get("source_file") != final_stop.file
+            or int(checkpoint_after_restart.get("source_position", 0)) != final_stop.position
+        ):
+            raise HarnessError(
+                f"CREATE TABLE restart did not advance checkpoint exactly to event end: {checkpoint_after_restart}"
+            )
+        if target_create_count() != "1":
+            raise HarnessError("CREATE TABLE restart re-executed target DDL")
+        replayed = self.run_stream(start, final_stop)
+        require_success(replayed, "CREATE TABLE idempotent replay")
+        if self.checkpoint() != checkpoint_after_restart:
+            raise HarnessError("CREATE TABLE idempotent replay changed checkpoint state")
+        if target_create_count() != "1":
+            raise HarnessError("CREATE TABLE idempotent replay executed target DDL again")
+        final_status = self.admin_query(
+            self.target,
+            "SELECT status FROM cdc.ddl_replay_journal "
+            "WHERE source_identity LIKE 'cdc-harness-source#server-id=%';",
+        ).strip()
+        if final_status != "checkpointed":
+            raise HarnessError(f"CREATE TABLE final journal status={final_status!r}")
+        print(
+            "create_table_crash_restart_converged "
+            f"source_default={source_default} target_default={target_default} "
+            f"target_collation={target_collation} target_create_count=1 "
+            f"checkpoint={final_stop.file}:{final_stop.position}"
+        )
+
     def ddl_journal_rows(self) -> list[list[str]]:
         assert self.target
         output = self.query(
@@ -1996,6 +2131,8 @@ class Harness:
             self.run_strict_secondary_btree()
         elif scenario == "production-alter-table":
             self.run_production_alter_table()
+        elif scenario == "create-table-crash-restart":
+            self.run_create_table_crash_restart()
         elif scenario == "bootstrap-contract":
             self.run_bootstrap_contract()
         elif scenario in {
