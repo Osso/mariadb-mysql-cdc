@@ -19,6 +19,12 @@ source connection loss without replaying from static startup coordinates.
   failure, missing binlog file, unsupported event type, quarantine, or target
   write failure.
 
+Reconnect/backoff applies only after an established connection loses transport.
+It is not a TLS fallback: failed CA loading, chain validation, or required
+DNS/hostname identity matching stops immediately. Reconnect attempts retain the
+same TLS configuration; literal IP endpoints continue to skip hostname/IP
+identity matching only.
+
 ### Durable checkpointing
 
 - [x] Persist the last successfully applied binlog file and position outside the

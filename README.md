@@ -83,10 +83,13 @@ creates the table. Different source primary keys remain different conflict
 identities. `repair-drift` now invokes the planner for child-first deletes,
 parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
 windows, a non-mutating full-scope Verify equality phase, and evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 32 executable scenarios
-covering bootstrap/grants, DDL journal crash recovery, reconnect/GET_LOCK
-behavior, and FK-aware repair/conflict resolution. Its `create-table-crash-restart`
-scenario passes the differing-default MariaDB/MySQL fixture through post-DDL/pre-applied
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 33 executable scenarios,
+including `catchup-snapshot-tls` as real-engine coverage of configured-CA chain
+validation over literal IP endpoints and resumable snapshot convergence. The
+remaining scenarios cover bootstrap/grants, DDL journal crash recovery,
+reconnect/GET_LOCK behavior, and FK-aware repair/conflict resolution. Its
+`create-table-crash-restart` scenario passes the differing-default MariaDB/MySQL
+fixture through post-DDL/pre-applied
 crash recovery, prepared-state restart, exact checkpointing, and idempotent replay;
 its `production-alter-table` scenario passes five checkpointed ALTER events; checks column, comment,
 non-unique and unique-index metadata, duplicate rejection parity, translated
@@ -145,13 +148,19 @@ cargo run -- catchup-snapshot \
   --progress-file /var/lib/mariadb-mysql-cdc/snapshot-progress.json
 ```
 
+## TLS policy
+
 All target-using commands accept `--target-tls-ca-file PATH`; it defaults to
-`/etc/mariadb-mysql-cdc/do-ca.pem`, and the CA remains required. Source/binlog
-commands accept `--source-tls-ca-file PATH`; it defaults to
-`/etc/mariadb-mysql-cdc/source-ca.pem`. `catchup-snapshot` requires an explicit
-`--source-tls-ca-file PATH`. Each file must be readable and contain a valid PEM
-or DER CA certificate. Connections fail before the driver runs with an
-endpoint-specific diagnostic when that CA is missing, unreadable, or invalid.
+`/etc/mariadb-mysql-cdc/do-ca.pem`. Source/binlog commands accept
+`--source-tls-ca-file PATH`; it defaults to `/etc/mariadb-mysql-cdc/source-ca.pem`.
+`catchup-snapshot` requires an explicit `--source-tls-ca-file PATH`. The CA is
+always required, the certificate chain is always validated, and a missing,
+unreadable, or invalid CA fails before the driver runs. DNS/hostname endpoints
+require certificate identity matching. Literal IP endpoints skip hostname/IP
+identity matching only; they still require CA-based chain validation. The CA
+may be a trust anchor or chain bundle; no exclusive-root or IP-SAN requirement
+is implied. There is no plaintext, invalid-certificate, or TLS-validation retry
+fallback. See [TLS connection policy](docs/schema-inventory.md#tls-connection-policy).
 
 `sync-table` requires `--run-id` and stores resumable state in
 `cdc.table_sync_runs` by default. A new recurrence needs a new ID; reuse is

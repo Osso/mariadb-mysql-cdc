@@ -13,7 +13,7 @@ This is not a parity proof by itself. `INSERT IGNORE` preserves target rows that
 CDC already wrote, but does not overwrite divergent values or remove target
 orphans. A skipped live duplicate remains reconciliation debt.
 
-Catchup source reads and target writes use TLS with endpoint-specific CA files.
+Catchup source reads and target writes follow the [TLS connection policy](schema-inventory.md#tls-connection-policy).
 `catchup-snapshot` requires an explicit `--source-tls-ca-file`; a missing,
 unreadable, or invalid source CA fails before the driver connects. Target writes
 continue to require the reviewed DigitalOcean CA at
