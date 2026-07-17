@@ -126,102 +126,165 @@ fn parse_observed_column_options(tokens: &[String], mut index: usize) -> Result<
 }
 
 fn normalize_ddl_sql(source_sql: &str) -> Result<String, String> {
-    let characters = source_sql.chars().collect::<Vec<_>>();
-    let mut output = String::new();
-    let mut quote = None;
-    let mut pending_space = false;
-    let mut index = 0;
-    while index < characters.len() {
-        let character = characters[index];
-        if let Some(active_quote) = quote {
-            output.push(character);
-            if character == active_quote {
-                if characters.get(index + 1) == Some(&active_quote) {
-                    output.push(active_quote);
-                    index += 2;
-                    continue;
-                }
-                quote = None;
-            } else if character == '\\' && active_quote == '\'' {
-                if let Some(escaped) = characters.get(index + 1) {
-                    output.push(*escaped);
-                    index += 2;
-                    continue;
-                }
-            }
-            index += 1;
-            continue;
+    DdlSqlNormalizer::new(source_sql).normalize()
+}
+
+struct DdlSqlNormalizer {
+    characters: Vec<char>,
+    output: String,
+    quote: Option<char>,
+    pending_space: bool,
+    index: usize,
+}
+
+impl DdlSqlNormalizer {
+    fn new(source_sql: &str) -> Self {
+        Self {
+            characters: source_sql.chars().collect(),
+            output: String::new(),
+            quote: None,
+            pending_space: false,
+            index: 0,
         }
-        if matches!(character, '`' | '\'' | '"') {
-            if pending_space && !output.is_empty() && !output.ends_with([' ', '(', '.']) {
-                output.push(' ');
-            }
-            pending_space = false;
-            quote = Some(character);
-            output.push(character);
-            index += 1;
-            continue;
+    }
+
+    fn normalize(mut self) -> Result<String, String> {
+        while self.index < self.characters.len() {
+            self.normalize_next_character()?;
         }
-        if character == '/' && characters.get(index + 1) == Some(&'*') {
-            index += 2;
-            while index + 1 < characters.len()
-                && !(characters[index] == '*' && characters[index + 1] == '/')
-            {
-                index += 1;
-            }
-            if index + 1 >= characters.len() {
-                return Err("unterminated DDL block comment".to_string());
-            }
-            index += 2;
-            pending_space = true;
-            continue;
+        if self.quote.is_some() {
+            return Err("unterminated DDL quote".to_string());
         }
-        if character == '#'
+        Ok(self.output.trim().trim_end_matches(';').trim().to_string())
+    }
+
+    fn normalize_next_character(&mut self) -> Result<(), String> {
+        if self.quote.is_some() {
+            self.copy_quoted_character();
+        } else if self.starts_quote() {
+            self.start_quote();
+        } else if self.starts_block_comment() {
+            self.skip_block_comment()?;
+        } else if self.starts_line_comment() {
+            self.skip_line_comment();
+        } else {
+            self.copy_unquoted_character();
+        }
+        Ok(())
+    }
+
+    fn copy_quoted_character(&mut self) {
+        let character = self.characters[self.index];
+        let active_quote = self.quote.expect("quoted scanner requires active quote");
+        self.output.push(character);
+        if character == active_quote && self.characters.get(self.index + 1) == Some(&active_quote) {
+            self.output.push(active_quote);
+            self.index += 2;
+        } else if character == active_quote {
+            self.quote = None;
+            self.index += 1;
+        } else if character == '\\' && active_quote == '\'' {
+            self.copy_escaped_character();
+        } else {
+            self.index += 1;
+        }
+    }
+
+    fn copy_escaped_character(&mut self) {
+        if let Some(escaped) = self.characters.get(self.index + 1) {
+            self.output.push(*escaped);
+            self.index += 2;
+        } else {
+            self.index += 1;
+        }
+    }
+
+    fn starts_quote(&self) -> bool {
+        matches!(self.characters[self.index], '`' | '\'' | '"')
+    }
+
+    fn start_quote(&mut self) {
+        self.append_pending_space(self.characters[self.index]);
+        let quote = self.characters[self.index];
+        self.quote = Some(quote);
+        self.output.push(quote);
+        self.index += 1;
+    }
+
+    fn starts_block_comment(&self) -> bool {
+        self.characters[self.index] == '/'
+            && self.characters.get(self.index + 1) == Some(&'*')
+    }
+
+    fn skip_block_comment(&mut self) -> Result<(), String> {
+        self.index += 2;
+        while self.index + 1 < self.characters.len()
+            && !(self.characters[self.index] == '*'
+                && self.characters[self.index + 1] == '/')
+        {
+            self.index += 1;
+        }
+        if self.index + 1 >= self.characters.len() {
+            return Err("unterminated DDL block comment".to_string());
+        }
+        self.index += 2;
+        self.pending_space = true;
+        Ok(())
+    }
+
+    fn starts_line_comment(&self) -> bool {
+        let character = self.characters[self.index];
+        character == '#'
             || (character == '-'
-                && characters.get(index + 1) == Some(&'-')
-                && characters
-                    .get(index + 2)
+                && self.characters.get(self.index + 1) == Some(&'-')
+                && self
+                    .characters
+                    .get(self.index + 2)
                     .is_none_or(|after| after.is_whitespace() || after.is_control()))
+    }
+
+    fn skip_line_comment(&mut self) {
+        while self
+            .characters
+            .get(self.index)
+            .is_some_and(|character| *character != '\n')
         {
-            while characters
-                .get(index)
-                .is_some_and(|current| *current != '\n')
-            {
-                index += 1;
-            }
-            pending_space = true;
-            continue;
+            self.index += 1;
         }
+        self.pending_space = true;
+    }
+
+    fn copy_unquoted_character(&mut self) {
+        let character = self.characters[self.index];
         if character.is_whitespace() {
-            pending_space = true;
-            index += 1;
-            continue;
+            self.pending_space = true;
+        } else if character == ',' {
+            self.append_comma();
+        } else {
+            self.append_pending_space(character);
+            self.output.push(character);
         }
-        if character == ',' {
-            while output.ends_with(' ') {
-                output.pop();
-            }
-            output.push(',');
-            output.push(' ');
-            pending_space = false;
-            index += 1;
-            continue;
-        }
-        if pending_space
-            && !output.is_empty()
-            && !output.ends_with([' ', '(', '.'])
-            && !matches!(character, ')' | '.' | ';')
-        {
-            output.push(' ');
-        }
-        pending_space = false;
-        output.push(character);
-        index += 1;
+        self.index += 1;
     }
-    if quote.is_some() {
-        return Err("unterminated DDL quote".to_string());
+
+    fn append_comma(&mut self) {
+        while self.output.ends_with(' ') {
+            self.output.pop();
+        }
+        self.output.push_str(", ");
+        self.pending_space = false;
     }
-    Ok(output.trim().trim_end_matches(';').trim().to_string())
+
+    fn append_pending_space(&mut self, next_character: char) {
+        let needs_space = self.pending_space
+            && !self.output.is_empty()
+            && !self.output.ends_with([' ', '(', '.'])
+            && !matches!(next_character, ')' | '.' | ';');
+        if needs_space {
+            self.output.push(' ');
+        }
+        self.pending_space = false;
+    }
 }
 
 fn parse_rename_columns_if_exists(
