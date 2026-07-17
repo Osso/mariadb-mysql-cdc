@@ -1,5 +1,6 @@
 use super::transform::{
-    DDL_TRANSFORMATION_VERSION, parse_production_alter_table_ast, transform_drop_columns_if_exists,
+    DDL_TRANSFORMATION_VERSION, parse_fixture_create_table, parse_production_alter_table_ast,
+    transform_drop_columns_if_exists, transform_fixture_create_table,
 };
 use super::*;
 use crate::inventory::{
@@ -843,6 +844,52 @@ fn rename_column_if_exists_becomes_proven_noop_when_source_columns_are_absent() 
     .expect("proven no-op transformation");
 
     assert_eq!(transformation.target_sql, None);
+}
+
+#[test]
+fn fixture_create_accounts_table_has_typed_ast_and_deterministic_mysql8_sql() {
+    let source_sql = "CREATE TABLE accounts (\
+        id BIGINT NOT NULL PRIMARY KEY, \
+        email VARCHAR(255) NOT NULL, \
+        payload VARCHAR(64) NOT NULL, \
+        KEY idx_accounts_payload (payload)\
+    ) ENGINE=InnoDB";
+
+    let ast = parse_fixture_create_table(source_sql).expect("fixture CREATE TABLE AST");
+    assert_eq!(ast.name, "accounts");
+    assert_eq!(ast.engine, "InnoDB");
+    assert_eq!(ast.primary_key, vec!["id"]);
+    assert_eq!(ast.columns.len(), 3);
+    assert_eq!(
+        ast.columns
+            .iter()
+            .map(|column| (
+                column.name.as_str(),
+                column.column_type.as_str(),
+                column.nullable,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("id", "bigint", false),
+            ("email", "varchar(255)", false),
+            ("payload", "varchar(64)", false),
+        ]
+    );
+    assert_eq!(ast.indexes.len(), 1);
+    assert_eq!(ast.indexes[0].name, "idx_accounts_payload");
+    assert!(!ast.indexes[0].unique);
+    assert_eq!(ast.indexes[0].key_parts.len(), 1);
+    assert_eq!(ast.indexes[0].key_parts[0].column, "payload");
+
+    let transformation =
+        transform_fixture_create_table(source_sql).expect("fixture CREATE TABLE transformation");
+    assert_eq!(transformation.version, DDL_TRANSFORMATION_VERSION);
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "CREATE TABLE `accounts` (`id` BIGINT NOT NULL, `email` VARCHAR(255) NOT NULL, `payload` VARCHAR(64) NOT NULL, PRIMARY KEY (`id`), KEY `idx_accounts_payload` (`payload`)) ENGINE=InnoDB"
+        )
+    );
 }
 
 #[test]
