@@ -743,6 +743,24 @@ fn transforms_mariadb_drop_column_if_exists_for_mysql8() {
 }
 
 #[test]
+fn drop_column_if_exists_matches_target_column_case_insensitively() {
+    let columns = ["id".to_string(), "handle".to_string()]
+        .into_iter()
+        .collect();
+
+    let transformation = transform_drop_columns_if_exists(
+        "ALTER TABLE accounts DROP COLUMN IF EXISTS HANDLE",
+        &columns,
+    )
+    .expect("case-insensitive DROP COLUMN IF EXISTS");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some("ALTER TABLE `accounts` DROP COLUMN `handle`")
+    );
+}
+
+#[test]
 fn drop_column_if_exists_is_proven_noop_when_target_column_is_absent() {
     let columns = ["id".to_string()].into_iter().collect();
 
