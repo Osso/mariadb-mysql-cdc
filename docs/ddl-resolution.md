@@ -189,9 +189,8 @@ fails explicitly rather than partially applying a transaction.
       durable observation ledger and FK-aware phased repair are wired and covered
       by the Docker harness.
 
-## Legacy test/config artifact
+## Retired manual ledger
 
-`src/live/ddl_ledger.rs` remains compiled only for tests in this slice, and the
-legacy `ddl_ledger_table` configuration/parser symbols and tests remain visible
-in the source tree. They document no supported manual workflow and must not be
-used to provision, grant, or clear a production DDL barrier.
+The manual ledger is absent from runtime, configuration, bootstrap, grants,
+harness behavior, and tests. It must not be recreated or used to provision,
+grant, or clear a production DDL barrier.
