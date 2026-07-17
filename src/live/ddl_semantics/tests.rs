@@ -1,5 +1,5 @@
-use super::*;
 use super::transform::{DDL_TRANSFORMATION_VERSION, parse_production_alter_table_ast};
+use super::*;
 use crate::inventory::{
     ColumnInventory, EventInventory, ForeignKeyInventory, IndexColumnInventory, IndexInventory,
     InventoryConfig, RoutineInventory, SchemaInventory, TableInventory, TriggerInventory,

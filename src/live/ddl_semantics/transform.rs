@@ -1,8 +1,7 @@
 use super::model::{
-    ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedIndexAst,
-    ParsedIndexKeyPart,
+    ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedIndexAst, ParsedIndexKeyPart,
 };
-use super::tokenizer::tokenize_ddl;
+use super::tokenizer::{ddl_contains_comments, tokenize_ddl};
 use std::collections::BTreeSet;
 
 pub const DDL_TRANSFORMATION_VERSION: &str = "mariadb-mysql8-v1";
@@ -52,9 +51,10 @@ pub fn transform_rename_columns_if_exists(
     })
 }
 
-pub fn parse_production_alter_table_ast(
-    source_sql: &str,
-) -> Result<ParsedAlterTableAst, String> {
+pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterTableAst, String> {
+    if ddl_contains_comments(source_sql) {
+        return Err("production ALTER TABLE comments are not supported".to_string());
+    }
     let tokens = tokenize_ddl(source_sql)?;
     require_keyword(&tokens, 0, "ALTER")?;
     require_keyword(&tokens, 1, "TABLE")?;
@@ -64,12 +64,8 @@ pub fn parse_production_alter_table_ast(
     let mut index = 3;
     while index < tokens.len() {
         require_keyword(&tokens, index, "ADD")?;
-        let (clause, next_index) = parse_production_alter_clause(
-            &tokens,
-            index,
-            &table,
-            &mut literals,
-        )?;
+        let (clause, next_index) =
+            parse_production_alter_clause(&tokens, index, &table, &mut literals)?;
         clauses.push(clause);
         index = next_index;
         if index == tokens.len() {
@@ -90,7 +86,10 @@ fn parse_production_alter_clause(
     table: &str,
     literals: &mut impl Iterator<Item = String>,
 ) -> Result<(ParsedAlterClause, usize), String> {
-    match tokens.get(index + 1).map(|token| token.to_ascii_uppercase()) {
+    match tokens
+        .get(index + 1)
+        .map(|token| token.to_ascii_uppercase())
+    {
         Some(kind) if kind == "COLUMN" => parse_add_column_clause(tokens, index, literals),
         Some(kind) if kind == "KEY" => parse_add_key_clause(tokens, index, table),
         actual => Err(format!(
@@ -99,27 +98,33 @@ fn parse_production_alter_clause(
     }
 }
 
+struct ParsedColumnOptions {
+    nullable: bool,
+    default_value: Option<String>,
+    comment: String,
+    after: Option<String>,
+    next_index: usize,
+}
+
 fn parse_add_column_clause(
     tokens: &[String],
     index: usize,
     literals: &mut impl Iterator<Item = String>,
 ) -> Result<(ParsedAlterClause, usize), String> {
     let name = require_identifier(tokens, index + 2, "added column")?;
-    let (column_type, data_type, options_start) =
-        parse_observed_column_type(tokens, index + 3)?;
-    let (nullable, default_value, comment, after, next_index) =
-        parse_observed_column_options(tokens, options_start, literals)?;
+    let (column_type, data_type, options_start) = parse_observed_column_type(tokens, index + 3)?;
+    let options = parse_observed_column_options(tokens, options_start, literals)?;
     Ok((
         ParsedAlterClause::AddColumn(ParsedAddColumnAst {
             name,
             column_type,
             data_type,
-            nullable,
-            default_value,
-            comment,
-            after,
+            nullable: options.nullable,
+            default_value: options.default_value,
+            comment: options.comment,
+            after: options.after,
         }),
-        next_index,
+        options.next_index,
     ))
 }
 
@@ -171,15 +176,25 @@ fn parse_observed_column_type(
 ) -> Result<(String, String, usize), String> {
     let data_type = require_identifier(tokens, index, "added column type")?.to_ascii_lowercase();
     if !matches!(data_type.as_str(), "varchar" | "datetime" | "smallint") {
-        return Err(format!("unsupported production ADD COLUMN type {data_type}"));
+        return Err(format!(
+            "unsupported production ADD COLUMN type {data_type}"
+        ));
     }
     index += 1;
     let mut column_type = data_type.clone();
     if tokens.get(index).map(String::as_str) == Some("(") {
         let length = require_identifier(tokens, index + 1, "column type length")?;
+        let parsed_length = length
+            .parse::<u32>()
+            .map_err(|_| format!("invalid column type length {length}"))?;
+        if parsed_length == 0 || parsed_length.to_string() != length {
+            return Err(format!("noncanonical column type length {length}"));
+        }
         require_keyword(tokens, index + 2, ")")?;
-        column_type.push_str(&format!("({length})"));
+        column_type.push_str(&format!("({parsed_length})"));
         index += 3;
+    } else if data_type == "varchar" {
+        return Err("VARCHAR requires an explicit canonical length".to_string());
     }
     if tokens
         .get(index)
@@ -195,7 +210,7 @@ fn parse_observed_column_options(
     tokens: &[String],
     mut index: usize,
     literals: &mut impl Iterator<Item = String>,
-) -> Result<(bool, Option<String>, String, Option<String>, usize), String> {
+) -> Result<ParsedColumnOptions, String> {
     let mut nullable = true;
     let mut default_value = None;
     let mut comment = String::new();
@@ -224,7 +239,13 @@ fn parse_observed_column_options(
             ));
         }
     }
-    Ok((nullable, default_value, comment, after, index))
+    Ok(ParsedColumnOptions {
+        nullable,
+        default_value,
+        comment,
+        after,
+        next_index: index,
+    })
 }
 
 fn extract_single_quoted_literals(source_sql: &str) -> Result<Vec<String>, String> {
@@ -354,15 +375,13 @@ impl DdlSqlNormalizer {
     }
 
     fn starts_block_comment(&self) -> bool {
-        self.characters[self.index] == '/'
-            && self.characters.get(self.index + 1) == Some(&'*')
+        self.characters[self.index] == '/' && self.characters.get(self.index + 1) == Some(&'*')
     }
 
     fn skip_block_comment(&mut self) -> Result<(), String> {
         self.index += 2;
         while self.index + 1 < self.characters.len()
-            && !(self.characters[self.index] == '*'
-                && self.characters[self.index + 1] == '/')
+            && !(self.characters[self.index] == '*' && self.characters[self.index + 1] == '/')
         {
             self.index += 1;
         }

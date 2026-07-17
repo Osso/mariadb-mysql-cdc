@@ -295,7 +295,9 @@ fn apply_add_column(
             .iter()
             .position(|item| item.name == *after)
             .map(|position| position + 1)
-            .ok_or_else(|| format!("ADD COLUMN AFTER target `{table_name}`.`{after}` is missing"))?,
+            .ok_or_else(|| {
+                format!("ADD COLUMN AFTER target `{table_name}`.`{after}` is missing")
+            })?,
         None => table.columns.len(),
     };
     table.columns.insert(
@@ -322,15 +324,21 @@ fn apply_add_key(
     expected: &mut SemanticSchemaSnapshot,
     ast: &ParsedIndexAst,
 ) -> Result<(), String> {
-    validate_index_operation(expected, &DdlOperation {
-        family: DdlFamily::Index,
-        object_kind: DdlObjectKind::Index,
-        primary_object: ast.name.clone(),
-        secondary_object: Some(ast.table.clone()),
-        index_ast: Some(ast.clone()),
-        alter_table_ast: None,
-    })?;
-    expected.inventory.indexes.push(index_inventory_from_ast(ast));
+    validate_index_operation(
+        expected,
+        &DdlOperation {
+            family: DdlFamily::Index,
+            object_kind: DdlObjectKind::Index,
+            primary_object: ast.name.clone(),
+            secondary_object: Some(ast.table.clone()),
+            index_ast: Some(ast.clone()),
+            alter_table_ast: None,
+        },
+    )?;
+    expected
+        .inventory
+        .indexes
+        .push(index_inventory_from_ast(ast));
     Ok(())
 }
 

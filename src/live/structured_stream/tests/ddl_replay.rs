@@ -152,7 +152,10 @@ fn production_add_column_ddl_is_admitted_by_live_stream() {
     .expect("production ADD COLUMN must enter automatic replay")
     .expect("DDL outcome");
 
-    assert_eq!(outcome.resume_coordinate.map(|value| value.position), Some(180));
+    assert_eq!(
+        outcome.resume_coordinate.map(|value| value.position),
+        Some(180)
+    );
     assert_eq!(
         operations.borrow().as_slice(),
         &[
