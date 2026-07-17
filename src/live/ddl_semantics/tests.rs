@@ -815,6 +815,20 @@ fn production_add_column_and_key_ddl_transforms_to_deterministic_mysql8_sql() {
 }
 
 #[test]
+fn production_add_unique_key_transforms_to_deterministic_mysql8_sql() {
+    let transformation = transform_production_alter_table(
+        "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email (email)",
+    )
+    .expect("named production ADD UNIQUE KEY must be translatable");
+
+    assert_eq!(transformation.version, DDL_TRANSFORMATION_VERSION);
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some("ALTER TABLE `accounts` ADD UNIQUE KEY `uq_accounts_email` (`email`)")
+    );
+}
+
+#[test]
 fn production_alter_rendering_depends_only_on_typed_ast() {
     let compact = transform_production_alter_table(
         "ALTER TABLE accounts ADD COLUMN handle VARCHAR(64) COMMENT 'user''s handle' AFTER id",
