@@ -28,3 +28,23 @@ INSERT INTO `users_search_queries_history` (`query`,`user_id`,`guest_id`,`sessio
 ###   @1=10
 ###   @2='new-value'
 # Number of rows: 1
+
+# at 960000100
+#260701 12:00:00 server id 3  end_log_pos 960000600 CRC32 0x00000000  Query thread_id=10 exec_time=0 error_code=0 xid=0
+ALTER TABLE `home_feed_panel_candidates`
+  ADD COLUMN `filter_prompt_version` VARCHAR(64) DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_reason`,
+  ADD COLUMN `filtered_time` DATETIME NULL DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_prompt_version`
+/*!*/;
+# at 960001000
+#260702 12:00:00 server id 3  end_log_pos 960001700 CRC32 0x00000000  Query thread_id=11 exec_time=0 error_code=0 xid=0
+-- sanitized deployment comment
+ALTER TABLE `home_feed_bakes`
+  ADD COLUMN `variant_id` SMALLINT UNSIGNED DEFAULT NULL AFTER `reading_direction`,
+  ADD KEY `idx_hfb_variant_status_published` (`variant_id`, `status`, `published_time`)
+/*!*/;
+# at 960002000
+#260703 12:00:00 server id 3  end_log_pos 960002300 CRC32 0x00000000  Query thread_id=12 exec_time=0 error_code=0 xid=0
+ALTER TABLE `home_feed_captions`
+  RENAME COLUMN IF EXISTS `arc_start_order` TO `deprecated_arc_start_order`,
+  RENAME COLUMN IF EXISTS `arc_end_order` TO `deprecated_arc_end_order`
+/*!*/;
