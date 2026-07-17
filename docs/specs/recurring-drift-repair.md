@@ -2,7 +2,7 @@
 
 `repair-drift` orchestrates bounded, run-scoped phased repairs after forward CDC
 application. Each recurrence gets a fresh orchestration ID; only the exact
-interrupted run may be resumed. The real Docker harness defines 30 executable
+interrupted run may be resumed. The real Docker harness defines 31 executable
 scenarios and proves FK ordering, fail-closed planning, resumable runs, PK-window
 bounds, secondary-unique safety, and zero unresolved debt for the repaired scope.
 

@@ -18,7 +18,8 @@ slices: explicitly named, unqualified, visible, non-unique secondary BTREE
 the production-observed unqualified multi-clause `ALTER TABLE` form with
 `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the
 observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and named
-composite `ADD KEY` or `ADD UNIQUE KEY`; and the production-observed unqualified
+composite `ADD KEY` or `ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with
+present-column execution or an absent-column no-op; and the production-observed unqualified
 multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form. For the
 implemented ALTER slice, expected post-state is derived from fenced target
 pre-state plus the event AST; historical replay does not require a live source
@@ -74,9 +75,10 @@ an irreducible ambiguity boundary.
 ## Production ALTER proof
 
 The disposable real MariaDB 11.4/MySQL 8.0 `production-alter-table` scenario
-replays three supported ALTER events, checks column/comment/non-unique and unique
-index parity plus duplicate rejection, and requires all three journal rows plus
-the final supported-event source checkpoint to be `checkpointed`. It then proves
+replays five supported ALTER events, checks column/comment/non-unique and unique
+index parity, duplicate rejection, translated column removal, and an absent-column
+no-op, and requires all five journal rows plus the final supported-event source
+checkpoint to be `checkpointed`. It then proves
 an unsupported unique-prefix option remains `translation_pending` without target
 execution or checkpoint advancement. It proves only
 the implemented observed ALTER slice, not full ALTER TABLE coverage, a full matrix,

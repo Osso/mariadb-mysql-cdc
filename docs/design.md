@@ -23,8 +23,8 @@ with complete parsed options and no FK dependency; the production-observed
 unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` for
 `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`,
 `NULL`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY` or
-`ADD UNIQUE KEY`;
-and the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
+`ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with target-column-conditioned
+execution/no-op behavior; and the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
 COLUMN IF EXISTS ...` form. The implemented ALTER path records a canonical typed
 clause AST and derives expected post-state by applying that AST to a fenced target
 pre-state, so historical replay does not require a live source head at the event
@@ -68,10 +68,10 @@ guards, constraints, and exact table/application grants before opening the sourc
 stream; runtime never creates the table. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 30 executable scenarios;
-its `production-alter-table` scenario passes three checkpointed ALTER events,
-checks column/comment/non-unique and unique-index metadata plus duplicate
-rejection parity, and proves an unsupported unique-prefix option remains pending
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 31 executable scenarios;
+its `production-alter-table` scenario passes five checkpointed ALTER events,
+checks column/comment/non-unique and unique-index metadata, duplicate rejection
+parity, translated `DROP COLUMN IF EXISTS`, and its absent-column no-op, and proves an unsupported unique-prefix option remains pending
 without target mutation or checkpoint advancement. These are local proofs for implemented
 boundaries. Broader ALTER coverage, the full compatibility matrix, live recurring
 scheduling, deployment, and cutover gates remain unchecked.

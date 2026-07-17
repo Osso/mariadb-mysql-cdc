@@ -8,7 +8,8 @@ non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
 metadata and no FK dependency; the production-observed unqualified multi-clause
 `ALTER TABLE` form with `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or
 `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER`
-options, and named composite `ADD KEY` or `ADD UNIQUE KEY`; plus the existing
+options, named composite `ADD KEY` or `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS`
+with present-column execution or an absent-column no-op; plus the existing
 `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator slice. Every other DDL
 form enters the same journal as `translation_pending`; no operator-authored
 target SQL is accepted as a resolution path.
@@ -98,10 +99,10 @@ is part of this flow.
 ### Production ALTER proof
 
 The real MariaDB 11.4/MySQL 8.0 harness scenario `production-alter-table`
-replays three source ALTER events. It verifies `VARCHAR(64)`, `DATETIME`, and
+replays five source ALTER events. It verifies `VARCHAR(64)`, `DATETIME`, and
 `SMALLINT UNSIGNED` column metadata, comments and placement, named composite
-non-unique and unique BTREE indexes, duplicate-row rejection parity, three
-`checkpointed` journal rows with transformation evidence/version, and the final
+non-unique and unique BTREE indexes, duplicate-row rejection parity, translated
+column removal and its absent-column no-op, five `checkpointed` journal rows with transformation evidence/version, and the final
 stream checkpoint. A neighboring unique-prefix option remains
 `translation_pending` with no target index and no checkpoint advancement. This is implemented-slice proof only, not full ALTER TABLE coverage,
 a full compatibility matrix, or deployment proof.

@@ -127,10 +127,11 @@ The current slice is covered by:
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
       generated SQL and preserves journal/checkpoint ordering.
 - [x] `scripts/cdc-integration-harness.py --scenario production-alter-table` —
-      real MariaDB/MySQL replay of three checkpointed ALTER events, including
+      real MariaDB/MySQL replay of five checkpointed ALTER events, including
       VARCHAR/DATETIME/SMALLINT column parity, comments, non-unique and unique
-      composite-index metadata, duplicate-row rejection parity, journal
-      evidence/version, and final supported-event checkpoint; an unsupported
+      composite-index metadata, duplicate-row rejection parity, translated
+      column removal and its absent-column no-op, journal evidence/version, and
+      final supported-event checkpoint; an unsupported
       unique-prefix option remains `translation_pending` with zero target
       execution and unchanged checkpoint.
 
@@ -141,13 +142,14 @@ MariaDB/MySQL matrix, or deployment safety.
 ## Known gaps (current cycle)
 
 - [ ] Extend the current translator beyond the production-observed
-      `ADD COLUMN`/`ADD KEY`/`ADD UNIQUE KEY` and rename slices into the canonical
+      `ADD COLUMN`/`ADD KEY`/`ADD UNIQUE KEY`/`DROP COLUMN IF EXISTS` and rename
+      slices into the canonical
       MariaDB DDL parser and MySQL 8 transformation pipeline.
 - [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
       retired manual DDL ledger without restoring manual replay.
 - [ ] Build the broader production-derived DDL corpus and real MariaDB/MySQL 8
-      parity matrix; the current three-supported-event plus one pending-event
-      ALTER scenario is only a slice proof.
+      parity matrix; the current five-supported-event plus one pending-event ALTER
+      scenario is only a slice proof.
 - [ ] Define transformation-version compatibility after the first production
       deployment establishes a real schema upgrade boundary.
 - [ ] Extend the canonical AST and renderer one production-derived unsupported
