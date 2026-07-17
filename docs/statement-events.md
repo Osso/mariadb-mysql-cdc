@@ -1,78 +1,46 @@
 # Statement Events
 
-Offline MariaDB `MIXED` fixtures can emit SQL statement events when the server
-decides statement replication is safe. Production `stream-binlog` preflights
-`binlog_format=ROW` and `binlog_row_image=FULL`; any statement-DML `QueryEvent`
-is a contract violation and stops without checkpointing.
+Offline MariaDB `MIXED` fixtures can emit statement events. Production
+`stream-binlog` preflights `binlog_format=ROW` and `binlog_row_image=FULL`; any
+statement DML QueryEvent is a contract violation.
 
-## Replay Policy
+## Replay policy
 
-Production `stream-binlog` rejects statement DML because its source contract
-requires `ROW` binlogs with `FULL` row images. The removed `apply-binlog` text
-mode is not a supported execution path.
+Statement DML is never replayed in the production stream. The removed
+`apply-binlog` text path is not a supported health check.
 
-The automatic DDL path is limited to unqualified objects in the configured
-application schema. It replays compatible table, index, view, routine, event,
-and trigger DDL, including `RENAME TABLE`, `TRUNCATE TABLE`, and `DROP` forms.
-Database/schema DDL (`CREATE|ALTER|DROP DATABASE` or `SCHEMA`) is never automatic
-even though those prefixes are recognized; it is a manual boundary because the
-MySQL target would require global database DDL privileges.
+Automatic DDL admission is only an explicitly named, unqualified, visible,
+non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX` whose key parts and
+options are completely modeled and whose FK dependency is disproven from the
+fenced target inventory. The parser rejects comments, ambiguous/incomplete syntax, double-quoted
+identifiers when ANSI_QUOTES mode is not captured, qualified names (including
+backtick-qualified names), generated names, `IF EXISTS`,
+unique/fulltext/spatial/invisible forms, and unmodeled options. Unqualified
+backtick identifiers are tokenized; their real-MySQL coverage remains unchecked.
 
-Any explicit qualified identifier (`schema.object`), including backtick and
-ANSI_QUOTES double-quoted forms, cross-schema reference, unsafe `DEFINER` or
-`SQL SECURITY DEFINER` clause, MariaDB-only syntax, or otherwise disallowed
-multi-statement DDL is manual resolution, not automatic replay. Qualification
-scanning ignores line and block comment text, so prose punctuation cannot turn
-an unqualified DDL statement into a false manual boundary. The manual path
-preserves the exact source SQL in the DDL ledger.
+Tables, `ALTER TABLE`, views, routines, events, triggers, `RENAME`, `TRUNCATE`,
+non-admitted `DROP` forms, database/schema DDL, qualified/cross-schema
+references, definer/security clauses, MariaDB-only syntax, and multi-object or
+multi-statement forms are manual boundaries. The stream flushes earlier DML,
+records exact SQL/coordinates in `cdc.ddl_events`, and stops before advancing.
 
-The narrow DML allowlist includes:
+Qualifier handling is fail-closed. Tokenization removes comments from syntax
+but preserves identifier/dot/identifier detection across inline comments; index
+parsing rejects any comment outright. Backticks and ANSI_QUOTES double-quoted
+identifiers are not admitted when their mode is unavailable. Trigger `ON` and
+index `ON` references are qualified checks, not automatic exceptions.
 
-- `INSERT INTO ...`
-- `UPDATE ...`
-- `DELETE FROM ...`
-- `REPLACE INTO ...`
+## Automatic journal
 
-Statements are normalized by trimming whitespace and a single trailing
-semicolon. Replayed statements are sent to the target executor as raw SQL with
-no parameters because they came from the source binlog text.
+Admitted DDL writes immutable pre-state/AST evidence to
+`cdc.ddl_replay_journal` as `prepared` before execution. The stream validates the
+complete affected target state, transitions to `applied`, and atomically
+transitions to `checkpointed` with the exact predecessor checkpoint. `prepared`
+and `blocked` rows stop startup from overtaking the event. Only a unique exact
+expected post-state can reconcile a crash; otherwise the row blocks.
 
-## Schema-changing Query Events
+## Quarantine
 
-For an unqualified `QueryEvent` whose default database is the configured source
-schema, compatible application-object DDL executes automatically. The stream
-flushes any grouped DML first, executes the DDL, then saves the event's
-`end_log_pos` in a separate target checkpoint transaction and invalidates the
-cached target schema. No DDL-ledger row or operator action is required. DDL
-execution and checkpoint persistence are not one atomic operation. A target
-execution error stops the stream without advancing the checkpoint.
-
-Database/schema DDL, any qualified or cross-schema DDL, unsafe `DEFINER` or
-`SQL SECURITY DEFINER` DDL, MariaDB-only forms such as `RETURNING`, `SEQUENCE`,
-`SYSTEM VERSIONING`, `VERSIONING`, `DELETE HISTORY`, or `INSERT DELAYED`, and
-disallowed multi-statement DDL use manual resolution. The stream flushes earlier
-DML, records the exact event and coordinates as `pending`, does not execute it,
-and stops before checkpointing past it. An operator must apply and validate the
-target change, mark the same ledger row `resolved`, and restart. See the [DDL
-Resolution Runbook](ddl-resolution.md).
-
-## Quarantine Policy
-
-The applier quarantines non-DDL statements with exact binlog coordinates when
-they are not in the replay allowlist or contain syntax that is risky during a
-MariaDB to MySQL migration.
-
-Initial quarantine reasons include:
-
-- Empty statement text.
-- Multi-statement text.
-- Unsupported non-DDL statement types such as transaction control, session
-  changes, procedure calls, privilege changes, or maintenance statements.
-- MariaDB-only syntax such as `RETURNING`, sequences, system versioning,
-  `DELETE HISTORY`, or `INSERT DELAYED`.
-- Unsafe file/privilege patterns such as `LOAD DATA`, `INTO OUTFILE`,
-  `LOAD_FILE`, `DEFINER`, or `SQL SECURITY DEFINER`.
-
-Quarantine is a rehearsal artifact, not silent data loss. Every record keeps
-the source file, position, default database, raw SQL, and reason so the
-specific incompatibility can be patched or marked safe before cutover.
+Unsupported non-DDL statements are quarantined with source coordinates, raw SQL,
+and a reason. Quarantine is not silent data loss and remains a cutover blocker
+until reviewed.

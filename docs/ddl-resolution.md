@@ -1,182 +1,120 @@
 # DDL Resolution Runbook
 
-`stream-binlog` automatically executes compatible, unqualified application-object
-DDL in the configured source schema: tables, indexes, views, routines, events,
-triggers, `RENAME TABLE`, `TRUNCATE TABLE`, and `DROP` operations. Database/schema
-DDL is manual even when its statement prefix is recognized, because the target
-would require global database DDL privileges.
+`stream-binlog` has two DDL paths:
 
-Any qualified or cross-schema DDL, unsafe `DEFINER` or `SQL SECURITY DEFINER`
-syntax, MariaDB-only syntax, or disallowed multi-statement DDL is also manual.
-For a manual boundary, the stream flushes earlier DML, records the exact event
-in the target-side ledger, does not execute the source SQL, and stops before
-checkpointing past it.
+- **Automatic journal:** only strict named, unqualified, visible, non-unique
+  secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed metadata and
+  no FK dependency. It uses `cdc.ddl_replay_journal`.
+- **Manual ledger:** every other DDL form. It uses `cdc.ddl_events`.
 
-The durable contract is [DDL Replay and Manual Resolution](specs/manual-ddl-resolution.md).
+The stream does not create or repair either control-plane object. Bootstrap must
+run with admin/resolver credentials while the stream is stopped. Run both files in
+order, then review the resulting grants and procedure definitions:
 
-## Configuration
+```bash
+mariadb --defaults-extra-file=/path/admin.cnf < docs/ddl-control-plane-bootstrap.sql
+mariadb --defaults-extra-file=/path/admin.cnf < docs/ddl-replay-journal-bootstrap.sql
+```
 
-The ledger defaults to `cdc.ddl_events`. Set a different qualified table only when the stream configuration and the operator commands below use the same table:
+The two files together must match the target fixture contract: exact
+`cdc.row_conflicts` `SELECT, INSERT, UPDATE`, checkpoint/journal/ledger scopes,
+application-schema grants, and `EXECUTE` only on the three trigger-inventory
+procedures.
+
+## Startup/bootstrap validation boundary
+
+Bootstrap and startup validate external administrative state once, before source
+replication: control-plane columns, keys, checks, guards, trigger-inventory
+procedure call results, effective grants, and checkpoint/lease prerequisites.
+Admin/resolver bootstrap separately reviews `SHOW CREATE PROCEDURE` and direct
+trigger rows.
+A mismatch is deployment drift and fails fast. The runtime does not recreate or
+repair that state.
+
+Binlog DDL is different: it is untrusted source input and is classified per event
+against the admission policy before any target operation. Once an event has been
+admitted, the CDC-generated SQL is trusted internal program behavior. Event
+handling executes the known internal operation directly, performs only the
+operation's event-specific pre/post-state or journal checks, and surfaces database
+errors. It does not rerun effective-grant policy validation, query `SHOW GRANTS`,
+or maintain a second grant/control-plane allowlist.
+
+Manual DDL follows the same boundary. Classification routes the source event to
+`cdc.ddl_events`; operator apply/validation is external administrative work and
+is not a substitute for startup validation.
+
+## Automatic journal safety
+
+Before source replication, startup validates journal columns, primary key, status
+CHECK, immutable insert/update guards, trigger-inventory procedure call results,
+effective grants, and the no-overtake barrier. Admin/resolver bootstrap separately
+reviews the procedure definition. The expected journal row is:
 
 ```text
---ddl-ledger-table cdc.ddl_events
+(source_identity, source_server_id, binlog_file, event_start_position,
+ event_end_position, schema_name, raw_sql, canonical_ast, pre_state,
+ expected_post_state, status)
 ```
 
-Before first startup, stop the stream and run
-[`ddl-control-plane-bootstrap.sql`](ddl-control-plane-bootstrap.sql) with
-resolver/admin credentials. The stream does not create or repair this control
-plane. `cdc_stream` lacks `TRIGGER` and other mutation privileges on the ledger
-but retains application-schema `TRIGGER` for automatic source trigger replay; it
-must not inspect `information_schema.triggers` directly. For ledger table
-`schema.table`, the
-only trigger-inspection path available to the runtime is the exact
-`schema.<table>_trigger_inventory()` `SQL SECURITY DEFINER` procedure created by
-bootstrap. On every startup, before source replication begins, the runtime calls
-that exact procedure and validates the returned trigger metadata (target
-schema/table, `BEFORE` timing, `INSERT`/`UPDATE` event, exact guard names,
-statement bodies, and order); a missing, failing, or malformed routine/result
-fails closed. Its immutable primary key is:
+The state machine is:
 
 ```text
-(source_identity, binlog_file, event_start_position)
+prepared -> applied -> checkpointed
+prepared -> blocked
 ```
 
-## Credentials and stream lease
+The stream captures target pre-state and canonical AST before execution, inserts
+`prepared`, executes the index DDL, validates the complete affected target state,
+marks `applied`, then atomically performs the journal checkpoint transition and
+predecessor checkpoint update. `prepared` and `blocked` prevent later source
+coordinates from overtaking the event.
 
-Provision the restricted account from
-[`ddl-runtime-grants.sql.example`](ddl-runtime-grants.sql.example) after replacing
-the password and reviewing the application schema. Use separate credentials:
+A restart never blindly replays `prepared`. It finalizes only an exact unique
+expected post-state that differs from pre-state. Pre-state, both/neither, mixed,
+or unavailable proof blocks. Target-binlog receipt is not available; this is
+semantic evidence only.
 
-- `cdc_stream`: `SELECT`, `INSERT`, `UPDATE`, and `DELETE` for target DML plus
-  schema-scoped `CREATE`, `ALTER`, `DROP`, `INDEX`, `REFERENCES`, `CREATE VIEW`,
-  `SHOW VIEW`, `CREATE ROUTINE`, `ALTER ROUTINE`, `EXECUTE`, `EVENT`, and
-  `TRIGGER` on the application schema. This supports automatic table, index,
-  view, routine, event, trigger, rename, truncate, and drop replay.
-  Database/schema DDL remains manual because it would require global DDL
-  privileges. The account also receives `SELECT`, `INSERT`, and `UPDATE` on
-  `cdc.stream_checkpoint`; `SELECT`, `INSERT` on `cdc.ddl_events`; and the exact
-  `GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';`
-  (or the corresponding `<table>_trigger_inventory` procedure for a custom
-  ledger). It must not have `UPDATE`, `DELETE`, `ALTER`, `DROP`, or `TRIGGER` on
-  the ledger, global `ALL`, global DDL, `GRANT OPTION`, `PROXY`, account/role/
-  server/resource-group/tablespace administration, or active role grants.
-  Startup fails closed when those privileges could resolve or replace a ledger
-  row. The
-  validated trigger rejects any inserted ledger row whose status is not
-  `pending` or whose resolution note is set.
-- Resolver/operator credential: reviewed access to apply target schema changes
-  and update `cdc.ddl_events.status` and `resolution_note`.
+The manual ledger and automatic journal may use separate exact
+trigger-inventory procedures, but they share one startup/bootstrap grant contract.
+The procedure call results are validated as static prerequisites; admin/resolver
+reviews the definitions separately. Event handling does not revalidate their grants.
 
-Provision both triggers and the matching inventory routine using the bootstrap
-SQL or the exact SQL printed by a startup error. `cdc.ddl_events_pending_insert_guard`
-enforces pending-only inserts. `cdc.ddl_events_monotonic_resolution_guard` makes
-source identity, coordinates, schema, and raw SQL immutable and permits exactly
-one non-empty-note transition from `pending` to `resolved`. Retain both triggers
-and the routine during schema reviews.
+## Prior duplicate-validator failure
 
-Bootstrap/resolver credentials must independently inspect the actual target
-objects before granting runtime access and after any control-plane change. Run
-these checks as an admin/resolver, never as `cdc_stream`:
+The prior implementation called the shared `validate_runtime_grants` path from
+`MySqlDdlEventLedger::ensure` while routing a manual DDL event. Startup validation
+had already accepted the exact `GRANT EXECUTE ON PROCEDURE
+cdc.ddl_replay_journal_trigger_inventory` scope. The second event-path validator
+used a narrower per-object policy and rejected that same already-approved exact
+inventory grant, so valid manual DDL routing failed despite a passing startup
+contract. This was a design error caused by duplicated policy validation, not
+missing privilege evidence or a reason to expand the allowlist. The corrected
+design keeps static validation at startup/bootstrap only.
 
-```sql
-SHOW CREATE PROCEDURE cdc.ddl_events_trigger_inventory\G
+## Manual boundary procedure
 
-SELECT
-    trigger_name,
-    event_object_schema,
-    event_object_table,
-    event_manipulation,
-    action_timing,
-    action_statement,
-    action_order
-FROM information_schema.triggers
-WHERE event_object_schema = 'cdc'
-  AND event_object_table = 'ddl_events'
-ORDER BY event_manipulation, action_order;
-```
+Every table/view/routine/event/trigger/rename/truncate/non-admitted drop,
+`ALTER TABLE`, database/schema DDL, qualified or cross-schema reference,
+comments, backtick-qualified or ANSI_QUOTES-ambiguous identifiers,
+definer/security clause, MariaDB-only form, incomplete form, or
+multi-object/multi-statement form reaches the manual ledger. Unqualified
+backtick identifiers are tokenized by the current parser but lack real-MySQL
+coverage proof.
 
-The routine definition and trigger rows must match the bootstrap contract. The
-runtime only executes `CALL cdc.ddl_events_trigger_inventory()` and validates its
-returned rows; it never directly reads `information_schema.triggers`.
+The shared inventory query hardcodes `IS_VISIBLE='YES'` for cross-engine
+compatibility because MariaDB does not expose a portable visibility column. It
+cannot prove that a MySQL target index is visible. If target-native metadata shows
+an invisible index in the affected object, keep the DDL manual; do not rely on
+automatic admission.
 
-The stream acquires target named lock `cdc-stream:<target database>` without
-waiting. Only one stream may target a database; lock failure means another stream
-process owns that target and this process exits.
+### 1. Stop at the boundary
 
-Both the checkpoint row name (`stream-binlog:<source-identity>`) and DDL ledger
-identity are scoped to the source incarnation. Before replacing/rebuilding a
-source, choose a new identity; never reuse the previous checkpoint row. For an
-existing stream migration, stop the old writer, read its final legacy checkpoint,
-confirm that binlog file still exists on the source, then clone it once with a
-guarded `INSERT ... SELECT` (never UPSERT):
+The stream flushes earlier grouped DML, inserts the exact source identity,
+server ID, file, start/end positions, schema, and raw SQL as `pending`, and
+stops without advancing past the event. Do not restart repeatedly while the row
+is pending.
 
-```sql
-INSERT INTO cdc.stream_checkpoint (checkpoint_name, checkpoint_json)
-SELECT
-    'stream-binlog:production-source',
-    checkpoint_json
-FROM cdc.stream_checkpoint legacy
-WHERE legacy.checkpoint_name = 'stream-binlog'
-  AND NOT EXISTS (
-      SELECT 1
-      FROM cdc.stream_checkpoint scoped
-      WHERE scoped.checkpoint_name =
-          'stream-binlog:production-source'
-  );
-```
-
-Require exactly one inserted row and verify the legacy/scoped JSON hashes match
-before starting the new stream. Retain the legacy row for rollback review.
-
-For a fresh source with no legacy row, capture the exact snapshot/binlog boundary
-and insert it explicitly:
-
-```sql
-INSERT INTO cdc.stream_checkpoint (checkpoint_name, checkpoint_json)
-VALUES (
-    'stream-binlog:production-source',
-    JSON_OBJECT(
-        'source_file', 'mysqld-bin.000001',
-        'source_position', 4,
-        'gtid', NULL,
-        'event_timestamp', 0,
-        'last_event', JSON_OBJECT(
-            'event_type', 'Bootstrap',
-            'description', 'reviewed snapshot/binlog boundary'
-        )
-    )
-);
-```
-
-Never invent or default this coordinate. It must match the reviewed snapshot
-boundary and its binlog file must still exist on the source.
-
-Pass `--source-identity` as a stable base incarnation ID, for example
-`production-source`. Do not include a `#server-id=` suffix. The
-stream appends the event server ID when storing the row, producing a value such
-as `production-source#server-id=123`. This prevents a binlog
-coordinate from one source incarnation/server from resolving another. A row also
-stores `source_server_id`, `event_end_position`, `schema_name`, exact `raw_sql`,
-`status`, and `resolution_note`.
-
-## Required procedure
-
-### 1. Stop at the manual DDL boundary
-
-Compatible, unqualified application-object DDL is replayed automatically and
-never reaches this procedure. Database/schema DDL, qualified or cross-schema
-DDL, unsafe `DEFINER`/`SQL SECURITY DEFINER` DDL, MariaDB-only forms, and
-otherwise rejected DDL do reach it. When the stream exits with `manual DDL
-resolution required`, retain the emitted `source_server_id`, `file`,
-`start_position`, `end_position`, schema, and SQL. Earlier DML has already been
-flushed. The rejected DDL has **not** been executed and the checkpoint has **not**
-advanced past it.
-
-Do not restart repeatedly while the row is pending. It will stop at the same boundary.
-
-### 2. Read the immutable ledger record
-
-Replace the placeholders with values from the stream error. Use the complete endpoint-plus-server-ID `source_identity`, file, and start position; do not identify a DDL by SQL text alone.
+### 2. Read the immutable row
 
 ```sql
 SELECT
@@ -197,68 +135,61 @@ WHERE source_identity = 'prod-db.example:3306#server-id=123'
   AND event_start_position = 123456\G
 ```
 
-Copy `raw_sql` directly from this result. The restart path requires byte-for-byte equality with the source event's SQL; editing `raw_sql` to a translated statement will make the stream fail with a ledger SQL mismatch.
+Copy `raw_sql` exactly. Do not replace it with a translated statement.
 
-### 3. Review, apply, and validate the target schema
+### 3. Apply and validate manually
 
-Review the exact source DDL and decide the explicit target-side migration. Apply it manually with the target change-control process. The target statement may be a consciously reviewed compatible adaptation, but the ledger's `raw_sql` must remain the unmodified source SQL.
+Review the source statement, apply the consciously reviewed target migration, and
+validate the complete intended target object with resolver credentials. Generic
+errors such as already-exists, missing-object, or object-does-not-exist are not
+proof and do not authorize resolution.
 
-Validate target schema state before resolving. For a table change, inspect the target definition and the specific expected object/column/index, for example:
+Record the applied migration and validation evidence in the resolution note.
 
-```sql
-SHOW CREATE TABLE globalcomix.accounts\G
-
-SELECT column_name, column_type, is_nullable, column_default
-FROM information_schema.columns
-WHERE table_schema = 'globalcomix'
-  AND table_name = 'accounts'
-ORDER BY ordinal_position;
-```
-
-For views, routines, triggers, events, or databases, use the corresponding
-`SHOW CREATE ...` / `information_schema` check with resolver/admin credentials.
-These operator checks are independent of the runtime trigger-inventory call.
-Record the applied target migration and validation evidence in the resolution
-note.
-
-**Do not treat a generic target error as success.** Errors such as “already exists”, “doesn't exist”, or “missing object” do not prove the target has the intended schema. They do not resolve the ledger row and do not authorize a checkpoint advance.
-
-### 4. Mark the same row resolved only after validation
-
-After the target change and validation both succeed, update the existing row. Keep the immutable key and `raw_sql` unchanged. Include the applied migration reference and validation evidence in `resolution_note`.
+### 4. Resolve exactly once
 
 ```sql
 UPDATE cdc.ddl_events
 SET status = 'resolved',
-    resolution_note = 'Applied CHG-1234 on target; validated SHOW CREATE TABLE globalcomix.accounts at 2026-07-10T22:00:00Z.'
+    resolution_note = 'reviewed target migration and validation evidence'
 WHERE source_identity = 'prod-db.example:3306#server-id=123'
   AND binlog_file = 'mysqld-bin.000777'
   AND event_start_position = 123456
-  AND status = 'pending'
-  AND raw_sql = 'ALTER TABLE accounts ADD COLUMN handle varchar(64)';
+  AND status = 'pending';
 ```
 
-Confirm exactly one row changed, then re-read it:
+Require exactly one row changed. The trigger keeps coordinates, schema, and raw
+SQL immutable and permits only one non-empty-note `pending -> resolved` change.
 
-```sql
-SELECT status, raw_sql, resolution_note, updated_at
-FROM cdc.ddl_events
-WHERE source_identity = 'prod-db.example:3306#server-id=123'
-  AND binlog_file = 'mysqld-bin.000777'
-  AND event_start_position = 123456\G
-```
+### 5. Restart and verify
 
-**Warning:** marking a row `resolved` before the target DDL has been applied and validated causes source/target schema divergence. On restart, the stream will checkpoint past the source DDL without executing it again.
+Restart with the same source identity and ledger configuration. The stream checks
+byte-for-byte raw-SQL equality, advances the checkpoint to `event_end_position`,
+invalidates the schema cache, and does not execute the DDL again.
 
-### 5. Restart and verify progress
+## Runtime grant contract
 
-Restart the stream with the unchanged checkpoint and identical `--ddl-ledger-table` configuration. It re-reads the ledger record, verifies that its raw SQL exactly matches the source event, advances the checkpoint to `event_end_position`, invalidates its schema cache, and does not replay the DDL.
+Required control-plane scopes:
 
-Confirm the checkpoint has advanced to the recorded `event_end_position`, then monitor for the next event or boundary. This proves only that this DDL boundary was acknowledged; it does not prove whole-database schema or data parity.
+- global `USAGE` only;
+- `SELECT, INSERT, UPDATE` on `cdc.stream_checkpoint`;
+- `SELECT, INSERT, UPDATE` on `cdc.row_conflicts`;
+- `SELECT, INSERT` on `cdc.ddl_events`;
+- `SELECT, INSERT, UPDATE` on `cdc.ddl_replay_journal`;
+- `EXECUTE` only on the exact definer-safe `cdc.row_conflicts_trigger_inventory`, `cdc.ddl_events_trigger_inventory`, and `cdc.ddl_replay_journal_trigger_inventory` procedures.
 
-## Pending-ledger monitoring
+Reject global mutation, `ALL`, `GRANT OPTION`, `PROXY`, roles, broad `cdc.*`,
+and row-conflict `DELETE`, `ALTER`, or `DROP` privileges. The startup/bootstrap
+validator fails before source streaming when the table, guards, constraints,
+procedures, or effective exact grant is missing or widened. Application-schema
+privileges used by the stream remain a separate reviewed bootstrap contract.
+Runtime calls the exact inventory procedure during startup validation and checks
+its returned rows; it does not rerun grant policy validation during event handling.
+Admin or resolver credentials must independently run and review SHOW CREATE
+PROCEDURE plus the actual trigger rows; runtime does not require SHOW
+ROUTINE/global metadata privileges.
 
-Use this query to find all work blocking CDC, oldest first:
+## Monitoring
 
 ```sql
 SELECT
@@ -267,13 +198,38 @@ SELECT
     binlog_file,
     event_start_position,
     event_end_position,
-    schema_name,
     raw_sql,
     created_at,
     TIMESTAMPDIFF(MINUTE, created_at, UTC_TIMESTAMP()) AS pending_minutes
 FROM cdc.ddl_events
 WHERE status = 'pending'
 ORDER BY created_at, source_identity, binlog_file, event_start_position;
+
+SELECT
+    source_identity,
+    binlog_file,
+    event_start_position,
+    status,
+    created_at,
+    updated_at
+FROM cdc.ddl_replay_journal
+WHERE status IN ('prepared', 'blocked')
+ORDER BY binlog_file, event_start_position;
 ```
 
-Alert on any returned row. A pending row is an intentional stopped replication boundary, not a retryable transient failure.
+Any pending manual row or prepared/blocked automatic row is a replication
+boundary and a cutover blocker.
+
+A bounded stream uses an inclusive event-end stop position. It dispatches and
+checkpoints the event whose `end_log_pos` equals `--stop-position`, then exits.
+A stop inside an event or open row transaction, or a stop not reached before EOF,
+fails explicitly rather than partially applying a transaction.
+
+## Unchecked gates
+
+- [ ] Real-MySQL bootstrap/schema/guard/routine/grant validation.
+- [ ] Process crash after prepare, apply, and transactional checkpoint transition.
+- [ ] Qualifier/comment/ANSI_QUOTES/incomplete-form integration matrix.
+- [ ] Recurring conflict-to-repair scheduling and live convergence proof; the
+      durable observation ledger and FK-aware phased repair are wired and covered
+      by the Docker harness.

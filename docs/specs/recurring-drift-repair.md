@@ -1,47 +1,41 @@
 # Recurring Drift Repair
 
-`repair-drift` orchestrates recurring bounded table reconciliation after the live
-CDC stream has applied forward changes. It uses the existing `sync-table` repair
-path and does not alter live row-conflict semantics.
+`repair-drift` orchestrates bounded, run-scoped phased repairs after forward CDC
+application. Each recurrence gets a fresh orchestration ID; only the exact
+interrupted run may be resumed. The real Docker harness defines 30 executable
+scenarios and proves FK ordering, fail-closed planning, resumable runs, PK-window
+bounds, secondary-unique safety, and zero unresolved debt for the repaired scope.
 
-## What it must do
+## Current behavior
 
-- [x] Create a fresh run-scoped ID for every orchestration invocation.
-- [x] Inventory source and target base tables before selecting repair work.
-- [x] Compare source and target counts plus bounded content checks, invoking `sync-table` for count- or content-drifted tables.
-- [x] Skip missing target tables and incompatible primary-key/column inventories with an explicit reason.
-- [x] Support deterministic parent-first ordering through an explicit table-order prefix, then lexical ordering for remaining tables.
-- [x] Require an explicit `--max-deletes` value in apply mode so orphan deletion is always bounded by operator input.
-- [x] Preserve the existing `sync-table` primary-key repair path, including no-cross-primary-key conflict behavior.
+- [x] Generate a fresh orchestration run ID for each invocation.
+- [x] Inventory source/target base tables and compare counts plus bounded content
+      checks.
+- [x] Skip missing/incompatible tables with explicit reasons.
+- [x] Require an explicit `--max-deletes` in apply mode.
+- [x] Pass child run IDs to `sync-table`.
+- [x] Keep content-check bounds visible; at most 1,000 mismatch ranges are
+      recorded and floating-point columns are skipped.
+- [x] Keep target writes primary-key based.
 
-## How it works
+## Wired phased behavior
 
-- [Catchup and table repair runbook](../catchup.md)
-- [Table Sync Repair](table-sync-repair.md)
+- [x] Canonical source/target FK inventory drives child-first deletes and
+      parent-first inserts; `NO ACTION` and `RESTRICT` normalize across engines.
+- [x] Immutable plan hashes reject changed plans when reusing an interrupted run.
+- [x] Cycles, FK inventory/schema mismatch, and delete ceilings block before
+      target mutation.
+- [x] `--start-after`/`--end-at` bound the selected PK window; apply mode always
+      carries an explicit `--max-deletes` value.
+- [x] Unresolved conflicts resolve only after verified equality, with run/evidence
+      fields, and the real harness proves zero unresolved debt for scope.
+- [x] Secondary-unique collisions remain primary-key scoped and do not mutate the
+      conflicting owner row.
+- [x] Individual MariaDB 11.4 → MySQL 8.0 Docker scenarios pass.
 
-## Implementation inventory
+Remaining eventual-consistency gates are recurring scheduling from unresolved
+conflicts, full-tree parity, and deployment/cutover proof. Until a scheduler exists,
+operators must start each recurrence with a fresh bounded orchestration ID and
+review the persisted child run states.
 
-- `src/repair_drift.rs` - orchestration config, inventory/count/content planning, ordering, run IDs, and command dispatch.
-- `src/main.rs` - top-level command registration and CLI usage.
-- `src/table_sync.rs` - bounded per-table repair execution and progress persistence.
-
-## Tests asserting this spec
-
-- `src/repair_drift.rs` - ordering, count/content-drift selection, content-check wiring, and apply delete-safety tests.
-- `src/table_sync.rs` - primary-key repair and conflict-safe target writes.
-
-Content checks are intentionally bounded: at most 1,000 mismatch ranges are
-recorded, and floating-point columns are skipped because cross-server numeric
-normalization is unsafe. Reports expose both bounds (`range_limit_exceeded`) and
-skipped columns; operators must use reviewed `sync-table` columns when those
-limitations matter.
-
-## Known gaps (current cycle)
-
-- [ ] Add integration coverage against disposable MariaDB/MySQL endpoints.
-
-## Out of scope
-
-- Automatic foreign-key discovery or mutation. Operators provide the parent-first prefix from the reviewed schema inventory.
-- Unbounded orphan deletion.
-- Live-stream automatic repair scheduling.
+Out of scope: unbounded deletion and automatic cutover.

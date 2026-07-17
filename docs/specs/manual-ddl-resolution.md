@@ -1,80 +1,115 @@
 # DDL Replay and Manual Resolution
 
-`stream-binlog` automatically replays only compatible, unqualified application-schema
-DDL and uses an operator-controlled ledger for DDL that cannot be replayed safely.
-The [DDL resolution runbook](../ddl-resolution.md) describes the ledger and operator
-procedure.
+`stream-binlog` has one narrow automatic admission path and a separate manual
+DDL ledger. The automatic journal and manual ledger are different control-plane
+objects.
 
-## What it must do
+## Automatic admission
 
-### Automatic replay
+- [x] Require the configured source schema as the QueryEvent default database.
+- [x] Reject every qualified or cross-schema identifier before automatic replay.
+- [x] Admit only explicitly named simple visible non-unique secondary BTREE
+      `CREATE INDEX` and `DROP INDEX` forms.
+- [x] Model index names, table names, key parts, positive prefixes, ASC/DESC,
+      optional COLLATE, visibility, and BTREE options completely.
+- [x] Reject comments, qualified backtick forms, ANSI_QUOTES double-quoted
+      forms whose mode is not captured, generated names, `IF EXISTS`,
+      unique/fulltext/spatial/invisible indexes,
+      extra options, missing metadata, and ambiguous syntax.
+- [x] Reject an index that supports or depends on an FK, uses a generated column,
+      or cannot be proven against the fenced target pre-state.
+- [x] Capture immutable target pre-state plus canonical parsed AST before
+      execution; derive expected post-state from those values only.
+- [x] Persist `prepared` evidence before execution, validate complete affected
+      target state, and use the journal state machine before checkpointing.
+- [x] Keep statement DML forbidden under the production ROW/FULL contract.
 
-- [x] Automatically execute source schema-changing `QueryEvent` SQL only when the default database is the configured application schema, the SQL is unqualified, and the compatibility policy accepts it.
-- [x] Automatically replay full application-schema DDL: table, index, view, routine, event, trigger, `RENAME TABLE`, `TRUNCATE TABLE`, and `DROP` operations accepted by the compatibility policy.
-- [x] Automatically replay compatible `ALTER TABLE` statements, including multiple `ADD COLUMN` clauses and ordinary `DEFAULT`, `COMMENT`, and `AFTER` clauses.
-- [x] Grant the runtime exact schema-scoped DML plus `CREATE`, `ALTER`, `DROP`, `INDEX`, `REFERENCES`, `CREATE VIEW`, `SHOW VIEW`, `CREATE ROUTINE`, `ALTER ROUTINE`, `EXECUTE`, `EVENT`, and `TRIGGER` privileges on the application schema only; never grant global DDL, `ALL`, `GRANT OPTION`, account, role, server, resource-group, or tablespace administration.
-- [x] Route database/schema DDL through manual resolution because MySQL requires global privileges for those operations.
-- [x] Route qualified or cross-schema DDL, unsafe `DEFINER`/`SQL SECURITY DEFINER` DDL, MariaDB-only syntax, and disallowed multi-statement DDL through manual resolution.
-- [x] Flush grouped DML before automatic DDL, execute it, then persist its event end position in a separate checkpoint transaction, invalidate cached target schema state, and require no DDL ledger row; DDL and checkpoint persistence are not atomic as one operation.
-- [x] Do not advance the checkpoint when automatic DDL execution fails.
-- [x] Keep statement DML forbidden in production `ROW`/`FULL` streaming even though compatible DDL is replayed.
+## Manual boundary
 
-### Manual-resolution safety
+- [x] Route every incomplete or unsupported form manual before journal prepare,
+      execution, or checkpointing.
+- [x] Route tables, `ALTER TABLE`, views, routines, events, triggers, `RENAME`,
+      `TRUNCATE`, and non-admitted `DROP` forms manual.
+- [x] Route database/schema DDL, every qualified or cross-schema reference,
+      trigger `ON` qualifiers, index `ON` qualifiers, comments around dots,
+      multiple objects, view-body references that cannot be safely modeled,
+      unsafe `DEFINER`/`SQL SECURITY DEFINER`, MariaDB-only syntax, and
+      multi-statement forms manual.
+- [x] Flush earlier grouped DML, insert exact source identity/coordinates/raw SQL
+      into `cdc.ddl_events` as `pending`, and stop before the checkpoint.
+- [x] Require exact raw-SQL equality on restart before a resolved ledger row can
+      advance the checkpoint without re-execution.
 
-- [x] Require manual resolution when a recognized schema-changing statement is rejected by compatibility policy because it is unsafe, MariaDB-only, or contains a disallowed multi-statement sequence.
-- [x] Require manual resolution when the event cannot be safely associated with the configured source schema, including every qualified or cross-schema identifier, not only ambiguous ones.
-- [x] Flush all earlier grouped DML and their checkpoints before handling a manual DDL boundary.
-- [x] Record an unseen manual DDL boundary as `pending` in the target DDL ledger, keyed by base source incarnation identity plus event server ID, binlog file, and event start position.
-- [x] Stop at a pending manual DDL boundary without checkpointing past it.
-- [x] Keep the exact source SQL, source server identity, schema, and event end position in the ledger record.
-- [x] Enforce pending-only inserts with a validated target trigger and reject runtime credentials that can update, delete, alter, drop, trigger, or role-bypass the ledger.
-- [x] Keep `cdc_stream` without ledger `UPDATE`, `DELETE`, `ALTER`, `DROP`, or `TRIGGER` mutation privileges; grant it only `EXECUTE` on the exact `<table>_trigger_inventory` `SQL SECURITY DEFINER` routine used for ledger-trigger inspection. Application-schema `TRIGGER` remains allowed for automatic source trigger replay.
-- [x] Have bootstrap/resolver credentials independently inspect the actual trigger rows and `SHOW CREATE` routine definition; runtime never reads `information_schema.triggers` directly.
-- [x] Call the exact inventory routine during startup validation and fail closed when the routine is missing, fails, or returns missing/malformed trigger metadata.
-- [x] Enforce immutable event identity/coordinates/raw SQL and a single one-way `pending` to `resolved` transition with a validated `BEFORE UPDATE` trigger.
-- [x] Scope durable stream checkpoint rows to the base source identity so a replaced source cannot consume an earlier incarnation's coordinate.
+## Validation boundary (corrected design)
 
-### Manual resolution and restart
+- [x] Treat binlog DDL as untrusted input: classify and admit or route each event before execution.
+- [x] Treat SQL generated by CDC from an admitted event or known internal operation as trusted internal program behavior; do not validate its grant policy again per event or query.
+- [x] Validate the static control-plane schema, guards, triggers, procedures, effective grants, and startup prerequisites once during admin/bootstrap validation and fail fast before source replication.
+- [x] Execute known internal operations directly during event handling and surface database errors; do not rerun startup grant validation or maintain a second event-path allowlist.
+- [x] Keep event-specific pre/post-state evidence and manual operator validation separate from static bootstrap prerequisite validation.
+- [x] Record the prior duplicate-validator failure in the [DDL Resolution Runbook](../ddl-resolution.md#prior-duplicate-validator-failure): an already-approved exact inventory-procedure `EXECUTE` grant was rejected only because a second event-path validator disagreed with the startup contract.
 
-- [x] Resume past a manual DDL boundary only when its existing ledger row is `resolved`.
-- [x] Require the ledger row's raw SQL to exactly equal the replayed source SQL before advancing.
-- [x] Advance the checkpoint to the manually resolved DDL event end position without executing the DDL again.
-- [x] Invalidate cached target schema state after a resolved boundary.
-- [x] Never treat target errors such as object already exists or object missing as manual resolution.
+## Journal contract
 
-### Operator interface
+- [x] Validate exact journal columns, primary key, status CHECK, trigger bodies,
+      CALL-returned trigger inventory rows, and effective runtime grants at startup.
+- [x] Keep SHOW CREATE PROCEDURE and direct trigger-row review in the separate
+      admin/resolver bootstrap evidence path; runtime requires exact EXECUTE only.
+- [x] Insert only complete immutable `prepared` identity/evidence/lease/fence
+      rows.
+- [x] Permit only `prepared -> applied|blocked` and `applied -> checkpointed`.
+- [x] Enforce startup no-overtake for the earliest `prepared` or `blocked` row.
+- [x] Fail closed when a prepared row lacks unique expected-post proof; do not
+      blind replay.
+- [ ] Prove all of the above with real MySQL and process-crash fixtures.
+- [ ] Prove target-binlog receipt; the implementation currently has no such
+      receipt and therefore relies on semantic evidence only.
 
-- [x] Default the ledger table to `cdc.ddl_events` and allow replacement with `--ddl-ledger-table TABLE`.
-- [x] Provide an operator-readable runbook for inspection, target application/validation, resolution, restart, and pending-ledger monitoring.
+The disposable harness currently lists 30 executable scenarios. Its crash and
+connection-loss controls are behind the `integration-failpoints` Cargo feature;
+production builds use the default feature set and contain no failpoint controls.
+The harness proves the implemented Docker boundaries, not live-target or
+cutover readiness.
 
-## How it works
+## Runtime grants
 
-- [DDL resolution runbook](../ddl-resolution.md)
-- [Checkpoints](../checkpoints.md)
-- [Statement events](../statement-events.md)
+The static control-plane contract is exact: global `USAGE` only; checkpoint
+`SELECT,INSERT,UPDATE`; row-conflict ledger `SELECT,INSERT,UPDATE`; manual
+ledger `SELECT,INSERT`; journal `SELECT,INSERT,UPDATE`; and `EXECUTE` only on the
+three exact definer-safe trigger-inventory procedures. Reject global mutation,
+`ALL`, `GRANT OPTION`, `PROXY`, roles, broad `cdc.*`, and mutation of
+manual-ledger/journal guards. Validate this contract once during
+startup/bootstrap and fail fast on drift.
+
+The reviewed application-schema grant set is also bootstrap state. It is not a
+reason to re-run grant policy validation for each event or query. Event handling
+executes known internal operations, performs only event-specific state/evidence
+checks, and surfaces database errors. The exact prior failure and its corrected
+boundary are documented in the [DDL Resolution Runbook](../ddl-resolution.md#prior-duplicate-validator-failure).
 
 ## Implementation inventory
 
-- `src/live/structured_stream.rs` — routes compatible, unqualified application DDL to automatic replay and database/schema, qualified, unsafe, MariaDB-only, or otherwise rejected DDL to the manual ledger.
-- `src/live/ddl_ledger.rs` — validates the ledger and runtime grants, validates trigger metadata, and records pending events.
-- `src/live.rs` — owns the default ledger table and validates its configuration.
-- `src/main.rs` — exposes `--ddl-ledger-table`.
-- `src/statement.rs` — classifies automatically replayable and manually resolved schema changes.
+- `src/live/structured_stream.rs` — admission, manual boundaries, journal order,
+  barrier, and checkpoint transaction.
+- `src/live/ddl_semantics.rs` — strict index parser and semantic evidence.
+- `src/live/ddl_replay_journal.rs` — journal schema/grant validation, state
+  machine, barrier, and transactional status transitions.
+- `src/live/ddl_ledger.rs` — manual ledger validation and pending/resolved path.
 
-## Tests asserting this spec
+## Required real-MySQL matrix
 
-- `src/live/structured_stream/tests.rs` — compatible DDL bypasses manual resolution; automatic replay failure does not checkpoint; unsafe, database/schema, and qualified DDL remains pending; resolved manual DDL enforces exact SQL and checkpoint monotonicity before advancing without re-execution.
-- `src/statement.rs` — application-object automatic DDL coverage, database/schema manual boundaries, runtime grant contract, and compatible/unsafe/MariaDB-only classification.
-- `src/live/ddl_ledger.rs` — ledger schema, immutable coordinate lookup, and pending insert behavior.
-- `src/tests.rs` — parses `--ddl-ledger-table` into stream configuration.
+- [ ] qualified identifiers with backticks, ANSI_QUOTES, comments around dots,
+      trigger/index `ON` clauses, and cross-schema references;
+- [ ] incomplete key parts/options and every rejected index family;
+- [x] real Docker crash after journal prepare: restart reconciles prepared pre-state to `blocked` and does not overtake later events;
+- [x] real Docker crash after target DDL implicit commit but before journal `applied`: restart proves live post-state and continues without replay;
+- [x] real Docker crash after journal `applied` but before checkpoint: restart completes checkpoint-only recovery;
+- [x] real Docker crash after the journal checkpoint transition but before checkpoint write: transaction rollback leaves the row `applied`, not `checkpointed`, until restart completes the transaction;
+- [ ] pre/both/neither/mixed/unavailable post-state evidence;
+- [ ] missing/extra columns, keys, checks, guards, routines, or grants;
+- [ ] manual ledger resolution with exact-SQL mismatch and generic target errors.
 
-## Known gaps (current cycle)
-
-- [ ] Add an end-to-end startup test proving a real target with a missing or mismatched ledger guard fails before source replication begins.
-- [ ] Add an end-to-end test proving a real target DDL error cannot turn a pending row into `resolved`.
-
-## Out of scope
-
-- Automatically translating SQL that the compatibility policy rejects.
-- Treating target errors as proof that a manual DDL boundary was applied correctly.
-- Resolving target schema divergence caused by an operator marking a row resolved before applying and validating the DDL.
+The unchecked syntax rows above are intentional real-MySQL coverage gaps. The
+30-scenario Docker harness covers the implemented journal/bootstrap, recovery,
+lease, reconnect, and repair boundaries but does not turn those rows into a
+live-target proof.

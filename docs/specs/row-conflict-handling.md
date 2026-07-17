@@ -1,40 +1,73 @@
 # Row Conflict Handling
 
-The structured CDC stream applies MariaDB ROW binlog events to a MySQL-compatible target while allowing checksum-driven reconciliation to restore eventual consistency after target conflicts.
+The structured stream applies MariaDB ROW/FULL events by source primary key. A
+secondary-unique conflict must not mutate the target row that owns the
+conflicting secondary key.
 
-## What it must do
+## Current behavior
 
-- [x] Apply each source `WriteRowsEvent` row as an independent plain `INSERT` containing the explicit source primary key.
-- [x] Never generate `ON DUPLICATE KEY UPDATE` for a source row insert.
-- [x] Under `ignore-duplicate`, skip only the row whose target insert or update reports MySQL error 1062 and continue applying later rows from the event.
-- [x] Emit a parseable `cdc_row_conflict_skipped` event containing operation, schema, table, source coordinate, and source primary key.
-- [x] Advance the event checkpoint after the remaining rows apply even when a duplicate conflict is skipped; the skipped row becomes reconciliation debt.
-- [x] Preserve fail-fast behavior for duplicate row changes under the default conflict policy.
-- [x] Keep generated target columns out of row insert and update statements.
+- [x] Build plain `INSERT` statements with the explicit source primary key.
+- [x] Never use `ON DUPLICATE KEY UPDATE` for source inserts.
+- [x] Classify error 1062 plus admitted NOT NULL, foreign-key, and CHECK
+      constraint failures as durable repair debt.
+- [x] Persist conflict evidence on the independent control-plane connection,
+      then fail the row event so every earlier target mutation in the same
+      source transaction rolls back.
+- [x] Leave the stream checkpoint unchanged when the target transaction rolls
+      back.
+- [x] Emit parseable `cdc_row_conflict_skipped` output with operation, table,
+      source coordinate, and source primary key.
+- [x] Replay the same source event into the same identity and increment its
+      attempt count; a different source primary key creates a separate identity.
+- [x] Keep generated columns out of row writes.
+- [x] Provide a durable conflict-record schema/library contract containing source
+      identity/server/file/start/end, schema/table/operation, source PK,
+      duplicate index/owner when available, error code/text, first/last observed
+      times, attempt count, unresolved/resolved status, repair run ID, and
+      resolution evidence.
+- [x] Provide duplicate classification for same-primary, secondary-unique owner
+      mismatch, and malformed duplicate errors in the repair library/tests.
 
-## How it works
+## Durable conflict control plane
 
-- [Statement events](../statement-events.md)
-- [Table sync repair](table-sync-repair.md)
+`cdc.row_conflicts` is bootstrapped by the admin DDL file and is never created by
+runtime code. Startup validates the exact columns, nullability/defaults,
+ASCII SHA-256 `conflict_identity` primary key, unresolved/resolved status CHECK,
+insert/update guards, and effective privileges before opening the source stream.
+Trigger metadata is read only through the SQL SECURITY DEFINER, READS SQL DATA
+procedure `cdc.row_conflicts_trigger_inventory`; runtime calls that exact
+procedure and validates its returned trigger rows before streaming. Admin/resolver
+bootstrap separately reviews `SHOW CREATE PROCEDURE` and the direct trigger rows.
+The identity is lowercase SHA-256 over an ordered, length-prefixed tuple of
+`source_identity`, server ID, binlog file, start position, schema, table,
+operation, and the complete source primary-key JSON. All identity fields remain
+stored. Duplicate-key upserts compare every hashed field; a mismatch fails via
+the immutable-identity guard instead of merging a theoretical hash collision.
 
-## Implementation inventory
+The runtime grant is exact table scope: `SELECT, INSERT, UPDATE` only, plus
+EXECUTE on the exact inventory procedure. DELETE, ALTER, DROP, other CDC
+EXECUTE/schema scopes, schema-wide/global/admin/role/grant-option access is
+rejected.
+Observations use a guarded UPSERT that increments unresolved attempts but never
+downgrades a resolved record. Resolution updates only an unresolved record after
+verified source/target equality and requires non-empty repair evidence.
 
-- `src/row.rs` — constructs and applies explicit-primary-key row statements and logs skipped conflicts.
-- `src/target.rs` — exposes row execution outcomes without changing generic target writers.
-- `src/mysql_client.rs` — classifies duplicate row-change errors under the configured policy.
-- `src/live/insert_conflict.rs` — defines duplicate-conflict policy checks.
+It is forbidden to convert an insert into an update of the secondary-key owner
+or to select a target row by the secondary key.
 
-## Tests asserting this spec
+## Live wiring and remaining proof
 
-- `src/row.rs` — independent inserts, continued application after one ignored conflict, generated-column exclusion, and conflict log format.
-- `src/live/insert_conflict.rs` — duplicate insert/update classification and default fail-fast policy.
+The structured live stream persists row-conflict observations to this durable
+ledger before returning the row failure. The target data transaction and its
+checkpoint then roll back together, while the independently persisted evidence
+survives. Startup validates the ledger schema, guards, trigger inventory, and
+exact grants before source replication. `repair-drift` resolves rows only after
+verified equality and records the run ID plus evidence. The Docker harness proves
+multi-row rollback, durable idempotent evidence, different-primary-key isolation,
+unchanged checkpoints, and zero unresolved debt for repaired scope.
 
-## Known gaps (current cycle)
+- [ ] Schedule recurring repair from unresolved records.
+- [ ] Prove the live deployed path and repeated convergence before cutover.
 
-- [ ] Persist skipped conflict counters/ranges for scheduling targeted reconciliation.
-- [ ] Add recurring checksum/sync orchestration that proves skipped rows converge.
-
-## Out of scope
-
-- Resolving unique-key swaps or cycles inside the live stream. Reconciliation owns those conflicts.
-- Replaying source statement-based DML. Production source replication uses `ROW` with `FULL` row images.
+See [Table Sync Repair](table-sync-repair.md) and
+[Catchup Workflow](../catchup.md).

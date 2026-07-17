@@ -3,75 +3,69 @@
 Rust migration tooling for moving a MariaDB database to a MySQL-compatible
 target with minimal downtime.
 
-The immediate use case is MariaDB to DigitalOcean Managed MySQL, but this repo
-is intentionally not tied to GlobalComix infrastructure. It should be usable as
-a standalone migration/CDC tool.
+## Design constraints
 
-## Design Constraints
+- Consume production `binlog_format=ROW` with `binlog_row_image=FULL`.
+- Snapshot table data first, then stream from a recorded binlog position.
+- Apply row changes by source primary key; a secondary-unique conflict never
+  mutates another target primary key.
+- Keep skipped conflicts observable and reconcile them before cutover.
+- Stop or quarantine unsupported data-changing events with exact coordinates.
+- Keep the target out of service until repeated reconciliation proves parity.
 
-- Consume production `binlog_format=ROW` with `binlog_row_image=FULL` so source
-  primary keys and complete before/after row images are authoritative.
-- Snapshot table data first, then stream MariaDB binlogs from a recorded
-  position.
-- Apply row changes by source primary key; a secondary-unique conflict must not
-  mutate a different target primary key.
-- Allow observable conflict skips so checksum-driven repair can provide eventual
-  consistency without blocking the live stream.
-- Stop or quarantine on unsupported data-changing events with exact binlog
-  file/position/GTID.
-- Keep the target out of service until repeated reconciliation proves data and
-  schema parity.
+## Current status
 
-## Current Status
+The native stream applies row events and stores grouped row-event checkpoints in
+the target. Automatic DDL admission is intentionally narrow: only an explicitly
+named, unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or
+`DROP INDEX` is eligible, and only when every key part/option is modeled and the
+operation is proven not to support or depend on a foreign key.
 
-The structured stream consumes native MariaDB row events and persists grouped
-row-event checkpoints in the target transaction. Automatic DDL is executed
-separately and its checkpoint is saved only after successful execution; the DDL
-and checkpoint update are not atomic as one operation. It automatically replays
-unqualified, compatible application-schema `QueryEvent` DDL: tables, indexes,
-views, routines,
-events, triggers, `RENAME TABLE`, `TRUNCATE TABLE`, and `DROP` operations.
-Database/schema DDL remains manual because the target requires global database
-DDL privileges. Qualified or cross-schema DDL, unsafe `DEFINER`/`SQL SECURITY
-DEFINER` syntax, MariaDB-only syntax, and other rejected DDL become a manual
-boundary: the stream flushes earlier DML, writes a pending row to a target-side
-DDL ledger, and stops without checkpointing past the event.
-Snapshot, drift-check, checksum localization, and primary-key table repair
-commands support rehearsal and eventual convergence. Skipped duplicate conflicts
-are observable reconciliation debt; the stream does not schedule repairs
-automatically. The legacy `probe` text-binlog path is not a supported health check.
+Every other DDL form is manual: tables, `ALTER TABLE`, views, routines, events,
+triggers, `RENAME`, `TRUNCATE`, `DROP` object families other than the admitted
+index form, qualified or cross-schema references, comments, backtick-qualified or
+ANSI_QUOTES double-quoted identifiers where mode is not captured, incomplete or
+ambiguous syntax, definer/security clauses, MariaDB-only syntax, and
+multi-object/multi-statement forms.
 
-Target-side MySQL connections use TLS and load the DigitalOcean CA bundle from
-`/etc/mariadb-mysql-cdc/do-ca.pem` when that file is mounted. The native source
-binlog connection requires a CA file and verifies the pinned certificate; the
-catchup source SQL connection currently does not use TLS. These paths are
-rehearsal tooling, not evidence of production schema/data parity.
+Before an admitted index executes, the stream captures immutable evidence from a
+fenced target pre-state and the translated parsed AST. The target-side journal
+records `prepared`, executes the DDL, validates the complete affected state,
+then records `applied` and atomically transitions the journal to `checkpointed`
+with the predecessor checkpoint update. `prepared` and `blocked` rows form a
+startup no-overtake barrier. A crash is never blind replay: only an exact,
+unique expected post-state can finalize; pre-state, both/neither, mixed, or
+unavailable proof blocks. Target binlog receipt is unavailable, so this is
+semantic proof only.
 
-## DDL Resolution
+Manual DDL flushes earlier DML, records exact source SQL and coordinates in the
+manual ledger, and stops before checkpoint advancement. The ledger and the
+automatic journal are separate control-plane objects.
 
-The stream automatically executes only unqualified, compatible application-schema
-DDL. Recognized database/schema DDL, qualified or cross-schema DDL, unsafe
-`DEFINER`/`SQL SECURITY DEFINER` syntax, MariaDB-only syntax, and other rejected
-DDL use the default `cdc.ddl_events` ledger; use `--ddl-ledger-table TABLE` to
-configure another qualified table. An operator must review the recorded exact
-source SQL, apply and validate the intended target schema change, then update the
-same ledger row to `resolved` with a resolution note. On restart, the stream
-verifies the ledger raw SQL is an exact match and advances the checkpoint without
-re-executing the DDL.
+The code contains a durable row-conflict ledger wired into the live stream and
+an FK-aware phased repair planner. Startup fail-closes unless the admin-bootstrapped
+`cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory procedure, and exact table/procedure grants validate;
+runtime never creates the table. `repair-drift` now invokes the planner for
+child-first deletes, parent-first inserts, cycle/schema blocking, immutable
+resumption, bounded PK windows, and evidence-backed conflict resolution. The
+disposable MariaDB 11.4/MySQL 8.0 harness defines 30 executable scenarios covering
+bootstrap/grants, DDL journal crash recovery, reconnect/lease behavior, and FK-aware
+repair/conflict resolution. Those are local Docker proofs, not live cutover proof;
+recurring conflict scheduling and full cutover proof remain unchecked.
 
-Generic target errors—including already-exists and missing-object errors—never
-count as DDL success. Resolving before target apply and validation causes schema
-divergence because the stream will checkpoint past the source DDL. Startup also
-fails closed when the configured ledger schema, guards, trigger-inventory
-routine, returned trigger metadata, or runtime grants do not match the bootstrap
-contract. The restricted `cdc_stream` account has application-schema `TRIGGER`
-for source trigger replay but lacks `TRIGGER` and other mutation privileges on
-the `cdc` ledger. It receives only
-`GRANT EXECUTE ON PROCEDURE cdc.ddl_events_trigger_inventory TO 'cdc_stream'@'%';`
-for the exact `SQL SECURITY DEFINER` inventory routine and never reads
-`information_schema.triggers` directly. Bootstrap/resolver operators must
-independently inspect the routine definition and actual trigger rows. See
-[DDL Resolution Runbook](docs/ddl-resolution.md).
+Deployment remains blocked pending real-MySQL/live proof, exact grant/bootstrap
+review, bounded repair convergence, and ops rollout gates. Ops proof still needs
+fresh immutable image tags, suspended repair/catchup rollout review, replacement
+or justification of privileged catchup credentials, unique recurring run IDs,
+bounded delete evidence, FK-safe ordering, CA/config-map verification, journal
+arguments, and single-replica lease/fence proof. No ops or deployment action is
+part of this worktree. The legacy `probe` text-binlog path is not a supported
+health check.
+
+## DDL resolution
+
+Use [DDL Resolution Runbook](docs/ddl-resolution.md) for manual boundaries,
+ledger inspection, exact-SQL matching, and restart procedure.
 
 ## Commands
 
@@ -83,62 +77,41 @@ cargo run -- stream-binlog --source-host 127.0.0.1 --source-user repl \
   --source-identity app-mariadb-20260710 \
   --binlog-file mysql-bin.000001 --start-position 4 \
   --target-host 127.0.0.1 --target-user cdc_stream \
-  --target-password-env TARGET_PASSWORD --target-database app
+  --target-password-env TARGET_PASSWORD --target-database app \
+  --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem
 
 cargo run -- sync-table --source-host 127.0.0.1 --source-user reader \
   --source-password-env SOURCE_PASSWORD --source-database app \
+  --source-tls-ca-file /etc/mariadb-mysql-cdc/source-ca.pem \
   --target-host 127.0.0.1 --target-user writer \
   --target-password-env TARGET_PASSWORD --target-database app \
+  --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
   --table accounts --primary-key id --columns id,email,updated_at \
   --mode apply --run-id accounts-repair-20260710-01
 ```
 
-`sync-table` requires `--run-id` and stores resumable run state in
-`cdc.table_sync_runs` by default. Use a new ID for each recurrence; reuse an ID
-only for the exact interrupted run, because completed IDs are terminal. The
-immutable run specification covers source/target endpoints and databases, target
-write policy, mode, primary-key range, chunk size, table shape, maximum deletes,
-and `--updated-since` when present. A target-side named lock rejects concurrent
-processes using the same run ID.
+All target-using commands accept `--target-tls-ca-file PATH`; it defaults to
+`/etc/mariadb-mysql-cdc/do-ca.pem`. Source/binlog commands accept
+`--source-tls-ca-file PATH`; it defaults to `/etc/mariadb-mysql-cdc/source-ca.pem`.
+Each file must be readable and contain a valid PEM or DER CA certificate.
+Connections fail before the driver runs with an endpoint-specific diagnostic when
+that CA is missing, unreadable, or invalid.
 
-`repair-drift` runs the recurring bounded orchestration: it inventories source
-and target tables, compares counts plus bounded content checks, creates a fresh
-run ID, and invokes `sync-table` for count- or content-drifted tables with
-compatible primary-key and column inventories. Content checks default to enabled
-and can be disabled with `--content-check false`; they run only when source and
-target counts match. Dry-run is the default. Apply mode requires an explicit
-`--max-deletes` allowance; without it, orphan deletion remains disabled. Use
-repeated `--table` options to limit scope and `--parent-first parent_a,parent_b`
-to force a deterministic parent-first prefix before lexical ordering of remaining
-tables. Each table repair receives a child run ID under the fresh orchestration ID.
+`sync-table` requires `--run-id` and stores resumable state in
+`cdc.table_sync_runs` by default. A new recurrence needs a new ID; reuse is
+allowed only for the exact interrupted run. `repair-drift` creates a fresh
+orchestration ID, derives FK-safe phase order, and accepts bounded
+`--start-after`/`--end-at` windows. Apply mode requires an explicit
+`--max-deletes` allowance.
 
-Content checks split mismatches into primary-key ranges, but record at most 1,000
-mismatch ranges; `range_limit_exceeded=true` means further splitting was bounded.
-Floating-point columns are excluded from checksums because cross-server
-normalization is unsafe; skipped columns are reported, so content parity is not
-proven for those columns. Use `sync-table` with reviewed columns for targeted
-repair/validation when needed.
+`--stop-position` is an inclusive event-end boundary: the event whose
+`end_log_pos` equals the requested position is applied and durably checkpointed,
+then the stream exits. A position inside an event, inside an open row transaction,
+or not reached before EOF fails without partial-transaction completion.
 
-```bash
-mariadb-mysql-cdc repair-drift \
-  --source-host 127.0.0.1 --source-user reader \
-  --source-password-env SOURCE_PASSWORD --source-database app \
-  --target-host 127.0.0.1 --target-user writer \
-  --target-password-env TARGET_PASSWORD --target-database app \
-  --mode apply --max-deletes 25 --parent-first accounts,authors
-```
+The cross-engine inventory query reports `IS_VISIBLE='YES'` for index rows for
+MariaDB compatibility. That value is not proof that a MySQL target index is
+visible; inspect target-native visibility before admitting affected index DDL, or
+route it through the manual ledger.
 
-`cdc.table_sync_progress` remains the legacy catchup-only checkpoint table. An
-interrupted `--updated-since` retry safely restarts from the beginning because a
-row can become newly eligible behind a saved primary key; its idempotent upserts
-never delete target orphans. Inspect a specific repair with:
-
-```bash
-mariadb-mysql-cdc sync-progress ... \
-  --progress-table cdc.table_sync_runs \
-  --run-id releases-repair-20260710-01 \
-  --source-identity production-source
-```
-
-See [Catchup Workflow](docs/catchup.md) for the repair runbook and bounded-delete
-rules.
+See [Catchup Workflow](docs/catchup.md) for bounded repair rules.

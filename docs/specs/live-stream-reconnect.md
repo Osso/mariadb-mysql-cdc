@@ -77,11 +77,13 @@ source connection loss without replaying from static startup coordinates.
 
 ## Implementation inventory
 
-- `src/live.rs` — current live stream, binlog extraction, statement apply loop,
-  and stream progress logging.
-- `src/live/binlog_command.rs` — current `mariadb-binlog` command construction.
-- `src/checkpoint.rs` — file-backed durable checkpoint model.
-- `src/main.rs` — CLI options for live streaming.
+- `src/live/structured_stream/` — production native `mysql_cdc` row/DDL stream,
+  transaction boundaries, and event-end checkpoint decisions.
+- `src/live/reconnect.rs` — reconnect policy and checkpoint resume semantics.
+- `src/stream_checkpoint.rs` — target-table checkpoint store.
+- `src/live/binlog_command.rs` — text-binlog helper retained for the legacy probe
+  and fixture/debug paths, not the production stream.
+- `src/main.rs` — CLI options for live streaming, including `--stop-position`.
 - `deployment/stream-manifest` in the deployment repository —
   Kubernetes Deployment passes the source identity and target checkpoint table.
   A new source identity still requires an explicitly reviewed binlog file and
@@ -98,8 +100,8 @@ source connection loss without replaying from static startup coordinates.
   reconnect only while positive attempts remain, `--reconnect-forever true`
   allows unlimited transient reconnects, and non-transient source failures do
   not reconnect.
-- `src/checkpoint.rs` — asserts file-backed checkpoint writes are atomic through
-  temporary-file-and-rename behavior.
+- `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
+  selection remain source-identity scoped.
 
 ## Known gaps (current cycle)
 
@@ -111,8 +113,8 @@ source connection loss without replaying from static startup coordinates.
   overrides static startup coordinates.
 - [x] Add a failing test that checkpoint is written only after successful target
   apply.
-- [x] Replace or wrap the `mariadb-binlog --stop-never` production path so a TLS
-  reset does not terminate CDC progress.
+- [x] Production streaming uses the native client/reconnect loop; the
+  `mariadb-binlog --stop-never` helper is not a production dependency.
 
 ## Out of scope
 

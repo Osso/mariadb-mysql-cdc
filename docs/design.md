@@ -2,103 +2,62 @@
 
 ## Problem
 
-DigitalOcean Managed MySQL online migration supports MySQL 8 sources, but not
-MariaDB sources. MariaDB and MySQL also differ at both the SQL layer and the
-replication/binlog layer.
-
-The tool moves data from MariaDB to a MySQL-compatible target. Production
-streaming requires `binlog_format=ROW` and `binlog_row_image=FULL`; the source
-must not be switched from the existing MariaDB `MIXED` format until the CDC
-migration window explicitly enables and verifies that stream contract.
+DigitalOcean Managed MySQL does not accept MariaDB as an online migration source.
+MariaDB and MySQL differ in SQL, metadata, and binlog behavior.
 
 ## Approach
 
-Build a migration tool with two coordinated paths:
+1. Snapshot existing data in deterministic primary-key chunks.
+2. Consume MariaDB ROW/FULL binlog events from the snapshot boundary.
+3. Reconcile target drift before cutover; do not serve traffic from an unproven
+   target.
 
-1. Snapshot existing data in deterministic chunks.
-2. Consume MariaDB binlogs from the snapshot start point and apply compatible
-   changes to the target.
+## Event handling
 
-The target is not trusted until rehearsals show low or zero divergence.
+Production streaming requires `binlog_format=ROW` and
+`binlog_row_image=FULL`. Row events apply by source primary key.
 
-## Event Handling
+Automatic DDL admission is intentionally index-only: explicitly named,
+unqualified, visible, non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX`
+with complete parsed options and no FK dependency. All other DDL is manual.
+The manual path uses `cdc.ddl_events`; automatic admitted DDL uses the separate
+`cdc.ddl_replay_journal` with immutable pre-state/AST evidence, a prepared/applied/
+checkpointed/blocked state machine, startup barrier, and atomic applied-to-
+checkpointed transition.
 
-Production `stream-binlog` requires ROW/FULL while automatically replaying DDL
-approved by the MySQL compatibility policy. The removed `apply-binlog` text mode
-is not a supported execution path.
+Unsupported data-changing statements stop or quarantine with exact coordinates.
+The old text-binlog probe path is not a production health check.
 
-- Compatible, unqualified application-object DDL is replayed by the production
-  stream path: tables, indexes, views, routines, events, triggers, `RENAME
-  TABLE`, `TRUNCATE TABLE`, and `DROP` operations.
-- Database/schema DDL is manual because the target would require global database
-  DDL privileges.
-- Qualified or cross-schema DDL, unsafe `DEFINER`/`SQL SECURITY DEFINER` syntax,
-  MariaDB-only syntax, and disallowed multi-statement DDL use manual resolution.
-- Row events are applied as target DML once table metadata is available.
-- Unsupported data-changing events stop the applier or enter quarantine with
-  exact coordinates.
+Static control-plane prerequisites are validated once during admin/bootstrap and
+startup, before source replication; see the [DDL Resolution Runbook](ddl-resolution.md#startupbootstrap-validation-boundary).
+That validation covers effective grants, control-plane schema, guards, triggers,
+procedures, and checkpoint/lease prerequisites as deployment-drift detection.
+Binlog DDL remains untrusted input and is classified per event. After admission,
+CDC-generated SQL is trusted internal program behavior: event handling executes
+known operations directly, keeps only event-specific state/evidence checks, and
+surfaces database errors without rerunning grant policy validation or maintaining
+duplicate allowlists.
 
-## Parser Strategy
+## Repair model
 
-`stream-binlog` uses the vendored `mysql_cdc` native replication client with
-verified TLS. Captured binlog files remain parser compatibility fixtures;
-`mariadb-binlog` text decoding belongs only to explicit offline/apply workflows.
+The code contains a durable conflict schema contract wired into live row-event
+handling and an FK-aware phased planner. `cdc.row_conflicts` uses a lowercase
+ASCII SHA-256 `conflict_identity` primary key over the canonical full source
+identity tuple while retaining every source field for collision checks. Startup
+validates the admin-bootstrap schema, guards, constraints, and exact table grant
+before opening the source stream; runtime never creates the table. `repair-drift`
+now invokes FK-aware phases with immutable child runs, cycle/schema blocking,
+explicit delete ceilings, selected PK windows, and evidence-backed conflict
+resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 30 executable
+scenarios; its local proofs pass for the implemented boundaries. Live recurring
+scheduling, deployment, and cutover gates remain unchecked.
 
-The first probe uses `mariadb` for `SHOW MASTER STATUS` and `mariadb-binlog`
-for read-only remote binlog streaming. It classifies event text into broad
-categories so rehearsals can show which MariaDB event types appear before the
-tool starts applying anything to a target.
+## Safety and validation
 
-## Safety
-
-- Checkpoint every committed target DML transaction; automatic DDL checkpoints
-  only after successful execution.
-- Make writes idempotent where possible.
-- Validate table counts and sampled checksums during rehearsal.
-- Keep exact binlog coordinates in every error.
-
-Checkpoint state is stored as JSON with source file/position, GTID, event
-timestamp, and the last successfully processed event. See
-`docs/checkpoints.md`.
-
-Schema inventory is captured before snapshot/apply work so the migrator knows
-primary keys, generated columns, object definitions, and source-side objects
-that may need compatibility review. See `docs/schema-inventory.md`.
-
-Snapshot export/import is modeled as deterministic primary-key chunks with
-per-table progress. The source and target I/O are traits so the chunking and
-resume semantics can be tested before database-specific readers/writers are
-filled in. See `docs/snapshot.md`.
-
-Target writes are generated as parameterized MySQL statements and executed
-through a trait-backed writer. Snapshot rows use batched upserts, while CDC
-updates/deletes use primary-key predicates. See `docs/target-writer.md`.
-
-Statement events pass through a conservative allowlist before replay. Production
-streaming rejects statement DML but automatically replays compatible, unqualified
-application-object DDL. Recognized database/schema, qualified or cross-schema,
-unsafe, MariaDB-only, or otherwise rejected DDL is recorded in a
-manual-resolution ledger and stops the stream before its checkpoint. Unknown
-statements are quarantined with source coordinates. See
-`docs/statement-events.md` and `docs/ddl-resolution.md`.
-
-Row events are applied from table-map metadata. Each insert is a plain target
-`INSERT` with the explicit source primary key, updates use after images, and
-deletes use primary-key values from
-before images. Missing table maps or primary-key values fail with source
-coordinates. See `docs/row-events.md`.
-
-Validation is split into read-only count checks, deterministic sampled checksum
-checks, and paged row-level divergence reports. See `docs/validation.md`.
-
-The rehearsal workflow runs snapshot, CDC apply, and validation against a target
-that is explicitly guarded from serving application traffic. See
-`docs/rehearsal.md`.
-
-Cutover stops writes, drains CDC lag, validates again, switches the application
-endpoint, and resumes writes. Failed pre-switch cutovers attempt to resume
-writes without switching traffic. See `docs/cutover.md`.
-
-Live streaming must reconnect after transient source connection loss and resume
-from durable checkpoints instead of static startup coordinates. See
-`docs/specs/live-stream-reconnect.md`.
+- Checkpoint grouped target DML transactions.
+- Validate journal/ledger schema, guards, routines, grants, and lease/fence
+  state once before source replication; do not repeat this static policy per event.
+- Use stable primary-key windows for count/content checks.
+- Treat unresolved conflicts, quarantine, manual ledger rows, journal barriers,
+  schema drift, and CA/grant gaps as blockers.
+- Keep the target out of service through repeated validation and cutover review.
