@@ -46,6 +46,7 @@ SCENARIOS = (
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
+    ScenarioSpec("catchup-snapshot-tls", True),
     ScenarioSpec("missing-checkpoint", True),
     ScenarioSpec("missing-trigger", True),
     ScenarioSpec("missing-conflict-trigger", True),
@@ -502,6 +503,47 @@ class Harness:
             check=False,
         )
 
+    def _catchup_args(self, binary: Path, progress_file: Path) -> list[str]:
+        assert self.source and self.target
+        return [
+            str(binary),
+            "catchup-snapshot",
+            "--source-host",
+            "127.0.0.1",
+            "--source-port",
+            str(self.source.port),
+            "--source-user",
+            SOURCE_USER,
+            "--source-password-env",
+            "CDC_SOURCE_PASSWORD",
+            "--source-database",
+            APP_SCHEMA,
+            "--source-tls-ca-file",
+            str(self.ca_file),
+            "--target-host",
+            "127.0.0.1",
+            "--target-port",
+            str(self.target.port),
+            "--target-user",
+            TARGET_USER,
+            "--target-password-env",
+            "CDC_TARGET_PASSWORD",
+            "--target-database",
+            APP_SCHEMA,
+            "--target-tls-ca-file",
+            str(self.ca_file),
+            "--progress-file",
+            str(progress_file),
+            "--progress-table",
+            f"{APP_SCHEMA}.table_sync_progress",
+            "--chunk-size",
+            "2",
+            "--parallel-workers",
+            "2",
+            "--table",
+            "accounts",
+        ]
+
     def _repair_binary(self) -> Path:
         binary = self.binary or self.repo / "target/debug/mariadb-mysql-cdc"
         if not binary.is_file():
@@ -721,6 +763,88 @@ class Harness:
         """
         self.admin_sql(self.source, schema)
         self.admin_sql(self.target, schema)
+
+    def run_catchup_snapshot_tls(self) -> None:
+        assert self.source and self.target
+        self.setup_accounts_table()
+        self.admin_sql(
+            self.source,
+            "INSERT INTO accounts VALUES "
+            "(1, 'one@example.test', 'one'),"
+            "(2, 'two@example.test', 'two'),"
+            "(3, 'three@example.test', 'three'),"
+            "(4, 'four@example.test', 'four');",
+        )
+        binary = self._repair_binary()
+        progress_file = self.tempdir / "catchup-snapshot-tls-progress.json"
+        args = self._catchup_args(binary, progress_file)
+        env = {
+            **os.environ,
+            "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+            "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+        }
+
+        first = run(args, env=env, timeout=90, check=False)
+        require_success(first, "catchup snapshot TLS")
+        expected_rows = (
+            "1\\tone@example.test\\tone\\n"
+            "2\\ttwo@example.test\\ttwo\\n"
+            "3\\tthree@example.test\\tthree\\n"
+            "4\\tfour@example.test\\tfour"
+        )
+        copied_rows = self.query(
+            self.target,
+            "SELECT id,email,payload FROM accounts ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if copied_rows != expected_rows:
+            raise HarnessError(f"catchup TLS copied rows mismatch: {copied_rows!r}")
+        progress_before = progress_file.read_text()
+        if not progress_before:
+            raise HarnessError("catchup TLS progress file is empty")
+        progress_row = self.query(
+            self.target,
+            "SELECT table_name,status,rows_scanned FROM globalcomix.table_sync_progress "
+            "WHERE table_name='accounts';",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if progress_row != "accounts\\tcomplete\\t4":
+            raise HarnessError(f"catchup TLS progress row mismatch: {progress_row!r}")
+
+        self.admin_sql(
+            self.target,
+            "SET GLOBAL general_log=OFF; TRUNCATE TABLE mysql.general_log; "
+            "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;",
+        )
+        replay = run(args, env=env, timeout=90, check=False)
+        account_insert_attempts = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
+            "AND command_type IN ('Query','Prepare','Execute') "
+            "AND UPPER(argument) LIKE 'INSERT%ACCOUNTS%';",
+        ).strip()
+        self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
+        require_success(replay, "catchup snapshot TLS resume")
+        if account_insert_attempts != "0":
+            raise HarnessError(
+                f"catchup TLS resume attempted account inserts: {account_insert_attempts}"
+            )
+        if progress_file.read_text() != progress_before:
+            raise HarnessError("catchup TLS resume changed completed progress")
+        replayed_rows = self.query(
+            self.target,
+            "SELECT id,email,payload FROM accounts ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if replayed_rows != expected_rows:
+            raise HarnessError(f"catchup TLS resume changed rows: {replayed_rows!r}")
+        print(
+            "catchup_snapshot_tls_converged rows=4 source_ca=true target_ca=true "
+            "parallel_workers=2 resume_idempotent=true"
+        )
 
     def run_strict_secondary_btree(self) -> None:
         assert self.source and self.target
@@ -2170,6 +2294,8 @@ class Harness:
             self.run_create_table_crash_restart()
         elif scenario == "bootstrap-contract":
             self.run_bootstrap_contract()
+        elif scenario == "catchup-snapshot-tls":
+            self.run_catchup_snapshot_tls()
         elif scenario in {
             "missing-checkpoint",
             "missing-trigger",
