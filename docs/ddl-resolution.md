@@ -10,8 +10,9 @@
 - **Manual ledger:** every other DDL form. It uses `cdc.ddl_events`.
 
 The stream does not create or repair either control-plane object. Bootstrap must
-run with admin/resolver credentials while the stream is stopped. Run both files in
-order, then review the resulting grants and procedure definitions:
+run with admin/resolver credentials while the stream is stopped. For a new
+control plane, run both files in order, then review the resulting grants and
+procedure definitions:
 
 ```bash
 mariadb --defaults-extra-file=/path/admin.cnf < docs/ddl-control-plane-bootstrap.sql
@@ -25,6 +26,14 @@ INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE,
 EXECUTE, EVENT, TRIGGER` grants. Control-plane `EXECUTE` is only on the three
 exact trigger-inventory procedures; control-plane/global/admin mutation is
 rejected.
+
+For an existing journal created before transformation provenance was persisted,
+run the [one-time non-destructive journal upgrade](ddl-replay-journal-transformation-evidence-migration.sql)
+while the stream is stopped, then rerun `ddl-replay-journal-bootstrap.sql` to
+replace the immutable-evidence trigger and inventory procedure. The upgrade
+labels existing rows `legacy-raw-v0` and copies each legacy raw statement into
+`generated_sql`; it deletes no rows and does not alter journal identity, state,
+or canonical/pre/post-state evidence.
 
 ## Startup/bootstrap validation boundary
 
@@ -58,8 +67,8 @@ reviews the procedure definition. The expected journal row is:
 
 ```text
 (source_identity, source_server_id, binlog_file, event_start_position,
- event_end_position, schema_name, raw_sql, canonical_ast, pre_state,
- expected_post_state, status)
+ event_end_position, schema_name, raw_sql, transformation_version, generated_sql,
+ canonical_ast, pre_state, expected_post_state, status)
 ```
 
 The state machine is:
@@ -69,11 +78,14 @@ prepared -> applied -> checkpointed
 prepared -> blocked
 ```
 
-The stream captures target pre-state and canonical AST before execution, inserts
-`prepared`, executes the admitted or generated target DDL, validates the complete
-affected target state, marks `applied`, then atomically performs the journal
-checkpoint transition and predecessor checkpoint update. `prepared` and `blocked` prevent later source
-coordinates from overtaking the event.
+The stream runs the transformation first, then captures target pre-state and
+canonical AST and inserts immutable `transformation_version` plus nullable
+`generated_sql` with `prepared` before execution. A proven no-op stores
+`generated_sql = NULL`; otherwise the generated MySQL SQL is the exact SQL
+executed. It validates the complete affected target state, marks `applied`, then
+atomically performs the journal checkpoint transition and predecessor checkpoint
+update. `prepared` and `blocked` prevent later source coordinates from overtaking
+the event.
 
 A restart never blindly replays `prepared`. It finalizes only an exact unique
 expected post-state that differs from pre-state. Pre-state, both/neither, mixed,
@@ -217,6 +229,8 @@ SELECT
     binlog_file,
     event_start_position,
     status,
+    transformation_version,
+    generated_sql,
     created_at,
     updated_at
 FROM cdc.ddl_replay_journal

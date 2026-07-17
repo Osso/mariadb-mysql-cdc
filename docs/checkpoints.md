@@ -30,8 +30,10 @@ translator slice), the order is:
    transition `applied -> checkpointed`, and save the event-end checkpoint.
 
 The journal permits only `prepared -> applied|blocked` and
-`applied -> checkpointed`. Identity, SQL, AST, pre-state, and expected post-state
-are immutable. `blocked` and `checkpointed` are terminal.
+`applied -> checkpointed`. Identity, source SQL, transformation version,
+generated SQL, AST, pre-state, and expected post-state are immutable. A proven
+no-op records a NULL generated SQL value; otherwise it records the exact
+transformed SQL executed. `blocked` and `checkpointed` are terminal.
 
 A crash after `prepared` is never handled by blind re-execution. Reconciliation
 can finalize only when the observed target state exactly equals a unique expected

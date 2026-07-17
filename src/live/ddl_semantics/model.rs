@@ -70,6 +70,8 @@ pub struct SemanticSchemaSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DdlSemanticEvidence {
+    pub transformation_version: String,
+    pub generated_sql: Option<String>,
     pub canonical_ast: String,
     pub pre_state: String,
     pub expected_post_state: String,

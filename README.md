@@ -34,12 +34,14 @@ backtick-qualified or ANSI_QUOTES double-quoted identifiers where mode is not
 captured, incomplete or ambiguous syntax, definer/security clauses, MariaDB-only
 syntax, and multi-object/multi-statement forms.
 
-Before an admitted DDL executes, the stream captures immutable evidence from a
-fenced target pre-state and the translated parsed AST. The target-side journal
-records `prepared`, executes the admitted or generated target SQL, validates the
-complete affected state, then records `applied` and atomically transitions the
-journal to `checkpointed` with the predecessor checkpoint update. `prepared` and `blocked` rows form a
-startup no-overtake barrier. A crash is never blind replay: only an exact,
+Before an admitted DDL executes, the stream runs the transformation and captures
+immutable evidence from a fenced target pre-state and the translated parsed AST.
+The target-side journal records the transformation version and nullable generated
+SQL with `prepared`; proven no-ops store NULL, while non-no-ops store the exact
+transformed SQL executed. It validates the complete affected state, then records
+`applied` and atomically transitions the journal to `checkpointed` with the
+predecessor checkpoint update. `prepared` and `blocked` rows form a startup
+no-overtake barrier. A crash is never blind replay: only an exact,
 unique expected post-state can finalize; pre-state, both/neither, mixed, or
 unavailable proof blocks. Target binlog receipt is unavailable, so this is
 semantic proof only.
@@ -76,8 +78,11 @@ health check.
 
 ## DDL resolution
 
-Use [DDL Resolution Runbook](docs/ddl-resolution.md) for manual boundaries,
-ledger inspection, exact-SQL matching, and restart procedure.
+- [Authoritative DDL transformation spec](docs/specs/ddl-transformation.md)
+- [DDL Resolution Runbook](docs/ddl-resolution.md) for manual boundaries, ledger
+  inspection, exact-SQL matching, journal barriers, and restart procedure.
+- [One-time journal transformation-evidence upgrade](docs/ddl-replay-journal-transformation-evidence-migration.sql)
+  for existing journals, followed by the documented bootstrap rerun.
 
 ## Commands
 

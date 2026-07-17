@@ -40,8 +40,10 @@ index `ON` references are qualified checks, not automatic exceptions.
 
 ## Automatic journal
 
-Admitted DDL writes immutable pre-state/AST evidence to
-`cdc.ddl_replay_journal` as `prepared` before execution. The stream validates the
+Admitted DDL writes immutable pre-state/AST evidence plus the actual
+transformation version and nullable generated SQL to `cdc.ddl_replay_journal` as
+`prepared` before execution. A proven no-op stores NULL generated SQL; otherwise
+that field is the exact transformed SQL executed. The stream validates the
 complete affected target state, transitions to `applied`, and atomically
 transitions to `checkpointed` with the exact predecessor checkpoint. `prepared`
 and `blocked` rows stop startup from overtaking the event. Only a unique exact

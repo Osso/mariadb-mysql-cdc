@@ -26,6 +26,8 @@ fn event() -> DdlEvent {
 
 fn evidence() -> DdlSemanticEvidence {
     DdlSemanticEvidence {
+        transformation_version: "mariadb-mysql8-v1".to_string(),
+        generated_sql: Some("TRUNCATE TABLE `accounts`".to_string()),
         canonical_ast: "{\"family\":\"truncate\"}".to_string(),
         pre_state: "{\"row_count\":7}".to_string(),
         expected_post_state: "{\"row_count\":0}".to_string(),
@@ -359,7 +361,7 @@ fn assert_prepare_sql(sql: &str) {
         "'prod#server-id=3'",
         "'mysqld-bin.000777'",
         "100,200",
-        "canonical_ast,pre_state,expected_post_state",
+        "transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state",
         "'{\"family\":\"truncate\"}'",
         "'{\"row_count\":7}'",
         "'{\"row_count\":0}'",
@@ -376,7 +378,7 @@ fn assert_status_sql(select: &str, applied: &str, checkpointed: &str) {
         "event_start_position=100",
         "source_server_id",
         "schema_name",
-        "canonical_ast,pre_state,expected_post_state",
+        "transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state",
     ] {
         assert!(select.contains(expected), "missing {expected}");
     }
@@ -450,6 +452,8 @@ fn every_automatic_ddl_family_requires_unique_post_state_proof() {
 
 fn assert_family_reconciliation(family: DdlFamily) {
     let evidence = DdlSemanticEvidence {
+        transformation_version: "mariadb-mysql8-v1".to_string(),
+        generated_sql: Some("translated DDL".to_string()),
         canonical_ast: format!("{{\"family\":\"{}\"}}", family.as_str()),
         pre_state: "before".to_string(),
         expected_post_state: "after".to_string(),

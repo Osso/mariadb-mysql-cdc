@@ -106,7 +106,9 @@ where
     let transformation = semantic_inventory
         .transform_sql(&ddl_event.raw_sql)
         .map_err(ApplyBinlogError::Statement)?;
-    let evidence = capture_automatic_ddl_evidence(semantic_inventory, ledger, ddl_event)?;
+    let mut evidence = capture_automatic_ddl_evidence(semantic_inventory, ledger, ddl_event)?;
+    evidence.transformation_version = transformation.version.to_string();
+    evidence.generated_sql = transformation.target_sql.clone();
     journal
         .prepare(ddl_event, &evidence)
         .map_err(ApplyBinlogError::Statement)?;

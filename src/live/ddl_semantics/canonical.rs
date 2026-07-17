@@ -14,6 +14,8 @@ pub fn build_semantic_evidence(
     let pre_state = canonical_pre_state(operation, target)?;
     let expected_post_state = canonical_post_state(operation, target, source)?;
     Ok(DdlSemanticEvidence {
+        transformation_version: String::new(),
+        generated_sql: None,
         canonical_ast,
         pre_state,
         expected_post_state,

@@ -124,9 +124,11 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
         };
         validate_journal_event_identity(event, &row, "evidence")?;
         Ok(Some(DdlSemanticEvidence {
-            canonical_ast: row.5,
-            pre_state: row.6,
-            expected_post_state: row.7,
+            transformation_version: row.5,
+            generated_sql: row.6,
+            canonical_ast: row.7,
+            pre_state: row.8,
+            expected_post_state: row.9,
         }))
     }
 
@@ -198,7 +200,18 @@ fn allowed_journal_transition(from: DdlReplayStatus, to: DdlReplayStatus) -> Res
     }
 }
 
-type JournalRow = (u32, String, String, u64, String, String, String, String);
+type JournalRow = (
+    u32,
+    String,
+    String,
+    u64,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+);
 
 fn validate_journal_event_identity(
     event: &DdlEvent,
@@ -256,7 +269,7 @@ fn parse_status(status: &str) -> Result<DdlReplayStatus, String> {
 
 pub fn build_prepare_sql(table: &str, event: &DdlEvent, evidence: &DdlSemanticEvidence) -> String {
     format!(
-        "INSERT INTO {} (source_identity,source_server_id,binlog_file,event_start_position,event_end_position,schema_name,raw_sql,canonical_ast,pre_state,expected_post_state,status) VALUES ({},{},{},{},{},{},{},{},{},{},'prepared')",
+        "INSERT INTO {} (source_identity,source_server_id,binlog_file,event_start_position,event_end_position,schema_name,raw_sql,transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state,status) VALUES ({},{},{},{},{},{},{},{},{},{},{},{},'prepared')",
         quote_identifier_path(table),
         quote_sql_literal(&event.source_identity),
         event.source_server_id,
@@ -265,6 +278,12 @@ pub fn build_prepare_sql(table: &str, event: &DdlEvent, evidence: &DdlSemanticEv
         event.event_end_position,
         quote_sql_literal(&event.schema_name),
         quote_sql_literal(&event.raw_sql),
+        quote_sql_literal(&evidence.transformation_version),
+        evidence
+            .generated_sql
+            .as_deref()
+            .map(quote_sql_literal)
+            .unwrap_or_else(|| "NULL".to_string()),
         quote_sql_literal(&evidence.canonical_ast),
         quote_sql_literal(&evidence.pre_state),
         quote_sql_literal(&evidence.expected_post_state),
@@ -286,7 +305,7 @@ pub fn build_barrier_select_sql(table: &str, source_identity: &str) -> String {
 
 pub fn build_status_select_sql(table: &str, event: &DdlEvent) -> String {
     format!(
-        "SELECT source_server_id,status,raw_sql,event_end_position,schema_name,canonical_ast,pre_state,expected_post_state FROM {} WHERE source_identity={} AND binlog_file={} AND event_start_position={} LIMIT 1",
+        "SELECT source_server_id,status,raw_sql,event_end_position,schema_name,transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state FROM {} WHERE source_identity={} AND binlog_file={} AND event_start_position={} LIMIT 1",
         quote_identifier_path(table),
         quote_sql_literal(&event.source_identity),
         quote_sql_literal(&event.binlog_file),

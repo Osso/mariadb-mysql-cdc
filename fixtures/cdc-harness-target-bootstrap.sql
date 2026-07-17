@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS cdc.ddl_replay_journal (
     event_end_position BIGINT UNSIGNED NOT NULL,
     schema_name VARCHAR(255) NOT NULL,
     raw_sql LONGTEXT NOT NULL,
+    transformation_version VARCHAR(64) NOT NULL,
+    generated_sql LONGTEXT NULL,
     canonical_ast LONGTEXT NOT NULL,
     pre_state LONGTEXT NOT NULL,
     expected_post_state LONGTEXT NOT NULL,
@@ -190,6 +192,8 @@ BEGIN
        OR NOT (OLD.event_end_position <=> NEW.event_end_position)
        OR NOT (OLD.schema_name <=> NEW.schema_name)
        OR NOT (OLD.raw_sql <=> NEW.raw_sql)
+       OR NOT (OLD.transformation_version <=> NEW.transformation_version)
+       OR NOT (OLD.generated_sql <=> NEW.generated_sql)
        OR NOT (OLD.canonical_ast <=> NEW.canonical_ast)
        OR NOT (OLD.pre_state <=> NEW.pre_state)
        OR NOT (OLD.expected_post_state <=> NEW.expected_post_state)

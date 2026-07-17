@@ -22,7 +22,7 @@ pub(crate) const INSERT_GUARD_BODY: &str = "BEGIN IF NEW.status <> 'prepared' TH
 pub(crate) const JOURNAL_PENDING_INSERT_TRIGGER_BODY: &str = INSERT_GUARD_BODY;
 #[cfg(test)]
 pub(crate) const JOURNAL_MONOTONIC_UPDATE_TRIGGER_BODY: &str = UPDATE_GUARD_BODY;
-const UPDATE_GUARD_BODY: &str = "BEGIN IF NOT (OLD.source_identity <=> NEW.source_identity) OR NOT (OLD.source_server_id <=> NEW.source_server_id) OR NOT (OLD.binlog_file <=> NEW.binlog_file) OR NOT (OLD.event_start_position <=> NEW.event_start_position) OR NOT (OLD.event_end_position <=> NEW.event_end_position) OR NOT (OLD.schema_name <=> NEW.schema_name) OR NOT (OLD.raw_sql <=> NEW.raw_sql) OR NOT (OLD.canonical_ast <=> NEW.canonical_ast) OR NOT (OLD.pre_state <=> NEW.pre_state) OR NOT (OLD.expected_post_state <=> NEW.expected_post_state) OR NOT ((OLD.status = 'prepared' AND NEW.status IN ('applied','blocked')) OR (OLD.status = 'applied' AND NEW.status = 'checkpointed')) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'automatic DDL journal identity/evidence is immutable and status transition is not allowed'; END IF; END";
+const UPDATE_GUARD_BODY: &str = "BEGIN IF NOT (OLD.source_identity <=> NEW.source_identity) OR NOT (OLD.source_server_id <=> NEW.source_server_id) OR NOT (OLD.binlog_file <=> NEW.binlog_file) OR NOT (OLD.event_start_position <=> NEW.event_start_position) OR NOT (OLD.event_end_position <=> NEW.event_end_position) OR NOT (OLD.schema_name <=> NEW.schema_name) OR NOT (OLD.raw_sql <=> NEW.raw_sql) OR NOT (OLD.transformation_version <=> NEW.transformation_version) OR NOT (OLD.generated_sql <=> NEW.generated_sql) OR NOT (OLD.canonical_ast <=> NEW.canonical_ast) OR NOT (OLD.pre_state <=> NEW.pre_state) OR NOT (OLD.expected_post_state <=> NEW.expected_post_state) OR NOT ((OLD.status = 'prepared' AND NEW.status IN ('applied','blocked')) OR (OLD.status = 'applied' AND NEW.status = 'checkpointed')) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'automatic DDL journal identity/evidence is immutable and status transition is not allowed'; END IF; END";
 
 pub(crate) fn journal_schema_and_table<'a>(
     table: &'a str,
@@ -133,6 +133,8 @@ const EXPECTED_COLUMNS: &[ColumnSpec] = &[
     ("event_end_position", "bigint unsigned", "NO", "<null>", ""),
     ("schema_name", "varchar(255)", "NO", "<null>", ""),
     ("raw_sql", "longtext", "NO", "<null>", ""),
+    ("transformation_version", "varchar(64)", "NO", "<null>", ""),
+    ("generated_sql", "longtext", "YES", "<null>", ""),
     ("canonical_ast", "longtext", "NO", "<null>", ""),
     ("pre_state", "longtext", "NO", "<null>", ""),
     ("expected_post_state", "longtext", "NO", "<null>", ""),

@@ -31,6 +31,7 @@ allowlist.
 - [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form.
 - [x] Select executable rename clauses from immutable target-column pre-state; an absent old column is omitted, while old/new coexistence fails closed.
 - [x] Emit deterministic MySQL 8 SQL without `IF EXISTS`, return a proven no-op when no clause is executable, and record transformation version `mariadb-mysql8-v1`.
+- [x] Set journal `transformation_version` and nullable `generated_sql` from the actual transformation before `prepared`; proven no-ops persist `generated_sql = NULL`.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
 
 This is one translator slice, not the full MariaDB-to-MySQL 8 transformation
@@ -68,10 +69,11 @@ manual-ledger removal and deployment remain future work.
 
 ## How it works
 
-- [DDL recovery journal](../ddl-resolution.md)
+- [DDL recovery journal and upgrade runbook](../ddl-resolution.md)
 - [Checkpoint ordering](../checkpoints.md)
 - [Schema inventory](../schema-inventory.md)
 - [System design](../design.md)
+- [One-time journal transformation-evidence upgrade](../ddl-replay-journal-transformation-evidence-migration.sql)
 
 ## Implementation inventory
 
@@ -114,7 +116,8 @@ transformation contract, real MariaDB/MySQL compatibility, or deployment safety.
 - [ ] Build the production-derived DDL corpus and real MariaDB/MySQL 8 parity
       matrix.
 - [ ] Define transformation-version compatibility for journal replay after code
-      upgrades.
+      upgrades; existing pre-provenance rows are labeled `legacy-raw-v0` by the
+      [one-time journal upgrade](../ddl-replay-journal-transformation-evidence-migration.sql).
 - [ ] Reconcile existing pending/resolved legacy ledger rows into the automatic
       transformation journal without checkpoint loss.
 

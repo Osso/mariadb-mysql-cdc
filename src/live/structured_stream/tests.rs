@@ -243,6 +243,8 @@ impl Default for RecordingSemanticInventory {
     fn default() -> Self {
         Self {
             evidence: super::super::ddl_semantics::DdlSemanticEvidence {
+                transformation_version: "test-v1".to_string(),
+                generated_sql: Some("translated DDL".to_string()),
                 canonical_ast: "{\"family\":\"table\"}".to_string(),
                 pre_state: "before".to_string(),
                 expected_post_state: "after".to_string(),
