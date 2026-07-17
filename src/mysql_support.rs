@@ -1,9 +1,22 @@
 use crate::live::TargetMySqlConfig;
-use mysql::SslOpts;
+use mysql::{Opts, OptsBuilder, SslOpts};
 use std::path::PathBuf;
 
 pub const SOURCE_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/source-ca.pem";
 pub const TARGET_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/do-ca.pem";
+
+pub fn target_mysql_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
+    Ok(Opts::from(
+        OptsBuilder::default()
+            .ip_or_hostname(Some(target.host.clone()))
+            .tcp_port(target.port)
+            .user(Some(target.user.clone()))
+            .pass(Some(target.password.clone()))
+            .db_name(Some(target.database.clone()))
+            .prefer_socket(false)
+            .ssl_opts(Some(ssl_opts_from_ca(Some(&target.tls_ca_file)))),
+    ))
+}
 
 pub fn target_ssl_opts() -> SslOpts {
     ssl_opts_from_ca(Some(TARGET_TLS_CA_FILE))
@@ -80,6 +93,22 @@ mod tests {
         assert!(!ssl.accept_invalid_certs());
 
         std::fs::remove_file(ca_path).unwrap();
+    }
+
+    #[test]
+    fn target_mysql_opts_uses_configured_ca() {
+        let target = TargetMySqlConfig {
+            host: "target".to_string(),
+            tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
+            ..TargetMySqlConfig::default()
+        };
+
+        let opts = target_mysql_opts(&target).expect("target options");
+
+        assert_eq!(
+            opts.get_ssl_opts().and_then(|ssl| ssl.root_cert_path()),
+            Some(std::path::Path::new(&target.tls_ca_file))
+        );
     }
 
     #[test]
