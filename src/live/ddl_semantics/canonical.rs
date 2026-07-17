@@ -332,7 +332,11 @@ fn apply_drop_column(
     column: &super::model::ParsedDropColumnAst,
 ) -> Result<(), String> {
     if expected.inventory.indexes.iter().any(|index| {
-        index.table == table_name && index.columns.iter().any(|part| part.name == column.name)
+        index.table.eq_ignore_ascii_case(table_name)
+            && index
+                .columns
+                .iter()
+                .any(|part| part.name.eq_ignore_ascii_case(&column.name))
     }) {
         return Err(format!(
             "DROP COLUMN target `{table_name}`.`{}` has an index dependency",
@@ -340,7 +344,11 @@ fn apply_drop_column(
         ));
     }
     if expected.inventory.foreign_keys.iter().any(|foreign_key| {
-        foreign_key.table == table_name && foreign_key.columns.contains(&column.name)
+        foreign_key.table.eq_ignore_ascii_case(table_name)
+            && foreign_key
+                .columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&column.name))
     }) {
         return Err(format!(
             "DROP COLUMN target `{table_name}`.`{}` has a foreign-key dependency",
@@ -351,9 +359,13 @@ fn apply_drop_column(
         .inventory
         .tables
         .iter_mut()
-        .find(|table| table.name == table_name)
+        .find(|table| table.name.eq_ignore_ascii_case(table_name))
         .ok_or_else(|| format!("ALTER TABLE target `{table_name}` is missing"))?;
-    if table.primary_key.contains(&column.name) {
+    if table
+        .primary_key
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&column.name))
+    {
         return Err(format!(
             "DROP COLUMN target `{table_name}`.`{}` is part of the primary key",
             column.name
@@ -362,7 +374,7 @@ fn apply_drop_column(
     let Some(position) = table
         .columns
         .iter()
-        .position(|item| item.name == column.name)
+        .position(|item| item.name.eq_ignore_ascii_case(&column.name))
     else {
         if column.if_exists {
             return Ok(());

@@ -761,6 +761,36 @@ fn drop_column_if_exists_matches_target_column_case_insensitively() {
 }
 
 #[test]
+fn drop_column_if_exists_ast_removes_target_column_case_insensitively() {
+    let mut target = semantic_snapshot(1, Some(2));
+    target.inventory.indexes.clear();
+    target.inventory.foreign_keys.clear();
+    let operation = parse_ddl_operation("ALTER TABLE accounts DROP COLUMN IF EXISTS HANDLE")
+        .expect("typed DROP COLUMN operation");
+
+    let evidence = build_semantic_evidence(&operation, &target, &target)
+        .expect("target-local DROP COLUMN evidence");
+    let ast: serde_json::Value =
+        serde_json::from_str(&evidence.canonical_ast).expect("canonical AST JSON");
+    assert_eq!(
+        ast["parsed_alter_table"]["clauses"],
+        serde_json::json!([{"kind":"drop_column","name":"HANDLE","if_exists":true}])
+    );
+    let post: serde_json::Value =
+        serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
+    let columns = post["definition"]["columns"]
+        .as_array()
+        .expect("post-state columns");
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column["name"].as_str().expect("column name"))
+            .collect::<Vec<_>>(),
+        vec!["id"]
+    );
+}
+
+#[test]
 fn drop_column_if_exists_is_proven_noop_when_target_column_is_absent() {
     let columns = ["id".to_string()].into_iter().collect();
 

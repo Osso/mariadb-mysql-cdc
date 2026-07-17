@@ -118,9 +118,10 @@ pub fn transform_drop_columns_if_exists(
         .clauses
         .iter()
         .filter_map(|clause| match clause {
-            ParsedAlterClause::DropColumn(column) if target_columns.contains(&column.name) => {
-                Some(column.name.clone())
-            }
+            ParsedAlterClause::DropColumn(column) => target_columns
+                .iter()
+                .find(|target| target.eq_ignore_ascii_case(&column.name))
+                .cloned(),
             _ => None,
         })
         .collect::<Vec<_>>();
