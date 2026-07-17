@@ -13,18 +13,15 @@ This is not a parity proof by itself. `INSERT IGNORE` preserves target rows that
 CDC already wrote, but does not overwrite divergent values or remove target
 orphans. A skipped live duplicate remains reconciliation debt.
 
-Catchup source reads and target writes follow the [TLS connection policy](schema-inventory.md#tls-connection-policy).
-`catchup-snapshot` and `sync-table` require an explicit `--source-tls-ca-file`;
-a missing, unreadable, or invalid source CA fails before the driver connects.
-Target writes continue to require the reviewed DigitalOcean CA at
-`/etc/mariadb-mysql-cdc/do-ca.pem`, with the same fail-before-connect behavior.
-The catchup deployment must mount both CA files and pass the required source
-option; do not call a run CA-verified until that live configuration is checked.
-The real-engine `catchup-snapshot-tls` scenario rejects a wrong `sync-table`
-source CA and wrong catchup source or target CA before catchup target rows or
-progress mutate, then proves a valid four-row copy. Its second successful
-invocation proves a completed-run no-op, not an interrupted parallel-range
-resume.
+Catchup source reads and target writes follow the [connection policy](schema-inventory.md#connection-policy).
+The live source MariaDB (`source-mariadb.example` / `192.0.2.10`) is
+plaintext-only; `catchup-snapshot`, `sync-table`, and `repair-drift` must not
+require or pass a source CA for that source. Target writes continue to require
+the reviewed DigitalOcean CA at `/etc/mariadb-mysql-cdc/do-ca.pem` plus target
+hostname verification. The deployment must keep target CA material mounted while
+omitting source CA arguments for the current source. The second successful
+catchup invocation proves a completed-run no-op, not an interrupted
+parallel-range resume.
 
 For a resumable snapshot backfill:
 
@@ -34,7 +31,6 @@ mariadb-mysql-cdc catchup-snapshot \
   --source-user cdc_reader \
   --source-password-env SOURCE_PASSWORD \
   --source-database globalcomix \
-  --source-tls-ca-file /etc/mariadb-mysql-cdc/source-ca.pem \
   --target-host target-mysql.example \
   --target-port 25060 \
   --target-user target_user \

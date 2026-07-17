@@ -35,25 +35,30 @@ slice should leave the event in the journal's `translation_pending` barrier.
 The retired manual-ledger runtime, configuration, bootstrap, grants, and harness
 paths have been removed.
 
-## TLS connection policy
+## Connection policy
 
-Every source and target endpoint connection uses its configured CA file and
-validates the certificate chain; a connection is not allowed to proceed without
-that CA. DNS/hostname endpoints require certificate identity matching. Literal IP
-endpoints skip hostname/IP identity matching only; CA-based chain validation
-remains mandatory. The configured CA may be a trust anchor or a chain bundle;
-there is no exclusive-root requirement and no IP-SAN requirement for literal IP
-endpoints. Plaintext, invalid-certificate acceptance, and TLS-validation retry
-fallbacks are forbidden.
+The live GlobalComix source MariaDB (`source-mariadb.example` /
+`192.0.2.10`) is plaintext-only by accepted operational policy. CDC source
+inventory, snapshot, stream, repair, and sync-table connections must use an
+explicit plaintext source mode for this endpoint. Do not require a source CA,
+do not attempt opportunistic TLS-to-plaintext fallback, and do not treat
+source CA absence as an error for the current source.
 
-Missing, unreadable, or invalid CA files fail with a source/target-specific
-diagnostic before metadata queries run. Retryable I/O, codec, timeout,
-connection, and packet/setup failures may cause a fresh connection attempt and
-retry the same metadata query once, but every attempt reuses the configured TLS
-settings and performs the same CA/chain validation. Configuration, certificate,
-identity, and other non-retryable failures stop immediately. Logs identify
-endpoint role, inventory stage, schema, TLS mode, attempt (`1/2` or `2/2`),
-reset status, connection age, and both the original and retry errors.
+Target DigitalOcean MySQL connections are different: every target endpoint
+connection must use its configured CA file and validate the certificate chain.
+DNS/hostname target endpoints require certificate identity matching. Target
+plaintext, invalid-certificate acceptance, and TLS-validation retry fallbacks
+are forbidden.
+
+Missing, unreadable, or invalid target CA files fail with a target-specific
+diagnostic before target metadata queries or writes run. Retryable target I/O,
+codec, timeout, connection, and packet/setup failures may cause a fresh
+connection attempt and retry the same metadata query once, but every target
+attempt reuses the configured TLS settings and performs the same CA/chain and
+hostname validation. Configuration, certificate, identity, and other
+non-retryable target failures stop immediately. Logs identify endpoint role,
+inventory stage, schema, TLS mode, attempt (`1/2` or `2/2`), reset status,
+connection age, and both the original and retry errors.
 
 ## Tests asserting this behavior
 

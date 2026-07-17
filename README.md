@@ -83,12 +83,13 @@ creates the table. Different source primary keys remain different conflict
 identities. `repair-drift` now invokes the planner for child-first deletes,
 parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
 windows, a non-mutating full-scope Verify equality phase, and evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 33 executable scenarios,
-including `catchup-snapshot-tls` as real-engine coverage of configured-CA chain
-validation over literal IP endpoints. It rejects a wrong `sync-table` source CA
-and wrong catchup source or target CA before catchup target rows or progress
-mutate, then proves a valid four-row copy and a completed-run no-op. It does not
-prove interrupted parallel-range resume or DNS/hostname identity coverage. The
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 33 executable scenarios.
+Earlier TLS harness coverage used a disposable TLS-enabled source, but the live
+GlobalComix source MariaDB (`source-mariadb.example` / `192.0.2.10`) is
+plaintext-only by accepted operational policy. Current production safety is:
+source plaintext only, target DigitalOcean MySQL with configured CA and hostname
+verification. The harness proves a valid four-row copy and a completed-run
+no-op; it does not prove interrupted parallel-range resume. The
 remaining scenarios cover bootstrap/grants, DDL journal crash recovery,
 reconnect/GET_LOCK behavior, and FK-aware repair/conflict resolution. Its
 `create-table-crash-restart` scenario passes the differing-default MariaDB/MySQL
@@ -123,7 +124,6 @@ health check.
 cargo run -- plan
 cargo run -- stream-binlog --source-host 127.0.0.1 --source-user repl \
   --source-password-env SOURCE_PASSWORD --source-database app \
-  --source-tls-ca-file /etc/mariadb-mysql-cdc/source-ca.pem \
   --source-identity app-mariadb-20260710 \
   --binlog-file mysql-bin.000001 --start-position 4 \
   --target-host 127.0.0.1 --target-user cdc_stream \
@@ -132,7 +132,6 @@ cargo run -- stream-binlog --source-host 127.0.0.1 --source-user repl \
 
 cargo run -- sync-table --source-host 127.0.0.1 --source-user reader \
   --source-password-env SOURCE_PASSWORD --source-database app \
-  --source-tls-ca-file /etc/mariadb-mysql-cdc/source-ca.pem \
   --target-host 127.0.0.1 --target-user writer \
   --target-password-env TARGET_PASSWORD --target-database app \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
@@ -144,7 +143,6 @@ cargo run -- sync-table --source-host 127.0.0.1 --source-user reader \
 cargo run -- catchup-snapshot \
   --source-host 127.0.0.1 --source-user reader \
   --source-password-env SOURCE_PASSWORD --source-database app \
-  --source-tls-ca-file /etc/mariadb-mysql-cdc/source-ca.pem \
   --target-host 127.0.0.1 --target-user writer \
   --target-password-env TARGET_PASSWORD --target-database app \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
@@ -153,17 +151,16 @@ cargo run -- catchup-snapshot \
 
 ## TLS policy
 
+The live GlobalComix source MariaDB (`source-mariadb.example` /
+`192.0.2.10`) is plaintext-only. Production CDC source connections must not
+require or attempt a source CA for that endpoint until the source database
+transport is explicitly changed. Source TLS support may exist for disposable or
+future TLS-enabled sources, but it is inactive for the current source.
+
 All target-using commands accept `--target-tls-ca-file PATH`; it defaults to
-`/etc/mariadb-mysql-cdc/do-ca.pem`. Stream source connections default to
-`/etc/mariadb-mysql-cdc/source-ca.pem`; `catchup-snapshot` and `sync-table`
-require an explicit `--source-tls-ca-file PATH`. The CA is
-always required, the certificate chain is always validated, and a missing,
-unreadable, or invalid CA fails before the driver runs. DNS/hostname endpoints
-require certificate identity matching. Literal IP endpoints skip hostname/IP
-identity matching only; they still require CA-based chain validation. The CA
-may be a trust anchor or chain bundle; no exclusive-root or IP-SAN requirement
-is implied. There is no plaintext, invalid-certificate, or TLS-validation retry
-fallback. See [TLS connection policy](docs/schema-inventory.md#tls-connection-policy).
+`/etc/mariadb-mysql-cdc/do-ca.pem`. Target DigitalOcean MySQL connections must
+use the configured CA and hostname verification. Do not weaken target CA or
+hostname verification when changing source transport. See [connection policy](docs/schema-inventory.md#connection-policy).
 
 `sync-table` requires `--run-id` and stores resumable state in
 `cdc.table_sync_runs` by default. A new recurrence needs a new ID; reuse is

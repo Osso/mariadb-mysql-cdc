@@ -8,16 +8,19 @@ in [catchup.md](../catchup.md).
 
 ### Connection security
 
-- [x] Require a source TLS CA file, validate its certificate chain, and use it
-      for the MariaDB source inventory and persistent snapshot reads.
+- [x] Treat the live GlobalComix source MariaDB (`source-mariadb.example` /
+      `192.0.2.10`) as plaintext-only by accepted operational policy.
+- [x] Do not require a source TLS CA file for the current source; source TLS
+      support may remain for disposable or future TLS-enabled sources only when
+      explicitly configured.
+- [x] Use explicit source plaintext mode only for the current source; do not add
+      opportunistic TLS-to-plaintext fallback behavior.
 - [x] Require the target TLS CA file, validate its certificate chain, and use it
       for MySQL target writes.
-- [x] Fail before driver connection when either endpoint CA is missing,
-      unreadable, empty, or invalid.
-- [x] Require certificate identity matching for DNS/hostname endpoints while
-      skipping hostname/IP identity matching only for literal IP endpoints.
-- [x] Reject plaintext, invalid-certificate, and TLS-validation retry
-      fallbacks; retries retain the configured CA and chain validation.
+- [x] Require certificate identity matching for DNS/hostname target endpoints.
+- [x] Reject target plaintext, invalid-certificate acceptance, and target
+      TLS-validation retry fallbacks; retries retain configured target CA and
+      hostname validation.
 
 ### Snapshot Execution
 
@@ -75,11 +78,11 @@ in [catchup.md](../catchup.md).
 ## Tests asserting this spec
 
 - `scripts/cdc-integration-harness.py --scenario catchup-snapshot-tls` — real
-  MariaDB 11.4/MySQL 8.0 connections using configured CAs on literal IP
-  endpoints; rejects a wrong `sync-table` source CA and wrong catchup source or
-  target CA before catchup target rows or progress mutate, then proves a valid
-  four-row copy and target progress. A completed rerun proves a no-op; it does
-  not claim interrupted parallel-range resume or DNS/hostname identity coverage.
+  MariaDB 11.4/MySQL 8.0 engine coverage for catchup copy behavior, target
+  progress, and target CA validation in the disposable harness. The live
+  GlobalComix source is plaintext-only, so this scenario must not be cited as a
+  production source-TLS requirement. A completed rerun proves a no-op; it does
+  not claim interrupted parallel-range resume.
 - `src/mysql_snapshot/tests.rs`
 - `src/mysql_snapshot/parallel.rs`
 - `src/snapshot/tests.rs`

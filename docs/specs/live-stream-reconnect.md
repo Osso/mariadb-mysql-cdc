@@ -8,8 +8,8 @@ source connection loss without replaying from static startup coordinates.
 
 ### Connection loss
 
-- [x] Detect source stream loss, including TCP reset, TLS reset, EOF, timeout,
-  and `mariadb-binlog`/client process exit.
+- [x] Detect source stream loss, including TCP reset, EOF, timeout, and client
+  process exit. The live GlobalComix source is plaintext-only.
 - [x] Reconnect automatically after transient source stream loss.
 - [x] Resume from the last durably applied source coordinate, not from the
   manifest's original `--binlog-file` and `--start-position` arguments.
@@ -19,11 +19,11 @@ source connection loss without replaying from static startup coordinates.
   failure, missing binlog file, unsupported event type, quarantine, or target
   write failure.
 
-Reconnect/backoff applies only after an established connection loses transport.
-It is not a TLS fallback: failed CA loading, chain validation, or required
-DNS/hostname identity matching stops immediately. Reconnect attempts retain the
-same TLS configuration; literal IP endpoints continue to skip hostname/IP
-identity matching only.
+Reconnect/backoff applies only after an established source connection loses
+transport. It is not an opportunistic TLS-to-plaintext fallback: the current
+GlobalComix source uses explicit plaintext mode from the start. Target TLS
+configuration is separate; failed target CA loading, chain validation, or
+required DNS/hostname identity matching stops immediately.
 
 ### Durable checkpointing
 
