@@ -897,30 +897,91 @@ class Harness:
         expected_journal_row = "checkpointed\tmariadb-mysql8-v1\t1\t1\t1"
         if journal != [expected_journal_row, expected_journal_row, expected_journal_row]:
             raise HarnessError(f"production ALTER TABLE journal mismatch: {journal}")
-        unique_evidence = self.query(
+        unique_evidence_row = self.query(
             self.target,
-            "SELECT status,transformation_version,generated_sql,"
-            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.table')),"
-            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.clauses[0].kind')),"
-            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.clauses[0].index.name')),"
-            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.clauses[0].index.unique')),"
-            "JSON_UNQUOTE(JSON_EXTRACT(canonical_ast,'$.parsed_alter_table.clauses[0].index.key_parts[0].column')),"
-            "JSON_LENGTH(JSON_EXTRACT(pre_state,'$.indexes')),"
-            "JSON_LENGTH(JSON_EXTRACT(expected_post_state,'$.indexes')),"
-            "JSON_UNQUOTE(JSON_EXTRACT(expected_post_state,'$.indexes[0].name')),"
-            "JSON_UNQUOTE(JSON_EXTRACT(expected_post_state,'$.indexes[0].unique')) "
+            "SELECT status,transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state "
             "FROM cdc.ddl_replay_journal "
             "WHERE raw_sql LIKE 'ALTER TABLE accounts ADD UNIQUE KEY%';",
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         ).strip()
-        expected_unique_evidence = (
-            "checkpointed\tmariadb-mysql8-v1\t"
-            "ALTER TABLE `accounts` ADD UNIQUE KEY `uq_accounts_email` (`email`)\t"
-            "accounts\tadd_key\tuq_accounts_email\ttrue\temail\t0\t1\tuq_accounts_email\ttrue"
-        )
-        if unique_evidence != expected_unique_evidence:
-            raise HarnessError(f"production ADD UNIQUE KEY evidence mismatch: {unique_evidence!r}")
+        unique_evidence_fields = unique_evidence_row.split("\t", 5)
+        if len(unique_evidence_fields) != 6:
+            raise HarnessError(f"production ADD UNIQUE KEY evidence shape mismatch: {unique_evidence_row!r}")
+        status, version, generated_sql, ast_json, pre_state_json, post_state_json = unique_evidence_fields
+        expected_generated_sql = "ALTER TABLE `accounts` ADD UNIQUE KEY `uq_accounts_email` (`email`)"
+        if (status, version, generated_sql) != (
+            "checkpointed",
+            "mariadb-mysql8-v1",
+            expected_generated_sql,
+        ):
+            raise HarnessError(
+                "production ADD UNIQUE KEY journal identity mismatch: "
+                f"{(status, version, generated_sql)!r}"
+            )
+        expected_index_ast = {
+            "create": True,
+            "name": "uq_accounts_email",
+            "table": "accounts",
+            "unique": True,
+            "index_type": "BTREE",
+            "visible": True,
+            "comment": None,
+            "key_parts": [
+                {
+                    "column": "email",
+                    "prefix_length": None,
+                    "order": "ASC",
+                    "collation": "A",
+                }
+            ],
+        }
+        expected_ast = {
+            "family": "table",
+            "object_kind": "table",
+            "primary_object": "accounts",
+            "secondary_object": None,
+            "parsed_index": None,
+            "parsed_alter_table": {
+                "table": "accounts",
+                "clauses": [{"kind": "add_key", "index": expected_index_ast}],
+            },
+        }
+        canonical_ast = json.loads(ast_json)
+        if canonical_ast != expected_ast:
+            raise HarnessError(f"production ADD UNIQUE KEY canonical AST mismatch: {canonical_ast!r}")
+        pre_state = json.loads(pre_state_json)
+        post_state = json.loads(post_state_json)
+        expected_state_keys = {"kind", "name", "definition", "indexes", "foreign_keys"}
+        if set(pre_state) != expected_state_keys or set(post_state) != expected_state_keys:
+            raise HarnessError(
+                f"production ADD UNIQUE KEY state shape mismatch: pre={pre_state!r} post={post_state!r}"
+            )
+        if pre_state["definition"] != post_state["definition"] or pre_state["foreign_keys"] != post_state["foreign_keys"]:
+            raise HarnessError(
+                f"production ADD UNIQUE KEY changed unrelated state: pre={pre_state!r} post={post_state!r}"
+            )
+        expected_index_state = {
+            "table": "accounts",
+            "name": "uq_accounts_email",
+            "unique": True,
+            "index_type": "BTREE",
+            "visible": True,
+            "comment": None,
+            "columns": [
+                {
+                    "name": "email",
+                    "sequence": 1,
+                    "prefix_length": None,
+                    "collation": "A",
+                    "order": "ASC",
+                }
+            ],
+        }
+        if pre_state["indexes"] != [] or post_state["indexes"] != [expected_index_state]:
+            raise HarnessError(
+                f"production ADD UNIQUE KEY post-state mismatch: pre={pre_state!r} post={post_state!r}"
+            )
         checkpoint = self.checkpoint()
         if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
             raise HarnessError(f"production ALTER TABLE checkpoint mismatch: {checkpoint}")
@@ -949,7 +1010,7 @@ class Harness:
         target_execution_attempts = self.admin_query(
             self.target,
             "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
-            "AND command_type='Query' "
+            "AND command_type IN ('Query','Prepare','Execute') "
             "AND argument LIKE 'ALTER TABLE%uq_accounts_email_prefix%';",
         ).strip()
         self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
