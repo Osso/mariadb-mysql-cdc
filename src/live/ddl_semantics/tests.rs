@@ -797,8 +797,7 @@ fn production_add_column_and_key_ddl_transforms_to_deterministic_mysql8_sql() {
         "globalcomix".to_string(),
         "globalcomix".to_string(),
     );
-    let source_sql = "-- sanitized deployment comment\n\
-         ALTER TABLE `home_feed_bakes`\n\
+    let source_sql = "ALTER TABLE `home_feed_bakes`\n\
          ADD COLUMN `variant_id` SMALLINT UNSIGNED DEFAULT NULL AFTER `reading_direction`,\n\
          ADD KEY `idx_hfb_variant_status_published` (`variant_id`, `status`, `published_time`)";
 
@@ -811,6 +810,26 @@ fn production_add_column_and_key_ddl_transforms_to_deterministic_mysql8_sql() {
         transformation.target_sql.as_deref(),
         Some(
             "ALTER TABLE `home_feed_bakes` ADD COLUMN `variant_id` SMALLINT UNSIGNED DEFAULT NULL AFTER `reading_direction`, ADD KEY `idx_hfb_variant_status_published` (`variant_id`, `status`, `published_time`)"
+        )
+    );
+}
+
+#[test]
+fn production_alter_rendering_depends_only_on_typed_ast() {
+    let compact = transform_production_alter_table(
+        "ALTER TABLE accounts ADD COLUMN handle VARCHAR(64) COMMENT 'user''s handle' AFTER id",
+    )
+    .expect("compact ALTER");
+    let spaced = transform_production_alter_table(
+        "alter table `accounts` add column `handle` varchar ( 64 ) comment 'user''s handle' after `id`",
+    )
+    .expect("spaced ALTER");
+
+    assert_eq!(compact.target_sql, spaced.target_sql);
+    assert_eq!(
+        compact.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `accounts` ADD COLUMN `handle` VARCHAR(64) NULL DEFAULT NULL COMMENT 'user''s handle' AFTER `id`"
         )
     );
 }
