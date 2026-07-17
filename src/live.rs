@@ -179,6 +179,7 @@ pub struct TargetMySqlConfig {
     pub user: String,
     pub password: String,
     pub database: String,
+    pub tls_ca_file: String,
     pub insert_conflict_policy: InsertConflictPolicy,
 }
 
@@ -190,6 +191,7 @@ impl Default for TargetMySqlConfig {
             user: String::new(),
             password: String::new(),
             database: String::new(),
+            tls_ca_file: crate::mysql_support::TARGET_TLS_CA_FILE.to_string(),
             insert_conflict_policy: InsertConflictPolicy::Error,
         }
     }

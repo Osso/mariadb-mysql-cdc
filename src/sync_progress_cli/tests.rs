@@ -359,6 +359,7 @@ fn target_progress_connection_has_short_io_timeouts() {
         user: "cdc".to_string(),
         password: "secret".to_string(),
         database: "globalcomix".to_string(),
+        tls_ca_file: crate::mysql_support::TARGET_TLS_CA_FILE.to_string(),
         insert_conflict_policy: live::InsertConflictPolicy::Error,
     };
 

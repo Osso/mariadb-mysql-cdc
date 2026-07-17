@@ -90,6 +90,7 @@ mod tests {
             user: "target_user".to_string(),
             password: "secret".to_string(),
             database: "globalcomix".to_string(),
+            tls_ca_file: TARGET_TLS_CA_FILE.to_string(),
             insert_conflict_policy: crate::live::InsertConflictPolicy::IgnoreDuplicate,
         };
 
