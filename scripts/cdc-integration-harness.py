@@ -795,15 +795,16 @@ class Harness:
     def _assert_catchup_target_unchanged(self) -> None:
         assert self.target
         row_count = self.admin_query(self.target, "SELECT COUNT(*) FROM accounts;").strip()
-        progress_count = self.admin_query(
+        progress_table_count = self.admin_query(
             self.target,
-            "SELECT COUNT(*) FROM globalcomix.table_sync_progress "
-            "WHERE table_name='accounts';",
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema='globalcomix' "
+            "AND table_name='table_sync_progress';",
         ).strip()
-        if row_count != "0" or progress_count != "0":
+        if row_count != "0" or progress_table_count != "0":
             raise HarnessError(
                 "rejected catchup mutated target: "
-                f"rows={row_count!r} progress_rows={progress_count!r}"
+                f"rows={row_count!r} progress_tables={progress_table_count!r}"
             )
 
     def _assert_catchup_ca_rejected(
