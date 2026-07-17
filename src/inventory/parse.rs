@@ -1,8 +1,21 @@
 use super::model::{
     ColumnRow, EventRow, ForeignKeyRow, IndexRow, InventoryError, PrimaryKeyRow, RoutineRow,
-    SourceMasterCoordinate, TableRow, TableRuntimeMetadata, TriggerRow, ViewRow,
+    SchemaDefaults, SourceMasterCoordinate, TableRow, TableRuntimeMetadata, TriggerRow, ViewRow,
 };
 use crate::conflict_repair::CanonicalForeignKeyRow;
+
+pub(crate) fn parse_schema_defaults(fields: &[String]) -> Result<SchemaDefaults, InventoryError> {
+    require_len(fields, 2, "schema defaults")?;
+    if fields[0].is_empty() || fields[1].is_empty() {
+        return Err(InventoryError::new(
+            "schema defaults require non-empty character set and collation",
+        ));
+    }
+    Ok(SchemaDefaults {
+        character_set: fields[0].clone(),
+        collation: fields[1].clone(),
+    })
+}
 
 pub(crate) fn parse_source_master_coordinate(
     fields: &[String],

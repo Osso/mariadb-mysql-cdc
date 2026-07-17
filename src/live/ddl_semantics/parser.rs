@@ -1,7 +1,7 @@
 use super::super::ddl_replay_journal::DdlFamily;
 use super::model::{DdlObjectKind, DdlOperation, ParsedIndexAst, ParsedIndexKeyPart};
 use super::tokenizer::{ddl_contains_comments, tokenize_ddl};
-use super::transform::parse_production_alter_table_ast;
+use super::transform::{parse_fixture_create_table, parse_production_alter_table_ast};
 
 pub fn parse_simple_index_ddl(sql: &str) -> Result<ParsedIndexAst, String> {
     if ddl_contains_comments(sql) {
@@ -282,6 +282,9 @@ pub fn parse_ddl_operation(sql: &str) -> Result<DdlOperation, String> {
     if operation.object_kind == DdlObjectKind::Index {
         operation.index_ast = Some(parse_simple_index_ddl(sql)?);
     }
+    if command == "CREATE" && operation.object_kind == DdlObjectKind::Table {
+        operation.create_table_ast = parse_fixture_create_table(sql).ok();
+    }
     if command == "ALTER" && operation.object_kind == DdlObjectKind::Table {
         operation.alter_table_ast = parse_production_alter_table_ast(sql).ok();
     }
@@ -308,6 +311,7 @@ fn parse_create_or_alter(
         primary_object: name,
         secondary_object,
         index_ast: None,
+        create_table_ast: None,
         alter_table_ast: None,
     })
 }
@@ -365,6 +369,7 @@ fn parse_drop(tokens: &[String], keywords: &[String]) -> Result<DdlOperation, St
         primary_object: name,
         secondary_object,
         index_ast: None,
+        create_table_ast: None,
         alter_table_ast: None,
     })
 }
@@ -401,6 +406,7 @@ fn parse_rename(tokens: &[String], keywords: &[String]) -> Result<DdlOperation, 
         primary_object: from,
         secondary_object: Some(to),
         index_ast: None,
+        create_table_ast: None,
         alter_table_ast: None,
     })
 }
@@ -417,6 +423,7 @@ fn parse_truncate(tokens: &[String], keywords: &[String]) -> Result<DdlOperation
         primary_object: object_name(tokens, name_index)?,
         secondary_object: None,
         index_ast: None,
+        create_table_ast: None,
         alter_table_ast: None,
     })
 }

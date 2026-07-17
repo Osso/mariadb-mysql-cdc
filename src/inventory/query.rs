@@ -4,6 +4,13 @@ pub(crate) fn source_master_coordinate_query() -> &'static str {
     "SHOW MASTER STATUS"
 }
 
+pub(crate) fn schema_defaults_query(schema: &str) -> String {
+    format!(
+        "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = {}",
+        quote_sql_string(schema)
+    )
+}
+
 pub(crate) fn table_runtime_query(schema: &str, table: &str) -> String {
     format!(
         "SELECT (SELECT COUNT(*) FROM {}.{}), AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} AND TABLE_TYPE = 'BASE TABLE'",

@@ -244,8 +244,25 @@ fn parse_fixture_table_key(
     ))
 }
 
+#[cfg(test)]
 pub fn transform_fixture_create_table(source_sql: &str) -> Result<DdlTransformation, String> {
     let ast = parse_fixture_create_table(source_sql)?;
+    transform_fixture_create_table_ast(&ast, None)
+}
+
+pub fn transform_fixture_create_table_with_defaults(
+    ast: &ParsedCreateTableAst,
+    defaults: &crate::inventory::SchemaDefaults,
+) -> Result<DdlTransformation, String> {
+    validate_schema_default_identifier(&defaults.character_set, "character set")?;
+    validate_schema_default_identifier(&defaults.collation, "collation")?;
+    transform_fixture_create_table_ast(ast, Some(defaults))
+}
+
+fn transform_fixture_create_table_ast(
+    ast: &ParsedCreateTableAst,
+    defaults: Option<&crate::inventory::SchemaDefaults>,
+) -> Result<DdlTransformation, String> {
     let mut definitions = ast
         .columns
         .iter()
@@ -277,15 +294,34 @@ pub fn transform_fixture_create_table(source_sql: &str) -> Result<DdlTransformat
                 .join(", ")
         )
     }));
+    let schema_defaults = defaults.map_or_else(String::new, |defaults| {
+        format!(
+            " DEFAULT CHARACTER SET {} COLLATE {}",
+            defaults.character_set, defaults.collation
+        )
+    });
     Ok(DdlTransformation {
         version: DDL_TRANSFORMATION_VERSION,
         target_sql: Some(format!(
-            "CREATE TABLE {} ({}) ENGINE={}",
+            "CREATE TABLE {} ({}) ENGINE={}{}",
             quote_identifier(&ast.name),
             definitions.join(", "),
-            ast.engine
+            ast.engine,
+            schema_defaults,
         )),
     })
+}
+
+fn validate_schema_default_identifier(value: &str, kind: &str) -> Result<(), String> {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        Ok(())
+    } else {
+        Err(format!("invalid source schema {kind} `{value}`"))
+    }
 }
 
 pub fn supports_drop_columns_if_exists(source_sql: &str) -> bool {

@@ -1,9 +1,54 @@
 use super::super::ddl_replay_journal::DdlFamily;
 use super::model::{
     DdlObjectKind, DdlOperation, DdlSemanticEvidence, ParsedAddColumnAst, ParsedAlterClause,
-    ParsedAlterTableAst, ParsedIndexAst, ParsedIndexKeyPart, SemanticSchemaSnapshot,
+    ParsedAlterTableAst, ParsedCreateTableAst, ParsedIndexAst, ParsedIndexKeyPart,
+    SemanticSchemaSnapshot,
 };
 use serde_json::json;
+
+pub fn build_fenced_create_table_evidence(
+    operation: &DdlOperation,
+    target: &SemanticSchemaSnapshot,
+    defaults: &crate::inventory::SchemaDefaults,
+    expected_file: &str,
+    expected_position: u64,
+    before: &crate::inventory::SourceMasterCoordinate,
+    after: &crate::inventory::SourceMasterCoordinate,
+) -> Result<DdlSemanticEvidence, String> {
+    super::validate_source_snapshot_coordinate(
+        expected_file,
+        expected_position,
+        before,
+        after,
+    )?;
+    let ast = operation
+        .create_table_ast
+        .as_ref()
+        .ok_or_else(|| "typed fixture CREATE TABLE AST is missing".to_string())?;
+    let pre_state = canonical_pre_state(operation, target)?;
+    if pre_state != canonical_absent_state() {
+        return Err(format!(
+            "target table `{}` already exists before CREATE TABLE",
+            operation.primary_object
+        ));
+    }
+    let transformation = super::transform::transform_fixture_create_table_with_defaults(ast, defaults)?;
+    let mut ast_value: serde_json::Value = serde_json::from_str(&canonical_ast(operation)?)
+        .map_err(|error| format!("failed to decode canonical CREATE TABLE AST: {error}"))?;
+    ast_value["source_schema_defaults"] = json!({
+        "character_set": defaults.character_set,
+        "collation": defaults.collation,
+    });
+    let canonical_ast = serde_json::to_string(&ast_value)
+        .map_err(|error| format!("failed to encode canonical CREATE TABLE AST: {error}"))?;
+    Ok(DdlSemanticEvidence {
+        transformation_version: transformation.version.to_string(),
+        generated_sql: transformation.target_sql,
+        canonical_ast,
+        pre_state,
+        expected_post_state: expected_create_table_post_state(ast, defaults)?,
+    })
+}
 
 pub fn build_semantic_evidence(
     operation: &DdlOperation,
@@ -29,6 +74,7 @@ fn canonical_ast(operation: &DdlOperation) -> Result<String, String> {
         "primary_object": operation.primary_object,
         "secondary_object": operation.secondary_object,
         "parsed_index": operation.index_ast.as_ref().map(canonical_index_ast_value),
+        "parsed_create_table": operation.create_table_ast.as_ref().map(canonical_create_table_ast_value),
         "parsed_alter_table": operation.alter_table_ast.as_ref().map(canonical_alter_table_ast_value),
     }))
     .map_err(|error| format!("failed to encode canonical DDL AST: {error}"))
@@ -222,6 +268,86 @@ fn canonical_index_state(
         .as_deref()
         .ok_or_else(|| "index DDL table is missing".to_string())?;
     canonical_table_structure_state(snapshot, table)
+}
+
+fn expected_create_table_post_state(
+    ast: &ParsedCreateTableAst,
+    defaults: &crate::inventory::SchemaDefaults,
+) -> Result<String, String> {
+    let table = crate::inventory::TableInventory {
+        name: ast.name.clone(),
+        table_type: "BASE TABLE".to_string(),
+        engine: Some(ast.engine.clone()),
+        collation: Some(defaults.collation.clone()),
+        primary_key: ast.primary_key.clone(),
+        columns: ast
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| crate::inventory::ColumnInventory {
+                name: column.name.clone(),
+                ordinal_position: (index + 1) as u32,
+                column_type: column.column_type.to_ascii_lowercase(),
+                data_type: column
+                    .column_type
+                    .split('(')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                is_nullable: column.nullable,
+                default_value: None,
+                extra: String::new(),
+                comment: String::new(),
+                generated: None,
+            })
+            .collect(),
+    };
+    let indexes = ast
+        .indexes
+        .iter()
+        .map(|index| crate::inventory::IndexInventory {
+            table: ast.name.clone(),
+            name: index.name.clone(),
+            unique: index.unique,
+            index_type: index.index_type.clone(),
+            visible: index.visible,
+            comment: index.comment.clone(),
+            columns: index
+                .key_parts
+                .iter()
+                .enumerate()
+                .map(|(part_index, part)| crate::inventory::IndexColumnInventory {
+                    name: part.column.clone(),
+                    sequence: (part_index + 1) as u32,
+                    prefix_length: part.prefix_length,
+                    collation: Some("A".to_string()),
+                    order: part.order.clone(),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&json!({
+        "kind": "table",
+        "name": ast.name,
+        "definition": table,
+        "indexes": indexes,
+        "foreign_keys": [],
+    }))
+    .map_err(|error| format!("failed to encode expected CREATE TABLE state: {error}"))
+}
+
+fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::Value {
+    json!({
+        "name": ast.name,
+        "columns": ast.columns.iter().map(|column| json!({
+            "name": column.name,
+            "column_type": column.column_type,
+            "nullable": column.nullable,
+        })).collect::<Vec<_>>(),
+        "primary_key": ast.primary_key,
+        "indexes": ast.indexes.iter().map(canonical_index_ast_value).collect::<Vec<_>>(),
+        "engine": ast.engine,
+    })
 }
 
 fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Value {

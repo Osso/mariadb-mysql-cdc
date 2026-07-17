@@ -19,6 +19,7 @@ fn assert_operation_cases(cases: &[(&str, DdlFamily, DdlObjectKind, &str, Option
                 primary_object: (*primary).to_string(),
                 secondary_object: secondary.map(str::to_string),
                 index_ast: parse_simple_index_ddl(sql).ok(),
+                create_table_ast: parse_fixture_create_table(sql).ok(),
                 alter_table_ast: parse_production_alter_table_ast(sql).ok(),
             },
             "{sql}",
@@ -218,6 +219,7 @@ fn parser_ignores_comments_and_preserves_quoted_identifier_contents() {
             primary_object: "account.history".to_string(),
             secondary_object: None,
             index_ast: None,
+            create_table_ast: None,
             alter_table_ast: None,
         }
     );
@@ -865,14 +867,14 @@ fn rename_column_if_exists_becomes_proven_noop_when_source_columns_are_absent() 
 }
 
 #[test]
-fn live_transform_admits_exact_fixture_create_table() {
+fn live_transform_keeps_fixture_create_table_disabled_until_evidence_gates_pass() {
     let inventory = LiveDdlSemanticInventory::new(
         InventoryConfig::default(),
         InventoryConfig::default(),
         "fixture_cdc".to_string(),
         "fixture_cdc".to_string(),
     );
-    let transformation = inventory
+    let error = inventory
         .transform_sql(
             "CREATE TABLE accounts (\
                 id BIGINT NOT NULL PRIMARY KEY, \
@@ -881,14 +883,80 @@ fn live_transform_admits_exact_fixture_create_table() {
                 KEY idx_accounts_payload (payload)\
             ) ENGINE=InnoDB",
         )
-        .expect("production fixture CREATE TABLE transformation");
+        .expect_err("runtime CREATE TABLE admission must remain disabled");
 
-    assert_eq!(transformation.version, DDL_TRANSFORMATION_VERSION);
+    assert!(error.contains("does not support this statement"), "{error}");
+}
+
+#[test]
+fn fixture_create_table_evidence_captures_fenced_source_defaults_and_explicit_sql() {
+    let source_sql = "CREATE TABLE accounts (\
+        id BIGINT NOT NULL PRIMARY KEY, \
+        email VARCHAR(255) NOT NULL, \
+        payload VARCHAR(64) NOT NULL, \
+        KEY idx_accounts_payload (payload)\
+    ) ENGINE=InnoDB";
+    let operation = parse_ddl_operation(source_sql).expect("fixture CREATE TABLE operation");
+    let target = SemanticSchemaSnapshot {
+        inventory: SchemaInventory {
+            schema: "fixture_cdc".to_string(),
+            tables: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            views: Vec::new(),
+            triggers: Vec::new(),
+            routines: Vec::new(),
+            events: Vec::new(),
+        },
+        table_runtime: Default::default(),
+    };
+    let coordinate = crate::inventory::SourceMasterCoordinate {
+        file: "mysqld-bin.000777".to_string(),
+        position: 180,
+    };
+    let defaults = crate::inventory::SchemaDefaults {
+        character_set: "utf8mb4".to_string(),
+        collation: "utf8mb4_unicode_ci".to_string(),
+    };
+
+    let evidence = build_fenced_create_table_evidence(
+        &operation,
+        &target,
+        &defaults,
+        "mysqld-bin.000777",
+        180,
+        &coordinate,
+        &coordinate,
+    )
+    .expect("fenced fixture CREATE TABLE evidence");
+
+    assert_eq!(evidence.pre_state, canonical_absent_state());
     assert_eq!(
-        transformation.target_sql.as_deref(),
-        Some(
-            "CREATE TABLE `accounts` (`id` BIGINT NOT NULL, `email` VARCHAR(255) NOT NULL, `payload` VARCHAR(64) NOT NULL, PRIMARY KEY (`id`), KEY `idx_accounts_payload` (`payload`)) ENGINE=InnoDB"
+        evidence.generated_sql.as_deref(),
+        Some("CREATE TABLE `accounts` (`id` BIGINT NOT NULL, `email` VARCHAR(255) NOT NULL, `payload` VARCHAR(64) NOT NULL, PRIMARY KEY (`id`), KEY `idx_accounts_payload` (`payload`)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+    );
+    let ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast).expect("AST JSON");
+    assert_eq!(ast["source_schema_defaults"]["character_set"], "utf8mb4");
+    assert_eq!(ast["source_schema_defaults"]["collation"], "utf8mb4_unicode_ci");
+    let post: serde_json::Value =
+        serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
+    assert_eq!(post["definition"]["collation"], "utf8mb4_unicode_ci");
+
+    let ahead = crate::inventory::SourceMasterCoordinate {
+        file: coordinate.file.clone(),
+        position: coordinate.position + 1,
+    };
+    assert!(
+        build_fenced_create_table_evidence(
+            &operation,
+            &target,
+            &defaults,
+            "mysqld-bin.000777",
+            180,
+            &coordinate,
+            &ahead,
         )
+        .is_err()
     );
 }
 

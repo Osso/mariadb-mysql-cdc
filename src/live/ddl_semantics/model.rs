@@ -100,6 +100,7 @@ pub struct DdlOperation {
     pub primary_object: String,
     pub secondary_object: Option<String>,
     pub index_ast: Option<ParsedIndexAst>,
+    pub create_table_ast: Option<ParsedCreateTableAst>,
     pub alter_table_ast: Option<ParsedAlterTableAst>,
 }
 

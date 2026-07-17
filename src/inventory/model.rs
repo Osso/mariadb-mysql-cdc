@@ -188,6 +188,12 @@ pub struct SourceMasterCoordinate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaDefaults {
+    pub character_set: String,
+    pub collation: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TableRow {
     pub table_name: String,
     pub table_type: String,

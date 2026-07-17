@@ -14,6 +14,8 @@ mod transform;
 
 #[cfg(test)]
 pub(super) use canonical::canonical_absent_state;
+#[cfg(test)]
+pub(super) use canonical::build_fenced_create_table_evidence;
 pub use canonical::{
     build_semantic_evidence, observe_operation_state, supports_automatic_semantic_recovery,
 };
@@ -26,8 +28,7 @@ pub(super) use tokenizer::tokenize_ddl;
 pub use transform::{
     DdlTransformation, supports_drop_columns_if_exists, supports_production_alter_table,
     supports_rename_columns_if_exists, transform_drop_columns_if_exists,
-    transform_fixture_create_table, transform_production_alter_table,
-    transform_rename_columns_if_exists,
+    transform_production_alter_table, transform_rename_columns_if_exists,
 };
 
 pub trait DdlSemanticInventory {
@@ -105,9 +106,6 @@ fn read_affected_runtime(
 
 impl DdlSemanticInventory for LiveDdlSemanticInventory {
     fn transform_sql(&self, sql: &str) -> Result<DdlTransformation, String> {
-        if let Ok(transformation) = transform_fixture_create_table(sql) {
-            return Ok(transformation);
-        }
         if supports_automatic_index_ddl(sql) {
             return Ok(DdlTransformation {
                 version: transform::DDL_TRANSFORMATION_VERSION,
@@ -159,6 +157,15 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
     ) -> Result<DdlSemanticEvidence, String> {
         let operation = parse_ddl_operation(sql)?;
         let target_before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+        if operation.create_table_ast.is_some() {
+            return capture_fenced_create_table_evidence(
+                self,
+                &operation,
+                &target_before,
+                source_file,
+                event_end_position,
+            );
+        }
         if operation.object_kind == DdlObjectKind::Index || operation.alter_table_ast.is_some() {
             return capture_translated_evidence(self, &operation, &target_before);
         }
@@ -178,6 +185,44 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         validate_target_snapshot_consistency(&before, &after)?;
         observe_operation_state(&before, &operation)
     }
+}
+
+fn capture_fenced_create_table_evidence(
+    inventory: &LiveDdlSemanticInventory,
+    operation: &DdlOperation,
+    target_before: &SemanticSchemaSnapshot,
+    source_file: &str,
+    event_end_position: u64,
+) -> Result<DdlSemanticEvidence, String> {
+    let before = inventory
+        .source
+        .read_source_master_coordinate()
+        .map_err(|error| format!("failed to read source coordinate before schema defaults: {error}"))?;
+    let defaults = inventory
+        .source
+        .read_schema_defaults(&inventory.source_schema)
+        .map_err(|error| {
+            format!(
+                "failed to read source schema defaults for {}: {error}",
+                inventory.source_schema
+            )
+        })?;
+    let after = inventory
+        .source
+        .read_source_master_coordinate()
+        .map_err(|error| format!("failed to read source coordinate after schema defaults: {error}"))?;
+    let target_after =
+        LiveDdlSemanticInventory::snapshot(&inventory.target, &inventory.target_schema, operation)?;
+    validate_target_snapshot_consistency(target_before, &target_after)?;
+    canonical::build_fenced_create_table_evidence(
+        operation,
+        target_before,
+        &defaults,
+        source_file,
+        event_end_position,
+        &before,
+        &after,
+    )
 }
 
 fn capture_translated_evidence(

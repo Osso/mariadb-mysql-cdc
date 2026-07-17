@@ -1,17 +1,18 @@
 use super::model::{
     ColumnRow, EventRow, ForeignKeyRow, IndexRow, InventoryConfig, InventoryError, InventoryReader,
-    PrimaryKeyRow, RoutineRow, SourceBinlogSettings, SourceMasterCoordinate, TableRow,
-    TableRuntimeMetadata, TriggerRow, ViewRow,
+    PrimaryKeyRow, RoutineRow, SchemaDefaults, SourceBinlogSettings, SourceMasterCoordinate,
+    TableRow, TableRuntimeMetadata, TriggerRow, ViewRow,
 };
 use super::parse::{
     parse_canonical_foreign_key_row, parse_column_row, parse_event_row, parse_foreign_key_row,
-    parse_index_row, parse_primary_key_row, parse_routine_row, parse_source_master_coordinate,
-    parse_table_row, parse_table_runtime_row, parse_trigger_row, parse_view_row,
+    parse_index_row, parse_primary_key_row, parse_routine_row, parse_schema_defaults,
+    parse_source_master_coordinate, parse_table_row, parse_table_runtime_row, parse_trigger_row,
+    parse_view_row,
 };
 use super::query::{
     canonical_foreign_keys_query, columns_query, events_query, foreign_keys_query, indexes_query,
-    primary_keys_query, routines_query, source_master_coordinate_query, table_runtime_query,
-    tables_query, triggers_query, views_query,
+    primary_keys_query, routines_query, schema_defaults_query, source_master_coordinate_query,
+    table_runtime_query, tables_query, triggers_query, views_query,
 };
 use super::retry::{
     inventory_attempt_error, inventory_retry_error, is_retryable_inventory_error,
@@ -97,6 +98,7 @@ pub(crate) enum InventoryQueryStage {
     Events,
     BinlogSettings,
     TableRuntime,
+    SchemaDefaults,
     MasterCoordinate,
 }
 
@@ -115,6 +117,7 @@ impl InventoryQueryStage {
             Self::Events => "events",
             Self::BinlogSettings => "binlog_settings",
             Self::TableRuntime => "table_runtime",
+            Self::SchemaDefaults => "schema_defaults",
             Self::MasterCoordinate => "master_coordinate",
         }
     }
@@ -192,6 +195,21 @@ impl MariaDbInventoryReader {
         if expired {
             self.conn.replace(None);
         }
+    }
+
+    pub fn read_schema_defaults(&self, schema: &str) -> Result<SchemaDefaults, InventoryError> {
+        let rows = self.query_rows(
+            InventoryQueryStage::SchemaDefaults,
+            schema,
+            &schema_defaults_query(schema),
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(InventoryError::new(format!(
+                "expected one schema defaults row for {schema}, found {}",
+                rows.len()
+            )));
+        };
+        parse_schema_defaults(row)
     }
 
     pub fn read_source_master_coordinate(&self) -> Result<SourceMasterCoordinate, InventoryError> {
