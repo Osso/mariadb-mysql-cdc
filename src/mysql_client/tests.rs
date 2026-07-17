@@ -37,6 +37,30 @@ fn shared_source_opts_accept_plaintext_without_tls_ca() {
 }
 
 #[test]
+fn persistent_target_reader_connection_uses_configured_ca() {
+    let config = crate::mysql_snapshot::MySqlConnectionConfig {
+        host: "target-db.example".to_string(),
+        port: 1,
+        user: "reader".to_string(),
+        password: "secret".to_string(),
+        database: "globalcomix".to_string(),
+    };
+    let ca_file = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem");
+
+    let error = match PersistentMySqlSource::new_with_tls_ca(&config, Some(ca_file)) {
+        Ok(_) => panic!("test target reader connection should fail at port 1"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to connect to source mysql")
+    );
+    assert!(!error.to_string().contains("TLS CA file"));
+}
+
+#[test]
 fn target_opts_require_authenticated_tls() {
     let target = TargetMySqlConfig {
         host: "target".to_string(),

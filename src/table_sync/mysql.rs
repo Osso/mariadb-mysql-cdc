@@ -6,13 +6,22 @@ use std::collections::BTreeMap;
 
 pub(crate) struct MySqlSyncReader {
     config: crate::mysql_snapshot::MySqlConnectionConfig,
+    tls_ca_file: Option<String>,
     source: RefCell<Option<PersistentMySqlSource>>,
 }
 
 impl MySqlSyncReader {
     pub fn new(config: crate::mysql_snapshot::MySqlConnectionConfig) -> Self {
+        Self::new_with_tls_ca(config, None)
+    }
+
+    pub(crate) fn new_with_tls_ca(
+        config: crate::mysql_snapshot::MySqlConnectionConfig,
+        tls_ca_file: Option<String>,
+    ) -> Self {
         Self {
             config,
+            tls_ca_file,
             source: RefCell::new(None),
         }
     }
@@ -28,7 +37,8 @@ impl MySqlSyncReader {
     ) -> Result<std::cell::RefMut<'_, PersistentMySqlSource>, TableSyncError> {
         if self.source.borrow().is_none() {
             let source =
-                PersistentMySqlSource::new(&self.config).map_err(snapshot_error_to_table_sync)?;
+                PersistentMySqlSource::new_with_tls_ca(&self.config, self.tls_ca_file.as_deref())
+                    .map_err(snapshot_error_to_table_sync)?;
             self.source.replace(Some(source));
         }
         Ok(std::cell::RefMut::map(self.source.borrow_mut(), |source| {

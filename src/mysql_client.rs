@@ -53,13 +53,20 @@ pub struct PersistentProgressWriter {
 
 impl PersistentMySqlSource {
     pub fn new(config: &MySqlConnectionConfig) -> Result<Self, SnapshotError> {
+        Self::new_with_tls_ca(config, None)
+    }
+
+    pub(crate) fn new_with_tls_ca(
+        config: &MySqlConnectionConfig,
+        tls_ca_file: Option<&str>,
+    ) -> Result<Self, SnapshotError> {
         let opts = base_opts(
             &config.host,
             config.port,
             &config.user,
             &config.password,
             &config.database,
-            None,
+            tls_ca_file,
             &format!("source `{}`:{}", config.host, config.port),
         )
         .map_err(SnapshotError::InvalidTable)?;
