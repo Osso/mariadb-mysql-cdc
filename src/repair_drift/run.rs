@@ -7,7 +7,6 @@ use super::{RepairDriftConfig, RepairDriftError, RepairDriftReport, RepairDriftT
 use crate::drift_check::{self, DriftCheckConfig};
 use crate::inventory::{InventoryConfig, InventoryEndpointRole, SchemaInventory, build_inventory};
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::SOURCE_TLS_CA_FILE;
 use crate::table_sync::{self, SyncMode, SyncPhase, SyncTable, SyncTableConfig};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -349,7 +348,7 @@ fn run_sync_phase(
         .map_err(|error| RepairDriftError::Repair(format!("{table_name} {phase:?}: {error}")))
 }
 
-fn sync_config(
+pub(crate) fn sync_config(
     config: &RepairDriftConfig,
     table: SyncTable,
     run_id: String,
@@ -475,17 +474,10 @@ fn build_endpoint_inventory(
         password: source.password.clone(),
         endpoint_role,
         use_tls: true,
-        tls_ca_file: Some(source_tls_ca_file(source)),
+        tls_ca_file: source.tls_ca_file.clone(),
         ..InventoryConfig::default()
     });
     build_inventory(&source.database, &reader)
-}
-
-fn source_tls_ca_file(source: &MySqlConnectionConfig) -> String {
-    source
-        .tls_ca_file
-        .clone()
-        .unwrap_or_else(|| SOURCE_TLS_CA_FILE.to_string())
 }
 
 fn build_target_inventory(

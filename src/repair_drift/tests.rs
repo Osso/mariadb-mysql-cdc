@@ -4,7 +4,8 @@ use super::config::{
 use super::plan::{exclude_progress_table, order_table_names};
 use super::run::{
     build_drift_check_config, can_resolve_verified_conflicts,
-    can_resolve_verified_conflicts_after_verify, fresh_run_id, verified_conflict_evidence,
+    can_resolve_verified_conflicts_after_verify, fresh_run_id, sync_config,
+    verified_conflict_evidence,
 };
 use super::*;
 use crate::drift_check::{ContentDriftSummary, DriftComparison};
@@ -200,6 +201,27 @@ fn parses_selected_primary_key_window_for_bounded_repair() {
     repair_drift_option(&mut config, "--end-at", "20").expect("end bound");
     assert_eq!(config.start_after, Some(vec!["10".to_string()]));
     assert_eq!(config.end_at, Some(vec!["20".to_string()]));
+}
+
+#[test]
+fn default_source_ca_reaches_child_sync_config() {
+    let config = default_repair_drift_config();
+    let child = sync_config(
+        &config,
+        table_sync::SyncTable {
+            name: "accounts".to_string(),
+            primary_key: vec!["id".to_string()],
+            columns: vec!["id".to_string()],
+        },
+        "repair-run".to_string(),
+        "plan-hash",
+    );
+
+    assert_eq!(
+        config.source.tls_ca_file.as_deref(),
+        Some(crate::mysql_support::SOURCE_TLS_CA_FILE)
+    );
+    assert_eq!(child.source.tls_ca_file, config.source.tls_ca_file);
 }
 
 #[test]

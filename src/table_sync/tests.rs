@@ -254,8 +254,12 @@ fn core_config_rejects_missing_source_tls_ca_file() {
 
 #[test]
 fn core_config_rejects_updated_since_with_primary_key_bounds() {
+    let source = crate::mysql_snapshot::MySqlConnectionConfig {
+        tls_ca_file: Some(crate::mysql_support::SOURCE_TLS_CA_FILE.to_string()),
+        ..Default::default()
+    };
     let config = SyncTableConfig {
-        source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
+        source,
         target: crate::live::TargetMySqlConfig::default(),
         table: account_table_with_updated_at(),
         chunk_size: 10,

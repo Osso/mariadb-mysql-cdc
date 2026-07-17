@@ -1,6 +1,7 @@
 use super::RepairDriftConfig;
 use crate::live::TargetMySqlConfig;
 use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_support::SOURCE_TLS_CA_FILE;
 use crate::table_sync::SyncMode;
 
 pub(crate) fn parse_repair_drift_config(args: Vec<String>) -> Result<RepairDriftConfig, String> {
@@ -19,8 +20,12 @@ pub(crate) fn parse_repair_drift_config(args: Vec<String>) -> Result<RepairDrift
 }
 
 pub(crate) fn default_repair_drift_config() -> RepairDriftConfig {
+    let source = MySqlConnectionConfig {
+        tls_ca_file: Some(SOURCE_TLS_CA_FILE.to_string()),
+        ..MySqlConnectionConfig::default()
+    };
     RepairDriftConfig {
-        source: MySqlConnectionConfig::default(),
+        source,
         source_identity: String::new(),
         target: TargetMySqlConfig::default(),
         tables: Vec::new(),
