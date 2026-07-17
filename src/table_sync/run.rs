@@ -60,10 +60,8 @@ pub fn run_sync_table_phase(
 ) -> Result<SyncTableReport, TableSyncError> {
     validate_sync_table_config(config)?;
     let source = MySqlSyncReader::new(config.source.clone());
-    let target = MySqlSyncReader::new_with_tls_ca(
-        target_connection_config(config),
-        Some(config.target.tls_ca_file.clone()),
-    );
+    let target = MySqlSyncReader::new_with_target(target_connection_config(config), &config.target)
+        .map_err(TableSyncError::Read)?;
     let mut progress_store = progress::MySqlSyncRunProgressStore::new(
         config.target.clone(),
         config.progress_table.clone(),

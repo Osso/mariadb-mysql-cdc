@@ -1,5 +1,6 @@
 use super::{SyncChunkRequest, SyncTableReader, TableSyncError, UpdatedSince};
-use crate::mysql_client::PersistentMySqlSource;
+use crate::live::TargetMySqlConfig;
+use crate::mysql_client::{PersistentMySqlSource, target_reader_opts};
 use crate::snapshot::{SnapshotError, SnapshotRow};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -8,6 +9,7 @@ pub(crate) struct MySqlSyncReader {
     config: crate::mysql_snapshot::MySqlConnectionConfig,
     tls_ca_file: Option<String>,
     source: RefCell<Option<PersistentMySqlSource>>,
+    target_opts: Option<mysql::Opts>,
 }
 
 impl MySqlSyncReader {
@@ -23,7 +25,20 @@ impl MySqlSyncReader {
             config,
             tls_ca_file,
             source: RefCell::new(None),
+            target_opts: None,
         }
+    }
+
+    pub(crate) fn new_with_target(
+        config: crate::mysql_snapshot::MySqlConnectionConfig,
+        target: &TargetMySqlConfig,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            config,
+            tls_ca_file: None,
+            source: RefCell::new(None),
+            target_opts: Some(target_reader_opts(target)?),
+        })
     }
 
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
@@ -36,9 +51,14 @@ impl MySqlSyncReader {
         &self,
     ) -> Result<std::cell::RefMut<'_, PersistentMySqlSource>, TableSyncError> {
         if self.source.borrow().is_none() {
-            let source =
-                PersistentMySqlSource::new_with_tls_ca(&self.config, self.tls_ca_file.as_deref())
-                    .map_err(snapshot_error_to_table_sync)?;
+            let source = match &self.target_opts {
+                Some(opts) => PersistentMySqlSource::new_with_opts(opts.clone()),
+                None => PersistentMySqlSource::new_with_tls_ca(
+                    &self.config,
+                    self.tls_ca_file.as_deref(),
+                ),
+            }
+            .map_err(snapshot_error_to_table_sync)?;
             self.source.replace(Some(source));
         }
         Ok(std::cell::RefMut::map(self.source.borrow_mut(), |source| {

@@ -13,7 +13,7 @@ use crate::target::{
     TransactionalTargetExecutor,
 };
 use mysql::prelude::Queryable;
-use mysql::{Conn, Params};
+use mysql::{Conn, Opts, Params};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -51,9 +51,28 @@ pub struct PersistentProgressWriter {
     progress_table: String,
 }
 
+pub(crate) fn target_reader_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
+    base_opts(
+        &target.host,
+        target.port,
+        &target.user,
+        &target.password,
+        &target.database,
+        Some(&target.tls_ca_file),
+        &format!("target `{}`:{}", target.host, target.port),
+    )
+}
+
 impl PersistentMySqlSource {
     pub fn new(config: &MySqlConnectionConfig) -> Result<Self, SnapshotError> {
         Self::new_with_tls_ca(config, None)
+    }
+
+    pub(crate) fn new_with_opts(opts: Opts) -> Result<Self, SnapshotError> {
+        let conn = open_conn(opts).map_err(snapshot_connect_error)?;
+        Ok(Self {
+            conn: RefCell::new(conn),
+        })
     }
 
     pub(crate) fn new_with_tls_ca(
@@ -70,10 +89,7 @@ impl PersistentMySqlSource {
             &format!("source `{}`:{}", config.host, config.port),
         )
         .map_err(SnapshotError::InvalidTable)?;
-        let conn = open_conn(opts).map_err(snapshot_connect_error)?;
-        Ok(Self {
-            conn: RefCell::new(conn),
-        })
+        Self::new_with_opts(opts)
     }
 
     pub fn count_rows(&self, table: &str) -> Result<u64, SnapshotError> {
