@@ -223,6 +223,8 @@ struct RecordingSemanticInventory {
     translator_available: std::cell::Cell<bool>,
     use_live_transform: bool,
     present_target_create_evidence: bool,
+    absent_target_create_evidence: bool,
+    create_observed_state: std::cell::RefCell<Option<String>>,
 }
 
 impl Default for RecordingSemanticInventory {
@@ -240,6 +242,8 @@ impl Default for RecordingSemanticInventory {
             translator_available: std::cell::Cell::new(true),
             use_live_transform: false,
             present_target_create_evidence: false,
+            absent_target_create_evidence: false,
+            create_observed_state: std::cell::RefCell::new(None),
         }
     }
 }
@@ -281,19 +285,24 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
         source_file: &str,
         event_end_position: u64,
     ) -> Result<super::super::ddl_semantics::DdlSemanticEvidence, String> {
-        if self.present_target_create_evidence {
+        if self.present_target_create_evidence || self.absent_target_create_evidence {
             let operation = super::super::ddl_semantics::parse_ddl_operation(sql)?;
+            let tables = if self.present_target_create_evidence {
+                vec![crate::inventory::TableInventory {
+                    name: "accounts".to_string(),
+                    table_type: "BASE TABLE".to_string(),
+                    engine: Some("InnoDB".to_string()),
+                    collation: Some("utf8mb4_unicode_ci".to_string()),
+                    primary_key: vec!["id".to_string()],
+                    columns: Vec::new(),
+                }]
+            } else {
+                Vec::new()
+            };
             let target = super::super::ddl_semantics::SemanticSchemaSnapshot {
                 inventory: crate::inventory::SchemaInventory {
                     schema: "fixture_cdc".to_string(),
-                    tables: vec![crate::inventory::TableInventory {
-                        name: "accounts".to_string(),
-                        table_type: "BASE TABLE".to_string(),
-                        engine: Some("InnoDB".to_string()),
-                        collation: Some("utf8mb4_unicode_ci".to_string()),
-                        primary_key: vec!["id".to_string()],
-                        columns: Vec::new(),
-                    }],
+                    tables,
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
                     views: Vec::new(),
@@ -307,7 +316,7 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
                 file: source_file.to_string(),
                 position: event_end_position,
             };
-            return super::super::ddl_semantics::build_fenced_create_table_evidence(
+            let evidence = super::super::ddl_semantics::build_fenced_create_table_evidence(
                 &operation,
                 &target,
                 &crate::inventory::SchemaDefaults {
@@ -318,7 +327,10 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
                 event_end_position,
                 &coordinate,
                 &coordinate,
-            );
+            )?;
+            self.create_observed_state
+                .replace(Some(evidence.expected_post_state.clone()));
+            return Ok(evidence);
         }
         match &self.capture_error {
             Some(error) => Err(error.clone()),
@@ -327,7 +339,11 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
     }
 
     fn observe_target_state(&self, _sql: &str) -> Result<String, String> {
-        Ok(self.observed_state.clone())
+        Ok(self
+            .create_observed_state
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.observed_state.clone()))
     }
 }
 

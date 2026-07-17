@@ -27,8 +27,10 @@ pub use parser::{parse_ddl_operation, supports_automatic_index_ddl};
 #[cfg(test)]
 pub(super) use tokenizer::tokenize_ddl;
 pub use transform::{
-    DdlTransformation, supports_drop_columns_if_exists, supports_production_alter_table,
-    supports_rename_columns_if_exists, transform_drop_columns_if_exists,
+    DDL_TRANSFORMATION_VERSION, DdlTransformation, supports_drop_columns_if_exists,
+    supports_fixture_create_table,
+    supports_production_alter_table, supports_rename_columns_if_exists,
+    transform_drop_columns_if_exists,
     transform_production_alter_table, transform_rename_columns_if_exists,
 };
 

@@ -244,6 +244,10 @@ fn parse_fixture_table_key(
     ))
 }
 
+pub fn supports_fixture_create_table(source_sql: &str) -> bool {
+    parse_fixture_create_table(source_sql).is_ok()
+}
+
 #[cfg(test)]
 pub fn transform_fixture_create_table(source_sql: &str) -> Result<DdlTransformation, String> {
     let ast = parse_fixture_create_table(source_sql)?;

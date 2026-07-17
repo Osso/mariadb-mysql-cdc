@@ -1,6 +1,7 @@
 use super::*;
 use crate::live::ddl_semantics::{
-    DdlTransformation, supports_drop_columns_if_exists, supports_rename_columns_if_exists,
+    DDL_TRANSFORMATION_VERSION, DdlTransformation, supports_drop_columns_if_exists,
+    supports_fixture_create_table, supports_rename_columns_if_exists,
 };
 use crate::target::SqlStatement;
 
@@ -193,14 +194,33 @@ where
         header: _,
         event,
     } = input;
-    let transformation = match semantic_inventory.transform_sql(&ddl_event.raw_sql) {
-        Ok(transformation) => transformation,
-        Err(error) => {
-            ensure_translation_pending(journal, ddl_event)?;
-            return Err(ApplyBinlogError::Statement(error));
-        }
+    let create_table_requires_evidence_sql = parse_ddl_operation(&ddl_event.raw_sql)
+        .is_ok_and(|operation| operation.create_table_ast.is_some());
+    let (transformation, mut evidence) = if create_table_requires_evidence_sql {
+        let evidence = capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event)?;
+        let target_sql = evidence.generated_sql.clone().ok_or_else(|| {
+            ApplyBinlogError::Statement(
+                "CREATE TABLE evidence is missing deterministic generated SQL".to_string(),
+            )
+        })?;
+        (
+            DdlTransformation {
+                version: DDL_TRANSFORMATION_VERSION,
+                target_sql: Some(target_sql),
+            },
+            evidence,
+        )
+    } else {
+        let transformation = match semantic_inventory.transform_sql(&ddl_event.raw_sql) {
+            Ok(transformation) => transformation,
+            Err(error) => {
+                ensure_translation_pending(journal, ddl_event)?;
+                return Err(ApplyBinlogError::Statement(error));
+            }
+        };
+        let evidence = capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event)?;
+        (transformation, evidence)
     };
-    let mut evidence = capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event)?;
     evidence.transformation_version = transformation.version.to_string();
     evidence.generated_sql = transformation.target_sql.clone();
     journal
@@ -391,7 +411,8 @@ pub(super) fn automatically_handled_ddl_event<'a>(
         return None;
     };
     let operation = parse_ddl_operation(&query.sql_statement).ok();
-    let supports_transformation = supports_production_alter_table(&query.sql_statement)
+    let supports_transformation = supports_fixture_create_table(&query.sql_statement)
+        || supports_production_alter_table(&query.sql_statement)
         || supports_drop_columns_if_exists(&query.sql_statement)
         || supports_rename_columns_if_exists(&query.sql_statement);
     let supports_automatic_operation = operation.as_ref().is_some_and(|operation| {

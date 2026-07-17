@@ -224,12 +224,80 @@ fn mariadb_rename_column_if_exists_executes_generated_mysql8_sql() {
 }
 
 #[test]
-fn fixture_create_table_stays_translation_pending_without_target_or_checkpoint_execution() {
+fn unsupported_create_table_stays_translation_pending_without_target_or_checkpoint_execution() {
     let executor = TransactionRecordingExecutor::default();
     let mut applier = crate::row::RowApplier::new(executor);
     let journal = RecordingDdlReplayJournal::default();
     let semantic_inventory = RecordingSemanticInventory {
         use_live_transform: true,
+        ..RecordingSemanticInventory::default()
+    };
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE TABLE accounts (\
+            id BIGINT NOT NULL PRIMARY KEY, \
+            email VARCHAR(255) NOT NULL, \
+            payload VARCHAR(64) NOT NULL, \
+            created_at DATETIME NOT NULL, \
+            KEY idx_accounts_payload (payload)\
+        ) ENGINE=InnoDB"
+            .to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let error = handle_ddl_event(
+        &mut applier,
+        &journal,
+        &semantic_inventory,
+        "production-source",
+        &mut context,
+        &event_header(2, 180),
+        &event,
+    )
+    .expect_err("unsupported CREATE TABLE must remain translation-pending");
+
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("translator unavailable")
+    );
+    assert_eq!(
+        *journal.status.borrow(),
+        Some(DdlReplayStatus::TranslationPending)
+    );
+    assert_eq!(
+        journal.operations.borrow().as_slice(),
+        &["TRANSLATION_PENDING"]
+    );
+    assert!(applier.executor().operations().is_empty());
+}
+
+#[test]
+fn fixture_create_table_executes_evidence_sql_and_checkpoints_once() {
+    let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let executor = TransactionRecordingExecutor::with_operations(operations.clone());
+    let mut applier = crate::row::RowApplier::new(executor);
+    let journal = RecordingDdlReplayJournal::with_operations(operations.clone());
+    let semantic_inventory = RecordingSemanticInventory {
+        absent_target_create_evidence: true,
         ..RecordingSemanticInventory::default()
     };
     let resolver = FixtureSchemaResolver;
@@ -261,7 +329,7 @@ fn fixture_create_table_stays_translation_pending_without_target_or_checkpoint_e
         group_config: TargetTransactionGroupConfig::default(),
     };
 
-    let error = handle_ddl_event(
+    let outcome = handle_ddl_event(
         &mut applier,
         &journal,
         &semantic_inventory,
@@ -270,23 +338,22 @@ fn fixture_create_table_stays_translation_pending_without_target_or_checkpoint_e
         &event_header(2, 180),
         &event,
     )
-    .expect_err("fixture CREATE TABLE must remain translation-pending");
+    .expect("fixture CREATE TABLE replay")
+    .expect("fixture CREATE TABLE outcome");
 
-    assert!(
-        error
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("translator unavailable")
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
+    assert_eq!(
+        journal
+            .evidence
+            .borrow()
+            .as_ref()
+            .and_then(|evidence| evidence.generated_sql.as_deref()),
+        Some("CREATE TABLE `accounts` (`id` BIGINT NOT NULL, `email` VARCHAR(255) NOT NULL, `payload` VARCHAR(64) NOT NULL, PRIMARY KEY (`id`), KEY `idx_accounts_payload` (`payload`)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
     );
     assert_eq!(
-        *journal.status.borrow(),
-        Some(DdlReplayStatus::TranslationPending)
+        operations.borrow().as_slice(),
+        &["PREPARE", "EXEC", "APPLIED", "BEGIN", "LOCK_CHECKPOINT", "EXEC", "CHECKPOINT", "COMMIT"]
     );
-    assert_eq!(
-        journal.operations.borrow().as_slice(),
-        &["TRANSLATION_PENDING"]
-    );
-    assert!(applier.executor().operations().is_empty());
 }
 
 #[test]
