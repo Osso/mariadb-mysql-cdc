@@ -790,6 +790,32 @@ fn production_add_column_ddl_transforms_to_deterministic_mysql8_sql() {
 }
 
 #[test]
+fn production_add_column_and_key_ddl_transforms_to_deterministic_mysql8_sql() {
+    let inventory = LiveDdlSemanticInventory::new(
+        InventoryConfig::default(),
+        InventoryConfig::default(),
+        "globalcomix".to_string(),
+        "globalcomix".to_string(),
+    );
+    let source_sql = "-- sanitized deployment comment\n\
+         ALTER TABLE `home_feed_bakes`\n\
+         ADD COLUMN `variant_id` SMALLINT UNSIGNED DEFAULT NULL AFTER `reading_direction`,\n\
+         ADD KEY `idx_hfb_variant_status_published` (`variant_id`, `status`, `published_time`)";
+
+    let transformation = inventory
+        .transform_sql(source_sql)
+        .expect("production ADD COLUMN and ADD KEY DDL must be translatable");
+
+    assert_eq!(transformation.version, DDL_TRANSFORMATION_VERSION);
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `home_feed_bakes` ADD COLUMN `variant_id` SMALLINT UNSIGNED DEFAULT NULL AFTER `reading_direction`, ADD KEY `idx_hfb_variant_status_published` (`variant_id`, `status`, `published_time`)"
+        )
+    );
+}
+
+#[test]
 fn rename_column_if_exists_fails_closed_when_old_and_new_columns_both_exist() {
     let columns = ["arc_start_order", "deprecated_arc_start_order"]
         .into_iter()
