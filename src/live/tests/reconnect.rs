@@ -42,6 +42,15 @@ fn classifies_purged_or_missing_binlog_source_errors() {
 }
 
 #[test]
+fn reconnects_when_source_restart_temporarily_refuses_connections() {
+    let error = ApplyBinlogError::SourceCommand(
+        "source binlog command failed: Connection refused".to_string(),
+    );
+
+    assert!(should_reconnect(&error, 0, 3, false));
+}
+
+#[test]
 fn reconnect_forever_fails_without_changing_a_stale_checkpoint() {
     let checkpoint_store =
         MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.000001", 4));

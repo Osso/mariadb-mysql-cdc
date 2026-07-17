@@ -232,6 +232,7 @@ fn is_transient_source_error(error: &ApplyBinlogError) -> bool {
     };
     let lower = message.to_ascii_lowercase();
     lower.contains("connection reset")
+        || lower.contains("connection refused")
         || lower.contains("tls/ssl")
         || lower.contains("reading packet")
         || lower.contains("eof")
