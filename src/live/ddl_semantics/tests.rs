@@ -1074,8 +1074,8 @@ fn fixture_create_table_expected_post_state_matches_observed_inventory_exactly()
         table_runtime: Default::default(),
     };
 
-    let observed_state = observe_operation_state(&observed, &operation)
-        .expect("observed CREATE TABLE post-state");
+    let observed_state =
+        observe_operation_state(&observed, &operation).expect("observed CREATE TABLE post-state");
     assert_eq!(observed_state, evidence.expected_post_state);
 
     let mut drifted = observed;

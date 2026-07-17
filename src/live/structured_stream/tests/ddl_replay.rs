@@ -348,11 +348,22 @@ fn fixture_create_table_executes_evidence_sql_and_checkpoints_once() {
             .borrow()
             .as_ref()
             .and_then(|evidence| evidence.generated_sql.as_deref()),
-        Some("CREATE TABLE `accounts` (`id` BIGINT NOT NULL, `email` VARCHAR(255) NOT NULL, `payload` VARCHAR(64) NOT NULL, PRIMARY KEY (`id`), KEY `idx_accounts_payload` (`payload`)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        Some(
+            "CREATE TABLE `accounts` (`id` BIGINT NOT NULL, `email` VARCHAR(255) NOT NULL, `payload` VARCHAR(64) NOT NULL, PRIMARY KEY (`id`), KEY `idx_accounts_payload` (`payload`)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        )
     );
     assert_eq!(
         operations.borrow().as_slice(),
-        &["PREPARE", "EXEC", "APPLIED", "BEGIN", "LOCK_CHECKPOINT", "EXEC", "CHECKPOINT", "COMMIT"]
+        &[
+            "PREPARE",
+            "EXEC",
+            "APPLIED",
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "EXEC",
+            "CHECKPOINT",
+            "COMMIT"
+        ]
     );
 }
 
