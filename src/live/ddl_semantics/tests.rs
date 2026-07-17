@@ -865,6 +865,34 @@ fn rename_column_if_exists_becomes_proven_noop_when_source_columns_are_absent() 
 }
 
 #[test]
+fn live_transform_admits_exact_fixture_create_table() {
+    let inventory = LiveDdlSemanticInventory::new(
+        InventoryConfig::default(),
+        InventoryConfig::default(),
+        "fixture_cdc".to_string(),
+        "fixture_cdc".to_string(),
+    );
+    let transformation = inventory
+        .transform_sql(
+            "CREATE TABLE accounts (\
+                id BIGINT NOT NULL PRIMARY KEY, \
+                email VARCHAR(255) NOT NULL, \
+                payload VARCHAR(64) NOT NULL, \
+                KEY idx_accounts_payload (payload)\
+            ) ENGINE=InnoDB",
+        )
+        .expect("production fixture CREATE TABLE transformation");
+
+    assert_eq!(transformation.version, DDL_TRANSFORMATION_VERSION);
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "CREATE TABLE `accounts` (`id` BIGINT NOT NULL, `email` VARCHAR(255) NOT NULL, `payload` VARCHAR(64) NOT NULL, PRIMARY KEY (`id`), KEY `idx_accounts_payload` (`payload`)) ENGINE=InnoDB"
+        )
+    );
+}
+
+#[test]
 fn fixture_create_accounts_table_has_typed_ast_and_deterministic_mysql8_sql() {
     let source_sql = "CREATE TABLE accounts (\
         id BIGINT NOT NULL PRIMARY KEY, \

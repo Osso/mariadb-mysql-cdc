@@ -26,7 +26,8 @@ pub(super) use tokenizer::tokenize_ddl;
 pub use transform::{
     DdlTransformation, supports_drop_columns_if_exists, supports_production_alter_table,
     supports_rename_columns_if_exists, transform_drop_columns_if_exists,
-    transform_production_alter_table, transform_rename_columns_if_exists,
+    transform_fixture_create_table, transform_production_alter_table,
+    transform_rename_columns_if_exists,
 };
 
 pub trait DdlSemanticInventory {
@@ -104,6 +105,9 @@ fn read_affected_runtime(
 
 impl DdlSemanticInventory for LiveDdlSemanticInventory {
     fn transform_sql(&self, sql: &str) -> Result<DdlTransformation, String> {
+        if let Ok(transformation) = transform_fixture_create_table(sql) {
+            return Ok(transformation);
+        }
         if supports_automatic_index_ddl(sql) {
             return Ok(DdlTransformation {
                 version: transform::DDL_TRANSFORMATION_VERSION,

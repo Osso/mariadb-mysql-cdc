@@ -1,9 +1,7 @@
 use super::model::{
-    ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedDropColumnAst,
-    ParsedIndexAst, ParsedIndexKeyPart,
+    ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedCreateColumnAst,
+    ParsedCreateTableAst, ParsedDropColumnAst, ParsedIndexAst, ParsedIndexKeyPart,
 };
-#[cfg(test)]
-use super::model::{ParsedCreateColumnAst, ParsedCreateTableAst};
 use super::tokenizer::{ddl_contains_comments, tokenize_ddl};
 use std::collections::BTreeSet;
 
@@ -96,7 +94,6 @@ fn quote_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-#[cfg(test)]
 pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableAst, String> {
     if ddl_contains_comments(source_sql) {
         return Err("fixture CREATE TABLE comments are not supported".to_string());
@@ -174,7 +171,6 @@ pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableA
     })
 }
 
-#[cfg(test)]
 fn parse_fixture_table_column(
     tokens: &[String],
     index: usize,
@@ -218,7 +214,6 @@ fn parse_fixture_table_column(
     ))
 }
 
-#[cfg(test)]
 fn parse_fixture_table_key(
     tokens: &[String],
     index: usize,
@@ -249,7 +244,6 @@ fn parse_fixture_table_key(
     ))
 }
 
-#[cfg(test)]
 pub fn transform_fixture_create_table(source_sql: &str) -> Result<DdlTransformation, String> {
     let ast = parse_fixture_create_table(source_sql)?;
     let mut definitions = ast
