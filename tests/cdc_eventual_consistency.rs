@@ -86,10 +86,10 @@ fn real_catchup_snapshot_tls_harness_smoke() {
 }
 
 #[test]
-fn catchup_harness_can_select_source_and_target_ca_independently() {
+fn catchup_harness_omits_source_ca_and_preserves_target_ca() {
     let script = harness_script();
     let code = format!(
-        r#"
+        r#"""
 import importlib.util
 import pathlib
 import sys
@@ -107,32 +107,31 @@ harness.ca_file = pathlib.Path('/tmp/shared-ca.pem')
 args = harness._catchup_args(
     pathlib.Path('/tmp/cdc'),
     pathlib.Path('/tmp/progress.json'),
-    source_ca_file=pathlib.Path('/tmp/source-ca.pem'),
     target_ca_file=pathlib.Path('/tmp/target-ca.pem'),
 )
-source_index = args.index('--source-tls-ca-file')
+assert '--source-tls-ca-file' not in args
 target_index = args.index('--target-tls-ca-file')
-assert args[source_index + 1] == '/tmp/source-ca.pem'
 assert args[target_index + 1] == '/tmp/target-ca.pem'
-"#,
+"""#,
         script = script.display()
     );
     let output = Command::new("python3")
         .args(["-c", &code])
         .output()
-        .expect("check independent catchup CA selection");
+        .expect("check catchup CA policy");
     assert!(
         output.status.success(),
-        "independent CA selection failed:\n{}",
+        "catchup CA policy failed:
+{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
 #[test]
-fn sync_table_harness_propagates_source_ca() {
+fn sync_table_harness_omits_source_ca_and_preserves_target_ca() {
     let script = harness_script();
     let code = format!(
-        r#"
+        r#"""
 import importlib.util
 import pathlib
 import sys
@@ -146,23 +145,22 @@ spec.loader.exec_module(module)
 harness = module.Harness.__new__(module.Harness)
 harness.source = module.Endpoint('source', 3307)
 harness.target = module.Endpoint('target', 3308)
-harness.ca_file = pathlib.Path('/tmp/shared-ca.pem')
-args = harness._sync_table_args(
-    pathlib.Path('/tmp/cdc'),
-    source_ca_file=pathlib.Path('/tmp/source-ca.pem'),
-)
-source_index = args.index('--source-tls-ca-file')
-assert args[source_index + 1] == '/tmp/source-ca.pem'
-"#,
+harness.ca_file = pathlib.Path('/tmp/target-ca.pem')
+args = harness._sync_table_args(pathlib.Path('/tmp/cdc'))
+assert '--source-tls-ca-file' not in args
+target_index = args.index('--target-tls-ca-file')
+assert args[target_index + 1] == '/tmp/target-ca.pem'
+"""#,
         script = script.display()
     );
     let output = Command::new("python3")
         .args(["-c", &code])
         .output()
-        .expect("check sync-table source CA propagation");
+        .expect("check sync-table CA policy");
     assert!(
         output.status.success(),
-        "sync-table source CA propagation failed:\n{}",
+        "sync-table CA policy failed:
+{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -299,7 +297,7 @@ fn repair_scenarios_are_executable_and_in_repair_scope() {
 fn repair_scenarios_have_real_cli_orchestration_dispatch() {
     let script = fs::read_to_string(harness_script()).expect("read integration harness");
     assert!(script.contains("def run_repair_scenario"));
-    assert!(script.contains("--source-tls-ca-file"));
+    assert!(!script.contains("--source-tls-ca-file"));
     for scenario in [
         "fk-child-first-delete",
         "fk-parent-first-insert",
@@ -587,7 +585,7 @@ fn harness_has_no_unsafe_runtime_sql_or_tls_flags() {
     );
     assert!(runtime.contains("TARGET_USER"));
     assert!(runtime.contains("SOURCE_USER"));
-    assert!(runtime.contains("--source-tls-ca-file"));
+    assert!(!runtime.contains("--source-tls-ca-file"));
     assert!(runtime.contains("--target-tls-ca-file"));
     assert!(!runtime.contains("/etc/mariadb-mysql-cdc/do-ca.pem"));
 }

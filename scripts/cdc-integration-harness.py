@@ -474,8 +474,6 @@ class Harness:
             "CDC_SOURCE_PASSWORD",
             "--source-database",
             APP_SCHEMA,
-            "--source-tls-ca-file",
-            str(self.ca_file),
             "--source-identity",
             SOURCE_IDENTITY,
             "--binlog-file",
@@ -527,11 +525,9 @@ class Harness:
         binary: Path,
         progress_file: Path,
         *,
-        source_ca_file: Path | None = None,
         target_ca_file: Path | None = None,
     ) -> list[str]:
         assert self.source and self.target
-        source_ca_file = source_ca_file or self.ca_file
         target_ca_file = target_ca_file or self.ca_file
         return [
             str(binary),
@@ -546,8 +542,6 @@ class Harness:
             "CDC_SOURCE_PASSWORD",
             "--source-database",
             APP_SCHEMA,
-            "--source-tls-ca-file",
-            str(source_ca_file),
             "--target-host",
             "127.0.0.1",
             "--target-port",
@@ -575,11 +569,8 @@ class Harness:
     def _sync_table_args(
         self,
         binary: Path,
-        *,
-        source_ca_file: Path | None = None,
     ) -> list[str]:
         assert self.source and self.target
-        source_ca_file = source_ca_file or self.ca_file
         return [
             str(binary),
             "sync-table",
@@ -593,8 +584,6 @@ class Harness:
             "CDC_SOURCE_PASSWORD",
             "--source-database",
             APP_SCHEMA,
-            "--source-tls-ca-file",
-            str(source_ca_file),
             "--target-host",
             "127.0.0.1",
             "--target-port",
@@ -651,8 +640,6 @@ class Harness:
             SOURCE_USER,
             "--source-password-env",
             "CDC_SOURCE_PASSWORD",
-            "--source-tls-ca-file",
-            str(self.ca_file),
             "--source-database",
             APP_SCHEMA,
             "--source-identity",
@@ -860,7 +847,6 @@ class Harness:
         progress_file: Path,
         env: dict[str, str],
         *,
-        source_ca_file: Path,
         target_ca_file: Path,
         label: str,
     ) -> None:
@@ -868,7 +854,6 @@ class Harness:
             self._catchup_args(
                 binary,
                 progress_file,
-                source_ca_file=source_ca_file,
                 target_ca_file=target_ca_file,
             ),
             env=env,
@@ -892,7 +877,6 @@ class Harness:
         result = run(
             self._sync_table_args(
                 binary,
-                source_ca_file=self.unrelated_ca_file,
             ),
             env=env,
             timeout=90,
@@ -931,7 +915,6 @@ class Harness:
             binary,
             progress_file,
             env,
-            source_ca_file=self.unrelated_ca_file,
             target_ca_file=self.ca_file,
             label="untrusted source CA",
         )
@@ -939,7 +922,6 @@ class Harness:
             binary,
             progress_file,
             env,
-            source_ca_file=self.ca_file,
             target_ca_file=self.unrelated_ca_file,
             label="untrusted target CA",
         )
