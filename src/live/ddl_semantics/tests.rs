@@ -1087,6 +1087,70 @@ fn fixture_create_table_expected_post_state_matches_observed_inventory_exactly()
 }
 
 #[test]
+fn fixture_create_table_expected_indexes_use_observed_inventory_order() {
+    let sql = "CREATE TABLE accounts (\
+        id BIGINT NOT NULL PRIMARY KEY, \
+        a BIGINT NOT NULL, \
+        b BIGINT NOT NULL, \
+        KEY z_idx (a), \
+        KEY a_idx (b)\
+    ) ENGINE=InnoDB";
+    let operation = parse_ddl_operation(sql).expect("multi-key CREATE TABLE operation");
+    let absent = SemanticSchemaSnapshot {
+        inventory: SchemaInventory {
+            schema: "fixture_cdc".to_string(),
+            tables: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            views: Vec::new(),
+            triggers: Vec::new(),
+            routines: Vec::new(),
+            events: Vec::new(),
+        },
+        table_runtime: Default::default(),
+    };
+    let coordinate = crate::inventory::SourceMasterCoordinate {
+        file: "mysqld-bin.000777".to_string(),
+        position: 180,
+    };
+    let evidence = build_fenced_create_table_evidence(
+        &operation,
+        &absent,
+        &crate::inventory::SchemaDefaults {
+            character_set: "utf8mb4".to_string(),
+            collation: "utf8mb4_unicode_ci".to_string(),
+        },
+        &coordinate.file,
+        coordinate.position,
+        &coordinate,
+        &coordinate,
+    )
+    .expect("multi-key CREATE TABLE evidence");
+    let post: serde_json::Value =
+        serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
+    assert_eq!(
+        post["indexes"]
+            .as_array()
+            .expect("indexes")
+            .iter()
+            .map(|index| index["name"].as_str().expect("index name"))
+            .collect::<Vec<_>>(),
+        vec!["a_idx", "z_idx"]
+    );
+}
+
+#[test]
+fn fixture_create_table_rejects_empty_and_punctuation_identifiers() {
+    for sql in [
+        "CREATE TABLE `` (id BIGINT NOT NULL PRIMARY KEY) ENGINE=InnoDB",
+        "CREATE TABLE accounts (`=` BIGINT NOT NULL PRIMARY KEY) ENGINE=InnoDB",
+        "CREATE TABLE accounts (id BIGINT NOT NULL PRIMARY KEY, KEY `` (id)) ENGINE=InnoDB",
+    ] {
+        assert!(parse_fixture_create_table(sql).is_err(), "accepted {sql}");
+    }
+}
+
+#[test]
 fn fixture_create_accounts_table_has_typed_ast_and_deterministic_mysql8_sql() {
     let source_sql = "CREATE TABLE accounts (\
         id BIGINT NOT NULL PRIMARY KEY, \

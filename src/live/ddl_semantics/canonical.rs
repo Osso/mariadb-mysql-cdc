@@ -298,7 +298,7 @@ fn expected_create_table_post_state(
             })
             .collect(),
     };
-    let indexes = ast
+    let mut indexes = ast
         .indexes
         .iter()
         .map(|index| crate::inventory::IndexInventory {
@@ -324,6 +324,7 @@ fn expected_create_table_post_state(
                 .collect(),
         })
         .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.name.cmp(&right.name));
     serde_json::to_string(&json!({
         "kind": "table",
         "name": ast.name,

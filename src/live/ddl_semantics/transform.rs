@@ -764,7 +764,12 @@ fn require_identifier(tokens: &[String], index: usize, context: &str) -> Result<
     let value = tokens
         .get(index)
         .ok_or_else(|| format!("missing {context}"))?;
-    if matches!(value.as_str(), "." | "," | "(" | ")" | "<string>") {
+    let mut bytes = value.bytes();
+    let valid_start = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+    let valid_rest = bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if !valid_start || !valid_rest {
         return Err(format!("invalid {context}: {value}"));
     }
     Ok(value.clone())
