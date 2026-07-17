@@ -18,14 +18,19 @@ target with minimal downtime.
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in
-the target. Automatic DDL admission currently has two narrow slices: an
-explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE INDEX`
-or `DROP INDEX` when every key part/option is modeled and the operation is proven
-not to support or depend on a foreign key; and the production-observed
-unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form.
-The rename slice uses target column pre-state, emits deterministic MySQL 8 SQL
-without `IF EXISTS`, treats absent old columns as a proven no-op, and fails closed
-when old and new columns coexist.
+the target. Automatic DDL admission currently has three narrow slices: an explicitly named,
+unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
+when every key part/option is modeled and the operation is proven not to support
+or depend on a foreign key; the production-observed unqualified multi-clause
+`ALTER TABLE` form with `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or
+`SMALLINT UNSIGNED` and the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and
+`AFTER` options; and a named, non-unique composite `ADD KEY` over ordinary
+columns. The ALTER path records a typed clause AST and derives expected
+post-state by applying that AST to a fenced target pre-state, without requiring a
+live source head at the historical event coordinate. The rename slice uses target
+column pre-state, emits deterministic MySQL 8 SQL without `IF EXISTS`, treats
+absent old columns as a proven no-op, and fails closed when old and new columns
+coexist. Broader types/options and full ALTER TABLE remain unsupported.
 
 Every other DDL form—tables, other `ALTER TABLE`, views, routines, events,
 triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP`, qualified or cross-schema
@@ -62,10 +67,12 @@ creates the table. Different source primary keys remain different conflict
 identities. `repair-drift` now invokes the planner for child-first deletes,
 parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
 windows, a non-mutating full-scope Verify equality phase, and evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 30
-executable scenarios covering bootstrap/grants, DDL journal crash recovery,
-reconnect/GET_LOCK behavior, and FK-aware repair/conflict resolution. Those are
-local Docker proofs, not live cutover proof;
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 30 executable scenarios
+covering bootstrap/grants, DDL journal crash recovery, reconnect/GET_LOCK
+behavior, and FK-aware repair/conflict resolution. Its `production-alter-table`
+scenario passes two checkpointed ALTER events and checks column/comment/index
+parity plus the final checkpoint. These are local Docker proofs, not live cutover
+proof;
 recurring conflict scheduling and full cutover proof remain unchecked.
 
 Deployment remains blocked pending real-MySQL/live proof, exact grant/bootstrap

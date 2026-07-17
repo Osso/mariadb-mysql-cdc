@@ -17,12 +17,18 @@ MariaDB and MySQL differ in SQL, metadata, and binlog behavior.
 Production streaming requires `binlog_format=ROW` and
 `binlog_row_image=FULL`. Row events apply by source primary key.
 
-Automatic DDL admission currently covers two slices: explicitly named,
+Automatic DDL admission currently covers three narrow slices: explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX`
-with complete parsed options and no FK dependency, plus the production-observed
-unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form.
-The rename slice selects executable clauses from target pre-state and emits
-MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
+with complete parsed options and no FK dependency; the production-observed
+unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` for
+`VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`,
+`NULL`, `COMMENT`, and `AFTER` options, and named non-unique composite `ADD KEY`;
+and the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
+COLUMN IF EXISTS ...` form. The implemented ALTER path records a canonical typed
+clause AST and derives expected post-state by applying that AST to a fenced target
+pre-state, so historical replay does not require a live source head at the event
+coordinate. The rename slice selects executable clauses from target pre-state and
+emits MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
 `cdc.ddl_replay_journal` as `translation_pending` with sentinel/no evidence;
 translator availability promotes that same row once to `prepared`, after which
 generated SQL, postcondition evidence, and checkpointing proceed automatically.
@@ -61,9 +67,11 @@ guards, constraints, and exact table/application grants before opening the sourc
 stream; runtime never creates the table. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 30
-executable scenarios; its local proofs pass for the implemented boundaries. Live
-recurring scheduling, deployment, and cutover gates remain unchecked.
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 30 executable scenarios;
+its `production-alter-table` scenario passes two checkpointed ALTER events and
+checks column/comment/index parity. These are local proofs for implemented
+boundaries. Broader ALTER coverage, the full compatibility matrix, live recurring
+scheduling, deployment, and cutover gates remain unchecked.
 
 ## Safety and validation
 

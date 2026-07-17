@@ -28,20 +28,24 @@ allowlist.
 
 ### Current implemented slice
 
-- [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form.
-- [x] Select executable rename clauses from immutable target-column pre-state; an absent old column is omitted, while old/new coexistence fails closed.
-- [x] Emit deterministic MySQL 8 SQL without `IF EXISTS`, return a proven no-op when no clause is executable, and record transformation version `mariadb-mysql8-v1`.
+- [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` and named `ADD KEY` clauses.
+- [x] Transform the observed `ADD COLUMN` forms for `VARCHAR(length)`, `DATETIME`, and `SMALLINT UNSIGNED`, with the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options.
+- [x] Transform a named, non-unique composite `ADD KEY` over ordinary columns as a BTREE index; broader index and clause options remain outside this slice.
+- [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
+- [x] Derive the expected post-state by applying the event AST to a fenced target pre-state snapshot; this translated ALTER path does not require a live source snapshot or source head at the event coordinate.
+- [x] Emit deterministic MySQL 8 SQL and record transformation version `mariadb-mysql8-v1`.
 - [x] Set journal `transformation_version` and nullable `generated_sql` from the actual transformation before `prepared`; proven no-ops persist `generated_sql = NULL`.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
 
-This is one translator slice, not the full MariaDB-to-MySQL 8 transformation
-pipeline. Unsupported DDL now enters the same durable journal as
-`translation_pending` with sentinel/no evidence and blocks checkpoint/overtake.
-When translator code becomes available, the same row promotes once to `prepared`,
-fills immutable evidence, executes generated SQL, and checkpoints automatically.
-Evidence-capture failure uses the same barrier. The event handler has no
-supported manual-ledger workflow, but config/bootstrap/grant/harness cleanup is
-still open and this contract is not deployment-ready.
+This is a production-derived ALTER TABLE slice, not full ALTER TABLE or the full
+MariaDB-to-MySQL 8 transformation pipeline. Unsupported DDL now enters the same
+durable journal as `translation_pending` with sentinel/no evidence and blocks
+checkpoint/overtake. When translator code becomes available, the same row
+promotes once to `prepared`, fills immutable evidence, executes generated SQL,
+and checkpoints automatically. Evidence-capture failure uses the same barrier.
+The event handler has no supported manual-ledger workflow, but
+config/bootstrap/grant/harness cleanup is still open and this contract is not
+deployment-ready.
 
 ### Execution and recovery
 
@@ -87,9 +91,11 @@ still open and this contract is not deployment-ready.
   checkpoint barrier.
 - `src/live/ddl_semantics.rs` — dispatches current DDL transformations and
   captures semantic evidence.
-- `src/live/ddl_semantics/transform.rs` — first `RENAME COLUMN IF EXISTS`
-  translator slice, including target pre-state selection and versioned SQL
+- `src/live/ddl_semantics/transform.rs` — production-derived `ADD COLUMN`/`ADD KEY`
+  and `RENAME COLUMN IF EXISTS` translators, including deterministic SQL
   emission.
+- `src/live/ddl_semantics/canonical.rs` — typed ALTER clause AST encoding and
+  expected post-state derivation from the fenced target pre-state.
 - `src/live/structured_stream/ddl.rs` — prepares the journal, executes generated
   target SQL, and preserves checkpoint ordering.
 - `src/live/ddl_replay_journal.rs` — durable evidence, crash reconciliation, and
@@ -104,24 +110,29 @@ still open and this contract is not deployment-ready.
 
 The current slice is covered by:
 
-- [x] `src/live/ddl_semantics/tests.rs` — deterministic multi-clause MySQL 8
-      output, proven no-op when old columns are absent, and fail-closed behavior
-      when old and new columns coexist.
+- [x] `src/live/ddl_semantics/tests.rs` — deterministic production `ADD COLUMN`
+      and `ADD KEY` SQL, typed AST parsing, post-state derivation without a live
+      source snapshot, plus the existing rename boundaries.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
-      generated SQL without `IF EXISTS` and leaves the journal prepared when
-      target execution fails.
+      generated SQL and preserves journal/checkpoint ordering.
+- [x] `scripts/cdc-integration-harness.py --scenario production-alter-table` —
+      real MariaDB/MySQL replay of two checkpointed ALTER events, including
+      VARCHAR/DATETIME/SMALLINT column parity, comments, composite index parity,
+      journal status/version, and final checkpoint.
 
-These tests prove only the current rename slice. They do not prove the full
-transformation contract, real MariaDB/MySQL compatibility, or deployment safety.
+These tests prove only the observed ALTER slice and existing narrow DDL paths.
+They do not prove full ALTER TABLE, the broader transformation contract, a full
+MariaDB/MySQL matrix, or deployment safety.
 
 ## Known gaps (current cycle)
 
-- [ ] Extend the current translator beyond the production-observed rename slice
-      into the canonical MariaDB DDL parser and MySQL 8 transformation pipeline.
+- [ ] Extend the current translator beyond the production-observed
+      `ADD COLUMN`/`ADD KEY` and rename slices into the canonical MariaDB DDL
+      parser and MySQL 8 transformation pipeline.
 - [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
       retired manual DDL ledger without restoring manual replay.
-- [ ] Build the production-derived DDL corpus and real MariaDB/MySQL 8 parity
-      matrix.
+- [ ] Build the broader production-derived DDL corpus and real MariaDB/MySQL 8
+      parity matrix; the current two-event ALTER scenario is only a slice proof.
 - [ ] Define transformation-version compatibility after the first production
       deployment establishes a real schema upgrade boundary.
 
@@ -129,5 +140,8 @@ transformation contract, real MariaDB/MySQL compatibility, or deployment safety.
 
 - Manual target-SQL authoring or operator resolution as a CDC fallback.
 - Index-only automatic replay as the target DDL architecture.
+- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`/`ADD KEY` forms.
+- Additional column types, defaults, clauses, index options, and DDL families not
+  listed in the implemented slice.
 - Silently dropping, weakening, or approximating source schema semantics.
 - Cross-schema mutation outside the configured application schema.

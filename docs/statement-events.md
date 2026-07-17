@@ -9,11 +9,18 @@ statement DML QueryEvent is a contract violation.
 Statement DML is never replayed in the production stream. The removed
 `apply-binlog` text path is not a supported health check.
 
-Automatic DDL admission currently has two slices:
+Automatic DDL admission currently has three narrow slices:
 
 - explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE
   INDEX` or `DROP INDEX` whose key parts and options are completely modeled and
   whose FK dependency is disproven from the fenced target inventory;
+- the production-observed unqualified multi-clause `ALTER TABLE` form with
+  `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the
+  observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and a named
+  non-unique composite `ADD KEY`; this path records a canonical typed clause AST,
+  emits deterministic MySQL 8 SQL, and derives expected post-state from fenced
+  target pre-state plus the event AST without requiring the historical source
+  head; and
 - the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
   COLUMN IF EXISTS ...` form, which is token-parsed and transformed from target
   column pre-state into deterministic MySQL 8 SQL.
@@ -22,12 +29,14 @@ The index parser rejects comments, ambiguous/incomplete syntax, double-quoted
 identifiers when ANSI_QUOTES mode is not captured, qualified names (including
 backtick-qualified names), generated names, `IF EXISTS`, unique/fulltext/spatial/
 invisible forms, and unmodeled options. Unqualified backtick identifiers are
-tokenized; their real-MySQL coverage remains unchecked. The rename translator
-removes `IF EXISTS`; absent old columns become a proven no-op, while old/new
-coexistence fails closed.
+tokenized; their real-MySQL coverage remains unchecked. The production ALTER
+parser does not imply broader `ALTER TABLE` support: types, defaults, clauses,
+and index options outside the observed slice remain translation boundaries. The
+rename translator removes `IF EXISTS`; absent old columns become a proven no-op,
+while old/new coexistence fails closed.
 
-Other tables, `ALTER TABLE`, views, routines, events, triggers, `RENAME`,
-`TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
+Other table DDL and unsupported `ALTER TABLE` forms, views, routines, events,
+triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
 qualified/cross-schema references, definer/security clauses, MariaDB-only syntax,
 and multi-object or multi-statement forms are translation boundaries in the
 stream event path. The intended behavior flushes earlier DML, records exact

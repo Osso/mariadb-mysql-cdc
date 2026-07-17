@@ -5,10 +5,13 @@ The event handler uses one durable DDL control plane:
 
 Automatic admission currently covers strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
-metadata and no FK dependency, plus the production-observed unqualified
-multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator slice.
-Every other DDL form enters the same journal as `translation_pending`; no
-operator-authored target SQL is accepted as a resolution path.
+metadata and no FK dependency; the production-observed unqualified multi-clause
+`ALTER TABLE` form with `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or
+`SMALLINT UNSIGNED`, the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER`
+options, and named non-unique composite `ADD KEY`; plus the existing
+`ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator slice. Every other DDL
+form enters the same journal as `translation_pending`; no operator-authored
+target SQL is accepted as a resolution path.
 
 The stream does not create or repair control-plane objects. Bootstrap must run
 with admin/resolver credentials while the stream is stopped:
@@ -79,18 +82,29 @@ startup barrier, so later source coordinates cannot overtake it.
 
 ### Translator becomes available
 
-Reprocess the same source event. The stream captures target pre-state and the
-canonical AST, derives the expected post-state from that immutable pre-state,
-and promotes the existing `translation_pending` row exactly once to `prepared`.
-The promotion fills immutable transformation evidence. It then executes the
-generated MySQL SQL, or records a proven no-op with `generated_sql = NULL`,
-validates the complete affected target state, marks `applied`, and atomically
-checkpoints the event.
+Reprocess the same source event. The stream captures a fenced target pre-state
+and the canonical AST, derives the expected post-state by applying that AST to
+the pre-state, and promotes the existing `translation_pending` row exactly once
+to `prepared`. For the implemented production ALTER slice, this derivation is
+purely target-pre-state-plus-event-AST; historical replay does not require a live
+source snapshot or source head at the event coordinate. The promotion fills
+immutable transformation evidence. It then executes the generated MySQL SQL, or
+records a proven no-op with `generated_sql = NULL`, validates the complete
+affected target state, marks `applied`, and atomically checkpoints the event.
 
 No operator-authored target SQL, `resolution_note`, or manual status transition
 is part of this flow.
 
-### Transformation/evidence failure
+### Production ALTER proof
+
+The real MariaDB 11.4/MySQL 8.0 harness scenario `production-alter-table`
+replays two source ALTER events. It verifies `VARCHAR(64)`, `DATETIME`, and
+`SMALLINT UNSIGNED` column metadata, comments and placement, the named composite
+non-unique BTREE index, two `checkpointed` journal rows, and the final stream
+checkpoint. This is implemented-slice proof only, not full ALTER TABLE coverage,
+a full compatibility matrix, or deployment proof.
+
+## Transformation/evidence failure
 
 Translation failure and evidence-capture failure use the same
 `translation_pending` journal insert and no-overtake barrier. Retry only by
