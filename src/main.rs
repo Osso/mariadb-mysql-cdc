@@ -598,7 +598,6 @@ fn apply_source_option(
         "--source-user" => source.user = value.to_string(),
         "--source-password-env" => source.password = read_env_password(value)?,
         "--source-database" => source.database = Some(value.to_string()),
-        "--source-tls-ca-file" => source.tls_ca_file = value.to_string(),
         "--binlog-file" => source.binlog_file = value.to_string(),
         "--start-position" => source.start_position = parse_u64(flag, value)?,
         "--stop-position" => source.stop_position = Some(parse_u64(flag, value)?),

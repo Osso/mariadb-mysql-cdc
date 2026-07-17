@@ -35,6 +35,13 @@ fn stream_requires_schema_qualified_checkpoint_table() {
 }
 
 #[test]
+fn stream_defaults_to_plaintext_source_without_ca() {
+    let config = ApplyBinlogConfig::default();
+
+    assert!(config.source.tls_ca_file.is_empty());
+}
+
+#[test]
 fn stream_accepts_plaintext_source_without_tls_ca() {
     let config = ApplyBinlogConfig {
         source: SourceBinlogConfig {

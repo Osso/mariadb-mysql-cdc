@@ -250,7 +250,7 @@ impl Default for SourceBinlogConfig {
             user: String::new(),
             password: String::new(),
             database: None,
-            tls_ca_file: "/etc/mariadb-mysql-cdc/source-ca.pem".to_string(),
+            tls_ca_file: String::new(),
             binlog_file: String::new(),
             start_position: 4,
             stop_position: None,
