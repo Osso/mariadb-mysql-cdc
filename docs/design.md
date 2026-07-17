@@ -85,8 +85,10 @@ guards, constraints, and exact table/application grants before opening the sourc
 stream; runtime never creates the table. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 32 executable scenarios;
-its `create-table-crash-restart` scenario passes the differing-default fixture
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 33 executable scenarios,
+including `catchup-snapshot-tls` as real MariaDB/MySQL coverage of configured-CA
+chain validation over literal IP endpoints and resumable snapshot convergence.
+Its `create-table-crash-restart` scenario passes the differing-default fixture
 through post-DDL/pre-applied crash recovery, prepared-state restart, exact
 checkpointing, and idempotent replay; its `production-alter-table` scenario passes
 five checkpointed ALTER events,

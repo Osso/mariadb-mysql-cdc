@@ -8,11 +8,16 @@ in [catchup.md](../catchup.md).
 
 ### Connection security
 
-- [x] Require a source TLS CA file and use it for the MariaDB source inventory
-      and persistent snapshot reads.
-- [x] Require the target TLS CA file and use it for MySQL target writes.
+- [x] Require a source TLS CA file, validate its certificate chain, and use it
+      for the MariaDB source inventory and persistent snapshot reads.
+- [x] Require the target TLS CA file, validate its certificate chain, and use it
+      for MySQL target writes.
 - [x] Fail before driver connection when either endpoint CA is missing,
       unreadable, empty, or invalid.
+- [x] Require certificate identity matching for DNS/hostname endpoints while
+      skipping hostname/IP identity matching only for literal IP endpoints.
+- [x] Reject plaintext, invalid-certificate, and TLS-validation retry
+      fallbacks; retries retain the configured CA and chain validation.
 
 ### Snapshot Execution
 
@@ -69,6 +74,11 @@ in [catchup.md](../catchup.md).
 
 ## Tests asserting this spec
 
+- `scripts/cdc-integration-harness.py --scenario catchup-snapshot-tls` — real
+  MariaDB 11.4/MySQL 8.0 connections using the configured CA on literal IP
+  endpoints; proves CA/chain validation, four-row copy, target progress, and
+  idempotent resume. This scenario does not claim DNS/hostname identity
+  coverage.
 - `src/mysql_snapshot/tests.rs`
 - `src/mysql_snapshot/parallel.rs`
 - `src/snapshot/tests.rs`
