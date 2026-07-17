@@ -1,4 +1,7 @@
-use super::transform::{DDL_TRANSFORMATION_VERSION, parse_production_alter_table_ast};
+use super::transform::{
+    DDL_TRANSFORMATION_VERSION, parse_production_alter_table_ast,
+    transform_drop_columns_if_exists,
+};
 use super::*;
 use crate::inventory::{
     ColumnInventory, EventInventory, ForeignKeyInventory, IndexColumnInventory, IndexInventory,
@@ -720,6 +723,37 @@ fn fixture_event(row_count: u64) -> EventInventory {
         status: "ENABLED".to_string(),
         definition: format!("delete from accounts where id <= {row_count}"),
     }
+}
+
+#[test]
+fn transforms_mariadb_drop_column_if_exists_for_mysql8() {
+    let columns = ["id".to_string(), "handle".to_string()]
+        .into_iter()
+        .collect();
+
+    let transformation = transform_drop_columns_if_exists(
+        "ALTER TABLE accounts DROP COLUMN IF EXISTS handle",
+        &columns,
+    )
+    .expect("DROP COLUMN IF EXISTS transformation");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some("ALTER TABLE `accounts` DROP COLUMN `handle`")
+    );
+}
+
+#[test]
+fn drop_column_if_exists_is_proven_noop_when_target_column_is_absent() {
+    let columns = ["id".to_string()].into_iter().collect();
+
+    let transformation = transform_drop_columns_if_exists(
+        "ALTER TABLE accounts DROP COLUMN IF EXISTS handle",
+        &columns,
+    )
+    .expect("DROP COLUMN IF EXISTS no-op");
+
+    assert_eq!(transformation.target_sql, None);
 }
 
 #[test]
