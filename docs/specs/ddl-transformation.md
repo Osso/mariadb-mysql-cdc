@@ -111,9 +111,6 @@ broader DDL coverage and operational proof gaps listed below.
   target SQL, and preserves checkpoint ordering.
 - `src/live/ddl_replay_journal.rs` — durable evidence, crash reconciliation, and
   checkpoint ordering.
-- `src/live/ddl_ledger.rs` — legacy ledger artifact retained behind test-only
-  compilation in this slice; config/parser and harness/test dependencies remain
-  open and it is not a supported DDL workflow.
 - `scripts/cdc-integration-harness.py` — real MariaDB/MySQL compatibility and
   crash matrix.
 
