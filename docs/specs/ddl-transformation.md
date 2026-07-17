@@ -1,8 +1,9 @@
 # MariaDB to MySQL 8 DDL Transformation
 
-The CDC stream must convert production MariaDB DDL into deterministic MySQL 8
-DDL while preserving source intent. This is the authoritative DDL behavior
-contract. Journal and checkpoint mechanics are described in
+The CDC stream must convert production MariaDB DDL syntax into deterministic
+MySQL 8 DDL syntax. This translator is not responsible for reconciling
+preexisting source/target schema or data differences. This is the authoritative
+DDL transformation contract. Journal and checkpoint mechanics are described in
 [DDL resolution and recovery](../ddl-resolution.md), but they must serve this
 transformation pipeline rather than restrict automatic handling to a small DDL
 allowlist.
@@ -16,12 +17,12 @@ allowlist.
 - [ ] Transform MariaDB syntax, defaults, identifiers, data types, collations,
       indexes, constraints, generated columns, table options, partitioning,
       views, routines, triggers, and events into MySQL 8-compatible DDL.
-- [ ] Preserve the source operation's observable schema and database behavior;
-      reject silent semantic weakening or approximation.
+- [ ] Preserve the meaning expressed by the parsed DDL statement while converting
+      syntax; reject unsupported clauses instead of dropping or approximating
+      them.
 - [ ] Preserve object qualification and dependency relationships without
       allowing writes outside the configured application schema.
-- [ ] Produce deterministic MySQL 8 SQL and canonical expected post-state from
-      the source event plus immutable target pre-state.
+- [ ] Produce deterministic MySQL 8 SQL from the parsed source statement.
 - [ ] Make transformations observable by persisting source SQL, canonical input,
       generated MySQL SQL, transformation version, source coordinate, pre-state,
       expected post-state, and observed post-state.
@@ -32,7 +33,7 @@ allowlist.
 - [x] Transform the observed `ADD COLUMN` forms for `VARCHAR(length)`, `DATETIME`, and `SMALLINT UNSIGNED`, with the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options.
 - [x] Transform named composite `ADD KEY` and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; broader index and clause options remain outside this slice.
 - [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
-- [x] Derive the expected post-state for the explicitly supported ALTER slice by applying the event AST to a fenced target pre-state snapshot.
+- [x] Record expected target object state for crash/replay verification without treating that evidence as source/target reconciliation.
 - [x] Fail closed as `translation_pending` before target execution when syntax, context, dependencies, or semantics fall outside that explicit slice; the stream checkpoint and later-event barrier must remain unchanged.
 - [x] Emit deterministic MySQL 8 SQL and record transformation version `mariadb-mysql8-v1`.
 - [x] Set journal `transformation_version` and nullable `generated_sql` from the actual transformation before `prepared`; proven no-ops persist `generated_sql = NULL`.
@@ -45,12 +46,14 @@ cycle. The translator may use only semantics completely represented by the
 admitted event AST and fenced target pre-state; it must not infer unmodeled
 historical source state.
 
-Unsupported or ambiguous DDL enters the durable journal as
+Unsupported or ambiguous DDL syntax enters the durable journal as
 `translation_pending` with sentinel/no execution evidence. It performs no target
 DDL, does not advance the stream checkpoint, and blocks later events from
-overtaking it. When translator code later supports the exact event, the same row
+overtaking it. When translator code later supports the exact syntax, the same row
 may promote once to `prepared`, fill immutable evidence, execute generated SQL,
-and checkpoint automatically. Evidence-capture failure uses the same barrier.
+and checkpoint automatically. Target execution failures caused by preexisting
+target schema or data differences are execution/reconciliation failures, not
+translator-unavailable events.
 The event handler has no supported manual-ledger workflow, but
 config/bootstrap/grant/harness cleanup is still open and this contract is not
 deployment-ready.
@@ -62,8 +65,8 @@ deployment-ready.
 - [x] Reconcile crashes after prepare, target implicit commit, journal update, and
       checkpoint update without blind duplicate execution; ambiguous evidence
       becomes a durable barrier.
-- [x] Block checkpoint advancement when a required transformation or evidence
-      capture is missing, ambiguous, or cannot preserve semantics.
+- [x] Block checkpoint advancement when required syntax transformation is
+      unsupported or ambiguous, or when target execution/recovery fails.
 - [x] When translator code becomes available, automatically promote the same
       `translation_pending` event to `prepared`, fill evidence, execute generated
       SQL, and checkpoint without operator-authored SQL or status transition.
@@ -160,8 +163,14 @@ MariaDB/MySQL matrix, or deployment safety.
   `ADD UNIQUE KEY` forms.
 - Additional column types, defaults, clauses, index options, and DDL families not
   listed in the implemented slice.
-- Silently dropping, weakening, or approximating source schema semantics.
+- Silently dropping, weakening, or approximating parsed DDL clauses.
 - Cross-schema mutation outside the configured application schema.
+- Detecting or reconciling preexisting source/target schema differences,
+  including column type, charset, collation, defaults, or existing indexes.
+- Detecting or repairing preexisting source/target data differences, including
+  duplicate target rows before `ADD UNIQUE KEY` execution.
+- Treating target execution failure caused by schema/data drift as unsupported
+  translation; those failures remain observable recovery/reconciliation blocks.
 - Coordinate-anchored historical source semantic lineage reconstruction or a
   durable source-model head in the current cycle. Events needing that history
   remain `translation_pending` rather than guessed from current source or target
