@@ -1,7 +1,9 @@
 use super::*;
+use super::transform::DDL_TRANSFORMATION_VERSION;
 use crate::inventory::{
     ColumnInventory, EventInventory, ForeignKeyInventory, IndexColumnInventory, IndexInventory,
-    RoutineInventory, SchemaInventory, TableInventory, TriggerInventory, ViewInventory,
+    InventoryConfig, RoutineInventory, SchemaInventory, TableInventory, TriggerInventory,
+    ViewInventory,
 };
 
 fn assert_operation_cases(cases: &[(&str, DdlFamily, DdlObjectKind, &str, Option<&str>)]) {
@@ -760,6 +762,31 @@ fn rename_column_if_exists_becomes_proven_noop_when_source_columns_are_absent() 
     .expect("proven no-op transformation");
 
     assert_eq!(transformation.target_sql, None);
+}
+
+#[test]
+fn production_add_column_ddl_transforms_to_deterministic_mysql8_sql() {
+    let inventory = LiveDdlSemanticInventory::new(
+        InventoryConfig::default(),
+        InventoryConfig::default(),
+        "globalcomix".to_string(),
+        "globalcomix".to_string(),
+    );
+    let source_sql = "ALTER TABLE `home_feed_panel_candidates`\n\
+         ADD COLUMN `filter_prompt_version` VARCHAR(64) DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_reason`,\n\
+         ADD COLUMN `filtered_time` DATETIME NULL DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_prompt_version`";
+
+    let transformation = inventory
+        .transform_sql(source_sql)
+        .expect("production ADD COLUMN DDL must be translatable");
+
+    assert_eq!(transformation.version, DDL_TRANSFORMATION_VERSION);
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `home_feed_panel_candidates` ADD COLUMN `filter_prompt_version` VARCHAR(64) DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_reason`, ADD COLUMN `filtered_time` DATETIME NULL DEFAULT NULL COMMENT 'sanitized description' AFTER `filter_prompt_version`"
+        )
+    );
 }
 
 #[test]
