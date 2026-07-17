@@ -290,6 +290,79 @@ fn fixture_create_table_stays_translation_pending_without_target_or_checkpoint_e
 }
 
 #[test]
+fn fixture_create_table_rejects_present_target_without_execution_or_checkpoint() {
+    let executor = TransactionRecordingExecutor::default();
+    let mut applier = crate::row::RowApplier::new(executor);
+    let journal = RecordingDdlReplayJournal::default();
+    let semantic_inventory = RecordingSemanticInventory {
+        present_target_create_evidence: true,
+        ..RecordingSemanticInventory::default()
+    };
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE TABLE accounts (\
+            id BIGINT NOT NULL PRIMARY KEY, \
+            email VARCHAR(255) NOT NULL, \
+            payload VARCHAR(64) NOT NULL, \
+            KEY idx_accounts_payload (payload)\
+        ) ENGINE=InnoDB"
+            .to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let header = event_header(2, 180);
+    let BinlogEvent::QueryEvent(query) = &event else {
+        unreachable!("fixture CREATE TABLE query event");
+    };
+    let ddl_event = ddl_event(
+        "production-source",
+        "mysqld-bin.000777",
+        &header,
+        query,
+    );
+    let error = prepare_and_execute_automatic_ddl(
+        &mut applier,
+        &journal,
+        &semantic_inventory,
+        AutomaticDdlInput {
+            context: &mut context,
+            header: &header,
+            event: &event,
+        },
+        &ddl_event,
+    )
+    .expect_err("present target must reject CREATE TABLE evidence");
+
+    assert!(error.to_string().contains("already exists"), "{error}");
+    assert_eq!(
+        *journal.status.borrow(),
+        Some(DdlReplayStatus::TranslationPending)
+    );
+    assert_eq!(
+        journal.operations.borrow().as_slice(),
+        &["TRANSLATION_PENDING"]
+    );
+    assert!(applier.executor().operations().is_empty());
+}
+
+#[test]
 fn unsupported_ddl_persists_barrier_then_replays_after_translator_upgrade() {
     let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let executor = TransactionRecordingExecutor::with_operations(operations.clone());

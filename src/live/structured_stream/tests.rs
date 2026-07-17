@@ -222,6 +222,7 @@ struct RecordingSemanticInventory {
     capture_error: Option<String>,
     translator_available: std::cell::Cell<bool>,
     use_live_transform: bool,
+    present_target_create_evidence: bool,
 }
 
 impl Default for RecordingSemanticInventory {
@@ -238,6 +239,7 @@ impl Default for RecordingSemanticInventory {
             capture_error: None,
             translator_available: std::cell::Cell::new(true),
             use_live_transform: false,
+            present_target_create_evidence: false,
         }
     }
 }
@@ -275,10 +277,49 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
 
     fn capture_evidence(
         &self,
-        _sql: &str,
-        _source_file: &str,
-        _event_end_position: u64,
+        sql: &str,
+        source_file: &str,
+        event_end_position: u64,
     ) -> Result<super::super::ddl_semantics::DdlSemanticEvidence, String> {
+        if self.present_target_create_evidence {
+            let operation = super::super::ddl_semantics::parse_ddl_operation(sql)?;
+            let target = super::super::ddl_semantics::SemanticSchemaSnapshot {
+                inventory: crate::inventory::SchemaInventory {
+                    schema: "fixture_cdc".to_string(),
+                    tables: vec![crate::inventory::TableInventory {
+                        name: "accounts".to_string(),
+                        table_type: "BASE TABLE".to_string(),
+                        engine: Some("InnoDB".to_string()),
+                        collation: Some("utf8mb4_unicode_ci".to_string()),
+                        primary_key: vec!["id".to_string()],
+                        columns: Vec::new(),
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    views: Vec::new(),
+                    triggers: Vec::new(),
+                    routines: Vec::new(),
+                    events: Vec::new(),
+                },
+                table_runtime: Default::default(),
+            };
+            let coordinate = crate::inventory::SourceMasterCoordinate {
+                file: source_file.to_string(),
+                position: event_end_position,
+            };
+            return super::super::ddl_semantics::build_fenced_create_table_evidence(
+                &operation,
+                &target,
+                &crate::inventory::SchemaDefaults {
+                    character_set: "utf8mb4".to_string(),
+                    collation: "utf8mb4_unicode_ci".to_string(),
+                },
+                source_file,
+                event_end_position,
+                &coordinate,
+                &coordinate,
+            );
+        }
         match &self.capture_error {
             Some(error) => Err(error.clone()),
             None => Ok(self.evidence.clone()),

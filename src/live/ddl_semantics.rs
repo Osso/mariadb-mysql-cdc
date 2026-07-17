@@ -2,7 +2,7 @@ use super::ddl_replay_journal::DdlFamily;
 use crate::inventory::{
     InventoryConfig, MariaDbInventoryReader, SourceMasterCoordinate, build_inventory,
 };
-use model::{DdlOperation, SemanticSchemaSnapshot, TableRuntimeState};
+use model::{DdlOperation, TableRuntimeState};
 
 mod canonical;
 mod model;
@@ -19,6 +19,7 @@ pub(super) use canonical::canonical_absent_state;
 pub use canonical::{
     build_semantic_evidence, observe_operation_state, supports_automatic_semantic_recovery,
 };
+pub(super) use model::SemanticSchemaSnapshot;
 pub use model::{DdlObjectKind, DdlSemanticEvidence};
 #[cfg(test)]
 pub(super) use parser::parse_simple_index_ddl;
