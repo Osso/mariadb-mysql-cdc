@@ -563,6 +563,49 @@ fn bootstrap_fixtures_use_exact_restricted_accounts() {
 }
 
 #[test]
+fn source_based_harness_rebuilds_existing_binary_but_explicit_binary_does_not() {
+    let script = harness_script();
+    let code = format!(
+        r#"
+import importlib.util
+import pathlib
+import sys
+import tempfile
+
+script = pathlib.Path(r'{script}')
+spec = importlib.util.spec_from_file_location('cdc_harness_freshness', script)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+repo = pathlib.Path(tempfile.mkdtemp())
+binary = repo / 'target/debug/mariadb-mysql-cdc'
+binary.parent.mkdir(parents=True)
+binary.write_text('existing')
+calls = []
+module.run = lambda command, cwd=None, **kwargs: calls.append((command, cwd))
+source_harness = module.Harness(repo, None)
+assert source_harness._stream_binary(None) == binary
+assert calls == [(['cargo', 'build', '--bin', 'mariadb-mysql-cdc'], repo)]
+calls.clear()
+explicit_harness = module.Harness(repo, binary)
+assert explicit_harness._stream_binary(None) == binary
+assert calls == []
+"#,
+        script = script.display()
+    );
+    let output = Command::new("python3")
+        .args(["-c", &code])
+        .output()
+        .expect("check harness binary freshness");
+    assert!(
+        output.status.success(),
+        "freshness check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn recovery_scenarios_are_executable_and_use_failpoint_binary() {
     let script = fs::read_to_string(harness_script()).expect("read integration harness");
     for scenario in [
@@ -581,6 +624,8 @@ fn recovery_scenarios_are_executable_and_use_failpoint_binary() {
     }
     assert!(script.contains("self.run_recovery_scenario(scenario)"));
     assert!(script.contains("self.run_connection_loss_scenario(scenario)"));
+    assert!(script.contains("ScenarioSpec(\"row-conflict-rollback\", True)"));
+    assert!(script.contains("self.run_row_conflict_rollback()"));
     assert!(script.contains("--features"));
     assert!(script.contains("integration-failpoints"));
     assert!(script.contains("--integration-failpoint"));

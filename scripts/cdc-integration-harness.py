@@ -60,6 +60,7 @@ SCENARIOS = (
     ScenarioSpec("checkpoint-transaction", True),
     ScenarioSpec("source-connection-loss", True),
     ScenarioSpec("target-connection-loss", True),
+    ScenarioSpec("row-conflict-rollback", True),
     ScenarioSpec("pre-state-drift", True),
     ScenarioSpec("coordinate-reuse", True),
     ScenarioSpec("raw-sql-reuse", True),
@@ -413,7 +414,8 @@ class Harness:
         if integration_failpoint is not None:
             build.extend(["--features", "integration-failpoints"])
         build.extend(["--bin", "mariadb-mysql-cdc"])
-        if not binary.is_file() or integration_failpoint is not None:
+        source_based_binary = self.binary is None
+        if source_based_binary or integration_failpoint is not None:
             run(build, cwd=self.repo)
         if not binary.is_file():
             raise HarnessError(f"CDC binary build did not produce {binary}")
@@ -833,8 +835,8 @@ class Harness:
         assert self.target
         output = self.query(
             self.target,
-            "SELECT source_identity,source_server_id,binlog_file,event_start_position,"
-            "event_end_position,schema_name,raw_sql,canonical_ast,pre_state,"
+            "SELECT source_identity,source_server_id,binlog_file,event_start_position," 
+            "event_end_position,schema_name,raw_sql,canonical_ast,pre_state," 
             "expected_post_state,status "
             "FROM cdc.ddl_replay_journal "
             "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
@@ -874,7 +876,7 @@ class Harness:
         self.admin_sql(
             self.target,
             "INSERT INTO cdc.ddl_replay_journal "
-            "(source_identity,source_server_id,binlog_file,event_start_position,event_end_position,"
+            "(source_identity,source_server_id,binlog_file,event_start_position,event_end_position," 
             "schema_name,raw_sql,canonical_ast,pre_state,expected_post_state,status) VALUES ("
             f"{sql_literal(row['source_identity'])},{row['source_server_id']},"
             f"{sql_literal(row['binlog_file'])},{row['event_start_position']},{row['event_end_position']},"
@@ -1207,6 +1209,83 @@ class Harness:
         self.assert_recovery_state(final_stop, expected_status="checkpointed", expected_index=True, expected_rows="0")
         print(f"{scenario}_converged journal=checkpointed checkpoint={final_stop.file}:{final_stop.position}")
 
+    def run_row_conflict_rollback(self) -> None:
+        assert self.source and self.target
+        self.setup_accounts_table()
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email (email);")
+        self.admin_sql(self.target, "INSERT INTO accounts VALUES (99, 'duplicate@example.test', 'owner');")
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "START TRANSACTION; "
+            "INSERT INTO accounts VALUES (1, 'first@example.test', 'first'); "
+            "INSERT INTO accounts VALUES (2, 'duplicate@example.test', 'second'); "
+            "COMMIT;",
+        )
+        stop = self.coordinate()
+        for attempt in (1, 2):
+            result = self.run_stream(start, stop)
+            output = f"{result.stdout}\n{result.stderr}".lower()
+            if result.returncode == 0 or "duplicate conflict persisted for repair" not in output:
+                raise HarnessError(f"duplicate rollback attempt {attempt} did not fail durably: {output}")
+            rows = self.admin_query(self.target, "SELECT id,email,payload FROM accounts ORDER BY id;").strip()
+            if rows != "99\tduplicate@example.test\towner":
+                raise HarnessError(f"duplicate rollback mutated sibling/owner rows: {rows!r}")
+            checkpoint = self.checkpoint()
+            if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
+                raise HarnessError(f"duplicate rollback advanced checkpoint: {checkpoint}")
+            evidence = self.admin_query(
+                self.target,
+                "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
+                "WHERE table_name='accounts' ORDER BY conflict_identity;",
+            ).strip()
+            expected = f'["2"]\t1062\t{attempt}\tunresolved'
+            if evidence != expected:
+                raise HarnessError(f"duplicate evidence mismatch attempt={attempt}: {evidence!r}")
+
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, "DROP TABLE IF EXISTS constraint_rows;")
+        self.admin_sql(
+            self.source,
+            "CREATE TABLE constraint_rows (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL) ENGINE=InnoDB;",
+        )
+        self.admin_sql(
+            self.target,
+            "CREATE TABLE constraint_rows (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL, "
+            "CONSTRAINT chk_constraint_rows_payload CHECK (payload <> 'blocked')) ENGINE=InnoDB;",
+        )
+        constraint_start = self.coordinate()
+        self.write_checkpoint(constraint_start)
+        self.admin_sql(
+            self.source,
+            "START TRANSACTION; "
+            "INSERT INTO constraint_rows VALUES (10, 'first'); "
+            "INSERT INTO constraint_rows VALUES (11, 'blocked'); "
+            "COMMIT;",
+        )
+        constraint_stop = self.coordinate()
+        for attempt in (1, 2):
+            result = self.run_stream(constraint_start, constraint_stop)
+            output = f"{result.stdout}\n{result.stderr}".lower()
+            if result.returncode == 0 or "constraint failure" not in output and "conflict persisted for repair" not in output:
+                raise HarnessError(f"constraint rollback attempt {attempt} did not fail durably: {output}")
+            rows = self.admin_query(self.target, "SELECT COUNT(*) FROM constraint_rows;").strip()
+            if rows != "0":
+                raise HarnessError(f"constraint rollback retained sibling rows: {rows}")
+            checkpoint = self.checkpoint()
+            if checkpoint.get("source_file") != constraint_start.file or int(checkpoint.get("source_position", 0)) != constraint_start.position:
+                raise HarnessError(f"constraint rollback advanced checkpoint: {checkpoint}")
+            evidence = self.admin_query(
+                self.target,
+                "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
+                "WHERE table_name='constraint_rows' ORDER BY conflict_identity;",
+            ).strip().split("\t")
+            if len(evidence) != 4 or evidence[0] != '["11"]' or evidence[1] not in {"3819", "4025"} or evidence[2:] != [str(attempt), "unresolved"]:
+                raise HarnessError(f"constraint evidence mismatch attempt={attempt}: {evidence!r}")
+        print("row-conflict-rollback_ok duplicate_attempts=2 constraint_attempts=2 checkpoint_unchanged=true")
+
     def assert_foreign_keys_enabled(self) -> None:
         assert self.source and self.target
         for endpoint, label in ((self.source, "source"), (self.target, "target")):
@@ -1411,10 +1490,10 @@ class Harness:
             self.admin_sql(
                 self.target,
                 "INSERT INTO cdc.row_conflicts "
-                "(conflict_identity,source_identity,source_server_id,source_file,source_start_position,source_end_position,"
-                "schema_name,table_name,operation,source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json,"
-                "error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status) VALUES ("
-                f"{sql_literal(identity)},{sql_literal(SOURCE_IDENTITY)},101,{sql_literal(coordinate.file)},{coordinate.position},{coordinate.position + 1},"
+                "(conflict_identity,source_identity,source_server_id,source_file,source_start_position,source_end_position," 
+                "schema_name,table_name,operation,source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json," 
+                "error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status) VALUES (" 
+                f"{sql_literal(identity)},{sql_literal(SOURCE_IDENTITY)},101,{sql_literal(coordinate.file)},{coordinate.position},{coordinate.position + 1}," 
                 f"'globalcomix',{sql_literal(table)},'update','[\\\"1\\\"]','uq_{table}_email','[\\\"2\\\"]',1062,"
                 f"'Duplicate entry duplicate@example.test for key uq_{table}_email',1,1,1,'unresolved');",
             )
@@ -1590,6 +1669,8 @@ class Harness:
             self.run_recovery_scenario(scenario)
         elif scenario in {"source-connection-loss", "target-connection-loss"}:
             self.run_connection_loss_scenario(scenario)
+        elif scenario == "row-conflict-rollback":
+            self.run_row_conflict_rollback()
         elif scenario == "pre-state-drift":
             self.run_journal_mismatch_scenario("pre-state-drift")
         elif scenario == "coordinate-reuse":
