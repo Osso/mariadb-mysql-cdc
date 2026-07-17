@@ -197,11 +197,6 @@ fn drift_check_source_is_plaintext_and_target_keeps_tls_ca() {
         source_query_config(&MySqlConnectionConfig::default()).tls_ca_file,
         None
     );
-    let custom_source = MySqlConnectionConfig {
-        tls_ca_file: Some("/tmp/custom-source-ca.pem".to_string()),
-        ..MySqlConnectionConfig::default()
-    };
-    assert_eq!(source_query_config(&custom_source).tls_ca_file, None);
     let default_target = TargetMySqlConfig {
         tls_ca_file: "/tmp/custom-target-ca.pem".to_string(),
         ..TargetMySqlConfig::default()

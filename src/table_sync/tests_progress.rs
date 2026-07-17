@@ -69,7 +69,6 @@ fn run_scope_changes_with_endpoints_and_write_policy() {
             user: "reader".to_string(),
             password: "secret".to_string(),
             database: "app".to_string(),
-            tls_ca_file: None,
         },
         target: crate::live::TargetMySqlConfig {
             host: "target-a".to_string(),

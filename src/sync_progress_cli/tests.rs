@@ -444,7 +444,6 @@ fn source_progress_opts_use_plaintext_without_ca() {
         user: "reader".to_string(),
         password: "secret".to_string(),
         database: "globalcomix".to_string(),
-        tls_ca_file: None,
         ..Default::default()
     };
 

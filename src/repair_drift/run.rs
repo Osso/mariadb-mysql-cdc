@@ -517,7 +517,6 @@ mod tests {
             user: "reader".to_string(),
             password: "secret".to_string(),
             database: "globalcomix".to_string(),
-            tls_ca_file: None,
         };
 
         let error = build_endpoint_inventory(&source, InventoryEndpointRole::Source)

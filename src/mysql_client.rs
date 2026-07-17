@@ -59,7 +59,7 @@ impl PersistentMySqlSource {
             &config.user,
             &config.password,
             &config.database,
-            config.tls_ca_file.as_deref(),
+            None,
             &format!("source `{}`:{}", config.host, config.port),
         )
         .map_err(SnapshotError::InvalidTable)?;

@@ -36,7 +36,6 @@ pub struct MySqlConnectionConfig {
     pub user: String,
     pub password: String,
     pub database: String,
-    pub tls_ca_file: Option<String>,
 }
 
 impl Default for MySqlConnectionConfig {
@@ -47,7 +46,6 @@ impl Default for MySqlConnectionConfig {
             user: String::new(),
             password: String::new(),
             database: String::new(),
-            tls_ca_file: None,
         }
     }
 }

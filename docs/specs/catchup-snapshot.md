@@ -10,9 +10,8 @@ in [catchup.md](../catchup.md).
 
 - [x] Treat the live GlobalComix source MariaDB (`source-mariadb.example` /
       `192.0.2.10`) as plaintext-only by accepted operational policy.
-- [x] Do not require a source TLS CA file for the current source; source TLS
-      support may remain for disposable or future TLS-enabled sources only when
-      explicitly configured.
+- [x] Do not require or pass a source TLS CA file for the current source; source
+      transport is explicitly plaintext-only.
 - [x] Use explicit source plaintext mode only for the current source; do not add
       opportunistic TLS-to-plaintext fallback behavior.
 - [x] Require the target TLS CA file, validate its certificate chain, and use it

@@ -2,7 +2,7 @@ use super::tests_support::*;
 use super::*;
 
 #[test]
-fn target_connection_config_uses_target_ca_for_reader_tls() {
+fn target_connection_config_preserves_target_endpoint() {
     let config = SyncTableConfig {
         source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
         target: crate::live::TargetMySqlConfig {
@@ -28,10 +28,9 @@ fn target_connection_config_uses_target_ca_for_reader_tls() {
 
     let target = target_connection_config(&config);
 
-    assert_eq!(
-        target.tls_ca_file.as_deref(),
-        Some("/tmp/custom-target-ca.pem")
-    );
+    assert_eq!(target.host, "target");
+    assert_eq!(target.port, 25060);
+    assert_eq!(target.database, "globalcomix");
 }
 
 #[test]
@@ -249,10 +248,7 @@ fn core_config_accepts_plaintext_source_without_tls_ca() {
 
 #[test]
 fn core_config_rejects_updated_since_with_primary_key_bounds() {
-    let source = crate::mysql_snapshot::MySqlConnectionConfig {
-        tls_ca_file: None,
-        ..Default::default()
-    };
+    let source = crate::mysql_snapshot::MySqlConnectionConfig::default();
     let config = SyncTableConfig {
         source,
         target: crate::live::TargetMySqlConfig::default(),

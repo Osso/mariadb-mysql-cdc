@@ -153,9 +153,8 @@ cargo run -- catchup-snapshot \
 
 The live GlobalComix source MariaDB (`source-mariadb.example` /
 `192.0.2.10`) is plaintext-only. Production CDC source connections must not
-require or attempt a source CA for that endpoint until the source database
-transport is explicitly changed. Source TLS support may exist for disposable or
-future TLS-enabled sources, but it is inactive for the current source.
+require or attempt a source CA for that endpoint. Source transport is explicitly
+plaintext-only for the current source.
 
 All target-using commands accept `--target-tls-ca-file PATH`; it defaults to
 `/etc/mariadb-mysql-cdc/do-ca.pem`. Target DigitalOcean MySQL connections must

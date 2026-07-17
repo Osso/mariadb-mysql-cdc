@@ -64,7 +64,6 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
     assert_eq!(config.source.port, 3307);
     assert_eq!(config.source.password, "source-secret");
     assert_eq!(config.source.database.as_deref(), Some("app"));
-    assert!(config.source.tls_ca_file.is_empty());
     assert_eq!(config.source_identity, "production-source");
     assert_eq!(config.source.binlog_file, "mysqld-bin.000777");
     assert_eq!(config.source.start_position, 12345);

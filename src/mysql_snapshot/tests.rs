@@ -118,8 +118,7 @@ fn catchup_table_mode_uses_parallel_only_when_requested() {
 
 #[test]
 fn catchup_snapshot_accepts_plaintext_source_without_tls_ca() {
-    let mut config = valid_catchup_config();
-    config.source.tls_ca_file = None;
+    let config = valid_catchup_config();
 
     validate_config(&config).expect("plaintext source without CA should be accepted");
 }
@@ -129,7 +128,6 @@ fn catchup_source_inventory_uses_plaintext_without_tls_ca() {
     let mut config = valid_catchup_config();
     config.source.host = "127.0.0.1".to_string();
     config.source.port = 1;
-    config.source.tls_ca_file = None;
 
     let error = read_snapshot_tables(&config).expect_err("source inventory connection should fail");
     let message = error.to_string();
@@ -143,7 +141,6 @@ fn persistent_snapshot_source_uses_plaintext_without_tls_ca() {
     let mut source = valid_catchup_config().source;
     source.host = "127.0.0.1".to_string();
     source.port = 1;
-    source.tls_ca_file = None;
 
     let error = match PersistentMySqlSource::new(&source) {
         Ok(_) => panic!("source connection should fail"),
@@ -249,9 +246,6 @@ fn valid_catchup_config() -> CatchupSnapshotConfig {
             user: "reader".to_string(),
             password: "secret".to_string(),
             database: "globalcomix".to_string(),
-            tls_ca_file: Some(
-                concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
-            ),
         },
         target: TargetMySqlConfig {
             host: "target".to_string(),

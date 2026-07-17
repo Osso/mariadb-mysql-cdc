@@ -354,10 +354,6 @@ mod tests {
 
         assert_eq!(config.source.host, "source-db");
         assert_eq!(config.source.password, "source-pass");
-        assert_eq!(
-            config.source.tls_ca_file.as_deref(),
-            Some("/tmp/source-ca.pem")
-        );
         assert_eq!(config.target.host, "target-db");
         assert_eq!(config.target.password, "target-pass");
         assert_eq!(config.table.name, "releases");
@@ -397,10 +393,6 @@ mod tests {
         assert_eq!(config.source.user, "source-user");
         assert_eq!(config.source.password, "source-pass");
         assert_eq!(config.source.database, "source_database");
-        assert_eq!(
-            config.source.tls_ca_file.as_deref(),
-            Some("/tmp/source-ca.pem")
-        );
         assert_eq!(config.target.host, "target-db");
         assert_eq!(config.target.port, 3311);
         assert_eq!(config.target.user, "target-user");

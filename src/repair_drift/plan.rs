@@ -345,7 +345,6 @@ fn target_as_connection_config(config: &RepairDriftConfig) -> MySqlConnectionCon
         user: config.target.user.clone(),
         password: config.target.password.clone(),
         database: config.target.database.clone(),
-        tls_ca_file: Some(config.target.tls_ca_file.clone()),
     }
 }
 
