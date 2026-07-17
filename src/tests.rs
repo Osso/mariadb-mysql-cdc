@@ -480,7 +480,7 @@ fn rejects_unknown_catchup_snapshot_option() {
 }
 
 #[test]
-fn parses_catchup_source_tls_ca_file() {
+fn rejects_catchup_source_tls_ca_file_option() {
     let mut config = mysql_snapshot::CatchupSnapshotConfig {
         source: mysql_snapshot::MySqlConnectionConfig::default(),
         target: live::TargetMySqlConfig::default(),
@@ -492,17 +492,32 @@ fn parses_catchup_source_tls_ca_file() {
         table: None,
     };
 
-    catchup_snapshot_option(
+    let error = catchup_snapshot_option(
         &mut config,
         "--source-tls-ca-file",
         "/etc/mariadb-mysql-cdc/source-ca.pem",
     )
-    .expect("source TLS CA option");
+    .expect_err("source TLS CA option");
 
     assert_eq!(
-        config.source.tls_ca_file.as_deref(),
-        Some("/etc/mariadb-mysql-cdc/source-ca.pem")
+        error,
+        "unknown catchup-snapshot option: --source-tls-ca-file"
     );
+}
+
+#[test]
+fn catchup_target_dns_keeps_hostname_verification() {
+    let target = live::TargetMySqlConfig {
+        host: "target-db.example".to_string(),
+        tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
+        ..live::TargetMySqlConfig::default()
+    };
+
+    let opts = crate::mysql_support::target_mysql_opts(&target).expect("target TLS options");
+    let ssl = opts.get_ssl_opts().expect("target TLS configured");
+
+    assert!(!ssl.skip_domain_validation());
+    assert!(!ssl.accept_invalid_certs());
 }
 
 #[test]
