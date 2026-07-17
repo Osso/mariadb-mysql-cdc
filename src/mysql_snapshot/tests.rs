@@ -115,6 +115,16 @@ fn catchup_table_mode_uses_parallel_only_when_requested() {
 }
 
 #[test]
+fn rejects_missing_source_tls_ca_file() {
+    let mut config = valid_catchup_config();
+    config.source.tls_ca_file = None;
+
+    let error = validate_config(&config).expect_err("missing source TLS CA");
+
+    assert_eq!(error.to_string(), "source TLS CA file is required");
+}
+
+#[test]
 fn rejects_zero_parallel_workers() {
     let mut config = valid_catchup_config();
     config.parallel_workers = 0;
@@ -187,7 +197,9 @@ fn valid_catchup_config() -> CatchupSnapshotConfig {
             user: "reader".to_string(),
             password: "secret".to_string(),
             database: "globalcomix".to_string(),
-            tls_ca_file: None,
+            tls_ca_file: Some(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
+            ),
         },
         target: TargetMySqlConfig {
             host: "target".to_string(),

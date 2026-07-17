@@ -479,6 +479,32 @@ fn rejects_unknown_catchup_snapshot_option() {
 }
 
 #[test]
+fn parses_catchup_source_tls_ca_file() {
+    let mut config = mysql_snapshot::CatchupSnapshotConfig {
+        source: mysql_snapshot::MySqlConnectionConfig::default(),
+        target: live::TargetMySqlConfig::default(),
+        progress_file: PathBuf::new(),
+        progress_table: "cdc.table_sync_progress".to_string(),
+        chunk_size: 10_000,
+        throttle: Duration::ZERO,
+        parallel_workers: 1,
+        table: None,
+    };
+
+    catchup_snapshot_option(
+        &mut config,
+        "--source-tls-ca-file",
+        "/etc/mariadb-mysql-cdc/source-ca.pem",
+    )
+    .expect("source TLS CA option");
+
+    assert_eq!(
+        config.source.tls_ca_file.as_deref(),
+        Some("/etc/mariadb-mysql-cdc/source-ca.pem")
+    );
+}
+
+#[test]
 fn parses_catchup_progress_file() {
     let progress_file = parse_progress_file(args([
         "--progress-file",

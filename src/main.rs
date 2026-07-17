@@ -31,7 +31,7 @@ mariadb-mysql-cdc
 Usage:
   mariadb-mysql-cdc plan
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
-  mariadb-mysql-cdc catchup-snapshot --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --progress-file PATH [options]
+  mariadb-mysql-cdc catchup-snapshot --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-tls-ca-file CA --target-host HOST --target-user USER --target-password-env ENV --target-database DB --progress-file PATH [options]
   mariadb-mysql-cdc catchup-progress --progress-file PATH
   mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS --run-id ID [options]
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -365,6 +365,7 @@ fn catchup_source_option(
         "--source-user" => source.user = value.to_string(),
         "--source-password-env" => source.password = read_env_password(value)?,
         "--source-database" => source.database = value.to_string(),
+        "--source-tls-ca-file" => source.tls_ca_file = Some(value.to_string()),
         _ => return Ok(false),
     }
 
