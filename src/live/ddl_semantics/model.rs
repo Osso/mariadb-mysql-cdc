@@ -59,9 +59,16 @@ pub struct ParsedAddColumnAst {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedDropColumnAst {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsedAlterClause {
     AddColumn(ParsedAddColumnAst),
     AddKey(ParsedIndexAst),
+    DropColumn(ParsedDropColumnAst),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

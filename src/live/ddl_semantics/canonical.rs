@@ -242,6 +242,11 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                 "kind": "add_key",
                 "index": canonical_index_ast_value(index),
             }),
+            ParsedAlterClause::DropColumn(column) => json!({
+                "kind": "drop_column",
+                "name": column.name,
+                "if_exists": column.if_exists,
+            }),
         }).collect::<Vec<_>>(),
     })
 }
@@ -269,6 +274,7 @@ fn apply_alter_clause(
     match clause {
         ParsedAlterClause::AddColumn(column) => apply_add_column(expected, &ast.table, column),
         ParsedAlterClause::AddKey(index) => apply_add_key(expected, index),
+        ParsedAlterClause::DropColumn(column) => apply_drop_column(expected, &ast.table, column),
     }
 }
 
@@ -314,6 +320,59 @@ fn apply_add_column(
             generated: None,
         },
     );
+    for (index, item) in table.columns.iter_mut().enumerate() {
+        item.ordinal_position = (index + 1) as u32;
+    }
+    Ok(())
+}
+
+fn apply_drop_column(
+    expected: &mut SemanticSchemaSnapshot,
+    table_name: &str,
+    column: &super::model::ParsedDropColumnAst,
+) -> Result<(), String> {
+    if expected.inventory.indexes.iter().any(|index| {
+        index.table == table_name && index.columns.iter().any(|part| part.name == column.name)
+    }) {
+        return Err(format!(
+            "DROP COLUMN target `{table_name}`.`{}` has an index dependency",
+            column.name
+        ));
+    }
+    if expected.inventory.foreign_keys.iter().any(|foreign_key| {
+        foreign_key.table == table_name && foreign_key.columns.contains(&column.name)
+    }) {
+        return Err(format!(
+            "DROP COLUMN target `{table_name}`.`{}` has a foreign-key dependency",
+            column.name
+        ));
+    }
+    let table = expected
+        .inventory
+        .tables
+        .iter_mut()
+        .find(|table| table.name == table_name)
+        .ok_or_else(|| format!("ALTER TABLE target `{table_name}` is missing"))?;
+    if table.primary_key.contains(&column.name) {
+        return Err(format!(
+            "DROP COLUMN target `{table_name}`.`{}` is part of the primary key",
+            column.name
+        ));
+    }
+    let Some(position) = table
+        .columns
+        .iter()
+        .position(|item| item.name == column.name)
+    else {
+        if column.if_exists {
+            return Ok(());
+        }
+        return Err(format!(
+            "DROP COLUMN target `{table_name}` lacks `{}`",
+            column.name
+        ));
+    };
+    table.columns.remove(position);
     for (index, item) in table.columns.iter_mut().enumerate() {
         item.ordinal_position = (index + 1) as u32;
     }

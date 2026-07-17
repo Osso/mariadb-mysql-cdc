@@ -1,5 +1,7 @@
 use super::*;
-use crate::live::ddl_semantics::{DdlTransformation, supports_rename_columns_if_exists};
+use crate::live::ddl_semantics::{
+    DdlTransformation, supports_drop_columns_if_exists, supports_rename_columns_if_exists,
+};
 use crate::target::SqlStatement;
 
 pub(super) fn handle_ddl_event<E, R, C, J, S>(
@@ -390,6 +392,7 @@ pub(super) fn automatically_handled_ddl_event<'a>(
     };
     let operation = parse_ddl_operation(&query.sql_statement).ok();
     let supports_transformation = supports_production_alter_table(&query.sql_statement)
+        || supports_drop_columns_if_exists(&query.sql_statement)
         || supports_rename_columns_if_exists(&query.sql_statement);
     let supports_automatic_operation = operation.as_ref().is_some_and(|operation| {
         if operation.family == DdlFamily::Index {

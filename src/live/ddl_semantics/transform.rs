@@ -1,5 +1,6 @@
 use super::model::{
-    ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedIndexAst, ParsedIndexKeyPart,
+    ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedDropColumnAst,
+    ParsedIndexAst, ParsedIndexKeyPart,
 };
 use super::tokenizer::{ddl_contains_comments, tokenize_ddl};
 use std::collections::BTreeSet;
@@ -19,7 +20,14 @@ struct RenameColumnClause {
 }
 
 pub fn supports_production_alter_table(source_sql: &str) -> bool {
-    parse_production_alter_table_ast(source_sql).is_ok()
+    parse_production_alter_table_ast(source_sql).is_ok_and(|ast| {
+        ast.clauses.iter().all(|clause| {
+            matches!(
+                clause,
+                ParsedAlterClause::AddColumn(_) | ParsedAlterClause::AddKey(_)
+            )
+        })
+    })
 }
 
 pub fn transform_production_alter_table(source_sql: &str) -> Result<DdlTransformation, String> {
@@ -44,6 +52,9 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
     match clause {
         ParsedAlterClause::AddColumn(column) => render_add_column(column),
         ParsedAlterClause::AddKey(index) => render_add_key(index),
+        ParsedAlterClause::DropColumn(column) => {
+            format!("DROP COLUMN {}", quote_identifier(&column.name))
+        }
     }
 }
 
@@ -84,28 +95,41 @@ fn quote_string_literal(value: &str) -> String {
 }
 
 pub fn supports_drop_columns_if_exists(source_sql: &str) -> bool {
-    tokenize_ddl(source_sql)
-        .ok()
-        .and_then(|tokens| parse_drop_columns_if_exists(&tokens).ok())
-        .is_some()
+    parse_production_alter_table_ast(source_sql).is_ok_and(|ast| {
+        ast.clauses
+            .iter()
+            .all(|clause| matches!(clause, ParsedAlterClause::DropColumn(_)))
+    })
 }
 
 pub fn transform_drop_columns_if_exists(
     source_sql: &str,
     target_columns: &BTreeSet<String>,
 ) -> Result<DdlTransformation, String> {
-    let tokens = tokenize_ddl(source_sql)?;
-    let (table, columns) = parse_drop_columns_if_exists(&tokens)?;
-    let executable_columns = columns
-        .into_iter()
-        .filter(|column| target_columns.contains(column))
+    let ast = parse_production_alter_table_ast(source_sql)?;
+    if !ast
+        .clauses
+        .iter()
+        .all(|clause| matches!(clause, ParsedAlterClause::DropColumn(_)))
+    {
+        return Err("ALTER TABLE mixes DROP COLUMN IF EXISTS with unsupported clauses".to_string());
+    }
+    let executable_columns = ast
+        .clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            ParsedAlterClause::DropColumn(column) if target_columns.contains(&column.name) => {
+                Some(column.name.clone())
+            }
+            _ => None,
+        })
         .collect::<Vec<_>>();
     let target_sql = if executable_columns.is_empty() {
         None
     } else {
         Some(format!(
             "ALTER TABLE {} {}",
-            quote_identifier(&table),
+            quote_identifier(&ast.table),
             executable_columns
                 .iter()
                 .map(|column| format!("DROP COLUMN {}", quote_identifier(column)))
@@ -152,9 +176,19 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
     let mut clauses = Vec::new();
     let mut index = 3;
     while index < tokens.len() {
-        require_keyword(&tokens, index, "ADD")?;
-        let (clause, next_index) =
-            parse_production_alter_clause(&tokens, index, &table, &mut literals)?;
+        let (clause, next_index) = match tokens
+            .get(index)
+            .map(|token| token.to_ascii_uppercase())
+            .as_deref()
+        {
+            Some("ADD") => parse_production_add_clause(&tokens, index, &table, &mut literals)?,
+            Some("DROP") => parse_drop_column_clause(&tokens, index)?,
+            actual => {
+                return Err(format!(
+                    "unsupported production ALTER TABLE clause {actual:?}"
+                ));
+            }
+        };
         clauses.push(clause);
         index = next_index;
         if index == tokens.len() {
@@ -169,7 +203,7 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
     Ok(ParsedAlterTableAst { table, clauses })
 }
 
-fn parse_production_alter_clause(
+fn parse_production_add_clause(
     tokens: &[String],
     index: usize,
     table: &str,
@@ -382,29 +416,22 @@ fn extract_single_quoted_literals(source_sql: &str) -> Result<Vec<String>, Strin
     Ok(literals)
 }
 
-fn parse_drop_columns_if_exists(tokens: &[String]) -> Result<(String, Vec<String>), String> {
-    require_keyword(tokens, 0, "ALTER")?;
-    require_keyword(tokens, 1, "TABLE")?;
-    let table = require_identifier(tokens, 2, "ALTER TABLE name")?;
-    let mut columns = Vec::new();
-    let mut index = 3;
-    while index < tokens.len() {
-        require_keyword(tokens, index, "DROP")?;
-        require_keyword(tokens, index + 1, "COLUMN")?;
-        require_keyword(tokens, index + 2, "IF")?;
-        require_keyword(tokens, index + 3, "EXISTS")?;
-        columns.push(require_identifier(tokens, index + 4, "dropped column")?);
-        index += 5;
-        if index == tokens.len() {
-            break;
-        }
-        require_keyword(tokens, index, ",")?;
-        index += 1;
-    }
-    if columns.is_empty() {
-        return Err("ALTER TABLE has no DROP COLUMN IF EXISTS clauses".to_string());
-    }
-    Ok((table, columns))
+fn parse_drop_column_clause(
+    tokens: &[String],
+    index: usize,
+) -> Result<(ParsedAlterClause, usize), String> {
+    require_keyword(tokens, index, "DROP")?;
+    require_keyword(tokens, index + 1, "COLUMN")?;
+    require_keyword(tokens, index + 2, "IF")?;
+    require_keyword(tokens, index + 3, "EXISTS")?;
+    let name = require_identifier(tokens, index + 4, "dropped column")?;
+    Ok((
+        ParsedAlterClause::DropColumn(ParsedDropColumnAst {
+            name,
+            if_exists: true,
+        }),
+        index + 5,
+    ))
 }
 
 fn parse_rename_columns_if_exists(

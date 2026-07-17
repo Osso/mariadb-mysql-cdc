@@ -808,9 +808,10 @@ class Harness:
             ) ENGINE=InnoDB;
             CREATE TABLE accounts (
                 id BIGINT NOT NULL PRIMARY KEY,
-                email VARCHAR(255) NOT NULL
+                email VARCHAR(255) NOT NULL,
+                handle VARCHAR(64) DEFAULT NULL
             ) ENGINE=InnoDB;
-            INSERT INTO accounts VALUES (1, 'existing@example.test');
+            INSERT INTO accounts VALUES (1, 'existing@example.test', 'existing');
         """
         self.admin_sql(self.source, schema)
         self.admin_sql(self.target, schema)
@@ -826,6 +827,7 @@ class Harness:
               ADD COLUMN variant_id SMALLINT UNSIGNED DEFAULT NULL AFTER reading_direction,
               ADD KEY idx_hfb_variant_status_published (variant_id, status, published_time);
             ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email (email);
+            ALTER TABLE accounts DROP COLUMN IF EXISTS handle;
             """,
         )
         stop = self.coordinate()
@@ -877,7 +879,7 @@ class Harness:
         expected_unique_metadata = "uq_accounts_email\t0\t1\temail\tNULL\tBTREE"
         if unique_metadata != [expected_unique_metadata, expected_unique_metadata]:
             raise HarnessError(f"production ADD UNIQUE KEY metadata parity failed: {unique_metadata}")
-        duplicate_sql = "INSERT INTO accounts VALUES (2, 'existing@example.test');"
+        duplicate_sql = "INSERT INTO accounts (id,email) VALUES (2, 'existing@example.test');"
         for endpoint in (self.source, self.target):
             self.assert_admin_sql_rejected(endpoint, duplicate_sql, "Duplicate entry")
             rows = self.admin_query(endpoint, "SELECT id,email FROM accounts ORDER BY id;").strip()
@@ -895,7 +897,7 @@ class Harness:
             password=TARGET_PASSWORD,
         ).splitlines()
         expected_journal_row = "checkpointed\tmariadb-mysql8-v1\t1\t1\t1"
-        if journal != [expected_journal_row, expected_journal_row, expected_journal_row]:
+        if journal != [expected_journal_row] * 4:
             raise HarnessError(f"production ALTER TABLE journal mismatch: {journal}")
         unique_evidence_row = self.query(
             self.target,
@@ -982,10 +984,55 @@ class Harness:
             raise HarnessError(
                 f"production ADD UNIQUE KEY post-state mismatch: pre={pre_state!r} post={post_state!r}"
             )
+        dropped_columns = []
+        for endpoint in (self.source, self.target):
+            dropped_columns.append(
+                self.admin_query(
+                    endpoint,
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema='globalcomix' AND table_name='accounts' "
+                    "AND column_name='handle';",
+                ).strip()
+            )
+        if dropped_columns != ["0", "0"]:
+            raise HarnessError(f"DROP COLUMN IF EXISTS parity failed: {dropped_columns}")
+        drop_evidence = self.query(
+            self.target,
+            "SELECT status,transformation_version,generated_sql "
+            "FROM cdc.ddl_replay_journal WHERE raw_sql LIKE '%DROP COLUMN IF EXISTS handle%';",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if drop_evidence != (
+            "checkpointed\tmariadb-mysql8-v1\t"
+            "ALTER TABLE `accounts` DROP COLUMN `handle`"
+        ):
+            raise HarnessError(f"DROP COLUMN IF EXISTS evidence mismatch: {drop_evidence!r}")
         checkpoint = self.checkpoint()
         if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
             raise HarnessError(f"production ALTER TABLE checkpoint mismatch: {checkpoint}")
         supported_checkpoint = checkpoint
+
+        self.admin_sql(self.source, "ALTER TABLE accounts DROP COLUMN IF EXISTS handle;")
+        no_op_stop = self.coordinate()
+        no_op_result = self.run_stream(stop, no_op_stop)
+        require_success(no_op_result, "DROP COLUMN IF EXISTS proven no-op replay")
+        no_op_evidence = self.query(
+            self.target,
+            "SELECT status,transformation_version,generated_sql "
+            "FROM cdc.ddl_replay_journal WHERE raw_sql LIKE '%DROP COLUMN IF EXISTS handle%' "
+            "ORDER BY event_start_position DESC LIMIT 1;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if no_op_evidence != "checkpointed\tmariadb-mysql8-v1\tNULL":
+            raise HarnessError(f"DROP COLUMN IF EXISTS no-op evidence mismatch: {no_op_evidence!r}")
+        no_op_checkpoint = self.checkpoint()
+        if no_op_checkpoint.get("source_file") != no_op_stop.file or int(
+            no_op_checkpoint.get("source_position", 0)
+        ) != no_op_stop.position:
+            raise HarnessError(f"DROP COLUMN IF EXISTS no-op checkpoint mismatch: {no_op_checkpoint}")
+        supported_checkpoint = no_op_checkpoint
 
         self.admin_sql(
             self.target,
@@ -997,7 +1044,7 @@ class Harness:
             "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email_prefix (email(8));",
         )
         pending_stop = self.coordinate()
-        pending_result = self.run_stream(stop, pending_stop)
+        pending_result = self.run_stream(no_op_stop, pending_stop)
         require_translation_pending_termination(pending_result)
         pending_index = self.admin_query(
             self.target,
@@ -1035,8 +1082,9 @@ class Harness:
                 f"before={supported_checkpoint} after={pending_checkpoint}"
             )
         print(
-            f"production_alter_table_ok coordinate={stop.file}:{stop.position} "
-            "journal_rows=3 unique_parity=true pending_unique_option=true"
+            f"production_alter_table_ok coordinate={no_op_stop.file}:{no_op_stop.position} "
+            "journal_rows=5 unique_parity=true drop_column=true drop_noop=true "
+            "pending_unique_option=true"
         )
 
     def ddl_journal_rows(self) -> list[list[str]]:
