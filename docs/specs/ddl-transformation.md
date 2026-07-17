@@ -35,21 +35,28 @@ allowlist.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
 
 This is one translator slice, not the full MariaDB-to-MySQL 8 transformation
-pipeline. Unsupported DDL still follows the existing manual-resolution boundary;
-manual-ledger removal and deployment remain future work.
+pipeline. Unsupported DDL now enters the same durable journal as
+`translation_pending` with sentinel/no evidence and blocks checkpoint/overtake.
+When translator code becomes available, the same row promotes once to `prepared`,
+fills immutable evidence, executes generated SQL, and checkpoints automatically.
+Evidence-capture failure uses the same barrier. The event handler has no
+supported manual-ledger workflow, but config/bootstrap/grant/harness cleanup is
+still open and this contract is not deployment-ready.
 
 ### Execution and recovery
 
-- [ ] Execute transformed DDL through the durable replay journal before advancing
+- [x] Execute transformed DDL through the durable replay journal before advancing
       the stream checkpoint.
-- [ ] Reconcile crashes after prepare, target implicit commit, journal update, and
-      checkpoint update without duplicate or skipped schema mutations.
-- [ ] Block checkpoint advancement when a required transformation is missing,
-      ambiguous, or cannot preserve semantics.
-- [ ] After the translator is extended, automatically replay the blocked source
-      event from its durable journal evidence without operator-authored target SQL
-      or a manual-resolution state transition.
-- [ ] Prevent later row or statement events from overtaking a blocked DDL event.
+- [x] Reconcile crashes after prepare, target implicit commit, journal update, and
+      checkpoint update without blind duplicate execution; ambiguous evidence
+      becomes a durable barrier.
+- [x] Block checkpoint advancement when a required transformation or evidence
+      capture is missing, ambiguous, or cannot preserve semantics.
+- [x] When translator code becomes available, automatically promote the same
+      `translation_pending` event to `prepared`, fill evidence, execute generated
+      SQL, and checkpoint without operator-authored SQL or status transition.
+- [x] Prevent later row or statement events from overtaking a
+      `translation_pending`, `prepared`, or `blocked` DDL event.
 - [ ] Keep runtime grants exact: application DML and required application DDL
       privileges only, exact CDC control-plane table privileges, and no global
       administration or grant delegation.
@@ -73,7 +80,6 @@ manual-ledger removal and deployment remain future work.
 - [Checkpoint ordering](../checkpoints.md)
 - [Schema inventory](../schema-inventory.md)
 - [System design](../design.md)
-- [One-time journal transformation-evidence upgrade](../ddl-replay-journal-transformation-evidence-migration.sql)
 
 ## Implementation inventory
 
@@ -88,8 +94,9 @@ manual-ledger removal and deployment remain future work.
   target SQL, and preserves checkpoint ordering.
 - `src/live/ddl_replay_journal.rs` — durable evidence, crash reconciliation, and
   checkpoint ordering.
-- `src/live/ddl_ledger.rs` — legacy manual-resolution path for unsupported DDL;
-  removal is not part of this slice.
+- `src/live/ddl_ledger.rs` — legacy ledger artifact retained behind test-only
+  compilation in this slice; config/parser and harness/test dependencies remain
+  open and it is not a supported DDL workflow.
 - `scripts/cdc-integration-harness.py` — real MariaDB/MySQL compatibility and
   crash matrix.
 
@@ -111,15 +118,12 @@ transformation contract, real MariaDB/MySQL compatibility, or deployment safety.
 
 - [ ] Extend the current translator beyond the production-observed rename slice
       into the canonical MariaDB DDL parser and MySQL 8 transformation pipeline.
-- [ ] Remove the manual-resolution runtime, schema, grants, documentation, and
-      operational workflow.
+- [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
+      retired manual DDL ledger without restoring manual replay.
 - [ ] Build the production-derived DDL corpus and real MariaDB/MySQL 8 parity
       matrix.
-- [ ] Define transformation-version compatibility for journal replay after code
-      upgrades; existing pre-provenance rows are labeled `legacy-raw-v0` by the
-      [one-time journal upgrade](../ddl-replay-journal-transformation-evidence-migration.sql).
-- [ ] Reconcile existing pending/resolved legacy ledger rows into the automatic
-      transformation journal without checkpoint loss.
+- [ ] Define transformation-version compatibility after the first production
+      deployment establishes a real schema upgrade boundary.
 
 ## Out of scope
 

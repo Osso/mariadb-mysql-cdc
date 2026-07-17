@@ -27,28 +27,29 @@ The rename slice uses target column pre-state, emits deterministic MySQL 8 SQL
 without `IF EXISTS`, treats absent old columns as a proven no-op, and fails closed
 when old and new columns coexist.
 
-Every other DDL form is manual: tables, other `ALTER TABLE`, views, routines,
-events, triggers, `RENAME`, `TRUNCATE`, `DROP` object families other than the
-admitted index form, qualified or cross-schema references, comments,
-backtick-qualified or ANSI_QUOTES double-quoted identifiers where mode is not
-captured, incomplete or ambiguous syntax, definer/security clauses, MariaDB-only
-syntax, and multi-object/multi-statement forms.
+Every other DDL form—tables, other `ALTER TABLE`, views, routines, events,
+triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP`, qualified or cross-schema
+references, comments, ambiguous quoting, incomplete syntax, definer/security
+clauses, MariaDB-only syntax, and multi-object/multi-statement forms—enters the
+same automatic journal as `translation_pending`. It stores the exact source
+identity/coordinates and raw SQL with sentinel `translator-unavailable`, NULL
+generated SQL, and empty transformation evidence. It flushes earlier DML and
+blocks checkpoint/overtake. The removed manual ledger is not part of runtime,
+configuration, bootstrap, grants, or the harness.
 
-Before an admitted DDL executes, the stream runs the transformation and captures
-immutable evidence from a fenced target pre-state and the translated parsed AST.
-The target-side journal records the transformation version and nullable generated
-SQL with `prepared`; proven no-ops store NULL, while non-no-ops store the exact
-transformed SQL executed. It validates the complete affected state, then records
-`applied` and atomically transitions the journal to `checkpointed` with the
-predecessor checkpoint update. `prepared` and `blocked` rows form a startup
-no-overtake barrier. A crash is never blind replay: only an exact,
-unique expected post-state can finalize; pre-state, both/neither, mixed, or
-unavailable proof blocks. Target binlog receipt is unavailable, so this is
-semantic proof only.
+When translator code becomes available, reprocessing the same event captures
+immutable pre-state/AST/expected-post-state evidence and promotes that same row
+exactly once to `prepared`. The stream executes generated MySQL SQL (or a proven
+no-op), validates the complete affected state, transitions `applied`, and
+atomically checkpoints. Translation failure and evidence-capture failure use the
+same barrier. `translation_pending`, `prepared`, and `blocked` rows stop later
+coordinates. A crash is never blind replay: only an exact, unique expected
+post-state can finalize; otherwise the row becomes `blocked`. Target binlog
+receipt is unavailable, so this is semantic proof only.
 
-Manual DDL flushes earlier DML, records exact source SQL and coordinates in the
-manual ledger, and stops before checkpoint advancement. The ledger and the
-automatic journal are separate control-plane objects.
+No operator-authored target SQL or manual status transition is a supported DDL
+resolution path. Fresh bootstrap is the pre-production schema contract; obsolete
+development migrations are not maintained as upgrade paths.
 
 The code contains a durable row-conflict ledger wired into the live stream and
 an FK-aware phased repair planner. Duplicate and supported constraint conflicts
@@ -79,10 +80,8 @@ health check.
 ## DDL resolution
 
 - [Authoritative DDL transformation spec](docs/specs/ddl-transformation.md)
-- [DDL Resolution Runbook](docs/ddl-resolution.md) for manual boundaries, ledger
-  inspection, exact-SQL matching, journal barriers, and restart procedure.
-- [One-time journal transformation-evidence upgrade](docs/ddl-replay-journal-transformation-evidence-migration.sql)
-  for existing journals, followed by the documented bootstrap rerun.
+- [DDL Resolution Runbook](docs/ddl-resolution.md) for journal barriers,
+  translation-pending promotion, evidence inspection, and restart procedure.
 
 ## Commands
 
@@ -129,6 +128,6 @@ or not reached before EOF fails without partial-transaction completion.
 The cross-engine inventory query reports `IS_VISIBLE='YES'` for index rows for
 MariaDB compatibility. That value is not proof that a MySQL target index is
 visible; inspect target-native visibility before admitting affected index DDL, or
-route it through the manual ledger.
+leave it in the journal's translation-pending barrier.
 
 See [Catchup Workflow](docs/catchup.md) for bounded repair rules.

@@ -29,8 +29,11 @@ coexistence fails closed.
 Other tables, `ALTER TABLE`, views, routines, events, triggers, `RENAME`,
 `TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
 qualified/cross-schema references, definer/security clauses, MariaDB-only syntax,
-and multi-object or multi-statement forms are manual boundaries. The stream flushes earlier DML,
-records exact SQL/coordinates in `cdc.ddl_events`, and stops before advancing.
+and multi-object or multi-statement forms are translation boundaries in the
+stream event path. The intended behavior flushes earlier DML, records exact
+SQL/coordinates in `cdc.ddl_replay_journal` as `translation_pending`, and stops
+before advancing. Config/bootstrap/grant/harness cleanup remains open, so this
+is not yet a complete operational contract.
 
 Qualifier handling is fail-closed. Tokenization removes comments from syntax
 but preserves identifier/dot/identifier detection across inline comments; index
@@ -45,9 +48,15 @@ transformation version and nullable generated SQL to `cdc.ddl_replay_journal` as
 `prepared` before execution. A proven no-op stores NULL generated SQL; otherwise
 that field is the exact transformed SQL executed. The stream validates the
 complete affected target state, transitions to `applied`, and atomically
-transitions to `checkpointed` with the exact predecessor checkpoint. `prepared`
-and `blocked` rows stop startup from overtaking the event. Only a unique exact
-expected post-state can reconcile a crash; otherwise the row blocks.
+transitions to `checkpointed` with the exact predecessor checkpoint.
+`translation_pending`, `prepared`, and `blocked` rows stop startup from
+overtaking the event. Translation and evidence-capture failures use the same
+`translation_pending` barrier. Only a unique exact expected post-state can
+reconcile a crash; otherwise the row blocks.
+
+No operator-authored target SQL or manual journal status transition is a
+supported DDL resolution path in the event handler. Legacy ledger/config/test
+symbols and bootstrap/grant/harness dependencies remain open cleanup items.
 
 ## Quarantine
 

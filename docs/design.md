@@ -22,11 +22,15 @@ unqualified, visible, non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX`
 with complete parsed options and no FK dependency, plus the production-observed
 unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form.
 The rename slice selects executable clauses from target pre-state and emits
-MySQL 8 SQL without `IF EXISTS`; all other DDL remains manual.
-The manual path uses `cdc.ddl_events`; automatic admitted DDL uses the separate
-`cdc.ddl_replay_journal` with immutable pre-state/AST evidence, a prepared/applied/
-checkpointed/blocked state machine, startup barrier, and atomic applied-to-
-checkpointed transition.
+MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
+`cdc.ddl_replay_journal` as `translation_pending` with sentinel/no evidence;
+translator availability promotes that same row once to `prepared`, after which
+generated SQL, postcondition evidence, and checkpointing proceed automatically.
+The journal state machine is
+`translation_pending -> prepared -> applied -> checkpointed` plus
+`prepared -> blocked`; startup barriers prevent overtake. The event-handler behavior is implemented in
+this slice, but config/bootstrap/grant/harness cleanup and safe migration rollout
+remain open; do not treat manual-ledger removal as deployment-complete.
 
 Unsupported data-changing statements stop or quarantine with exact coordinates.
 The old text-binlog probe path is not a production health check.
@@ -68,6 +72,8 @@ recurring scheduling, deployment, and cutover gates remain unchecked.
   single-writer `GET_LOCK` state once before source replication; do not repeat
   this static policy per event.
 - Use stable primary-key windows for count/content checks.
-- Treat unresolved conflicts, quarantine, manual ledger rows, journal barriers,
-  schema drift, and CA/grant gaps as blockers.
+- Treat unresolved conflicts, quarantine, journal barriers, schema drift, and
+  CA/grant gaps as blockers. `translation_pending` is cleared only by translator
+  code and automatic promotion in the event path; config/bootstrap/grant/harness
+  dependencies and migration safety remain open.
 - Keep the target out of service through repeated validation and cutover review.
