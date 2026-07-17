@@ -615,6 +615,8 @@ class Harness:
             "id,email,payload",
             "--run-id",
             "sync-table-source-ca-proof",
+            "--progress-table",
+            "globalcomix.sync_table_tls_progress",
         ]
 
     def _repair_binary(self) -> Path:
