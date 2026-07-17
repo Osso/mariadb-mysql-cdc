@@ -572,6 +572,51 @@ class Harness:
             "accounts",
         ]
 
+    def _sync_table_args(
+        self,
+        binary: Path,
+        *,
+        source_ca_file: Path | None = None,
+    ) -> list[str]:
+        assert self.source and self.target
+        source_ca_file = source_ca_file or self.ca_file
+        return [
+            str(binary),
+            "sync-table",
+            "--source-host",
+            "127.0.0.1",
+            "--source-port",
+            str(self.source.port),
+            "--source-user",
+            SOURCE_USER,
+            "--source-password-env",
+            "CDC_SOURCE_PASSWORD",
+            "--source-database",
+            APP_SCHEMA,
+            "--source-tls-ca-file",
+            str(source_ca_file),
+            "--target-host",
+            "127.0.0.1",
+            "--target-port",
+            str(self.target.port),
+            "--target-user",
+            TARGET_USER,
+            "--target-password-env",
+            "CDC_TARGET_PASSWORD",
+            "--target-database",
+            APP_SCHEMA,
+            "--target-tls-ca-file",
+            str(self.ca_file),
+            "--table",
+            "accounts",
+            "--primary-key",
+            "id",
+            "--columns",
+            "id,email,payload",
+            "--run-id",
+            "sync-table-source-ca-proof",
+        ]
+
     def _repair_binary(self) -> Path:
         binary = self.binary or self.repo / "target/debug/mariadb-mysql-cdc"
         if not binary.is_file():
@@ -837,6 +882,28 @@ class Harness:
             )
         self._assert_catchup_target_unchanged()
 
+    def _assert_sync_table_source_ca_rejected(
+        self,
+        binary: Path,
+        env: dict[str, str],
+    ) -> None:
+        result = run(
+            self._sync_table_args(
+                binary,
+                source_ca_file=self.unrelated_ca_file,
+            ),
+            env=env,
+            timeout=90,
+            check=False,
+        )
+        if result.returncode == 0:
+            raise HarnessError("sync-table accepted untrusted source CA")
+        diagnostic = f"{result.stdout}\n{result.stderr}".lower()
+        if not any(marker in diagnostic for marker in ("certificate", "ssl", "tls")):
+            raise HarnessError(
+                f"sync-table wrong source CA lacked TLS diagnostic: {diagnostic!r}"
+            )
+
     def run_catchup_snapshot_tls(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
@@ -857,6 +924,7 @@ class Harness:
             "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
         }
 
+        self._assert_sync_table_source_ca_rejected(binary, env)
         self._assert_catchup_ca_rejected(
             binary,
             progress_file,
@@ -931,6 +999,7 @@ class Harness:
             )
         print(
             "catchup_snapshot_tls_converged rows=4 source_ca=true target_ca=true "
+            "sync_table_wrong_source_ca_rejected=true "
             "wrong_source_ca_rejected=true wrong_target_ca_rejected=true "
             "parallel_workers=2 completed_rerun_noop=true"
         )

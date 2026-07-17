@@ -129,6 +129,45 @@ assert args[target_index + 1] == '/tmp/target-ca.pem'
 }
 
 #[test]
+fn sync_table_harness_propagates_source_ca() {
+    let script = harness_script();
+    let code = format!(
+        r#"
+import importlib.util
+import pathlib
+import sys
+
+script = pathlib.Path(r'{script}')
+spec = importlib.util.spec_from_file_location('cdc_harness', script)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+harness = module.Harness.__new__(module.Harness)
+harness.source = module.Endpoint('source', 3307)
+harness.target = module.Endpoint('target', 3308)
+harness.ca_file = pathlib.Path('/tmp/shared-ca.pem')
+args = harness._sync_table_args(
+    pathlib.Path('/tmp/cdc'),
+    source_ca_file=pathlib.Path('/tmp/source-ca.pem'),
+)
+source_index = args.index('--source-tls-ca-file')
+assert args[source_index + 1] == '/tmp/source-ca.pem'
+"#,
+        script = script.display()
+    );
+    let output = Command::new("python3")
+        .args(["-c", &code])
+        .output()
+        .expect("check sync-table source CA propagation");
+    assert!(
+        output.status.success(),
+        "sync-table source CA propagation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn harness_python_source_parses_without_generating_bytecode() {
     let script = harness_script();
     let code = format!(
