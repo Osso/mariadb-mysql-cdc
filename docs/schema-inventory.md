@@ -36,8 +36,17 @@ the manual DDL ledger when an invisible target index is possible.
 Source and target inventory connections use endpoint-specific TLS CA settings
 when configured. Missing, unreadable, or invalid CA files fail with a
 source/target-specific diagnostic before metadata queries run. Retryable I/O,
-codec, TLS, timeout, connection, and packet/setup failures reset the connection
-once and retry the same metadata query. Logs identify endpoint role, inventory
-stage, schema, TLS mode, attempt (`1/2` or `2/2`), reset status, connection age,
-and both the original and retry errors; non-retryable failures stop immediately.
+codec, TLS, timeout, connection, and packet/setup failures cause a fresh
+connection attempt and retry the same metadata query once; an existing
+connection is discarded before that attempt, while an initial connection
+failure simply opens a new one. Configuration and other non-retryable failures
+stop immediately. Logs identify endpoint role, inventory stage, schema, TLS
+mode, attempt (`1/2` or `2/2`), reset status, connection age, and both the
+original and retry errors.
+
+## Tests asserting this behavior
+
+- `src/inventory/tests/reader.rs` — asserts TLS setup, retry after a packet
+  desynchronization, retry after an initial connection failure, immediate
+  failure for server SQL errors, and replacement of expired connections.
 

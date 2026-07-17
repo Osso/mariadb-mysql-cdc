@@ -91,6 +91,9 @@ reason to re-run grant policy validation for each event or query. Event handling
 executes known internal operations, performs only event-specific state/evidence
 checks, and surfaces database errors. The exact prior failure and its corrected
 boundary are documented in the [DDL Resolution Runbook](../ddl-resolution.md#prior-duplicate-validator-failure).
+The focused validator test in `src/live/ddl_replay_journal/tests.rs` removes each
+required application `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and `EXECUTE`
+privilege in turn and asserts startup validation rejects the grant set.
 
 ## Implementation inventory
 
