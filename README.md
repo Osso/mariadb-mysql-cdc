@@ -25,8 +25,7 @@ or depend on a foreign key; the production-observed unqualified multi-clause
 `ALTER TABLE` form with `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or
 `SMALLINT UNSIGNED` and the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and
 `AFTER` options; named composite `ADD KEY` or `ADD UNIQUE KEY` clauses over
-ordinary columns; and `DROP COLUMN IF EXISTS`, which emits `DROP COLUMN` for
-present target columns and a proven no-op for absent columns. The ALTER path records a typed clause AST and derives expected
+ordinary columns; and `DROP COLUMN IF EXISTS`, which matches target column identifiers ASCII-case-insensitively, emits each matched target spelling once, and treats absent or repeated case-variant clauses as proven no-ops. The ALTER path records a typed clause AST and derives expected
 post-state by applying that AST to a fenced target pre-state, without requiring a
 live source head at the historical event coordinate. The rename slice uses target
 column pre-state, emits deterministic MySQL 8 SQL without `IF EXISTS`, treats

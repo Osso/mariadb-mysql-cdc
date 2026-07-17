@@ -314,17 +314,22 @@ pub fn transform_drop_columns_if_exists(
     {
         return Err("ALTER TABLE mixes DROP COLUMN IF EXISTS with unsupported clauses".to_string());
     }
-    let executable_columns = ast
-        .clauses
-        .iter()
-        .filter_map(|clause| match clause {
-            ParsedAlterClause::DropColumn(column) => target_columns
-                .iter()
-                .find(|target| target.eq_ignore_ascii_case(&column.name))
-                .cloned(),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut remaining_columns = target_columns.clone();
+    let mut executable_columns = Vec::new();
+    for clause in &ast.clauses {
+        let ParsedAlterClause::DropColumn(column) = clause else {
+            continue;
+        };
+        let Some(target_column) = remaining_columns
+            .iter()
+            .find(|target| target.eq_ignore_ascii_case(&column.name))
+            .cloned()
+        else {
+            continue;
+        };
+        remaining_columns.remove(&target_column);
+        executable_columns.push(target_column);
+    }
     let target_sql = if executable_columns.is_empty() {
         None
     } else {

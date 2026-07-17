@@ -23,8 +23,9 @@ with complete parsed options and no FK dependency; the production-observed
 unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` for
 `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`,
 `NULL`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY` or
-`ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with target-column-conditioned
-execution/no-op behavior; and the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
+`ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with ASCII-case-insensitive target
+matching, one emitted drop per matched target spelling, and absent or repeated
+case-variant no-ops; and the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
 COLUMN IF EXISTS ...` form. The implemented ALTER path records a canonical typed
 clause AST and derives expected post-state by applying that AST to a fenced target
 pre-state, so historical replay does not require a live source head at the event

@@ -762,6 +762,24 @@ fn drop_column_if_exists_matches_target_column_case_insensitively() {
 }
 
 #[test]
+fn duplicate_case_variant_drop_columns_execute_target_column_once() {
+    let columns = ["id".to_string(), "handle".to_string()]
+        .into_iter()
+        .collect();
+
+    let transformation = transform_drop_columns_if_exists(
+        "ALTER TABLE accounts DROP COLUMN IF EXISTS handle, DROP COLUMN IF EXISTS HANDLE",
+        &columns,
+    )
+    .expect("duplicate case-variant DROP COLUMN IF EXISTS transformation");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some("ALTER TABLE `accounts` DROP COLUMN `handle`")
+    );
+}
+
+#[test]
 fn drop_column_if_exists_ast_removes_target_column_case_insensitively() {
     let mut target = semantic_snapshot(1, Some(2));
     target.inventory.indexes.clear();

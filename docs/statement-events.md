@@ -18,7 +18,8 @@ Automatic DDL admission currently has three narrow slices:
   `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the
   observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and a named
   composite `ADD KEY` or `ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with
-  present-column execution or an absent-column no-op; this path records a
+  ASCII-case-insensitive target matching, one emitted drop per matched target spelling,
+  and absent or repeated case-variant no-ops; this path records a
   canonical typed clause AST,
   emits deterministic MySQL 8 SQL, and derives expected post-state from fenced
   target pre-state plus the event AST without requiring the historical source

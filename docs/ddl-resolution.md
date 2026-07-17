@@ -9,7 +9,7 @@ metadata and no FK dependency; the production-observed unqualified multi-clause
 `ALTER TABLE` form with `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or
 `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER`
 options, named composite `ADD KEY` or `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS`
-with present-column execution or an absent-column no-op; plus the existing
+with ASCII-case-insensitive target matching, one emitted drop per matched target spelling, and absent or repeated case-variant no-ops; plus the existing
 `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator slice. Every other DDL
 form enters the same journal as `translation_pending`; no operator-authored
 target SQL is accepted as a resolution path.

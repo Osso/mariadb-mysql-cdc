@@ -19,7 +19,8 @@ the production-observed unqualified multi-clause `ALTER TABLE` form with
 `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the
 observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and named
 composite `ADD KEY` or `ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with
-present-column execution or an absent-column no-op; and the production-observed unqualified
+ASCII-case-insensitive target matching, one emitted drop per matched target spelling,
+and absent or repeated case-variant no-ops; and the production-observed unqualified
 multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form. For the
 implemented ALTER slice, expected post-state is derived from fenced target
 pre-state plus the event AST; historical replay does not require a live source
