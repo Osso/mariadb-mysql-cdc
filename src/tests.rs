@@ -47,8 +47,6 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "ignore-duplicate",
         "--checkpoint-table",
         "cdc.stream_checkpoint",
-        "--ddl-ledger-table",
-        "cdc.manual_ddl_events",
         "--max-reconnects",
         "3",
         "--reconnect-forever",
@@ -80,7 +78,6 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         live::InsertConflictPolicy::IgnoreDuplicate
     );
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
-    assert_eq!(config.ddl_ledger_table, "cdc.manual_ddl_events");
     assert_eq!(config.max_reconnects, 3);
     assert!(config.reconnect_forever);
     assert_eq!(config.target_transaction_group_size, 25);

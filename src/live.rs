@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::fmt;
 
 mod binlog_command;
-mod ddl_ledger;
+mod ddl_event;
 mod ddl_replay_journal;
 mod ddl_semantics;
 mod insert_conflict;
@@ -132,7 +132,6 @@ pub struct ApplyBinlogConfig {
     pub target: TargetMySqlConfig,
     pub checkpoint_table: String,
     pub conflict_table: String,
-    pub ddl_ledger_table: String,
     pub max_reconnects: u32,
     pub reconnect_forever: bool,
     pub target_transaction_group_size: usize,
@@ -149,7 +148,6 @@ impl Default for ApplyBinlogConfig {
             target: TargetMySqlConfig::default(),
             checkpoint_table: default_stream_checkpoint_table(),
             conflict_table: "cdc.row_conflicts".to_string(),
-            ddl_ledger_table: "cdc.ddl_events".to_string(),
             max_reconnects: 12,
             reconnect_forever: false,
             target_transaction_group_size: 1,
@@ -206,11 +204,6 @@ fn validate_apply_table_paths(config: &ApplyBinlogConfig) -> Result<(), ApplyBin
         &config.conflict_table,
         "conflict table is required",
         "conflict table must be a schema-qualified schema.table path",
-    )?;
-    validate_schema_qualified_table(
-        &config.ddl_ledger_table,
-        "DDL ledger table is required",
-        "DDL ledger table must be a schema-qualified schema.table path",
     )
 }
 

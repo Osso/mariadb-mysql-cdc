@@ -58,7 +58,7 @@ Commands:
   apply-binlog
           Read remote MariaDB binlog text and apply compatible statements.
   stream-binlog
-          Stream native MariaDB ROW/FULL binlog events with transactional target checkpoints and manual DDL boundaries.
+          Stream native MariaDB ROW/FULL binlog events with transactional target checkpoints and durable DDL translation barriers.
 
 Probe options:
   --host HOST                 MariaDB source host.
@@ -85,7 +85,6 @@ Apply options:
   --target-database DB            MySQL target database.
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --conflict-table TABLE           Durable row-conflict store. Defaults to cdc.row_conflicts.
-  --ddl-ledger-table TABLE         Manual DDL resolution ledger. Defaults to cdc.ddl_events.
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
   --reconnect-forever BOOL        Ignore reconnect cap for transient source loss. Defaults to false.
@@ -529,7 +528,6 @@ fn apply_binlog_identity_option(
         "--source-identity" => config.source_identity = value.to_string(),
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--conflict-table" => config.conflict_table = value.to_string(),
-        "--ddl-ledger-table" => config.ddl_ledger_table = value.to_string(),
         _ => return Ok(false),
     }
 

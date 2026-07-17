@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn stream_requires_schema_qualified_checkpoint_and_ddl_tables() {
+fn stream_requires_schema_qualified_checkpoint_table() {
     let mut config = ApplyBinlogConfig {
         source: SourceBinlogConfig {
             host: "source-db".to_string(),
@@ -22,10 +22,6 @@ fn stream_requires_schema_qualified_checkpoint_and_ddl_tables() {
         ..ApplyBinlogConfig::default()
     };
 
-    config.ddl_ledger_table = "ddl_events".to_string();
-    assert!(config.validate().is_err());
-
-    config.ddl_ledger_table = "cdc.ddl_events".to_string();
     config.checkpoint_table = "stream_checkpoint".to_string();
     assert!(config.validate().is_err());
 
