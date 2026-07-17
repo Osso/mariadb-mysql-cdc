@@ -1,5 +1,5 @@
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, OptsBuilder, SslOpts};
+use mysql::{Conn, Opts, OptsBuilder};
 use std::collections::BTreeMap;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -380,8 +380,7 @@ fn probe_opts(config: &ProbeConfig) -> Opts {
         .tcp_port(config.port)
         .user(Some(&config.user))
         .pass(Some(&config.password))
-        .prefer_socket(false)
-        .ssl_opts(SslOpts::default());
+        .prefer_socket(false);
     Opts::from(builder)
 }
 
@@ -469,7 +468,7 @@ mod tests {
     use super::{
         BinlogCoordinate, EventClass, ProbeConfig, ProbeProcessRunner, ProbeReport,
         build_binlog_args, classify_binlog_events, classify_line, parse_at_position,
-        parse_master_status, parse_rotate_file, run_probe,
+        parse_master_status, parse_rotate_file, probe_opts, run_probe,
     };
 
     struct FakeProcessRunner {
@@ -613,6 +612,21 @@ mod tests {
                 "mysqld-bin.000777",
             ]
         );
+    }
+
+    #[test]
+    fn probe_source_opts_disable_tls() {
+        let config = ProbeConfig {
+            host: "192.0.2.10".to_string(),
+            port: 3306,
+            user: "cdc_reader".to_string(),
+            password: "secret".to_string(),
+            ..ProbeConfig::default()
+        };
+
+        let opts = probe_opts(&config);
+
+        assert!(opts.get_ssl_opts().is_none());
     }
 
     #[test]
