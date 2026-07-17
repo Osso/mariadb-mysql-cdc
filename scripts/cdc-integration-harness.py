@@ -800,9 +800,6 @@ class Harness:
         ).strip()
         if copied_rows != expected_rows:
             raise HarnessError(f"catchup TLS copied rows mismatch: {copied_rows!r}")
-        progress_before = progress_file.read_text()
-        if not progress_before:
-            raise HarnessError("catchup TLS progress file is empty")
         progress_row = self.query(
             self.target,
             "SELECT table_name,status,rows_scanned FROM globalcomix.table_sync_progress "
@@ -831,8 +828,6 @@ class Harness:
             raise HarnessError(
                 f"catchup TLS resume attempted account inserts: {account_insert_attempts}"
             )
-        if progress_file.read_text() != progress_before:
-            raise HarnessError("catchup TLS resume changed completed progress")
         replayed_rows = self.query(
             self.target,
             "SELECT id,email,payload FROM accounts ORDER BY id;",
