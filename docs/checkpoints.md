@@ -18,7 +18,7 @@ slices: explicitly named, unqualified, visible, non-unique secondary BTREE
 the production-observed unqualified multi-clause `ALTER TABLE` form with
 `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the
 observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and named
-non-unique composite `ADD KEY`; and the production-observed unqualified
+composite `ADD KEY` or `ADD UNIQUE KEY`; and the production-observed unqualified
 multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form. For the
 implemented ALTER slice, expected post-state is derived from fenced target
 pre-state plus the event AST; historical replay does not require a live source

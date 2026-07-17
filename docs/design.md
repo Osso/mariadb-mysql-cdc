@@ -22,7 +22,8 @@ unqualified, visible, non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX`
 with complete parsed options and no FK dependency; the production-observed
 unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` for
 `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`,
-`NULL`, `COMMENT`, and `AFTER` options, and named non-unique composite `ADD KEY`;
+`NULL`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY` or
+`ADD UNIQUE KEY`;
 and the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
 COLUMN IF EXISTS ...` form. The implemented ALTER path records a canonical typed
 clause AST and derives expected post-state by applying that AST to a fenced target

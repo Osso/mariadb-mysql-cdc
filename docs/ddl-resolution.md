@@ -8,7 +8,7 @@ non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
 metadata and no FK dependency; the production-observed unqualified multi-clause
 `ALTER TABLE` form with `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or
 `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER`
-options, and named non-unique composite `ADD KEY`; plus the existing
+options, and named composite `ADD KEY` or `ADD UNIQUE KEY`; plus the existing
 `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator slice. Every other DDL
 form enters the same journal as `translation_pending`; no operator-authored
 target SQL is accepted as a resolution path.

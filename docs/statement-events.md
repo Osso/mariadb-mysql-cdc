@@ -17,7 +17,8 @@ Automatic DDL admission currently has three narrow slices:
 - the production-observed unqualified multi-clause `ALTER TABLE` form with
   `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the
   observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and a named
-  non-unique composite `ADD KEY`; this path records a canonical typed clause AST,
+  composite `ADD KEY` or `ADD UNIQUE KEY`; this path records a canonical typed
+  clause AST,
   emits deterministic MySQL 8 SQL, and derives expected post-state from fenced
   target pre-state plus the event AST without requiring the historical source
   head; and

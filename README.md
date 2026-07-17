@@ -24,8 +24,8 @@ when every key part/option is modeled and the operation is proven not to support
 or depend on a foreign key; the production-observed unqualified multi-clause
 `ALTER TABLE` form with `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or
 `SMALLINT UNSIGNED` and the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and
-`AFTER` options; and a named, non-unique composite `ADD KEY` over ordinary
-columns. The ALTER path records a typed clause AST and derives expected
+`AFTER` options; and named composite `ADD KEY` or `ADD UNIQUE KEY` clauses over
+ordinary columns. The ALTER path records a typed clause AST and derives expected
 post-state by applying that AST to a fenced target pre-state, without requiring a
 live source head at the historical event coordinate. The rename slice uses target
 column pre-state, emits deterministic MySQL 8 SQL without `IF EXISTS`, treats

@@ -28,7 +28,7 @@ allowlist.
 
 ### Current implemented slice
 
-- [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` and named `ADD KEY` clauses.
+- [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`, named `ADD KEY`, and named `ADD UNIQUE KEY` clauses.
 - [x] Transform the observed `ADD COLUMN` forms for `VARCHAR(length)`, `DATETIME`, and `SMALLINT UNSIGNED`, with the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options.
 - [x] Transform named composite `ADD KEY` and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; broader index and clause options remain outside this slice.
 - [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
@@ -152,7 +152,8 @@ MariaDB/MySQL matrix, or deployment safety.
 
 - Manual target-SQL authoring or operator resolution as a CDC fallback.
 - Index-only automatic replay as the target DDL architecture.
-- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`/`ADD KEY` forms.
+- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`, `ADD KEY`, and
+  `ADD UNIQUE KEY` forms.
 - Additional column types, defaults, clauses, index options, and DDL families not
   listed in the implemented slice.
 - Silently dropping, weakening, or approximating source schema semantics.
