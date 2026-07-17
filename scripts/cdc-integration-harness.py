@@ -43,6 +43,7 @@ class ScenarioSpec:
 
 SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
+    ScenarioSpec("production-alter-table", True),
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("missing-checkpoint", True),
     ScenarioSpec("missing-trigger", True),
@@ -780,6 +781,83 @@ class Harness:
         if pending != "0":
             raise HarnessError(f"unexpected unresolved DDL journal debt after strict replay: {pending}")
         print(f"strict_secondary_btree_ok coordinate={stop.file}:{stop.position} journal_rows={len(rows)}")
+
+    def run_production_alter_table(self) -> None:
+        assert self.source and self.target
+        schema = """
+            CREATE TABLE home_feed_panel_candidates (
+                id BIGINT NOT NULL PRIMARY KEY,
+                filter_reason VARCHAR(64) DEFAULT NULL
+            ) ENGINE=InnoDB;
+            CREATE TABLE home_feed_bakes (
+                id BIGINT NOT NULL PRIMARY KEY,
+                reading_direction TINYINT UNSIGNED NOT NULL,
+                status TINYINT UNSIGNED NOT NULL,
+                published_time DATETIME DEFAULT NULL
+            ) ENGINE=InnoDB;
+        """
+        self.admin_sql(self.source, schema)
+        self.admin_sql(self.target, schema)
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            """
+            ALTER TABLE home_feed_panel_candidates
+              ADD COLUMN filter_prompt_version VARCHAR(64) DEFAULT NULL COMMENT 'sanitized description' AFTER filter_reason,
+              ADD COLUMN filtered_time DATETIME NULL DEFAULT NULL COMMENT 'sanitized description' AFTER filter_prompt_version;
+            ALTER TABLE home_feed_bakes
+              ADD COLUMN variant_id SMALLINT UNSIGNED DEFAULT NULL AFTER reading_direction,
+              ADD KEY idx_hfb_variant_status_published (variant_id, status, published_time);
+            """,
+        )
+        stop = self.coordinate()
+        result = self.run_stream(start, stop)
+        require_success(result, "production ALTER TABLE replay")
+        columns = self.query(
+            self.target,
+            "SELECT table_name,column_name,column_type,is_nullable,column_default,column_comment "
+            "FROM information_schema.columns WHERE table_schema='globalcomix' "
+            "AND ((table_name='home_feed_panel_candidates' AND column_name IN ('filter_prompt_version','filtered_time')) "
+            "OR (table_name='home_feed_bakes' AND column_name='variant_id')) "
+            "ORDER BY table_name,ordinal_position;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).splitlines()
+        expected_columns = [
+            "home_feed_bakes\tvariant_id\tsmallint unsigned\tYES\tNULL\t",
+            "home_feed_panel_candidates\tfilter_prompt_version\tvarchar(64)\tYES\tNULL\tsanitized description",
+            "home_feed_panel_candidates\tfiltered_time\tdatetime\tYES\tNULL\tsanitized description",
+        ]
+        if columns != expected_columns:
+            raise HarnessError(f"production ALTER TABLE column parity failed: {columns}")
+        index_rows = self.query(
+            self.target,
+            "SELECT index_name,non_unique,seq_in_index,column_name,index_type "
+            "FROM information_schema.statistics WHERE table_schema='globalcomix' "
+            "AND table_name='home_feed_bakes' AND index_name='idx_hfb_variant_status_published' "
+            "ORDER BY seq_in_index;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).splitlines()
+        if index_rows != [
+            "idx_hfb_variant_status_published\t1\t1\tvariant_id\tBTREE",
+            "idx_hfb_variant_status_published\t1\t2\tstatus\tBTREE",
+            "idx_hfb_variant_status_published\t1\t3\tpublished_time\tBTREE",
+        ]:
+            raise HarnessError(f"production ALTER TABLE index parity failed: {index_rows}")
+        journal = self.query(
+            self.target,
+            "SELECT status,transformation_version FROM cdc.ddl_replay_journal ORDER BY event_start_position;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).splitlines()
+        if len(journal) != 2 or any(not row.startswith("checkpointed\tmariadb-mysql8-v1") for row in journal):
+            raise HarnessError(f"production ALTER TABLE journal mismatch: {journal}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
+            raise HarnessError(f"production ALTER TABLE checkpoint mismatch: {checkpoint}")
+        print(f"production_alter_table_ok coordinate={stop.file}:{stop.position} journal_rows=2")
 
     def ddl_journal_rows(self) -> list[list[str]]:
         assert self.target
@@ -1688,6 +1766,8 @@ class Harness:
         self.prepare()
         if scenario == "strict-secondary-btree":
             self.run_strict_secondary_btree()
+        elif scenario == "production-alter-table":
+            self.run_production_alter_table()
         elif scenario == "bootstrap-contract":
             self.run_bootstrap_contract()
         elif scenario in {

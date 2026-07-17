@@ -32,6 +32,24 @@ fn real_strict_secondary_btree_harness_smoke() {
 }
 
 #[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_production_alter_table_harness_smoke() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("production-alter-table")
+        .output()
+        .expect("run production ALTER TABLE harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn harness_python_source_parses_without_generating_bytecode() {
     let script = harness_script();
     let code = format!(
