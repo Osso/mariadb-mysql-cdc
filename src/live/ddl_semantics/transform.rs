@@ -552,30 +552,44 @@ fn parse_observed_column_type(
         ));
     }
     index += 1;
-    let mut column_type = data_type.clone();
-    if tokens.get(index).map(String::as_str) == Some("(") {
-        let length = tokens
-            .get(index + 1)
-            .cloned()
-            .ok_or_else(|| "missing column type length".to_string())?;
-        let parsed_length = length
-            .parse::<u32>()
-            .map_err(|_| format!("invalid column type length {length}"))?;
-        if parsed_length == 0 || parsed_length.to_string() != length {
-            return Err(format!("noncanonical column type length {length}"));
+    let column_type = match data_type.as_str() {
+        "varchar" => {
+            require_keyword(tokens, index, "(")?;
+            let length = tokens
+                .get(index + 1)
+                .cloned()
+                .ok_or_else(|| "missing column type length".to_string())?;
+            let parsed_length = length
+                .parse::<u32>()
+                .map_err(|_| format!("invalid column type length {length}"))?;
+            if parsed_length == 0 || parsed_length.to_string() != length {
+                return Err(format!("noncanonical column type length {length}"));
+            }
+            require_keyword(tokens, index + 2, ")")?;
+            index += 3;
+            format!("varchar({parsed_length})")
         }
-        require_keyword(tokens, index + 2, ")")?;
-        column_type.push_str(&format!("({parsed_length})"));
-        index += 3;
-    } else if data_type == "varchar" {
-        return Err("VARCHAR requires an explicit canonical length".to_string());
-    }
+        "datetime" => {
+            if tokens.get(index).map(String::as_str) == Some("(") {
+                return Err("DATETIME precision is unsupported".to_string());
+            }
+            data_type.clone()
+        }
+        "smallint" => {
+            if tokens.get(index).map(String::as_str) == Some("(") {
+                return Err("SMALLINT display width is unsupported".to_string());
+            }
+            require_keyword(tokens, index, "UNSIGNED")?;
+            index += 1;
+            "smallint unsigned".to_string()
+        }
+        _ => unreachable!("supported types were checked above"),
+    };
     if tokens
         .get(index)
         .is_some_and(|token| token.eq_ignore_ascii_case("UNSIGNED"))
     {
-        column_type.push_str(" unsigned");
-        index += 1;
+        return Err(format!("UNSIGNED is unsupported for {data_type}"));
     }
     Ok((column_type, data_type, index))
 }
