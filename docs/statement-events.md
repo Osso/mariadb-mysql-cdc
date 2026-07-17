@@ -15,8 +15,11 @@ Automatic DDL admission currently has three narrow slices:
   INDEX` or `DROP INDEX` whose key parts and options are completely modeled and
   whose FK dependency is disproven from the fenced target inventory;
 - the production-observed unqualified multi-clause `ALTER TABLE` form with
-  `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the
-  observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and a named
+  `ADD COLUMN` under the exact unquoted type grammar
+  `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
+  quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
+  rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
+  `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and a named
   composite `ADD KEY` or `ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with
   ASCII-case-insensitive target matching, one emitted drop per matched target spelling,
   and absent or repeated case-variant no-ops; this path records a

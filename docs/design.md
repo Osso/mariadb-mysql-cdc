@@ -26,16 +26,22 @@ comments/double quotes/qualification rejected, one or more `BIGINT` or
 `VARCHAR(positive canonical decimal length)` `NOT NULL` columns with at least one
 inline `PRIMARY KEY`, zero or more one-column named ordinary `KEY` items, and
 `ENGINE=InnoDB` with an optional semicolon; the production-observed unqualified
-multi-clause `ALTER TABLE` form with `ADD COLUMN` for
-`VARCHAR(length)`, `DATETIME`, or `SMALLINT UNSIGNED`, the observed `DEFAULT NULL`,
-`NULL`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY` or
+multi-clause `ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type
+grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT
+UNSIGNED`, the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options,
+and named composite `ADD KEY` or
 `ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with ASCII-case-insensitive target
 matching, one emitted drop per matched target spelling, and absent or repeated
 case-variant no-ops; and the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
 COLUMN IF EXISTS ...` form. The implemented ALTER path records a canonical typed
 clause AST and derives expected post-state by applying that AST to a fenced target
 pre-state, so historical replay does not require a live source head at the event
-coordinate. For admitted CREATE TABLE, source charset/collation are read between exact
+coordinate. For the ALTER `ADD COLUMN` slice, the exact unquoted type grammar is
+`VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
+quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
+rejected, as are `DATETIME` precision and `SMALLINT` display width. Those unsupported
+variants remain `translation_pending` with no target DDL or checkpoint advance. For
+admitted CREATE TABLE, source charset/collation are read between exact
 event-coordinate fences, persisted in evidence, rendered explicitly, and checked
 against target absence before and after capture plus the exact observed post-state;
 canonical table evidence sorts indexes by index name. Unsupported CREATE variants

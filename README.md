@@ -28,10 +28,11 @@ comments/double quotes/qualification rejected, one or more `BIGINT` or
 `VARCHAR(positive canonical decimal length)` `NOT NULL` columns with at least one
 inline `PRIMARY KEY`, zero or more one-column named ordinary `KEY` items, and
 `ENGINE=InnoDB` with an optional semicolon; the
-production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`
-for `VARCHAR(length)`, `DATETIME`, or
-`SMALLINT UNSIGNED` and the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and
-`AFTER` options; named composite `ADD KEY` or `ADD UNIQUE KEY` clauses over
+production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type grammar
+`VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
+quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
+rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
+`DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options; named composite `ADD KEY` or `ADD UNIQUE KEY` clauses over
 ordinary columns; and `DROP COLUMN IF EXISTS`, which matches target column identifiers ASCII-case-insensitively, emits each matched target spelling once, and treats absent or repeated case-variant clauses as proven no-ops. The ALTER path records a typed clause AST and derives expected
 post-state by applying that AST to a fenced target pre-state, without requiring a
 live source head at the historical event coordinate. The rename slice uses target

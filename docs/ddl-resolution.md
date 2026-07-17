@@ -6,9 +6,12 @@ The event handler uses one durable DDL control plane:
 Automatic admission currently covers strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
 metadata and no FK dependency; the production-observed unqualified multi-clause
-`ALTER TABLE` form with `ADD COLUMN` for `VARCHAR(length)`, `DATETIME`, or
-`SMALLINT UNSIGNED`, the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER`
-options, named composite `ADD KEY` or `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS`
+`ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type grammar
+`VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
+quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
+rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
+`DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, named composite `ADD KEY`
+or `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS`
 with ASCII-case-insensitive target matching, one emitted drop per matched target spelling, and absent or repeated case-variant no-ops; plus the existing
 `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator slice. Every other DDL
 form enters the same journal as `translation_pending`; no operator-authored
