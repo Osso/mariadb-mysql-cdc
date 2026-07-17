@@ -473,8 +473,8 @@ fn build_endpoint_inventory(
         user: source.user.clone(),
         password: source.password.clone(),
         endpoint_role,
-        use_tls: true,
-        tls_ca_file: source.tls_ca_file.clone(),
+        use_tls: false,
+        tls_ca_file: None,
         ..InventoryConfig::default()
     });
     build_inventory(&source.database, &reader)
@@ -503,6 +503,59 @@ pub(crate) fn fresh_run_id(prefix: &str) -> String {
         .as_millis();
     let sequence = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{millis}-{}-{sequence}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_endpoint_inventory_uses_plaintext_without_ca() {
+        let source = MySqlConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            user: "reader".to_string(),
+            password: "secret".to_string(),
+            database: "globalcomix".to_string(),
+            tls_ca_file: None,
+        };
+
+        let error = build_endpoint_inventory(&source, InventoryEndpointRole::Source)
+            .expect_err("source inventory connection should fail");
+        let message = error.to_string();
+
+        assert!(!message.contains("TLS CA file"));
+    }
+
+    #[test]
+    fn target_endpoint_inventory_keeps_configured_ca() {
+        let target = crate::live::TargetMySqlConfig {
+            host: "target-db".to_string(),
+            tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
+            ..crate::live::TargetMySqlConfig::default()
+        };
+        let inventory = InventoryConfig {
+            host: target.host.clone(),
+            port: target.port,
+            user: target.user.clone(),
+            password: target.password.clone(),
+            endpoint_role: InventoryEndpointRole::Target,
+            use_tls: true,
+            tls_ca_file: Some(target.tls_ca_file.clone()),
+            ..InventoryConfig::default()
+        };
+
+        let opts =
+            crate::inventory::reader::inventory_opts(&inventory).expect("target inventory TLS");
+        let ssl = opts.get_ssl_opts().expect("target TLS configured");
+
+        assert_eq!(
+            ssl.root_cert_path(),
+            Some(std::path::Path::new(&target.tls_ca_file))
+        );
+        assert!(!ssl.skip_domain_validation());
+        assert!(!ssl.accept_invalid_certs());
+    }
 }
 
 fn phase_name(phase: SyncPhase) -> &'static str {

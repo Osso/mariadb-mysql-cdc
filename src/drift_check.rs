@@ -4,8 +4,6 @@ use std::fmt;
 
 #[cfg(test)]
 pub(crate) use crate::checksum::ChecksumColumn;
-#[cfg(test)]
-pub(crate) use crate::mysql_support::SOURCE_TLS_CA_FILE;
 
 const MIN_REPAIR_RANGE_ROWS: u64 = 100;
 const MAX_MISMATCH_RANGES: usize = 1000;

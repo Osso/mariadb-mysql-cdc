@@ -1,6 +1,6 @@
 use super::{DriftCheckError, MySqlConnectionConfig, TargetMySqlConfig};
 use crate::checksum::{ChecksumColumn, ChecksumRequest, build_chunk_checksum_sql};
-use crate::mysql_support::{SOURCE_TLS_CA_FILE, quote_ident, quote_sql_literal, ssl_opts_from_ca};
+use crate::mysql_support::{quote_ident, quote_sql_literal, ssl_opts_from_ca};
 use mysql::prelude::{FromRow, Queryable};
 use mysql::{Conn, Opts, OptsBuilder, Row, Value};
 use std::cell::RefCell;
@@ -253,18 +253,16 @@ fn query_error(error: mysql::Error) -> DriftCheckError {
 
 pub(crate) fn connection_opts(config: &QueryConnectionConfig) -> Result<Opts, String> {
     let endpoint = format!("{} `{}`:{}", config.endpoint_role, config.host, config.port);
-    let builder = OptsBuilder::default()
+    let mut builder = OptsBuilder::default()
         .ip_or_hostname(Some(&config.host))
         .tcp_port(config.port)
         .user(Some(&config.user))
         .pass(Some(&config.password))
         .db_name(Some(&config.database))
-        .prefer_socket(false)
-        .ssl_opts(ssl_opts_from_ca(
-            &endpoint,
-            &config.host,
-            &config.tls_ca_file,
-        )?);
+        .prefer_socket(false);
+    if let Some(ca_file) = config.tls_ca_file.as_deref() {
+        builder = builder.ssl_opts(ssl_opts_from_ca(&endpoint, &config.host, ca_file)?);
+    }
     Ok(Opts::from(builder))
 }
 
@@ -275,7 +273,7 @@ pub(crate) struct QueryConnectionConfig {
     pub(crate) user: String,
     pub(crate) password: String,
     pub(crate) database: String,
-    pub(crate) tls_ca_file: String,
+    pub(crate) tls_ca_file: Option<String>,
     pub(crate) endpoint_role: &'static str,
 }
 
@@ -286,10 +284,7 @@ pub(crate) fn source_query_config(config: &MySqlConnectionConfig) -> QueryConnec
         user: config.user.clone(),
         password: config.password.clone(),
         database: config.database.clone(),
-        tls_ca_file: config
-            .tls_ca_file
-            .clone()
-            .unwrap_or_else(|| SOURCE_TLS_CA_FILE.to_string()),
+        tls_ca_file: None,
         endpoint_role: "source",
     }
 }
@@ -301,7 +296,7 @@ pub(crate) fn target_query_config(target: &TargetMySqlConfig) -> QueryConnection
         user: target.user.clone(),
         password: target.password.clone(),
         database: target.database.clone(),
-        tls_ca_file: target.tls_ca_file.clone(),
+        tls_ca_file: Some(target.tls_ca_file.clone()),
         endpoint_role: "target",
     }
 }

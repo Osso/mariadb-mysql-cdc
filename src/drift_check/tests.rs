@@ -192,26 +192,23 @@ fn only_1146_42s02_errors_are_treated_as_missing_tables() {
 }
 
 #[test]
-fn drift_check_uses_endpoint_specific_tls_ca_paths() {
+fn drift_check_source_is_plaintext_and_target_keeps_tls_ca() {
     assert_eq!(
         source_query_config(&MySqlConnectionConfig::default()).tls_ca_file,
-        SOURCE_TLS_CA_FILE
+        None
     );
     let custom_source = MySqlConnectionConfig {
         tls_ca_file: Some("/tmp/custom-source-ca.pem".to_string()),
         ..MySqlConnectionConfig::default()
     };
-    assert_eq!(
-        source_query_config(&custom_source).tls_ca_file,
-        "/tmp/custom-source-ca.pem"
-    );
+    assert_eq!(source_query_config(&custom_source).tls_ca_file, None);
     let default_target = TargetMySqlConfig {
         tls_ca_file: "/tmp/custom-target-ca.pem".to_string(),
         ..TargetMySqlConfig::default()
     };
     assert_eq!(
         target_query_config(&default_target).tls_ca_file,
-        "/tmp/custom-target-ca.pem"
+        Some("/tmp/custom-target-ca.pem".to_string())
     );
 
     let source_ca = temporary_ca_path("source");
@@ -226,7 +223,7 @@ fn drift_check_uses_endpoint_specific_tls_ca_paths() {
         user: "source-user".to_string(),
         password: "source-password".to_string(),
         database: "source-db".to_string(),
-        tls_ca_file: source_ca.to_string_lossy().into_owned(),
+        tls_ca_file: None,
         endpoint_role: "source",
     };
     let target = QueryConnectionConfig {
@@ -235,22 +232,18 @@ fn drift_check_uses_endpoint_specific_tls_ca_paths() {
         user: "target-user".to_string(),
         password: "target-password".to_string(),
         database: "target-db".to_string(),
-        tls_ca_file: target_ca.to_string_lossy().into_owned(),
+        tls_ca_file: Some(target_ca.to_string_lossy().into_owned()),
         endpoint_role: "target",
     };
 
-    let source_opts = connection_opts(&source).expect("source TLS options");
+    let source_opts = connection_opts(&source).expect("source plaintext options");
     let target_opts = connection_opts(&target).expect("target TLS options");
-    let source_root = source_opts
-        .get_ssl_opts()
-        .and_then(|ssl| ssl.root_cert_path());
-    let target_root = target_opts
-        .get_ssl_opts()
-        .and_then(|ssl| ssl.root_cert_path());
+    let target_ssl = target_opts.get_ssl_opts().expect("target TLS configured");
 
-    assert_eq!(source_root, Some(source_ca.as_path()));
-    assert_eq!(target_root, Some(target_ca.as_path()));
-    assert_ne!(source_root, target_root);
+    assert!(source_opts.get_ssl_opts().is_none());
+    assert_eq!(target_ssl.root_cert_path(), Some(target_ca.as_path()));
+    assert!(!target_ssl.skip_domain_validation());
+    assert!(!target_ssl.accept_invalid_certs());
 
     let _ = std::fs::remove_file(source_ca);
     let _ = std::fs::remove_file(target_ca);
