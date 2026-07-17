@@ -340,6 +340,17 @@ class Harness:
     def admin_query(self, endpoint: Endpoint, sql: str) -> str:
         return self.admin_sql(endpoint, sql)
 
+    def assert_admin_sql_rejected(self, endpoint: Endpoint, sql: str, expected_error: str) -> None:
+        try:
+            self.admin_sql(endpoint, sql)
+        except HarnessError as error:
+            if expected_error.lower() not in str(error).lower():
+                raise HarnessError(
+                    f"SQL failed for the wrong reason endpoint={endpoint.container}: {error}"
+                ) from error
+            return
+        raise HarnessError(f"SQL unexpectedly succeeded endpoint={endpoint.container}: {sql}")
+
     def query(self, endpoint: Endpoint, sql: str, *, user: str, password: str) -> str:
         return self._mysql(endpoint, sql, user, password)
 
@@ -795,6 +806,11 @@ class Harness:
                 status TINYINT UNSIGNED NOT NULL,
                 published_time DATETIME DEFAULT NULL
             ) ENGINE=InnoDB;
+            CREATE TABLE accounts (
+                id BIGINT NOT NULL PRIMARY KEY,
+                email VARCHAR(255) NOT NULL
+            ) ENGINE=InnoDB;
+            INSERT INTO accounts VALUES (1, 'existing@example.test');
         """
         self.admin_sql(self.source, schema)
         self.admin_sql(self.target, schema)
@@ -809,6 +825,7 @@ class Harness:
             ALTER TABLE home_feed_bakes
               ADD COLUMN variant_id SMALLINT UNSIGNED DEFAULT NULL AFTER reading_direction,
               ADD KEY idx_hfb_variant_status_published (variant_id, status, published_time);
+            ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email (email);
             """,
         )
         stop = self.coordinate()
@@ -846,18 +863,88 @@ class Harness:
             "idx_hfb_variant_status_published\t1\t3\tpublished_time\tBTREE",
         ]:
             raise HarnessError(f"production ALTER TABLE index parity failed: {index_rows}")
+        unique_metadata = []
+        for endpoint in (self.source, self.target):
+            unique_metadata.append(
+                self.admin_query(
+                    endpoint,
+                    "SELECT index_name,non_unique,seq_in_index,column_name,index_type "
+                    "FROM information_schema.statistics WHERE table_schema='globalcomix' "
+                    "AND table_name='accounts' AND index_name='uq_accounts_email' "
+                    "ORDER BY seq_in_index;",
+                ).strip()
+            )
+        expected_unique_metadata = "uq_accounts_email\t0\t1\temail\tBTREE"
+        if unique_metadata != [expected_unique_metadata, expected_unique_metadata]:
+            raise HarnessError(f"production ADD UNIQUE KEY metadata parity failed: {unique_metadata}")
+        duplicate_sql = "INSERT INTO accounts VALUES (2, 'existing@example.test');"
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(endpoint, duplicate_sql, "Duplicate entry")
+            rows = self.admin_query(endpoint, "SELECT id,email FROM accounts ORDER BY id;").strip()
+            if rows != "1\texisting@example.test":
+                raise HarnessError(
+                    f"production ADD UNIQUE KEY duplicate rejection mutated rows "
+                    f"endpoint={endpoint.container}: {rows!r}"
+                )
         journal = self.query(
             self.target,
-            "SELECT status,transformation_version FROM cdc.ddl_replay_journal ORDER BY event_start_position;",
+            "SELECT status,transformation_version,CHAR_LENGTH(canonical_ast)>0,"
+            "CHAR_LENGTH(pre_state)>0,CHAR_LENGTH(expected_post_state)>0 "
+            "FROM cdc.ddl_replay_journal ORDER BY event_start_position;",
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         ).splitlines()
-        if len(journal) != 2 or any(not row.startswith("checkpointed\tmariadb-mysql8-v1") for row in journal):
+        expected_journal_row = "checkpointed\tmariadb-mysql8-v1\t1\t1\t1"
+        if journal != [expected_journal_row, expected_journal_row, expected_journal_row]:
             raise HarnessError(f"production ALTER TABLE journal mismatch: {journal}")
+        unique_evidence = self.query(
+            self.target,
+            "SELECT generated_sql FROM cdc.ddl_replay_journal "
+            "WHERE raw_sql LIKE 'ALTER TABLE accounts ADD UNIQUE KEY%';",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if unique_evidence != "ALTER TABLE `accounts` ADD UNIQUE KEY `uq_accounts_email` (`email`)":
+            raise HarnessError(f"production ADD UNIQUE KEY evidence mismatch: {unique_evidence!r}")
         checkpoint = self.checkpoint()
         if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
             raise HarnessError(f"production ALTER TABLE checkpoint mismatch: {checkpoint}")
-        print(f"production_alter_table_ok coordinate={stop.file}:{stop.position} journal_rows=2")
+
+        self.admin_sql(
+            self.source,
+            "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email_prefix (email(8));",
+        )
+        pending_stop = self.coordinate()
+        pending_result = self.run_stream(stop, pending_stop)
+        require_translation_pending_termination(pending_result)
+        pending_index = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.statistics "
+            "WHERE table_schema='globalcomix' AND table_name='accounts' "
+            "AND index_name='uq_accounts_email_prefix';",
+        ).strip()
+        if pending_index != "0":
+            raise HarnessError("unsupported unique-key option executed target DDL")
+        pending_rows = self.query(
+            self.target,
+            "SELECT status,transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state "
+            "FROM cdc.ddl_replay_journal WHERE raw_sql LIKE '%uq_accounts_email_prefix%';",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).splitlines()
+        if pending_rows != ["translation_pending\ttranslator-unavailable\tNULL\t\t\t"]:
+            raise HarnessError(f"unsupported unique-key journal evidence mismatch: {pending_rows}")
+        pending_checkpoint = self.checkpoint()
+        if pending_checkpoint.get("source_file") != stop.file or int(
+            pending_checkpoint.get("source_position", 0)
+        ) != stop.position:
+            raise HarnessError(
+                f"unsupported unique-key option advanced checkpoint: {pending_checkpoint}"
+            )
+        print(
+            f"production_alter_table_ok coordinate={stop.file}:{stop.position} "
+            "journal_rows=3 unique_parity=true pending_unique_option=true"
+        )
 
     def ddl_journal_rows(self) -> list[list[str]]:
         assert self.target

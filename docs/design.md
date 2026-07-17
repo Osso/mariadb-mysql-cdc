@@ -69,8 +69,10 @@ stream; runtime never creates the table. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
 conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 30 executable scenarios;
-its `production-alter-table` scenario passes two checkpointed ALTER events and
-checks column/comment/index parity. These are local proofs for implemented
+its `production-alter-table` scenario passes three checkpointed ALTER events,
+checks column/comment/non-unique and unique-index metadata plus duplicate
+rejection parity, and proves an unsupported unique-prefix option remains pending
+without target mutation or checkpoint advancement. These are local proofs for implemented
 boundaries. Broader ALTER coverage, the full compatibility matrix, live recurring
 scheduling, deployment, and cutover gates remain unchecked.
 

@@ -70,8 +70,10 @@ windows, a non-mutating full-scope Verify equality phase, and evidence-backed
 conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 30 executable scenarios
 covering bootstrap/grants, DDL journal crash recovery, reconnect/GET_LOCK
 behavior, and FK-aware repair/conflict resolution. Its `production-alter-table`
-scenario passes two checkpointed ALTER events and checks column/comment/index
-parity plus the final checkpoint. These are local Docker proofs, not live cutover
+scenario passes three checkpointed ALTER events; checks column, comment,
+non-unique and unique-index metadata plus duplicate rejection parity; then proves
+an unsupported unique-prefix option remains `translation_pending` without target
+mutation or checkpoint advancement. These are local Docker proofs, not live cutover
 proof;
 recurring conflict scheduling and full cutover proof remain unchecked.
 

@@ -74,8 +74,11 @@ an irreducible ambiguity boundary.
 ## Production ALTER proof
 
 The disposable real MariaDB 11.4/MySQL 8.0 `production-alter-table` scenario
-replays two ALTER events, checks column/comment/index parity, and requires both
-journal rows plus the final source checkpoint to be `checkpointed`. It proves only
+replays three supported ALTER events, checks column/comment/non-unique and unique
+index parity plus duplicate rejection, and requires all three journal rows plus
+the final supported-event source checkpoint to be `checkpointed`. It then proves
+an unsupported unique-prefix option remains `translation_pending` without target
+execution or checkpoint advancement. It proves only
 the implemented observed ALTER slice, not full ALTER TABLE coverage, a full matrix,
 or deployment readiness.
 

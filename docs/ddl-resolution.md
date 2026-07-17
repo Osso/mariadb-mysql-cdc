@@ -98,10 +98,12 @@ is part of this flow.
 ### Production ALTER proof
 
 The real MariaDB 11.4/MySQL 8.0 harness scenario `production-alter-table`
-replays two source ALTER events. It verifies `VARCHAR(64)`, `DATETIME`, and
-`SMALLINT UNSIGNED` column metadata, comments and placement, the named composite
-non-unique BTREE index, two `checkpointed` journal rows, and the final stream
-checkpoint. This is implemented-slice proof only, not full ALTER TABLE coverage,
+replays three source ALTER events. It verifies `VARCHAR(64)`, `DATETIME`, and
+`SMALLINT UNSIGNED` column metadata, comments and placement, named composite
+non-unique and unique BTREE indexes, duplicate-row rejection parity, three
+`checkpointed` journal rows with transformation evidence/version, and the final
+stream checkpoint. A neighboring unique-prefix option remains
+`translation_pending` with no target index and no checkpoint advancement. This is implemented-slice proof only, not full ALTER TABLE coverage,
 a full compatibility matrix, or deployment proof.
 
 ## Transformation/evidence failure
