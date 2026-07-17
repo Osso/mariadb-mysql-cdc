@@ -816,6 +816,27 @@ fn production_add_column_and_key_ddl_transforms_to_deterministic_mysql8_sql() {
 }
 
 #[test]
+fn production_alter_rejects_comment_bearing_and_executable_comment_syntax() {
+    for sql in [
+        "-- deployment comment\nALTER TABLE accounts ADD COLUMN c VARCHAR(64)",
+        "ALTER TABLE accounts /* 'decoy' */ ADD COLUMN c VARCHAR(64) COMMENT 'real'",
+        "ALTER TABLE accounts ADD COLUMN c VARCHAR(64) /*M!100000 NOT NULL */",
+    ] {
+        assert!(
+            !supports_production_alter_table(sql),
+            "comment-bearing ALTER was admitted: {sql}"
+        );
+    }
+}
+
+#[test]
+fn production_alter_rejects_noncanonical_type_lengths() {
+    assert!(!supports_production_alter_table(
+        "ALTER TABLE accounts ADD COLUMN c VARCHAR(00064)"
+    ));
+}
+
+#[test]
 fn rename_column_if_exists_fails_closed_when_old_and_new_columns_both_exist() {
     let columns = ["arc_start_order", "deprecated_arc_start_order"]
         .into_iter()
