@@ -571,6 +571,7 @@ version = "0.1.0"
 dependencies = [
  "mysql",
  "mysql_cdc",
+ "native-tls",
  "serde",
  "serde_json",
 ]
