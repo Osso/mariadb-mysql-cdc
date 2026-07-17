@@ -59,21 +59,32 @@ fn starts_ddl_comment(characters: &[char], index: usize) -> bool {
 }
 
 pub(crate) fn tokenize_ddl(sql: &str) -> Result<Vec<String>, String> {
+    tokenize_ddl_with_quoted_flags(sql).map(|(tokens, _)| tokens)
+}
+
+pub(crate) fn tokenize_ddl_with_quoted_flags(
+    sql: &str,
+) -> Result<(Vec<String>, Vec<bool>), String> {
     let characters = sql.chars().collect::<Vec<_>>();
     tokenize_ddl_characters(&characters)
 }
 
-fn tokenize_ddl_characters(characters: &[char]) -> Result<Vec<String>, String> {
+fn tokenize_ddl_characters(characters: &[char]) -> Result<(Vec<String>, Vec<bool>), String> {
     let mut tokens = Vec::new();
+    let mut quoted_flags = Vec::new();
     let mut index = 0;
     while index < characters.len() {
+        let quoted = characters
+            .get(index)
+            .is_some_and(|character| matches!(character, '`' | '"'));
         let (token, next_index) = tokenize_ddl_step(characters, index)?;
         if let Some(token) = token {
             tokens.push(token);
+            quoted_flags.push(quoted);
         }
         index = next_index;
     }
-    Ok(tokens)
+    Ok((tokens, quoted_flags))
 }
 
 fn tokenize_ddl_step(characters: &[char], index: usize) -> Result<(Option<String>, usize), String> {

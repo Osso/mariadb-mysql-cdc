@@ -1316,6 +1316,27 @@ fn production_alter_rejects_smallint_display_width() {
 }
 
 #[test]
+fn production_alter_rejects_quoted_datetime_type() {
+    assert!(!supports_production_alter_table(
+        "ALTER TABLE accounts ADD COLUMN c `DATETIME`"
+    ));
+}
+
+#[test]
+fn production_alter_rejects_quoted_varchar_length() {
+    assert!(!supports_production_alter_table(
+        "ALTER TABLE accounts ADD COLUMN c VARCHAR(`64`)"
+    ));
+}
+
+#[test]
+fn production_alter_rejects_quoted_unsigned_keyword() {
+    assert!(!supports_production_alter_table(
+        "ALTER TABLE accounts ADD COLUMN c SMALLINT `UNSIGNED`"
+    ));
+}
+
+#[test]
 fn rename_column_if_exists_fails_closed_when_old_and_new_columns_both_exist() {
     let columns = ["arc_start_order", "deprecated_arc_start_order"]
         .into_iter()

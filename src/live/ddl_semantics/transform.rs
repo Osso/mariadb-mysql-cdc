@@ -2,7 +2,7 @@ use super::model::{
     ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedCreateColumnAst,
     ParsedCreateTableAst, ParsedDropColumnAst, ParsedIndexAst, ParsedIndexKeyPart,
 };
-use super::tokenizer::{ddl_contains_comments, tokenize_ddl};
+use super::tokenizer::{ddl_contains_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags};
 use std::collections::BTreeSet;
 
 pub const DDL_TRANSFORMATION_VERSION: &str = "mariadb-mysql8-v1";
@@ -411,7 +411,7 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
     if ddl_contains_comments(source_sql) {
         return Err("production ALTER TABLE comments are not supported".to_string());
     }
-    let tokens = tokenize_ddl(source_sql)?;
+    let (tokens, quoted_flags) = tokenize_ddl_with_quoted_flags(source_sql)?;
     require_keyword(&tokens, 0, "ALTER")?;
     require_keyword(&tokens, 1, "TABLE")?;
     let table = require_identifier(&tokens, 2, "ALTER TABLE name")?;
@@ -424,7 +424,9 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
             .map(|token| token.to_ascii_uppercase())
             .as_deref()
         {
-            Some("ADD") => parse_production_add_clause(&tokens, index, &table, &mut literals)?,
+            Some("ADD") => {
+                parse_production_add_clause(&tokens, &quoted_flags, index, &table, &mut literals)?
+            }
             Some("DROP") => parse_drop_column_clause(&tokens, index)?,
             actual => {
                 return Err(format!(
@@ -448,6 +450,7 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
 
 fn parse_production_add_clause(
     tokens: &[String],
+    quoted_flags: &[bool],
     index: usize,
     table: &str,
     literals: &mut impl Iterator<Item = String>,
@@ -456,7 +459,9 @@ fn parse_production_add_clause(
         .get(index + 1)
         .map(|token| token.to_ascii_uppercase())
     {
-        Some(kind) if kind == "COLUMN" => parse_add_column_clause(tokens, index, literals),
+        Some(kind) if kind == "COLUMN" => {
+            parse_add_column_clause(tokens, quoted_flags, index, literals)
+        }
         Some(kind) if kind == "KEY" => parse_add_key_clause(tokens, index + 1, table, false),
         Some(kind) if kind == "UNIQUE" => {
             require_keyword(tokens, index + 2, "KEY")?;
@@ -478,11 +483,13 @@ struct ParsedColumnOptions {
 
 fn parse_add_column_clause(
     tokens: &[String],
+    quoted_flags: &[bool],
     index: usize,
     literals: &mut impl Iterator<Item = String>,
 ) -> Result<(ParsedAlterClause, usize), String> {
     let name = require_identifier(tokens, index + 2, "added column")?;
-    let (column_type, data_type, options_start) = parse_observed_column_type(tokens, index + 3)?;
+    let (column_type, data_type, options_start) =
+        parse_observed_column_type(tokens, quoted_flags, index + 3)?;
     let options = parse_observed_column_options(tokens, options_start, literals)?;
     Ok((
         ParsedAlterClause::AddColumn(ParsedAddColumnAst {
@@ -543,8 +550,10 @@ fn parse_add_key_clause(
 
 fn parse_observed_column_type(
     tokens: &[String],
+    quoted_flags: &[bool],
     mut index: usize,
 ) -> Result<(String, String, usize), String> {
+    require_unquoted_token(quoted_flags, index, "added column type")?;
     let data_type = require_identifier(tokens, index, "added column type")?.to_ascii_lowercase();
     if !matches!(data_type.as_str(), "varchar" | "datetime" | "smallint") {
         return Err(format!(
@@ -554,6 +563,9 @@ fn parse_observed_column_type(
     index += 1;
     let column_type = match data_type.as_str() {
         "varchar" => {
+            require_unquoted_token(quoted_flags, index, "VARCHAR opening parenthesis")?;
+            require_unquoted_token(quoted_flags, index + 1, "VARCHAR length")?;
+            require_unquoted_token(quoted_flags, index + 2, "VARCHAR closing parenthesis")?;
             require_keyword(tokens, index, "(")?;
             let length = tokens
                 .get(index + 1)
@@ -579,6 +591,7 @@ fn parse_observed_column_type(
             if tokens.get(index).map(String::as_str) == Some("(") {
                 return Err("SMALLINT display width is unsupported".to_string());
             }
+            require_unquoted_token(quoted_flags, index, "SMALLINT UNSIGNED keyword")?;
             require_keyword(tokens, index, "UNSIGNED")?;
             index += 1;
             "smallint unsigned".to_string()
@@ -592,6 +605,17 @@ fn parse_observed_column_type(
         return Err(format!("UNSIGNED is unsupported for {data_type}"));
     }
     Ok((column_type, data_type, index))
+}
+
+fn require_unquoted_token(
+    quoted_flags: &[bool],
+    index: usize,
+    context: &str,
+) -> Result<(), String> {
+    if quoted_flags.get(index) == Some(&true) {
+        return Err(format!("quoted token is unsupported for {context}"));
+    }
+    Ok(())
 }
 
 fn parse_observed_column_options(
