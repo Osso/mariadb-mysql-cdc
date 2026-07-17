@@ -304,6 +304,7 @@ fn parse_create_or_alter(
         primary_object: name,
         secondary_object,
         index_ast: None,
+        alter_table_ast: None,
     })
 }
 
@@ -360,6 +361,7 @@ fn parse_drop(tokens: &[String], keywords: &[String]) -> Result<DdlOperation, St
         primary_object: name,
         secondary_object,
         index_ast: None,
+        alter_table_ast: None,
     })
 }
 
@@ -395,6 +397,7 @@ fn parse_rename(tokens: &[String], keywords: &[String]) -> Result<DdlOperation, 
         primary_object: from,
         secondary_object: Some(to),
         index_ast: None,
+        alter_table_ast: None,
     })
 }
 
@@ -410,6 +413,7 @@ fn parse_truncate(tokens: &[String], keywords: &[String]) -> Result<DdlOperation
         primary_object: object_name(tokens, name_index)?,
         secondary_object: None,
         index_ast: None,
+        alter_table_ast: None,
     })
 }
 

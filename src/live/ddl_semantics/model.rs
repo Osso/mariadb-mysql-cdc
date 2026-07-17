@@ -48,12 +48,36 @@ pub struct ParsedIndexAst {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedAddColumnAst {
+    pub name: String,
+    pub column_type: String,
+    pub data_type: String,
+    pub nullable: bool,
+    pub default_value: Option<String>,
+    pub comment: String,
+    pub after: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsedAlterClause {
+    AddColumn(ParsedAddColumnAst),
+    AddKey(ParsedIndexAst),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedAlterTableAst {
+    pub table: String,
+    pub clauses: Vec<ParsedAlterClause>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DdlOperation {
     pub family: DdlFamily,
     pub object_kind: DdlObjectKind,
     pub primary_object: String,
     pub secondary_object: Option<String>,
     pub index_ast: Option<ParsedIndexAst>,
+    pub alter_table_ast: Option<ParsedAlterTableAst>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

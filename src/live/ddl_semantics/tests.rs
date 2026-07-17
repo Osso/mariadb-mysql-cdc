@@ -16,6 +16,7 @@ fn assert_operation_cases(cases: &[(&str, DdlFamily, DdlObjectKind, &str, Option
                 primary_object: (*primary).to_string(),
                 secondary_object: secondary.map(str::to_string),
                 index_ast: parse_simple_index_ddl(sql).ok(),
+                alter_table_ast: None,
             },
             "{sql}",
         );
@@ -214,6 +215,7 @@ fn parser_ignores_comments_and_preserves_quoted_identifier_contents() {
             primary_object: "account.history".to_string(),
             secondary_object: None,
             index_ast: None,
+            alter_table_ast: None,
         }
     );
 }
