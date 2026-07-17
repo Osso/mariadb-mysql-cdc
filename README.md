@@ -134,12 +134,24 @@ cargo run -- sync-table --source-host 127.0.0.1 --source-user reader \
   --mode apply --run-id accounts-repair-20260710-01
 ```
 
+```bash
+cargo run -- catchup-snapshot \
+  --source-host 127.0.0.1 --source-user reader \
+  --source-password-env SOURCE_PASSWORD --source-database app \
+  --source-tls-ca-file /etc/mariadb-mysql-cdc/source-ca.pem \
+  --target-host 127.0.0.1 --target-user writer \
+  --target-password-env TARGET_PASSWORD --target-database app \
+  --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
+  --progress-file /var/lib/mariadb-mysql-cdc/snapshot-progress.json
+```
+
 All target-using commands accept `--target-tls-ca-file PATH`; it defaults to
-`/etc/mariadb-mysql-cdc/do-ca.pem`. Source/binlog commands accept
-`--source-tls-ca-file PATH`; it defaults to `/etc/mariadb-mysql-cdc/source-ca.pem`.
-Each file must be readable and contain a valid PEM or DER CA certificate.
-Connections fail before the driver runs with an endpoint-specific diagnostic when
-that CA is missing, unreadable, or invalid.
+`/etc/mariadb-mysql-cdc/do-ca.pem`, and the CA remains required. Source/binlog
+commands accept `--source-tls-ca-file PATH`; it defaults to
+`/etc/mariadb-mysql-cdc/source-ca.pem`. `catchup-snapshot` requires an explicit
+`--source-tls-ca-file PATH`. Each file must be readable and contain a valid PEM
+or DER CA certificate. Connections fail before the driver runs with an
+endpoint-specific diagnostic when that CA is missing, unreadable, or invalid.
 
 `sync-table` requires `--run-id` and stores resumable state in
 `cdc.table_sync_runs` by default. A new recurrence needs a new ID; reuse is

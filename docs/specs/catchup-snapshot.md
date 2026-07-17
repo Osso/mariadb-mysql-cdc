@@ -6,6 +6,14 @@ in [catchup.md](../catchup.md).
 
 ## What it must do
 
+### Connection security
+
+- [x] Require a source TLS CA file and use it for the MariaDB source inventory
+      and persistent snapshot reads.
+- [x] Require the target TLS CA file and use it for MySQL target writes.
+- [x] Fail before driver connection when either endpoint CA is missing,
+      unreadable, empty, or invalid.
+
 ### Snapshot Execution
 
 - [x] Copy source rows into the target in deterministic primary-key order.

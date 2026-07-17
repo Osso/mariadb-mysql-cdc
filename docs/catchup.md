@@ -13,12 +13,33 @@ This is not a parity proof by itself. `INSERT IGNORE` preserves target rows that
 CDC already wrote, but does not overwrite divergent values or remove target
 orphans. A skipped live duplicate remains reconciliation debt.
 
-Target writes require the reviewed DigitalOcean CA path when mounted; a
-missing, unreadable, or invalid target CA fails before the driver connects with an
-endpoint-specific diagnostic. The catchup source SQL reader currently uses
-non-TLS connections and has no source-CA verification path. The Kubernetes
-catchup manifest does not mount the target CA; do not call a catchup run
-CA-verified until that live deployment gap is closed.
+Catchup source reads and target writes use TLS with endpoint-specific CA files.
+`catchup-snapshot` requires an explicit `--source-tls-ca-file`; a missing,
+unreadable, or invalid source CA fails before the driver connects. Target writes
+continue to require the reviewed DigitalOcean CA at
+`/etc/mariadb-mysql-cdc/do-ca.pem`, with the same fail-before-connect behavior.
+The catchup deployment must mount both CA files and pass the required source
+option; do not call a run CA-verified until that live configuration is checked.
+
+For a resumable snapshot backfill:
+
+```bash
+mariadb-mysql-cdc catchup-snapshot \
+  --source-host 192.0.2.10 \
+  --source-user cdc_reader \
+  --source-password-env SOURCE_PASSWORD \
+  --source-database globalcomix \
+  --source-tls-ca-file /etc/mariadb-mysql-cdc/source-ca.pem \
+  --target-host target-mysql.example \
+  --target-port 25060 \
+  --target-user target_user \
+  --target-password-env TARGET_PASSWORD \
+  --target-database globalcomix \
+  --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
+  --progress-file /var/lib/mariadb-mysql-cdc/snapshot-progress.json \
+  --chunk-size 10000 \
+  --parallel-workers 4
+```
 
 ## Recurring drift repair
 
