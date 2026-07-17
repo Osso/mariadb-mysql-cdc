@@ -17,12 +17,12 @@ type ColumnSpec = (
     &'static str,
 );
 
-pub(crate) const INSERT_GUARD_BODY: &str = "BEGIN IF NEW.status <> 'prepared' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'automatic DDL journal rows must begin prepared'; END IF; END";
+pub(crate) const INSERT_GUARD_BODY: &str = "BEGIN IF NOT ((NEW.status = 'translation_pending' AND NEW.transformation_version = 'translator-unavailable' AND NEW.generated_sql IS NULL AND NEW.canonical_ast = '' AND NEW.pre_state = '' AND NEW.expected_post_state = '') OR (NEW.status = 'prepared' AND NEW.transformation_version <> '' AND NEW.canonical_ast <> '' AND NEW.pre_state <> '' AND NEW.expected_post_state <> '')) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'automatic DDL journal rows must begin translation_pending or prepared with valid evidence'; END IF; END";
 #[cfg(test)]
 pub(crate) const JOURNAL_PENDING_INSERT_TRIGGER_BODY: &str = INSERT_GUARD_BODY;
 #[cfg(test)]
 pub(crate) const JOURNAL_MONOTONIC_UPDATE_TRIGGER_BODY: &str = UPDATE_GUARD_BODY;
-const UPDATE_GUARD_BODY: &str = "BEGIN IF NOT (OLD.source_identity <=> NEW.source_identity) OR NOT (OLD.source_server_id <=> NEW.source_server_id) OR NOT (OLD.binlog_file <=> NEW.binlog_file) OR NOT (OLD.event_start_position <=> NEW.event_start_position) OR NOT (OLD.event_end_position <=> NEW.event_end_position) OR NOT (OLD.schema_name <=> NEW.schema_name) OR NOT (OLD.raw_sql <=> NEW.raw_sql) OR NOT (OLD.transformation_version <=> NEW.transformation_version) OR NOT (OLD.generated_sql <=> NEW.generated_sql) OR NOT (OLD.canonical_ast <=> NEW.canonical_ast) OR NOT (OLD.pre_state <=> NEW.pre_state) OR NOT (OLD.expected_post_state <=> NEW.expected_post_state) OR NOT ((OLD.status = 'prepared' AND NEW.status IN ('applied','blocked')) OR (OLD.status = 'applied' AND NEW.status = 'checkpointed')) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'automatic DDL journal identity/evidence is immutable and status transition is not allowed'; END IF; END";
+const UPDATE_GUARD_BODY: &str = "BEGIN IF NOT (OLD.source_identity <=> NEW.source_identity) OR NOT (OLD.source_server_id <=> NEW.source_server_id) OR NOT (OLD.binlog_file <=> NEW.binlog_file) OR NOT (OLD.event_start_position <=> NEW.event_start_position) OR NOT (OLD.event_end_position <=> NEW.event_end_position) OR NOT (OLD.schema_name <=> NEW.schema_name) OR NOT (OLD.raw_sql <=> NEW.raw_sql) OR NOT ((OLD.status = 'translation_pending' AND NEW.status = 'prepared' AND OLD.transformation_version = 'translator-unavailable' AND OLD.generated_sql IS NULL AND OLD.canonical_ast = '' AND OLD.pre_state = '' AND OLD.expected_post_state = '' AND NEW.transformation_version <> '' AND NEW.canonical_ast <> '' AND NEW.pre_state <> '' AND NEW.expected_post_state <> '') OR ((OLD.transformation_version <=> NEW.transformation_version) AND (OLD.generated_sql <=> NEW.generated_sql) AND (OLD.canonical_ast <=> NEW.canonical_ast) AND (OLD.pre_state <=> NEW.pre_state) AND (OLD.expected_post_state <=> NEW.expected_post_state) AND ((OLD.status = 'prepared' AND NEW.status IN ('applied','blocked')) OR (OLD.status = 'applied' AND NEW.status = 'checkpointed')))) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'automatic DDL journal identity/evidence is immutable and status transition is not allowed'; END IF; END";
 
 pub(crate) fn journal_schema_and_table<'a>(
     table: &'a str,
@@ -229,7 +229,7 @@ fn validate_exact<T: std::fmt::Debug + PartialEq>(
 }
 
 pub(crate) fn validate_ddl_replay_journal_status_checks(checks: &[String]) -> Result<(), String> {
-    let expected = "statusin('prepared','applied','checkpointed','blocked')";
+    let expected = "statusin('translation_pending','prepared','applied','checkpointed','blocked')";
     if checks
         .iter()
         .any(|check| normalize_check(check) == expected)
@@ -320,7 +320,13 @@ fn validate_single_trigger(
     {
         Ok(())
     } else {
-        Err(format!("DDL replay journal {event} guard drift"))
+        Err(format!(
+            "DDL replay journal {event} guard drift: expected name={expected_name} order=1 body={}; found name={} order={} body={}",
+            normalize_sql(expected_body),
+            name,
+            order,
+            normalize_sql(statement),
+        ))
     }
 }
 
@@ -373,7 +379,6 @@ pub(crate) struct JournalRuntimeContract<'a> {
     pub(crate) grants: &'a [String],
     pub(crate) application_schema: &'a str,
     pub(crate) checkpoint_table: &'a str,
-    pub(crate) ledger_table: &'a str,
     pub(crate) journal_table: &'a str,
     pub(crate) conflict_table: &'a str,
     pub(crate) inventory_procedure: &'a str,
@@ -404,7 +409,6 @@ fn validate_runtime_access(contract: &JournalRuntimeContract<'_>) -> Result<(), 
         contract.grants,
         contract.application_schema,
         contract.checkpoint_table,
-        contract.ledger_table,
         contract.journal_table,
         contract.conflict_table,
         contract.inventory_procedure,

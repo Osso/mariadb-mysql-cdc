@@ -17,6 +17,7 @@ pub trait DdlReplayJournal {
     fn earliest_barrier(&self, source_identity: &str) -> Result<Option<JournalBarrier>, String>;
     fn read_status(&self, event: &DdlEvent) -> Result<Option<DdlReplayStatus>, String>;
     fn read_evidence(&self, event: &DdlEvent) -> Result<Option<DdlSemanticEvidence>, String>;
+    fn record_translation_pending(&self, event: &DdlEvent) -> Result<(), String>;
     fn prepare(&self, event: &DdlEvent, evidence: &DdlSemanticEvidence) -> Result<(), String>;
     fn mark_applied(&self, event: &DdlEvent) -> Result<(), String>;
     fn mark_blocked(&self, event: &DdlEvent) -> Result<(), String>;
@@ -84,7 +85,6 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
             grants: &grants,
             application_schema: &self.target.database,
             checkpoint_table: "cdc.stream_checkpoint",
-            ledger_table: "cdc.ddl_events",
             journal_table: &self.table,
             conflict_table: "cdc.row_conflicts",
             inventory_procedure: &inventory_procedure,
@@ -132,19 +132,24 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
         }))
     }
 
-    fn prepare(&self, event: &DdlEvent, evidence: &DdlSemanticEvidence) -> Result<(), String> {
+    fn record_translation_pending(&self, event: &DdlEvent) -> Result<(), String> {
         let mut connection = self.connect()?;
         connection
-            .query_drop(build_prepare_sql(&self.table, event, evidence))
+            .query_drop(build_translation_pending_sql(&self.table, event))
             .map_err(mysql_error)?;
-        if connection.affected_rows() == 1 {
-            Ok(())
+        ensure_one_write(&connection, event, "translation-pending DDL journal insert")
+    }
+
+    fn prepare(&self, event: &DdlEvent, evidence: &DdlSemanticEvidence) -> Result<(), String> {
+        let status = self.read_status(event)?;
+        let sql = if status == Some(DdlReplayStatus::TranslationPending) {
+            build_promote_translation_sql(&self.table, event, evidence)
         } else {
-            Err(format!(
-                "automatic DDL journal prepare did not update exactly one row at {}:{}",
-                event.binlog_file, event.event_start_position
-            ))
-        }
+            build_prepare_sql(&self.table, event, evidence)
+        };
+        let mut connection = self.connect()?;
+        connection.query_drop(sql).map_err(mysql_error)?;
+        ensure_one_write(&connection, event, "automatic DDL journal prepare")
     }
 
     fn mark_applied(&self, event: &DdlEvent) -> Result<(), String> {
@@ -165,6 +170,17 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
             ),
             params: Vec::new(),
         })
+    }
+}
+
+fn ensure_one_write(connection: &Conn, event: &DdlEvent, operation: &str) -> Result<(), String> {
+    if connection.affected_rows() == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{operation} did not update exactly one row at {}:{}",
+            event.binlog_file, event.event_start_position
+        ))
     }
 }
 
@@ -259,12 +275,54 @@ fn parse_barrier(row: (String, u64, String)) -> Result<JournalBarrier, String> {
 
 fn parse_status(status: &str) -> Result<DdlReplayStatus, String> {
     match status {
+        "translation_pending" => Ok(DdlReplayStatus::TranslationPending),
         "prepared" => Ok(DdlReplayStatus::Prepared),
         "applied" => Ok(DdlReplayStatus::Applied),
         "checkpointed" => Ok(DdlReplayStatus::Checkpointed),
         "blocked" => Ok(DdlReplayStatus::Blocked),
         other => Err(format!("unknown automatic DDL journal status `{other}`")),
     }
+}
+
+pub fn build_translation_pending_sql(table: &str, event: &DdlEvent) -> String {
+    format!(
+        "INSERT INTO {} (source_identity,source_server_id,binlog_file,event_start_position,event_end_position,schema_name,raw_sql,transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state,status) VALUES ({},{},{},{},{},{},{},'translator-unavailable',NULL,'','','','translation_pending')",
+        quote_identifier_path(table),
+        quote_sql_literal(&event.source_identity),
+        event.source_server_id,
+        quote_sql_literal(&event.binlog_file),
+        event.event_start_position,
+        event.event_end_position,
+        quote_sql_literal(&event.schema_name),
+        quote_sql_literal(&event.raw_sql),
+    )
+}
+
+pub fn build_promote_translation_sql(
+    table: &str,
+    event: &DdlEvent,
+    evidence: &DdlSemanticEvidence,
+) -> String {
+    format!(
+        "UPDATE {} SET transformation_version={},generated_sql={},canonical_ast={},pre_state={},expected_post_state={},status='prepared' WHERE source_identity={} AND source_server_id={} AND binlog_file={} AND event_start_position={} AND event_end_position={} AND schema_name={} AND raw_sql={} AND status='translation_pending'",
+        quote_identifier_path(table),
+        quote_sql_literal(&evidence.transformation_version),
+        evidence
+            .generated_sql
+            .as_deref()
+            .map(quote_sql_literal)
+            .unwrap_or_else(|| "NULL".to_string()),
+        quote_sql_literal(&evidence.canonical_ast),
+        quote_sql_literal(&evidence.pre_state),
+        quote_sql_literal(&evidence.expected_post_state),
+        quote_sql_literal(&event.source_identity),
+        event.source_server_id,
+        quote_sql_literal(&event.binlog_file),
+        event.event_start_position,
+        event.event_end_position,
+        quote_sql_literal(&event.schema_name),
+        quote_sql_literal(&event.raw_sql),
+    )
 }
 
 pub fn build_prepare_sql(table: &str, event: &DdlEvent, evidence: &DdlSemanticEvidence) -> String {
@@ -297,7 +355,7 @@ pub fn build_barrier_select_sql(table: &str, source_identity: &str) -> String {
         .replace('_', "=_");
     let pattern = format!("{escaped_identity}#server-id=%");
     format!(
-        "SELECT binlog_file,event_start_position,status FROM {} WHERE source_identity LIKE {} ESCAPE '=' AND status IN ('prepared','blocked') ORDER BY binlog_file,event_start_position LIMIT 1",
+        "SELECT binlog_file,event_start_position,status FROM {} WHERE source_identity LIKE {} ESCAPE '=' AND status IN ('translation_pending','prepared','blocked') ORDER BY binlog_file,event_start_position LIMIT 1",
         quote_identifier_path(table),
         quote_sql_literal(&pattern),
     )
@@ -339,7 +397,9 @@ pub fn replay_action(
     status: Option<DdlReplayStatus>,
 ) -> Result<super::DdlReplayAction, String> {
     match status {
-        None => Ok(super::DdlReplayAction::PrepareAndExecute),
+        None | Some(DdlReplayStatus::TranslationPending) => {
+            Ok(super::DdlReplayAction::PrepareAndExecute)
+        }
         Some(DdlReplayStatus::Prepared) => Err(format!(
             "ambiguous automatic DDL at {}:{}; inspect target state before resolving journal entry",
             event.binlog_file, event.event_start_position

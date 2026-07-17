@@ -74,7 +74,6 @@ fn grants() -> Vec<String> {
         "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, EVENT, TRIGGER ON `globalcomix`.* TO `cdc_stream`@`%`".to_string(),
         "GRANT SELECT, INSERT, UPDATE ON `cdc`.`stream_checkpoint` TO `cdc_stream`@`%`".to_string(),
         "GRANT SELECT, INSERT, UPDATE ON `cdc`.`row_conflicts` TO `cdc_stream`@`%`".to_string(),
-        "GRANT SELECT, INSERT ON `cdc`.`ddl_events` TO `cdc_stream`@`%`".to_string(),
         "GRANT SELECT, INSERT, UPDATE ON `cdc`.`ddl_replay_journal` TO `cdc_stream`@`%`".to_string(),
         "GRANT EXECUTE ON PROCEDURE `cdc`.`ddl_replay_journal_trigger_inventory` TO `cdc_stream`@`%`".to_string(),
     ]
@@ -99,7 +98,6 @@ fn runtime_contract<'a>(
         grants,
         application_schema: "globalcomix",
         checkpoint_table: "cdc.stream_checkpoint",
-        ledger_table: "cdc.ddl_events",
         journal_table: "cdc.ddl_replay_journal",
         conflict_table: "cdc.row_conflicts",
         inventory_procedure: "cdc.ddl_replay_journal_trigger_inventory",
@@ -171,7 +169,10 @@ fn validates_journal_runtime_contract_with_call_rows_and_exact_execute_only() {
     let columns = expected_ddl_replay_journal_columns();
     let keys = expected_ddl_replay_journal_keys();
     let constraints = expected_ddl_replay_journal_constraints();
-    let checks = vec!["(status in ('prepared','applied','checkpointed','blocked'))".to_string()];
+    let checks = vec![
+        "(status in ('translation_pending','prepared','applied','checkpointed','blocked'))"
+            .to_string(),
+    ];
     let trigger_rows = triggers();
     let grant_rows = grants();
     assert_runtime_contract(
@@ -244,7 +245,6 @@ fn validates_required_runtime_grants_and_rejects_control_plane_bypass() {
             &grant_rows,
             "globalcomix",
             "cdc.stream_checkpoint",
-            "cdc.ddl_events",
             "cdc.ddl_replay_journal",
             "cdc.row_conflicts",
             "cdc.ddl_replay_journal_trigger_inventory"
@@ -267,7 +267,6 @@ fn assert_missing_conflict_update_is_rejected(grant_rows: &[String]) {
         &missing,
         "globalcomix",
         "cdc.stream_checkpoint",
-        "cdc.ddl_events",
         "cdc.ddl_replay_journal",
         "cdc.row_conflicts",
         "cdc.ddl_replay_journal_trigger_inventory",
@@ -286,7 +285,6 @@ fn assert_missing_application_privilege_is_rejected(grant_rows: &[String]) {
             &missing,
             "globalcomix",
             "cdc.stream_checkpoint",
-            "cdc.ddl_events",
             "cdc.ddl_replay_journal",
             "cdc.row_conflicts",
             "cdc.ddl_replay_journal_trigger_inventory",
@@ -314,7 +312,6 @@ fn assert_bad_grants_are_rejected(grant_rows: &[String]) {
                 &drifted,
                 "globalcomix",
                 "cdc.stream_checkpoint",
-                "cdc.ddl_events",
                 "cdc.ddl_replay_journal",
                 "cdc.row_conflicts",
                 "cdc.ddl_replay_journal_trigger_inventory"
@@ -497,7 +494,7 @@ fn unresolved_entry_blocks_later_source_events() {
 #[test]
 fn startup_barrier_query_is_source_scoped_and_ordered() {
     let sql = build_barrier_select_sql("cdc.ddl_replay_journal", "prod%_source");
-    assert!(sql.contains("status IN ('prepared','blocked')"));
+    assert!(sql.contains("status IN ('translation_pending','prepared','blocked')"));
     assert!(sql.contains("prod=%=_source#server-id=%"));
     assert!(sql.contains("ESCAPE '='"));
     assert!(sql.contains("ORDER BY binlog_file,event_start_position LIMIT 1"));

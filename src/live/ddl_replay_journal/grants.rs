@@ -75,7 +75,6 @@ const APPLICATION_DDL_PRIVILEGES: &[&str] = &[
     "TRIGGER",
 ];
 const CHECKPOINT_PRIVILEGES: &[&str] = &["SELECT", "INSERT", "UPDATE"];
-const LEDGER_PRIVILEGES: &[&str] = &["SELECT", "INSERT"];
 const JOURNAL_PRIVILEGES: &[&str] = &["SELECT", "INSERT", "UPDATE"];
 const EXECUTE_PRIVILEGES: &[&str] = &["EXECUTE"];
 
@@ -90,7 +89,6 @@ pub(crate) fn validate_runtime_grants(
     grants: &[String],
     application_schema: &str,
     checkpoint_table: &str,
-    ledger_table: &str,
     journal_table: &str,
     conflict_table: &str,
     inventory_procedure: &str,
@@ -98,7 +96,6 @@ pub(crate) fn validate_runtime_grants(
     let policy = RuntimeGrantPolicy::new(
         application_schema,
         checkpoint_table,
-        ledger_table,
         journal_table,
         conflict_table,
         inventory_procedure,
@@ -127,7 +124,6 @@ fn collect_grants(
 struct RuntimeGrantPolicy {
     application_scope: String,
     checkpoint_scope: String,
-    ledger_scope: String,
     journal_scope: String,
     conflict_scope: String,
     inventory_scope: String,
@@ -137,7 +133,6 @@ impl RuntimeGrantPolicy {
     fn new(
         application_schema: &str,
         checkpoint_table: &str,
-        ledger_table: &str,
         journal_table: &str,
         conflict_table: &str,
         inventory_procedure: &str,
@@ -145,7 +140,6 @@ impl RuntimeGrantPolicy {
         Self {
             application_scope: format!("{application_schema}.*").to_ascii_uppercase(),
             checkpoint_scope: checkpoint_table.to_ascii_uppercase(),
-            ledger_scope: ledger_table.to_ascii_uppercase(),
             journal_scope: journal_table.to_ascii_uppercase(),
             conflict_scope: conflict_table.to_ascii_uppercase(),
             inventory_scope: exact_procedure_scope(inventory_procedure),
@@ -176,12 +170,10 @@ impl RuntimeGrantPolicy {
         }
         let privileges = match scope {
             scope if scope == self.checkpoint_scope => CHECKPOINT_PRIVILEGES,
-            scope if scope == self.ledger_scope => LEDGER_PRIVILEGES,
             scope if scope == self.journal_scope => JOURNAL_PRIVILEGES,
             scope if scope == self.conflict_scope => JOURNAL_PRIVILEGES,
             scope if scope == self.inventory_scope => EXECUTE_PRIVILEGES,
-            "PROCEDURE CDC.DDL_EVENTS_TRIGGER_INVENTORY"
-            | "PROCEDURE CDC.ROW_CONFLICTS_TRIGGER_INVENTORY" => EXECUTE_PRIVILEGES,
+            "PROCEDURE CDC.ROW_CONFLICTS_TRIGGER_INVENTORY" => EXECUTE_PRIVILEGES,
             _ => return None,
         };
         Some(RuntimeGrantScope::Control(privileges))
@@ -251,7 +243,6 @@ fn validate_required_runtime_scopes(
 ) -> Result<(), String> {
     let required = [
         (&policy.checkpoint_scope, CHECKPOINT_PRIVILEGES),
-        (&policy.ledger_scope, LEDGER_PRIVILEGES),
         (&policy.journal_scope, JOURNAL_PRIVILEGES),
         (&policy.conflict_scope, JOURNAL_PRIVILEGES),
         (&policy.inventory_scope, EXECUTE_PRIVILEGES),

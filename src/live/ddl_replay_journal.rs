@@ -1,4 +1,4 @@
-use super::ddl_ledger::DdlEvent;
+use super::ddl_event::DdlEvent;
 use super::ddl_semantics::DdlSemanticEvidence;
 use super::{TargetMySqlConfig, target_session_init_command};
 use crate::mysql_support::target_mysql_opts;
@@ -40,6 +40,7 @@ fn mysql_error(error: mysql::Error) -> String {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DdlReplayStatus {
+    TranslationPending,
     Prepared,
     Applied,
     Checkpointed,
@@ -151,8 +152,9 @@ pub fn enforce_no_overtake(
 }
 
 impl DdlReplayStatus {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::TranslationPending => "translation_pending",
             Self::Prepared => "prepared",
             Self::Applied => "applied",
             Self::Checkpointed => "checkpointed",
