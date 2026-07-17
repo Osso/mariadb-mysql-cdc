@@ -3,13 +3,17 @@ use super::{
     ApplyBinlogConfig, ApplyBinlogError, QuarantineRecorder, RecordingQuarantine,
     SourceBinlogConfig,
 };
+use crate::conflict_repair::{ConflictStore, MySqlConflictStore};
 use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
     SourceBinlogSettings, build_inventory,
 };
 use crate::mysql_support::TARGET_TLS_CA_FILE;
 use crate::probe::BinlogCoordinate;
-use crate::row::{DeleteRowsEvent, RowApplier, RowImage, RowTableMap, RowUpdate, TableMapEvent};
+use crate::row::{
+    DeleteRowsEvent, RowApplier, RowConflictContext, RowImage, RowTableMap, RowUpdate,
+    TableMapEvent,
+};
 use crate::statement::{StatementApplier, StatementEvent, StatementOutcome};
 use crate::target::{TargetExecutor, TransactionalTargetExecutor};
 use mysql::Value;
@@ -29,7 +33,7 @@ use mysql_cdc::ssl_mode::SslMode;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::progress::{StreamProgress, format_stream_progress};
 use super::reconnect::{StreamCheckpointStore, run_stream_reconnect_loop};
@@ -296,6 +300,11 @@ fn stream_once(
     executor
         .acquire_stream_lease(&format!("cdc-stream:{}", config.target.database))
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    let mut conflict_store = MySqlConflictStore::new(&config.target, "cdc.row_conflicts")
+        .map_err(ApplyBinlogError::Checkpoint)?;
+    conflict_store
+        .ensure()
+        .map_err(ApplyBinlogError::Checkpoint)?;
     let mut applier = RowApplier::new(executor);
     let ddl_ledger = MySqlDdlEventLedger::new(&config.target, config.ddl_ledger_table.clone());
     ddl_ledger.ensure().map_err(ApplyBinlogError::Statement)?;
@@ -348,9 +357,14 @@ fn stream_once(
                 &event,
             )? {
                 Some(outcome) => outcome,
-                None => {
-                    apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)?
-                }
+                None => apply_stream_event_transactionally_with_conflicts(
+                    &mut applier,
+                    &mut context,
+                    &header,
+                    &event,
+                    &source_identity,
+                    &mut conflict_store,
+                )?,
             },
         };
         log_stream_progress(&mut progress, &outcome);
@@ -845,11 +859,36 @@ fn lock_validate_and_save_checkpoint(
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))
 }
 
+#[cfg(test)]
 fn apply_stream_event_transactionally<E, R, C>(
     applier: &mut RowApplier<E>,
     context: &mut StreamEventContext<'_, R, C>,
     header: &EventHeader,
     event: &BinlogEvent,
+) -> Result<StructuredEventOutcome, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    R: TableSchemaResolver,
+    C: StreamCheckpointStore,
+{
+    let mut conflict_store = crate::conflict_repair::InMemoryConflictStore::default();
+    apply_stream_event_transactionally_with_conflicts(
+        applier,
+        context,
+        header,
+        event,
+        "test-source",
+        &mut conflict_store,
+    )
+}
+
+fn apply_stream_event_transactionally_with_conflicts<E, R, C>(
+    applier: &mut RowApplier<E>,
+    context: &mut StreamEventContext<'_, R, C>,
+    header: &EventHeader,
+    event: &BinlogEvent,
+    source_identity: &str,
+    conflict_store: &mut dyn ConflictStore,
 ) -> Result<StructuredEventOutcome, ApplyBinlogError>
 where
     E: TransactionalTargetExecutor,
@@ -870,13 +909,21 @@ where
             .begin_if_needed(applier.executor())?;
     }
 
-    let outcome = match handle_structured_event(
+    let mut conflict_context = RowConflictContext {
+        store: conflict_store,
+        source_identity,
+        source_server_id: u64::from(header.server_id),
+        end_position: u64::from(header.next_event_position),
+        observed_at_ms: current_time_ms(),
+    };
+    let outcome = match handle_structured_event_with_conflicts(
         applier,
         context.schema_resolver,
         context.state,
         context.current_file,
         header,
         event,
+        Some(&mut conflict_context),
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -1048,8 +1095,39 @@ where
     E: TargetExecutor,
     R: TableSchemaResolver,
 {
+    handle_structured_event_with_conflicts(
+        applier,
+        schema_resolver,
+        state,
+        current_file,
+        header,
+        event,
+        None,
+    )
+}
+
+fn handle_structured_event_with_conflicts<E, R>(
+    applier: &mut RowApplier<E>,
+    schema_resolver: &R,
+    state: &mut StructuredEventState,
+    current_file: &str,
+    header: &EventHeader,
+    event: &BinlogEvent,
+    conflict_context: Option<&mut RowConflictContext<'_>>,
+) -> Result<StructuredEventOutcome, ApplyBinlogError>
+where
+    E: TargetExecutor,
+    R: TableSchemaResolver,
+{
     let coordinate = event_coordinate(current_file, header, event);
-    let policy = apply_structured_event(applier, schema_resolver, state, &coordinate, event)?;
+    let policy = apply_structured_event(
+        applier,
+        schema_resolver,
+        state,
+        &coordinate,
+        event,
+        conflict_context,
+    )?;
     Ok(StructuredEventOutcome {
         policy,
         resume_coordinate: resume_coordinate(current_file, header, event),
@@ -1062,6 +1140,7 @@ fn apply_structured_event<E, R>(
     state: &mut StructuredEventState,
     coordinate: &BinlogCoordinate,
     event: &BinlogEvent,
+    conflict_context: Option<&mut RowConflictContext<'_>>,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
@@ -1072,13 +1151,13 @@ where
             apply_table_map_event(applier, schema_resolver, state, coordinate, table_map)
         }
         BinlogEvent::WriteRowsEvent(rows) => {
-            apply_write_rows_event(applier, state, coordinate, rows)
+            apply_write_rows_event(applier, state, coordinate, rows, conflict_context)
         }
         BinlogEvent::UpdateRowsEvent(rows) => {
-            apply_update_rows_event(applier, state, coordinate, rows)
+            apply_update_rows_event(applier, state, coordinate, rows, conflict_context)
         }
         BinlogEvent::DeleteRowsEvent(rows) => {
-            apply_delete_rows_event(applier, state, coordinate, rows)
+            apply_delete_rows_event(applier, state, coordinate, rows, conflict_context)
         }
         BinlogEvent::XidEvent(_) => Ok(EventPolicy::CommitTransaction),
         BinlogEvent::IntVarEvent(event) => {
@@ -1378,6 +1457,7 @@ fn apply_write_rows_event<E>(
     state: &StructuredEventState,
     coordinate: &BinlogCoordinate,
     rows: &mysql_cdc::events::row_events::write_rows_event::WriteRowsEvent,
+    conflict_context: Option<&mut RowConflictContext<'_>>,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
@@ -1392,9 +1472,15 @@ where
         table_id: rows.table_id,
         rows: map_row_data_list(&rows.rows, &table)?,
     };
-    applier
-        .apply_write_rows(&event)
-        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    if let Some(context) = conflict_context {
+        applier
+            .apply_write_rows_with_conflicts(&event, context)
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    } else {
+        applier
+            .apply_write_rows(&event)
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    }
     Ok(EventPolicy::ApplyRows)
 }
 
@@ -1403,6 +1489,7 @@ fn apply_update_rows_event<E>(
     state: &StructuredEventState,
     coordinate: &BinlogCoordinate,
     rows: &mysql_cdc::events::row_events::update_rows_event::UpdateRowsEvent,
+    conflict_context: Option<&mut RowConflictContext<'_>>,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
@@ -1422,9 +1509,15 @@ where
             .map(|row| map_update_row_data(row, &table))
             .collect::<Result<Vec<_>, _>>()?,
     };
-    applier
-        .apply_update_rows(&event)
-        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    if let Some(context) = conflict_context {
+        applier
+            .apply_update_rows_with_conflicts(&event, context)
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    } else {
+        applier
+            .apply_update_rows(&event)
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    }
     Ok(EventPolicy::ApplyRows)
 }
 
@@ -1433,6 +1526,7 @@ fn apply_delete_rows_event<E>(
     state: &StructuredEventState,
     coordinate: &BinlogCoordinate,
     rows: &mysql_cdc::events::row_events::delete_rows_event::DeleteRowsEvent,
+    conflict_context: Option<&mut RowConflictContext<'_>>,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
@@ -1447,10 +1541,23 @@ where
         table_id: rows.table_id,
         rows: map_row_data_list(&rows.rows, &table)?,
     };
-    applier
-        .apply_delete_rows(&event)
-        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    if let Some(context) = conflict_context {
+        applier
+            .apply_delete_rows_with_conflicts(&event, context)
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    } else {
+        applier
+            .apply_delete_rows(&event)
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    }
     Ok(EventPolicy::ApplyRows)
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub(crate) fn replica_options_from_source(
