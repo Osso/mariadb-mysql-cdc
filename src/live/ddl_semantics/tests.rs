@@ -1,6 +1,5 @@
 use super::transform::{
-    DDL_TRANSFORMATION_VERSION, parse_production_alter_table_ast,
-    transform_drop_columns_if_exists,
+    DDL_TRANSFORMATION_VERSION, parse_production_alter_table_ast, transform_drop_columns_if_exists,
 };
 use super::*;
 use crate::inventory::{
