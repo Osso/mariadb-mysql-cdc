@@ -1,7 +1,7 @@
 use super::super::ddl_replay_journal::DdlFamily;
 use super::model::{
-    DdlObjectKind, DdlOperation, DdlSemanticEvidence, ParsedIndexAst, ParsedIndexKeyPart,
-    SemanticSchemaSnapshot,
+    DdlObjectKind, DdlOperation, DdlSemanticEvidence, ParsedAddColumnAst, ParsedAlterClause,
+    ParsedAlterTableAst, ParsedIndexAst, ParsedIndexKeyPart, SemanticSchemaSnapshot,
 };
 use serde_json::json;
 
@@ -29,6 +29,7 @@ fn canonical_ast(operation: &DdlOperation) -> Result<String, String> {
         "primary_object": operation.primary_object,
         "secondary_object": operation.secondary_object,
         "parsed_index": operation.index_ast.as_ref().map(canonical_index_ast_value),
+        "parsed_alter_table": operation.alter_table_ast.as_ref().map(canonical_alter_table_ast_value),
     }))
     .map_err(|error| format!("failed to encode canonical DDL AST: {error}"))
 }
@@ -49,6 +50,9 @@ fn canonical_post_state(
     target: &SemanticSchemaSnapshot,
     source: &SemanticSchemaSnapshot,
 ) -> Result<String, String> {
+    if operation.alter_table_ast.is_some() {
+        return translated_alter_table_post_state(target, operation);
+    }
     match operation.family {
         DdlFamily::Index => translated_index_post_state(target, operation),
         DdlFamily::Drop => Ok(canonical_absent_state()),
@@ -218,6 +222,116 @@ fn canonical_index_state(
         .as_deref()
         .ok_or_else(|| "index DDL table is missing".to_string())?;
     canonical_table_structure_state(snapshot, table)
+}
+
+fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Value {
+    json!({
+        "table": ast.table,
+        "clauses": ast.clauses.iter().map(|clause| match clause {
+            ParsedAlterClause::AddColumn(column) => json!({
+                "kind": "add_column",
+                "name": column.name,
+                "column_type": column.column_type,
+                "data_type": column.data_type,
+                "nullable": column.nullable,
+                "default_value": column.default_value,
+                "comment": column.comment,
+                "after": column.after,
+            }),
+            ParsedAlterClause::AddKey(index) => json!({
+                "kind": "add_key",
+                "index": canonical_index_ast_value(index),
+            }),
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn translated_alter_table_post_state(
+    target: &SemanticSchemaSnapshot,
+    operation: &DdlOperation,
+) -> Result<String, String> {
+    let ast = operation
+        .alter_table_ast
+        .as_ref()
+        .ok_or_else(|| "ALTER TABLE DDL lacks parsed AST".to_string())?;
+    let mut expected = target.clone();
+    for clause in &ast.clauses {
+        apply_alter_clause(&mut expected, ast, clause)?;
+    }
+    canonical_table_structure_state(&expected, &ast.table)
+}
+
+fn apply_alter_clause(
+    expected: &mut SemanticSchemaSnapshot,
+    ast: &ParsedAlterTableAst,
+    clause: &ParsedAlterClause,
+) -> Result<(), String> {
+    match clause {
+        ParsedAlterClause::AddColumn(column) => apply_add_column(expected, &ast.table, column),
+        ParsedAlterClause::AddKey(index) => apply_add_key(expected, index),
+    }
+}
+
+fn apply_add_column(
+    expected: &mut SemanticSchemaSnapshot,
+    table_name: &str,
+    column: &ParsedAddColumnAst,
+) -> Result<(), String> {
+    let table = expected
+        .inventory
+        .tables
+        .iter_mut()
+        .find(|table| table.name == table_name)
+        .ok_or_else(|| format!("ALTER TABLE target `{table_name}` is missing"))?;
+    if table.columns.iter().any(|item| item.name == column.name) {
+        return Err(format!(
+            "ADD COLUMN target `{table_name}` already contains `{}`",
+            column.name
+        ));
+    }
+    let insertion = match &column.after {
+        Some(after) => table
+            .columns
+            .iter()
+            .position(|item| item.name == *after)
+            .map(|position| position + 1)
+            .ok_or_else(|| format!("ADD COLUMN AFTER target `{table_name}`.`{after}` is missing"))?,
+        None => table.columns.len(),
+    };
+    table.columns.insert(
+        insertion,
+        crate::inventory::ColumnInventory {
+            name: column.name.clone(),
+            ordinal_position: 0,
+            column_type: column.column_type.clone(),
+            data_type: column.data_type.clone(),
+            is_nullable: column.nullable,
+            default_value: column.default_value.clone(),
+            extra: String::new(),
+            comment: column.comment.clone(),
+            generated: None,
+        },
+    );
+    for (index, item) in table.columns.iter_mut().enumerate() {
+        item.ordinal_position = (index + 1) as u32;
+    }
+    Ok(())
+}
+
+fn apply_add_key(
+    expected: &mut SemanticSchemaSnapshot,
+    ast: &ParsedIndexAst,
+) -> Result<(), String> {
+    validate_index_operation(expected, &DdlOperation {
+        family: DdlFamily::Index,
+        object_kind: DdlObjectKind::Index,
+        primary_object: ast.name.clone(),
+        secondary_object: Some(ast.table.clone()),
+        index_ast: Some(ast.clone()),
+        alter_table_ast: None,
+    })?;
+    expected.inventory.indexes.push(index_inventory_from_ast(ast));
+    Ok(())
 }
 
 fn canonical_index_ast_value(ast: &ParsedIndexAst) -> serde_json::Value {

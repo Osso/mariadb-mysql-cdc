@@ -148,8 +148,8 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
     ) -> Result<DdlSemanticEvidence, String> {
         let operation = parse_ddl_operation(sql)?;
         let target_before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
-        if operation.object_kind == DdlObjectKind::Index {
-            return capture_index_evidence(self, &operation, &target_before);
+        if operation.object_kind == DdlObjectKind::Index || operation.alter_table_ast.is_some() {
+            return capture_translated_evidence(self, &operation, &target_before);
         }
         capture_source_evidence(
             self,
@@ -169,7 +169,7 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
     }
 }
 
-fn capture_index_evidence(
+fn capture_translated_evidence(
     inventory: &LiveDdlSemanticInventory,
     operation: &DdlOperation,
     target_before: &SemanticSchemaSnapshot,
