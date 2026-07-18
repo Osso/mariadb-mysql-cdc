@@ -21,11 +21,20 @@ The applier translates full row images into target DML:
   not change, only changed writable columns need assignment.
 - `DeleteRowsEvent` uses every before-image primary-key column for `DELETE`.
 
-Each row statement runs inside the target transaction. Duplicate-key and
-supported constraint conflicts are recorded in the independent conflict ledger,
-then returned as row failures; the target transaction and its live checkpoint are
-not advanced. Repeating the same source event updates the same conflict record,
-while a different source primary key gets a different record.
+Each row statement runs inside the target transaction. Supported constraint
+conflicts are recorded in the independent conflict ledger, then returned as row
+failures; the target transaction and its live checkpoint are not advanced.
+Repeating the same source event updates the same conflict record, while a
+different source primary key gets a different record.
+
+`--insert-conflict-policy ignore-duplicate` applies to this native ROW path.
+For a ROW `INSERT`, a MySQL `1062` is logged as skipped without durable conflict
+evidence only when the target row fetched by source primary key exactly equals
+the source row. A divergent or otherwise non-equal row becomes a durable
+constraint conflict, fails the row event, and blocks checkpoint advancement.
+A ROW `UPDATE` duplicate remains policy-skipped under `ignore-duplicate`; the
+default `error` policy fails native row duplicates. Supported non-duplicate
+constraint conflicts remain durable repair debt regardless of this policy.
 
 Primary-key values are extracted from the table map's primary-key columns. A row
 event with no table map, no primary key, or a missing primary-key value fails

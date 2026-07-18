@@ -20,6 +20,23 @@ For a ROW update that changes its primary key, the assignments cover every
 writable, non-generated after-image column and the predicates cover every
 before-image primary-key column.
 
+## Insert conflict policy boundary
+
+`--insert-conflict-policy ignore-duplicate` affects generic target execution:
+a MySQL `1062` is treated as success when the statement begins with `INSERT INTO`.
+It also applies to native ROW changes: a duplicate from a ROW `INSERT` is
+logged as skipped without durable conflict evidence only when the target row
+fetched by source primary key exactly equals the source row. A divergent or
+otherwise non-equal row uses the durable constraint-conflict path and rolls back
+the target transaction/checkpoint. ROW `UPDATE` duplicates remain policy-skipped.
+With the default `error` policy, native row duplicates fail, roll back the
+transaction, and leave the checkpoint unchanged. Supported non-duplicate
+constraint conflicts still use the durable conflict path.
+
+Snapshot/catchup writes and normal range table repairs explicitly use
+`INSERT IGNORE`; that SQL choice is independent of the flag. The
+`sync-table --updated-since` path uses an upsert.
+
 Errors include:
 
 - operation name
