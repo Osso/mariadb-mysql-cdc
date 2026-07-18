@@ -51,7 +51,7 @@ where
         row_target_error(coordinate, table, operation, RowError::Target(source))
     })?;
     match outcome {
-        TargetExecutionOutcome::Applied => resolve_successful_conflict(
+        TargetExecutionOutcome::Applied => stage_successful_conflict_resolution(
             context,
             coordinate,
             table,
