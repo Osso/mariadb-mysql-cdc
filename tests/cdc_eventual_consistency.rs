@@ -87,8 +87,8 @@ fn real_catchup_snapshot_tls_harness_smoke() {
 
 #[test]
 fn source_harness_stream_account_allows_plaintext_transport() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/cdc-harness-source-bootstrap.sql");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cdc-harness-source-bootstrap.sql");
     let source_bootstrap = fs::read_to_string(fixture).expect("read source bootstrap fixture");
     assert!(!source_bootstrap.contains("REQUIRE SSL"));
 }
