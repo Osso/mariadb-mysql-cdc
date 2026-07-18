@@ -5,7 +5,7 @@ use super::model::{
 use crate::conflict_repair::{ConflictCoordinate, ConflictObservation, ConflictStore};
 use crate::mysql_client::value_to_string;
 use crate::probe::BinlogCoordinate;
-use crate::target::{SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor};
+use crate::target::{TargetExecuteError, TargetExecutionOutcome, TargetExecutor, TargetRowChange};
 use mysql::Value;
 
 pub(crate) fn build_duplicate_conflict_observation(
@@ -37,17 +37,17 @@ pub(crate) fn build_duplicate_conflict_observation(
 
 pub(crate) fn execute_row_statement<E>(
     executor: &E,
-    statement: SqlStatement,
+    change: TargetRowChange,
     coordinate: &BinlogCoordinate,
     table: &RowTableMap,
     operation: RowOperation,
-    primary_key: &[Value],
     context: Option<&mut RowConflictContext<'_>>,
 ) -> RowResult<()>
 where
     E: TargetExecutor,
 {
-    let outcome = executor.execute_row_change(&statement).map_err(|source| {
+    let primary_key = &change.primary_key_values;
+    let outcome = executor.execute_row_change(&change).map_err(|source| {
         row_target_error(coordinate, table, operation, RowError::Target(source))
     })?;
     match outcome {

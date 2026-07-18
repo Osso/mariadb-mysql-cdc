@@ -35,6 +35,24 @@ pub struct DuplicateConflict {
     pub duplicate_index: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetRowChangeKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TargetRowChange {
+    pub statement: SqlStatement,
+    pub kind: TargetRowChangeKind,
+    pub table: String,
+    pub primary_key_columns: Vec<String>,
+    pub primary_key_values: Vec<Value>,
+    pub writable_columns: Vec<String>,
+    pub source_values: Vec<Value>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TargetExecutionOutcome {
     Applied,
@@ -47,9 +65,9 @@ pub trait TargetExecutor {
 
     fn execute_row_change(
         &self,
-        statement: &SqlStatement,
+        change: &TargetRowChange,
     ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
-        self.execute(statement)?;
+        self.execute(&change.statement)?;
         Ok(TargetExecutionOutcome::Applied)
     }
 }
@@ -72,6 +90,18 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
     ) -> Result<(), TargetExecuteError>;
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
+}
+
+pub(crate) fn duplicate_insert_outcome(
+    conflict: DuplicateConflict,
+    existing_values: Option<&[Value]>,
+    source_values: &[Value],
+) -> TargetExecutionOutcome {
+    if existing_values.is_some_and(|values| values == source_values) {
+        TargetExecutionOutcome::DuplicateIgnored(conflict)
+    } else {
+        TargetExecutionOutcome::ConstraintConflict(conflict)
+    }
 }
 
 impl<E> TransactionalTargetExecutor for &E
@@ -581,6 +611,33 @@ mod tests {
         assert_eq!(executed.len(), 2);
         assert_eq!(executed[0].params.len(), 65_520);
         assert_eq!(executed[1].params.len(), 21);
+    }
+
+    #[test]
+    fn duplicate_insert_continues_only_for_type_aware_equal_values() {
+        let conflict = DuplicateConflict {
+            error_code: 1062,
+            error_text: "duplicate".to_string(),
+            duplicate_index: Some("PRIMARY".to_string()),
+        };
+        let source_values = vec![Value::UInt(7), Value::Bytes(b"same".to_vec())];
+
+        assert_eq!(
+            duplicate_insert_outcome(conflict.clone(), Some(&source_values), &source_values,),
+            TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
+        );
+        assert_eq!(
+            duplicate_insert_outcome(
+                conflict.clone(),
+                Some(&[Value::Int(7), Value::Bytes(b"same".to_vec())]),
+                &source_values,
+            ),
+            TargetExecutionOutcome::ConstraintConflict(conflict.clone())
+        );
+        assert_eq!(
+            duplicate_insert_outcome(conflict.clone(), None, &source_values),
+            TargetExecutionOutcome::ConstraintConflict(conflict)
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use super::{ApplyBinlogConfig, MysqlCliExecutor, SourceBinlogConfig};
-use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
+use crate::target::{
+    SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor, TargetRowChange,
+};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
 use std::cell::RefCell;
@@ -36,6 +38,16 @@ where
         match self.target.execute(statement) {
             Ok(()) => Ok(()),
             Err(error) => self.create_missing_table_and_retry(statement, error),
+        }
+    }
+
+    fn execute_row_change(
+        &self,
+        change: &TargetRowChange,
+    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+        match self.target.execute_row_change(change) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => self.create_missing_table_and_retry_row_change(change, error),
         }
     }
 }
@@ -81,6 +93,25 @@ where
         self.target.execute(statement).map_err(|source| {
             TargetExecuteError::new(format!(
                 "statement still failed after creating missing target table `{table}`: {source}"
+            ))
+        })
+    }
+
+    fn create_missing_table_and_retry_row_change(
+        &self,
+        change: &TargetRowChange,
+        error: TargetExecuteError,
+    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+        let Some(table) = missing_target_table_name(&error.to_string()) else {
+            return Err(error);
+        };
+
+        let source_ddl = self.source_schema.read_create_table(&table)?;
+        let target_ddl = mysql_compatible_create_table(&source_ddl);
+        self.create_target_table(&table, target_ddl)?;
+        self.target.execute_row_change(change).map_err(|source| {
+            TargetExecuteError::new(format!(
+                "row change still failed after creating missing target table `{table}`: {source}"
             ))
         })
     }

@@ -136,7 +136,7 @@ pub(crate) fn build_delete_statement(
     })
 }
 
-fn writable_columns(table: &RowTableMap) -> Vec<String> {
+pub(crate) fn writable_columns(table: &RowTableMap) -> Vec<String> {
     table
         .columns
         .iter()
@@ -145,7 +145,7 @@ fn writable_columns(table: &RowTableMap) -> Vec<String> {
         .collect()
 }
 
-fn ordered_values(row: &RowImage, columns: &[String]) -> Vec<Value> {
+pub(crate) fn ordered_values(row: &RowImage, columns: &[String]) -> Vec<Value> {
     columns
         .iter()
         .map(|column| row.get(column).cloned().unwrap_or(Value::NULL))

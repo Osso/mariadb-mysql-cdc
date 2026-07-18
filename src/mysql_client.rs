@@ -10,7 +10,7 @@ use crate::table_sync::progress::{
 use crate::table_sync::{SyncTableProgress, TableSyncError};
 use crate::target::{
     DuplicateConflict, SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor,
-    TransactionalTargetExecutor,
+    TargetRowChange, TargetRowChangeKind, TransactionalTargetExecutor, duplicate_insert_outcome,
 };
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, Params};
@@ -217,10 +217,28 @@ impl TargetExecutor for PersistentTargetExecutor {
 
     fn execute_row_change(
         &self,
-        statement: &SqlStatement,
+        change: &TargetRowChange,
     ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
-        match self.execute_statement(statement) {
+        match self.execute_statement(&change.statement) {
             Ok(()) => Ok(TargetExecutionOutcome::Applied),
+            Err(error)
+                if error.mysql_code() == Some(1062)
+                    && self.insert_conflict_policy
+                        == crate::live::InsertConflictPolicy::IgnoreDuplicate
+                    && change.kind == TargetRowChangeKind::Insert =>
+            {
+                let conflict = DuplicateConflict {
+                    error_code: 1062,
+                    error_text: error.to_string(),
+                    duplicate_index: crate::target::duplicate_index_from_error(&error.to_string()),
+                };
+                let existing_values = self.read_existing_row(change)?;
+                Ok(duplicate_insert_outcome(
+                    conflict,
+                    existing_values.as_deref(),
+                    &change.source_values,
+                ))
+            }
             Err(error)
                 if error.mysql_code() == Some(1062)
                     && self.insert_conflict_policy
@@ -240,7 +258,7 @@ impl TargetExecutor for PersistentTargetExecutor {
                 if let Some(conflict) = constraint_conflict_from_error(&error) {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
-                self.retry_or_return_error(statement, error)?;
+                self.retry_or_return_error(&change.statement, error)?;
                 Ok(TargetExecutionOutcome::Applied)
             }
         }
@@ -360,6 +378,49 @@ impl PersistentTargetExecutor {
 
     fn can_ignore_duplicate_insert(&self, sql: &str, error: &str) -> bool {
         should_ignore_duplicate_insert(self.insert_conflict_policy, sql, error)
+    }
+
+    fn read_existing_row(
+        &self,
+        change: &TargetRowChange,
+    ) -> Result<Option<Vec<mysql::Value>>, TargetExecuteError> {
+        let columns = change
+            .writable_columns
+            .iter()
+            .map(|column| crate::mysql_support::quote_ident(column))
+            .collect::<Vec<_>>();
+        let predicates = change
+            .primary_key_columns
+            .iter()
+            .map(|column| format!("{} = ?", crate::mysql_support::quote_ident(column)))
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} LIMIT 1",
+            columns.join(", "),
+            crate::mysql_support::quote_ident(&change.table),
+            predicates.join(" AND ")
+        );
+        let row = self
+            .conn
+            .borrow_mut()
+            .exec_first::<mysql::Row, _, _>(
+                sql,
+                Params::Positional(change.primary_key_values.clone()),
+            )
+            .map_err(target_query_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let values = row.unwrap();
+        if values.len() != change.writable_columns.len() {
+            return Err(TargetExecuteError::new(format!(
+                "target row for `{}` returned {} values, expected {}",
+                change.table,
+                values.len(),
+                change.writable_columns.len()
+            )));
+        }
+        Ok(Some(values))
     }
 }
 

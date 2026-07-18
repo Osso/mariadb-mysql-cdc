@@ -1,6 +1,8 @@
 use super::TargetMySqlConfig;
 use crate::mysql_client::PersistentTargetExecutor;
-use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor};
+use crate::target::{
+    SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor, TargetRowChange,
+};
 use std::cell::RefCell;
 #[cfg(test)]
 use std::time::Instant;
@@ -38,6 +40,13 @@ impl MysqlCliExecutor {
 impl TargetExecutor for MysqlCliExecutor {
     fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
         self.ensure_executor()?.execute(statement)
+    }
+
+    fn execute_row_change(
+        &self,
+        change: &TargetRowChange,
+    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+        self.ensure_executor()?.execute_row_change(change)
     }
 }
 

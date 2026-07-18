@@ -5,12 +5,15 @@ use super::model::{
     row_error,
 };
 use super::sql::{
-    build_delete_statement, build_insert_statement, build_update_statement, primary_key_values,
-    validate_row_has_primary_key, validate_rows_have_primary_keys,
+    build_delete_statement, build_insert_statement, build_update_statement, ordered_values,
+    primary_key_values, validate_row_has_primary_key, validate_rows_have_primary_keys,
+    writable_columns,
 };
 use crate::probe::BinlogCoordinate;
-use crate::target::{SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor};
-use mysql::Value;
+use crate::target::{
+    SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor, TargetRowChange,
+    TargetRowChangeKind,
+};
 
 pub struct RowApplier<E> {
     registry: TableMapRegistry,
@@ -18,8 +21,7 @@ pub struct RowApplier<E> {
 }
 
 struct RowChange {
-    statement: SqlStatement,
-    primary_key: Vec<Value>,
+    target: TargetRowChange,
 }
 
 type RowPreflight<R> = fn(&RowTableMap, &[R], &BinlogCoordinate) -> RowResult<()>;
@@ -135,11 +137,10 @@ where
             };
             execute_row_statement(
                 &self.executor,
-                change.statement,
+                change.target,
                 input.coordinate,
                 table,
                 input.operation,
-                &change.primary_key,
                 context.as_deref_mut(),
             )?;
         }
@@ -207,9 +208,18 @@ fn insert_change(
     row: &RowImage,
     coordinate: &BinlogCoordinate,
 ) -> RowResult<Option<RowChange>> {
+    let writable_columns = writable_columns(table);
+    let primary_key_values = primary_key_values(table, row, coordinate)?;
     Ok(Some(RowChange {
-        statement: build_insert_statement(table, row),
-        primary_key: primary_key_values(table, row, coordinate)?,
+        target: TargetRowChange {
+            statement: build_insert_statement(table, row),
+            kind: TargetRowChangeKind::Insert,
+            table: table.table.clone(),
+            primary_key_columns: table.primary_key.clone(),
+            primary_key_values,
+            source_values: ordered_values(row, &writable_columns),
+            writable_columns,
+        },
     }))
 }
 
@@ -222,9 +232,18 @@ fn update_change(
     let Some(statement) = build_update_statement(table, update, coordinate)? else {
         return Ok(None);
     };
+    let writable_columns = writable_columns(table);
+    let primary_key_values = primary_key_values(table, &update.after, coordinate)?;
     Ok(Some(RowChange {
-        statement,
-        primary_key: primary_key_values(table, &update.after, coordinate)?,
+        target: TargetRowChange {
+            statement,
+            kind: TargetRowChangeKind::Update,
+            table: table.table.clone(),
+            primary_key_columns: table.primary_key.clone(),
+            primary_key_values,
+            source_values: ordered_values(&update.after, &writable_columns),
+            writable_columns,
+        },
     }))
 }
 
@@ -233,9 +252,18 @@ fn delete_change(
     row: &RowImage,
     coordinate: &BinlogCoordinate,
 ) -> RowResult<Option<RowChange>> {
+    let writable_columns = writable_columns(table);
+    let primary_key_values = primary_key_values(table, row, coordinate)?;
     Ok(Some(RowChange {
-        statement: build_delete_statement(table, row, coordinate)?,
-        primary_key: primary_key_values(table, row, coordinate)?,
+        target: TargetRowChange {
+            statement: build_delete_statement(table, row, coordinate)?,
+            kind: TargetRowChangeKind::Delete,
+            table: table.table.clone(),
+            primary_key_columns: table.primary_key.clone(),
+            primary_key_values,
+            source_values: ordered_values(row, &writable_columns),
+            writable_columns,
+        },
     }))
 }
 
@@ -249,8 +277,8 @@ where
 
     fn execute_row_change(
         &self,
-        statement: &SqlStatement,
+        change: &TargetRowChange,
     ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
-        (*self).execute_row_change(statement)
+        (*self).execute_row_change(change)
     }
 }

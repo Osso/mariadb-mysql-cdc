@@ -1,7 +1,9 @@
 use super::conflict::format_row_conflict_skipped;
 use super::*;
 use crate::probe::BinlogCoordinate;
-use crate::target::{SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor};
+use crate::target::{
+    SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor, TargetRowChange,
+};
 use mysql::Value;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -538,9 +540,9 @@ impl TargetExecutor for RecordingExecutor {
 
     fn execute_row_change(
         &self,
-        statement: &SqlStatement,
+        change: &TargetRowChange,
     ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
-        self.statements.borrow_mut().push(statement.clone());
+        self.statements.borrow_mut().push(change.statement.clone());
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
