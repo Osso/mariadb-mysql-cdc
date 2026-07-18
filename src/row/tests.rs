@@ -65,7 +65,7 @@ fn continues_after_one_duplicate_insert_is_ignored() {
 }
 
 #[test]
-fn ignored_duplicate_row_is_persisted_before_apply_returns() {
+fn ignored_duplicate_row_continues_without_persisting_conflict() {
     let executor = RecordingExecutor {
         row_outcomes: RefCell::new(VecDeque::from([TargetExecutionOutcome::DuplicateIgnored(
             crate::target::DuplicateConflict {
@@ -92,23 +92,10 @@ fn ignored_duplicate_row_is_persisted_before_apply_returns() {
         observed_at_ms: 100,
     };
 
-    let error = applier
+    applier
         .apply_write_rows_with_conflicts(&event, &mut context)
-        .expect_err("recorded duplicate must abort the target transaction");
-    assert!(
-        error
-            .to_string()
-            .contains("row conflict persisted for repair")
-    );
-
-    let record = &ledger.records()[0];
-    assert_eq!(record.key.coordinate.end_position, 200);
-    assert_eq!(record.duplicate_index.as_deref(), Some("uq_accounts_email"));
-    assert_eq!(record.error_code, 1062);
-    assert_eq!(
-        record.error_text,
-        "Duplicate entry 'x' for key 'uq_accounts_email'"
-    );
+        .expect("ignored duplicate should not abort the target transaction");
+    assert!(ledger.records().is_empty());
 }
 
 #[test]

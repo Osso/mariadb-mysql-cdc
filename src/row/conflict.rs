@@ -52,8 +52,14 @@ where
     })?;
     match outcome {
         TargetExecutionOutcome::Applied => Ok(()),
-        TargetExecutionOutcome::DuplicateIgnored(conflict)
-        | TargetExecutionOutcome::ConstraintConflict(conflict) => {
+        TargetExecutionOutcome::DuplicateIgnored(_) => {
+            println!(
+                "{}",
+                format_row_conflict_skipped(operation, table, coordinate, primary_key)
+            );
+            Ok(())
+        }
+        TargetExecutionOutcome::ConstraintConflict(conflict) => {
             println!(
                 "{}",
                 format_row_conflict_skipped(operation, table, coordinate, primary_key)
