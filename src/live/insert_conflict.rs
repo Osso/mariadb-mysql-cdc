@@ -33,7 +33,14 @@ pub(crate) fn should_replace_divergent_primary(
 ) -> bool {
     policy == InsertConflictPolicy::ReplaceDivergentPk
         && !rows_equal
-        && duplicate_index.is_some_and(|index| index.eq_ignore_ascii_case("PRIMARY"))
+        && duplicate_index.is_some_and(is_primary_duplicate_index)
+}
+
+fn is_primary_duplicate_index(index: &str) -> bool {
+    index.eq_ignore_ascii_case("PRIMARY")
+        || index
+            .rsplit_once('.')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("PRIMARY"))
 }
 
 fn starts_with_row_change(sql: &str) -> bool {
@@ -112,6 +119,11 @@ mod tests {
         assert!(should_replace_divergent_primary(
             InsertConflictPolicy::ReplaceDivergentPk,
             Some("PRIMARY"),
+            false,
+        ));
+        assert!(should_replace_divergent_primary(
+            InsertConflictPolicy::ReplaceDivergentPk,
+            Some("accounts.PRIMARY"),
             false,
         ));
         assert!(!should_replace_divergent_primary(
