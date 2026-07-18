@@ -1,6 +1,7 @@
 use super::{ApplyBinlogConfig, ApplyBinlogError};
 use crate::checkpoint::{Checkpoint, CheckpointError, FileCheckpointStore, LastEvent};
 use crate::probe::BinlogCoordinate;
+use crate::snapshot::{SnapshotFence, compare_source_coordinates};
 #[cfg(test)]
 use crate::statement::StatementEvent;
 use crate::stream_checkpoint::MySqlStreamCheckpointStore;
@@ -119,9 +120,25 @@ pub(super) fn coordinate_checkpoint(coordinate: &BinlogCoordinate, event_type: &
     }
 }
 
+#[cfg(test)]
 pub(super) fn run_stream_reconnect_loop<C, F, S>(
     config: &ApplyBinlogConfig,
     checkpoint_store: Option<&C>,
+    run_attempt: F,
+    sleep: S,
+) -> Result<(), ApplyBinlogError>
+where
+    C: StreamCheckpointStore,
+    F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
+    S: Fn(std::time::Duration),
+{
+    run_stream_reconnect_loop_with_fence(config, checkpoint_store, None, run_attempt, sleep)
+}
+
+pub(super) fn run_stream_reconnect_loop_with_fence<C, F, S>(
+    config: &ApplyBinlogConfig,
+    checkpoint_store: Option<&C>,
+    snapshot_fence: Option<&SnapshotFence>,
     mut run_attempt: F,
     sleep: S,
 ) -> Result<(), ApplyBinlogError>
@@ -131,7 +148,12 @@ where
     S: Fn(std::time::Duration),
 {
     let mut attempt_config = config.clone();
-    resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
+    if let Some(fence) = snapshot_fence {
+        attempt_config.source.binlog_file = fence.source_file.clone();
+        attempt_config.source.start_position = fence.source_position;
+    } else {
+        resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
+    }
     attempt_config.source.validate_start_coordinate()?;
     let mut attempt = 0;
 
@@ -164,6 +186,36 @@ where
             Err(error) => return Err(error),
         }
     }
+}
+
+pub(super) fn validate_snapshot_fence_checkpoint(
+    snapshot_fence: &SnapshotFence,
+    checkpoint: Option<&Checkpoint>,
+) -> Result<(), ApplyBinlogError> {
+    snapshot_fence
+        .validate()
+        .map_err(|error| ApplyBinlogError::Checkpoint(error.to_string()))?;
+    let Some(checkpoint) = checkpoint else {
+        return Err(ApplyBinlogError::Checkpoint(
+            "required source-scoped stream checkpoint is missing".to_string(),
+        ));
+    };
+    if compare_source_coordinates(
+        &checkpoint.source_file,
+        checkpoint.source_position,
+        &snapshot_fence.source_file,
+        snapshot_fence.source_position,
+    ) == std::cmp::Ordering::Greater
+    {
+        return Err(ApplyBinlogError::Checkpoint(format!(
+            "stream checkpoint {}:{} is ahead of snapshot fence {}:{}",
+            checkpoint.source_file,
+            checkpoint.source_position,
+            snapshot_fence.source_file,
+            snapshot_fence.source_position,
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn resume_from_checkpoint(

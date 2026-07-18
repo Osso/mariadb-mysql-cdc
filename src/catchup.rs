@@ -1,7 +1,7 @@
 use crate::live::{ApplyBinlogConfig, ApplyBinlogError, ApplyBinlogReport, apply_remote_binlog};
 use crate::snapshot::{
-    SnapshotError, SnapshotProgressStore, SnapshotResult, SnapshotSource, SnapshotTable,
-    SnapshotTarget, snapshot_table,
+    SnapshotError, SnapshotFence, SnapshotProgressStore, SnapshotResult, SnapshotSource,
+    SnapshotTable, SnapshotTarget, snapshot_table,
 };
 use std::fmt;
 
@@ -15,6 +15,7 @@ pub struct CatchupPlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatchupReport {
+    pub snapshot_fence: SnapshotFence,
     pub snapshot_results: Vec<SnapshotResult>,
     pub replay_report: ApplyBinlogReport,
 }
@@ -89,13 +90,47 @@ where
     R: CdcReplay,
 {
     validate_plan(plan)?;
+    let snapshot_fence = load_or_capture_snapshot_fence(progress_store, snapshot_source)?;
     let snapshot_results = snapshot_tables(plan, progress_store, snapshot_source, snapshot_target)?;
-    let replay_report = replay.replay_from_start(&plan.start_file, plan.start_position)?;
+    let mut progress = progress_store.load()?;
+    let mut completed_fence = snapshot_fence.clone();
+    completed_fence.complete = true;
+    progress.snapshot_fence = Some(completed_fence.clone());
+    progress_store.save(&progress)?;
+    let replay_report =
+        replay.replay_from_start(&snapshot_fence.source_file, snapshot_fence.source_position)?;
 
     Ok(CatchupReport {
+        snapshot_fence: completed_fence,
         snapshot_results,
         replay_report,
     })
+}
+
+fn load_or_capture_snapshot_fence<P, S>(
+    progress_store: &P,
+    snapshot_source: &S,
+) -> Result<SnapshotFence, CatchupError>
+where
+    P: SnapshotProgressStore,
+    S: SnapshotSource,
+{
+    let mut progress = progress_store.load()?;
+    if let Some(fence) = progress.snapshot_fence {
+        fence.validate().map_err(CatchupError::Snapshot)?;
+        return Ok(fence);
+    }
+    if !progress.tables.is_empty() {
+        return Err(CatchupError::InvalidPlan(
+            "snapshot progress is missing source fencing metadata".to_string(),
+        ));
+    }
+
+    let fence = snapshot_source.capture_start_coordinate()?;
+    fence.validate().map_err(CatchupError::Snapshot)?;
+    progress.snapshot_fence = Some(fence.clone());
+    progress_store.save(&progress)?;
+    Ok(fence)
 }
 
 fn snapshot_tables<P, S, T>(
@@ -160,15 +195,22 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
 
     #[test]
-    fn snapshots_chunks_then_replays_from_global_start() {
+    fn snapshots_capture_and_replay_from_the_persisted_source_fence() {
         let plan = CatchupPlan {
             tables: vec![accounts_table()],
             chunk_size: 2,
-            start_file: "mysqld-bin.000001".to_string(),
-            start_position: 123,
+            start_file: "stale-binlog.000001".to_string(),
+            start_position: 4,
         };
         let progress_store = MemoryProgressStore::default();
-        let source = QueueSnapshotSource::new(vec![vec![row("1", "snapshot")], Vec::new()]);
+        let source = QueueSnapshotSource::with_start(
+            SnapshotFence {
+                source_file: "mysqld-bin.000009".to_string(),
+                source_position: 321,
+                complete: false,
+            },
+            vec![vec![row("1", "snapshot")], Vec::new()],
+        );
         let mut target = RecordingSnapshotTarget::default();
         let replay = RecordingReplay::default();
 
@@ -182,10 +224,146 @@ mod tests {
                 rows_copied: 1,
             }]
         );
+        assert_eq!(
+            report.snapshot_fence,
+            SnapshotFence {
+                source_file: "mysqld-bin.000009".to_string(),
+                source_position: 321,
+                complete: true,
+            }
+        );
         assert_eq!(target.rows.borrow().as_slice(), &[row("1", "snapshot")]);
         assert_eq!(
+            progress_store
+                .load()
+                .expect("persisted snapshot progress")
+                .snapshot_fence,
+            Some(SnapshotFence {
+                source_file: "mysqld-bin.000009".to_string(),
+                source_position: 321,
+                complete: true,
+            })
+        );
+        assert_eq!(
             replay.start.borrow().as_ref(),
-            Some(&("mysqld-bin.000001".to_string(), 123))
+            Some(&("mysqld-bin.000009".to_string(), 321))
+        );
+    }
+
+    #[test]
+    fn parent_created_after_snapshot_start_is_replayed() {
+        let plan = CatchupPlan {
+            tables: vec![accounts_table()],
+            chunk_size: 2,
+            start_file: "mysqld-bin.000001".to_string(),
+            start_position: 4,
+        };
+        let progress_store = MemoryProgressStore::default();
+        let source = QueueSnapshotSource::with_start(
+            SnapshotFence {
+                source_file: "mysqld-bin.000001".to_string(),
+                source_position: 100,
+                complete: false,
+            },
+            vec![Vec::new()],
+        );
+        let mut target = RecordingSnapshotTarget::default();
+        let replay = FilteringReplay::new(vec![
+            ReplayEvent {
+                position: 99,
+                row: row("parent", "before"),
+            },
+            ReplayEvent {
+                position: 100,
+                row: row("parent", "created-after-start"),
+            },
+        ]);
+
+        run_catchup(&plan, &progress_store, &source, &mut target, &replay).expect("catchup");
+
+        assert_eq!(
+            replay.applied.borrow().as_slice(),
+            &[row("parent", "created-after-start")]
+        );
+    }
+
+    #[test]
+    fn child_later_than_snapshot_fence_is_replayed_from_exact_boundary() {
+        let plan = CatchupPlan {
+            tables: vec![accounts_table()],
+            chunk_size: 2,
+            start_file: "mysqld-bin.000001".to_string(),
+            start_position: 4,
+        };
+        let progress_store = MemoryProgressStore::default();
+        let source = QueueSnapshotSource::with_start(
+            SnapshotFence {
+                source_file: "mysqld-bin.000001".to_string(),
+                source_position: 200,
+                complete: false,
+            },
+            vec![Vec::new()],
+        );
+        let mut target = RecordingSnapshotTarget::default();
+        let replay = FilteringReplay::new(vec![
+            ReplayEvent {
+                position: 199,
+                row: row("child", "before"),
+            },
+            ReplayEvent {
+                position: 200,
+                row: row("child", "at-fence"),
+            },
+            ReplayEvent {
+                position: 201,
+                row: row("child", "later"),
+            },
+        ]);
+
+        run_catchup(&plan, &progress_store, &source, &mut target, &replay).expect("catchup");
+
+        assert_eq!(
+            replay.applied.borrow().as_slice(),
+            &[row("child", "at-fence"), row("child", "later")]
+        );
+    }
+
+    #[test]
+    fn rejects_progress_with_rows_but_without_snapshot_fence() {
+        let plan = CatchupPlan {
+            tables: vec![accounts_table()],
+            chunk_size: 2,
+            start_file: "mysqld-bin.000001".to_string(),
+            start_position: 4,
+        };
+        let progress_store = MemoryProgressStore::with_progress(SnapshotProgress {
+            snapshot_fence: None,
+            tables: BTreeMap::from([(
+                "accounts".to_string(),
+                crate::snapshot::TableSnapshotProgress {
+                    last_primary_key: Some(vec!["1".to_string()]),
+                    rows_copied: 1,
+                    complete: false,
+                },
+            )]),
+        });
+        let source = QueueSnapshotSource::with_start(
+            SnapshotFence {
+                source_file: "mysqld-bin.000001".to_string(),
+                source_position: 100,
+                complete: false,
+            },
+            vec![],
+        );
+        let mut target = RecordingSnapshotTarget::default();
+        let replay = RecordingReplay::default();
+
+        let error = run_catchup(&plan, &progress_store, &source, &mut target, &replay)
+            .expect_err("missing fence must reject resumed snapshot");
+
+        assert_eq!(
+            error.to_string(),
+            "snapshot progress is missing source fencing metadata"
         );
     }
 
@@ -253,6 +431,14 @@ mod tests {
         progress: RefCell<SnapshotProgress>,
     }
 
+    impl MemoryProgressStore {
+        fn with_progress(progress: SnapshotProgress) -> Self {
+            Self {
+                progress: RefCell::new(progress),
+            }
+        }
+    }
+
     impl SnapshotProgressStore for MemoryProgressStore {
         fn load(&self) -> Result<SnapshotProgress, SnapshotError> {
             Ok(self.progress.borrow().clone())
@@ -265,12 +451,14 @@ mod tests {
     }
 
     struct QueueSnapshotSource {
+        start: SnapshotFence,
         chunks: RefCell<VecDeque<Vec<SnapshotRow>>>,
     }
 
     impl QueueSnapshotSource {
-        fn new(chunks: Vec<Vec<SnapshotRow>>) -> Self {
+        fn with_start(start: SnapshotFence, chunks: Vec<Vec<SnapshotRow>>) -> Self {
             Self {
+                start,
                 chunks: RefCell::new(chunks.into()),
             }
         }
@@ -279,6 +467,10 @@ mod tests {
     impl SnapshotSource for QueueSnapshotSource {
         fn read_chunk(&self, _request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError> {
             Ok(self.chunks.borrow_mut().pop_front().unwrap_or_default())
+        }
+
+        fn capture_start_coordinate(&self) -> Result<SnapshotFence, SnapshotError> {
+            Ok(self.start.clone())
         }
     }
 
@@ -297,6 +489,49 @@ mod tests {
     #[derive(Default)]
     struct RecordingReplay {
         start: RefCell<Option<(String, u64)>>,
+    }
+
+    struct ReplayEvent {
+        position: u64,
+        row: SnapshotRow,
+    }
+
+    struct FilteringReplay {
+        events: Vec<ReplayEvent>,
+        applied: RefCell<Vec<SnapshotRow>>,
+    }
+
+    impl FilteringReplay {
+        fn new(events: Vec<ReplayEvent>) -> Self {
+            Self {
+                events,
+                applied: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CdcReplay for FilteringReplay {
+        fn replay_from_start(
+            &self,
+            start_file: &str,
+            start_position: u64,
+        ) -> Result<ApplyBinlogReport, CatchupError> {
+            for event in &self.events {
+                if crate::snapshot::compare_source_coordinates(
+                    "mysqld-bin.000001",
+                    event.position,
+                    start_file,
+                    start_position,
+                ) != std::cmp::Ordering::Less
+                {
+                    self.applied.borrow_mut().push(event.row.clone());
+                }
+            }
+            Ok(ApplyBinlogReport {
+                applied_statements: self.applied.borrow().len() as u64,
+                quarantined_statements: 0,
+            })
+        }
     }
 
     impl CdcReplay for RecordingReplay {

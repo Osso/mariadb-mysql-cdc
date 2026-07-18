@@ -403,6 +403,7 @@ fn snapshot_progress(
         complete,
     };
     SnapshotProgress {
+        snapshot_fence: None,
         tables: BTreeMap::from([(table.to_string(), table_progress)]),
     }
 }

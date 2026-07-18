@@ -4,7 +4,7 @@ use crate::inventory::{
 use crate::live::TargetMySqlConfig;
 use crate::mysql_client::{PersistentMySqlSource, PersistentProgressWriter};
 use crate::snapshot::{
-    ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotProgress,
+    ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotFence, SnapshotProgress,
     SnapshotProgressStore, SnapshotTable, snapshot_table_with_observer,
 };
 use crate::table_sync::{SyncMode, SyncProgressStatus, SyncTableProgress, TableSyncError};
@@ -64,6 +64,7 @@ pub struct CatchupSnapshotConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatchupSnapshotReport {
+    pub snapshot_fence: SnapshotFence,
     pub tables: Vec<CatchupSnapshotTableReport>,
 }
 
@@ -118,6 +119,7 @@ pub fn run_catchup_snapshot(
     let tables = read_snapshot_tables(config)?;
     let progress_store = catchup_progress_store(config)?;
     let source = PersistentMySqlSource::new(&config.source)?;
+    let snapshot_fence = load_or_capture_snapshot_fence(&source, &progress_store)?;
     let total_tables = tables.len();
     let mut reports = Vec::new();
 
@@ -135,8 +137,39 @@ pub fn run_catchup_snapshot(
         reports.push(report);
     }
 
+    let mut progress = progress_store.load()?;
+    let mut completed_fence = snapshot_fence;
+    completed_fence.complete = true;
+    progress.snapshot_fence = Some(completed_fence.clone());
+    progress_store.save(&progress)?;
+
     println!("catchup_snapshot_complete tables={}", reports.len());
-    Ok(CatchupSnapshotReport { tables: reports })
+    Ok(CatchupSnapshotReport {
+        snapshot_fence: completed_fence,
+        tables: reports,
+    })
+}
+
+fn load_or_capture_snapshot_fence(
+    source: &PersistentMySqlSource,
+    progress_store: &CatchupProgressStore,
+) -> Result<SnapshotFence, CatchupSnapshotError> {
+    let mut progress = progress_store.load()?;
+    if let Some(fence) = progress.snapshot_fence {
+        fence.validate()?;
+        return Ok(fence);
+    }
+    if !progress.tables.is_empty() {
+        return Err(CatchupSnapshotError::Config(
+            "snapshot progress is missing source fencing metadata".to_string(),
+        ));
+    }
+
+    let fence = source.capture_start_coordinate()?;
+    fence.validate()?;
+    progress.snapshot_fence = Some(fence.clone());
+    progress_store.save(&progress)?;
+    Ok(fence)
 }
 
 fn log_catchup_snapshot_start(total_tables: usize, config: &CatchupSnapshotConfig) {

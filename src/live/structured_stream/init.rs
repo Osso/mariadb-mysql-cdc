@@ -1,6 +1,11 @@
 use super::*;
+use crate::live::reconnect::{
+    run_stream_reconnect_loop_with_fence, validate_snapshot_fence_checkpoint,
+};
+use crate::snapshot::{FileSnapshotProgressStore, SnapshotFence, SnapshotProgressStore};
 
 pub(crate) fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
+    let snapshot_fence = load_snapshot_fence(config)?;
     verify_source_binlog_contract(config)?;
     let checkpoint_store = crate::stream_checkpoint::MySqlStreamCheckpointStore::new(
         config.target.clone(),
@@ -11,13 +16,43 @@ pub(crate) fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), App
     checkpoint_store
         .ensure()
         .map_err(ApplyBinlogError::Checkpoint)?;
+    let checkpoint = checkpoint_store
+        .load()
+        .map_err(ApplyBinlogError::Checkpoint)?;
+    validate_snapshot_fence_checkpoint(&snapshot_fence, checkpoint.as_ref())?;
     validate_startup_contract(config)?;
-    stream_with_checkpoint_store(
+    stream_with_checkpoint_store_from_fence(
         config,
         Some(&checkpoint_store),
+        &snapshot_fence,
         Some(config.checkpoint_table.as_str()),
         Some(checkpoint_name.as_str()),
     )
+}
+
+fn load_snapshot_fence(config: &ApplyBinlogConfig) -> Result<SnapshotFence, ApplyBinlogError> {
+    let path = config.snapshot_progress_file.as_ref().ok_or_else(|| {
+        ApplyBinlogError::Checkpoint(
+            "snapshot fencing metadata file is required before stream startup".to_string(),
+        )
+    })?;
+    let progress = FileSnapshotProgressStore::new(path)
+        .load()
+        .map_err(|error| ApplyBinlogError::Checkpoint(error.to_string()))?;
+    let fence = progress.snapshot_fence.ok_or_else(|| {
+        ApplyBinlogError::Checkpoint(
+            "snapshot fencing metadata is missing from snapshot progress".to_string(),
+        )
+    })?;
+    fence
+        .validate()
+        .map_err(|error| ApplyBinlogError::Checkpoint(error.to_string()))?;
+    if !fence.complete {
+        return Err(ApplyBinlogError::Checkpoint(
+            "snapshot fencing metadata is not complete".to_string(),
+        ));
+    }
+    Ok(fence)
 }
 
 pub(super) fn validate_startup_contract(
@@ -40,18 +75,20 @@ pub(super) fn validate_startup_contract(
         .map_err(ApplyBinlogError::Statement)
 }
 
-pub(super) fn stream_with_checkpoint_store<C>(
+fn stream_with_checkpoint_store_from_fence<C>(
     config: &ApplyBinlogConfig,
     checkpoint_store: Option<&C>,
+    snapshot_fence: &SnapshotFence,
     transaction_checkpoint_table: Option<&str>,
     transaction_checkpoint_name: Option<&str>,
 ) -> Result<(), ApplyBinlogError>
 where
     C: StreamCheckpointStore,
 {
-    run_stream_reconnect_loop(
+    run_stream_reconnect_loop_with_fence(
         config,
         checkpoint_store,
+        Some(snapshot_fence),
         |attempt_config| {
             stream_once(
                 attempt_config,
