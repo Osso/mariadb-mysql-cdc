@@ -460,6 +460,7 @@ enum DuplicateMode {
     Divergent,
     DefaultError,
     ForeignKey,
+    UpdateUnique,
 }
 
 struct TransactionRecordingExecutor {
@@ -564,6 +565,14 @@ impl TransactionRecordingExecutor {
         }
     }
 
+    fn with_update_unique_conflict() -> Self {
+        Self {
+            duplicate_row_change_number: Some(1),
+            duplicate_mode: DuplicateMode::UpdateUnique,
+            ..Self::default()
+        }
+    }
+
     fn operations(&self) -> Vec<&'static str> {
         self.operations.borrow().clone()
     }
@@ -624,6 +633,16 @@ impl TargetExecutor for TransactionRecordingExecutor {
                                 "Cannot add or update a child row: a foreign key constraint fails"
                                     .to_string(),
                             duplicate_index: None,
+                        },
+                    ))
+                }
+                DuplicateMode::UpdateUnique => {
+                    Ok(crate::target::TargetExecutionOutcome::ConstraintConflict(
+                        crate::target::DuplicateConflict {
+                            error_code: 1062,
+                            error_text: "Duplicate entry 'beta' for key 'uq_accounts_name'"
+                                .to_string(),
+                            duplicate_index: Some("uq_accounts_name".to_string()),
                         },
                     ))
                 }

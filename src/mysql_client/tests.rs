@@ -175,6 +175,36 @@ fn stream_lease_rejects_missing_or_unacquired_lock() {
 }
 
 #[test]
+fn classifies_non_insert_duplicate_as_durable_conflict() {
+    let error = TargetExecuteError::from_mysql(
+        1062,
+        "ERROR 1062 (23000): Duplicate entry 'x' for key 'uq_accounts_name'",
+    );
+
+    let conflict = duplicate_conflict_for_row_change(TargetRowChangeKind::Update, &error)
+        .expect("update duplicate conflict");
+
+    assert_eq!(conflict.error_code, 1062);
+    assert_eq!(
+        conflict.duplicate_index.as_deref(),
+        Some("uq_accounts_name")
+    );
+}
+
+#[test]
+fn does_not_classify_insert_duplicate_as_non_insert_conflict() {
+    let error = TargetExecuteError::from_mysql(
+        1062,
+        "ERROR 1062 (23000): Duplicate entry 'x' for key 'PRIMARY'",
+    );
+
+    assert_eq!(
+        duplicate_conflict_for_row_change(TargetRowChangeKind::Insert, &error),
+        None
+    );
+}
+
+#[test]
 fn classifies_supported_mysql_constraint_errors_for_durable_evidence() {
     for code in [1048, 1451, 1452, 3819, 4025] {
         let error = TargetExecuteError::from_mysql(code, format!("constraint failure {code}"));

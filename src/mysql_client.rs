@@ -239,22 +239,10 @@ impl TargetExecutor for PersistentTargetExecutor {
                     &change.source_values,
                 ))
             }
-            Err(error)
-                if error.mysql_code() == Some(1062)
-                    && self.insert_conflict_policy
-                        == crate::live::InsertConflictPolicy::IgnoreDuplicate =>
-            {
-                Ok(TargetExecutionOutcome::DuplicateIgnored(
-                    DuplicateConflict {
-                        error_code: 1062,
-                        error_text: error.to_string(),
-                        duplicate_index: crate::target::duplicate_index_from_error(
-                            &error.to_string(),
-                        ),
-                    },
-                ))
-            }
             Err(error) => {
+                if let Some(conflict) = duplicate_conflict_for_row_change(change.kind, &error) {
+                    return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
+                }
                 if let Some(conflict) = constraint_conflict_from_error(&error) {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
@@ -263,6 +251,21 @@ impl TargetExecutor for PersistentTargetExecutor {
             }
         }
     }
+}
+
+fn duplicate_conflict_for_row_change(
+    kind: TargetRowChangeKind,
+    error: &TargetExecuteError,
+) -> Option<DuplicateConflict> {
+    if kind == TargetRowChangeKind::Insert || error.mysql_code() != Some(1062) {
+        return None;
+    }
+    let error_text = error.to_string();
+    Some(DuplicateConflict {
+        error_code: 1062,
+        error_text: error_text.clone(),
+        duplicate_index: crate::target::duplicate_index_from_error(&error_text),
+    })
 }
 
 fn constraint_conflict_from_error(error: &TargetExecuteError) -> Option<DuplicateConflict> {

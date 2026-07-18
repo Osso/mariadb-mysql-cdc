@@ -209,6 +209,98 @@ fn divergent_duplicate_rolls_back_and_persists_conflict_evidence() {
 }
 
 #[test]
+fn update_unique_conflict_under_ignore_duplicate_rolls_back_and_records_ledger() {
+    let executor = TransactionRecordingExecutor::with_update_unique_conflict();
+    let mut applier = crate::row::RowApplier::new(executor);
+    applier.apply_table_map(accounts_row_table_map());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    let event = BinlogEvent::UpdateRowsEvent(MysqlCdcUpdateRowsEvent {
+        table_id: 18,
+        flags: 0,
+        columns_number: 5,
+        columns_before_update: vec![true; 5],
+        columns_after_update: vec![true; 5],
+        rows: vec![UpdateRowData::new(
+            RowData::new(vec![
+                Some(MySqlValue::Int(1)),
+                Some(MySqlValue::String("alpha".to_string())),
+                Some(MySqlValue::Int(100)),
+                Some(MySqlValue::String("safe".to_string())),
+                Some(MySqlValue::DateTime(DateTime {
+                    year: 2026,
+                    month: 6,
+                    day: 22,
+                    hour: 12,
+                    minute: 3,
+                    second: 4,
+                    millis: 0,
+                })),
+            ]),
+            RowData::new(vec![
+                Some(MySqlValue::Int(1)),
+                Some(MySqlValue::String("beta".to_string())),
+                Some(MySqlValue::Int(100)),
+                Some(MySqlValue::String("safe".to_string())),
+                Some(MySqlValue::DateTime(DateTime {
+                    year: 2026,
+                    month: 6,
+                    day: 22,
+                    hour: 12,
+                    minute: 3,
+                    second: 4,
+                    millis: 0,
+                })),
+            ]),
+        )],
+    });
+    let header = event_header(30, 240);
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let error = apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &header,
+        &event,
+        "test-source",
+        &mut conflicts,
+    )
+    .expect_err("update duplicate must abort the source transaction");
+
+    assert!(
+        error
+            .to_string()
+            .contains("row conflict persisted for repair")
+    );
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "ROLLBACK"]
+    );
+    assert_eq!(conflicts.records().len(), 1);
+    assert_eq!(
+        conflicts.records()[0].key.operation,
+        crate::conflict_repair::ConflictOperation::Update
+    );
+    assert_eq!(conflicts.records()[0].error_code, 1062);
+    assert_eq!(
+        conflicts.records()[0].duplicate_index.as_deref(),
+        Some("uq_accounts_name")
+    );
+}
+
+#[test]
 fn duplicate_insert_under_default_error_policy_rolls_back_without_ledger_entry() {
     let executor = TransactionRecordingExecutor::with_default_duplicate_second_row_change();
     let mut applier = crate::row::RowApplier::new(executor);

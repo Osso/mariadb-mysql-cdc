@@ -97,11 +97,296 @@ pub(crate) fn duplicate_insert_outcome(
     existing_values: Option<&[Value]>,
     source_values: &[Value],
 ) -> TargetExecutionOutcome {
-    if existing_values.is_some_and(|values| values == source_values) {
+    if existing_values.is_some_and(|values| values_equal(values, source_values)) {
         TargetExecutionOutcome::DuplicateIgnored(conflict)
     } else {
         TargetExecutionOutcome::ConstraintConflict(conflict)
     }
+}
+
+fn values_equal(left: &[Value], right: &[Value]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| value_equal(left, right))
+}
+
+fn value_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::NULL, Value::NULL) => true,
+        (Value::Bytes(left), Value::Bytes(right)) => left == right,
+        (Value::Date(..), Value::Date(..))
+        | (Value::Time(..), Value::Time(..))
+        | (Value::Date(..), Value::Bytes(_))
+        | (Value::Bytes(_), Value::Date(..))
+        | (Value::Time(..), Value::Bytes(_))
+        | (Value::Bytes(_), Value::Time(..)) => temporal_values_equal(left, right),
+        (Value::Float(left), Value::Float(right)) => left == right,
+        (Value::Double(left), Value::Double(right)) => left == right,
+        (left, right) if is_numeric_value(left) || is_numeric_value(right) => numeric_value(left)
+            .zip(numeric_value(right))
+            .is_some_and(|(left, right)| left == right),
+        _ => left == right,
+    }
+}
+
+fn is_numeric_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Double(_)
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CanonicalNumber {
+    negative: bool,
+    digits: String,
+    scale: i64,
+}
+
+fn numeric_value(value: &Value) -> Option<CanonicalNumber> {
+    let text = match value {
+        Value::Int(value) => value.to_string(),
+        Value::UInt(value) => value.to_string(),
+        Value::Float(value) => value.to_string(),
+        Value::Double(value) => value.to_string(),
+        Value::Bytes(value) => std::str::from_utf8(value).ok()?.to_string(),
+        _ => return None,
+    };
+    parse_numeric_text(&text)
+}
+
+fn parse_numeric_text(text: &str) -> Option<CanonicalNumber> {
+    let (negative, text) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (mantissa, exponent) = text
+        .split_once(['e', 'E'])
+        .map_or((text, 0), |(mantissa, exponent)| {
+            (mantissa, exponent.parse::<i64>().ok().unwrap_or(i64::MAX))
+        });
+    if mantissa.is_empty() || exponent == i64::MAX {
+        return None;
+    }
+
+    let mut digits = String::new();
+    let mut fractional_digits = 0_i64;
+    let mut seen_decimal = false;
+    for character in mantissa.chars() {
+        match character {
+            '0'..='9' => {
+                digits.push(character);
+                fractional_digits += i64::from(seen_decimal);
+            }
+            '.' if !seen_decimal => seen_decimal = true,
+            _ => return None,
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+
+    let first_nonzero = digits.find(|character| character != '0');
+    let Some(first_nonzero) = first_nonzero else {
+        return Some(CanonicalNumber {
+            negative: false,
+            digits: "0".to_string(),
+            scale: 0,
+        });
+    };
+    digits.drain(..first_nonzero);
+    while digits.ends_with('0') {
+        digits.pop();
+        fractional_digits -= 1;
+    }
+
+    Some(CanonicalNumber {
+        negative,
+        digits,
+        scale: fractional_digits - exponent,
+    })
+}
+
+fn temporal_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (
+            Value::Date(
+                left_year,
+                left_month,
+                left_day,
+                left_hour,
+                left_minute,
+                left_second,
+                left_micros,
+            ),
+            Value::Date(
+                right_year,
+                right_month,
+                right_day,
+                right_hour,
+                right_minute,
+                right_second,
+                right_micros,
+            ),
+        ) => {
+            (
+                left_year,
+                left_month,
+                left_day,
+                left_hour,
+                left_minute,
+                left_second,
+                left_micros,
+            ) == (
+                right_year,
+                right_month,
+                right_day,
+                right_hour,
+                right_minute,
+                right_second,
+                right_micros,
+            )
+        }
+        (
+            Value::Time(
+                left_negative,
+                left_days,
+                left_hours,
+                left_minutes,
+                left_seconds,
+                left_micros,
+            ),
+            Value::Time(
+                right_negative,
+                right_days,
+                right_hours,
+                right_minutes,
+                right_seconds,
+                right_micros,
+            ),
+        ) => {
+            (
+                left_negative,
+                left_days,
+                left_hours,
+                left_minutes,
+                left_seconds,
+                left_micros,
+            ) == (
+                right_negative,
+                right_days,
+                right_hours,
+                right_minutes,
+                right_seconds,
+                right_micros,
+            )
+        }
+        (Value::Date(..), Value::Bytes(bytes)) => {
+            parse_date_text(bytes).is_some_and(|value| temporal_date(left) == value)
+        }
+        (Value::Bytes(bytes), Value::Date(..)) => {
+            parse_date_text(bytes).is_some_and(|value| value == temporal_date(right))
+        }
+        (Value::Time(..), Value::Bytes(bytes)) => {
+            parse_time_text(bytes).is_some_and(|value| temporal_time(left) == value)
+        }
+        (Value::Bytes(bytes), Value::Time(..)) => {
+            parse_time_text(bytes).is_some_and(|value| value == temporal_time(right))
+        }
+        _ => false,
+    }
+}
+
+type DateParts = (u16, u8, u8, u8, u8, u8, u32);
+type TimeParts = (bool, u32, u8, u8, u8, u32);
+
+fn temporal_date(value: &Value) -> DateParts {
+    match value {
+        Value::Date(year, month, day, hour, minute, second, micros) => {
+            (*year, *month, *day, *hour, *minute, *second, *micros)
+        }
+        _ => unreachable!("expected date value"),
+    }
+}
+
+fn temporal_time(value: &Value) -> TimeParts {
+    match value {
+        Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            (*negative, *days, *hours, *minutes, *seconds, *micros)
+        }
+        _ => unreachable!("expected time value"),
+    }
+}
+
+fn parse_date_text(bytes: &[u8]) -> Option<DateParts> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (date, time) = text
+        .split_once(' ')
+        .map_or((text, None), |(date, time)| (date, Some(time)));
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse().ok()?;
+    let month = date_parts.next()?.parse().ok()?;
+    let day = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let (hour, minute, second, micros) = match time {
+        Some(time) => parse_clock_text(time)?,
+        None => (0, 0, 0, 0),
+    };
+    Some((
+        year,
+        month,
+        day,
+        hour.try_into().ok()?,
+        minute,
+        second,
+        micros,
+    ))
+}
+
+fn parse_time_text(bytes: &[u8]) -> Option<TimeParts> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (negative, text) = text
+        .strip_prefix('-')
+        .map_or((false, text), |text| (true, text));
+    let (total_hours, minutes, seconds, micros) = parse_clock_text(text)?;
+    Some((
+        negative,
+        total_hours / 24,
+        (total_hours % 24).try_into().ok()?,
+        minutes,
+        seconds,
+        micros,
+    ))
+}
+
+fn parse_clock_text(text: &str) -> Option<(u32, u8, u8, u32)> {
+    let (clock, fraction) = text
+        .split_once('.')
+        .map_or((text, None), |(clock, fraction)| (clock, Some(fraction)));
+    let mut parts = clock.split(':');
+    let hours = parts.next()?.parse().ok()?;
+    let minutes = parts.next()?.parse().ok()?;
+    let seconds = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || minutes >= 60 || seconds >= 60 {
+        return None;
+    }
+    let micros = match fraction {
+        None => 0,
+        Some(fraction)
+            if !fraction.is_empty()
+                && fraction.len() <= 6
+                && fraction.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            format!("{fraction:0<6}").parse().ok()?
+        }
+        Some(_) => return None,
+    };
+    Some((hours, minutes, seconds, micros))
 }
 
 impl<E> TransactionalTargetExecutor for &E
@@ -631,6 +916,33 @@ mod tests {
                 conflict.clone(),
                 Some(&[Value::Int(7), Value::Bytes(b"same".to_vec())]),
                 &source_values,
+            ),
+            TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
+        );
+        assert_eq!(
+            duplicate_insert_outcome(
+                conflict.clone(),
+                Some(&[
+                    Value::Double(12.34),
+                    Value::Date(2026, 7, 16, 3, 4, 5, 600_000),
+                    Value::Time(false, 1, 2, 3, 4, 600_000),
+                ]),
+                &[
+                    Value::Bytes(b"12.3400".to_vec()),
+                    Value::Bytes(b"2026-07-16 03:04:05.600".to_vec()),
+                    Value::Bytes(b"26:03:04.600".to_vec()),
+                ],
+            ),
+            TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
+        );
+        assert_eq!(
+            duplicate_insert_outcome(
+                conflict.clone(),
+                Some(&[Value::Bytes(b"7".to_vec()), Value::Bytes(b"same".to_vec())]),
+                &[
+                    Value::Bytes(b"007".to_vec()),
+                    Value::Bytes(b"same".to_vec())
+                ],
             ),
             TargetExecutionOutcome::ConstraintConflict(conflict.clone())
         );
