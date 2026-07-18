@@ -97,10 +97,14 @@ identity. Startup validates the ledger schema, guards, trigger inventory, and
 exact grants before source replication. `repair-drift` resolves rows only after
 its non-mutating Verify phase proves full-scope equality, then records the run ID
 plus evidence. The Docker harness `row-conflict-rollback` scenario passes
-`--insert-conflict-policy ignore-duplicate` and proves equal-duplicate
-continuation/checkpointing, constraint-conflict rollback, durable idempotent
-evidence, different-primary-key isolation, and zero unresolved debt for repaired
-scope.
+`--insert-conflict-policy ignore-duplicate` for an equal same-primary-key
+`ROW INSERT`, and asserts that the target transaction succeeds, the checkpoint
+advances to the event end, and no unresolved ledger row exists for that source
+primary key. It then asserts rollback, unchanged checkpoints, and durable
+idempotent evidence for a divergent secondary-unique conflict, different
+primary-key isolation, and a CHECK conflict. The structured-stream transaction
+tests separately assert the same rollback/evidence boundary for a foreign-key
+conflict; the harness's FK scenarios cover repair ordering and cycle blocking.
 
 - [ ] Schedule recurring repair from unresolved records.
 - [ ] Prove the live deployed path and repeated convergence before cutover.

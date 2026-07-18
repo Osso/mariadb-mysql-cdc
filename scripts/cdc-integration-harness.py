@@ -1963,6 +1963,46 @@ class Harness:
     def run_row_conflict_rollback(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
+        equal_row = "INSERT INTO accounts VALUES (1, 'same@example.test', 'same');"
+        self.admin_sql(self.target, equal_row)
+        equal_start = self.coordinate()
+        self.write_checkpoint(equal_start)
+        self.admin_sql(self.source, equal_row)
+        equal_stop = self.coordinate()
+        equal_result = self.run_stream(
+            equal_start,
+            equal_stop,
+            insert_conflict_policy="ignore-duplicate",
+        )
+        equal_output = f"{equal_result.stdout}\n{equal_result.stderr}".lower()
+        if (
+            equal_result.returncode != 0
+            or "cdc_row_conflict_skipped" not in equal_output
+            or 'primary_key=["1"]' not in equal_output
+        ):
+            raise HarnessError(f"equal-PK duplicate did not continue cleanly: {equal_output}")
+        rows = self.admin_query(
+            self.target,
+            "SELECT id,email,payload FROM accounts ORDER BY id;",
+        ).strip()
+        if rows != "1\tsame@example.test\tsame":
+            raise HarnessError(f"equal-PK duplicate changed the target row: {rows!r}")
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint.get("source_file") != equal_stop.file
+            or int(checkpoint.get("source_position", 0)) != equal_stop.position
+        ):
+            raise HarnessError(f"equal-PK duplicate did not advance checkpoint: {checkpoint}")
+        unresolved = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM cdc.row_conflicts "
+            "WHERE table_name='accounts' AND source_primary_key_json=JSON_ARRAY('1') "
+            "AND status='unresolved';",
+        ).strip()
+        if unresolved != "0":
+            raise HarnessError(f"equal-PK duplicate created unresolved conflict debt: {unresolved}")
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, "DELETE FROM accounts WHERE id=1;")
         for endpoint in (self.source, self.target):
             self.admin_sql(endpoint, "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email (email);")
         self.admin_sql(self.target, "INSERT INTO accounts VALUES (99, 'duplicate@example.test', 'owner');")
@@ -2077,7 +2117,9 @@ class Harness:
             if len(evidence) != 4 or evidence[0] != '["11"]' or evidence[1] not in {"3819", "4025"} or evidence[2:] != [str(attempt), "unresolved"]:
                 raise HarnessError(f"constraint evidence mismatch attempt={attempt}: {evidence!r}")
         print(
-            "row-conflict-rollback_ok duplicate_attempts=2 different_pk_attempts=1 "
+            "row-conflict-rollback_ok equal_pk_duplicate=continued "
+            "equal_pk_checkpoint_advanced=true equal_pk_conflict_debt=0 "
+            "duplicate_attempts=2 different_pk_attempts=1 "
             "constraint_attempts=2 checkpoint_unchanged=true"
         )
 
