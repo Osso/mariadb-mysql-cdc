@@ -52,6 +52,136 @@ fn xid_event_checkpoints_after_transaction_rows_are_applied() {
     );
 }
 
+fn guests_table_map_event(table_id: u64) -> MysqlCdcTableMapEvent {
+    MysqlCdcTableMapEvent {
+        table_id,
+        database_name: "fixture_cdc".to_string(),
+        table_name: "guests".to_string(),
+        column_types: vec![8, 254],
+        column_metadata: vec![0, 0],
+        null_bitmap: vec![false, false],
+        table_metadata: None,
+    }
+}
+
+fn sessions_table_map_event(table_id: u64) -> MysqlCdcTableMapEvent {
+    MysqlCdcTableMapEvent {
+        table_id,
+        database_name: "fixture_cdc".to_string(),
+        table_name: "sessions".to_string(),
+        column_types: vec![8, 8, 254],
+        column_metadata: vec![0, 0, 0],
+        null_bitmap: vec![false, false, false],
+        table_metadata: None,
+    }
+}
+
+fn guest_write_rows_event(table_id: u64) -> BinlogEvent {
+    BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id,
+        flags: 0,
+        columns_number: 2,
+        columns_present: vec![true, true],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(78_806_710)),
+            Some(MySqlValue::String(
+                "02f12400-1020-4c7b-907b-0613c292bcd6MD3X".to_string(),
+            )),
+        ])],
+    })
+}
+
+fn sessions_write_rows_event(table_id: u64) -> BinlogEvent {
+    BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id,
+        flags: 0,
+        columns_number: 3,
+        columns_present: vec![true, true, true],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(109_017_694)),
+            Some(MySqlValue::Int(78_806_710)),
+            Some(MySqlValue::String(
+                "02f12400-1020-4c7b-907b-0613c292bcd6MD3X".to_string(),
+            )),
+        ])],
+    })
+}
+
+#[test]
+fn source_xid_boundary_keeps_parent_committed_when_stream_fails_after_child_transaction() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.002709".to_string();
+    let mut transaction = TargetTransaction::default();
+    let group_config = TargetTransactionGroupConfig {
+        size: 25,
+        timeout: Duration::ZERO,
+    };
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
+                current_file: &mut current_file,
+                group_config,
+            };
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        }};
+    }
+
+    process_event!(
+        event_header(19, 215329700),
+        BinlogEvent::TableMapEvent(guests_table_map_event(19))
+    )
+    .expect("guests table map");
+    process_event!(
+        event_header(19, 215329720),
+        BinlogEvent::TableMapEvent(sessions_table_map_event(20))
+    )
+    .expect("sessions table map");
+    process_event!(event_header(30, 215329760), guest_write_rows_event(19))
+        .expect("parent write in XID A");
+    process_event!(
+        event_header(16, 215329780),
+        BinlogEvent::XidEvent(XidEvent { xid: 101 })
+    )
+    .expect("XID A");
+    process_event!(event_header(30, 215329892), sessions_write_rows_event(20))
+        .expect("child write in XID B");
+    process_event!(
+        event_header(16, 215329912),
+        BinlogEvent::XidEvent(XidEvent { xid: 102 })
+    )
+    .expect("XID B");
+
+    transaction
+        .rollback_if_open(applier.executor())
+        .expect("inject stream failure after XID B");
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        [
+            "BEGIN",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "COMMIT",
+            "BEGIN",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "COMMIT",
+        ]
+    );
+}
+
 #[test]
 fn staged_success_resolution_is_discarded_on_target_rollback() {
     let executor = TransactionRecordingExecutor::default();

@@ -144,6 +144,14 @@ fn fixture_table_schema(
             "created_at",
             "status",
         ])),
+        ("guests", 2) => Ok(schema_with_primary_key(
+            vec!["guest_id", "guest_hash"],
+            vec!["guest_id"],
+        )),
+        ("sessions", 3) => Ok(schema_with_primary_key(
+            vec!["session_id", "guest_id", "guest_hash"],
+            vec!["session_id"],
+        )),
         _ => Err(mapping_error(format!(
             "unexpected fixture table {table}/{column_count}"
         ))),
@@ -151,9 +159,13 @@ fn fixture_table_schema(
 }
 
 fn schema(columns: Vec<&str>) -> ResolvedTableSchema {
+    schema_with_primary_key(columns, vec!["id"])
+}
+
+fn schema_with_primary_key(columns: Vec<&str>, primary_key: Vec<&str>) -> ResolvedTableSchema {
     ResolvedTableSchema {
         columns: columns.into_iter().map(str::to_string).collect(),
-        primary_key: vec!["id".to_string()],
+        primary_key: primary_key.into_iter().map(str::to_string).collect(),
         generated_columns: Vec::new(),
         signed_columns: Vec::new(),
         enum_columns: BTreeMap::new(),

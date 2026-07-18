@@ -215,7 +215,7 @@ where
     };
 
     if outcome.policy == EventPolicy::CommitTransaction {
-        let force_flush = matches!(event, BinlogEvent::QueryEvent(_));
+        let force_flush = matches!(event, BinlogEvent::QueryEvent(_) | BinlogEvent::XidEvent(_));
         finish_source_transaction(
             applier.executor(),
             context,
