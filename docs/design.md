@@ -78,11 +78,14 @@ handling and an FK-aware phased planner. `cdc.row_conflicts` uses a lowercase
 ASCII SHA-256 `conflict_identity` primary key over the canonical full source
 identity tuple while retaining every source field for collision checks. This
 SHA-256 statement is limited to conflict identities; it does not claim that
-FNV-based sync-progress IDs migrated. Conflict evidence is persisted on an
-independent connection before the target transaction rolls back, and the live
-target checkpoint does not advance. Startup validates the admin-bootstrap schema,
-guards, constraints, and exact table/application grants before opening the source
-stream; runtime never creates the table. `repair-drift` now invokes FK-aware
+FNV-based sync-progress IDs migrated. Supported constraint-conflict evidence is
+persisted on an independent connection before the target transaction rolls back,
+and the live target checkpoint does not advance. Duplicate `1062` row changes
+under `--insert-conflict-policy ignore-duplicate` are logged as skipped without
+ledger persistence, so their target transaction and checkpoint can commit.
+Startup validates the admin-bootstrap schema, guards, constraints, and exact
+table/application grants before opening the source stream; runtime never creates
+the table. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
 conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 33 executable scenarios,

@@ -9,9 +9,12 @@ Catchup uses a snapshot plus forward CDC replay:
 5. Validate counts, stable primary-key windows, content, checksums, orphans, and
    schema state.
 
-This is not a parity proof by itself. `INSERT IGNORE` preserves target rows that
-CDC already wrote, but does not overwrite divergent values or remove target
-orphans. A skipped live duplicate remains reconciliation debt.
+This is not a parity proof by itself. `INSERT IGNORE` preserves any conflicting
+target row, but does not overwrite divergent values or remove target orphans.
+Snapshot `INSERT IGNORE` is independent of `--insert-conflict-policy`.
+For native live ROW events, `ignore-duplicate` logs a MySQL `1062` as skipped
+without recording durable conflict debt, allowing the target transaction and
+checkpoint to advance. The default `error` policy rolls back on that duplicate.
 
 Catchup source reads and target writes follow the [connection policy](schema-inventory.md#connection-policy).
 The live source MariaDB (`source-mariadb.example` / `192.0.2.10`) is

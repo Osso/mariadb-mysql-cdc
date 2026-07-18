@@ -27,6 +27,13 @@ then returned as row failures; the target transaction and its live checkpoint ar
 not advanced. Repeating the same source event updates the same conflict record,
 while a different source primary key gets a different record.
 
+`--insert-conflict-policy ignore-duplicate` applies to this native ROW path.
+A MySQL `1062` from either a ROW `INSERT` or `UPDATE` is logged as skipped,
+without durable conflict evidence, so the target transaction and checkpoint can
+advance. With the default `error` policy, the duplicate fails the row event and
+blocks checkpoint advancement. Supported non-duplicate constraint conflicts
+remain durable repair debt regardless of this policy.
+
 Primary-key values are extracted from the table map's primary-key columns. A row
 event with no table map, no primary key, or a missing primary-key value fails
 before reaching the target.
