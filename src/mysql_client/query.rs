@@ -71,10 +71,7 @@ pub(crate) fn snapshot_progress_from_rows(
         .into_iter()
         .map(snapshot_table_progress_from_row)
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    Ok(SnapshotProgress {
-        snapshot_fence: None,
-        tables,
-    })
+    Ok(SnapshotProgress { tables })
 }
 
 fn snapshot_table_progress_from_row(

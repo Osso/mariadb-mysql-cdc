@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -50,56 +49,8 @@ pub struct ChunkRequest {
     pub limit: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SnapshotFence {
-    pub source_file: String,
-    pub source_position: u64,
-    pub complete: bool,
-}
-
-impl SnapshotFence {
-    pub fn validate(&self) -> Result<(), SnapshotError> {
-        if self.source_file.is_empty() {
-            return Err(SnapshotError::InvalidTable(
-                "snapshot fence source binlog file is required".to_string(),
-            ));
-        }
-        if self.source_position == 0 {
-            return Err(SnapshotError::InvalidTable(
-                "snapshot fence source binlog position must be greater than zero".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub fn compare_source_coordinates(
-    left_file: &str,
-    left_position: u64,
-    right_file: &str,
-    right_position: u64,
-) -> Ordering {
-    if left_file == right_file {
-        return left_position.cmp(&right_position);
-    }
-
-    match (
-        binlog_file_number(left_file),
-        binlog_file_number(right_file),
-    ) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left_file.cmp(right_file),
-    }
-}
-
-fn binlog_file_number(file: &str) -> Option<u64> {
-    file.rsplit_once('.')?.1.parse().ok()
-}
-
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnapshotProgress {
-    #[serde(default)]
-    pub snapshot_fence: Option<SnapshotFence>,
     pub tables: BTreeMap<String, TableSnapshotProgress>,
 }
 
@@ -122,12 +73,6 @@ pub trait SnapshotProgressStore {
 }
 
 pub trait SnapshotSource {
-    fn capture_start_coordinate(&self) -> Result<SnapshotFence, SnapshotError> {
-        Err(SnapshotError::InvalidTable(
-            "snapshot source start coordinate is unavailable".to_string(),
-        ))
-    }
-
     fn read_chunk(&self, request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError>;
 }
 

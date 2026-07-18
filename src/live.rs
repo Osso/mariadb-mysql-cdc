@@ -7,7 +7,6 @@ use crate::stream_checkpoint::default_stream_checkpoint_table;
 use crate::target::TargetExecutor;
 use std::cell::RefCell;
 use std::fmt;
-use std::path::PathBuf;
 
 mod binlog_command;
 mod ddl_event;
@@ -37,15 +36,9 @@ pub(crate) use mysql_cli::{strip_insert_column_for_retry, target_session_init_co
 #[cfg(test)]
 use progress::{StreamProgress, format_stream_progress, format_stream_quarantine};
 #[cfg(test)]
-use reconnect::{
-    StreamCheckpointStore, run_stream_reconnect_loop, run_stream_reconnect_loop_with_fence,
-    save_stream_checkpoint,
-};
+use reconnect::{StreamCheckpointStore, run_stream_reconnect_loop, save_stream_checkpoint};
 #[cfg(test)]
-use reconnect::{
-    is_stale_or_missing_binlog_error, resume_from_checkpoint, should_reconnect,
-    validate_snapshot_fence_checkpoint,
-};
+use reconnect::{is_stale_or_missing_binlog_error, resume_from_checkpoint, should_reconnect};
 #[cfg(test)]
 use repair::{FailedStatementRepairer, repair_failed_statement};
 pub(crate) use schema_recovery::mysql_compatible_create_table;
@@ -140,7 +133,6 @@ pub struct ApplyBinlogConfig {
     pub target: TargetMySqlConfig,
     pub checkpoint_table: String,
     pub conflict_table: String,
-    pub snapshot_progress_file: Option<PathBuf>,
     pub max_reconnects: u32,
     pub reconnect_forever: bool,
     pub target_transaction_group_size: usize,
@@ -157,7 +149,6 @@ impl Default for ApplyBinlogConfig {
             target: TargetMySqlConfig::default(),
             checkpoint_table: default_stream_checkpoint_table(),
             conflict_table: "cdc.row_conflicts".to_string(),
-            snapshot_progress_file: None,
             max_reconnects: 12,
             reconnect_forever: false,
             target_transaction_group_size: 1,

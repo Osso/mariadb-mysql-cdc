@@ -85,7 +85,6 @@ Apply options:
   --target-database DB            MySQL target database.
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --conflict-table TABLE           Durable row-conflict store. Defaults to cdc.row_conflicts.
-  --snapshot-progress-file PATH     Completed catchup snapshot fencing metadata.
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error, ignore-duplicate, or replace-divergent-pk.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
   --reconnect-forever BOOL        Ignore reconnect cap for transient source loss. Defaults to false.
@@ -528,7 +527,6 @@ fn apply_binlog_identity_option(
         "--source-identity" => config.source_identity = value.to_string(),
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
         "--conflict-table" => config.conflict_table = value.to_string(),
-        "--snapshot-progress-file" => config.snapshot_progress_file = Some(PathBuf::from(value)),
         _ => return Ok(false),
     }
 

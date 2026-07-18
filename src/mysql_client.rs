@@ -5,9 +5,7 @@ use crate::live::{
 };
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::mysql_support::target_mysql_opts;
-use crate::snapshot::{
-    ChunkRequest, SnapshotError, SnapshotFence, SnapshotProgress, SnapshotRow, SnapshotSource,
-};
+use crate::snapshot::{ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource};
 use crate::table_sync::progress::{
     build_add_total_rows_column_sql, build_create_progress_schema_sql,
     build_create_progress_table_sql, build_progress_upsert_sql,
@@ -98,24 +96,6 @@ impl PersistentMySqlSource {
         Self::new_with_opts(opts)
     }
 
-    pub fn capture_start_coordinate(&self) -> Result<SnapshotFence, SnapshotError> {
-        let (source_file, source_position) = self
-            .conn
-            .borrow_mut()
-            .query_first::<(String, u64), _>("SHOW MASTER STATUS")
-            .map_err(snapshot_query_error)?
-            .ok_or_else(|| {
-                SnapshotError::InvalidTable("SHOW MASTER STATUS returned no rows".to_string())
-            })?;
-        let fence = SnapshotFence {
-            source_file,
-            source_position,
-            complete: false,
-        };
-        fence.validate()?;
-        Ok(fence)
-    }
-
     pub fn count_rows(&self, table: &str) -> Result<u64, SnapshotError> {
         let sql = format!(
             "SELECT COUNT(*) FROM {}",
@@ -196,10 +176,6 @@ impl PersistentMySqlSource {
 }
 
 impl SnapshotSource for PersistentMySqlSource {
-    fn capture_start_coordinate(&self) -> Result<SnapshotFence, SnapshotError> {
-        PersistentMySqlSource::capture_start_coordinate(self)
-    }
-
     fn read_chunk(&self, request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError> {
         let sql = crate::mysql_snapshot::build_select_chunk_sql(request);
         let rows = self
