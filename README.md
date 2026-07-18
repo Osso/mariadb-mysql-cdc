@@ -75,12 +75,12 @@ development migrations are not maintained as upgrade paths.
 The code contains a durable row-conflict ledger wired into the live stream and
 an FK-aware phased repair planner. Supported constraint conflicts persist
 evidence through an independent control-plane connection before the row failure
-rolls back the target transaction. An ignored native ROW `INSERT` duplicate is
-logged and committed without ledger persistence only after the target row fetched
-by source primary key exactly equals the source row; divergent values remain
-durable constraint conflicts. Native ROW `UPDATE` duplicates remain
-policy-skipped. Guarded observation upserts are idempotent, and the live target
-checkpoint does not advance for durable constraint conflicts. The admin-bootstrapped
+rolls back the target transaction. Under `ignore-duplicate`, only an equal native
+ROW `INSERT` duplicate may be logged and committed without ledger persistence;
+divergent inserts and every non-`INSERT` `1062` unique conflict persist evidence,
+abort, and leave the target transaction/checkpoint uncommitted. Guarded
+observation upserts are idempotent, and the live target checkpoint does not
+advance for durable constraint conflicts. The admin-bootstrapped
 `cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory
 procedure, and exact table/procedure grants must validate at startup; runtime never
 creates the table. Different source primary keys remain different conflict
@@ -172,13 +172,13 @@ hostname verification when changing source transport. See [connection policy](do
 
 - Generic target execution treats a MySQL `1062` as success only for statements
   beginning with `INSERT INTO`. Other statements and errors still fail.
-- Native ROW events honor the policy. For `ROW INSERT`, `ignore-duplicate`
-  skips a MySQL `1062` without creating a durable conflict record only when the
-  target row fetched by source primary key exactly equals the source row;
-  divergent or otherwise non-equal values persist as durable conflict debt and
-  roll back the target transaction/checkpoint. `ROW UPDATE` duplicates remain
-  policy-skipped. With the default `error` policy, native row duplicates fail,
-  roll back the target transaction, and leave the checkpoint unchanged.
+- Native ROW events honor the policy. Under `ignore-duplicate`, only a `ROW
+  INSERT` MySQL `1062` whose target row fetched by source primary key exactly
+  equals the source row may continue without durable evidence. Divergent
+  `ROW INSERT` values and every non-`INSERT` `1062` unique conflict persist
+  evidence, abort the row event, roll back the target transaction, and leave the
+  checkpoint unchanged. With the default `error` policy, native row duplicates
+  fail, roll back the target transaction, and leave the checkpoint unchanged.
 - `catchup-snapshot` and normal range `sync-table` repairs use explicit
   `INSERT IGNORE` independently of this flag. `sync-table --updated-since`
   uses its own upsert path.

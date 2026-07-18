@@ -76,6 +76,7 @@ fn accounts_row_table_map() -> crate::row::TableMapEvent {
             generated_columns: Vec::new(),
             signed_columns: Vec::new(),
             enum_columns: BTreeMap::new(),
+            set_columns: BTreeMap::new(),
         },
     }
 }
@@ -156,6 +157,7 @@ fn schema(columns: Vec<&str>) -> ResolvedTableSchema {
         generated_columns: Vec::new(),
         signed_columns: Vec::new(),
         enum_columns: BTreeMap::new(),
+        set_columns: BTreeMap::new(),
     }
 }
 
@@ -180,6 +182,7 @@ impl TableSchemaResolver for ReleasesSchemaResolver {
                 "public_time_delta".to_string(),
                 vec!["1".to_string(), "2".to_string(), "14".to_string()],
             )]),
+            set_columns: BTreeMap::new(),
         })
     }
 }
@@ -615,11 +618,13 @@ impl TargetExecutor for TransactionRecordingExecutor {
                     conflict,
                     Some(&change.source_values),
                     &change.source_values,
+                    &change.set_columns,
                 )),
                 DuplicateMode::Divergent => Ok(crate::target::duplicate_insert_outcome(
                     conflict,
                     Some(&[Value::Bytes(b"different".to_vec())]),
                     &change.source_values,
+                    &change.set_columns,
                 )),
                 DuplicateMode::DefaultError => Err(crate::target::TargetExecuteError::from_mysql(
                     1062,

@@ -83,9 +83,10 @@ persisted on an independent connection before the target transaction rolls back,
 and the live target checkpoint does not advance. For native ROW `INSERT` changes,
 `--insert-conflict-policy ignore-duplicate` skips a `1062` only after the target
 row fetched by source primary key exactly equals the source row. A divergent or
-otherwise non-equal row follows the durable constraint-conflict path and rolls
-back the target transaction/checkpoint; an equal row has no ledger record and can
-commit. Native ROW `UPDATE` duplicates remain policy-skipped.
+otherwise non-equal `ROW INSERT` persists conflict evidence and aborts, rolling
+back the target transaction/checkpoint. Every non-`INSERT` `1062` unique conflict
+also persists evidence and aborts; only equal `ROW INSERT` duplicates under
+`ignore-duplicate` can continue without a ledger record.
 Startup validates the admin-bootstrap schema, guards, constraints, and exact
 table/application grants before opening the source stream; runtime never creates
 the table. `repair-drift` now invokes FK-aware

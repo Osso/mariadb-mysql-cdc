@@ -224,6 +224,7 @@ fn primary_key_change_assigns_every_writable_after_image_column() {
             generated_columns: vec!["generated_label".to_string()],
             signed_columns: Vec::new(),
             enum_columns: BTreeMap::new(),
+            set_columns: BTreeMap::new(),
         },
     });
     let event = UpdateRowsEvent {
@@ -305,6 +306,7 @@ fn excludes_generated_columns_from_write_and_update_statements() {
             generated_columns: vec!["public_time".to_string()],
             signed_columns: Vec::new(),
             enum_columns: BTreeMap::new(),
+            set_columns: BTreeMap::new(),
         },
     });
     let row = BTreeMap::from([
@@ -467,6 +469,7 @@ fn accounts_table_map() -> TableMapEvent {
             generated_columns: Vec::new(),
             signed_columns: Vec::new(),
             enum_columns: BTreeMap::new(),
+            set_columns: BTreeMap::new(),
         },
     }
 }
@@ -494,6 +497,7 @@ fn composite_accounts_table_map() -> TableMapEvent {
             generated_columns: Vec::new(),
             signed_columns: Vec::new(),
             enum_columns: BTreeMap::new(),
+            set_columns: BTreeMap::new(),
         },
     }
 }

@@ -217,6 +217,10 @@ fn insert_change(
             table: table.table.clone(),
             primary_key_columns: table.primary_key.clone(),
             primary_key_values,
+            set_columns: writable_columns
+                .iter()
+                .map(|column| table.set_columns.get(column).cloned())
+                .collect(),
             source_values: ordered_values(row, &writable_columns),
             writable_columns,
         },
@@ -241,6 +245,10 @@ fn update_change(
             table: table.table.clone(),
             primary_key_columns: table.primary_key.clone(),
             primary_key_values,
+            set_columns: writable_columns
+                .iter()
+                .map(|column| table.set_columns.get(column).cloned())
+                .collect(),
             source_values: ordered_values(&update.after, &writable_columns),
             writable_columns,
         },
@@ -261,6 +269,10 @@ fn delete_change(
             table: table.table.clone(),
             primary_key_columns: table.primary_key.clone(),
             primary_key_values,
+            set_columns: writable_columns
+                .iter()
+                .map(|column| table.set_columns.get(column).cloned())
+                .collect(),
             source_values: ordered_values(row, &writable_columns),
             writable_columns,
         },

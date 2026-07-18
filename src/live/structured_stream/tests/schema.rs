@@ -82,6 +82,49 @@ fn metadata_table_map_uses_inventory_enum_values_when_metadata_omits_them() {
 }
 
 #[test]
+fn metadata_table_map_supplies_set_member_names_for_duplicate_comparison() {
+    let resolver = EmptySchemaResolver;
+    let table_map = MysqlCdcTableMapEvent {
+        table_id: 79,
+        database_name: "app".to_string(),
+        table_name: "labels".to_string(),
+        column_types: vec![3, MYSQL_COLUMN_TYPE_SET],
+        column_metadata: vec![0, 3],
+        null_bitmap: vec![false, true],
+        table_metadata: Some(TableMetadata {
+            signedness: None,
+            default_charset: None,
+            column_charsets: None,
+            column_names: Some(vec!["id".to_string(), "labels".to_string()]),
+            set_string_values: Some(vec![vec![
+                "red".to_string(),
+                "green".to_string(),
+                "blue".to_string(),
+            ]]),
+            enum_string_values: None,
+            geometry_types: None,
+            simple_primary_keys: Some(vec![0]),
+            primary_keys_with_prefix: None,
+            enum_and_set_default_charset: None,
+            enum_and_set_column_charsets: None,
+            column_visibility: None,
+        }),
+    };
+
+    let mapped = map_table_map_event(&stream_coordinate(100), &table_map, &resolver)
+        .expect("map SET metadata");
+
+    assert_eq!(
+        mapped.table.set_columns.get("labels"),
+        Some(&vec![
+            "red".to_string(),
+            "green".to_string(),
+            "blue".to_string(),
+        ])
+    );
+}
+
+#[test]
 fn parses_enum_values_from_inventory_column_type() {
     assert_eq!(
         parse_enum_column_type("enum('1','2','14')"),

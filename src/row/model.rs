@@ -17,6 +17,7 @@ pub struct RowTableMap {
     pub generated_columns: Vec<String>,
     pub signed_columns: Vec<String>,
     pub enum_columns: BTreeMap<String, Vec<String>>,
+    pub set_columns: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

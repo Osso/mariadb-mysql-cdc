@@ -13,9 +13,9 @@ conflicting secondary key.
       NULL, foreign-key, and CHECK constraint failures are also durable debt.
 - [x] Under `ignore-duplicate`, skip a native ROW `INSERT` `1062` only when the
       target row fetched by source primary key exactly equals the source row;
-      divergent or otherwise non-equal rows follow the durable conflict path.
-      Native ROW `UPDATE` duplicates remain policy-skipped; the default `error`
-      policy fails native row duplicates.
+      divergent `ROW INSERT` values and every non-`INSERT` `1062` unique conflict
+      persist evidence and abort. Only equal `ROW INSERT` duplicates continue;
+      the default `error` policy fails native row duplicates.
 - [x] Persist supported constraint-conflict evidence on the independent
       control-plane connection, then fail the row event so every earlier target
       mutation in the same source transaction rolls back.
@@ -42,11 +42,12 @@ execution and native ROW changes. The generic target executor treats MySQL
 `INSERT` changes do so only after the target row fetched by source primary key
 exactly equals the source row. A divergent or otherwise non-equal row is a
 constraint conflict: it is persisted as repair debt, fails the row event, and
-leaves the target transaction/checkpoint uncommitted. Native ROW `UPDATE`
-duplicates remain policy-skipped. With the default `error` policy, native row
-duplicates fail and leave the transaction/checkpoint uncommitted. Supported
-non-duplicate constraint conflicts still use the durable conflict path regardless
-of policy.
+leaves the target transaction/checkpoint uncommitted. Every non-`INSERT` `1062`
+unique conflict likewise persists evidence and aborts. Only equal native ROW
+`INSERT` duplicates under `ignore-duplicate` continue without a ledger record;
+with the default `error` policy, native row duplicates fail and leave the
+transaction/checkpoint uncommitted. Supported non-duplicate constraint conflicts
+still use the durable conflict path regardless of policy.
 Snapshot/catchup writes and normal range repairs use explicit `INSERT IGNORE`
 independently of the flag; the `sync-table --updated-since` path uses an upsert.
 

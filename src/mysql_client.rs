@@ -237,6 +237,7 @@ impl TargetExecutor for PersistentTargetExecutor {
                     conflict,
                     existing_values.as_deref(),
                     &change.source_values,
+                    &change.set_columns,
                 ))
             }
             Err(error) => {

@@ -8,6 +8,7 @@ pub(super) struct ResolvedTableSchema {
     pub(super) generated_columns: Vec<String>,
     pub(super) signed_columns: Vec<String>,
     pub(super) enum_columns: BTreeMap<String, Vec<String>>,
+    pub(super) set_columns: BTreeMap<String, Vec<String>>,
 }
 
 pub(super) trait TableSchemaResolver {
@@ -108,10 +109,12 @@ where
     let fallback_schema = fallback_schema_for_metadata(metadata, &fallback)?;
     let primary_key = metadata_primary_key(metadata, &columns, &fallback_schema)?;
     let enum_columns = metadata_enum_columns(table_map, metadata, &columns, &fallback_schema)?;
+    let set_columns = metadata_set_columns(table_map, metadata, &columns, &fallback_schema)?;
     Ok(resolved_table_schema(
         columns,
         primary_key,
         enum_columns,
+        set_columns,
         fallback_schema,
     ))
 }
@@ -137,10 +140,17 @@ fn resolved_table_schema(
     columns: Vec<String>,
     primary_key: Vec<String>,
     enum_columns: BTreeMap<String, Vec<String>>,
+    set_columns: BTreeMap<String, Vec<String>>,
     fallback: Option<ResolvedTableSchema>,
 ) -> ResolvedTableSchema {
     let (generated_columns, signed_columns) = fallback
-        .map(|schema| (schema.generated_columns, schema.signed_columns))
+        .as_ref()
+        .map(|schema| {
+            (
+                schema.generated_columns.clone(),
+                schema.signed_columns.clone(),
+            )
+        })
         .unwrap_or_default();
     ResolvedTableSchema {
         columns,
@@ -148,6 +158,7 @@ fn resolved_table_schema(
         generated_columns,
         signed_columns,
         enum_columns,
+        set_columns,
     }
 }
 
@@ -164,6 +175,7 @@ fn build_inventory_table_schema(
     let generated_columns = generated_column_names(table);
     let signed_columns = signed_column_names(table);
     let enum_columns = enum_column_values(table);
+    let set_columns = set_column_values(table);
     validate_column_count(schema, &table.name, column_count, &columns)?;
     Ok(ResolvedTableSchema {
         columns,
@@ -171,6 +183,7 @@ fn build_inventory_table_schema(
         generated_columns,
         signed_columns,
         enum_columns,
+        set_columns,
     })
 }
 
@@ -198,6 +211,16 @@ fn enum_column_values(table: &TableInventory) -> BTreeMap<String, Vec<String>> {
         .iter()
         .filter_map(|column| {
             parse_enum_column_type(&column.column_type).map(|values| (column.name.clone(), values))
+        })
+        .collect()
+}
+
+fn set_column_values(table: &TableInventory) -> BTreeMap<String, Vec<String>> {
+    table
+        .columns
+        .iter()
+        .filter_map(|column| {
+            parse_set_column_type(&column.column_type).map(|values| (column.name.clone(), values))
         })
         .collect()
 }
@@ -258,6 +281,22 @@ fn metadata_enum_columns(
     Ok(metadata_values)
 }
 
+fn metadata_set_columns(
+    table_map: &MysqlCdcTableMapEvent,
+    metadata: &TableMetadata,
+    columns: &[String],
+    fallback: &Option<ResolvedTableSchema>,
+) -> Result<BTreeMap<String, Vec<String>>, ApplyBinlogError> {
+    let metadata_values = set_columns_from_metadata(table_map, metadata, columns)?;
+    if metadata_values.is_empty() {
+        return Ok(fallback
+            .as_ref()
+            .map(|schema| schema.set_columns.clone())
+            .unwrap_or_default());
+    }
+    Ok(metadata_values)
+}
+
 pub(super) fn map_table_map_event<R>(
     coordinate: &BinlogCoordinate,
     table_map: &MysqlCdcTableMapEvent,
@@ -278,6 +317,7 @@ where
             generated_columns: schema.generated_columns,
             signed_columns: schema.signed_columns,
             enum_columns: schema.enum_columns,
+            set_columns: schema.set_columns,
         },
     })
 }
@@ -322,8 +362,47 @@ fn enum_column_indexes(table_map: &MysqlCdcTableMapEvent) -> Vec<usize> {
         .collect()
 }
 
+pub(super) fn set_columns_from_metadata(
+    table_map: &MysqlCdcTableMapEvent,
+    metadata: &TableMetadata,
+    columns: &[String],
+) -> Result<BTreeMap<String, Vec<String>>, ApplyBinlogError> {
+    let Some(set_value_sets) = &metadata.set_string_values else {
+        return Ok(BTreeMap::new());
+    };
+    let set_column_indexes = table_map
+        .column_types
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column_type)| (*column_type == MYSQL_COLUMN_TYPE_SET).then_some(index))
+        .collect::<Vec<_>>();
+    if set_column_indexes.len() != set_value_sets.len() {
+        return Err(mapping_error(format!(
+            "table map SET metadata has {} SET columns but {} SET value sets",
+            set_column_indexes.len(),
+            set_value_sets.len()
+        )));
+    }
+
+    set_column_indexes
+        .into_iter()
+        .zip(set_value_sets.iter())
+        .map(|(column_index, values)| {
+            let column = columns.get(column_index).cloned().ok_or_else(|| {
+                mapping_error(format!("SET column index {column_index} is out of range"))
+            })?;
+            Ok((column, values.clone()))
+        })
+        .collect()
+}
+
 pub(super) fn parse_enum_column_type(column_type: &str) -> Option<Vec<String>> {
     let values = column_type.strip_prefix("enum(")?.strip_suffix(')')?;
+    Some(parse_sql_string_list(values))
+}
+
+pub(super) fn parse_set_column_type(column_type: &str) -> Option<Vec<String>> {
+    let values = column_type.strip_prefix("set(")?.strip_suffix(')')?;
     Some(parse_sql_string_list(values))
 }
 

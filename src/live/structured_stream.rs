@@ -53,6 +53,7 @@ const MYSQL_CDC_HEARTBEAT_SECONDS: u64 = 30;
 // applies, so the server's net_write_timeout does not kill the dump connection.
 const READ_AHEAD_EVENT_BUFFER: usize = 1024;
 const MYSQL_COLUMN_TYPE_ENUM: u8 = 247;
+const MYSQL_COLUMN_TYPE_SET: u8 = 248;
 const MILLIS_PER_SECOND: u64 = 1_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 mod ddl;

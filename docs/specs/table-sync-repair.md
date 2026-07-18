@@ -29,10 +29,10 @@ are resolved only after verified equality.
 ## Remaining boundaries
 
 - [x] The live stream writes supported constraint conflicts to the durable
-      ledger through the row-event conflict context; equal native ROW `INSERT`
-      duplicates and policy-skipped ROW `UPDATE` duplicates continue without
-      ledger records, while divergent native ROW `INSERT` duplicates remain
-      durable conflicts.
+      ledger through the row-event conflict context; only equal native ROW
+      `INSERT` duplicates under `ignore-duplicate` continue without ledger
+      records. Divergent `ROW INSERT` values and every non-`INSERT` `1062` unique
+      conflict persist evidence and abort as durable conflicts.
 - [x] `repair-drift` creates a fresh orchestration ID, derives FK-safe phases, and
       passes immutable child run IDs to `sync-table`.
 - [ ] No recurring conflict-to-repair scheduler exists; operators must invoke a

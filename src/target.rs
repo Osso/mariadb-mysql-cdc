@@ -51,6 +51,7 @@ pub struct TargetRowChange {
     pub primary_key_values: Vec<Value>,
     pub writable_columns: Vec<String>,
     pub source_values: Vec<Value>,
+    pub set_columns: Vec<Option<Vec<String>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,23 +97,79 @@ pub(crate) fn duplicate_insert_outcome(
     conflict: DuplicateConflict,
     existing_values: Option<&[Value]>,
     source_values: &[Value],
+    set_columns: &[Option<Vec<String>>],
 ) -> TargetExecutionOutcome {
-    if existing_values.is_some_and(|values| values_equal(values, source_values)) {
+    if existing_values.is_some_and(|values| values_equal(values, source_values, set_columns)) {
         TargetExecutionOutcome::DuplicateIgnored(conflict)
     } else {
         TargetExecutionOutcome::ConstraintConflict(conflict)
     }
 }
 
-fn values_equal(left: &[Value], right: &[Value]) -> bool {
+fn values_equal(left: &[Value], right: &[Value], set_columns: &[Option<Vec<String>>]) -> bool {
     left.len() == right.len()
         && left
             .iter()
             .zip(right)
-            .all(|(left, right)| value_equal(left, right))
+            .enumerate()
+            .all(|(index, (left, right))| {
+                value_equal(
+                    left,
+                    right,
+                    set_columns.get(index).and_then(Option::as_deref),
+                )
+            })
 }
 
-fn value_equal(left: &Value, right: &Value) -> bool {
+fn value_equal(left: &Value, right: &Value, set_values: Option<&[String]>) -> bool {
+    if let Some(set_values) = set_values {
+        return set_values_equal(left, right, set_values);
+    }
+    value_equal_without_set(left, right)
+}
+
+fn set_values_equal(left: &Value, right: &Value, set_values: &[String]) -> bool {
+    match (left, right) {
+        (Value::UInt(left), Value::Bytes(right)) => set_mask_matches_text(*left, right, set_values),
+        (Value::Bytes(left), Value::UInt(right)) => set_mask_matches_text(*right, left, set_values),
+        _ => value_equal_without_set(left, right),
+    }
+}
+
+fn set_mask_matches_text(mask: u64, text: &[u8], set_values: &[String]) -> bool {
+    let Ok(text) = std::str::from_utf8(text) else {
+        return false;
+    };
+    if set_values.len() > u64::BITS as usize {
+        return false;
+    }
+    let allowed_mask = if set_values.len() == u64::BITS as usize {
+        u64::MAX
+    } else {
+        (1_u64 << set_values.len()) - 1
+    };
+    if mask & !allowed_mask != 0 {
+        return false;
+    }
+    if text.is_empty() {
+        return mask == 0;
+    }
+
+    let mut text_mask = 0_u64;
+    for value in text.split(',') {
+        let Some(index) = set_values.iter().position(|candidate| candidate == value) else {
+            return false;
+        };
+        let bit = 1_u64 << index;
+        if text_mask & bit != 0 {
+            return false;
+        }
+        text_mask |= bit;
+    }
+    text_mask == mask
+}
+
+fn value_equal_without_set(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::NULL, Value::NULL) => true,
         (Value::Bytes(left), Value::Bytes(right)) => left == right,
@@ -908,7 +965,7 @@ mod tests {
         let source_values = vec![Value::UInt(7), Value::Bytes(b"same".to_vec())];
 
         assert_eq!(
-            duplicate_insert_outcome(conflict.clone(), Some(&source_values), &source_values,),
+            duplicate_insert_outcome(conflict.clone(), Some(&source_values), &source_values, &[],),
             TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
         );
         assert_eq!(
@@ -916,6 +973,7 @@ mod tests {
                 conflict.clone(),
                 Some(&[Value::Int(7), Value::Bytes(b"same".to_vec())]),
                 &source_values,
+                &[],
             ),
             TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
         );
@@ -932,6 +990,7 @@ mod tests {
                     Value::Bytes(b"2026-07-16 03:04:05.600".to_vec()),
                     Value::Bytes(b"26:03:04.600".to_vec()),
                 ],
+                &[],
             ),
             TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
         );
@@ -943,11 +1002,12 @@ mod tests {
                     Value::Bytes(b"007".to_vec()),
                     Value::Bytes(b"same".to_vec())
                 ],
+                &[],
             ),
             TargetExecutionOutcome::ConstraintConflict(conflict.clone())
         );
         assert_eq!(
-            duplicate_insert_outcome(conflict.clone(), None, &source_values),
+            duplicate_insert_outcome(conflict.clone(), None, &source_values, &[]),
             TargetExecutionOutcome::ConstraintConflict(conflict)
         );
     }
