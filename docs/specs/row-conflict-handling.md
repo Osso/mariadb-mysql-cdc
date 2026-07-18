@@ -96,7 +96,8 @@ creating a second row; a different source primary key remains a distinct
 identity. Startup validates the ledger schema, guards, trigger inventory, and
 exact grants before source replication. `repair-drift` resolves rows only after
 its non-mutating Verify phase proves full-scope equality, then records the run ID
-plus evidence. The Docker harness proves ignored duplicate
+plus evidence. The Docker harness `row-conflict-rollback` scenario passes
+`--insert-conflict-policy ignore-duplicate` and proves equal-duplicate
 continuation/checkpointing, constraint-conflict rollback, durable idempotent
 evidence, different-primary-key isolation, and zero unresolved debt for repaired
 scope.

@@ -459,6 +459,7 @@ class Harness:
         stop: Coordinate | None,
         integration_failpoint: str | None,
         max_reconnects: int,
+        insert_conflict_policy: str | None = None,
     ) -> list[str]:
         assert self.source and self.target
         args = [
@@ -497,6 +498,8 @@ class Harness:
         ]
         if stop:
             args.extend(["--stop-position", str(stop.position)])
+        if insert_conflict_policy is not None:
+            args.extend(["--insert-conflict-policy", insert_conflict_policy])
         if integration_failpoint is not None:
             args.extend(["--integration-failpoint", integration_failpoint])
         return args
@@ -508,13 +511,21 @@ class Harness:
         integration_failpoint: str | None = None,
         max_reconnects: int = 0,
         barrier_dir: Path | None = None,
+        insert_conflict_policy: str | None = None,
     ) -> CommandResult:
         binary = self._stream_binary(integration_failpoint)
         env = {**os.environ, "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD, "CDC_TARGET_PASSWORD": TARGET_PASSWORD}
         if barrier_dir is not None:
             env["CDC_INTEGRATION_BARRIER_DIR"] = str(barrier_dir)
         return run(
-            self._stream_args(binary, start, stop, integration_failpoint, max_reconnects),
+            self._stream_args(
+                binary,
+                start,
+                stop,
+                integration_failpoint,
+                max_reconnects,
+                insert_conflict_policy,
+            ),
             env=env,
             timeout=90,
             check=False,
@@ -1966,7 +1977,7 @@ class Harness:
         )
         stop = self.coordinate()
         for attempt in (1, 2):
-            result = self.run_stream(start, stop)
+            result = self.run_stream(start, stop, insert_conflict_policy="ignore-duplicate")
             output = f"{result.stdout}\n{result.stderr}".lower()
             if result.returncode == 0 or "row conflict persisted for repair" not in output:
                 raise HarnessError(f"duplicate rollback attempt {attempt} did not fail durably: {output}")
@@ -1996,7 +2007,11 @@ class Harness:
             "INSERT INTO accounts VALUES (3, 'different-pk@example.test', 'different-pk');",
         )
         different_pk_stop = self.coordinate()
-        different_pk_result = self.run_stream(different_pk_start, different_pk_stop)
+        different_pk_result = self.run_stream(
+            different_pk_start,
+            different_pk_stop,
+            insert_conflict_policy="ignore-duplicate",
+        )
         different_pk_output = f"{different_pk_result.stdout}\n{different_pk_result.stderr}".lower()
         if different_pk_result.returncode == 0 or "row conflict persisted for repair" not in different_pk_output:
             raise HarnessError(f"different-PK replay did not fail durably: {different_pk_output}")
@@ -2040,7 +2055,11 @@ class Harness:
         )
         constraint_stop = self.coordinate()
         for attempt in (1, 2):
-            result = self.run_stream(constraint_start, constraint_stop)
+            result = self.run_stream(
+                constraint_start,
+                constraint_stop,
+                insert_conflict_policy="ignore-duplicate",
+            )
             output = f"{result.stdout}\n{result.stderr}".lower()
             if result.returncode == 0 or "constraint failure" not in output and "conflict persisted for repair" not in output:
                 raise HarnessError(f"constraint rollback attempt {attempt} did not fail durably: {output}")

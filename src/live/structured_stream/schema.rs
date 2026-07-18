@@ -373,8 +373,11 @@ pub(super) fn set_columns_from_metadata(
     let set_column_indexes = table_map
         .column_types
         .iter()
+        .zip(&table_map.column_metadata)
         .enumerate()
-        .filter_map(|(index, column_type)| (*column_type == MYSQL_COLUMN_TYPE_SET).then_some(index))
+        .filter_map(|(index, (column_type, metadata))| {
+            is_set_column(*column_type, *metadata).then_some(index)
+        })
         .collect::<Vec<_>>();
     if set_column_indexes.len() != set_value_sets.len() {
         return Err(mapping_error(format!(
@@ -394,6 +397,12 @@ pub(super) fn set_columns_from_metadata(
             Ok((column, values.clone()))
         })
         .collect()
+}
+
+fn is_set_column(column_type: u8, metadata: u16) -> bool {
+    column_type == MYSQL_COLUMN_TYPE_SET
+        || (column_type == MYSQL_COLUMN_TYPE_STRING
+            && metadata >> 8 == u16::from(MYSQL_COLUMN_TYPE_SET))
 }
 
 pub(super) fn parse_enum_column_type(column_type: &str) -> Option<Vec<String>> {
