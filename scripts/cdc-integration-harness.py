@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Disposable MariaDB -> MySQL CDC proof harness.
 
-The executable scenarios use dedicated least-privilege accounts and strict TLS.
+The executable scenarios use dedicated least-privilege accounts. Harness
+administrative and target connections use TLS; the source stream intentionally
+uses plaintext to match the accepted production source transport policy.
 Scenarios without a production failpoint or real repair command are reported as
 explicit prerequisites, never as passes.
 """
