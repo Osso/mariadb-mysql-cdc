@@ -140,17 +140,21 @@ fn stage_successful_conflict_resolution(
         "{reason}; source coordinate {}:{}; table `{}` primary key {:?}",
         coordinate.file, coordinate.position, table.table, primary_key
     );
-    context
-        .pending_resolutions
-        .push(crate::conflict_repair::ConflictResolution {
-            source_identity: context.source_identity.to_string(),
-            schema: table.schema.clone(),
-            table: table.table.clone(),
-            source_primary_key: primary_key,
-            repair_run_id,
-            evidence,
-        });
-    let _ = operation;
+    let resolution = crate::conflict_repair::ConflictResolution {
+        source_identity: context.source_identity.to_string(),
+        schema: table.schema.clone(),
+        table: table.table.clone(),
+        source_primary_key: primary_key,
+        repair_run_id,
+        evidence,
+    };
+    if context
+        .store
+        .has_unresolved(&resolution)
+        .map_err(|error| conflict_store_error(coordinate, table, operation, "inspect", error))?
+    {
+        context.pending_resolutions.push(resolution);
+    }
     Ok(())
 }
 

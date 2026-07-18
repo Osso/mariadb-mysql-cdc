@@ -14,6 +14,7 @@ pub trait ConflictStore {
     }
     fn observe(&mut self, observation: ConflictObservation) -> Result<(), String>;
     fn resolve_existing(&mut self, resolution: ConflictResolution) -> Result<(), String>;
+    fn has_unresolved(&mut self, resolution: &ConflictResolution) -> Result<bool, String>;
 
     fn resolve_if_equal(
         &mut self,
@@ -42,6 +43,16 @@ impl InMemoryConflictStore {
 }
 
 impl ConflictStore for InMemoryConflictStore {
+    fn has_unresolved(&mut self, resolution: &ConflictResolution) -> Result<bool, String> {
+        Ok(self.records.values().any(|record| {
+            record.status == ConflictStatus::Unresolved
+                && record.key.source_identity == resolution.source_identity
+                && record.key.schema == resolution.schema
+                && record.key.table == resolution.table
+                && record.key.source_primary_key == resolution.source_primary_key
+        }))
+    }
+
     fn resolve_existing(&mut self, resolution: ConflictResolution) -> Result<(), String> {
         if let Some(record) = self.records.values_mut().find(|record| {
             record.status == ConflictStatus::Unresolved
@@ -387,6 +398,23 @@ fn query_conflict_checks(
 }
 
 impl ConflictStore for MySqlConflictStore {
+    fn has_unresolved(&mut self, resolution: &ConflictResolution) -> Result<bool, String> {
+        let primary_key_json = serde_json::to_string(&resolution.source_primary_key)
+            .map_err(|error| format!("conflict primary key serialization failed: {error}"))?;
+        self.conn
+            .borrow_mut()
+            .query_first::<u64, _>(format!(
+                "SELECT COUNT(*) FROM {} WHERE source_identity={} AND schema_name={} AND table_name={} AND source_primary_key_json={} AND status='unresolved'",
+                self.table,
+                quote_sql_literal(&resolution.source_identity),
+                quote_sql_literal(&resolution.schema),
+                quote_sql_literal(&resolution.table),
+                quote_sql_literal(&primary_key_json),
+            ))
+            .map_err(conflict_mysql_error)
+            .map(|count| count.unwrap_or(0) > 0)
+    }
+
     fn ensure(&mut self) -> Result<(), String> {
         Self::ensure(self)
     }
@@ -511,6 +539,15 @@ impl<E: ConflictSqlExecutor> DurableConflictStore<E> {
 }
 
 impl<E: ConflictSqlExecutor> ConflictStore for DurableConflictStore<E> {
+    fn has_unresolved(&mut self, resolution: &ConflictResolution) -> Result<bool, String> {
+        Ok(self.unresolved.iter().any(|key| {
+            key.source_identity == resolution.source_identity
+                && key.schema == resolution.schema
+                && key.table == resolution.table
+                && key.source_primary_key == resolution.source_primary_key
+        }))
+    }
+
     fn ensure(&mut self) -> Result<(), String> {
         DurableConflictStore::ensure(self)
     }
