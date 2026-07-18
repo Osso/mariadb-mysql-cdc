@@ -1,4 +1,4 @@
-use crate::conflict_repair::{ConflictOperation, ConflictStore};
+use crate::conflict_repair::{ConflictOperation, ConflictResolution, ConflictStore};
 use crate::probe::BinlogCoordinate;
 use crate::target::TargetExecuteError;
 use mysql::Value;
@@ -55,6 +55,7 @@ pub struct RowUpdate {
 
 pub struct RowConflictContext<'a> {
     pub store: &'a mut dyn ConflictStore,
+    pub pending_resolutions: &'a mut Vec<ConflictResolution>,
     pub source_identity: &'a str,
     pub source_server_id: u64,
     pub end_position: u64,

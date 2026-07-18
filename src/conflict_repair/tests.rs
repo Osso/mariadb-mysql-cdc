@@ -191,6 +191,54 @@ fn interrupted_phase_resumes_exact_plan_without_repeating_completed_deletes() {
 }
 
 #[test]
+fn successful_resolution_never_creates_and_isolated_resolution_matches_source_scope() {
+    let mut ledger = InMemoryConflictStore::default();
+    ledger
+        .resolve_existing(ConflictResolution {
+            source_identity: "missing-source".to_string(),
+            schema: "missing_schema".to_string(),
+            table: "accounts".to_string(),
+            source_primary_key: vec!["1".to_string()],
+            repair_run_id: "run".to_string(),
+            evidence: "successful replay".to_string(),
+        })
+        .expect("missing resolution is a no-op");
+    assert!(ledger.records().is_empty());
+
+    let mut source_a = test_conflict("accounts", "1");
+    source_a.source_identity = "source-a".to_string();
+    source_a.schema = "schema-a".to_string();
+    let mut source_b = source_a.clone();
+    source_b.source_identity = "source-b".to_string();
+    source_b.schema = "schema-b".to_string();
+    ledger.observe(source_a).expect("source-a observation");
+    ledger.observe(source_b).expect("source-b observation");
+
+    ledger
+        .resolve_existing(ConflictResolution {
+            source_identity: "source-a".to_string(),
+            schema: "schema-a".to_string(),
+            table: "accounts".to_string(),
+            source_primary_key: vec!["1".to_string()],
+            repair_run_id: "run".to_string(),
+            evidence: "successful replay".to_string(),
+        })
+        .expect("scoped resolution");
+
+    let records = ledger.records();
+    let resolved = records
+        .iter()
+        .find(|record| record.key.source_identity == "source-a")
+        .expect("source-a record");
+    let isolated = records
+        .iter()
+        .find(|record| record.key.source_identity == "source-b")
+        .expect("source-b record");
+    assert_eq!(resolved.status, ConflictStatus::Resolved);
+    assert_eq!(isolated.status, ConflictStatus::Unresolved);
+}
+
+#[test]
 fn durable_conflict_store_is_a_validating_conflict_store() {
     let mut store = DurableConflictStore::new(RecordingSql::default(), "cdc.row_conflicts");
     let observation = test_conflict("accounts", "1");

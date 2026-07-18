@@ -57,7 +57,7 @@ where
                 "{}",
                 format_row_conflict_skipped(operation, table, coordinate, primary_key)
             );
-            resolve_successful_conflict(
+            stage_successful_conflict_resolution(
                 context,
                 coordinate,
                 table,
@@ -94,27 +94,21 @@ fn record_replaced_conflict(
     let Some(context) = context else {
         return Ok(());
     };
-    let mut observation =
-        skipped_conflict_observation(context, coordinate, table, operation, primary_key, conflict);
-    observation.error_text = format!(
-        "replace-divergent-pk: target row replaced with source image; {}",
-        observation.error_text
+    let reason = format!(
+        "target row replaced with source image; {}",
+        conflict.error_text
     );
-    context
-        .store
-        .observe(observation)
-        .map_err(|error| conflict_store_error(coordinate, table, operation, "persist", error))?;
-    resolve_successful_conflict(
+    stage_successful_conflict_resolution(
         Some(context),
         coordinate,
         table,
         operation,
         primary_key,
-        "target row replaced with source image",
+        &reason,
     )
 }
 
-fn resolve_successful_conflict(
+fn stage_successful_conflict_resolution(
     context: Option<&mut RowConflictContext<'_>>,
     coordinate: &BinlogCoordinate,
     table: &RowTableMap,
@@ -127,8 +121,7 @@ fn resolve_successful_conflict(
     };
     let primary_key = primary_key
         .iter()
-        .cloned()
-        .map(|value| value_to_string(value).unwrap_or_default())
+        .map(value_to_conflict_key)
         .collect::<Vec<_>>();
     let repair_run_id = format!(
         "stream-{}-{}-{}",
@@ -141,9 +134,17 @@ fn resolve_successful_conflict(
         coordinate.file, coordinate.position, table.table, primary_key
     );
     context
-        .store
-        .resolve_if_equal(&table.table, &primary_key, true, &repair_run_id, &evidence)
-        .map_err(|error| conflict_store_error(coordinate, table, operation, "resolve", error))
+        .pending_resolutions
+        .push(crate::conflict_repair::ConflictResolution {
+            source_identity: context.source_identity.to_string(),
+            schema: table.schema.clone(),
+            table: table.table.clone(),
+            source_primary_key: primary_key,
+            repair_run_id,
+            evidence,
+        });
+    let _ = operation;
+    Ok(())
 }
 
 fn record_skipped_conflict(

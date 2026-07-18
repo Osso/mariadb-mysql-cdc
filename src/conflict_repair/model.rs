@@ -181,6 +181,16 @@ impl ConflictKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictResolution {
+    pub source_identity: String,
+    pub schema: String,
+    pub table: String,
+    pub source_primary_key: Vec<String>,
+    pub repair_run_id: String,
+    pub evidence: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConflictObservation {
     pub source_identity: String,

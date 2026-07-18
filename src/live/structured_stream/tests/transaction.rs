@@ -53,6 +53,32 @@ fn xid_event_checkpoints_after_transaction_rows_are_applied() {
 }
 
 #[test]
+fn staged_success_resolution_is_discarded_on_target_rollback() {
+    let executor = TransactionRecordingExecutor::default();
+    let mut transaction = TargetTransaction::default();
+    transaction
+        .begin_if_needed(&executor)
+        .expect("begin target transaction");
+    transaction.pending_conflict_resolutions_mut().push(
+        crate::conflict_repair::ConflictResolution {
+            source_identity: "source".to_string(),
+            schema: "fixture_cdc".to_string(),
+            table: "accounts".to_string(),
+            source_primary_key: vec!["1".to_string()],
+            repair_run_id: "run".to_string(),
+            evidence: "successful replay".to_string(),
+        },
+    );
+
+    transaction
+        .rollback_if_open(&executor)
+        .expect("rollback target transaction");
+
+    assert!(!transaction.has_pending_conflict_resolutions());
+    assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK"]);
+}
+
+#[test]
 fn wraps_target_writes_and_checkpoint_in_source_xid_transaction() {
     let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
     let resolver = FixtureSchemaResolver;
@@ -168,6 +194,28 @@ fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
     let mut current_file = "mysqld-bin.000777".to_string();
     let mut transaction = TargetTransaction::default();
     let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    crate::conflict_repair::ConflictStore::observe(
+        &mut conflicts,
+        crate::conflict_repair::ConflictObservation {
+            source_identity: "test-source".to_string(),
+            source_server_id: 1,
+            coordinate: crate::conflict_repair::ConflictCoordinate {
+                file: "prior-binlog".to_string(),
+                start_position: 1,
+                end_position: 2,
+            },
+            schema: "fixture_cdc".to_string(),
+            table: "accounts".to_string(),
+            operation: crate::conflict_repair::ConflictOperation::Insert,
+            source_primary_key: vec!["2".to_string()],
+            duplicate_index: Some("PRIMARY".to_string()),
+            duplicate_owner_primary_key: None,
+            error_code: 1062,
+            error_text: "prior replacement conflict".to_string(),
+            observed_at_ms: 1,
+        },
+    )
+    .expect("prior conflict");
     let header = event_header(30, 240);
     let event = write_rows_event(18, 2, "beta");
     let mut context = StreamEventContext {
@@ -229,11 +277,7 @@ fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
             .as_deref()
             .is_some_and(|evidence| evidence.contains("target row replaced with source image"))
     );
-    assert!(
-        record
-            .error_text
-            .starts_with("replace-divergent-pk: target row replaced with source image;")
-    );
+    assert_eq!(record.error_text, "prior replacement conflict");
 }
 
 #[test]

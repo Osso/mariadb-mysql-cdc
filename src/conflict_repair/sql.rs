@@ -55,6 +55,12 @@ enum ConflictResolutionScope<'a> {
         source_identity: &'a str,
         row_table: &'a str,
     },
+    SourceSchemaTableRow {
+        source_identity: &'a str,
+        schema: &'a str,
+        row_table: &'a str,
+        primary_key_json: String,
+    },
     TableRow {
         schema: Option<&'a str>,
         row_table: &'a str,
@@ -96,6 +102,18 @@ fn build_conflict_resolution_update_sql(
 
 fn build_conflict_scope_sql(scope: ConflictResolutionScope<'_>) -> String {
     match scope {
+        ConflictResolutionScope::SourceSchemaTableRow {
+            source_identity,
+            schema,
+            row_table,
+            primary_key_json,
+        } => format!(
+            "source_identity={} AND schema_name={} AND table_name={} AND source_primary_key_json={}",
+            sql_literal(source_identity),
+            sql_literal(schema),
+            sql_literal(row_table),
+            sql_literal(&primary_key_json),
+        ),
         ConflictResolutionScope::Table {
             source_identity,
             row_table,
@@ -135,6 +153,23 @@ pub fn build_conflict_table_resolution_sql(
         ConflictResolutionScope::Table {
             source_identity,
             row_table,
+        },
+    )
+}
+
+pub fn build_conflict_resolution_for_source_row_sql(
+    ledger_table: &str,
+    resolution: &ConflictResolution,
+) -> String {
+    build_conflict_resolution_update_sql(
+        ledger_table,
+        &resolution.repair_run_id,
+        &resolution.evidence,
+        ConflictResolutionScope::SourceSchemaTableRow {
+            source_identity: &resolution.source_identity,
+            schema: &resolution.schema,
+            row_table: &resolution.table,
+            primary_key_json: json_string(&resolution.source_primary_key),
         },
     )
 }

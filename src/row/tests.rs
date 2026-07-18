@@ -9,6 +9,32 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 
 #[test]
+fn successful_resolution_uses_temporal_pk_canonicalization_from_observation() {
+    let primary_key = [Value::Date(2026, 7, 18, 12, 34, 56, 789_000)];
+    let observation =
+        super::conflict::build_duplicate_conflict_observation(DuplicateConflictInput {
+            source_identity: "source-a",
+            source_server_id: 7,
+            coordinate: &coordinate(120),
+            end_position: 121,
+            schema: "app",
+            table: "accounts",
+            operation: RowOperation::Insert,
+            primary_key: &primary_key,
+            duplicate_index: Some("PRIMARY".to_string()),
+            duplicate_owner_primary_key: None,
+            error_code: 1062,
+            error_text: "duplicate",
+            observed_at_ms: 1,
+        });
+
+    assert_eq!(
+        observation.source_primary_key,
+        vec!["2026-07-18 12:34:56.789000".to_string()]
+    );
+}
+
+#[test]
 fn applies_write_rows_as_independent_plain_inserts() {
     let applier = applier_with_accounts_table();
     let event = WriteRowsEvent {
@@ -87,8 +113,30 @@ fn replaced_divergent_primary_continues_and_records_durable_evidence() {
         rows: vec![row("1", "source"), row("2", "next")],
     };
     let mut ledger = crate::conflict_repair::InMemoryConflictStore::default();
+    applier
+        .record_duplicate_conflict(
+            &mut ledger,
+            DuplicateConflictInput {
+                source_identity: "source-a",
+                source_server_id: 7,
+                coordinate: &coordinate(155),
+                end_position: 200,
+                schema: "fixture_cdc",
+                table: "accounts",
+                operation: RowOperation::Insert,
+                primary_key: &[value("1")],
+                duplicate_index: Some("PRIMARY".to_string()),
+                duplicate_owner_primary_key: None,
+                error_code: 1062,
+                error_text: "Duplicate entry '1' for key 'PRIMARY'",
+                observed_at_ms: 100,
+            },
+        )
+        .expect("seed conflict");
+    let mut pending_resolutions = Vec::new();
     let mut context = RowConflictContext {
         store: &mut ledger,
+        pending_resolutions: &mut pending_resolutions,
         source_identity: "source-a",
         source_server_id: 7,
         end_position: 200,
@@ -103,20 +151,11 @@ fn replaced_divergent_primary_continues_and_records_durable_evidence() {
     let record = &ledger.records()[0];
     assert_eq!(
         record.status,
-        crate::conflict_repair::ConflictStatus::Resolved
+        crate::conflict_repair::ConflictStatus::Unresolved
     );
-    assert!(record.repair_run_id.is_some());
-    assert!(
-        record
-            .resolution_evidence
-            .as_deref()
-            .is_some_and(|evidence| evidence.contains("target row replaced with source image"))
-    );
-    assert!(
-        record
-            .error_text
-            .starts_with("replace-divergent-pk: target row replaced with source image;")
-    );
+    assert!(record.repair_run_id.is_none());
+    assert!(record.resolution_evidence.is_none());
+    assert_eq!(pending_resolutions.len(), 1);
 }
 
 #[test]
@@ -139,8 +178,32 @@ fn ignored_duplicate_row_continues_without_persisting_conflict() {
         rows: vec![row("A", "conflict")],
     };
     let mut ledger = crate::conflict_repair::InMemoryConflictStore::default();
+    crate::conflict_repair::ConflictStore::observe(
+        &mut ledger,
+        crate::conflict_repair::ConflictObservation {
+            source_identity: "source-a".to_string(),
+            source_server_id: 7,
+            coordinate: crate::conflict_repair::ConflictCoordinate {
+                file: "prior-binlog".to_string(),
+                start_position: 1,
+                end_position: 2,
+            },
+            schema: "app".to_string(),
+            table: "accounts".to_string(),
+            operation: crate::conflict_repair::ConflictOperation::Insert,
+            source_primary_key: vec!["1".to_string()],
+            duplicate_index: Some("PRIMARY".to_string()),
+            duplicate_owner_primary_key: None,
+            error_code: 1062,
+            error_text: "prior replacement conflict".to_string(),
+            observed_at_ms: 1,
+        },
+    )
+    .expect("prior conflict");
+    let mut pending_resolutions = Vec::new();
     let mut context = RowConflictContext {
         store: &mut ledger,
+        pending_resolutions: &mut pending_resolutions,
         source_identity: "source-a",
         source_server_id: 7,
         end_position: 200,
@@ -150,7 +213,11 @@ fn ignored_duplicate_row_continues_without_persisting_conflict() {
     applier
         .apply_write_rows_with_conflicts(&event, &mut context)
         .expect("ignored duplicate should not abort the target transaction");
-    assert!(ledger.records().is_empty());
+    assert_eq!(ledger.records().len(), 1);
+    assert_eq!(
+        ledger.records()[0].status,
+        crate::conflict_repair::ConflictStatus::Unresolved
+    );
 }
 
 #[test]
