@@ -51,7 +51,14 @@ where
         row_target_error(coordinate, table, operation, RowError::Target(source))
     })?;
     match outcome {
-        TargetExecutionOutcome::Applied => Ok(()),
+        TargetExecutionOutcome::Applied => resolve_successful_conflict(
+            context,
+            coordinate,
+            table,
+            operation,
+            primary_key,
+            "source row applied successfully",
+        ),
         TargetExecutionOutcome::DuplicateIgnored(_) => {
             println!(
                 "{}",
