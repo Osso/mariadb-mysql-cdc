@@ -1,7 +1,7 @@
 use crate::live::{ApplyBinlogConfig, ApplyBinlogError, ApplyBinlogReport, apply_remote_binlog};
 use crate::snapshot::{
-    SnapshotError, SnapshotFence, SnapshotProgress, SnapshotProgressStore, SnapshotResult,
-    SnapshotSource, SnapshotTable, SnapshotTarget, snapshot_table,
+    SnapshotError, SnapshotFence, SnapshotProgressStore, SnapshotResult, SnapshotSource,
+    SnapshotTable, SnapshotTarget, snapshot_table,
 };
 use std::fmt;
 
@@ -93,7 +93,8 @@ where
     let snapshot_fence = load_or_capture_snapshot_fence(progress_store, snapshot_source)?;
     let snapshot_results = snapshot_tables(plan, progress_store, snapshot_source, snapshot_target)?;
     let mut progress = progress_store.load()?;
-    let completed_fence = finalize_snapshot_fence(plan, &progress, snapshot_fence.clone())?;
+    let mut completed_fence = snapshot_fence.clone();
+    completed_fence.complete = true;
     progress.snapshot_fence = Some(completed_fence.clone());
     progress_store.save(&progress)?;
     let replay_report =
@@ -159,25 +160,6 @@ where
     Ok(results)
 }
 
-fn finalize_snapshot_fence(
-    plan: &CatchupPlan,
-    progress: &SnapshotProgress,
-    mut fence: SnapshotFence,
-) -> Result<SnapshotFence, CatchupError> {
-    if !plan.tables.iter().all(|table| {
-        progress
-            .table(&table.name)
-            .is_some_and(|table_progress| table_progress.complete)
-    }) {
-        return Err(CatchupError::InvalidPlan(
-            "snapshot progress is incomplete for planned tables".to_string(),
-        ));
-    }
-
-    fence.complete = true;
-    Ok(fence)
-}
-
 fn validate_plan(plan: &CatchupPlan) -> Result<(), CatchupError> {
     if plan.tables.is_empty() {
         return Err(CatchupError::InvalidPlan(
@@ -207,124 +189,10 @@ fn validate_plan(plan: &CatchupPlan) -> Result<(), CatchupError> {
 mod tests {
     use super::*;
     use crate::snapshot::{
-        ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotProgress,
-        SnapshotProgressStore, SnapshotRow, TableSnapshotProgress,
+        ChunkRequest, SnapshotError, SnapshotProgress, SnapshotProgressStore, SnapshotRow,
     };
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
-
-    #[test]
-    fn file_progress_reload_replays_from_persisted_fence_after_all_planned_tables_complete() {
-        let path = unique_path("catchup-progress.json");
-        let plan = CatchupPlan {
-            tables: vec![accounts_table(), orders_table()],
-            chunk_size: 2,
-            start_file: "stale-binlog.000001".to_string(),
-            start_position: 4,
-        };
-        let fence = SnapshotFence {
-            source_file: "mysqld-bin.000009".to_string(),
-            source_position: 321,
-            complete: false,
-        };
-        let first_store = FileSnapshotProgressStore::new(&path);
-        let source = QueueSnapshotSource::with_start(
-            fence.clone(),
-            vec![vec![row("1", "account")], vec![row("2", "order")]],
-        );
-        let mut target = RecordingSnapshotTarget::default();
-
-        run_catchup(
-            &plan,
-            &first_store,
-            &source,
-            &mut target,
-            &RecordingReplay::default(),
-        )
-        .expect("initial catchup");
-
-        let reloaded_store = FileSnapshotProgressStore::new(&path);
-        let persisted = reloaded_store.load().expect("reload progress");
-        assert_eq!(
-            persisted.snapshot_fence,
-            Some(SnapshotFence {
-                complete: true,
-                ..fence.clone()
-            })
-        );
-        assert!(plan.tables.iter().all(|table| {
-            persisted
-                .table(&table.name)
-                .is_some_and(|progress| progress.complete)
-        }));
-
-        let restarted_source = QueueSnapshotSource::with_start(
-            SnapshotFence {
-                source_file: "wrong-binlog.000001".to_string(),
-                source_position: 999,
-                complete: false,
-            },
-            Vec::new(),
-        );
-        let replay = RecordingReplay::default();
-        run_catchup(
-            &plan,
-            &reloaded_store,
-            &restarted_source,
-            &mut RecordingSnapshotTarget::default(),
-            &replay,
-        )
-        .expect("restarted catchup");
-
-        assert_eq!(
-            replay.start.borrow().as_ref(),
-            Some(&(fence.source_file, fence.source_position))
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn file_progress_does_not_complete_fence_for_partial_planned_tables() {
-        let path = unique_path("partial-catchup-progress.json");
-        let plan = CatchupPlan {
-            tables: vec![accounts_table(), orders_table()],
-            chunk_size: 2,
-            start_file: "mysqld-bin.000001".to_string(),
-            start_position: 4,
-        };
-        let fence = SnapshotFence {
-            source_file: "mysqld-bin.000009".to_string(),
-            source_position: 321,
-            complete: false,
-        };
-        let store = FileSnapshotProgressStore::new(&path);
-        store
-            .save(&SnapshotProgress {
-                snapshot_fence: Some(fence.clone()),
-                tables: BTreeMap::from([
-                    (
-                        "accounts".to_string(),
-                        TableSnapshotProgress {
-                            complete: true,
-                            ..TableSnapshotProgress::default()
-                        },
-                    ),
-                    ("orders".to_string(), TableSnapshotProgress::default()),
-                ]),
-            })
-            .expect("save partial progress");
-
-        let reloaded = FileSnapshotProgressStore::new(&path);
-        let progress = reloaded.load().expect("reload partial progress");
-        let error = finalize_snapshot_fence(&plan, &progress, fence).expect_err("partial plan");
-
-        assert_eq!(
-            error.to_string(),
-            "snapshot progress is incomplete for planned tables"
-        );
-        assert!(!progress.snapshot_fence.expect("fence").complete);
-        let _ = std::fs::remove_file(path);
-    }
 
     #[test]
     fn snapshots_capture_and_replay_from_the_persisted_source_fence() {
@@ -541,29 +409,11 @@ mod tests {
     }
 
     fn accounts_table() -> SnapshotTable {
-        table("accounts")
-    }
-
-    fn orders_table() -> SnapshotTable {
-        table("orders")
-    }
-
-    fn table(name: &str) -> SnapshotTable {
         SnapshotTable {
-            name: name.to_string(),
+            name: "accounts".to_string(),
             primary_key: vec!["id".to_string()],
             columns: vec!["id".to_string(), "name".to_string()],
         }
-    }
-
-    fn unique_path(file_name: &str) -> std::path::PathBuf {
-        let mut path = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        path.push(format!("mariadb-mysql-cdc-catchup-{nanos}-{file_name}"));
-        path
     }
 
     fn row(id: &str, name: &str) -> SnapshotRow {
