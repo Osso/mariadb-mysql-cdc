@@ -159,6 +159,55 @@ fn equal_duplicate_commits_multi_row_transaction_and_checkpoints() {
 }
 
 #[test]
+fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
+    let executor = TransactionRecordingExecutor::with_replaced_duplicate_second_row_change();
+    let mut applier = crate::row::RowApplier::new(executor);
+    applier.apply_table_map(accounts_row_table_map());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    let header = event_header(30, 240);
+    let event = write_rows_event(18, 2, "beta");
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &header,
+        &event,
+        "test-source",
+        &mut conflicts,
+    )
+    .expect("replacement should continue");
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC"]
+    );
+    let record = &conflicts.records()[0];
+    assert_eq!(
+        record.status,
+        crate::conflict_repair::ConflictStatus::Unresolved
+    );
+    assert!(
+        record
+            .error_text
+            .starts_with("replace-divergent-pk: target row replaced with source image;")
+    );
+}
+
+#[test]
 fn divergent_duplicate_rolls_back_and_persists_conflict_evidence() {
     let executor = TransactionRecordingExecutor::with_divergent_duplicate_second_row_change();
     let mut applier = crate::row::RowApplier::new(executor);
@@ -386,6 +435,52 @@ fn foreign_key_conflict_rolls_back_and_preserves_constraint_evidence() {
     assert_eq!(conflicts.records().len(), 1);
     assert_eq!(conflicts.records()[0].error_code, 1452);
     assert_eq!(conflicts.records()[0].duplicate_index, None);
+}
+
+#[test]
+fn check_conflict_rolls_back_and_preserves_constraint_evidence() {
+    let executor = TransactionRecordingExecutor::with_check_conflict_second_row_change();
+    let mut applier = crate::row::RowApplier::new(executor);
+    applier.apply_table_map(accounts_row_table_map());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    let header = event_header(30, 240);
+    let event = write_rows_event(18, 2, "beta");
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let error = apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &header,
+        &event,
+        "test-source",
+        &mut conflicts,
+    )
+    .expect_err("CHECK conflict must abort the source transaction");
+
+    assert!(
+        error
+            .to_string()
+            .contains("row conflict persisted for repair")
+    );
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "ROLLBACK"]
+    );
+    assert_eq!(conflicts.records().len(), 1);
+    assert_eq!(conflicts.records()[0].error_code, 3819);
 }
 
 #[test]

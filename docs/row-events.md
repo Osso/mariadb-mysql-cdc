@@ -27,15 +27,17 @@ failures; the target transaction and its live checkpoint are not advanced.
 Repeating the same source event updates the same conflict record, while a
 different source primary key gets a different record.
 
-`--insert-conflict-policy ignore-duplicate` applies to this native ROW path.
-For a ROW `INSERT`, a MySQL `1062` is logged as skipped without durable conflict
-evidence only when the target row fetched by source primary key exactly equals
-the source row. A divergent or otherwise non-equal `ROW INSERT` persists
-conflict evidence, fails the row event, and blocks checkpoint advancement.
-Every non-`INSERT` `1062` unique conflict likewise persists evidence and aborts;
-only equal `ROW INSERT` duplicates under `ignore-duplicate` continue without a
-ledger record. Supported non-duplicate constraint conflicts remain durable
-repair debt regardless of this policy.
+`--insert-conflict-policy` accepts `error`, `ignore-duplicate`, and
+`replace-divergent-pk`. For a ROW `INSERT`, `ignore-duplicate` continues without
+ledger evidence only when the target row fetched by source primary key exactly
+equals the source row. `replace-divergent-pk` replaces an unequal row only when
+MySQL reports `PRIMARY`, using a primary-key UPDATE of the source image; it
+records durable replacement evidence and allows checkpoint advancement. The
+accepted risk is overwriting the divergent target row. Secondary-unique,
+foreign-key, CHECK, and replacement-update conflicts persist evidence and abort;
+if a later conflict rolls back the target transaction, the replacement rolls back
+but its independent ledger observation survives. Supported non-duplicate
+constraint conflicts remain durable repair debt regardless of this policy.
 
 Primary-key values are extracted from the table map's primary-key columns. A row
 event with no table map, no primary key, or a missing primary-key value fails

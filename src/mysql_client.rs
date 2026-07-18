@@ -1,5 +1,8 @@
 use crate::checkpoint::Checkpoint;
-use crate::live::{InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert};
+use crate::live::{
+    InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
+    should_replace_divergent_primary,
+};
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::mysql_support::target_mysql_opts;
 use crate::snapshot::{ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource};
@@ -10,7 +13,8 @@ use crate::table_sync::progress::{
 use crate::table_sync::{SyncTableProgress, TableSyncError};
 use crate::target::{
     DuplicateConflict, SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor,
-    TargetRowChange, TargetRowChangeKind, TransactionalTargetExecutor, duplicate_insert_outcome,
+    TargetRowChange, TargetRowChangeKind, TransactionalTargetExecutor,
+    build_primary_key_replacement_statement,
 };
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, Params};
@@ -223,22 +227,43 @@ impl TargetExecutor for PersistentTargetExecutor {
             Ok(()) => Ok(TargetExecutionOutcome::Applied),
             Err(error)
                 if error.mysql_code() == Some(1062)
-                    && self.insert_conflict_policy
-                        == crate::live::InsertConflictPolicy::IgnoreDuplicate
                     && change.kind == TargetRowChangeKind::Insert =>
             {
+                let error_text = error.to_string();
                 let conflict = DuplicateConflict {
                     error_code: 1062,
-                    error_text: error.to_string(),
+                    error_text,
                     duplicate_index: crate::target::duplicate_index_from_error(&error.to_string()),
                 };
+                if self.insert_conflict_policy == InsertConflictPolicy::Error {
+                    return Err(error);
+                }
                 let existing_values = self.read_existing_row(change)?;
-                Ok(duplicate_insert_outcome(
-                    conflict,
-                    existing_values.as_deref(),
-                    &change.source_values,
-                    &change.set_columns,
-                ))
+                let rows_equal = existing_values.as_deref().is_some_and(|values| {
+                    crate::target::duplicate_insert_outcome(
+                        conflict.clone(),
+                        Some(values),
+                        &change.source_values,
+                        &change.set_columns,
+                    ) == TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
+                });
+                if rows_equal
+                    && matches!(
+                        self.insert_conflict_policy,
+                        InsertConflictPolicy::IgnoreDuplicate
+                            | InsertConflictPolicy::ReplaceDivergentPk
+                    )
+                {
+                    return Ok(TargetExecutionOutcome::DuplicateIgnored(conflict));
+                }
+                if should_replace_divergent_primary(
+                    self.insert_conflict_policy,
+                    conflict.duplicate_index.as_deref(),
+                    rows_equal,
+                ) {
+                    return self.replace_divergent_primary_key_row(change, conflict);
+                }
+                Ok(TargetExecutionOutcome::ConstraintConflict(conflict))
             }
             Err(error) => {
                 if let Some(conflict) = duplicate_conflict_for_row_change(change.kind, &error) {
@@ -348,6 +373,29 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
 }
 
 impl PersistentTargetExecutor {
+    fn replace_divergent_primary_key_row(
+        &self,
+        change: &TargetRowChange,
+        conflict: DuplicateConflict,
+    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+        let statement = build_primary_key_replacement_statement(change);
+        match self.execute_statement(&statement) {
+            Ok(()) => Ok(TargetExecutionOutcome::PrimaryKeyReplaced(conflict)),
+            Err(error) => {
+                if let Some(conflict) =
+                    duplicate_conflict_for_row_change(TargetRowChangeKind::Update, &error)
+                {
+                    return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
+                }
+                if let Some(conflict) = constraint_conflict_from_error(&error) {
+                    return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
+                }
+                self.retry_or_return_error(&statement, error)?;
+                Ok(TargetExecutionOutcome::Applied)
+            }
+        }
+    }
+
     fn execute_transaction_control(&self, sql: &str) -> Result<(), TargetExecuteError> {
         self.conn
             .borrow_mut()

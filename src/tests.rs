@@ -565,6 +565,14 @@ fn rejects_invalid_numeric_options() {
 }
 
 #[test]
+fn accepts_replace_divergent_primary_insert_conflict_policy() {
+    assert_eq!(
+        parse_insert_policy("replace-divergent-pk").expect("replace policy"),
+        live::InsertConflictPolicy::ReplaceDivergentPk
+    );
+}
+
+#[test]
 fn rejects_unknown_insert_conflict_policy() {
     let error = parse_insert_policy("replace").expect_err("unknown policy");
 

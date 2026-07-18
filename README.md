@@ -167,18 +167,25 @@ hostname verification when changing source transport. See [connection policy](do
 
 ## Insert conflict policy
 
-`--insert-conflict-policy ignore-duplicate` is path-specific, not a global
-“keep CDC running past duplicates” switch:
+`--insert-conflict-policy` is path-specific, not a global “keep CDC running past
+duplicates” switch. Values are `error`, `ignore-duplicate`, and the explicit
+`replace-divergent-pk` policy:
 
 - Generic target execution treats a MySQL `1062` as success only for statements
-  beginning with `INSERT INTO`. Other statements and errors still fail.
-- Native ROW events honor the policy. Under `ignore-duplicate`, only a `ROW
-  INSERT` MySQL `1062` whose target row fetched by source primary key exactly
-  equals the source row may continue without durable evidence. Divergent
-  `ROW INSERT` values and every non-`INSERT` `1062` unique conflict persist
-  evidence, abort the row event, roll back the target transaction, and leave the
-  checkpoint unchanged. With the default `error` policy, native row duplicates
-  fail, roll back the target transaction, and leave the checkpoint unchanged.
+  beginning with `INSERT INTO` under `ignore-duplicate`. Other statements and
+  errors still fail; `replace-divergent-pk` does not add a generic SQL fallback.
+- Native ROW events under `ignore-duplicate` continue only when a duplicate
+  `INSERT` target row fetched by source primary key exactly equals the source row.
+- Native ROW events under `replace-divergent-pk` read the target row by source
+  primary key and replace an unequal row only when the duplicate index is
+  `PRIMARY`, using a safe primary-key UPDATE of the source image. The accepted
+  risk is overwriting the divergent target row. Durable replacement evidence is
+  recorded and the row/event can checkpoint. Secondary-unique, foreign-key,
+  CHECK, and replacement-update conflicts persist evidence and abort. If a later
+  conflict rolls back the target transaction, the replacement rolls back while
+  independent ledger evidence survives.
+- With the default `error` policy, native row duplicates fail, roll back the
+  target transaction, and leave the checkpoint unchanged.
 - `catchup-snapshot` and normal range `sync-table` repairs use explicit
   `INSERT IGNORE` independently of this flag. `sync-table --updated-since`
   uses its own upsert path.

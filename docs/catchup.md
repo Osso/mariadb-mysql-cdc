@@ -14,9 +14,13 @@ target row, but does not overwrite divergent values or remove target orphans.
 Snapshot `INSERT IGNORE` is independent of `--insert-conflict-policy`.
 For a native live ROW `INSERT`, `ignore-duplicate` skips MySQL `1062` only when
 the target row fetched by source primary key exactly equals the source row.
-A divergent or otherwise non-equal row becomes durable conflict debt, rolls back
-the target transaction, and leaves the checkpoint unchanged. The default `error`
-policy also rolls back on the duplicate.
+The explicit `replace-divergent-pk` policy may replace an unequal row only for a
+`PRIMARY` duplicate, using a primary-key UPDATE of the source image and durable
+audit evidence; secondary-unique, foreign-key, CHECK, and replacement-update
+conflicts still roll back. The accepted overwrite risk is explicit. If a later
+conflict rolls back the enclosing target transaction, the replacement rolls back
+while its independent ledger evidence remains. The default `error` policy also
+rolls back on the duplicate.
 
 Catchup source reads and target writes follow the [connection policy](schema-inventory.md#connection-policy).
 The live source MariaDB (`source-mariadb.example` / `192.0.2.10`) is

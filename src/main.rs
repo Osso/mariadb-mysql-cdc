@@ -85,7 +85,7 @@ Apply options:
   --target-database DB            MySQL target database.
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --conflict-table TABLE           Durable row-conflict store. Defaults to cdc.row_conflicts.
-  --insert-conflict-policy POLICY Replay INSERT conflict policy: error or ignore-duplicate.
+  --insert-conflict-policy POLICY Replay INSERT conflict policy: error, ignore-duplicate, or replace-divergent-pk.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
   --reconnect-forever BOOL        Ignore reconnect cap for transient source loss. Defaults to false.
   --stop-never-slave-server-id ID MariaDB --stop-never slave server_id. Generated when omitted.
@@ -627,6 +627,7 @@ pub(crate) fn parse_insert_policy(value: &str) -> Result<live::InsertConflictPol
     match value {
         "error" => Ok(live::InsertConflictPolicy::Error),
         "ignore-duplicate" => Ok(live::InsertConflictPolicy::IgnoreDuplicate),
+        "replace-divergent-pk" => Ok(live::InsertConflictPolicy::ReplaceDivergentPk),
         other => Err(format!("unknown insert conflict policy: {other}")),
     }
 }

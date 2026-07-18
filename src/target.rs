@@ -58,6 +58,7 @@ pub struct TargetRowChange {
 pub enum TargetExecutionOutcome {
     Applied,
     DuplicateIgnored(DuplicateConflict),
+    PrimaryKeyReplaced(DuplicateConflict),
     ConstraintConflict(DuplicateConflict),
 }
 
@@ -91,6 +92,30 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
     ) -> Result<(), TargetExecuteError>;
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
+}
+
+pub(crate) fn build_primary_key_replacement_statement(change: &TargetRowChange) -> SqlStatement {
+    let assignments = change
+        .writable_columns
+        .iter()
+        .map(|column| format!("{} = ?", crate::mysql_support::quote_ident(column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let predicates = change
+        .primary_key_columns
+        .iter()
+        .map(|column| format!("{} = ?", crate::mysql_support::quote_ident(column)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut params = change.source_values.clone();
+    params.extend(change.primary_key_values.clone());
+    SqlStatement {
+        sql: format!(
+            "UPDATE {} SET {assignments} WHERE {predicates}",
+            crate::mysql_support::quote_ident(&change.table)
+        ),
+        params,
+    }
 }
 
 pub(crate) fn duplicate_insert_outcome(
@@ -953,6 +978,31 @@ mod tests {
         assert_eq!(executed.len(), 2);
         assert_eq!(executed[0].params.len(), 65_520);
         assert_eq!(executed[1].params.len(), 21);
+    }
+
+    #[test]
+    fn builds_primary_key_replacement_update_from_source_image() {
+        let change = TargetRowChange {
+            statement: SqlStatement {
+                sql: "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?)".to_string(),
+                params: values(["7", "source"]),
+            },
+            kind: TargetRowChangeKind::Insert,
+            table: "accounts".to_string(),
+            primary_key_columns: vec!["id".to_string()],
+            primary_key_values: values(["7"]),
+            writable_columns: vec!["id".to_string(), "name".to_string()],
+            source_values: values(["7", "source"]),
+            set_columns: vec![None, None],
+        };
+
+        let replacement = build_primary_key_replacement_statement(&change);
+
+        assert_eq!(
+            replacement.sql,
+            "UPDATE `accounts` SET `id` = ?, `name` = ? WHERE `id` = ?"
+        );
+        assert_eq!(replacement.params, values(["7", "source", "7"]));
     }
 
     #[test]

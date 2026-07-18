@@ -59,6 +59,13 @@ where
             );
             Ok(())
         }
+        TargetExecutionOutcome::PrimaryKeyReplaced(conflict) => {
+            println!(
+                "{}",
+                format_row_conflict_replaced(operation, table, coordinate, primary_key)
+            );
+            record_replaced_conflict(context, coordinate, table, operation, primary_key, conflict)
+        }
         TargetExecutionOutcome::ConstraintConflict(conflict) => {
             println!(
                 "{}",
@@ -67,6 +74,30 @@ where
             record_skipped_conflict(context, coordinate, table, operation, primary_key, conflict)
         }
     }
+}
+
+fn record_replaced_conflict(
+    context: Option<&mut RowConflictContext<'_>>,
+    coordinate: &BinlogCoordinate,
+    table: &RowTableMap,
+    operation: RowOperation,
+    primary_key: &[Value],
+    conflict: crate::target::DuplicateConflict,
+) -> RowResult<()> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let mut observation =
+        skipped_conflict_observation(context, coordinate, table, operation, primary_key, conflict);
+    observation.error_text = format!(
+        "replace-divergent-pk: target row replaced with source image; {}",
+        observation.error_text
+    );
+    context
+        .store
+        .observe(observation)
+        .map_err(|error| conflict_store_error(coordinate, table, operation, "persist", error))?;
+    Ok(())
 }
 
 fn record_skipped_conflict(
@@ -169,6 +200,24 @@ fn row_target_error(
         operation,
         source,
     })
+}
+
+pub(crate) fn format_row_conflict_replaced(
+    operation: RowOperation,
+    table: &RowTableMap,
+    coordinate: &BinlogCoordinate,
+    primary_key: &[Value],
+) -> String {
+    let primary_key = primary_key
+        .iter()
+        .cloned()
+        .map(value_to_string)
+        .collect::<Vec<_>>();
+    let primary_key = serde_json::to_string(&primary_key).expect("primary key JSON encoding");
+    format!(
+        "cdc_row_conflict_replaced operation={operation} schema={} table={} source_file={} source_position={} primary_key={primary_key}",
+        table.schema, table.table, coordinate.file, coordinate.position,
+    )
 }
 
 pub(crate) fn format_row_conflict_skipped(

@@ -461,8 +461,10 @@ impl DdlReplayJournal for RecordingDdlReplayJournal {
 enum DuplicateMode {
     Equal,
     Divergent,
+    Replaced,
     DefaultError,
     ForeignKey,
+    Check,
     UpdateUnique,
 }
 
@@ -552,6 +554,14 @@ impl TransactionRecordingExecutor {
         }
     }
 
+    fn with_replaced_duplicate_second_row_change() -> Self {
+        Self {
+            duplicate_row_change_number: Some(1),
+            duplicate_mode: DuplicateMode::Replaced,
+            ..Self::default()
+        }
+    }
+
     fn with_default_duplicate_second_row_change() -> Self {
         Self {
             duplicate_row_change_number: Some(1),
@@ -564,6 +574,14 @@ impl TransactionRecordingExecutor {
         Self {
             duplicate_row_change_number: Some(1),
             duplicate_mode: DuplicateMode::ForeignKey,
+            ..Self::default()
+        }
+    }
+
+    fn with_check_conflict_second_row_change() -> Self {
+        Self {
+            duplicate_row_change_number: Some(1),
+            duplicate_mode: DuplicateMode::Check,
             ..Self::default()
         }
     }
@@ -626,6 +644,9 @@ impl TargetExecutor for TransactionRecordingExecutor {
                     &change.source_values,
                     &change.set_columns,
                 )),
+                DuplicateMode::Replaced => Ok(
+                    crate::target::TargetExecutionOutcome::PrimaryKeyReplaced(conflict),
+                ),
                 DuplicateMode::DefaultError => Err(crate::target::TargetExecuteError::from_mysql(
                     1062,
                     "ERROR 1062 duplicate entry for key 'PRIMARY'",
@@ -637,6 +658,16 @@ impl TargetExecutor for TransactionRecordingExecutor {
                             error_text:
                                 "Cannot add or update a child row: a foreign key constraint fails"
                                     .to_string(),
+                            duplicate_index: None,
+                        },
+                    ))
+                }
+                DuplicateMode::Check => {
+                    Ok(crate::target::TargetExecutionOutcome::ConstraintConflict(
+                        crate::target::DuplicateConflict {
+                            error_code: 3819,
+                            error_text: "Check constraint 'accounts_status_chk' is violated"
+                                .to_string(),
                             duplicate_index: None,
                         },
                     ))

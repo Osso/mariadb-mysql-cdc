@@ -16,6 +16,15 @@ conflicting secondary key.
       divergent `ROW INSERT` values and every non-`INSERT` `1062` unique conflict
       persist evidence and abort. Only equal `ROW INSERT` duplicates continue;
       the default `error` policy fails native row duplicates.
+- [x] Under the explicit `replace-divergent-pk` policy, an unequal native ROW
+      `INSERT` duplicate is replaceable only when MySQL identifies `PRIMARY`:
+      read the target row by source primary key, update every writable source-image
+      column by that primary-key predicate, and emit durable replacement evidence.
+      Secondary-unique, foreign-key, CHECK, and replacement-update conflicts never
+      use this path and remain durable aborting conflicts. The accepted policy risk
+      is overwriting the divergent target row. Replacement keeps applying rows and
+      may checkpoint; if its enclosing target transaction later rolls back, the
+      independent ledger evidence survives while the replacement itself rolls back.
 - [x] Persist supported constraint-conflict evidence on the independent
       control-plane connection, then fail the row event so every earlier target
       mutation in the same source transaction rolls back.
@@ -36,18 +45,20 @@ conflicting secondary key.
 
 ## Insert conflict policy boundary
 
-`--insert-conflict-policy ignore-duplicate` applies to both generic target
-execution and native ROW changes. The generic target executor treats MySQL
-`1062` as success for statements beginning with `INSERT INTO`; native ROW
-`INSERT` changes do so only after the target row fetched by source primary key
-exactly equals the source row. A divergent or otherwise non-equal row is a
-constraint conflict: it is persisted as repair debt, fails the row event, and
-leaves the target transaction/checkpoint uncommitted. Every non-`INSERT` `1062`
-unique conflict likewise persists evidence and aborts. Only equal native ROW
-`INSERT` duplicates under `ignore-duplicate` continue without a ledger record;
-with the default `error` policy, native row duplicates fail and leave the
-transaction/checkpoint uncommitted. Supported non-duplicate constraint conflicts
-still use the durable conflict path regardless of policy.
+`--insert-conflict-policy` has three values: `error`, `ignore-duplicate`, and
+`replace-divergent-pk`. `ignore-duplicate` keeps its equality-only native ROW
+behavior: a duplicate continues without ledger evidence only when the target row
+fetched by source primary key exactly equals the source row. `replace-divergent-pk`
+is native ROW-only and replaces unequal rows only for a `PRIMARY` duplicate using
+a primary-key UPDATE of the source image; it records durable audit evidence and
+continues, so the target transaction/checkpoint can commit. Secondary-unique,
+foreign-key, CHECK, and replacement-update conflicts always persist evidence and
+abort. The accepted overwrite risk is explicit. If a later conflict rolls back the
+enclosing target transaction, the replacement rolls back but its independent
+ledger observation remains. Generic statement execution does not gain an unsafe
+replacement fallback. Snapshot/catchup writes and normal range repairs use
+explicit `INSERT IGNORE` independently of the flag; the `sync-table
+--updated-since` path uses an upsert.
 Snapshot/catchup writes and normal range repairs use explicit `INSERT IGNORE`
 independently of the flag; the `sync-table --updated-since` path uses an upsert.
 

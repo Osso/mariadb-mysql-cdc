@@ -22,18 +22,18 @@ before-image primary-key column.
 
 ## Insert conflict policy boundary
 
-`--insert-conflict-policy ignore-duplicate` affects generic target execution:
-a MySQL `1062` is treated as success when the statement begins with `INSERT INTO`.
-It also applies to native ROW changes: a duplicate from a ROW `INSERT` is
-logged as skipped without durable conflict evidence only when the target row
-fetched by source primary key exactly equals the source row. A divergent or
-otherwise non-equal `ROW INSERT` persists conflict evidence and aborts, rolling
-back the target transaction/checkpoint. Every non-`INSERT` `1062` unique conflict
-also persists evidence and aborts; only equal `ROW INSERT` duplicates under
-`ignore-duplicate` continue without a ledger record. With the default `error`
-policy, native row duplicates fail, roll back the transaction, and leave the
-checkpoint unchanged. Supported non-duplicate constraint conflicts still use
-the durable conflict path.
+`--insert-conflict-policy` accepts `error`, `ignore-duplicate`, and
+`replace-divergent-pk`. Generic target execution only ignores `1062` INSERT
+errors under `ignore-duplicate`; it never performs replacement. Native ROW
+`INSERT` duplicates under `ignore-duplicate` continue only after exact source/target
+primary-key row equality. Under `replace-divergent-pk`, an unequal row is
+replaced only for a `PRIMARY` duplicate using a primary-key UPDATE of the source
+image. The accepted overwrite risk is explicit; replacement evidence is durable
+and the row can checkpoint. Secondary-unique, foreign-key, CHECK, and
+replacement-update conflicts persist evidence and abort, rolling back the target
+transaction/checkpoint. If a later conflict rolls back the enclosing transaction,
+the replacement rolls back but the independent ledger evidence remains. The
+default `error` policy fails native row duplicates.
 
 Snapshot/catchup writes and normal range table repairs explicitly use
 `INSERT IGNORE`; that SQL choice is independent of the flag. The

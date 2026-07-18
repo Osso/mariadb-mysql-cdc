@@ -31,8 +31,11 @@ are resolved only after verified equality.
 - [x] The live stream writes supported constraint conflicts to the durable
       ledger through the row-event conflict context; only equal native ROW
       `INSERT` duplicates under `ignore-duplicate` continue without ledger
-      records. Divergent `ROW INSERT` values and every non-`INSERT` `1062` unique
-      conflict persist evidence and abort as durable conflicts.
+      records. The explicit `replace-divergent-pk` policy may replace only
+      divergent `PRIMARY` duplicates using a source-image primary-key UPDATE and
+      durable audit evidence; secondary-unique, foreign-key, CHECK, and
+      replacement-update conflicts persist evidence and abort. The accepted
+      overwrite risk is documented in the row-conflict spec.
 - [x] `repair-drift` creates a fresh orchestration ID, derives FK-safe phases, and
       passes immutable child run IDs to `sync-table`.
 - [ ] No recurring conflict-to-repair scheduler exists; operators must invoke a

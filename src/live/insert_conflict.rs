@@ -3,6 +3,7 @@ pub enum InsertConflictPolicy {
     #[default]
     Error,
     IgnoreDuplicate,
+    ReplaceDivergentPk,
 }
 
 pub fn should_ignore_duplicate_insert(
@@ -23,6 +24,16 @@ pub fn should_ignore_duplicate_row_change(
     policy == InsertConflictPolicy::IgnoreDuplicate
         && starts_with_row_change(sql)
         && is_duplicate_error(stderr)
+}
+
+pub(crate) fn should_replace_divergent_primary(
+    policy: InsertConflictPolicy,
+    duplicate_index: Option<&str>,
+    rows_equal: bool,
+) -> bool {
+    policy == InsertConflictPolicy::ReplaceDivergentPk
+        && !rows_equal
+        && duplicate_index.is_some_and(|index| index.eq_ignore_ascii_case("PRIMARY"))
 }
 
 fn starts_with_row_change(sql: &str) -> bool {
@@ -93,6 +104,30 @@ mod tests {
             InsertConflictPolicy::Error,
             "INSERT INTO accounts (id) VALUES (1)",
             "ERROR 1062 (23000): Duplicate entry '1' for key 'PRIMARY'",
+        ));
+    }
+
+    #[test]
+    fn replacement_requires_divergent_primary_duplicate() {
+        assert!(should_replace_divergent_primary(
+            InsertConflictPolicy::ReplaceDivergentPk,
+            Some("PRIMARY"),
+            false,
+        ));
+        assert!(!should_replace_divergent_primary(
+            InsertConflictPolicy::ReplaceDivergentPk,
+            Some("uq_accounts_email"),
+            false,
+        ));
+        assert!(!should_replace_divergent_primary(
+            InsertConflictPolicy::ReplaceDivergentPk,
+            Some("PRIMARY"),
+            true,
+        ));
+        assert!(!should_replace_divergent_primary(
+            InsertConflictPolicy::Error,
+            Some("PRIMARY"),
+            false,
         ));
     }
 }

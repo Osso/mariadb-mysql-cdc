@@ -67,6 +67,52 @@ fn continues_after_one_duplicate_insert_is_ignored() {
 }
 
 #[test]
+fn replaced_divergent_primary_continues_and_records_durable_evidence() {
+    let executor = RecordingExecutor {
+        row_outcomes: RefCell::new(VecDeque::from([
+            TargetExecutionOutcome::PrimaryKeyReplaced(crate::target::DuplicateConflict {
+                error_code: 1062,
+                error_text: "Duplicate entry '1' for key 'PRIMARY'".to_string(),
+                duplicate_index: Some("PRIMARY".to_string()),
+            }),
+            TargetExecutionOutcome::Applied,
+        ])),
+        ..RecordingExecutor::default()
+    };
+    let mut applier = RowApplier::new(executor);
+    applier.apply_table_map(accounts_table_map());
+    let event = WriteRowsEvent {
+        coordinate: coordinate(155),
+        table_id: 7,
+        rows: vec![row("1", "source"), row("2", "next")],
+    };
+    let mut ledger = crate::conflict_repair::InMemoryConflictStore::default();
+    let mut context = RowConflictContext {
+        store: &mut ledger,
+        source_identity: "source-a",
+        source_server_id: 7,
+        end_position: 200,
+        observed_at_ms: 100,
+    };
+
+    applier
+        .apply_write_rows_with_conflicts(&event, &mut context)
+        .expect("replacement should continue the source transaction");
+
+    assert_eq!(applier.executor().statements.borrow().len(), 2);
+    let record = &ledger.records()[0];
+    assert_eq!(
+        record.status,
+        crate::conflict_repair::ConflictStatus::Unresolved
+    );
+    assert!(
+        record
+            .error_text
+            .starts_with("replace-divergent-pk: target row replaced with source image;")
+    );
+}
+
+#[test]
 fn ignored_duplicate_row_continues_without_persisting_conflict() {
     let executor = RecordingExecutor {
         row_outcomes: RefCell::new(VecDeque::from([TargetExecutionOutcome::DuplicateIgnored(

@@ -100,6 +100,7 @@ pub(crate) fn build_sync_run_scope(config: &SyncTableConfig) -> Result<String, T
     let insert_conflict_policy = match config.target.insert_conflict_policy {
         crate::live::InsertConflictPolicy::Error => "error",
         crate::live::InsertConflictPolicy::IgnoreDuplicate => "ignore-duplicate",
+        crate::live::InsertConflictPolicy::ReplaceDivergentPk => "replace-divergent-pk",
     };
     serde_json::to_string(&SyncRunScope {
         source_host: &config.source.host,
