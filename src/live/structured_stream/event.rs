@@ -285,6 +285,19 @@ pub(super) fn event_coordinate(
     header: &EventHeader,
     event: &BinlogEvent,
 ) -> BinlogCoordinate {
+    let is_row_event = matches!(
+        event,
+        BinlogEvent::WriteRowsEvent(_)
+            | BinlogEvent::UpdateRowsEvent(_)
+            | BinlogEvent::DeleteRowsEvent(_)
+    );
+    if is_row_event && header.next_event_position > header.event_length {
+        return BinlogCoordinate {
+            file: current_file.to_string(),
+            position: u64::from(header.next_event_position - header.event_length),
+        };
+    }
+
     resume_coordinate(current_file, header, event).unwrap_or_else(|| BinlogCoordinate {
         file: current_file.to_string(),
         position: u64::from(header.next_event_position),

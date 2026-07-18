@@ -315,6 +315,130 @@ fn equal_duplicate_commits_multi_row_transaction_and_checkpoints() {
 }
 
 #[test]
+fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
+    let divergent_executor = TransactionRecordingExecutor {
+        duplicate_row_change_number: Some(2),
+        duplicate_mode: DuplicateMode::Divergent,
+        ..TransactionRecordingExecutor::default()
+    };
+    let mut divergent_applier = crate::row::RowApplier::new(divergent_executor);
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.002709".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    let mut row_header = event_header(30, 215_331_160);
+    row_header.event_length = 435;
+
+    macro_rules! process_divergent_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
+                current_file: &mut current_file,
+                group_config: TargetTransactionGroupConfig::default(),
+            };
+            apply_stream_event_transactionally_with_conflicts(
+                &mut divergent_applier,
+                &mut context,
+                &header,
+                &event,
+                "test-source",
+                &mut conflicts,
+            )
+        }};
+    }
+
+    process_divergent_event!(
+        event_header(19, 215_329_700),
+        BinlogEvent::TableMapEvent(guests_table_map_event(19))
+    )
+    .expect("guests table map");
+    process_divergent_event!(
+        event_header(19, 215_329_720),
+        BinlogEvent::TableMapEvent(sessions_table_map_event(20))
+    )
+    .expect("sessions table map");
+    process_divergent_event!(event_header(30, 215_329_760), guest_write_rows_event(19))
+        .expect("guest row");
+    process_divergent_event!(row_header, sessions_write_rows_event(20))
+        .expect_err("divergent sessions row must record a conflict");
+
+    let record = &conflicts.records()[0];
+    assert_eq!(record.key.table, "sessions");
+    assert_eq!(record.key.source_primary_key, ["109017694"]);
+    assert_eq!(record.key.coordinate.start_position, 215_330_725);
+    assert_eq!(record.key.coordinate.end_position, 215_331_160);
+
+    let equal_executor = TransactionRecordingExecutor::with_equal_duplicate_second_row_change();
+    let mut equal_applier = crate::row::RowApplier::new(equal_executor);
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.002709".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut row_header = event_header(30, 215_331_160);
+    row_header.event_length = 435;
+
+    macro_rules! process_equal_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
+                current_file: &mut current_file,
+                group_config: TargetTransactionGroupConfig::default(),
+            };
+            apply_stream_event_transactionally_with_conflicts(
+                &mut equal_applier,
+                &mut context,
+                &header,
+                &event,
+                "test-source",
+                &mut conflicts,
+            )
+        }};
+    }
+
+    process_equal_event!(
+        event_header(19, 215_329_700),
+        BinlogEvent::TableMapEvent(guests_table_map_event(19))
+    )
+    .expect("guests table map replay");
+    process_equal_event!(
+        event_header(19, 215_329_720),
+        BinlogEvent::TableMapEvent(sessions_table_map_event(20))
+    )
+    .expect("sessions table map replay");
+    process_equal_event!(event_header(30, 215_329_760), guest_write_rows_event(19))
+        .expect("guest row replay");
+    process_equal_event!(row_header, sessions_write_rows_event(20))
+        .expect("equal sessions row replay");
+    process_equal_event!(
+        event_header(16, 215_331_179),
+        BinlogEvent::XidEvent(XidEvent { xid: 102 })
+    )
+    .expect("XID replay");
+
+    let record = &conflicts.records()[0];
+    assert_eq!(
+        record.resolution_evidence.as_deref(),
+        Some(
+            "equal target row already existed; source coordinate mysqld-bin.002709:215330725; table `sessions` primary key [\"109017694\"]"
+        )
+    );
+}
+
+#[test]
 fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
     let executor = TransactionRecordingExecutor::with_replaced_duplicate_second_row_change();
     let mut applier = crate::row::RowApplier::new(executor);
