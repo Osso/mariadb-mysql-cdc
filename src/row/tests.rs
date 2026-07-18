@@ -121,7 +121,7 @@ fn replaced_divergent_primary_continues_and_records_durable_evidence() {
                 source_server_id: 7,
                 coordinate: &coordinate(155),
                 end_position: 200,
-                schema: "fixture_cdc",
+                schema: "app",
                 table: "accounts",
                 operation: RowOperation::Insert,
                 primary_key: &[value("1")],
