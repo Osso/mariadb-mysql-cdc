@@ -191,9 +191,31 @@ fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
     )
     .expect("replacement should continue");
 
+    let xid_header = event_header(16, 260);
+    let xid_event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &xid_header,
+        &xid_event,
+        "test-source",
+        &mut conflicts,
+    )
+    .expect("replacement transaction should commit");
+
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC"]
+        ["BEGIN", "EXEC", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
     );
     let record = &conflicts.records()[0];
     assert_eq!(
