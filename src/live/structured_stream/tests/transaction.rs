@@ -819,6 +819,8 @@ fn groups_multiple_xids_in_one_mysql_target_transaction() {
             "EXEC",
             "LOCK_CHECKPOINT",
             "CHECKPOINT",
+            "COMMIT",
+            "BEGIN",
             "EXEC",
             "LOCK_CHECKPOINT",
             "CHECKPOINT",
@@ -877,7 +879,16 @@ fn grouped_file_checkpoint_saves_last_xid_after_group_commit() {
 
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "EXEC", "COMMIT", "CHECKPOINT"]
+        [
+            "BEGIN",
+            "EXEC",
+            "COMMIT",
+            "CHECKPOINT",
+            "BEGIN",
+            "EXEC",
+            "COMMIT",
+            "CHECKPOINT"
+        ]
     );
 }
 
