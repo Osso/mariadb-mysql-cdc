@@ -93,7 +93,8 @@ the table. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
 conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 33 executable scenarios,
-including catchup, repair, conflict, DDL, and reconnect boundaries. The live
+including catchup, repair, conflict, DDL, and reconnect boundaries, plus a real
+`replace-divergent-pk` XID/commit/checkpoint and replay-evidence scenario. The live
 GlobalComix source MariaDB is plaintext-only by accepted operational policy;
 target MySQL remains CA- and hostname-verified. The catchup scenario proves a
 valid four-row copy and a completed-run no-op. It does not prove interrupted

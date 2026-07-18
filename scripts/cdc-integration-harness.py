@@ -63,6 +63,7 @@ SCENARIOS = (
     ScenarioSpec("checkpoint-transaction", True),
     ScenarioSpec("source-connection-loss", True),
     ScenarioSpec("target-connection-loss", True),
+    ScenarioSpec("replace-divergent-pk", True),
     ScenarioSpec("row-conflict-rollback", True),
     ScenarioSpec("pre-state-drift", True),
     ScenarioSpec("coordinate-reuse", True),
@@ -1960,6 +1961,110 @@ class Harness:
         self.assert_recovery_state(final_stop, expected_status="checkpointed", expected_index=True, expected_rows="0")
         print(f"{scenario}_converged journal=checkpointed checkpoint={final_stop.file}:{final_stop.position}")
 
+    def run_replace_divergent_pk(self) -> None:
+        assert self.source and self.target
+        self.setup_accounts_table()
+        self.admin_sql(
+            self.target,
+            "INSERT INTO accounts VALUES (1, 'target@example.test', 'target');",
+        )
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO accounts VALUES (1, 'source@example.test', 'source');",
+        )
+        stop = self.coordinate()
+
+        result = self.run_stream(
+            start,
+            stop,
+            insert_conflict_policy="replace-divergent-pk",
+        )
+        output = f"{result.stdout}\n{result.stderr}".lower()
+        require_success(result, "replace-divergent-pk commit")
+        if "cdc_row_conflict_replaced" not in output or 'primary_key=["1"]' not in output:
+            raise HarnessError(f"replacement did not report durable row evidence: {output}")
+        row = self.admin_query(self.target, "SELECT email,payload FROM accounts WHERE id=1;").strip()
+        if row != "source@example.test\tsource":
+            raise HarnessError(f"replacement did not install source image: {row!r}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
+            raise HarnessError(f"replacement did not commit checkpoint at XID end: {checkpoint}")
+        evidence = self.admin_query(
+            self.target,
+            "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
+            "WHERE table_name='accounts' ORDER BY conflict_identity;",
+        ).strip()
+        if evidence != '["1"]\t1062\t1\tunresolved':
+            raise HarnessError(f"replacement evidence mismatch after commit: {evidence!r}")
+
+        self.admin_sql(
+            self.target,
+            "UPDATE accounts SET email='target@example.test', payload='target' WHERE id=1;",
+        )
+        self.write_checkpoint(start)
+        replay = self.run_stream(
+            start,
+            stop,
+            insert_conflict_policy="replace-divergent-pk",
+        )
+        replay_output = f"{replay.stdout}\n{replay.stderr}".lower()
+        require_success(replay, "replace-divergent-pk replay")
+        if "cdc_row_conflict_replaced" not in replay_output:
+            raise HarnessError(f"replacement replay did not report evidence: {replay_output}")
+        evidence = self.admin_query(
+            self.target,
+            "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
+            "WHERE table_name='accounts' ORDER BY conflict_identity;",
+        ).strip()
+        if evidence != '["1"]\t1062\t2\tunresolved':
+            raise HarnessError(f"replacement evidence was not idempotently updated: {evidence!r}")
+
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, "DROP TABLE IF EXISTS replace_failure_rows;")
+        self.admin_sql(
+            self.source,
+            "CREATE TABLE replace_failure_rows (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL) ENGINE=InnoDB;",
+        )
+        self.admin_sql(
+            self.target,
+            "CREATE TABLE replace_failure_rows (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL, "
+            "CONSTRAINT chk_replace_failure_rows CHECK (payload <> 'blocked')) ENGINE=InnoDB;",
+        )
+        self.admin_sql(self.target, "INSERT INTO replace_failure_rows VALUES (1, 'target');")
+        failure_start = self.coordinate()
+        self.write_checkpoint(failure_start)
+        self.admin_sql(self.source, "INSERT INTO replace_failure_rows VALUES (1, 'blocked');")
+        failure_stop = self.coordinate()
+        for attempt in (1, 2):
+            failure = self.run_stream(
+                failure_start,
+                failure_stop,
+                insert_conflict_policy="replace-divergent-pk",
+            )
+            failure_output = f"{failure.stdout}\n{failure.stderr}".lower()
+            if failure.returncode == 0 or "row conflict persisted for repair" not in failure_output:
+                raise HarnessError(f"replacement update failure attempt {attempt} did not abort: {failure_output}")
+            row = self.admin_query(self.target, "SELECT payload FROM replace_failure_rows WHERE id=1;").strip()
+            if row != "target":
+                raise HarnessError(f"replacement update failure retained target mutation: {row!r}")
+            checkpoint = self.checkpoint()
+            if checkpoint.get("source_file") != failure_start.file or int(checkpoint.get("source_position", 0)) != failure_start.position:
+                raise HarnessError(f"replacement update failure advanced checkpoint: {checkpoint}")
+            evidence = self.admin_query(
+                self.target,
+                "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
+                "WHERE table_name='replace_failure_rows' ORDER BY conflict_identity;",
+            ).strip()
+            expected = f'["1"]\t3819\t{attempt}\tunresolved'
+            if evidence != expected and not evidence.startswith(f'["1"]\t4025\t{attempt}\tunresolved'):
+                raise HarnessError(f"replacement update failure evidence mismatch: {evidence!r}")
+        print(
+            "replace_divergent_pk_ok xid_commit_checkpoint=true replacement_attempts=2 "
+            "update_failure_rollback=true update_failure_attempts=2 crash_boundary_proven=false"
+        )
+
     def run_row_conflict_rollback(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
@@ -2522,6 +2627,8 @@ class Harness:
             self.run_recovery_scenario(scenario)
         elif scenario in {"source-connection-loss", "target-connection-loss"}:
             self.run_connection_loss_scenario(scenario)
+        elif scenario == "replace-divergent-pk":
+            self.run_replace_divergent_pk()
         elif scenario == "row-conflict-rollback":
             self.run_row_conflict_rollback()
         elif scenario == "pre-state-drift":

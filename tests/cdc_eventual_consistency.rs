@@ -756,6 +756,8 @@ fn recovery_scenarios_are_executable_and_use_failpoint_binary() {
     }
     assert!(script.contains("self.run_recovery_scenario(scenario)"));
     assert!(script.contains("self.run_connection_loss_scenario(scenario)"));
+    assert!(script.contains("ScenarioSpec(\"replace-divergent-pk\", True)"));
+    assert!(script.contains("self.run_replace_divergent_pk()"));
     assert!(script.contains("ScenarioSpec(\"row-conflict-rollback\", True)"));
     assert!(script.contains("self.run_row_conflict_rollback()"));
     assert!(script.contains("--features"));

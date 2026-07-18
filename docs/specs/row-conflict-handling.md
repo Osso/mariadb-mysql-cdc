@@ -18,8 +18,10 @@ conflicting secondary key.
       the default `error` policy fails native row duplicates.
 - [x] Under the explicit `replace-divergent-pk` policy, an unequal native ROW
       `INSERT` duplicate is replaceable only when MySQL identifies `PRIMARY`:
-      read the target row by source primary key, update every writable source-image
-      column by that primary-key predicate, and emit durable replacement evidence.
+      read exactly one target row by source primary key, update every writable
+      source-image column by that primary-key predicate, and require exactly one
+      matched target row. Missing/multiple PK rows or any other update count persist
+      conflict evidence and abort without checkpoint advancement.
       Secondary-unique, foreign-key, CHECK, and replacement-update conflicts never
       use this path and remain durable aborting conflicts. The accepted policy risk
       is overwriting the divergent target row. Replacement keeps applying rows and
@@ -107,7 +109,12 @@ creating a second row; a different source primary key remains a distinct
 identity. Startup validates the ledger schema, guards, trigger inventory, and
 exact grants before source replication. `repair-drift` resolves rows only after
 its non-mutating Verify phase proves full-scope equality, then records the run ID
-plus evidence. The Docker harness `row-conflict-rollback` scenario passes
+plus evidence. The Docker harness `replace-divergent-pk` scenario proves a real ROW transaction's
+XID target commit and checkpoint advancement, repeats the same source conflict to
+prove idempotent evidence attempts, and proves a replacement CHECK failure rolls
+back target DML without advancing the checkpoint. The harness does not inject a
+crash between target commit and process completion; that crash boundary remains
+unproven. The `row-conflict-rollback` scenario passes
 `--insert-conflict-policy ignore-duplicate` for an equal same-primary-key
 `ROW INSERT`, and asserts that the target transaction succeeds, the checkpoint
 advances to the event end, and no unresolved ledger row exists for that source

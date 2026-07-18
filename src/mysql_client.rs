@@ -14,7 +14,7 @@ use crate::table_sync::{SyncTableProgress, TableSyncError};
 use crate::target::{
     DuplicateConflict, SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor,
     TargetRowChange, TargetRowChangeKind, TransactionalTargetExecutor,
-    build_primary_key_replacement_statement,
+    build_primary_key_replacement_statement, primary_key_replacement_outcome,
 };
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, Params};
@@ -238,15 +238,14 @@ impl TargetExecutor for PersistentTargetExecutor {
                 if self.insert_conflict_policy == InsertConflictPolicy::Error {
                     return Err(error);
                 }
-                let existing_values = self.read_existing_row(change)?;
-                let rows_equal = existing_values.as_deref().is_some_and(|values| {
-                    crate::target::duplicate_insert_outcome(
+                let existing_rows = self.read_existing_rows(change)?;
+                let rows_equal = existing_rows.len() == 1
+                    && crate::target::duplicate_insert_outcome(
                         conflict.clone(),
-                        Some(values),
+                        Some(&existing_rows[0]),
                         &change.source_values,
                         &change.set_columns,
-                    ) == TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
-                });
+                    ) == TargetExecutionOutcome::DuplicateIgnored(conflict.clone());
                 if rows_equal
                     && matches!(
                         self.insert_conflict_policy,
@@ -261,7 +260,11 @@ impl TargetExecutor for PersistentTargetExecutor {
                     conflict.duplicate_index.as_deref(),
                     rows_equal,
                 ) {
-                    return self.replace_divergent_primary_key_row(change, conflict);
+                    return self.replace_divergent_primary_key_row(
+                        change,
+                        conflict,
+                        existing_rows.len(),
+                    );
                 }
                 Ok(TargetExecutionOutcome::ConstraintConflict(conflict))
             }
@@ -377,10 +380,23 @@ impl PersistentTargetExecutor {
         &self,
         change: &TargetRowChange,
         conflict: DuplicateConflict,
+        existing_row_count: usize,
     ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+        if existing_row_count != 1 {
+            return Ok(primary_key_replacement_outcome(
+                conflict,
+                existing_row_count,
+                0,
+            ));
+        }
+
         let statement = build_primary_key_replacement_statement(change);
-        match self.execute_statement(&statement) {
-            Ok(()) => Ok(TargetExecutionOutcome::PrimaryKeyReplaced(conflict)),
+        match self.execute_primary_key_replacement_statement(&statement) {
+            Ok(affected_rows) => Ok(primary_key_replacement_outcome(
+                conflict,
+                existing_row_count,
+                affected_rows,
+            )),
             Err(error) => {
                 if let Some(conflict) =
                     duplicate_conflict_for_row_change(TargetRowChangeKind::Update, &error)
@@ -390,8 +406,7 @@ impl PersistentTargetExecutor {
                 if let Some(conflict) = constraint_conflict_from_error(&error) {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
-                self.retry_or_return_error(&statement, error)?;
-                Ok(TargetExecutionOutcome::Applied)
+                Err(error)
             }
         }
     }
@@ -409,6 +424,18 @@ impl PersistentTargetExecutor {
             .borrow_mut()
             .exec_drop(&statement.sql, Params::Positional(params))
             .map_err(target_query_error)
+    }
+
+    fn execute_primary_key_replacement_statement(
+        &self,
+        statement: &SqlStatement,
+    ) -> Result<u64, TargetExecuteError> {
+        let params = statement.params.clone();
+        let mut connection = self.conn.borrow_mut();
+        connection
+            .exec_drop(&statement.sql, Params::Positional(params))
+            .map_err(target_query_error)?;
+        Ok(connection.affected_rows())
     }
 
     fn retry_or_return_error(
@@ -432,10 +459,10 @@ impl PersistentTargetExecutor {
         should_ignore_duplicate_insert(self.insert_conflict_policy, sql, error)
     }
 
-    fn read_existing_row(
+    fn read_existing_rows(
         &self,
         change: &TargetRowChange,
-    ) -> Result<Option<Vec<mysql::Value>>, TargetExecuteError> {
+    ) -> Result<Vec<Vec<mysql::Value>>, TargetExecuteError> {
         let columns = change
             .writable_columns
             .iter()
@@ -447,32 +474,30 @@ impl PersistentTargetExecutor {
             .map(|column| format!("{} = ?", crate::mysql_support::quote_ident(column)))
             .collect::<Vec<_>>();
         let sql = format!(
-            "SELECT {} FROM {} WHERE {} LIMIT 1",
+            "SELECT {} FROM {} WHERE {}",
             columns.join(", "),
             crate::mysql_support::quote_ident(&change.table),
             predicates.join(" AND ")
         );
-        let row = self
+        let rows = self
             .conn
             .borrow_mut()
-            .exec_first::<mysql::Row, _, _>(
-                sql,
-                Params::Positional(change.primary_key_values.clone()),
-            )
+            .exec::<mysql::Row, _, _>(sql, Params::Positional(change.primary_key_values.clone()))
             .map_err(target_query_error)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let values = row.unwrap();
-        if values.len() != change.writable_columns.len() {
-            return Err(TargetExecuteError::new(format!(
-                "target row for `{}` returned {} values, expected {}",
-                change.table,
-                values.len(),
-                change.writable_columns.len()
-            )));
-        }
-        Ok(Some(values))
+        rows.into_iter()
+            .map(|row| {
+                let values = row.unwrap();
+                if values.len() != change.writable_columns.len() {
+                    return Err(TargetExecuteError::new(format!(
+                        "target row for `{}` returned {} values, expected {}",
+                        change.table,
+                        values.len(),
+                        change.writable_columns.len()
+                    )));
+                }
+                Ok(values)
+            })
+            .collect()
     }
 }
 

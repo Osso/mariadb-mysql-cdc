@@ -27,13 +27,16 @@ before-image primary-key column.
 errors under `ignore-duplicate`; it never performs replacement. Native ROW
 `INSERT` duplicates under `ignore-duplicate` continue only after exact source/target
 primary-key row equality. Under `replace-divergent-pk`, an unequal row is
-replaced only for a `PRIMARY` duplicate using a primary-key UPDATE of the source
-image. The accepted overwrite risk is explicit; replacement evidence is durable
-and the row can checkpoint. Secondary-unique, foreign-key, CHECK, and
-replacement-update conflicts persist evidence and abort, rolling back the target
-transaction/checkpoint. If a later conflict rolls back the enclosing transaction,
-the replacement rolls back but the independent ledger evidence remains. The
-default `error` policy fails native row duplicates.
+replaced only for a `PRIMARY` duplicate when the source-PK lookup returns exactly
+one row and the in-place primary-key UPDATE matches exactly one target row. Missing
+or multiple lookup rows, zero/multiple matched rows, and update failures persist
+evidence and abort without checkpoint advancement. The accepted overwrite risk is
+explicit; replacement evidence is durable and a successful replacement can
+checkpoint. Secondary-unique, foreign-key, CHECK, and replacement-update conflicts
+persist evidence and abort, rolling back the target transaction/checkpoint. If a
+later conflict rolls back the enclosing transaction, the replacement rolls back but
+the independent ledger evidence remains. The default `error` policy fails native
+row duplicates.
 
 Snapshot/catchup writes and normal range table repairs explicitly use
 `INSERT IGNORE`; that SQL choice is independent of the flag. The

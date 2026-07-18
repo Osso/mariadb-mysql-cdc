@@ -118,6 +118,22 @@ pub(crate) fn build_primary_key_replacement_statement(change: &TargetRowChange) 
     }
 }
 
+pub(crate) fn primary_key_replacement_outcome(
+    mut conflict: DuplicateConflict,
+    existing_row_count: usize,
+    affected_row_count: u64,
+) -> TargetExecutionOutcome {
+    if existing_row_count == 1 && affected_row_count == 1 {
+        return TargetExecutionOutcome::PrimaryKeyReplaced(conflict);
+    }
+
+    conflict.error_text = format!(
+        "replace-divergent-pk: expected exactly one existing PK row and one affected target row, got existing_rows={existing_row_count} affected_rows={affected_row_count}; {}",
+        conflict.error_text
+    );
+    TargetExecutionOutcome::ConstraintConflict(conflict)
+}
+
 pub(crate) fn duplicate_insert_outcome(
     conflict: DuplicateConflict,
     existing_values: Option<&[Value]>,
@@ -1003,6 +1019,28 @@ mod tests {
             "UPDATE `accounts` SET `id` = ?, `name` = ? WHERE `id` = ?"
         );
         assert_eq!(replacement.params, values(["7", "source", "7"]));
+    }
+
+    #[test]
+    fn replacement_requires_exactly_one_existing_pk_row_and_one_affected_target_row() {
+        let conflict = DuplicateConflict {
+            error_code: 1062,
+            error_text: "Duplicate entry '7' for key 'PRIMARY'".to_string(),
+            duplicate_index: Some("PRIMARY".to_string()),
+        };
+
+        for (existing_rows, affected_rows) in [(0, 0), (2, 1), (1, 0), (1, 2)] {
+            let outcome =
+                primary_key_replacement_outcome(conflict.clone(), existing_rows, affected_rows);
+            let TargetExecutionOutcome::ConstraintConflict(conflict) = outcome else {
+                panic!("replacement precondition unexpectedly succeeded");
+            };
+            assert!(conflict.error_text.starts_with("replace-divergent-pk:"));
+        }
+        assert_eq!(
+            primary_key_replacement_outcome(conflict.clone(), 1, 1),
+            TargetExecutionOutcome::PrimaryKeyReplaced(conflict)
+        );
     }
 
     #[test]

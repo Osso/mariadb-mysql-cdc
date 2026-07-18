@@ -15,9 +15,11 @@ Snapshot `INSERT IGNORE` is independent of `--insert-conflict-policy`.
 For a native live ROW `INSERT`, `ignore-duplicate` skips MySQL `1062` only when
 the target row fetched by source primary key exactly equals the source row.
 The explicit `replace-divergent-pk` policy may replace an unequal row only for a
-`PRIMARY` duplicate, using a primary-key UPDATE of the source image and durable
-audit evidence; secondary-unique, foreign-key, CHECK, and replacement-update
-conflicts still roll back. The accepted overwrite risk is explicit. If a later
+`PRIMARY` duplicate after an exactly-one-row PK lookup and exactly-one-row
+primary-key UPDATE match; durable audit evidence records the decision. Missing or
+multiple PK rows and secondary-unique, foreign-key, CHECK, or replacement-update
+conflicts still roll back without checkpoint advancement. The accepted overwrite
+risk is explicit. If a later
 conflict rolls back the enclosing target transaction, the replacement rolls back
 while its independent ledger evidence remains. The default `error` policy also
 rolls back on the duplicate.

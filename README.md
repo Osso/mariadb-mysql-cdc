@@ -87,7 +87,7 @@ creates the table. Different source primary keys remain different conflict
 identities. `repair-drift` now invokes the planner for child-first deletes,
 parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
 windows, a non-mutating full-scope Verify equality phase, and evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 33 executable scenarios.
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 34 executable scenarios.
 Earlier TLS harness coverage used a disposable TLS-enabled source, but the live
 GlobalComix source MariaDB (`source-mariadb.example` / `192.0.2.10`) is
 plaintext-only by accepted operational policy. Current production safety is:
@@ -95,7 +95,8 @@ source plaintext only, target DigitalOcean MySQL with configured CA and hostname
 verification. The harness proves a valid four-row copy and a completed-run
 no-op; it does not prove interrupted parallel-range resume. The
 remaining scenarios cover bootstrap/grants, DDL journal crash recovery,
-reconnect/GET_LOCK behavior, and FK-aware repair/conflict resolution. Its
+reconnect/GET_LOCK behavior, FK-aware repair/conflict resolution, and a real
+`replace-divergent-pk` XID/commit/checkpoint plus replay-evidence scenario. Its
 `create-table-crash-restart` scenario passes the differing-default MariaDB/MySQL
 fixture through post-DDL/pre-applied
 crash recovery, prepared-state restart, exact checkpointing, and idempotent replay;
