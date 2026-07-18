@@ -180,11 +180,13 @@ duplicates” switch. Values are `error`, `ignore-duplicate`, and the explicit
 - Native ROW events under `replace-divergent-pk` read the target row by source
   primary key and replace an unequal row only when the duplicate index is
   `PRIMARY`, using a safe primary-key UPDATE of the source image. The accepted
-  risk is overwriting the divergent target row. Durable replacement evidence is
-  recorded and the row/event can checkpoint. Secondary-unique, foreign-key,
-  CHECK, and replacement-update conflicts persist evidence and abort. If a later
-  conflict rolls back the target transaction, the replacement rolls back while
-  independent ledger evidence survives.
+  risk is overwriting the divergent target row. Successful replacements and
+  equal no-ops never create ledger rows; they resolve only an already-recorded
+  matching source identity/schema/table/PK record after target commit and
+  checkpoint. Secondary-unique, foreign-key, CHECK, and replacement-update
+  conflicts persist evidence and abort. If a later conflict rolls back the
+  target transaction, the replacement rolls back and the existing ledger record
+  remains unresolved.
 - With the default `error` policy, native row duplicates fail, roll back the
   target transaction, and leave the checkpoint unchanged.
 - `catchup-snapshot` and normal range `sync-table` repairs use explicit

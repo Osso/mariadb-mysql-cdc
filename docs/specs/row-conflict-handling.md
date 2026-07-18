@@ -16,6 +16,15 @@ conflicting secondary key.
       divergent `ROW INSERT` values and every non-`INSERT` `1062` unique conflict
       persist evidence and abort. Only equal `ROW INSERT` duplicates continue;
       the default `error` policy fails native row duplicates.
+- [x] Successful equal native ROW `INSERT` no-ops and successful
+      `replace-divergent-pk` replacements never create a new ledger row; they
+      stage resolution of an already-recorded unresolved row only.
+- [x] Staged success resolution matches only `source_identity`, schema, table,
+      and the canonical source primary-key JSON used by observation; source and
+      schema records remain isolated.
+- [x] Resolution is finalized only after the target transaction and its
+      checkpoint commit; rollback or commit/checkpoint failure leaves the
+      existing conflict unresolved.
 - [x] Under the explicit `replace-divergent-pk` policy, an unequal native ROW
       `INSERT` duplicate is replaceable only when MySQL identifies `PRIMARY`:
       read exactly one target row by source primary key, update every writable
