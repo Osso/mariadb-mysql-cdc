@@ -1998,8 +1998,8 @@ class Harness:
             "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
             "WHERE table_name='accounts' ORDER BY conflict_identity;",
         ).strip()
-        if evidence != '["1"]\t1062\t1\tunresolved':
-            raise HarnessError(f"replacement evidence mismatch after commit: {evidence!r}")
+        if evidence:
+            raise HarnessError(f"successful replacement created ledger evidence: {evidence!r}")
 
         self.admin_sql(
             self.target,
@@ -2020,8 +2020,8 @@ class Harness:
             "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
             "WHERE table_name='accounts' ORDER BY conflict_identity;",
         ).strip()
-        if evidence != '["1"]\t1062\t2\tunresolved':
-            raise HarnessError(f"replacement evidence was not idempotently updated: {evidence!r}")
+        if evidence:
+            raise HarnessError(f"successful replacement replay created ledger evidence: {evidence!r}")
 
         for endpoint in (self.source, self.target):
             self.admin_sql(endpoint, "DROP TABLE IF EXISTS replace_failure_rows;")

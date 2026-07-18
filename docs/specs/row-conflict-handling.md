@@ -61,17 +61,16 @@ conflicting secondary key.
 behavior: a duplicate continues without ledger evidence only when the target row
 fetched by source primary key exactly equals the source row. `replace-divergent-pk`
 is native ROW-only and replaces unequal rows only for a `PRIMARY` duplicate using
-a primary-key UPDATE of the source image; it records durable audit evidence and
-continues, so the target transaction/checkpoint can commit. Secondary-unique,
-foreign-key, CHECK, and replacement-update conflicts always persist evidence and
-abort. The accepted overwrite risk is explicit. If a later conflict rolls back the
-enclosing target transaction, the replacement rolls back but its independent
-ledger observation remains. Generic statement execution does not gain an unsafe
-replacement fallback. Snapshot/catchup writes and normal range repairs use
+a primary-key UPDATE of the source image; it records durable evidence only when
+a matching unresolved conflict already exists, then continues so the target
+transaction/checkpoint can commit. Successful no-op/replacement events never
+create ledger rows. Secondary-unique, foreign-key, CHECK, and replacement-update
+conflicts always persist evidence and abort. The accepted overwrite risk is
+explicit. Resolution is staged until target commit/checkpoint success; rollback
+leaves existing evidence unresolved. Generic statement execution does not gain an
+unsafe replacement fallback. Snapshot/catchup writes and normal range repairs use
 explicit `INSERT IGNORE` independently of the flag; the `sync-table
 --updated-since` path uses an upsert.
-Snapshot/catchup writes and normal range repairs use explicit `INSERT IGNORE`
-independently of the flag; the `sync-table --updated-since` path uses an upsert.
 
 ## Durable conflict control plane
 
@@ -113,15 +112,15 @@ the independently persisted evidence survives. Equal native ROW `INSERT`
 duplicates are logged and applied without ledger persistence or rollback;
 divergent native ROW `INSERT` duplicates follow the durable conflict path.
 Replaying
-the same source identity is idempotent: it updates attempt evidence rather than
-creating a second row; a different source primary key remains a distinct
-identity. Startup validates the ledger schema, guards, trigger inventory, and
+the same source identity is idempotent: existing conflict evidence is resolved
+only after successful target commit/checkpoint, and a different source primary
+key remains a distinct identity. Startup validates the ledger schema, guards, trigger inventory, and
 exact grants before source replication. `repair-drift` resolves rows only after
 its non-mutating Verify phase proves full-scope equality, then records the run ID
 plus evidence. The Docker harness `replace-divergent-pk` scenario proves a real ROW transaction's
-XID target commit and checkpoint advancement, repeats the same source conflict to
-prove idempotent evidence attempts, and proves a replacement CHECK failure rolls
-back target DML without advancing the checkpoint. The harness does not inject a
+XID target commit and checkpoint advancement, successful replacement without
+creating a ledger row, and a replacement CHECK failure rolling back target DML
+without advancing the checkpoint. The harness does not inject a
 crash between target commit and process completion; that crash boundary remains
 unproven. The `row-conflict-rollback` scenario passes
 `--insert-conflict-policy ignore-duplicate` for an equal same-primary-key

@@ -8,11 +8,7 @@ pub struct AuthPluginSwitchCommand {
 }
 
 impl AuthPluginSwitchCommand {
-    pub fn new(
-        password: &String,
-        scramble: &String,
-        auth_plugin: AuthPlugin,
-    ) -> Self {
+    pub fn new(password: &String, scramble: &String, auth_plugin: AuthPlugin) -> Self {
         Self {
             password: password.clone(),
             scramble: scramble.clone(),
