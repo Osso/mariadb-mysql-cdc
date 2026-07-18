@@ -33,6 +33,15 @@ in [catchup.md](../catchup.md).
 - [x] Create missing target tables from source DDL before row copy starts.
 - [x] Refuse to copy when an existing target table is missing source columns.
 
+### Execution concurrency contract
+
+- [x] Run one catchup/snapshot synchronization at a time for this deployment.
+- [x] Do not introduce fencing, coordination, or recovery behavior for
+      concurrent independent snapshot/stream synchronizations; that is not a
+      supported operational mode.
+- [x] Parallel range workers, when enabled inside one catchup run, are not
+      independent synchronizations and must not be treated as such.
+
 ### Parallel Progress
 
 - [x] Split large tables into disjoint range checkpoints named
