@@ -327,7 +327,7 @@ fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
     let mut current_file = "mysqld-bin.002709".to_string();
     let mut transaction = TargetTransaction::default();
     let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
-    let mut row_header = event_header(30, 215_331_160);
+    let mut row_header = event_header(30, 0);
     row_header.event_length = 435;
 
     macro_rules! process_divergent_event {
@@ -367,6 +367,7 @@ fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
     .expect("sessions table map");
     process_divergent_event!(event_header(30, 215_329_760), guest_write_rows_event(19))
         .expect("guest row");
+    state.record_event_position(215_330_725);
     process_divergent_event!(row_header, sessions_write_rows_event(20))
         .expect_err("divergent sessions row must record a conflict");
 
@@ -374,14 +375,13 @@ fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
     assert_eq!(record.key.table, "sessions");
     assert_eq!(record.key.source_primary_key, ["109017694"]);
     assert_eq!(record.key.coordinate.start_position, 215_330_725);
-    assert_eq!(record.key.coordinate.end_position, 215_331_160);
 
     let equal_executor = TransactionRecordingExecutor::with_equal_duplicate_second_row_change();
     let mut equal_applier = crate::row::RowApplier::new(equal_executor);
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
     let mut current_file = "mysqld-bin.002709".to_string();
     let mut transaction = TargetTransaction::default();
-    let mut row_header = event_header(30, 215_331_160);
+    let mut row_header = event_header(30, 0);
     row_header.event_length = 435;
 
     macro_rules! process_equal_event {
@@ -421,21 +421,24 @@ fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
     .expect("sessions table map replay");
     process_equal_event!(event_header(30, 215_329_760), guest_write_rows_event(19))
         .expect("guest row replay");
+    state.record_event_position(215_330_725);
     process_equal_event!(row_header, sessions_write_rows_event(20))
         .expect("equal sessions row replay");
     process_equal_event!(
-        event_header(16, 215_331_179),
+        event_header(16, 215_331_160),
         BinlogEvent::XidEvent(XidEvent { xid: 102 })
     )
     .expect("XID replay");
 
     let record = &conflicts.records()[0];
-    assert_eq!(
-        record.resolution_evidence.as_deref(),
-        Some(
-            "equal target row already existed; source coordinate mysqld-bin.002709:215330725; table `sessions` primary key [\"109017694\"]"
-        )
-    );
+    let evidence = record
+        .resolution_evidence
+        .as_deref()
+        .expect("equal-row resolution evidence");
+    assert!(evidence.contains(
+        "equal target row already existed; source coordinate mysqld-bin.002709:215330725"
+    ));
+    assert!(evidence.contains("source transaction end position 215331160"));
 }
 
 #[test]

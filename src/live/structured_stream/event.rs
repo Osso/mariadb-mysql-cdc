@@ -63,7 +63,7 @@ where
     E: TargetExecutor,
     R: TableSchemaResolver,
 {
-    let coordinate = event_coordinate(current_file, header, event);
+    let coordinate = event_coordinate(current_file, header, event, state.current_event_position);
     let policy = apply_structured_event(
         applier,
         schema_resolver,
@@ -284,6 +284,7 @@ pub(super) fn event_coordinate(
     current_file: &str,
     header: &EventHeader,
     event: &BinlogEvent,
+    current_event_position: Option<u64>,
 ) -> BinlogCoordinate {
     let is_row_event = matches!(
         event,
@@ -291,11 +292,19 @@ pub(super) fn event_coordinate(
             | BinlogEvent::UpdateRowsEvent(_)
             | BinlogEvent::DeleteRowsEvent(_)
     );
-    if is_row_event && header.next_event_position > header.event_length {
-        return BinlogCoordinate {
-            file: current_file.to_string(),
-            position: u64::from(header.next_event_position - header.event_length),
-        };
+    if is_row_event {
+        if let Some(position) = current_event_position {
+            return BinlogCoordinate {
+                file: current_file.to_string(),
+                position,
+            };
+        }
+        if header.next_event_position > header.event_length {
+            return BinlogCoordinate {
+                file: current_file.to_string(),
+                position: u64::from(header.next_event_position - header.event_length),
+            };
+        }
     }
 
     resume_coordinate(current_file, header, event).unwrap_or_else(|| BinlogCoordinate {

@@ -128,6 +128,15 @@ impl TargetTransaction {
         !self.pending_conflict_resolutions.is_empty()
     }
 
+    pub(super) fn finalize_conflict_resolutions_at(&mut self, end_position: u64) {
+        for resolution in &mut self.pending_conflict_resolutions {
+            resolution.evidence = format!(
+                "{}; source transaction end position {end_position}",
+                resolution.evidence
+            );
+        }
+    }
+
     pub(super) fn reset(&mut self) {
         self.open = false;
         self.source_transactions = 0;
@@ -244,6 +253,14 @@ where
     C: StreamCheckpointStore,
 {
     context.target_transaction.record_source_transaction();
+
+    if matches!(event, BinlogEvent::XidEvent(_))
+        && let Some(coordinate) = &outcome.resume_coordinate
+    {
+        context
+            .target_transaction
+            .finalize_conflict_resolutions_at(coordinate.position);
+    }
 
     if context.transaction_checkpoint_table.is_some() {
         save_outcome_checkpoint(executor, context, event, outcome)?;

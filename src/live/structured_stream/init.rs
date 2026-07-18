@@ -75,7 +75,7 @@ pub(super) fn stream_once(
 
     let mut runtime = StreamRuntime::initialize(config)?;
     while let Ok(result) = runtime.event_receiver.recv() {
-        let (header, event) = match result {
+        let (header, event, source_position) = match result {
             Ok(event) => event,
             Err(error) => {
                 rollback_stream_transaction(&mut runtime)?;
@@ -90,6 +90,7 @@ pub(super) fn stream_once(
             transaction_checkpoint_name,
             &header,
             &event,
+            source_position,
         )?;
         if stop_decision == StopPositionDecision::DispatchAndStop {
             return complete_bounded_stop(
@@ -212,8 +213,9 @@ fn start_binlog_receiver(
     config: &ApplyBinlogConfig,
 ) -> Result<(std::sync::mpsc::Receiver<BinlogEventResult>, String), ApplyBinlogError> {
     let mut client = BinlogClient::new(replica_options_from_source(&config.source)?);
+    let initial_position = config.source.start_position;
     let events = client.replicate().map_err(source_error)?;
-    let receiver = spawn_read_ahead_reader(client, events);
+    let receiver = spawn_read_ahead_reader(client, events, initial_position);
     Ok((receiver, config.source.binlog_file.clone()))
 }
 
@@ -225,6 +227,7 @@ pub(super) fn process_stream_event<C>(
     transaction_checkpoint_name: Option<&str>,
     header: &EventHeader,
     event: &BinlogEvent,
+    source_position: u64,
 ) -> Result<StopPositionDecision, ApplyBinlogError>
 where
     C: StreamCheckpointStore,
@@ -240,6 +243,7 @@ where
             return Err(error);
         }
     };
+    runtime.state.record_event_position(source_position);
     let outcome = dispatch_stream_event(
         runtime,
         checkpoint_store,
@@ -399,25 +403,40 @@ pub(super) fn rollback_stream_transaction(
         .rollback_if_open(runtime.applier.executor())
 }
 
-type BinlogEventResult = Result<(EventHeader, BinlogEvent), MysqlCdcError>;
+type BinlogEventResult = Result<(EventHeader, BinlogEvent, u64), MysqlCdcError>;
 
 pub(super) fn spawn_read_ahead_reader(
     mut client: BinlogClient,
     mut events: mysql_cdc::binlog_events::BinlogEvents,
+    initial_position: u64,
 ) -> std::sync::mpsc::Receiver<BinlogEventResult> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(READ_AHEAD_EVENT_BUFFER);
     thread::spawn(move || {
+        let mut source_position = initial_position;
         for result in &mut events {
             let stop_after_send = result.is_err();
-            if let Ok((header, event)) = &result {
-                client.commit(header, event);
-            }
+            let result = result.map(|(header, event)| {
+                let event_position = source_position;
+                source_position = next_source_position(source_position, &header, &event);
+                client.commit(&header, &event);
+                (header, event, event_position)
+            });
             if sender.send(result).is_err() || stop_after_send {
                 return;
             }
         }
     });
     receiver
+}
+
+fn next_source_position(current_position: u64, header: &EventHeader, event: &BinlogEvent) -> u64 {
+    if let BinlogEvent::RotateEvent(rotate) = event {
+        return rotate.binlog_position;
+    }
+    if header.next_event_position > 0 {
+        return u64::from(header.next_event_position);
+    }
+    current_position.saturating_add(u64::from(header.event_length))
 }
 
 pub(super) fn replica_options_from_source(

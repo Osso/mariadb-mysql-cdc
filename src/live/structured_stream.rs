@@ -109,6 +109,7 @@ enum StopPositionDecision {
 pub(crate) struct StructuredEventState {
     source_database: Option<String>,
     ignored_table_ids: BTreeSet<u64>,
+    current_event_position: Option<u64>,
     pending_intvars: Vec<PendingIntVar>,
     pending_uservars: Vec<String>,
 }
@@ -124,6 +125,7 @@ impl StructuredEventState {
         Self {
             source_database,
             ignored_table_ids: BTreeSet::new(),
+            current_event_position: None,
             pending_intvars: Vec::new(),
             pending_uservars: Vec::new(),
         }
@@ -133,6 +135,10 @@ impl StructuredEventState {
         self.source_database
             .as_ref()
             .is_none_or(|source_database| source_database == schema)
+    }
+
+    fn record_event_position(&mut self, position: u64) {
+        self.current_event_position = Some(position);
     }
 
     fn ignore_table_id(&mut self, table_id: u64) {
