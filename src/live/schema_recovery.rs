@@ -162,37 +162,9 @@ fn missing_target_table_name(error: &str) -> Option<String> {
 
 pub(crate) fn mysql_compatible_create_table(source_ddl: &str) -> String {
     let create_if_missing = source_ddl.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1);
-    let mysql_collations = create_if_missing
+    create_if_missing
         .replace("utf8mb4_uca1400_ai_ci", "utf8mb4_0900_ai_ci")
-        .replace("utf8mb3_uca1400_ai_ci", "utf8mb3_general_ci");
-    remove_foreign_key_constraints(&mysql_collations)
-}
-
-fn remove_foreign_key_constraints(ddl: &str) -> String {
-    let mut lines = ddl
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("/*M!"))
-        .filter(|line| {
-            let upper = line.to_ascii_uppercase();
-            !(upper.contains("CONSTRAINT") && upper.contains("FOREIGN KEY"))
-        })
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-
-    if let Some(index) = line_before_table_options(&lines)
-        && lines[index].trim_end().ends_with(',')
-    {
-        lines[index] = lines[index].trim_end_matches(',').to_string();
-    }
-
-    lines.join("\n")
-}
-
-fn line_before_table_options(lines: &[String]) -> Option<usize> {
-    lines
-        .iter()
-        .position(|line| line.starts_with(") ENGINE"))
-        .and_then(|index| index.checked_sub(1))
+        .replace("utf8mb3_uca1400_ai_ci", "utf8mb3_general_ci")
 }
 
 fn quote_mysql_ident(identifier: &str) -> String {
@@ -248,7 +220,7 @@ mod tests {
             recovering_executor.target.statements.borrow().as_slice(),
             &[
                 "INSERT INTO `accounts` (`id`, `name`) VALUES (1, 'Ada')",
-                "CREATE TABLE IF NOT EXISTS `accounts` (\n  `id` bigint NOT NULL,\n  `name` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+                "CREATE TABLE IF NOT EXISTS `accounts` (\n  `id` bigint NOT NULL,\n  `name` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  CONSTRAINT `accounts_ibfk_1` FOREIGN KEY (`id`) REFERENCES `users` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
                 "INSERT INTO `accounts` (`id`, `name`) VALUES (1, 'Ada')",
             ]
         );
