@@ -96,8 +96,7 @@ fn wraps_target_writes_and_checkpoint_in_source_xid_transaction() {
 }
 
 #[test]
-fn duplicate_rolls_back_multi_row_transaction_without_checkpoint_and_persists_idempotent_evidence()
-{
+fn ignored_duplicate_commits_multi_row_transaction_and_checkpoints() {
     let executor = TransactionRecordingExecutor::with_duplicate_second_row_change();
     let mut applier = crate::row::RowApplier::new(executor);
     let resolver = FixtureSchemaResolver;
@@ -136,27 +135,27 @@ fn duplicate_rolls_back_multi_row_transaction_without_checkpoint_and_persists_id
     )
     .expect("table map");
 
-    for _attempt in 0..2 {
-        process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("first row");
-        let error = process_event!(event_header(31, 240), write_rows_event(18, 2, "beta"))
-            .expect_err("duplicate second row must abort source transaction");
-        assert!(
-            error
-                .to_string()
-                .contains("row conflict persisted for repair")
-        );
-    }
+    process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("first row");
+    process_event!(event_header(31, 240), write_rows_event(18, 2, "beta"))
+        .expect("ignored duplicate should not abort source transaction");
+    process_event!(
+        event_header(16, 260),
+        BinlogEvent::XidEvent(XidEvent { xid: 42 })
+    )
+    .expect("xid");
 
     assert_eq!(
         applier.executor().operations().as_slice(),
         [
-            "BEGIN", "EXEC", "EXEC", "ROLLBACK", "BEGIN", "EXEC", "EXEC", "ROLLBACK"
+            "BEGIN",
+            "EXEC",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "COMMIT"
         ]
     );
-    assert!(!applier.executor().operations().contains(&"CHECKPOINT"));
-    assert!(!applier.executor().operations().contains(&"COMMIT"));
-    assert_eq!(conflicts.records().len(), 1);
-    assert_eq!(conflicts.records()[0].attempt_count, 2);
+    assert!(conflicts.records().is_empty());
 }
 
 #[test]

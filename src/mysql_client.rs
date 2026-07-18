@@ -221,13 +221,21 @@ impl TargetExecutor for PersistentTargetExecutor {
     ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
         match self.execute_statement(statement) {
             Ok(()) => Ok(TargetExecutionOutcome::Applied),
-            Err(error) if error.mysql_code() == Some(1062) => Ok(
-                TargetExecutionOutcome::DuplicateIgnored(DuplicateConflict {
-                    error_code: 1062,
-                    error_text: error.to_string(),
-                    duplicate_index: crate::target::duplicate_index_from_error(&error.to_string()),
-                }),
-            ),
+            Err(error)
+                if error.mysql_code() == Some(1062)
+                    && self.insert_conflict_policy
+                        == crate::live::InsertConflictPolicy::IgnoreDuplicate =>
+            {
+                Ok(TargetExecutionOutcome::DuplicateIgnored(
+                    DuplicateConflict {
+                        error_code: 1062,
+                        error_text: error.to_string(),
+                        duplicate_index: crate::target::duplicate_index_from_error(
+                            &error.to_string(),
+                        ),
+                    },
+                ))
+            }
             Err(error) => {
                 if let Some(conflict) = constraint_conflict_from_error(&error) {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
