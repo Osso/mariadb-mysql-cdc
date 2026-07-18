@@ -103,7 +103,14 @@ fn replaced_divergent_primary_continues_and_records_durable_evidence() {
     let record = &ledger.records()[0];
     assert_eq!(
         record.status,
-        crate::conflict_repair::ConflictStatus::Unresolved
+        crate::conflict_repair::ConflictStatus::Resolved
+    );
+    assert!(record.repair_run_id.is_some());
+    assert!(
+        record
+            .resolution_evidence
+            .as_deref()
+            .is_some_and(|evidence| evidence.contains("target row replaced with source image"))
     );
     assert!(
         record

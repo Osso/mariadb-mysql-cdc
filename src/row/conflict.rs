@@ -57,7 +57,14 @@ where
                 "{}",
                 format_row_conflict_skipped(operation, table, coordinate, primary_key)
             );
-            Ok(())
+            resolve_successful_conflict(
+                context,
+                coordinate,
+                table,
+                operation,
+                primary_key,
+                "equal target row already existed",
+            )
         }
         TargetExecutionOutcome::PrimaryKeyReplaced(conflict) => {
             println!(
@@ -97,7 +104,46 @@ fn record_replaced_conflict(
         .store
         .observe(observation)
         .map_err(|error| conflict_store_error(coordinate, table, operation, "persist", error))?;
-    Ok(())
+    resolve_successful_conflict(
+        Some(context),
+        coordinate,
+        table,
+        operation,
+        primary_key,
+        "target row replaced with source image",
+    )
+}
+
+fn resolve_successful_conflict(
+    context: Option<&mut RowConflictContext<'_>>,
+    coordinate: &BinlogCoordinate,
+    table: &RowTableMap,
+    operation: RowOperation,
+    primary_key: &[Value],
+    reason: &str,
+) -> RowResult<()> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let primary_key = primary_key
+        .iter()
+        .cloned()
+        .map(|value| value_to_string(value).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let repair_run_id = format!(
+        "stream-{}-{}-{}",
+        coordinate.file.replace('/', "_"),
+        coordinate.position,
+        table.table
+    );
+    let evidence = format!(
+        "{reason}; source coordinate {}:{}; table `{}` primary key {:?}",
+        coordinate.file, coordinate.position, table.table, primary_key
+    );
+    context
+        .store
+        .resolve_if_equal(&table.table, &primary_key, true, &repair_run_id, &evidence)
+        .map_err(|error| conflict_store_error(coordinate, table, operation, "resolve", error))
 }
 
 fn record_skipped_conflict(
