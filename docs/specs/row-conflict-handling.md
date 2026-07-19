@@ -36,11 +36,11 @@ conflicting secondary key.
       is overwriting the divergent target row. Replacement keeps applying rows and
       may checkpoint; if its enclosing target transaction later rolls back, the
       independent ledger evidence survives while the replacement itself rolls back.
-- [x] Persist supported constraint-conflict evidence on the independent
-      control-plane connection, then fail the row event so every earlier target
-      mutation in the same source transaction rolls back.
-- [x] Leave the stream checkpoint unchanged when the target transaction rolls
-      back.
+- [x] Stage supported constraint-conflict observations within the source
+      transaction; at its XID, finalize their source-transaction end
+      coordinates, roll back the target transaction, persist the unresolved
+      observations through the independent control-plane connection, and fail
+      without checkpointing past the failed transaction.
 - [x] Emit parseable `cdc_row_conflict_skipped` output with operation, table,
       source coordinate, and source primary key.
 - [x] Replay the same source event into the same identity and increment its
@@ -105,12 +105,15 @@ or to select a target row by the secondary key.
 
 ## Live wiring and remaining proof
 
-The structured live stream persists supported constraint-conflict observations
-to this durable ledger before returning the row failure. The target data
-transaction rolls back and the live target checkpoint does not advance, while
-the independently persisted evidence survives. Equal native ROW `INSERT`
-duplicates are logged and applied without ledger persistence or rollback;
-divergent native ROW `INSERT` duplicates follow the durable conflict path.
+The structured live stream stages supported constraint-conflict observations
+within the source transaction. At the source XID, it finalizes their
+source-transaction end coordinates, rolls back the target transaction, then
+persists the unresolved observations through the independent durable ledger
+before returning the row failure. The failed transaction and later coordinates
+are not checkpointed, while the independently persisted evidence survives.
+Equal native ROW `INSERT` duplicates are logged and applied without ledger
+persistence or rollback; divergent native ROW `INSERT` duplicates follow the
+durable conflict path.
 Replaying
 the same source identity is idempotent: existing conflict evidence is resolved
 only after successful target commit/checkpoint, and a different source primary
