@@ -2135,8 +2135,10 @@ class Harness:
 
         self.admin_sql(
             self.target,
+            "SET FOREIGN_KEY_CHECKS=0; "
             "DELETE FROM collision_guests WHERE guest_id=77087004; "
             "UPDATE collision_guests SET guest_hash='hash-a', payload='displaced-a' WHERE guest_id=77096622; "
+            "SET FOREIGN_KEY_CHECKS=1; "
             "ALTER TABLE collision_guests ADD CONSTRAINT chk_collision_insert_failure CHECK (guest_id <> 77087004);",
         )
         failed_args = list(args)
