@@ -1,5 +1,35 @@
 use super::tests_support::*;
 use super::*;
+use std::cell::Cell;
+use std::time::Duration;
+
+#[test]
+fn missing_primary_key_sync_retries_transient_connection_loss_with_a_bound() {
+    let attempts = Cell::new(0);
+    let report =
+        retry_sync_table_operation(SyncMode::MissingPrimaryKeys, 3, Duration::ZERO, || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(TableSyncError::Read("connection timed out".to_string()))
+            } else {
+                Ok(SyncTableReport::default())
+            }
+        })
+        .expect("retry succeeds");
+
+    assert_eq!(report, SyncTableReport::default());
+    assert_eq!(attempts.get(), 2);
+
+    let failures = Cell::new(0);
+    let error = retry_sync_table_operation(SyncMode::MissingPrimaryKeys, 3, Duration::ZERO, || {
+        failures.set(failures.get() + 1);
+        Err(TableSyncError::Read("connection reset".to_string()))
+    })
+    .expect_err("retry bound");
+
+    assert_eq!(failures.get(), 3);
+    assert_eq!(error.to_string(), "sync read failed: connection reset");
+}
 
 #[test]
 fn target_connection_config_preserves_target_endpoint() {

@@ -3,6 +3,10 @@ use crate::snapshot::SnapshotError;
 use crate::table_sync::TableSyncError;
 use crate::target::TargetExecuteError;
 use mysql::{Conn, Opts, OptsBuilder};
+use std::time::Duration;
+
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const NETWORK_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn base_opts(
     host: &str,
@@ -19,7 +23,10 @@ pub(crate) fn base_opts(
         .user(Some(user))
         .pass(Some(password))
         .db_name(Some(database))
-        .prefer_socket(false);
+        .prefer_socket(false)
+        .tcp_connect_timeout(Some(TCP_CONNECT_TIMEOUT))
+        .read_timeout(Some(NETWORK_IO_TIMEOUT))
+        .write_timeout(Some(NETWORK_IO_TIMEOUT));
     if let Some(ca_file) = tls_ca_file {
         builder = builder.ssl_opts(ssl_opts_from_ca(endpoint, host, ca_file)?);
     }

@@ -41,6 +41,6 @@ pub(crate) use recent::{RecentUpdateSyncContext, sync_recent_updates_with_progre
 pub(crate) use repair::{
     apply_recent_update_chunk, count_extra_target_rows, ensure_delete_allowed, repair_chunk,
 };
-#[cfg(test)]
-pub(crate) use run::build_sync_run_scope;
 pub(crate) use run::should_record_sync_run_error;
+#[cfg(test)]
+pub(crate) use run::{build_sync_run_scope, retry_sync_table_operation};

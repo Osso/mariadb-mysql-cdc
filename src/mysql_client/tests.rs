@@ -1,5 +1,7 @@
 use super::*;
-use mysql::Value;
+use mysql::{Opts, OptsBuilder, Value};
+use std::net::TcpListener;
+use std::time::{Duration, Instant};
 
 #[test]
 fn formats_mysql_values_like_snapshot_text_rows() {
@@ -34,6 +36,64 @@ fn shared_source_opts_accept_plaintext_without_tls_ca() {
     .expect("plaintext source options");
 
     assert!(opts.get_ssl_opts().is_none());
+}
+
+#[test]
+fn shared_connection_opts_have_bounded_network_timeouts() {
+    let opts = base_opts(
+        "source-db",
+        3306,
+        "reader",
+        "secret",
+        "globalcomix",
+        None,
+        "source `source-db`:3306",
+    )
+    .expect("source options");
+
+    assert_eq!(
+        opts.get_tcp_connect_timeout(),
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(opts.get_read_timeout(), Some(&Duration::from_secs(30)));
+    assert_eq!(opts.get_write_timeout(), Some(&Duration::from_secs(30)));
+}
+
+#[test]
+fn stalled_mysql_handshake_returns_within_read_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled server");
+    let port = listener.local_addr().expect("listener address").port();
+    let server = std::thread::spawn(move || {
+        let (_connection, _) = listener.accept().expect("accept client");
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    let opts = Opts::from(
+        OptsBuilder::from_opts(
+            base_opts(
+                "127.0.0.1",
+                port,
+                "reader",
+                "secret",
+                "globalcomix",
+                None,
+                "stalled source",
+            )
+            .expect("stalled source options"),
+        )
+        .read_timeout(Some(Duration::from_millis(100)))
+        .write_timeout(Some(Duration::from_millis(100))),
+    );
+
+    let started = Instant::now();
+    let error = open_conn(opts).expect_err("stalled handshake must time out");
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let message = error.to_string().to_ascii_lowercase();
+    assert!(
+        message.contains("timed out") || message.contains("resource temporarily unavailable"),
+        "unexpected timeout error: {message}"
+    );
+    server.join().expect("stalled server");
 }
 
 #[test]

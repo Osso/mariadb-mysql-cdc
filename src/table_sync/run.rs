@@ -2,6 +2,10 @@ use super::mysql::MySqlSyncReader;
 use super::range::sync_table_with_progress_range;
 use super::recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
 use super::*;
+use std::time::Duration;
+
+const SYNC_CONNECTION_ATTEMPTS: usize = 5;
+const SYNC_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub fn sync_table(
     table: &SyncTable,
@@ -51,7 +55,60 @@ pub fn sync_table_with_progress(
 }
 
 pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, TableSyncError> {
-    run_sync_table_phase(config, SyncPhase::All)
+    retry_sync_table_operation(
+        config.mode,
+        SYNC_CONNECTION_ATTEMPTS,
+        SYNC_CONNECTION_RETRY_DELAY,
+        || run_sync_table_phase(config, SyncPhase::All),
+    )
+}
+
+pub(crate) fn retry_sync_table_operation<F>(
+    mode: SyncMode,
+    max_attempts: usize,
+    retry_delay: Duration,
+    mut operation: F,
+) -> Result<SyncTableReport, TableSyncError>
+where
+    F: FnMut() -> Result<SyncTableReport, TableSyncError>,
+{
+    let attempts = if mode == SyncMode::MissingPrimaryKeys {
+        max_attempts.max(1)
+    } else {
+        1
+    };
+    for attempt in 1..=attempts {
+        match operation() {
+            Ok(report) => return Ok(report),
+            Err(error) if attempt < attempts && is_retryable_connection_error(&error) => {
+                if !retry_delay.is_zero() {
+                    std::thread::sleep(retry_delay);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("sync retry loop has at least one attempt")
+}
+
+fn is_retryable_connection_error(error: &TableSyncError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    matches!(
+        error,
+        TableSyncError::Read(_) | TableSyncError::Repair(_) | TableSyncError::Progress(_)
+    ) && [
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "unexpected eof",
+        "server has gone away",
+        "lost connection",
+        "resource temporarily unavailable",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 pub fn run_sync_table_phase(
