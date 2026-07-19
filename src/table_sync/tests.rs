@@ -704,6 +704,40 @@ fn verify_only_reports_differences_inside_bounded_primary_key_window() {
 }
 
 #[test]
+fn missing_primary_keys_mode_inserts_only_absent_primary_keys() {
+    let source = FakeReader::new(vec![row("1", "new"), row("3", "missing")]);
+    let target = FakeReader::new(vec![row("1", "old"), row("2", "extra")]);
+    let mut repair_target = RecordingRepairTarget::default();
+
+    let report = sync_table(
+        &account_table(),
+        10,
+        SyncMode::MissingPrimaryKeys,
+        &source,
+        &target,
+        &mut repair_target,
+    )
+    .expect("missing primary-key sync");
+
+    assert_eq!(report.inserts, 1);
+    assert_eq!(report.updates, 0);
+    assert_eq!(report.extra_target_rows, 0);
+    assert_eq!(
+        repair_target.inserts.borrow().as_slice(),
+        &[row("3", "missing")]
+    );
+    assert!(repair_target.updates.borrow().is_empty());
+    assert!(repair_target.deletes.borrow().is_empty());
+    assert!(
+        target
+            .requests
+            .borrow()
+            .iter()
+            .all(|request| request.columns == vec!["id".to_string()])
+    );
+}
+
+#[test]
 fn phase_sync_applies_only_requested_mutation_kind() {
     let source = FakeReader::new(vec![row("1", "new")]);
     let target = FakeReader::new(vec![row("1", "old"), row("2", "extra")]);

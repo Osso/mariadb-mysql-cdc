@@ -310,6 +310,7 @@ fn parse_sync_mode(value: &str) -> Result<table_sync::SyncMode, String> {
     match value {
         "dry-run" => Ok(table_sync::SyncMode::DryRun),
         "apply" => Ok(table_sync::SyncMode::Apply),
+        "missing-primary-keys" => Ok(table_sync::SyncMode::MissingPrimaryKeys),
         other => Err(format!("unknown sync mode: {other}")),
     }
 }
@@ -560,6 +561,17 @@ mod tests {
         assert_eq!(config.chunk_size, 250);
         assert_eq!(config.mode, table_sync::SyncMode::Apply);
         assert_eq!(config.progress_table, "cdc.table_sync_progress");
+    }
+
+    #[test]
+    fn parses_missing_primary_keys_mode() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let config = parse_sync_table_config(required_args(["--mode", "missing-primary-keys"]))
+            .expect("missing primary-key config");
+
+        assert_eq!(config.mode, table_sync::SyncMode::MissingPrimaryKeys);
     }
 
     #[test]

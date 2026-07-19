@@ -554,6 +554,7 @@ impl SyncMode {
         match self {
             Self::DryRun => "dry-run",
             Self::Apply => "apply",
+            Self::MissingPrimaryKeys => "missing-primary-keys",
         }
     }
 
@@ -561,6 +562,7 @@ impl SyncMode {
         match value {
             "dry-run" => Ok(Self::DryRun),
             "apply" => Ok(Self::Apply),
+            "missing-primary-keys" => Ok(Self::MissingPrimaryKeys),
             other => Err(TableSyncError::Progress(format!(
                 "unknown sync mode in progress: {other}"
             ))),

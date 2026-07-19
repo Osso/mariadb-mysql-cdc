@@ -401,8 +401,19 @@ where
     R: SyncRepairTarget,
     P: SyncProgressStore,
 {
+    let primary_key_only_table;
+    let target_table = if context.mode == SyncMode::MissingPrimaryKeys {
+        primary_key_only_table = SyncTable {
+            name: context.table.name.clone(),
+            primary_key: context.table.primary_key.clone(),
+            columns: context.table.primary_key.clone(),
+        };
+        &primary_key_only_table
+    } else {
+        context.table
+    };
     read_target_window(
-        context.table,
+        target_table,
         context.start_after.clone(),
         Some(end_at.to_vec()),
         context.chunk_size,
@@ -440,6 +451,9 @@ where
     R: SyncRepairTarget,
     P: SyncProgressStore,
 {
+    if context.mode == SyncMode::MissingPrimaryKeys {
+        return Ok(());
+    }
     let target_rows = read_target_window(
         context.table,
         start_after,

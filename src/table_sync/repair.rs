@@ -13,6 +13,10 @@ pub(crate) fn repair_chunk(
 ) -> Result<(), TableSyncError> {
     let source_by_key = rows_by_key(source_rows);
     let target_by_key = rows_by_key(target_rows);
+    if mode == SyncMode::MissingPrimaryKeys {
+        repair_missing_rows(&source_by_key, &target_by_key, mode, repair_target, report)?;
+        return Ok(());
+    }
     if phase == SyncPhase::Verify {
         verify_chunk(&source_by_key, &target_by_key, report);
         return Ok(());
@@ -173,7 +177,7 @@ fn apply_insert(
     mode: SyncMode,
     repair_target: &mut impl SyncRepairTarget,
 ) -> Result<(), TableSyncError> {
-    if mode == SyncMode::Apply {
+    if mode != SyncMode::DryRun {
         repair_target.insert_row(row)?;
     }
     Ok(())

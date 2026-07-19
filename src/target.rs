@@ -18,6 +18,7 @@ pub struct PrimaryKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotInsertMode {
+    Insert,
     Upsert,
     IgnoreDuplicate,
 }
@@ -740,6 +741,12 @@ fn build_insert_statement(
         .collect();
 
     let sql = match insert_mode {
+        SnapshotInsertMode::Insert => format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            quote_ident(table),
+            column_list.join(", "),
+            placeholders
+        ),
         SnapshotInsertMode::Upsert => format!(
             "INSERT INTO {} ({}) VALUES {} ON DUPLICATE KEY UPDATE {}",
             quote_ident(table),
@@ -948,6 +955,25 @@ mod tests {
         assert_eq!(executed[0].params, values(["updated", "7"]));
         assert_eq!(executed[1].sql, "DELETE FROM `accounts` WHERE `id` = ?");
         assert_eq!(executed[1].params, values(["7"]));
+    }
+
+    #[test]
+    fn writes_snapshot_rows_as_strict_insert_when_requested() {
+        let executor = RecordingExecutor::default();
+        let table = crate::snapshot::SnapshotTable {
+            name: "accounts".to_string(),
+            primary_key: vec!["id".to_string()],
+            columns: vec!["id".to_string(), "name".to_string()],
+        };
+        let mut writer =
+            TargetMySqlWriter::from_snapshot_table(&table, executor, SnapshotInsertMode::Insert);
+
+        writer.write_rows(&[row("1", "alpha")]).expect("write rows");
+
+        assert_eq!(
+            writer.executor.statements.borrow()[0].sql,
+            "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?)"
+        );
     }
 
     #[test]
