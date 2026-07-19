@@ -199,7 +199,11 @@ target rows by primary key, reads only target primary-key columns, inserts sourc
 rows whose primary keys are absent, and never updates existing rows or deletes
 extra target rows. It uses strict `INSERT`, so any primary-key or secondary-unique
 conflict is an error; it does not ignore the conflict or update/delete the
-conflicting target row.
+conflicting target row. MySQL connections use a 10-second TCP connect timeout
+and 30-second read/write timeouts. Transient connection failures retry up to
+five attempts total (the initial attempt plus four retries), with each retry
+resuming from durable `cdc.table_sync_runs` progress; non-transient errors and
+exhausted retries fail.
 
 The default policy is `error`.
 

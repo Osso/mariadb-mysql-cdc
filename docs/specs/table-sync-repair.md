@@ -16,6 +16,10 @@ are resolved only after verified equality.
 - [x] Persist run-scoped progress in `cdc.table_sync_runs` by default and reject
       concurrent use of the same run ID with a target named lock.
 - [x] Keep `cdc.table_sync_progress` as catchup-only legacy state.
+- [x] Use bounded MySQL network timeouts: 10 seconds for TCP connect and 30 seconds
+      for reads and writes.
+- [x] In `missing-primary-keys` mode, retry transient connection failures up to
+      five attempts total, resuming each retry from durable run progress.
 - [x] Keep `--updated-since` retries restartable from the beginning under the same
       immutable run specification.
 - [x] Provide a durable conflict schema/SQL contract and resolve rows only after
