@@ -554,7 +554,7 @@ impl SyncMode {
         match self {
             Self::DryRun => "dry-run",
             Self::Apply => "apply",
-            Self::MissingPrimaryKeys => "missing-primary-keys",
+            Self::MissingPrimaryKeys => "missing-pks",
         }
     }
 
@@ -562,7 +562,7 @@ impl SyncMode {
         match value {
             "dry-run" => Ok(Self::DryRun),
             "apply" => Ok(Self::Apply),
-            "missing-primary-keys" => Ok(Self::MissingPrimaryKeys),
+            "missing-pks" => Ok(Self::MissingPrimaryKeys),
             other => Err(TableSyncError::Progress(format!(
                 "unknown sync mode in progress: {other}"
             ))),
@@ -689,6 +689,15 @@ mod tests {
         assert!(sql.contains("'[\"42\"]'"));
         assert!(sql.contains("2,2000,5000,3,4,5"));
         assert!(sql.contains("'apply','running'"));
+    }
+
+    #[test]
+    fn missing_primary_keys_progress_token_fits_existing_schema() {
+        let token = SyncMode::MissingPrimaryKeys.as_str();
+
+        assert_eq!(token, "missing-pks");
+        assert!(token.len() <= 16);
+        assert_eq!(SyncMode::parse(token), Ok(SyncMode::MissingPrimaryKeys));
     }
 
     #[test]
