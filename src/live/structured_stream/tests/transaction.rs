@@ -505,8 +505,8 @@ fn deferred_sessions_conflict_dooms_transaction_until_xid() {
     process_event!(event_header(30, 215_329_760), guest_write_rows_event(19))
         .expect("decoded guest row");
 
-    let mut row_header = event_header(30, 215_331_160);
-    row_header.event_length = 435;
+    let mut row_header = event_header(30, 215_331_129);
+    row_header.event_length = 404;
     process_event!(row_header, sessions_write_rows_event(20))
         .expect("conflict dooms transaction until XID");
     assert!(conflicts.records().is_empty());
@@ -517,8 +517,10 @@ fn deferred_sessions_conflict_dooms_transaction_until_xid() {
     )
     .expect("doomed transaction drains a later row event without a target write");
 
+    let mut xid_header = event_header(16, 215_331_160);
+    xid_header.event_length = 31;
     process_event!(
-        event_header(16, 215_331_160),
+        xid_header,
         BinlogEvent::XidEvent(XidEvent { xid: 215_331_160 })
     )
     .expect_err("XID finalizes the deferred conflict and stops replay");
