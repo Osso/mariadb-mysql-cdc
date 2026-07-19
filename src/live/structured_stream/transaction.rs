@@ -31,6 +31,7 @@ pub(super) struct TargetTransaction {
     opened_at: Option<Instant>,
     pending_file_checkpoint: Option<crate::checkpoint::Checkpoint>,
     pending_conflict_resolutions: Vec<crate::conflict_repair::ConflictResolution>,
+    pending_conflict_observations: Vec<crate::conflict_repair::ConflictObservation>,
 }
 
 impl TargetTransaction {
@@ -118,14 +119,42 @@ impl TargetTransaction {
                 .is_some_and(|opened_at| opened_at.elapsed() >= config.timeout)
     }
 
+    #[cfg(test)]
     pub(super) fn pending_conflict_resolutions_mut(
         &mut self,
     ) -> &mut Vec<crate::conflict_repair::ConflictResolution> {
         &mut self.pending_conflict_resolutions
     }
 
+    pub(super) fn pending_conflicts_mut(
+        &mut self,
+    ) -> (
+        &mut Vec<crate::conflict_repair::ConflictResolution>,
+        &mut Vec<crate::conflict_repair::ConflictObservation>,
+    ) {
+        (
+            &mut self.pending_conflict_resolutions,
+            &mut self.pending_conflict_observations,
+        )
+    }
+
     pub(super) fn has_pending_conflict_resolutions(&self) -> bool {
         !self.pending_conflict_resolutions.is_empty()
+    }
+
+    pub(super) fn has_pending_conflict_observations(&self) -> bool {
+        !self.pending_conflict_observations.is_empty()
+    }
+
+    pub(super) fn take_finalized_conflict_observations(
+        &mut self,
+        end_position: u64,
+    ) -> Vec<crate::conflict_repair::ConflictObservation> {
+        let mut observations = std::mem::take(&mut self.pending_conflict_observations);
+        for observation in &mut observations {
+            observation.coordinate.end_position = end_position;
+        }
+        observations
     }
 
     pub(super) fn reset(&mut self) {
@@ -134,6 +163,7 @@ impl TargetTransaction {
         self.opened_at = None;
         self.pending_file_checkpoint = None;
         self.pending_conflict_resolutions.clear();
+        self.pending_conflict_observations.clear();
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -186,11 +216,12 @@ where
             .begin_if_needed(applier.executor())?;
     }
 
+    let (pending_resolutions, pending_observations) =
+        context.target_transaction.pending_conflicts_mut();
     let mut conflict_context = RowConflictContext {
         store: conflict_store,
-        pending_resolutions: context
-            .target_transaction
-            .pending_conflict_resolutions_mut(),
+        pending_resolutions,
+        pending_observations,
         source_identity,
         source_server_id: u64::from(header.server_id),
         end_position: u64::from(header.next_event_position),
@@ -215,6 +246,23 @@ where
     };
 
     if outcome.policy == EventPolicy::CommitTransaction {
+        if matches!(event, BinlogEvent::XidEvent(_))
+            && context
+                .target_transaction
+                .has_pending_conflict_observations()
+        {
+            let end_position = outcome
+                .resume_coordinate
+                .as_ref()
+                .map_or(0, |coordinate| coordinate.position);
+            let observations = context
+                .target_transaction
+                .take_finalized_conflict_observations(end_position);
+            context
+                .target_transaction
+                .rollback_if_open(applier.executor())?;
+            return persist_deferred_conflicts(conflict_store, observations);
+        }
         let force_flush = matches!(event, BinlogEvent::QueryEvent(_) | BinlogEvent::XidEvent(_));
         finish_source_transaction(
             applier.executor(),
@@ -320,6 +368,28 @@ where
         finalize_conflict_resolutions(conflict_store, resolutions)?;
     }
     Ok(())
+}
+
+fn persist_deferred_conflicts(
+    conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
+    observations: Vec<crate::conflict_repair::ConflictObservation>,
+) -> Result<StructuredEventOutcome, ApplyBinlogError> {
+    let error_text = observations
+        .first()
+        .map(|observation| observation.error_text.clone())
+        .unwrap_or_else(|| "unknown row conflict".to_string());
+    for observation in observations {
+        conflict_store
+            .observe(observation)
+            .map_err(ApplyBinlogError::Target)?;
+    }
+    let unresolved_count = conflict_store
+        .unresolved_count_result()
+        .map_err(ApplyBinlogError::Target)?;
+    println!("cdc_row_conflict_progress unresolved_count={unresolved_count}");
+    Err(ApplyBinlogError::Target(format!(
+        "row conflict persisted for repair: {error_text}"
+    )))
 }
 
 fn finalize_conflict_resolutions(

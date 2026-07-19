@@ -439,6 +439,84 @@ fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
 }
 
 #[test]
+fn defers_sessions_conflict_until_xid_and_rolls_back_without_checkpoint() {
+    let executor = TransactionRecordingExecutor {
+        duplicate_row_change_number: Some(2),
+        duplicate_mode: DuplicateMode::Divergent,
+        ..TransactionRecordingExecutor::default()
+    };
+    let mut applier = crate::row::RowApplier::new(executor);
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.002709".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
+                current_file: &mut current_file,
+                group_config: TargetTransactionGroupConfig::default(),
+            };
+            apply_stream_event_transactionally_with_conflicts(
+                &mut applier,
+                &mut context,
+                &header,
+                &event,
+                "test-source",
+                &mut conflicts,
+            )
+        }};
+    }
+
+    process_event!(
+        event_header(19, 215_329_700),
+        BinlogEvent::TableMapEvent(guests_table_map_event(19))
+    )
+    .expect("guests table map");
+    process_event!(
+        event_header(19, 215_329_720),
+        BinlogEvent::TableMapEvent(sessions_table_map_event(20))
+    )
+    .expect("sessions table map");
+    process_event!(event_header(30, 215_329_760), guest_write_rows_event(19))
+        .expect("decoded guest row");
+
+    let mut row_header = event_header(30, 215_331_160);
+    row_header.event_length = 435;
+    process_event!(row_header, sessions_write_rows_event(20))
+        .expect("decoded sessions INSERT is deferred until XID");
+    assert!(conflicts.records().is_empty());
+
+    process_event!(
+        event_header(16, 215_331_160),
+        BinlogEvent::XidEvent(XidEvent { xid: 215_331_160 })
+    )
+    .expect_err("XID finalizes the deferred conflict and stops replay");
+
+    let record = &conflicts.records()[0];
+    assert_eq!(record.key.table, "sessions");
+    assert_eq!(record.key.source_primary_key, ["109017694"]);
+    assert_eq!(record.key.coordinate.file, "mysqld-bin.002709");
+    assert_eq!(record.key.coordinate.start_position, 215_330_725);
+    assert_eq!(record.key.coordinate.end_position, 215_331_160);
+
+    assert!(!transaction.is_open());
+    let operations = applier.executor().operations();
+    assert!(operations.contains(&"ROLLBACK"));
+    assert!(!operations.contains(&"LOCK_CHECKPOINT"));
+    assert!(!operations.contains(&"CHECKPOINT"));
+}
+
+#[test]
 fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
     let executor = TransactionRecordingExecutor::with_replaced_duplicate_second_row_change();
     let mut applier = crate::row::RowApplier::new(executor);
