@@ -271,7 +271,9 @@ where
     runtime.source_row_transaction_open = source_row_transaction_open;
     if let Ok((_, _outcome)) = &result {
         #[cfg(feature = "integration-failpoints")]
-        if _outcome.policy == EventPolicy::CommitTransaction && !runtime.target_transaction.is_open() {
+        if _outcome.policy == EventPolicy::CommitTransaction
+            && !runtime.target_transaction.is_open()
+        {
             super::super::wait_for_integration_barrier(
                 super::super::IntegrationFailpoint::SourceConnectionLoss,
                 "after-committed-event",

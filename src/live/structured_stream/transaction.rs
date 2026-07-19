@@ -219,6 +219,22 @@ where
         flush_grouped_transaction(applier.executor(), context)?;
     }
 
+    if context
+        .target_transaction
+        .has_pending_conflict_observations()
+        && matches!(
+            event,
+            BinlogEvent::WriteRowsEvent(_)
+                | BinlogEvent::UpdateRowsEvent(_)
+                | BinlogEvent::DeleteRowsEvent(_)
+        )
+    {
+        return Ok(StructuredEventOutcome {
+            policy: EventPolicy::ApplyRows,
+            resume_coordinate: None,
+        });
+    }
+
     if event_can_write_target(event, context.state) {
         context
             .target_transaction
