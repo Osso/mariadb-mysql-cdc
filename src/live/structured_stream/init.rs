@@ -85,12 +85,16 @@ pub(super) fn stream_once(
         let stop_decision = process_stream_event(
             config,
             &mut runtime,
-            checkpoint_store,
-            transaction_checkpoint_table,
-            transaction_checkpoint_name,
-            &header,
-            &event,
-            source_position,
+            StreamCheckpointContext {
+                store: checkpoint_store,
+                table: transaction_checkpoint_table,
+                name: transaction_checkpoint_name,
+            },
+            SourceStreamEvent {
+                header: &header,
+                event: &event,
+                source_position,
+            },
         )?;
         if stop_decision == StopPositionDecision::DispatchAndStop {
             return complete_bounded_stop(
@@ -219,22 +223,32 @@ fn start_binlog_receiver(
     Ok((receiver, config.source.binlog_file.clone()))
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct StreamCheckpointContext<'a, C> {
+    store: Option<&'a C>,
+    table: Option<&'a str>,
+    name: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SourceStreamEvent<'a> {
+    pub(super) header: &'a EventHeader,
+    pub(super) event: &'a BinlogEvent,
+    pub(super) source_position: u64,
+}
+
 pub(super) fn process_stream_event<C>(
     config: &ApplyBinlogConfig,
     runtime: &mut StreamRuntime,
-    checkpoint_store: Option<&C>,
-    transaction_checkpoint_table: Option<&str>,
-    transaction_checkpoint_name: Option<&str>,
-    header: &EventHeader,
-    event: &BinlogEvent,
-    source_position: u64,
+    checkpoint: StreamCheckpointContext<'_, C>,
+    input: SourceStreamEvent<'_>,
 ) -> Result<StopPositionDecision, ApplyBinlogError>
 where
     C: StreamCheckpointStore,
 {
     if let Err(error) = stop_position_decision(
         config.source.stop_position,
-        header,
+        input.header,
         runtime.source_row_transaction_open,
     ) {
         rollback_stream_transaction(runtime)?;
@@ -251,20 +265,8 @@ where
         &mut state,
         &mut progress,
         &mut source_row_transaction_open,
-        header,
-        event,
-        source_position,
-        |state, header, event| {
-            dispatch_stream_event(
-                runtime,
-                state,
-                checkpoint_store,
-                transaction_checkpoint_table,
-                transaction_checkpoint_name,
-                header,
-                event,
-            )
-        },
+        input,
+        |state, input| dispatch_stream_event(runtime, state, &checkpoint, input),
     );
     runtime.state = state;
     runtime.progress = progress;
@@ -288,38 +290,32 @@ pub(super) fn process_stream_event_core<D>(
     state: &mut StructuredEventState,
     progress: &mut StreamProgress,
     source_row_transaction_open: &mut bool,
-    header: &EventHeader,
-    event: &BinlogEvent,
-    source_position: u64,
+    input: SourceStreamEvent<'_>,
     mut dispatch: D,
 ) -> Result<(StopPositionDecision, StructuredEventOutcome), ApplyBinlogError>
 where
     D: FnMut(
         &mut StructuredEventState,
-        &EventHeader,
-        &BinlogEvent,
+        SourceStreamEvent<'_>,
     ) -> Result<StructuredEventOutcome, ApplyBinlogError>,
 {
     let stop_decision = stop_position_decision(
         config.source.stop_position,
-        header,
+        input.header,
         *source_row_transaction_open,
     )?;
-    state.record_event_position(source_position);
-    let outcome = dispatch(state, header, event)?;
+    state.record_event_position(input.source_position);
+    let outcome = dispatch(state, input)?;
     log_stream_progress(progress, &outcome);
-    update_source_row_transaction_state(source_row_transaction_open, event);
+    update_source_row_transaction_state(source_row_transaction_open, input.event);
     Ok((stop_decision, outcome))
 }
 
-pub(super) fn dispatch_stream_event<C>(
+fn dispatch_stream_event<C>(
     runtime: &mut StreamRuntime,
     state: &mut StructuredEventState,
-    checkpoint_store: Option<&C>,
-    transaction_checkpoint_table: Option<&str>,
-    transaction_checkpoint_name: Option<&str>,
-    header: &EventHeader,
-    event: &BinlogEvent,
+    checkpoint: &StreamCheckpointContext<'_, C>,
+    input: SourceStreamEvent<'_>,
 ) -> Result<StructuredEventOutcome, ApplyBinlogError>
 where
     C: StreamCheckpointStore,
@@ -340,9 +336,9 @@ where
         schema_resolver,
         state,
         target_transaction,
-        checkpoint_store,
-        transaction_checkpoint_table,
-        transaction_checkpoint_name,
+        checkpoint_store: checkpoint.store,
+        transaction_checkpoint_table: checkpoint.table,
+        transaction_checkpoint_name: checkpoint.name,
         current_file,
         group_config: *group_config,
     };
@@ -352,15 +348,15 @@ where
         semantic_inventory,
         source_identity,
         &mut context,
-        header,
-        event,
+        input.header,
+        input.event,
     )? {
         Some(outcome) => Ok(outcome),
         None => apply_stream_event_transactionally_with_conflicts(
             applier,
             &mut context,
-            header,
-            event,
+            input.header,
+            input.event,
             source_identity,
             conflict_store,
         ),

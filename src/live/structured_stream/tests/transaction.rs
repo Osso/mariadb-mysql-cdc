@@ -97,14 +97,32 @@ fn sessions_write_rows_event(table_id: u64) -> BinlogEvent {
         flags: 0,
         columns_number: 3,
         columns_present: vec![true, true, true],
-        rows: vec![RowData::new(vec![
-            Some(MySqlValue::Int(109_017_694)),
-            Some(MySqlValue::Int(78_806_710)),
-            Some(MySqlValue::String(
-                "02f12400-1020-4c7b-907b-0613c292bcd6MD3X".to_string(),
-            )),
-        ])],
+        rows: vec![session_row(109_017_694)],
     })
+}
+
+fn sessions_write_rows_event_with_conflict_followup(table_id: u64) -> BinlogEvent {
+    BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id,
+        flags: 0,
+        columns_number: 3,
+        columns_present: vec![true, true, true],
+        rows: vec![
+            session_row(109_017_693),
+            session_row(109_017_694),
+            session_row(109_017_695),
+        ],
+    })
+}
+
+fn session_row(session_id: u32) -> RowData {
+    RowData::new(vec![
+        Some(MySqlValue::Int(session_id)),
+        Some(MySqlValue::Int(78_806_710)),
+        Some(MySqlValue::String(
+            "02f12400-1020-4c7b-907b-0613c292bcd6MD3X".to_string(),
+        )),
+    ])
 }
 
 #[test]
@@ -460,7 +478,7 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
     let mut transaction = TargetTransaction::default();
     let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
     let executor = TransactionRecordingExecutor {
-        duplicate_row_change_number: Some(2),
+        duplicate_row_change_number: Some(3),
         duplicate_mode: DuplicateMode::Divergent,
         ..TransactionRecordingExecutor::default()
     };
@@ -468,8 +486,7 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
 
     {
         let mut dispatch = |state: &mut StructuredEventState,
-                            header: &EventHeader,
-                            event: &BinlogEvent|
+                            input: SourceStreamEvent<'_>|
          -> Result<StructuredEventOutcome, ApplyBinlogError> {
             let mut context = StreamEventContext {
                 schema_resolver: &resolver,
@@ -484,8 +501,8 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
             apply_stream_event_transactionally_with_conflicts(
                 &mut applier,
                 &mut context,
-                header,
-                event,
+                input.header,
+                input.event,
                 "test-source",
                 &mut conflicts,
             )
@@ -496,9 +513,11 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
             &mut state,
             &mut progress,
             &mut source_row_transaction_open,
-            &event_header(19, 215_329_700),
-            &BinlogEvent::TableMapEvent(guests_table_map_event(19)),
-            215_329_700,
+            SourceStreamEvent {
+                header: &event_header(19, 215_329_700),
+                event: &BinlogEvent::TableMapEvent(guests_table_map_event(19)),
+                source_position: 215_329_700,
+            },
             &mut dispatch,
         )
         .expect("guest table map");
@@ -507,9 +526,11 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
             &mut state,
             &mut progress,
             &mut source_row_transaction_open,
-            &event_header(19, 215_329_720),
-            &BinlogEvent::TableMapEvent(sessions_table_map_event(20)),
-            215_329_720,
+            SourceStreamEvent {
+                header: &event_header(19, 215_329_720),
+                event: &BinlogEvent::TableMapEvent(sessions_table_map_event(20)),
+                source_position: 215_329_720,
+            },
             &mut dispatch,
         )
         .expect("sessions table map");
@@ -518,9 +539,11 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
             &mut state,
             &mut progress,
             &mut source_row_transaction_open,
-            &event_header(30, 215_329_760),
-            &guest_write_rows_event(19),
-            215_329_760,
+            SourceStreamEvent {
+                header: &event_header(30, 215_329_760),
+                event: &guest_write_rows_event(19),
+                source_position: 215_329_760,
+            },
             &mut dispatch,
         )
         .expect("guest row");
@@ -531,9 +554,11 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
             &mut state,
             &mut progress,
             &mut source_row_transaction_open,
-            &row_header,
-            &sessions_write_rows_event(20),
-            215_330_725,
+            SourceStreamEvent {
+                header: &row_header,
+                event: &sessions_write_rows_event_with_conflict_followup(20),
+                source_position: 215_330_725,
+            },
             &mut dispatch,
         )
         .expect("divergent row observation is deferred until XID");
@@ -541,10 +566,10 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
     assert!(conflicts.records().is_empty());
     assert!(transaction.has_pending_conflict_observations());
     let operations_after_conflict = applier.executor().operations();
+    assert_eq!(operations_after_conflict, ["BEGIN", "EXEC", "EXEC", "EXEC"]);
     {
         let mut dispatch_doomed_row = |state: &mut StructuredEventState,
-                                       header: &EventHeader,
-                                       event: &BinlogEvent|
+                                       input: SourceStreamEvent<'_>|
          -> Result<StructuredEventOutcome, ApplyBinlogError> {
             let mut context = StreamEventContext {
                 schema_resolver: &resolver,
@@ -559,8 +584,8 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
             apply_stream_event_transactionally_with_conflicts(
                 &mut applier,
                 &mut context,
-                header,
-                event,
+                input.header,
+                input.event,
                 "test-source",
                 &mut conflicts,
             )
@@ -572,9 +597,11 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
             &mut state,
             &mut progress,
             &mut source_row_transaction_open,
-            &doomed_row_header,
-            &sessions_write_rows_event(20),
-            215_330_900,
+            SourceStreamEvent {
+                header: &doomed_row_header,
+                event: &sessions_write_rows_event(20),
+                source_position: 215_330_900,
+            },
             &mut dispatch_doomed_row,
         )
         .expect("doomed transaction drains later row without target write");
@@ -582,8 +609,7 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
     assert_eq!(applier.executor().operations(), operations_after_conflict);
 
     let mut dispatch_xid = |state: &mut StructuredEventState,
-                            header: &EventHeader,
-                            event: &BinlogEvent|
+                            input: SourceStreamEvent<'_>|
      -> Result<StructuredEventOutcome, ApplyBinlogError> {
         let mut context = StreamEventContext {
             schema_resolver: &resolver,
@@ -598,8 +624,8 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
         apply_stream_event_transactionally_with_conflicts(
             &mut applier,
             &mut context,
-            header,
-            event,
+            input.header,
+            input.event,
             "test-source",
             &mut conflicts,
         )
@@ -610,9 +636,11 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
         &mut state,
         &mut progress,
         &mut source_row_transaction_open,
-        &xid_header,
-        &BinlogEvent::XidEvent(XidEvent { xid: 102 }),
-        215_331_160,
+        SourceStreamEvent {
+            header: &xid_header,
+            event: &BinlogEvent::XidEvent(XidEvent { xid: 102 }),
+            source_position: 215_331_160,
+        },
         &mut dispatch_xid,
     )
     .expect_err("XID persists the finalized conflict and stops replay");
@@ -722,16 +750,27 @@ fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
     assert_eq!(record.error_text, "prior replacement conflict");
 }
 
+struct DeferredConflictFixture<'a> {
+    resolver: &'a FixtureSchemaResolver,
+    state: &'a mut StructuredEventState,
+    current_file: &'a mut String,
+    transaction: &'a mut TargetTransaction,
+    conflicts: &'a mut crate::conflict_repair::InMemoryConflictStore,
+}
+
 fn apply_deferred_conflict_at_xid(
     applier: &mut crate::row::RowApplier<TransactionRecordingExecutor>,
-    resolver: &FixtureSchemaResolver,
-    state: &mut StructuredEventState,
-    current_file: &mut String,
-    transaction: &mut TargetTransaction,
-    conflicts: &mut crate::conflict_repair::InMemoryConflictStore,
+    fixture: DeferredConflictFixture<'_>,
     header: &EventHeader,
     event: &BinlogEvent,
 ) -> ApplyBinlogError {
+    let DeferredConflictFixture {
+        resolver,
+        state,
+        current_file,
+        transaction,
+        conflicts,
+    } = fixture;
     {
         let mut context = StreamEventContext {
             schema_resolver: resolver,
@@ -791,11 +830,13 @@ fn divergent_duplicate_rolls_back_and_persists_conflict_evidence() {
     let event = write_rows_event(18, 2, "beta");
     let error = apply_deferred_conflict_at_xid(
         &mut applier,
-        &resolver,
-        &mut state,
-        &mut current_file,
-        &mut transaction,
-        &mut conflicts,
+        DeferredConflictFixture {
+            resolver: &resolver,
+            state: &mut state,
+            current_file: &mut current_file,
+            transaction: &mut transaction,
+            conflicts: &mut conflicts,
+        },
         &header,
         &event,
     );
@@ -869,11 +910,13 @@ fn update_unique_conflict_under_ignore_duplicate_rolls_back_and_records_ledger()
     let header = event_header(30, 240);
     let error = apply_deferred_conflict_at_xid(
         &mut applier,
-        &resolver,
-        &mut state,
-        &mut current_file,
-        &mut transaction,
-        &mut conflicts,
+        DeferredConflictFixture {
+            resolver: &resolver,
+            state: &mut state,
+            current_file: &mut current_file,
+            transaction: &mut transaction,
+            conflicts: &mut conflicts,
+        },
         &header,
         &event,
     );
@@ -954,11 +997,13 @@ fn foreign_key_conflict_rolls_back_and_preserves_constraint_evidence() {
     let event = write_rows_event(18, 2, "beta");
     let error = apply_deferred_conflict_at_xid(
         &mut applier,
-        &resolver,
-        &mut state,
-        &mut current_file,
-        &mut transaction,
-        &mut conflicts,
+        DeferredConflictFixture {
+            resolver: &resolver,
+            state: &mut state,
+            current_file: &mut current_file,
+            transaction: &mut transaction,
+            conflicts: &mut conflicts,
+        },
         &header,
         &event,
     );
@@ -991,11 +1036,13 @@ fn check_conflict_rolls_back_and_preserves_constraint_evidence() {
     let event = write_rows_event(18, 2, "beta");
     let error = apply_deferred_conflict_at_xid(
         &mut applier,
-        &resolver,
-        &mut state,
-        &mut current_file,
-        &mut transaction,
-        &mut conflicts,
+        DeferredConflictFixture {
+            resolver: &resolver,
+            state: &mut state,
+            current_file: &mut current_file,
+            transaction: &mut transaction,
+            conflicts: &mut conflicts,
+        },
         &header,
         &event,
     );
