@@ -232,40 +232,87 @@ pub(super) fn process_stream_event<C>(
 where
     C: StreamCheckpointStore,
 {
-    let stop_decision = match stop_position_decision(
+    if let Err(error) = stop_position_decision(
         config.source.stop_position,
         header,
         runtime.source_row_transaction_open,
     ) {
-        Ok(decision) => decision,
-        Err(error) => {
-            rollback_stream_transaction(runtime)?;
-            return Err(error);
-        }
-    };
-    runtime.state.record_event_position(source_position);
-    let outcome = dispatch_stream_event(
-        runtime,
-        checkpoint_store,
-        transaction_checkpoint_table,
-        transaction_checkpoint_name,
+        rollback_stream_transaction(runtime)?;
+        return Err(error);
+    }
+    let mut state = std::mem::replace(
+        &mut runtime.state,
+        StructuredEventState::new(config.source.database.clone()),
+    );
+    let mut progress = runtime.progress.clone();
+    let mut source_row_transaction_open = runtime.source_row_transaction_open;
+    let result = process_stream_event_core(
+        config,
+        &mut state,
+        &mut progress,
+        &mut source_row_transaction_open,
         header,
         event,
-    )?;
-    log_stream_progress(&mut runtime.progress, &outcome);
-    update_source_row_transaction_state(&mut runtime.source_row_transaction_open, event);
-    #[cfg(feature = "integration-failpoints")]
-    if outcome.policy == EventPolicy::CommitTransaction && !runtime.target_transaction.is_open() {
-        super::super::wait_for_integration_barrier(
-            super::super::IntegrationFailpoint::SourceConnectionLoss,
-            "after-committed-event",
-        );
+        source_position,
+        |state, header, event| {
+            dispatch_stream_event(
+                runtime,
+                state,
+                checkpoint_store,
+                transaction_checkpoint_table,
+                transaction_checkpoint_name,
+                header,
+                event,
+            )
+        },
+    );
+    runtime.state = state;
+    runtime.progress = progress;
+    runtime.source_row_transaction_open = source_row_transaction_open;
+    if let Ok((_, _outcome)) = &result {
+        #[cfg(feature = "integration-failpoints")]
+        if _outcome.policy == EventPolicy::CommitTransaction && !runtime.target_transaction.is_open() {
+            super::super::wait_for_integration_barrier(
+                super::super::IntegrationFailpoint::SourceConnectionLoss,
+                "after-committed-event",
+            );
+        }
     }
-    Ok(stop_decision)
+    result.map(|(stop_decision, _)| stop_decision)
+}
+
+pub(super) fn process_stream_event_core<D>(
+    config: &ApplyBinlogConfig,
+    state: &mut StructuredEventState,
+    progress: &mut StreamProgress,
+    source_row_transaction_open: &mut bool,
+    header: &EventHeader,
+    event: &BinlogEvent,
+    source_position: u64,
+    mut dispatch: D,
+) -> Result<(StopPositionDecision, StructuredEventOutcome), ApplyBinlogError>
+where
+    D: FnMut(
+        &mut StructuredEventState,
+        &EventHeader,
+        &BinlogEvent,
+    ) -> Result<StructuredEventOutcome, ApplyBinlogError>,
+{
+    let stop_decision = stop_position_decision(
+        config.source.stop_position,
+        header,
+        *source_row_transaction_open,
+    )?;
+    state.record_event_position(source_position);
+    let outcome = dispatch(state, header, event)?;
+    log_stream_progress(progress, &outcome);
+    update_source_row_transaction_state(source_row_transaction_open, event);
+    Ok((stop_decision, outcome))
 }
 
 pub(super) fn dispatch_stream_event<C>(
     runtime: &mut StreamRuntime,
+    state: &mut StructuredEventState,
     checkpoint_store: Option<&C>,
     transaction_checkpoint_table: Option<&str>,
     transaction_checkpoint_name: Option<&str>,
@@ -282,7 +329,6 @@ where
         semantic_inventory,
         schema_resolver,
         current_file,
-        state,
         target_transaction,
         group_config,
         source_identity,

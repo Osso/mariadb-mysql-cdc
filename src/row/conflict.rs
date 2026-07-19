@@ -169,26 +169,10 @@ fn record_skipped_conflict(
     let Some(context) = context else {
         return Ok(());
     };
-    let conflict_error = conflict.error_text.clone();
     let observation =
         skipped_conflict_observation(context, coordinate, table, operation, primary_key, conflict);
-    context
-        .store
-        .observe(observation)
-        .map_err(|error| conflict_store_error(coordinate, table, operation, "persist", error))?;
-    let unresolved_count = context
-        .store
-        .unresolved_count_result()
-        .map_err(|error| conflict_store_error(coordinate, table, operation, "read", error))?;
-    println!("cdc_row_conflict_progress unresolved_count={unresolved_count}");
-    Err(row_target_error(
-        coordinate,
-        table,
-        operation,
-        RowError::Target(TargetExecuteError::new(format!(
-            "row conflict persisted for repair: {conflict_error}"
-        ))),
-    ))
+    context.pending_observations.push(observation);
+    Ok(())
 }
 
 fn skipped_conflict_observation(

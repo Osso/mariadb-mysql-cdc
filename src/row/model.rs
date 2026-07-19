@@ -56,6 +56,7 @@ pub struct RowUpdate {
 pub struct RowConflictContext<'a> {
     pub store: &'a mut dyn ConflictStore,
     pub pending_resolutions: &'a mut Vec<ConflictResolution>,
+    pub pending_observations: &'a mut Vec<crate::conflict_repair::ConflictObservation>,
     pub source_identity: &'a str,
     pub source_server_id: u64,
     pub end_position: u64,

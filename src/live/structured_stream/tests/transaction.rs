@@ -442,6 +442,140 @@ fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
 }
 
 #[test]
+fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
+    let config = ApplyBinlogConfig::default();
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut progress = crate::live::progress::StreamProgress::new(BinlogCoordinate {
+        file: "mysqld-bin.002709".to_string(),
+        position: 215_329_700,
+    });
+    let mut source_row_transaction_open = false;
+    let mut current_file = "mysqld-bin.002709".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    let executor = TransactionRecordingExecutor {
+        duplicate_row_change_number: Some(2),
+        duplicate_mode: DuplicateMode::Divergent,
+        ..TransactionRecordingExecutor::default()
+    };
+    let mut applier = crate::row::RowApplier::new(executor);
+
+    {
+        let mut dispatch = |state: &mut StructuredEventState,
+                        header: &EventHeader,
+                        event: &BinlogEvent|
+     -> Result<StructuredEventOutcome, ApplyBinlogError> {
+        let mut context = StreamEventContext {
+            schema_resolver: &resolver,
+            state,
+            target_transaction: &mut transaction,
+            checkpoint_store: Some(&NoopCheckpointStore),
+            transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+            transaction_checkpoint_name: Some("stream-binlog:test-source"),
+            current_file: &mut current_file,
+            group_config: TargetTransactionGroupConfig::default(),
+        };
+        apply_stream_event_transactionally_with_conflicts(
+            &mut applier,
+            &mut context,
+            header,
+            event,
+            "test-source",
+            &mut conflicts,
+        )
+    };
+
+    process_stream_event_core(
+        &config,
+        &mut state,
+        &mut progress,
+        &mut source_row_transaction_open,
+        &event_header(19, 215_329_700),
+        &BinlogEvent::TableMapEvent(guests_table_map_event(19)),
+        215_329_700,
+        &mut dispatch,
+    )
+    .expect("guest table map");
+    process_stream_event_core(
+        &config,
+        &mut state,
+        &mut progress,
+        &mut source_row_transaction_open,
+        &event_header(19, 215_329_720),
+        &BinlogEvent::TableMapEvent(sessions_table_map_event(20)),
+        215_329_720,
+        &mut dispatch,
+    )
+    .expect("sessions table map");
+    process_stream_event_core(
+        &config,
+        &mut state,
+        &mut progress,
+        &mut source_row_transaction_open,
+        &event_header(30, 215_329_760),
+        &guest_write_rows_event(19),
+        215_329_760,
+        &mut dispatch,
+    )
+    .expect("guest row");
+    let mut row_header = event_header(30, 0);
+    row_header.event_length = 435;
+    process_stream_event_core(
+        &config,
+        &mut state,
+        &mut progress,
+        &mut source_row_transaction_open,
+        &row_header,
+        &sessions_write_rows_event(20),
+        215_330_725,
+        &mut dispatch,
+        )
+        .expect("divergent row observation is deferred until XID");
+    }
+    assert!(conflicts.records().is_empty());
+    assert!(transaction.has_pending_conflict_observations());
+
+    let mut dispatch_xid = |state: &mut StructuredEventState,
+                            header: &EventHeader,
+                            event: &BinlogEvent|
+     -> Result<StructuredEventOutcome, ApplyBinlogError> {
+        let mut context = StreamEventContext {
+            schema_resolver: &resolver,
+            state,
+            target_transaction: &mut transaction,
+            checkpoint_store: Some(&NoopCheckpointStore),
+            transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+            transaction_checkpoint_name: Some("stream-binlog:test-source"),
+            current_file: &mut current_file,
+            group_config: TargetTransactionGroupConfig::default(),
+        };
+        apply_stream_event_transactionally_with_conflicts(
+            &mut applier,
+            &mut context,
+            header,
+            event,
+            "test-source",
+            &mut conflicts,
+        )
+    };
+    let xid_header = event_header(16, 215_331_160);
+    process_stream_event_core(
+        &config,
+        &mut state,
+        &mut progress,
+        &mut source_row_transaction_open,
+        &xid_header,
+        &BinlogEvent::XidEvent(XidEvent { xid: 102 }),
+        215_331_160,
+        &mut dispatch_xid,
+    )
+    .expect_err("XID persists the finalized conflict and stops replay");
+    assert_eq!(conflicts.records()[0].key.coordinate.start_position, 215_330_725);
+    assert_eq!(conflicts.records()[0].key.coordinate.end_position, 215_331_160);
+}
+
+#[test]
 fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
     let executor = TransactionRecordingExecutor::with_replaced_duplicate_second_row_change();
     let mut applier = crate::row::RowApplier::new(executor);
