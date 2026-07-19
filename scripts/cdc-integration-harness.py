@@ -2114,7 +2114,7 @@ class Harness:
             "--mode", "missing-primary-keys",
             "--insert-conflict-policy", "replace-divergent-pk",
             "--start-after", "77085483",
-            "--end-at", "77087004",
+            "--end-at", "77096622",
         ])
         result = run(args, env=env, timeout=90, check=False)
         require_success(result, "FK-safe two-parent replacement")
