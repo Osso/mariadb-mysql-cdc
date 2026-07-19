@@ -28,6 +28,8 @@ mod query;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+use connection::{NetworkTimeouts, apply_network_timeouts};
 use connection::{
     base_opts, open_conn, progress_connect_error, snapshot_connect_error, target_connect_error,
 };

@@ -65,24 +65,28 @@ fn stalled_mysql_handshake_returns_within_read_timeout() {
     let port = listener.local_addr().expect("listener address").port();
     let server = std::thread::spawn(move || {
         let (_connection, _) = listener.accept().expect("accept client");
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_secs(2));
     });
-    let opts = Opts::from(
-        OptsBuilder::from_opts(
-            base_opts(
-                "127.0.0.1",
-                port,
-                "reader",
-                "secret",
-                "globalcomix",
-                None,
-                "stalled source",
-            )
-            .expect("stalled source options"),
+    let builder = OptsBuilder::from_opts(
+        base_opts(
+            "127.0.0.1",
+            port,
+            "reader",
+            "secret",
+            "globalcomix",
+            None,
+            "stalled source",
         )
-        .read_timeout(Some(Duration::from_millis(100)))
-        .write_timeout(Some(Duration::from_millis(100))),
+        .expect("stalled source options"),
     );
+    let opts = Opts::from(apply_network_timeouts(
+        builder,
+        NetworkTimeouts {
+            connect: Duration::from_millis(100),
+            read: Duration::from_millis(100),
+            write: Duration::from_millis(100),
+        },
+    ));
 
     let started = Instant::now();
     let error = open_conn(opts).expect_err("stalled handshake must time out");

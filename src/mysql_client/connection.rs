@@ -5,8 +5,28 @@ use crate::target::TargetExecuteError;
 use mysql::{Conn, Opts, OptsBuilder};
 use std::time::Duration;
 
-const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const NETWORK_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_NETWORK_TIMEOUTS: NetworkTimeouts = NetworkTimeouts {
+    connect: Duration::from_secs(10),
+    read: Duration::from_secs(30),
+    write: Duration::from_secs(30),
+};
+
+#[derive(Clone, Copy)]
+pub(crate) struct NetworkTimeouts {
+    pub(crate) connect: Duration,
+    pub(crate) read: Duration,
+    pub(crate) write: Duration,
+}
+
+pub(crate) fn apply_network_timeouts(
+    builder: OptsBuilder,
+    timeouts: NetworkTimeouts,
+) -> OptsBuilder {
+    builder
+        .tcp_connect_timeout(Some(timeouts.connect))
+        .read_timeout(Some(timeouts.read))
+        .write_timeout(Some(timeouts.write))
+}
 
 pub(crate) fn base_opts(
     host: &str,
@@ -17,16 +37,14 @@ pub(crate) fn base_opts(
     tls_ca_file: Option<&str>,
     endpoint: &str,
 ) -> Result<Opts, String> {
-    let mut builder = OptsBuilder::default()
+    let builder = OptsBuilder::default()
         .ip_or_hostname(Some(host))
         .tcp_port(port)
         .user(Some(user))
         .pass(Some(password))
         .db_name(Some(database))
-        .prefer_socket(false)
-        .tcp_connect_timeout(Some(TCP_CONNECT_TIMEOUT))
-        .read_timeout(Some(NETWORK_IO_TIMEOUT))
-        .write_timeout(Some(NETWORK_IO_TIMEOUT));
+        .prefer_socket(false);
+    let mut builder = apply_network_timeouts(builder, DEFAULT_NETWORK_TIMEOUTS);
     if let Some(ca_file) = tls_ca_file {
         builder = builder.ssl_opts(ssl_opts_from_ca(endpoint, host, ca_file)?);
     }
