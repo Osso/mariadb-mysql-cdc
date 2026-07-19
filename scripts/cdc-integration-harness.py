@@ -66,6 +66,7 @@ SCENARIOS = (
     ScenarioSpec("source-connection-loss", True),
     ScenarioSpec("target-connection-loss", True),
     ScenarioSpec("replace-divergent-pk", True),
+    ScenarioSpec("missing-pk-two-parent-collision", True),
     ScenarioSpec("row-conflict-rollback", True),
     ScenarioSpec("pre-state-drift", True),
     ScenarioSpec("coordinate-reuse", True),
@@ -2067,6 +2068,102 @@ class Harness:
             "update_failure_rollback=true update_failure_attempts=2 crash_boundary_proven=false"
         )
 
+    def run_missing_pk_two_parent_collision(self) -> None:
+        assert self.source and self.target
+        create_sql = (
+            "DROP TABLE IF EXISTS collision_sessions; DROP TABLE IF EXISTS collision_guests; "
+            "CREATE TABLE collision_guests (guest_id BIGINT NOT NULL PRIMARY KEY, "
+            "guest_hash VARCHAR(64) NOT NULL UNIQUE, payload VARCHAR(64) NOT NULL, "
+            "UNIQUE KEY uq_collision_guest_tuple (guest_id, guest_hash)) ENGINE=InnoDB; "
+            "CREATE TABLE collision_sessions (session_id BIGINT NOT NULL PRIMARY KEY, "
+            "guest_id BIGINT NOT NULL, guest_hash VARCHAR(64) NOT NULL, "
+            "CONSTRAINT fk_collision_session_guest FOREIGN KEY (guest_id, guest_hash) "
+            "REFERENCES collision_guests (guest_id, guest_hash) ON DELETE RESTRICT ON UPDATE RESTRICT) ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, create_sql)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO collision_guests VALUES "
+            "(77087004, 'hash-a', 'source-a'), (77096622, 'hash-b', 'source-b'); "
+            "INSERT INTO collision_sessions VALUES "
+            "(98586490, 77087004, 'hash-a'), (98598473, 77096622, 'hash-b');",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO collision_guests VALUES (77096622, 'hash-a', 'displaced-a'); "
+            "SET FOREIGN_KEY_CHECKS=0; "
+            "INSERT INTO collision_sessions VALUES "
+            "(98586490, 77087004, 'hash-a'), (98598473, 77096622, 'hash-b'); "
+            "SET FOREIGN_KEY_CHECKS=1;",
+        )
+        binary = self._repair_binary()
+        env = {
+            **os.environ,
+            "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+            "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+        }
+        args = self._sync_table_args(binary)
+        table_index = args.index("accounts")
+        args[table_index] = "collision_guests"
+        args[args.index("id")]= "guest_id"
+        args[args.index("id,email,payload")] = "guest_id,guest_hash,payload"
+        args[args.index("sync-table-source-ca-proof")] = "two-parent-collision-success"
+        args[args.index("globalcomix.sync_table_tls_progress")] = "globalcomix.collision_sync_runs"
+        args.extend([
+            "--mode", "missing-primary-keys",
+            "--insert-conflict-policy", "replace-divergent-pk",
+            "--start-after", "77085483",
+            "--end-at", "77087004",
+        ])
+        result = run(args, env=env, timeout=90, check=False)
+        require_success(result, "FK-safe two-parent replacement")
+        parents = self.admin_query(
+            self.target,
+            "SELECT guest_id,guest_hash,payload FROM collision_guests ORDER BY guest_id;",
+        ).strip()
+        expected_parents = "77087004\thash-a\tsource-a\n77096622\thash-b\tsource-b"
+        if parents != expected_parents:
+            raise HarnessError(f"two-parent replacement mismatch: {parents!r}")
+        children = self.admin_query(
+            self.target,
+            "SELECT session_id,guest_id,guest_hash FROM collision_sessions ORDER BY session_id;",
+        ).strip()
+        expected_children = "98586490\t77087004\thash-a\n98598473\t77096622\thash-b"
+        if children != expected_children:
+            raise HarnessError(f"two-parent replacement changed children: {children!r}")
+
+        self.admin_sql(
+            self.target,
+            "DELETE FROM collision_guests WHERE guest_id=77087004; "
+            "UPDATE collision_guests SET guest_hash='hash-a', payload='displaced-a' WHERE guest_id=77096622; "
+            "ALTER TABLE collision_guests ADD CONSTRAINT chk_collision_insert_failure CHECK (guest_id <> 77087004);",
+        )
+        failed_args = list(args)
+        failed_args[failed_args.index("two-parent-collision-success")] = "two-parent-collision-failure"
+        failure = run(failed_args, env=env, timeout=90, check=False)
+        if failure.returncode == 0:
+            raise HarnessError("injected second-parent failure unexpectedly succeeded")
+        rolled_back = self.admin_query(
+            self.target,
+            "SELECT guest_id,guest_hash,payload FROM collision_guests ORDER BY guest_id;",
+        ).strip()
+        if rolled_back != "77096622\thash-a\tdisplaced-a":
+            raise HarnessError(f"failed replacement did not roll back parents: {rolled_back!r}")
+        children_after_failure = self.admin_query(
+            self.target,
+            "SELECT session_id,guest_id,guest_hash FROM collision_sessions ORDER BY session_id;",
+        ).strip()
+        if children_after_failure != expected_children:
+            raise HarnessError(f"failed replacement changed children: {children_after_failure!r}")
+        progress = self.admin_query(
+            self.target,
+            "SELECT COALESCE(last_primary_key_json,'NULL'),status FROM collision_sync_runs "
+            "WHERE run_id='two-parent-collision-failure';",
+        ).strip()
+        if progress not in ("", "NULL\terror"):
+            raise HarnessError(f"failed replacement advanced checkpoint: {progress!r}")
+
     def run_row_conflict_rollback(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
@@ -2631,6 +2728,8 @@ class Harness:
             self.run_connection_loss_scenario(scenario)
         elif scenario == "replace-divergent-pk":
             self.run_replace_divergent_pk()
+        elif scenario == "missing-pk-two-parent-collision":
+            self.run_missing_pk_two_parent_collision()
         elif scenario == "row-conflict-rollback":
             self.run_row_conflict_rollback()
         elif scenario == "pre-state-drift":
