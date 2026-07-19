@@ -190,8 +190,16 @@ duplicates” switch. Values are `error`, `ignore-duplicate`, and the explicit
 - With the default `error` policy, native row duplicates fail, roll back the
   target transaction, and leave the checkpoint unchanged.
 - `catchup-snapshot` and normal range `sync-table` repairs use explicit
-  `INSERT IGNORE` independently of this flag. `sync-table --updated-since`
-  uses its own upsert path.
+  `INSERT IGNORE` independently of this flag, except
+  `sync-table --mode missing-primary-keys`, which uses strict `INSERT`.
+  `sync-table --updated-since` uses its own upsert path.
+
+`sync-table --mode missing-primary-keys` is apply-only: it compares source and
+target rows by primary key, reads only target primary-key columns, inserts source
+rows whose primary keys are absent, and never updates existing rows or deletes
+extra target rows. It uses strict `INSERT`, so any primary-key or secondary-unique
+conflict is an error; it does not ignore the conflict or update/delete the
+conflicting target row.
 
 The default policy is `error`.
 
