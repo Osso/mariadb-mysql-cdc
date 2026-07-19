@@ -143,6 +143,12 @@ where
                 input.operation,
                 context.as_deref_mut(),
             )?;
+            if context
+                .as_ref()
+                .is_some_and(|context| !context.pending_observations.is_empty())
+            {
+                break;
+            }
         }
 
         Ok(())

@@ -97,14 +97,28 @@ fn sessions_write_rows_event(table_id: u64) -> BinlogEvent {
         flags: 0,
         columns_number: 3,
         columns_present: vec![true, true, true],
-        rows: vec![RowData::new(vec![
-            Some(MySqlValue::Int(109_017_694)),
-            Some(MySqlValue::Int(78_806_710)),
-            Some(MySqlValue::String(
-                "02f12400-1020-4c7b-907b-0613c292bcd6MD3X".to_string(),
-            )),
-        ])],
+        rows: vec![session_row(109_017_694)],
     })
+}
+
+fn sessions_conflict_with_followup_row_event(table_id: u64) -> BinlogEvent {
+    BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id,
+        flags: 0,
+        columns_number: 3,
+        columns_present: vec![true, true, true],
+        rows: vec![session_row(109_017_694), session_row(109_017_695)],
+    })
+}
+
+fn session_row(session_id: u32) -> RowData {
+    RowData::new(vec![
+        Some(MySqlValue::Int(session_id)),
+        Some(MySqlValue::Int(78_806_710)),
+        Some(MySqlValue::String(
+            "02f12400-1020-4c7b-907b-0613c292bcd6MD3X".to_string(),
+        )),
+    ])
 }
 
 #[test]
@@ -444,12 +458,8 @@ fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
 }
 
 #[test]
-fn defers_sessions_conflict_until_xid_and_rolls_back_without_checkpoint() {
-    let executor = TransactionRecordingExecutor {
-        duplicate_row_change_number: Some(2),
-        duplicate_mode: DuplicateMode::Divergent,
-        ..TransactionRecordingExecutor::default()
-    };
+fn deferred_sessions_conflict_dooms_transaction_until_xid() {
+    let executor = TransactionRecordingExecutor::with_deferred_conflict_then_hard_failure();
     let mut applier = crate::row::RowApplier::new(executor);
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -497,8 +507,8 @@ fn defers_sessions_conflict_until_xid_and_rolls_back_without_checkpoint() {
 
     let mut row_header = event_header(30, 215_331_160);
     row_header.event_length = 435;
-    process_event!(row_header, sessions_write_rows_event(20))
-        .expect("decoded sessions INSERT is deferred until XID");
+    process_event!(row_header, sessions_conflict_with_followup_row_event(20))
+        .expect("conflict dooms transaction and drains the followup row until XID");
     assert!(conflicts.records().is_empty());
 
     process_event!(
@@ -515,10 +525,10 @@ fn defers_sessions_conflict_until_xid_and_rolls_back_without_checkpoint() {
     assert_eq!(record.key.coordinate.end_position, 215_331_160);
 
     assert!(!transaction.is_open());
-    let operations = applier.executor().operations();
-    assert!(operations.contains(&"ROLLBACK"));
-    assert!(!operations.contains(&"LOCK_CHECKPOINT"));
-    assert!(!operations.contains(&"CHECKPOINT"));
+    assert_eq!(
+        applier.executor().operations(),
+        ["BEGIN", "EXEC", "EXEC", "ROLLBACK"]
+    );
 }
 
 #[test]
@@ -650,7 +660,7 @@ fn divergent_duplicate_rolls_back_and_persists_conflict_evidence() {
     )
     .expect("divergent duplicate is deferred until XID");
     assert!(conflicts.records().is_empty());
-    drop(context);
+    let _ = context;
 
     let xid_header = event_header(16, 260);
     let xid_event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
@@ -762,7 +772,7 @@ fn update_unique_conflict_under_ignore_duplicate_rolls_back_and_records_ledger()
     )
     .expect("update conflict is deferred until XID");
     assert!(conflicts.records().is_empty());
-    drop(context);
+    let _ = context;
 
     let xid_header = event_header(16, 260);
     let xid_event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
@@ -881,7 +891,7 @@ fn foreign_key_conflict_rolls_back_and_preserves_constraint_evidence() {
     )
     .expect("foreign-key conflict is deferred until XID");
     assert!(conflicts.records().is_empty());
-    drop(context);
+    let _ = context;
 
     let xid_header = event_header(16, 260);
     let xid_event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
@@ -952,7 +962,7 @@ fn check_conflict_rolls_back_and_preserves_constraint_evidence() {
     )
     .expect("CHECK conflict is deferred until XID");
     assert!(conflicts.records().is_empty());
-    drop(context);
+    let _ = context;
 
     let xid_header = event_header(16, 260);
     let xid_event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
