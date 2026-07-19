@@ -406,7 +406,10 @@ where
     R: SyncRepairTarget,
     P: SyncProgressStore,
 {
-    if context.mode != SyncMode::MissingPrimaryKeys || context.phase == SyncPhase::Verify {
+    if context.mode != SyncMode::MissingPrimaryKeys
+        || context.phase == SyncPhase::Verify
+        || !context.target.requires_full_rows_for_missing_primary_keys()
+    {
         return Ok(false);
     }
     let source_by_key = source_rows
@@ -422,8 +425,13 @@ where
         .filter(|(primary_key, _)| !target_by_key.contains_key(*primary_key))
         .map(|(_, row)| *row)
         .collect::<Vec<_>>();
-    if missing.len() != 1 {
+    if missing.is_empty() {
         return Ok(false);
+    }
+    if missing.len() != 1 {
+        return Err(TableSyncError::Repair(
+            "replace-divergent-pk requires exactly one missing source owner per chunk".to_string(),
+        ));
     }
     let missing_source = missing[0];
     let displaced_targets = target_rows
@@ -433,8 +441,13 @@ where
                 && non_primary_values_equal(context.table, target, missing_source)
         })
         .collect::<Vec<_>>();
-    if displaced_targets.len() != 1 {
+    if displaced_targets.is_empty() {
         return Ok(false);
+    }
+    if displaced_targets.len() != 1 {
+        return Err(TableSyncError::Repair(
+            "replace-divergent-pk found an ambiguous displaced target owner".to_string(),
+        ));
     }
     let displaced_target = displaced_targets[0];
     let Some(displaced_source) = source_by_key.get(&displaced_target.primary_key).copied() else {
@@ -459,6 +472,7 @@ where
     context.repair_target.restore_displaced_owner_and_insert(
         context.table,
         displaced_source,
+        displaced_target,
         missing_source,
         &progress_sql,
     )?;
