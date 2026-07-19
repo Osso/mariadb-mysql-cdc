@@ -219,6 +219,9 @@ fn validate_updated_since(config: &table_sync::SyncTableConfig) -> Result<(), St
     let Some(updated_since) = &config.updated_since else {
         return Ok(());
     };
+    if config.mode == table_sync::SyncMode::MissingPrimaryKeys {
+        return Err("missing-primary-keys mode cannot use updated-since".to_string());
+    }
     if updated_since.column.is_empty() {
         return Err("updated-at column is required when updated-since is set".to_string());
     }
@@ -616,6 +619,26 @@ mod tests {
                 value: "2026-06-01 00:00:00".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn rejects_updated_since_with_missing_primary_keys_mode() {
+        set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
+        set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
+
+        let error = parse_sync_table_config(required_args([
+            "--mode",
+            "missing-primary-keys",
+            "--columns",
+            "id,name,updated_at",
+            "--updated-at-column",
+            "updated_at",
+            "--updated-since",
+            "2026-06-01 00:00:00",
+        ]))
+        .expect_err("incompatible updated-since");
+
+        assert_eq!(error, "missing-primary-keys mode cannot use updated-since");
     }
 
     #[test]
