@@ -92,19 +92,28 @@ where
 }
 
 fn is_retryable_connection_error(error: &TableSyncError) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    matches!(
-        error,
-        TableSyncError::Read(_) | TableSyncError::Repair(_) | TableSyncError::Progress(_)
-    ) && [
+    if matches!(error, TableSyncError::Read(_) | TableSyncError::Progress(_)) {
+        return true;
+    }
+    let TableSyncError::Repair(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    [
         "timed out",
         "timeout",
         "connection reset",
         "connection refused",
+        "connection closed",
+        "connection aborted",
         "broken pipe",
         "unexpected eof",
         "server has gone away",
         "lost connection",
+        "network is unreachable",
+        "could not connect",
+        "not connected",
+        "packet out of sync",
         "resource temporarily unavailable",
     ]
     .iter()

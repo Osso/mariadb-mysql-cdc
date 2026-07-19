@@ -29,6 +29,30 @@ fn missing_primary_key_sync_retries_transient_connection_loss_with_a_bound() {
 
     assert_eq!(failures.get(), 3);
     assert_eq!(error.to_string(), "sync read failed: connection reset");
+
+    let packet_attempts = Cell::new(0);
+    retry_sync_table_operation(SyncMode::MissingPrimaryKeys, 3, Duration::ZERO, || {
+        packet_attempts.set(packet_attempts.get() + 1);
+        if packet_attempts.get() == 1 {
+            Err(TableSyncError::Read("Packet out of sync".to_string()))
+        } else {
+            Ok(SyncTableReport::default())
+        }
+    })
+    .expect("packet error retries");
+    assert_eq!(packet_attempts.get(), 2);
+}
+
+#[test]
+fn successful_sync_is_not_failed_by_lock_release_connection_loss() {
+    let progress_store = RecordingProgressStore {
+        release_error: Some("connection reset while releasing lock".to_string()),
+        ..RecordingProgressStore::default()
+    };
+
+    let result = finish_sync_run("completed-run", Ok(42_u64), &progress_store);
+
+    assert_eq!(result, Ok(42));
 }
 
 #[test]

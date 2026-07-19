@@ -587,9 +587,8 @@ pub(crate) fn finish_sync_run<T>(
 ) -> Result<T, TableSyncError> {
     let release_result = progress_store.release_run(run_id);
     match (result, release_result) {
-        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Ok(())) | (Ok(value), Err(_)) => Ok(value),
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(release_error)) => Err(release_error),
         (Err(error), Err(release_error)) => Err(TableSyncError::Progress(format!(
             "{error}; also failed to release run lock: {release_error}"
         ))),
