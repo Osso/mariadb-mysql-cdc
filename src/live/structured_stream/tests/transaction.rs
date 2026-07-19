@@ -368,7 +368,12 @@ fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
     process_divergent_event!(event_header(30, 215_329_760), guest_write_rows_event(19))
         .expect("guest row");
     process_divergent_event!(row_header, sessions_write_rows_event(20))
-        .expect_err("divergent sessions row must record a conflict");
+        .expect("divergent sessions row is deferred until XID");
+    process_divergent_event!(
+        event_header(16, 215_331_160),
+        BinlogEvent::XidEvent(XidEvent { xid: 102 })
+    )
+    .expect_err("XID finalizes the deferred sessions conflict");
 
     let record = &conflicts.records()[0];
     assert_eq!(record.key.table, "sessions");
@@ -635,7 +640,7 @@ fn divergent_duplicate_rolls_back_and_persists_conflict_evidence() {
         group_config: TargetTransactionGroupConfig::default(),
     };
 
-    let error = apply_stream_event_transactionally_with_conflicts(
+    apply_stream_event_transactionally_with_conflicts(
         &mut applier,
         &mut context,
         &header,
@@ -643,7 +648,31 @@ fn divergent_duplicate_rolls_back_and_persists_conflict_evidence() {
         "test-source",
         &mut conflicts,
     )
-    .expect_err("divergent duplicate must abort the source transaction");
+    .expect("divergent duplicate is deferred until XID");
+    assert!(conflicts.records().is_empty());
+    drop(context);
+
+    let xid_header = event_header(16, 260);
+    let xid_event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    let error = apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &xid_header,
+        &xid_event,
+        "test-source",
+        &mut conflicts,
+    )
+    .expect_err("XID finalizes the deferred duplicate");
 
     assert!(
         error
@@ -723,7 +752,7 @@ fn update_unique_conflict_under_ignore_duplicate_rolls_back_and_records_ledger()
         group_config: TargetTransactionGroupConfig::default(),
     };
 
-    let error = apply_stream_event_transactionally_with_conflicts(
+    apply_stream_event_transactionally_with_conflicts(
         &mut applier,
         &mut context,
         &header,
@@ -731,7 +760,31 @@ fn update_unique_conflict_under_ignore_duplicate_rolls_back_and_records_ledger()
         "test-source",
         &mut conflicts,
     )
-    .expect_err("update duplicate must abort the source transaction");
+    .expect("update conflict is deferred until XID");
+    assert!(conflicts.records().is_empty());
+    drop(context);
+
+    let xid_header = event_header(16, 260);
+    let xid_event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    let error = apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &xid_header,
+        &xid_event,
+        "test-source",
+        &mut conflicts,
+    )
+    .expect_err("XID finalizes the deferred update conflict");
 
     assert!(
         error
@@ -818,7 +871,7 @@ fn foreign_key_conflict_rolls_back_and_preserves_constraint_evidence() {
         group_config: TargetTransactionGroupConfig::default(),
     };
 
-    let error = apply_stream_event_transactionally_with_conflicts(
+    apply_stream_event_transactionally_with_conflicts(
         &mut applier,
         &mut context,
         &header,
@@ -826,7 +879,31 @@ fn foreign_key_conflict_rolls_back_and_preserves_constraint_evidence() {
         "test-source",
         &mut conflicts,
     )
-    .expect_err("foreign-key conflict must abort the source transaction");
+    .expect("foreign-key conflict is deferred until XID");
+    assert!(conflicts.records().is_empty());
+    drop(context);
+
+    let xid_header = event_header(16, 260);
+    let xid_event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    let error = apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &xid_header,
+        &xid_event,
+        "test-source",
+        &mut conflicts,
+    )
+    .expect_err("XID finalizes the deferred foreign-key conflict");
 
     assert!(
         error
@@ -865,7 +942,7 @@ fn check_conflict_rolls_back_and_preserves_constraint_evidence() {
         group_config: TargetTransactionGroupConfig::default(),
     };
 
-    let error = apply_stream_event_transactionally_with_conflicts(
+    apply_stream_event_transactionally_with_conflicts(
         &mut applier,
         &mut context,
         &header,
@@ -873,7 +950,31 @@ fn check_conflict_rolls_back_and_preserves_constraint_evidence() {
         "test-source",
         &mut conflicts,
     )
-    .expect_err("CHECK conflict must abort the source transaction");
+    .expect("CHECK conflict is deferred until XID");
+    assert!(conflicts.records().is_empty());
+    drop(context);
+
+    let xid_header = event_header(16, 260);
+    let xid_event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    let error = apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &xid_header,
+        &xid_event,
+        "test-source",
+        &mut conflicts,
+    )
+    .expect_err("XID finalizes the deferred CHECK conflict");
 
     assert!(
         error
