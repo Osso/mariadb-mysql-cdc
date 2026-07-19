@@ -101,13 +101,13 @@ fn sessions_write_rows_event(table_id: u64) -> BinlogEvent {
     })
 }
 
-fn sessions_followup_row_event(table_id: u64) -> BinlogEvent {
+fn sessions_conflict_with_followup_row_event(table_id: u64) -> BinlogEvent {
     BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
         table_id,
         flags: 0,
         columns_number: 3,
         columns_present: vec![true, true, true],
-        rows: vec![session_row(109_017_695)],
+        rows: vec![session_row(109_017_694), session_row(109_017_695)],
     })
 }
 
@@ -507,15 +507,9 @@ fn deferred_sessions_conflict_dooms_transaction_until_xid() {
 
     let mut row_header = event_header(30, 215_331_129);
     row_header.event_length = 404;
-    process_event!(row_header, sessions_write_rows_event(20))
-        .expect("conflict dooms transaction until XID");
+    process_event!(row_header, sessions_conflict_with_followup_row_event(20))
+        .expect("conflict dooms transaction and drains the followup row until XID");
     assert!(conflicts.records().is_empty());
-
-    process_event!(
-        event_header(30, 215_331_145),
-        sessions_followup_row_event(20)
-    )
-    .expect("doomed transaction drains a later row event without a target write");
 
     let mut xid_header = event_header(16, 215_331_160);
     xid_header.event_length = 31;
