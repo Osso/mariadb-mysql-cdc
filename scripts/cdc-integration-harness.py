@@ -2091,7 +2091,7 @@ class Harness:
         )
         self.admin_sql(
             self.target,
-            "INSERT INTO collision_guests VALUES (77096622, 'hash-a', 'displaced-a'); "
+            "INSERT INTO collision_guests VALUES (77096622, 'hash-a', 'source-a'); "
             "SET FOREIGN_KEY_CHECKS=0; "
             "INSERT INTO collision_sessions VALUES "
             "(98586490, 77087004, 'hash-a'), (98598473, 77096622, 'hash-b'); "
@@ -2137,7 +2137,7 @@ class Harness:
             self.target,
             "SET FOREIGN_KEY_CHECKS=0; "
             "DELETE FROM collision_guests WHERE guest_id=77087004; "
-            "UPDATE collision_guests SET guest_hash='hash-a', payload='displaced-a' WHERE guest_id=77096622; "
+            "UPDATE collision_guests SET guest_hash='hash-a', payload='source-a' WHERE guest_id=77096622; "
             "SET FOREIGN_KEY_CHECKS=1; "
             "ALTER TABLE collision_guests ADD CONSTRAINT chk_collision_insert_failure CHECK (guest_id <> 77087004);",
         )
@@ -2150,7 +2150,7 @@ class Harness:
             self.target,
             "SELECT guest_id,guest_hash,payload FROM collision_guests ORDER BY guest_id;",
         ).strip()
-        if rolled_back != "77096622\thash-a\tdisplaced-a":
+        if rolled_back != "77096622\thash-a\tsource-a":
             raise HarnessError(f"failed replacement did not roll back parents: {rolled_back!r}")
         children_after_failure = self.admin_query(
             self.target,

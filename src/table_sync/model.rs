@@ -70,6 +70,10 @@ pub struct SyncTableReport {
 
 pub trait SyncTableReader {
     fn read_rows(&self, request: &SyncChunkRequest) -> Result<Vec<SnapshotRow>, TableSyncError>;
+
+    fn requires_full_rows_for_missing_primary_keys(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]

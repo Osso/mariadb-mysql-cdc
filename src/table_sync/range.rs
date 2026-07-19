@@ -378,6 +378,9 @@ where
 {
     let end_at = last_primary_key(source_rows)?;
     let target_rows = read_source_bounded_target_window(context, &end_at)?;
+    if repair_two_parent_collision(context, source_rows, &target_rows, &end_at)? {
+        return Ok(end_at);
+    }
     repair_chunk(
         source_rows,
         &target_rows,
@@ -391,6 +394,87 @@ where
     Ok(end_at)
 }
 
+fn repair_two_parent_collision<S, T, R, P>(
+    context: &mut SyncChunkContext<'_, S, T, R, P>,
+    source_rows: &[SnapshotRow],
+    target_rows: &[SnapshotRow],
+    end_at: &[String],
+) -> Result<bool, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    if context.mode != SyncMode::MissingPrimaryKeys || context.phase == SyncPhase::Verify {
+        return Ok(false);
+    }
+    let source_by_key = source_rows
+        .iter()
+        .map(|row| (row.primary_key.clone(), row))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let target_by_key = target_rows
+        .iter()
+        .map(|row| (row.primary_key.clone(), row))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let missing = source_by_key
+        .iter()
+        .filter(|(primary_key, _)| !target_by_key.contains_key(*primary_key))
+        .map(|(_, row)| *row)
+        .collect::<Vec<_>>();
+    if missing.len() != 1 {
+        return Ok(false);
+    }
+    let missing_source = missing[0];
+    let displaced_targets = target_rows
+        .iter()
+        .filter(|target| {
+            target.primary_key != missing_source.primary_key
+                && non_primary_values_equal(context.table, target, missing_source)
+        })
+        .collect::<Vec<_>>();
+    if displaced_targets.len() != 1 {
+        return Ok(false);
+    }
+    let displaced_target = displaced_targets[0];
+    let Some(displaced_source) = source_by_key.get(&displaced_target.primary_key).copied() else {
+        return Err(TableSyncError::Repair(
+            "two-parent collision source owner is outside the stable chunk".to_string(),
+        ));
+    };
+    let mut next_report = context.report.clone();
+    next_report.chunks += 1;
+    next_report.rows_scanned += source_rows.len() as u64;
+    next_report.inserts += 1;
+    let mut next_progress = context.progress.clone();
+    next_progress.record_chunk(&next_report, end_at.to_vec());
+    let progress_sql = context
+        .progress_store
+        .transactional_save_sql(&next_progress)
+        .ok_or_else(|| {
+            TableSyncError::Progress(
+                "two-parent collision requires transactional progress storage".to_string(),
+            )
+        })?;
+    context.repair_target.restore_displaced_owner_and_insert(
+        context.table,
+        displaced_source,
+        missing_source,
+        &progress_sql,
+    )?;
+    *context.report = next_report;
+    *context.progress = next_progress;
+    Ok(true)
+}
+
+fn non_primary_values_equal(table: &SyncTable, left: &SnapshotRow, right: &SnapshotRow) -> bool {
+    table
+        .columns
+        .iter()
+        .filter(|column| !table.primary_key.contains(column))
+        .all(|column| left.values.get(column) == right.values.get(column))
+}
+
 fn read_source_bounded_target_window<S, T, R, P>(
     context: &SyncChunkContext<'_, S, T, R, P>,
     end_at: &[String],
@@ -402,7 +486,9 @@ where
     P: SyncProgressStore,
 {
     let primary_key_only_table;
-    let target_table = if context.mode == SyncMode::MissingPrimaryKeys {
+    let target_table = if context.mode == SyncMode::MissingPrimaryKeys
+        && !context.target.requires_full_rows_for_missing_primary_keys()
+    {
         primary_key_only_table = SyncTable {
             name: context.table.name.clone(),
             primary_key: context.table.primary_key.clone(),

@@ -195,11 +195,14 @@ duplicates” switch. Values are `error`, `ignore-duplicate`, and the explicit
   `sync-table --updated-since` uses its own upsert path.
 
 `sync-table --mode missing-primary-keys` is apply-only: it compares source and
-target rows by primary key, reads only target primary-key columns, inserts source
-rows whose primary keys are absent, and never updates existing rows or deletes
-extra target rows. It uses strict `INSERT`, so any primary-key or secondary-unique
-conflict is an error; it does not ignore the conflict or update/delete the
-conflicting target row. MySQL connections use a 10-second TCP connect timeout
+target rows by primary key, inserts source rows whose primary keys are absent,
+and never deletes dependent rows. With `replace-divergent-pk`, an exact one-hop
+displacement is repaired transactionally: the displaced target owner is restored
+from the same source chunk, the missing owner is inserted, affected child rows
+are verified unchanged, and run progress commits on the same target connection.
+Ambiguous chains, absent source owners, verification failures, and constraint
+failures roll back parents and progress. Other conflicts remain errors. MySQL
+connections use a 10-second TCP connect timeout
 and 30-second read/write timeouts. Transient connection failures retry up to
 five attempts total (the initial attempt plus four retries), with each retry
 resuming from durable `cdc.table_sync_runs` progress; non-transient errors and

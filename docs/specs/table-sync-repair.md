@@ -20,6 +20,10 @@ are resolved only after verified equality.
       for reads and writes.
 - [x] In `missing-primary-keys` mode, retry transient connection failures up to
       five attempts total, resuming each retry from durable run progress.
+- [x] With `replace-divergent-pk`, repair only exact one-hop parent displacement
+      from one stable source chunk: lock both identities, restore the displaced
+      owner, insert the missing owner, verify affected children unchanged, and
+      commit run progress in the same transaction; roll back all state on failure.
 - [x] Keep `--updated-since` retries restartable from the beginning under the same
       immutable run specification.
 - [x] Provide a durable conflict schema/SQL contract and resolve rows only after

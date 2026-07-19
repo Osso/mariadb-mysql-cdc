@@ -210,6 +210,37 @@ impl PersistentTargetExecutor {
             .query(build_target_column_select_sql(table))
             .map_err(target_query_error)
     }
+
+    pub(crate) fn query_rows_as_strings(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<Vec<Option<String>>>, TargetExecuteError> {
+        let rows = self
+            .conn
+            .borrow_mut()
+            .query::<mysql::Row, _>(sql)
+            .map_err(target_query_error)?;
+        Ok(rows.into_iter().map(row_to_strings).collect())
+    }
+
+    pub(crate) fn execute_raw_sql(&self, sql: &str) -> Result<(), TargetExecuteError> {
+        self.conn
+            .borrow_mut()
+            .query_drop(sql)
+            .map_err(target_query_error)
+    }
+
+    pub(crate) fn begin_sync_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.execute_transaction_control("BEGIN")
+    }
+
+    pub(crate) fn commit_sync_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.execute_transaction_control("COMMIT")
+    }
+
+    pub(crate) fn rollback_sync_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.execute_transaction_control("ROLLBACK")
+    }
 }
 
 impl TargetExecutor for PersistentTargetExecutor {

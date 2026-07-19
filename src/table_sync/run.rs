@@ -147,18 +147,15 @@ pub(crate) fn should_record_sync_run_error(error: &TableSyncError) -> bool {
     matches!(error, TableSyncError::Read(_) | TableSyncError::Repair(_))
 }
 
-fn mysql_repair_target(
-    config: &SyncTableConfig,
-) -> Result<
-    crate::target::TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
-    TableSyncError,
-> {
+fn mysql_repair_target(config: &SyncTableConfig) -> Result<MySqlSyncRepairTarget, TableSyncError> {
     let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
         .map_err(|error| TableSyncError::Repair(error.to_string()))?;
-    Ok(crate::target::TargetMySqlWriter::from_snapshot_table(
-        &snapshot_table(&config.table),
-        executor,
-        sync_insert_mode(config),
+    Ok(MySqlSyncRepairTarget::new(
+        crate::target::TargetMySqlWriter::from_snapshot_table(
+            &snapshot_table(&config.table),
+            executor,
+            sync_insert_mode(config),
+        ),
     ))
 }
 

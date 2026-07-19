@@ -10,6 +10,7 @@ pub(crate) struct MySqlSyncReader {
     tls_ca_file: Option<String>,
     source: RefCell<Option<PersistentMySqlSource>>,
     target_opts: Option<mysql::Opts>,
+    replace_divergent_primary: bool,
 }
 
 impl MySqlSyncReader {
@@ -26,6 +27,7 @@ impl MySqlSyncReader {
             tls_ca_file,
             source: RefCell::new(None),
             target_opts: None,
+            replace_divergent_primary: false,
         }
     }
 
@@ -38,6 +40,8 @@ impl MySqlSyncReader {
             tls_ca_file: None,
             source: RefCell::new(None),
             target_opts: Some(target_reader_opts(target)?),
+            replace_divergent_primary: target.insert_conflict_policy
+                == crate::live::InsertConflictPolicy::ReplaceDivergentPk,
         })
     }
 
@@ -72,6 +76,10 @@ impl SyncTableReader for MySqlSyncReader {
         let sql = build_sync_select_sql(request);
         let rows = self.query_rows(&sql)?;
         parse_sync_rows(&request.columns, &request.primary_key, rows)
+    }
+
+    fn requires_full_rows_for_missing_primary_keys(&self) -> bool {
+        self.replace_divergent_primary
     }
 }
 

@@ -41,6 +41,9 @@ pub trait SyncProgressStore {
     fn load(&self, run_id: &str) -> Result<Option<SyncTableProgress>, TableSyncError>;
     fn save(&mut self, progress: &SyncTableProgress) -> Result<(), TableSyncError>;
     fn save_error(&mut self, run_id: &str, error: &TableSyncError) -> Result<(), TableSyncError>;
+    fn transactional_save_sql(&self, _progress: &SyncTableProgress) -> Option<String> {
+        None
+    }
 }
 
 pub struct NoopSyncProgressStore;
@@ -176,6 +179,10 @@ impl SyncProgressStore for MySqlSyncRunProgressStore {
     fn save_error(&mut self, run_id: &str, error: &TableSyncError) -> Result<(), TableSyncError> {
         self.inner
             .execute(build_sync_run_error_sql(&self.inner.table, run_id, error))
+    }
+
+    fn transactional_save_sql(&self, progress: &SyncTableProgress) -> Option<String> {
+        Some(build_sync_run_upsert_sql(&self.inner.table, progress))
     }
 }
 
