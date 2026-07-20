@@ -2466,13 +2466,22 @@ class Harness:
                 "reconciliation owner did not repair the missing guest fixture: "
                 f"{target_parent_after_owner!r}"
             )
-        if durable_after != durable_before:
+        expected_durable_after = (
+            f"{durable_run_id}\tguests\t{json.dumps([str(guest_id)])}\t2\t2\t2\t2\t0\t0\t"
+            "missing-primary-keys\tcomplete\tNULL"
+        )
+        if durable_after != expected_durable_after:
             raise HarnessError(
-                "durable guests run changed outside owner diagnosis: "
+                "reconciliation owner did not resume and complete the durable guests run: "
                 f"before={durable_before!r} after={durable_after!r}"
             )
-        if owner_runs.count("\n") != 3 or any("\tcomplete\t" not in f"\t{line}\t" for line in owner_runs.splitlines()):
-            raise HarnessError(f"reconciliation owner did not complete its fresh child runs: {owner_runs!r}")
+        owner_run_lines = owner_runs.splitlines()
+        if len(owner_run_lines) != 3 or any(
+            "\tcomplete\t" not in f"\t{line}\t" for line in owner_run_lines
+        ):
+            raise HarnessError(f"reconciliation owner did not complete its remaining fresh child runs: {owner_runs!r}")
+        if any("\tmissing-pks\t" in f"\t{line}\t" for line in owner_run_lines):
+            raise HarnessError(f"reconciliation owner created a fresh missing-PK run: {owner_runs!r}")
         if checkpoint_after_owner.get("source_file") != pre_stream.file or int(
             checkpoint_after_owner.get("source_position", 0)
         ) != pre_stream.position:
@@ -2482,12 +2491,6 @@ class Harness:
                 "reconciliation owner changed prior FK conflict evidence: "
                 f"before={cleared_evidence!r} after={owner_evidence!r}"
             )
-        raise HarnessError(
-            "missing backfill orchestration: production repair-drift completed a fresh owner run "
-            f"{owner_run_id!r} instead of discovering/resuming durable guests missing-PK run "
-            f"{durable_run_id!r}; guest_inserted=true durable_run_unchanged=true "
-            "stream_checkpoint_unchanged=true prior_conflict_evidence_preserved=true"
-        )
 
     def run_row_conflict_rollback(self) -> None:
         assert self.source and self.target
