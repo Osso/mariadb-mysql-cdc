@@ -105,6 +105,24 @@ fn real_global_delete_limit_preflights_all_tables_before_mutation() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_delete_only_descendants_are_preflighted_deleted_and_verified() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("delete-only-descendants")
+        .output()
+        .expect("run delete-only descendants harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_reconciliation_owner_should_resume_durable_missing_guest_run() {
     let output = Command::new("python3")
         .arg(harness_script())

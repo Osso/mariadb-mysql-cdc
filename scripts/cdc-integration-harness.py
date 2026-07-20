@@ -83,6 +83,7 @@ SCENARIOS = (
     ScenarioSpec("repair-resume", True),
     ScenarioSpec("bounded-delete", True),
     ScenarioSpec("global-delete-limit", True),
+    ScenarioSpec("delete-only-descendants", True),
     ScenarioSpec("conflict-resolution-zero-debt", True),
 )
 SCENARIO_BY_NAME = {scenario.name: scenario for scenario in SCENARIOS}
@@ -3094,6 +3095,97 @@ class Harness:
             print(f"{scenario}_converged same_run_id=true changed_plan_rejected=true rows={count}")
             return
 
+        if scenario == "delete-only-descendants":
+            for endpoint in (self.source, self.target):
+                self.admin_sql(
+                    endpoint,
+                    "DROP TABLE IF EXISTS repair_delete_invoices; "
+                    "DROP TABLE IF EXISTS repair_delete_orders; "
+                    "DROP TABLE IF EXISTS repair_delete_customers; "
+                    "CREATE TABLE repair_delete_customers ("
+                    "id BIGINT NOT NULL PRIMARY KEY, "
+                    "payload VARCHAR(64) NOT NULL"
+                    ") ENGINE=InnoDB; "
+                    "CREATE TABLE repair_delete_orders ("
+                    "id BIGINT NOT NULL PRIMARY KEY, "
+                    "customer_id BIGINT NOT NULL, "
+                    "payload VARCHAR(64) NOT NULL, "
+                    "CONSTRAINT fk_repair_delete_orders_customer FOREIGN KEY (customer_id) "
+                    "REFERENCES repair_delete_customers (id)"
+                    ") ENGINE=InnoDB; "
+                    "CREATE TABLE repair_delete_invoices ("
+                    "id BIGINT NOT NULL PRIMARY KEY, "
+                    "customer_id BIGINT NOT NULL, "
+                    "payload VARCHAR(64) NOT NULL, "
+                    "CONSTRAINT fk_repair_delete_invoices_customer FOREIGN KEY (customer_id) "
+                    "REFERENCES repair_delete_customers (id)"
+                    ") ENGINE=InnoDB;",
+                )
+            self.admin_sql(self.source, "INSERT INTO repair_delete_customers VALUES (1, 'keep');")
+            self.admin_sql(
+                self.target,
+                "INSERT INTO repair_delete_customers VALUES (1, 'keep'), (2, 'extra'); "
+                "INSERT INTO repair_delete_orders VALUES (20, 2, 'extra'); "
+                "INSERT INTO repair_delete_invoices VALUES (30, 2, 'extra');",
+            )
+            limited = self.run_repair(
+                tables=["repair_delete_customers"],
+                max_deletes=2,
+                run_id="delete-only-descendants-limit",
+            )
+            limited_output = f"{limited.stdout}\n{limited.stderr}".lower()
+            if limited.returncode == 0 or "delete safety threshold exceeded" not in limited_output:
+                raise HarnessError(
+                    f"{scenario} did not preflight cumulative childward deletes: {limited}"
+                )
+            unchanged = self.query(
+                self.target,
+                "SELECT COUNT(*) FROM repair_delete_customers; "
+                "SELECT COUNT(*) FROM repair_delete_orders; "
+                "SELECT COUNT(*) FROM repair_delete_invoices;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            if unchanged != "2\n1\n1":
+                raise HarnessError(f"{scenario} mutated before cumulative preflight: {unchanged!r}")
+
+            result = self.run_repair(
+                tables=["repair_delete_customers"],
+                max_deletes=3,
+                run_id="delete-only-descendants-success",
+            )
+            require_success(result, scenario)
+            remaining = self.query(
+                self.target,
+                "SELECT COUNT(*) FROM repair_delete_customers; "
+                "SELECT COUNT(*) FROM repair_delete_orders; "
+                "SELECT COUNT(*) FROM repair_delete_invoices;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            if remaining != "1\n0\n0":
+                raise HarnessError(
+                    f"{scenario} did not delete child extras before parent: {remaining!r}"
+                )
+            verify_runs = self.admin_query(
+                self.target,
+                "SELECT run_id,status FROM globalcomix.table_sync_runs "
+                "WHERE run_id LIKE 'delete-only-descendants-success-verify-%' "
+                "ORDER BY run_id;",
+            ).strip()
+            expected_verify_runs = (
+                "delete-only-descendants-success-verify-repair_delete_customers\tcomplete\n"
+                "delete-only-descendants-success-verify-repair_delete_invoices\tcomplete\n"
+                "delete-only-descendants-success-verify-repair_delete_orders\tcomplete"
+            )
+            if verify_runs != expected_verify_runs:
+                raise HarnessError(f"{scenario} did not reread the full Verify union: {verify_runs!r}")
+            print(
+                f"{scenario}_converged cumulative_deletes=3 child_before_parent=true "
+                "verify_union=true"
+            )
+            return
+
         if scenario == "global-delete-limit":
             first_table = "repair_limit_a"
             second_table = "repair_limit_b"
@@ -3418,6 +3510,8 @@ class Harness:
             self.run_repair_scenario("bounded-delete")
         elif scenario == "global-delete-limit":
             self.run_repair_scenario("global-delete-limit")
+        elif scenario == "delete-only-descendants":
+            self.run_repair_scenario("delete-only-descendants")
         elif scenario == "conflict-resolution-zero-debt":
             self.run_repair_scenario("conflict-resolution-zero-debt")
         else:
