@@ -602,4 +602,25 @@ mod tests {
         assert!(!ssl.skip_domain_validation());
         assert!(!ssl.accept_invalid_certs());
     }
+
+    #[test]
+    fn verify_phase_covers_union_of_directional_execution_scopes() {
+        let plan = crate::conflict_repair::RepairPlan {
+            run_id: "run".to_string(),
+            source_identity: "source".to_string(),
+            target_identity: "target".to_string(),
+            inventory_hash: "inventory".to_string(),
+            plan_hash: "plan".to_string(),
+            tables: vec!["customers".to_string(), "orders".to_string()],
+            delete_order: vec!["orders".to_string(), "customers".to_string()],
+            insert_order: vec!["customers".to_string()],
+            update_order: vec!["customers".to_string()],
+            max_deletes: 0,
+        };
+
+        let phases = repair_phases(&plan);
+
+        assert_eq!(phases[3].0, SyncPhase::Verify);
+        assert_eq!(phases[3].1, plan.tables.as_slice());
+    }
 }

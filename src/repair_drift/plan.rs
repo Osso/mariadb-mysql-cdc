@@ -564,3 +564,120 @@ fn build_repair_inventory(
         foreign_keys: build_canonical_foreign_key_inventory(&inventory.schema, &reader)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::{ColumnInventory, TableInventory};
+
+    fn table(name: &str) -> TableInventory {
+        TableInventory {
+            name: name.to_string(),
+            table_type: "BASE TABLE".to_string(),
+            engine: Some("InnoDB".to_string()),
+            collation: None,
+            primary_key: vec!["id".to_string()],
+            columns: vec![ColumnInventory {
+                name: "id".to_string(),
+                ordinal_position: 1,
+                column_type: "bigint".to_string(),
+                data_type: "bigint".to_string(),
+                is_nullable: false,
+                default_value: None,
+                extra: String::new(),
+                comment: String::new(),
+                generated: None,
+            }],
+        }
+    }
+
+    fn schema_inventory(names: &[&str]) -> SchemaInventory {
+        SchemaInventory {
+            schema: "app".to_string(),
+            tables: names.iter().map(|name| table(name)).collect(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            views: Vec::new(),
+            triggers: Vec::new(),
+            routines: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn repair_inventory(
+        tables: &[&str],
+        foreign_keys: Vec<CanonicalForeignKey>,
+    ) -> RepairInventory {
+        RepairInventory {
+            schema: "app".to_string(),
+            tables: tables.iter().map(|table| (*table).to_string()).collect(),
+            foreign_keys,
+        }
+    }
+
+    fn fk(child_table: &str, parent_table: &str) -> CanonicalForeignKey {
+        CanonicalForeignKey {
+            constraint_schema: "app".to_string(),
+            constraint_name: format!("{child_table}_{parent_table}_fk"),
+            child_schema: "app".to_string(),
+            child_table: child_table.to_string(),
+            child_columns: vec!["parent_id".to_string()],
+            parent_schema: "app".to_string(),
+            parent_table: parent_table.to_string(),
+            parent_columns: vec!["id".to_string()],
+            update_rule: "RESTRICT".to_string(),
+            delete_rule: "RESTRICT".to_string(),
+            match_option: "NONE".to_string(),
+            enforced: true,
+        }
+    }
+
+    fn runtime_plan(config: &RepairDriftConfig, inventory: RepairInventory) -> RepairPlan {
+        let source = reduce_to_dependency_scopes(inventory.clone(), config.tables.clone());
+        let target = reduce_to_dependency_scopes(inventory, config.tables.clone());
+        build_plan(config, "run", source, target).expect("directional repair plan")
+    }
+
+    #[test]
+    fn selected_child_candidates_include_parentward_repairs_before_child() {
+        let mut config = super::super::config::default_repair_drift_config();
+        config.tables = vec!["orders".to_string()];
+        let source = schema_inventory(&["customers", "orders", "invoices", "unrelated"]);
+        let plan = runtime_plan(
+            &config,
+            repair_inventory(
+                &["customers", "orders", "invoices", "unrelated"],
+                vec![fk("orders", "customers"), fk("invoices", "customers")],
+            ),
+        );
+
+        assert_eq!(plan.insert_order, vec!["customers", "orders"]);
+        assert_eq!(plan.delete_order, vec!["orders"]);
+        assert_eq!(
+            ordered_candidate_tables(&config, &source, &plan).expect("candidate tables"),
+            vec!["customers", "orders"]
+        );
+    }
+
+    #[test]
+    fn selected_parent_candidates_include_childward_delete_safety_scope() {
+        let mut config = super::super::config::default_repair_drift_config();
+        config.tables = vec!["customers".to_string()];
+        let source = schema_inventory(&["customers", "orders", "invoices", "unrelated"]);
+        let plan = runtime_plan(
+            &config,
+            repair_inventory(
+                &["customers", "orders", "invoices", "unrelated"],
+                vec![fk("orders", "customers"), fk("invoices", "customers")],
+            ),
+        );
+
+        assert_eq!(plan.insert_order, vec!["customers"]);
+        assert_eq!(plan.delete_order, vec!["orders", "invoices", "customers"]);
+        assert_eq!(
+            ordered_candidate_tables(&config, &source, &plan).expect("candidate tables"),
+            plan.tables
+        );
+        assert!(!plan.tables.contains(&"unrelated".to_string()));
+    }
+}
