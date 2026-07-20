@@ -79,12 +79,14 @@ fn reconcile_exact_sessions_guest(
     let (source, target) = build_sessions_guest_recovery_readers(config)?;
     let source_rows = source.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
     let target_rows = target.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
-    let reconciliation = plan_loaded_sessions_guest(&source_rows, &target_rows, request)?;
-    let GuestReconciliation::Insert(source_row) = reconciliation else {
-        return Ok(());
-    };
     let sync_config = exact_guest_sync_config(config, request);
-    connect_mysql_recovery_target(&sync_config)?.insert_row(&source_row)
+    let mut repair_target = connect_mysql_recovery_target(&sync_config)?;
+    reconcile_loaded_exact_parent(
+        &crate::live::ExactParentRecovery::SessionsGuest(request.clone()),
+        &source_rows,
+        &target_rows,
+        &mut repair_target,
+    )
 }
 
 fn reconcile_exact_home_feed_card(
@@ -106,12 +108,39 @@ fn reconcile_exact_home_feed_card(
         .and_then(Option::as_deref);
     let target_rows =
         target.read_home_feed_card_identity_rows(&request.card_id, card_type_id, source_id)?;
-    let reconciliation = plan_loaded_home_feed_card(source_row, &target_rows, request)?;
+    let sync_config = exact_home_feed_card_sync_config(config, request);
+    let mut repair_target = connect_mysql_recovery_target(&sync_config)?;
+    reconcile_loaded_exact_parent(
+        &crate::live::ExactParentRecovery::HomeFeedCard(request.clone()),
+        &source_rows,
+        &target_rows,
+        &mut repair_target,
+    )
+}
+
+pub(crate) fn reconcile_loaded_exact_parent(
+    request: &crate::live::ExactParentRecovery,
+    source_rows: &[crate::snapshot::SnapshotRow],
+    target_rows: &[crate::snapshot::SnapshotRow],
+    repair_target: &mut impl SyncRepairTarget,
+) -> Result<(), TableSyncError> {
+    let reconciliation = match request {
+        crate::live::ExactParentRecovery::SessionsGuest(request) => {
+            plan_loaded_sessions_guest(source_rows, target_rows, request)?
+        }
+        crate::live::ExactParentRecovery::HomeFeedCard(request) => {
+            let source_row = require_exact_home_feed_card_row("source", source_rows, request)?;
+            validate_parent_temporal_order(
+                recovery_create_time_epoch(source_row, "home feed card")?,
+                request.child_event_timestamp,
+            )?;
+            plan_loaded_home_feed_card(source_row, target_rows, request)?
+        }
+    };
     let GuestReconciliation::Insert(source_row) = reconciliation else {
         return Ok(());
     };
-    let sync_config = exact_home_feed_card_sync_config(config, request);
-    connect_mysql_recovery_target(&sync_config)?.insert_row(&source_row)
+    repair_target.insert_row(&source_row)
 }
 
 fn build_sessions_guest_recovery_readers(

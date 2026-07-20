@@ -47,7 +47,9 @@ pub(crate) use repair::{
     apply_recent_update_chunk, count_extra_target_rows, ensure_delete_allowed, repair_chunk,
 };
 #[cfg(test)]
-pub(crate) use run::{build_sync_run_scope, retry_sync_table_operation};
+pub(crate) use run::{
+    build_sync_run_scope, reconcile_loaded_exact_parent, retry_sync_table_operation,
+};
 pub(crate) use run::{
     find_compatible_failed_run, reconcile_exact_parent, run_sync_table_phase_with_run_spec,
     should_record_sync_run_error,

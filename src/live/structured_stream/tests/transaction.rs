@@ -1138,6 +1138,184 @@ fn home_feed_slide_4508905_fk_conflict_carries_exact_card_recovery_boundary() {
     );
 }
 
+#[derive(Default)]
+struct RecordingExactParentTarget {
+    inserted: Vec<crate::snapshot::SnapshotRow>,
+}
+
+impl crate::table_sync::SyncRepairTarget for RecordingExactParentTarget {
+    fn insert_row(
+        &mut self,
+        row: &crate::snapshot::SnapshotRow,
+    ) -> Result<(), crate::table_sync::TableSyncError> {
+        self.inserted.push(row.clone());
+        Ok(())
+    }
+
+    fn update_row(
+        &mut self,
+        _row: &crate::snapshot::SnapshotRow,
+    ) -> Result<(), crate::table_sync::TableSyncError> {
+        panic!("exact parent recovery must not update")
+    }
+
+    fn delete_row(
+        &mut self,
+        _primary_key: &[String],
+    ) -> Result<(), crate::table_sync::TableSyncError> {
+        panic!("exact parent recovery must not delete")
+    }
+}
+
+#[derive(Default)]
+struct ExactCheckpointStore {
+    saved: RefCell<Vec<crate::checkpoint::Checkpoint>>,
+}
+
+impl StreamCheckpointStore for ExactCheckpointStore {
+    fn load_checkpoint(&self) -> Result<Option<crate::checkpoint::Checkpoint>, ApplyBinlogError> {
+        Ok(self.saved.borrow().last().cloned())
+    }
+
+    fn save_checkpoint(
+        &self,
+        checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> Result<(), ApplyBinlogError> {
+        self.saved.borrow_mut().push(checkpoint.clone());
+        Ok(())
+    }
+}
+
+fn exact_home_feed_card_parent_row() -> crate::snapshot::SnapshotRow {
+    let values = [
+        ("id", Some("2492683")),
+        ("card_type_id", Some("1")),
+        ("status", Some("active")),
+        ("reading_direction", Some("l")),
+        ("comic_id", Some("10175")),
+        ("release_id", Some("50715")),
+        ("caption", Some("exact source caption")),
+        ("hook_image_url", Some("https://example.test/hook.jpg")),
+        ("source_id", Some("50151")),
+        ("filter_reason", None),
+        ("retired_reason", None),
+        ("first_published", None),
+        ("last_active_time", Some("2026-07-20 22:01:03")),
+        ("view_count", Some("0")),
+        ("reaction_count", Some("0")),
+        ("click_count", Some("0")),
+        ("curator_user_id", None),
+        ("curated_score", None),
+        ("facets_json", None),
+        ("create_time", Some("2026-06-23 05:01:16")),
+        ("__recovery_create_time_epoch", Some("1782190876")),
+    ];
+    crate::snapshot::SnapshotRow {
+        primary_key: vec!["2492683".to_string()],
+        values: values
+            .into_iter()
+            .map(|(column, value)| (column.to_string(), value.map(ToString::to_string)))
+            .collect(),
+    }
+}
+
+#[test]
+fn exact_home_feed_event_recovers_parent_then_replays_child_and_xid_checkpoint() {
+    let resolver = FixtureSchemaResolver;
+    let event = BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id: 21,
+        flags: 0,
+        columns_number: 2,
+        columns_present: vec![true, true],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(4_508_905)),
+            Some(MySqlValue::Int(2_492_683)),
+        ])],
+    });
+    let header = event_header_at(30, 308_259_874, 1_784_588_463);
+
+    let mut conflicting_applier = crate::row::RowApplier::new(
+        TransactionRecordingExecutor::with_home_feed_card_foreign_key_conflict(),
+    );
+    conflicting_applier.apply_table_map(home_feed_card_slides_row_table_map());
+    let mut conflict_state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let mut conflict_file = "mysqld-bin.002709".to_string();
+    let mut conflict_transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    let error = apply_deferred_conflict_at_xid_position(
+        &mut conflicting_applier,
+        DeferredConflictFixture {
+            resolver: &resolver,
+            state: &mut conflict_state,
+            current_file: &mut conflict_file,
+            transaction: &mut conflict_transaction,
+            conflicts: &mut conflicts,
+        },
+        &header,
+        &event,
+        308_261_441,
+    );
+    let recovery = error
+        .parent_recovery()
+        .expect("exact event must dispatch parent recovery");
+
+    let source_parent = exact_home_feed_card_parent_row();
+    let mut repair_target = RecordingExactParentTarget::default();
+    crate::table_sync::reconcile_loaded_exact_parent(
+        recovery,
+        std::slice::from_ref(&source_parent),
+        &[],
+        &mut repair_target,
+    )
+    .expect("exact parent reconciliation");
+    let mut canonical_parent = source_parent;
+    canonical_parent
+        .values
+        .remove("__recovery_create_time_epoch");
+    assert_eq!(repair_target.inserted, [canonical_parent]);
+
+    let mut replay_applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+    replay_applier.apply_table_map(home_feed_card_slides_row_table_map());
+    let checkpoint_store = ExactCheckpointStore::default();
+    let mut replay_state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let mut replay_file = "mysqld-bin.002709".to_string();
+    let mut replay_transaction = TargetTransaction::default();
+    let group_config = TargetTransactionGroupConfig {
+        size: 1,
+        timeout: Duration::ZERO,
+    };
+    for (event_header, replay_event) in [
+        (header, event),
+        (
+            event_header(16, 308_261_441),
+            BinlogEvent::XidEvent(XidEvent { xid: 308_261_441 }),
+        ),
+    ] {
+        let mut context = StreamEventContext {
+            schema_resolver: &resolver,
+            state: &mut replay_state,
+            target_transaction: &mut replay_transaction,
+            checkpoint_store: Some(&checkpoint_store),
+            transaction_checkpoint_table: None,
+            transaction_checkpoint_name: None,
+            current_file: &mut replay_file,
+            group_config,
+        };
+        apply_stream_event_transactionally(
+            &mut replay_applier,
+            &mut context,
+            &event_header,
+            &replay_event,
+        )
+        .expect("unchanged child replay and XID");
+    }
+
+    let checkpoints = checkpoint_store.saved.borrow();
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0].source_file, "mysqld-bin.002709");
+    assert_eq!(checkpoints[0].source_position, 308_261_441);
+}
+
 #[test]
 fn foreign_key_conflict_rolls_back_and_preserves_constraint_evidence() {
     let executor = TransactionRecordingExecutor::with_foreign_key_conflict_second_row_change();
