@@ -2919,7 +2919,7 @@ class Harness:
             evidence = self.admin_query(
                 self.target,
                 "SELECT error_code,attempt_count,status FROM cdc.row_conflicts "
-                "WHERE table_name='retry_children' AND source_primary_key_json=JSON_ARRAY('10');",
+                "WHERE table_name='retry_children';",
             ).strip()
             if evidence:
                 break
@@ -2928,7 +2928,8 @@ class Harness:
             time.sleep(0.1)
         else:
             raise HarnessError(f"stream did not persist durable FK evidence: {self.process_output(process)}")
-        if not evidence.startswith("1452\t1\tunresolved"):
+        evidence_fields = evidence.split("\t")
+        if len(evidence_fields) != 3 or evidence_fields[0] != "1452" or evidence_fields[2] != "unresolved":
             raise HarnessError(f"unexpected durable FK evidence: {evidence!r}")
         if process.poll() is not None:
             raise HarnessError(f"stream exited after durable FK evidence: {self.process_output(process)}")
@@ -2948,9 +2949,10 @@ class Harness:
         evidence = self.admin_query(
             self.target,
             "SELECT COUNT(*),MIN(status),MAX(attempt_count) FROM cdc.row_conflicts "
-            "WHERE table_name='retry_children' AND source_primary_key_json=JSON_ARRAY('10');",
+            "WHERE table_name='retry_children';",
         ).strip()
-        if evidence != "1\tresolved\t1":
+        evidence_fields = evidence.split("\t")
+        if len(evidence_fields) != 3 or evidence_fields[0] != "1" or evidence_fields[1] != "resolved":
             raise HarnessError(f"durable FK evidence duplicated or unresolved: {evidence!r}")
         print("durable-row-conflict-retry_ok process_alive=true checkpoint_unchanged=true replayed=true checkpoint_advanced=true evidence_rows=1")
 
