@@ -169,49 +169,60 @@ where
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
-        let error = handle_failed_attempt(
+        let error = match retry_or_stop_after_failed_attempt(
             error,
             checkpoint_store.is_some(),
             attempt,
             config,
             &mut attempted_recoveries,
             &mut recover,
-        )?;
-        prepare_next_attempt(&mut attempt_config, checkpoint_store, &mut attempt, &error)?;
+        )? {
+            FailedAttemptOutcome::Retry(error) => error,
+            FailedAttemptOutcome::Stop(error) => return Err(error),
+        };
+
+        attempt += 1;
+        let checkpoint = load_checkpoint_for_resume(checkpoint_store)?;
+        update_source_coordinate_from_checkpoint(&mut attempt_config, checkpoint);
+        validate_reconnect_start_coordinate(&attempt_config)?;
+        log_reconnect_start(&attempt_config, attempt, &error);
         sleep(reconnect_delay(attempt));
     }
 }
 
-fn handle_failed_attempt<R>(
+enum FailedAttemptOutcome {
+    Retry(ApplyBinlogError),
+    Stop(ApplyBinlogError),
+}
+
+fn retry_or_stop_after_failed_attempt<R>(
     error: ApplyBinlogError,
     has_checkpoint_store: bool,
     attempt: u32,
     config: &ApplyBinlogConfig,
     attempted_recoveries: &mut BTreeSet<crate::live::SessionsGuestRecovery>,
     recover: &mut R,
-) -> Result<ApplyBinlogError, ApplyBinlogError>
+) -> Result<FailedAttemptOutcome, ApplyBinlogError>
 where
     R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), RecoveryAttemptError>,
 {
     if let Some(stale_error) = stale_binlog_error(&error) {
-        return Err(stale_error);
+        return Ok(FailedAttemptOutcome::Stop(stale_error));
     }
-    if matches!(
-        failed_attempt_action(
+    if !has_checkpoint_store
+        || !should_reconnect(
             &error,
-            has_checkpoint_store,
             attempt,
             config.max_reconnects,
             config.reconnect_forever,
-        ),
-        FailedAttemptAction::Return
-    ) {
+        )
+    {
         log_skipped_recovery(&error);
-        return Err(error);
+        return Ok(FailedAttemptOutcome::Stop(error));
     }
     attempt_exact_parent_recovery(&error, attempted_recoveries, recover)
         .map_err(|source| sessions_guest_recovery_error(&error, source))?;
-    Ok(error)
+    Ok(FailedAttemptOutcome::Retry(error))
 }
 
 fn stale_binlog_error(error: &ApplyBinlogError) -> Option<ApplyBinlogError> {
@@ -233,25 +244,6 @@ fn sessions_guest_recovery_error(
     ApplyBinlogError::SessionsGuestRecoveryFailed {
         conflict: Box::new(conflict),
         source,
-    }
-}
-
-enum FailedAttemptAction {
-    Return,
-    Reconnect,
-}
-
-fn failed_attempt_action(
-    error: &ApplyBinlogError,
-    has_checkpoint_store: bool,
-    attempt: u32,
-    max_reconnects: u32,
-    reconnect_forever: bool,
-) -> FailedAttemptAction {
-    if has_checkpoint_store && should_reconnect(error, attempt, max_reconnects, reconnect_forever) {
-        FailedAttemptAction::Reconnect
-    } else {
-        FailedAttemptAction::Return
     }
 }
 
@@ -298,20 +290,12 @@ where
     Ok(())
 }
 
-fn prepare_next_attempt<C: StreamCheckpointStore>(
-    attempt_config: &mut ApplyBinlogConfig,
-    checkpoint_store: Option<&C>,
-    attempt: &mut u32,
-    error: &ApplyBinlogError,
-) -> Result<(), ApplyBinlogError> {
-    *attempt += 1;
-    resume_from_checkpoint(attempt_config, checkpoint_store)?;
-    attempt_config.source.validate_start_coordinate()?;
-    println!(
-        "{}",
-        format_reconnect_start(attempt_config, *attempt, error)
-    );
-    Ok(())
+fn validate_reconnect_start_coordinate(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
+    config.source.validate_start_coordinate()
+}
+
+fn log_reconnect_start(config: &ApplyBinlogConfig, attempt: u32, error: &ApplyBinlogError) {
+    println!("{}", format_reconnect_start(config, attempt, error));
 }
 
 fn format_recovery_log(
@@ -336,18 +320,34 @@ pub(super) fn resume_from_checkpoint(
     config: &mut ApplyBinlogConfig,
     checkpoint_store: Option<&impl StreamCheckpointStore>,
 ) -> Result<(), ApplyBinlogError> {
+    let checkpoint = load_checkpoint_for_resume(checkpoint_store)?;
+    update_source_coordinate_from_checkpoint(config, checkpoint);
+    Ok(())
+}
+
+fn load_checkpoint_for_resume(
+    checkpoint_store: Option<&impl StreamCheckpointStore>,
+) -> Result<Option<Checkpoint>, ApplyBinlogError> {
     let Some(store) = checkpoint_store else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(checkpoint) = store.load_checkpoint()? else {
         return Err(ApplyBinlogError::Checkpoint(
             "required source-scoped stream checkpoint is missing".to_string(),
         ));
     };
+    Ok(Some(checkpoint))
+}
 
+fn update_source_coordinate_from_checkpoint(
+    config: &mut ApplyBinlogConfig,
+    checkpoint: Option<Checkpoint>,
+) {
+    let Some(checkpoint) = checkpoint else {
+        return;
+    };
     config.source.binlog_file = checkpoint.source_file;
     config.source.start_position = checkpoint.source_position;
-    Ok(())
 }
 
 pub(super) fn should_reconnect(
