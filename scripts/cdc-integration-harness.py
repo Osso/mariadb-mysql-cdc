@@ -82,6 +82,7 @@ SCENARIOS = (
     ScenarioSpec("fk-unrelated-cycle-ignored", True),
     ScenarioSpec("fk-selected-dependency-cycle-block", True),
     ScenarioSpec("repair-resume", True),
+    ScenarioSpec("run-progress-least-privilege", True),
     ScenarioSpec("bounded-delete", True),
     ScenarioSpec("global-delete-limit", True),
     ScenarioSpec("delete-only-descendants", True),
@@ -2987,6 +2988,70 @@ class Harness:
         self.admin_sql(self.target, schema)
         self.assert_foreign_keys_enabled()
 
+    def run_run_progress_least_privilege(self) -> None:
+        assert self.source and self.target
+        self.setup_repair_accounts()
+        self.admin_sql(self.source, "INSERT INTO repair_accounts VALUES (1, 'one@example.test', 'one');")
+        self.admin_sql(
+            self.target,
+            "CREATE TABLE cdc.table_sync_runs ("
+            "run_id VARCHAR(128) NOT NULL PRIMARY KEY,"
+            "table_name VARCHAR(255) NOT NULL,"
+            "run_spec_json LONGTEXT NOT NULL,"
+            "last_primary_key_json TEXT NULL,"
+            "chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "total_rows BIGINT UNSIGNED NULL,"
+            "inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "mode VARCHAR(16) NOT NULL,"
+            "status VARCHAR(16) NOT NULL,"
+            "last_error TEXT NULL,"
+            "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+            ") ENGINE=InnoDB; "
+            "GRANT SELECT, INSERT, UPDATE ON cdc.table_sync_runs TO 'cdc_stream'@'%'; "
+            "FLUSH PRIVILEGES;",
+        )
+        grants = normalize_grants(
+            self.admin_query(self.target, "SHOW GRANTS FOR 'cdc_stream'@'%';")
+        )
+        if not any(
+            grant.upper().startswith("GRANT SELECT, INSERT, UPDATE ON CDC.TABLE_SYNC_RUNS")
+            for grant in grants
+        ):
+            raise HarnessError(f"runtime progress-table grant missing: {grants!r}")
+        if any(
+            " ON CDC.* " in grant.upper()
+            and any(privilege in grant.upper().split(" ON ", 1)[0] for privilege in ("CREATE", "ALTER"))
+            for grant in grants
+        ):
+            raise HarnessError(f"runtime user unexpectedly has cdc schema DDL grants: {grants!r}")
+
+        result = self.run_repair(
+            tables=["repair_accounts"],
+            max_deletes=0,
+            run_id="least-privilege-progress",
+            chunk_size=1,
+            progress_table="cdc.table_sync_runs",
+        )
+        require_success(result, "run-progress-least-privilege")
+        target_row = self.admin_query(
+            self.target,
+            "SELECT id,email,payload FROM repair_accounts;",
+        ).strip()
+        if target_row != "1\tone@example.test\tone":
+            raise HarnessError(f"bounded repair did not sync exact row: {target_row!r}")
+        progress = self.admin_query(
+            self.target,
+            "SELECT run_id,table_name,rows_scanned,inserts_applied,status "
+            "FROM cdc.table_sync_runs ORDER BY run_id;",
+        ).strip()
+        if progress != "least-privilege-progress:repair_accounts:insert-missing\trepair_accounts\t1\t1\tcomplete":
+            raise HarnessError(f"unexpected bounded sync progress: {progress!r}")
+        print("run-progress-least-privilege_ok rows=1 progress_rows=1 status=complete schema_ddl=false")
+
     def run_repair_scenario(self, scenario: str) -> None:
         assert self.source and self.target
         if scenario in {"fk-child-first-delete", "fk-parent-first-insert"}:
@@ -3585,6 +3650,8 @@ class Harness:
             self.run_repair_scenario("fk-selected-dependency-cycle-block")
         elif scenario == "repair-resume":
             self.run_repair_scenario("repair-resume")
+        elif scenario == "run-progress-least-privilege":
+            self.run_run_progress_least_privilege()
         elif scenario == "bounded-delete":
             self.run_repair_scenario("bounded-delete")
         elif scenario == "global-delete-limit":
