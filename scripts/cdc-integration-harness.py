@@ -67,6 +67,7 @@ SCENARIOS = (
     ScenarioSpec("target-connection-loss", True),
     ScenarioSpec("replace-divergent-pk", True),
     ScenarioSpec("missing-pk-two-parent-collision", True),
+    ScenarioSpec("reconciliation-owner-missing-guest", True),
     ScenarioSpec("row-conflict-rollback", True),
     ScenarioSpec("pre-state-drift", True),
     ScenarioSpec("coordinate-reuse", True),
@@ -2166,6 +2167,328 @@ class Harness:
         if progress not in ("", "NULL\terror"):
             raise HarnessError(f"failed replacement advanced checkpoint: {progress!r}")
 
+    def run_reconciliation_owner_missing_guest(self) -> None:
+        assert self.source and self.target
+        guest_hash = "50014a2e-6741-4d8a-ab8a-16333b1c1cebG0DA"
+        resume_pk = 77085483
+        guest_id = 78486038
+        session_id = 109017922
+        durable_run_id = "durable-guests-missing-pk"
+        owner_run_id = "repair-drift-owner"
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS guests; "
+                "CREATE TABLE guests ("
+                "guest_id BIGINT NOT NULL PRIMARY KEY, "
+                "guest_hash VARCHAR(64) NOT NULL, "
+                "payload VARCHAR(64) NOT NULL, "
+                "UNIQUE KEY uq_guests_guest_tuple (guest_id, guest_hash)"
+                ") ENGINE=InnoDB; "
+                "CREATE TABLE sessions ("
+                "session_id BIGINT NOT NULL PRIMARY KEY, "
+                "guest_id BIGINT NOT NULL, "
+                "guest_hash VARCHAR(64) NOT NULL, "
+                "payload VARCHAR(64) NOT NULL, "
+                "CONSTRAINT fk_sessions_guest FOREIGN KEY (guest_id, guest_hash) "
+                "REFERENCES guests (guest_id, guest_hash) ON DELETE RESTRICT ON UPDATE RESTRICT"
+                ") ENGINE=InnoDB;",
+            )
+        self.admin_sql(
+            self.source,
+            "INSERT INTO guests VALUES "
+            f"({resume_pk}, 'backfill-fence', 'already-backfilled'), "
+            f"({guest_id}, {sql_literal(guest_hash)}, 'source-parent');",
+        )
+        self.admin_sql(
+            self.target,
+            f"INSERT INTO guests VALUES ({resume_pk}, 'backfill-fence', 'already-backfilled');",
+        )
+        pre_stream = self.coordinate()
+        self.write_checkpoint(pre_stream)
+        source_parent = self.admin_query(
+            self.source,
+            f"SELECT guest_id,guest_hash,payload FROM guests WHERE guest_id={guest_id};",
+        ).strip()
+        target_parent = self.admin_query(
+            self.target,
+            f"SELECT guest_id,guest_hash,payload FROM guests WHERE guest_id={guest_id};",
+        ).strip()
+        if source_parent != f"{guest_id}\t{guest_hash}\tsource-parent" or target_parent:
+            raise HarnessError(
+                "FK parent backfill fixture was not staged: "
+                f"source_parent={source_parent!r} target_parent={target_parent!r}"
+            )
+        print(
+            f"reconciliation-owner-missing-guest_staged checkpoint={pre_stream.file}:{pre_stream.position} "
+            f"source_parent={guest_id}:{guest_hash} target_parent_absent=true"
+        )
+
+        process, _log = self.start_stream(pre_stream, label="reconciliation-owner-missing-guest")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise HarnessError(
+                    "FK parent backfill stream exited before child insert: "
+                    f"{self.process_output(process)}"
+                )
+            binlog_dump = self.admin_query(
+                self.source,
+                "SELECT COUNT(*) FROM information_schema.PROCESSLIST "
+                "WHERE USER='cdc_reader' AND COMMAND LIKE 'Binlog Dump%';",
+            ).strip()
+            if binlog_dump == "1":
+                break
+            time.sleep(0.2)
+        else:
+            raise HarnessError(
+                "FK parent backfill stream did not establish a source binlog connection: "
+                f"{self.process_output(process)}"
+            )
+
+        self.admin_sql(
+            self.source,
+            "INSERT INTO sessions VALUES "
+            f"({session_id}, {guest_id}, {sql_literal(guest_hash)}, 'source-child');",
+        )
+        child_stop = self.coordinate()
+        source_child = self.admin_query(
+            self.source,
+            f"SELECT session_id,guest_id,guest_hash,payload FROM sessions WHERE session_id={session_id};",
+        ).strip()
+        if source_child != f"{session_id}\t{guest_id}\t{guest_hash}\tsource-child":
+            raise HarnessError(f"FK child source fixture was not inserted: {source_child!r}")
+
+        result = self.finish_stream(process)
+        output = f"{result.stdout}\n{result.stderr}"
+        if result.returncode == 0 or "row conflict persisted for repair" not in output:
+            raise HarnessError(
+                "FK parent backfill stream did not stop at the real FK conflict: "
+                f"exit={result.returncode} output={output}"
+            )
+        target_parent_after = self.admin_query(
+            self.target,
+            f"SELECT guest_id,guest_hash,payload FROM guests WHERE guest_id={guest_id};",
+        ).strip()
+        target_child_after = self.admin_query(
+            self.target,
+            f"SELECT session_id,guest_id,guest_hash,payload FROM sessions WHERE session_id={session_id};",
+        ).strip()
+        if target_parent_after or target_child_after:
+            raise HarnessError(
+                "FK conflict retained target rows: "
+                f"parent={target_parent_after!r} child={target_child_after!r}"
+            )
+        checkpoint_after = self.checkpoint()
+        if (
+            checkpoint_after.get("source_file") != pre_stream.file
+            or int(checkpoint_after.get("source_position", 0)) != pre_stream.position
+        ):
+            raise HarnessError(
+                "FK conflict advanced checkpoint past child XID: "
+                f"before={pre_stream} after={checkpoint_after} child_stop={child_stop}"
+            )
+
+        evidence = self.admin_query(
+            self.target,
+            "SELECT source_identity,source_server_id,source_file,source_start_position,"
+            "source_end_position,schema_name,table_name,operation,source_primary_key_json,"
+            "COALESCE(duplicate_index,'NULL'),COALESCE(duplicate_owner_primary_key_json,'NULL'),"
+            "error_code,attempt_count,status,first_observed_at_ms,last_observed_at_ms,error_text "
+            "FROM cdc.row_conflicts "
+            f"WHERE source_identity={sql_literal(SOURCE_IDENTITY)} "
+            f"AND table_name='sessions' AND source_primary_key_json={sql_literal(json.dumps([str(session_id)]))};",
+        ).strip()
+        print(f"reconciliation-owner-missing-guest_observed evidence={evidence!r}")
+        fields = evidence.split("\t") if evidence else []
+        if len(fields) != 17:
+            raise HarnessError(f"FK conflict evidence missing or malformed: {evidence!r}")
+        expected_prefix = [
+            SOURCE_IDENTITY,
+            "101",
+            child_stop.file,
+            None,
+            str(child_stop.position),
+            APP_SCHEMA,
+            "sessions",
+            "insert",
+            json.dumps([str(session_id)]),
+            "NULL",
+            "NULL",
+            "1452",
+            "1",
+            "unresolved",
+        ]
+        actual_prefix = fields[:14]
+        if actual_prefix[0:3] != expected_prefix[0:3] or actual_prefix[4:] != expected_prefix[4:]:
+            raise HarnessError(
+                "FK conflict evidence mismatch: "
+                f"expected_prefix={expected_prefix!r} actual_prefix={actual_prefix!r}"
+            )
+        if not pre_stream.position < int(fields[3]) < int(fields[4]):
+            raise HarnessError(
+                "FK conflict evidence row event is outside child transaction: "
+                f"checkpoint={pre_stream.position} start={fields[3]} end={fields[4]}"
+            )
+        if not fields[14].isdigit() or fields[14] != fields[15] or int(fields[14]) <= 0:
+            raise HarnessError(f"FK conflict evidence timestamps are not exact: {fields[14:16]!r}")
+        error_text = fields[16]
+        for marker in (
+            "Cannot add or update a child row: a foreign key constraint fails",
+            "sessions",
+            "fk_sessions_guest",
+            "guests",
+            "guest_id",
+            "guest_hash",
+        ):
+            if marker not in error_text:
+                raise HarnessError(f"FK conflict error evidence missing {marker!r}: {error_text!r}")
+        conflict_key = sql_literal(json.dumps([str(session_id)]))
+        self.admin_sql(
+            self.target,
+            "UPDATE cdc.row_conflicts "
+            "SET status='resolved', repair_run_id='fixture-clear', "
+            "resolution_evidence='original blocker cleared' "
+            f"WHERE source_identity={sql_literal(SOURCE_IDENTITY)} "
+            f"AND table_name='sessions' AND source_primary_key_json={conflict_key};",
+        )
+        cleared_evidence = self.admin_query(
+            self.target,
+            "SELECT source_identity,source_server_id,source_file,source_start_position,"
+            "source_end_position,schema_name,table_name,operation,source_primary_key_json,"
+            "COALESCE(duplicate_index,'NULL'),COALESCE(duplicate_owner_primary_key_json,'NULL'),"
+            "error_code,attempt_count,status,first_observed_at_ms,last_observed_at_ms,error_text,"
+            "COALESCE(repair_run_id,'NULL'),COALESCE(resolution_evidence,'NULL') "
+            "FROM cdc.row_conflicts "
+            f"WHERE source_identity={sql_literal(SOURCE_IDENTITY)} "
+            f"AND table_name='sessions' AND source_primary_key_json={conflict_key};",
+        ).strip()
+        cleared_fields = cleared_evidence.split("\t") if cleared_evidence else []
+        if len(cleared_fields) != 19 or cleared_fields[11] != "1452" or cleared_fields[13] != "resolved":
+            raise HarnessError(f"original FK blocker was not represented as cleared: {cleared_evidence!r}")
+
+        self.admin_sql(
+            self.target,
+            "CREATE TABLE IF NOT EXISTS globalcomix.table_sync_runs ("
+            "run_id VARCHAR(128) NOT NULL PRIMARY KEY, "
+            "table_name VARCHAR(255) NOT NULL, "
+            "run_spec_json LONGTEXT NOT NULL, "
+            "last_primary_key_json TEXT NULL, "
+            "chunks BIGINT UNSIGNED NOT NULL DEFAULT 0, "
+            "rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0, "
+            "total_rows BIGINT UNSIGNED NULL, "
+            "inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0, "
+            "updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0, "
+            "extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0, "
+            "mode VARCHAR(32) NOT NULL, "
+            "status VARCHAR(16) NOT NULL, "
+            "last_error TEXT NULL, "
+            "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+            ") ENGINE=InnoDB; "
+            "INSERT INTO globalcomix.table_sync_runs "
+            "(run_id,table_name,run_spec_json,last_primary_key_json,chunks,rows_scanned,total_rows,"
+            "inserts_applied,updates_applied,extra_target_rows,mode,status,last_error) VALUES ("
+            f"{sql_literal(durable_run_id)},'guests',"
+            "'{\"scope\":\"durable-fixture\",\"table\":\"guests\","
+            "\"mode\":\"missing_primary_keys\"}',"
+            f"{sql_literal(json.dumps([str(resume_pk)]))},1,1,2,1,0,0,"
+            "'missing-primary-keys','error','original blocker cleared; resume required');",
+        )
+        durable_before = self.admin_query(
+            self.target,
+            "SELECT run_id,table_name,last_primary_key_json,chunks,rows_scanned,total_rows,"
+            "inserts_applied,updates_applied,extra_target_rows,mode,status,last_error "
+            "FROM globalcomix.table_sync_runs "
+            f"WHERE run_id={sql_literal(durable_run_id)};",
+        ).strip()
+        checkpoint_before_owner = self.checkpoint()
+        if checkpoint_before_owner.get("source_file") != pre_stream.file or int(
+            checkpoint_before_owner.get("source_position", 0)
+        ) != pre_stream.position:
+            raise HarnessError(f"stream checkpoint changed before reconciliation owner: {checkpoint_before_owner}")
+
+        owner_result = run(
+            self._repair_args(
+                self._repair_binary(),
+                tables=["guests"],
+                mode="apply",
+                max_deletes=0,
+                run_id=owner_run_id,
+                chunk_size=1,
+                progress_table="globalcomix.table_sync_runs",
+            ),
+            env={
+                **os.environ,
+                "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            },
+            timeout=180,
+            check=False,
+        )
+        if owner_result.returncode != 0:
+            raise HarnessError(
+                "reconciliation owner entrypoint failed before proving missing backfill orchestration: "
+                f"exit={owner_result.returncode} stdout={owner_result.stdout} stderr={owner_result.stderr}"
+            )
+
+        target_parent_after_owner = self.admin_query(
+            self.target,
+            f"SELECT guest_id,guest_hash,payload FROM guests WHERE guest_id={guest_id};",
+        ).strip()
+        durable_after = self.admin_query(
+            self.target,
+            "SELECT run_id,table_name,last_primary_key_json,chunks,rows_scanned,total_rows,"
+            "inserts_applied,updates_applied,extra_target_rows,mode,status,last_error "
+            "FROM globalcomix.table_sync_runs "
+            f"WHERE run_id={sql_literal(durable_run_id)};",
+        ).strip()
+        owner_runs = self.admin_query(
+            self.target,
+            "SELECT run_id,status,mode,COALESCE(last_primary_key_json,'NULL') "
+            "FROM globalcomix.table_sync_runs "
+            f"WHERE run_id LIKE {sql_literal(owner_run_id + '-%')} ORDER BY run_id;",
+        ).strip()
+        checkpoint_after_owner = self.checkpoint()
+        owner_evidence = self.admin_query(
+            self.target,
+            "SELECT source_identity,source_server_id,source_file,source_start_position,"
+            "source_end_position,schema_name,table_name,operation,source_primary_key_json,"
+            "COALESCE(duplicate_index,'NULL'),COALESCE(duplicate_owner_primary_key_json,'NULL'),"
+            "error_code,attempt_count,status,first_observed_at_ms,last_observed_at_ms,error_text,"
+            "COALESCE(repair_run_id,'NULL'),COALESCE(resolution_evidence,'NULL') "
+            "FROM cdc.row_conflicts "
+            f"WHERE source_identity={sql_literal(SOURCE_IDENTITY)} "
+            f"AND table_name='sessions' AND source_primary_key_json={conflict_key};",
+        ).strip()
+        if target_parent_after_owner != f"{guest_id}\t{guest_hash}\tsource-parent":
+            raise HarnessError(
+                "reconciliation owner did not repair the missing guest fixture: "
+                f"{target_parent_after_owner!r}"
+            )
+        if durable_after != durable_before:
+            raise HarnessError(
+                "durable guests run changed outside owner diagnosis: "
+                f"before={durable_before!r} after={durable_after!r}"
+            )
+        if owner_runs.count("\n") != 3 or any("\tcomplete\t" not in f"\t{line}\t" for line in owner_runs.splitlines()):
+            raise HarnessError(f"reconciliation owner did not complete its fresh child runs: {owner_runs!r}")
+        if checkpoint_after_owner.get("source_file") != pre_stream.file or int(
+            checkpoint_after_owner.get("source_position", 0)
+        ) != pre_stream.position:
+            raise HarnessError(f"reconciliation owner changed stream checkpoint: {checkpoint_after_owner}")
+        if owner_evidence != cleared_evidence:
+            raise HarnessError(
+                "reconciliation owner changed prior FK conflict evidence: "
+                f"before={cleared_evidence!r} after={owner_evidence!r}"
+            )
+        raise HarnessError(
+            "missing backfill orchestration: production repair-drift completed a fresh owner run "
+            f"{owner_run_id!r} instead of discovering/resuming durable guests missing-PK run "
+            f"{durable_run_id!r}; guest_inserted=true durable_run_unchanged=true "
+            "stream_checkpoint_unchanged=true prior_conflict_evidence_preserved=true"
+        )
+
     def run_row_conflict_rollback(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
@@ -2732,6 +3055,8 @@ class Harness:
             self.run_replace_divergent_pk()
         elif scenario == "missing-pk-two-parent-collision":
             self.run_missing_pk_two_parent_collision()
+        elif scenario == "reconciliation-owner-missing-guest":
+            self.run_reconciliation_owner_missing_guest()
         elif scenario == "row-conflict-rollback":
             self.run_row_conflict_rollback()
         elif scenario == "pre-state-drift":

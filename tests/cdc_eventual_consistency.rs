@@ -51,6 +51,24 @@ fn real_missing_pk_two_parent_collision_rolls_back_atomically() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_reconciliation_owner_should_resume_durable_missing_guest_run() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("reconciliation-owner-missing-guest")
+        .output()
+        .expect("run reconciliation owner missing guest harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_create_table_crash_restart_harness_smoke() {
     let output = Command::new("python3")
         .arg(harness_script())
