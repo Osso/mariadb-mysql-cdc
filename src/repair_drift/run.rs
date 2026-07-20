@@ -213,7 +213,13 @@ fn run_repair_phases(
         deleted_rows: 0,
         repaired_by_table: BTreeMap::new(),
     };
+    let verify_tables = required_verify_tables(plan, repair_tables);
     for (phase, order) in repair_phases(plan) {
+        let order = if phase == SyncPhase::Verify {
+            verify_tables.as_slice()
+        } else {
+            order
+        };
         for table_name in order {
             run_repair_phase_for_table(RepairPhaseRequest {
                 config,
@@ -244,6 +250,25 @@ fn repair_phases(plan: &crate::repair_drift::RepairPlan) -> [(SyncPhase, &[Strin
         (SyncPhase::UpdateDivergent, &plan.update_order),
         (SyncPhase::Verify, &plan.tables),
     ]
+}
+
+fn required_verify_tables(
+    plan: &crate::repair_drift::RepairPlan,
+    repair_tables: &RepairTableInputs,
+) -> Vec<String> {
+    let parentward_tables = plan.insert_order.iter().collect::<BTreeSet<_>>();
+    plan.tables
+        .iter()
+        .filter(|table_name| {
+            if parentward_tables.contains(table_name) {
+                return true;
+            }
+            repair_tables
+                .get(*table_name)
+                .is_some_and(|(source_count, target_count, _)| source_count <= target_count)
+        })
+        .cloned()
+        .collect()
 }
 
 fn initialize_conflict_store(
@@ -634,6 +659,49 @@ mod tests {
         );
         assert!(!ssl.skip_domain_validation());
         assert!(!ssl.accept_invalid_certs());
+    }
+
+    #[test]
+    fn verify_scope_keeps_delete_only_target_extras_but_not_source_missing_rows() {
+        let plan = crate::conflict_repair::RepairPlan {
+            run_id: "run".to_string(),
+            source_identity: "source".to_string(),
+            target_identity: "target".to_string(),
+            inventory_hash: "inventory".to_string(),
+            plan_hash: "plan".to_string(),
+            tables: vec![
+                "customers".to_string(),
+                "invoices".to_string(),
+                "orders".to_string(),
+            ],
+            delete_order: vec![
+                "orders".to_string(),
+                "invoices".to_string(),
+                "customers".to_string(),
+            ],
+            insert_order: vec!["customers".to_string()],
+            update_order: vec!["customers".to_string()],
+            max_deletes: 0,
+        };
+        let table = crate::table_sync::SyncTable {
+            name: "child".to_string(),
+            primary_key: vec!["id".to_string()],
+            columns: vec!["id".to_string()],
+        };
+        let repair_tables = [("customers", 1, 1), ("invoices", 0, 1), ("orders", 1, 0)]
+            .into_iter()
+            .map(|(name, source_count, target_count)| {
+                (
+                    name.to_string(),
+                    (source_count, target_count, table.clone()),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            required_verify_tables(&plan, &repair_tables),
+            vec!["customers", "invoices"]
+        );
     }
 
     #[test]
