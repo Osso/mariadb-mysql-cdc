@@ -102,6 +102,131 @@ impl SyncRunSelectionStore for ReclamationProgressStore {
     }
 }
 
+struct CleanupProgressStore {
+    events: RefCell<Vec<&'static str>>,
+    fail_acquire: bool,
+    fail_begin: bool,
+}
+
+impl CleanupProgressStore {
+    fn new(fail_acquire: bool, fail_begin: bool) -> Self {
+        Self {
+            events: RefCell::new(Vec::new()),
+            fail_acquire,
+            fail_begin,
+        }
+    }
+}
+
+impl SyncProgressStore for CleanupProgressStore {
+    fn ensure(&mut self) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+
+    fn load(&self, _run_id: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
+        Ok(None)
+    }
+
+    fn save(&mut self, _progress: &SyncTableProgress) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+
+    fn save_error(&mut self, _run_id: &str, _error: &TableSyncError) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+}
+
+impl SyncRunSelectionStore for CleanupProgressStore {
+    fn find_failed_run_candidates(
+        &self,
+        _table: &str,
+    ) -> Result<Vec<SyncRunCandidate>, TableSyncError> {
+        Ok(Vec::new())
+    }
+
+    fn acquire_selection_lock(
+        &self,
+        _table: &str,
+        _run_spec_json: &str,
+    ) -> Result<(), TableSyncError> {
+        self.events.borrow_mut().push("acquire");
+        if self.fail_acquire {
+            return Err(TableSyncError::Progress(
+                "GET_LOCK response lost after acquisition".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn release_selection_lock(
+        &self,
+        _table: &str,
+        _run_spec_json: &str,
+    ) -> Result<(), TableSyncError> {
+        self.events.borrow_mut().push("release");
+        Ok(())
+    }
+
+    fn begin_selection_transaction(&self) -> Result<(), TableSyncError> {
+        self.events.borrow_mut().push("begin");
+        if self.fail_begin {
+            return Err(TableSyncError::Progress(
+                "START TRANSACTION response lost after start".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit_selection_transaction(&self) -> Result<(), TableSyncError> {
+        self.events.borrow_mut().push("commit");
+        Ok(())
+    }
+
+    fn rollback_selection_transaction(&self) -> Result<(), TableSyncError> {
+        self.events.borrow_mut().push("rollback");
+        Ok(())
+    }
+}
+
+#[test]
+fn selection_lock_error_still_attempts_advisory_lock_release() {
+    let mut store = CleanupProgressStore::new(true, false);
+
+    let error = claim_compatible_failed_run(
+        &mut store,
+        "guests",
+        SyncPhase::InsertMissing,
+        "expected-spec",
+    )
+    .expect_err("ambiguous GET_LOCK outcome");
+
+    assert!(error.to_string().contains("GET_LOCK response lost"));
+    assert_eq!(store.events.borrow().as_slice(), &["acquire", "release"]);
+}
+
+#[test]
+fn transaction_start_error_still_rolls_back_and_releases_advisory_lock() {
+    let mut store = CleanupProgressStore::new(false, true);
+
+    let error = claim_compatible_failed_run(
+        &mut store,
+        "guests",
+        SyncPhase::InsertMissing,
+        "expected-spec",
+    )
+    .expect_err("ambiguous START TRANSACTION outcome");
+
+    assert!(
+        error
+            .to_string()
+            .contains("START TRANSACTION response lost")
+    );
+    assert_eq!(
+        store.events.borrow().as_slice(),
+        &["acquire", "begin", "rollback", "release"]
+    );
+}
+
 fn failed_run_progress(
     run_id: &str,
     spec: &str,

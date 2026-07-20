@@ -381,6 +381,45 @@ class Harness:
     def query(self, endpoint: Endpoint, sql: str, *, user: str, password: str) -> str:
         return self._mysql(endpoint, sql, user, password)
 
+    def wait_for_data_lock_wait(
+        self,
+        endpoint: Endpoint,
+        process: subprocess.Popen[str],
+        query_marker: str,
+        timeout: float = 30,
+    ) -> str:
+        evidence_sql = (
+            "SELECT waiting.PROCESSLIST_INFO, waiting.PROCESSLIST_STATE, "
+            "waits.REQUESTING_THREAD_ID, waits.BLOCKING_THREAD_ID "
+            "FROM performance_schema.data_lock_waits waits "
+            "JOIN performance_schema.threads waiting "
+            "ON waiting.THREAD_ID=waits.REQUESTING_THREAD_ID "
+            "WHERE waiting.PROCESSLIST_USER='cdc_stream' "
+            f"AND waiting.PROCESSLIST_INFO LIKE {sql_literal('%' + query_marker + '%')} "
+            "LIMIT 1;"
+        )
+        deadline = time.monotonic() + timeout
+        while True:
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                raise HarnessError(
+                    "blocked INSERT exited before MySQL exposed its lock wait: "
+                    f"exit={process.returncode} stdout={stdout!r} stderr={stderr!r}"
+                )
+            evidence = self.admin_query(endpoint, evidence_sql).strip()
+            if evidence:
+                fields = evidence.split("\t")
+                if len(fields) != 4 or "INSERT INTO" not in fields[0]:
+                    raise HarnessError(f"unexpected INSERT lock-wait evidence: {evidence!r}")
+                print(f"failed_run_claim_second_connection_blocked evidence={evidence!r}")
+                return evidence
+            if time.monotonic() >= deadline:
+                raise HarnessError(
+                    "MySQL never exposed the second connection's INSERT in data_lock_waits: "
+                    f"marker={query_marker!r}"
+                )
+            time.sleep(0.05)
+
     def start_query(
         self,
         endpoint: Endpoint,
@@ -2633,15 +2672,11 @@ class Harness:
                 user=TARGET_USER,
                 password=TARGET_PASSWORD,
             )
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and second.poll() is None:
-                time.sleep(0.05)
-            if second.poll() is not None:
-                stdout, stderr = second.communicate()
-                raise HarnessError(
-                    "second exact candidate committed before first claim transaction completed: "
-                    f"exit={second.returncode} stdout={stdout!r} stderr={stderr!r}"
-                )
+            self.wait_for_data_lock_wait(
+                self.target,
+                second,
+                second_run_id,
+            )
             self.release_barrier(barrier_dir, "failed-run-claim-revalidated")
             owner.wait(timeout=180)
             owner_output = self.process_output(owner)

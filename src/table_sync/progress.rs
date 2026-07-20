@@ -150,17 +150,23 @@ where
         return Ok(None);
     }
 
-    progress_store.acquire_selection_lock(table, expected_run_spec_json)?;
-    let mut transaction_started = false;
+    if let Err(error) = progress_store.acquire_selection_lock(table, expected_run_spec_json) {
+        return match progress_store.release_selection_lock(table, expected_run_spec_json) {
+            Ok(()) => Err(error),
+            Err(release_error) => Err(TableSyncError::Progress(format!(
+                "{error}; also failed to release compatible-run selection lock: {release_error}"
+            ))),
+        };
+    }
+    let mut transaction_may_be_active = true;
     let result = (|| {
         progress_store.begin_selection_transaction()?;
-        transaction_started = true;
         let candidates = progress_store.find_failed_run_candidates(table)?;
         if select_compatible_failed_run(&candidates, table, phase, expected_run_spec_json)?
             .is_none()
         {
             progress_store.commit_selection_transaction()?;
-            transaction_started = false;
+            transaction_may_be_active = false;
             return Ok(None);
         }
         let revalidated_candidates = progress_store.find_failed_run_candidates(table)?;
@@ -172,7 +178,7 @@ where
         )?
         else {
             progress_store.commit_selection_transaction()?;
-            transaction_started = false;
+            transaction_may_be_active = false;
             return Ok(None);
         };
         #[cfg(feature = "integration-failpoints")]
@@ -189,10 +195,10 @@ where
         progress.mark_running(candidate.mode);
         progress_store.save(&progress)?;
         progress_store.commit_selection_transaction()?;
-        transaction_started = false;
+        transaction_may_be_active = false;
         Ok(Some(candidate))
     })();
-    let result = if transaction_started {
+    let result = if transaction_may_be_active {
         match (result, progress_store.rollback_selection_transaction()) {
             (Ok(value), Ok(())) => Ok(value),
             (Ok(_), Err(rollback_error)) => Err(rollback_error),
