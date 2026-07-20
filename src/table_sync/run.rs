@@ -57,65 +57,103 @@ pub fn sync_table_with_progress(
     )
 }
 
-pub(crate) fn reconcile_exact_parent(
-    config: &crate::live::ApplyBinlogConfig,
-    request: &crate::live::ExactParentRecovery,
-) -> Result<(), TableSyncError> {
-    match request {
-        crate::live::ExactParentRecovery::SessionsGuest(request) => {
-            reconcile_exact_sessions_guest(config, request)
-        }
-        crate::live::ExactParentRecovery::HomeFeedCard(request) => {
-            reconcile_exact_home_feed_card(config, request)
-        }
+pub(crate) trait ExactParentReader {
+    fn read_guest_identity_rows(
+        &self,
+        guest_id: &str,
+        guest_hash: &str,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError>;
+
+    fn read_home_feed_card_rows_by_id(
+        &self,
+        card_id: &str,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError>;
+
+    fn read_home_feed_card_identity_rows(
+        &self,
+        card_id: &str,
+        card_type_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError>;
+}
+
+impl ExactParentReader for MySqlSyncReader {
+    fn read_guest_identity_rows(
+        &self,
+        guest_id: &str,
+        guest_hash: &str,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
+        self.read_guest_identity_rows(guest_id, guest_hash)
+    }
+
+    fn read_home_feed_card_rows_by_id(
+        &self,
+        card_id: &str,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
+        self.read_home_feed_card_rows_by_id(card_id)
+    }
+
+    fn read_home_feed_card_identity_rows(
+        &self,
+        card_id: &str,
+        card_type_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
+        self.read_home_feed_card_identity_rows(card_id, card_type_id, source_id)
     }
 }
 
-fn reconcile_exact_sessions_guest(
-    config: &crate::live::ApplyBinlogConfig,
-    request: &crate::live::SessionsGuestRecovery,
+pub(crate) fn reconcile_exact_parent(
+    request: &crate::live::ExactParentRecovery,
+    source: &impl ExactParentReader,
+    target: &impl ExactParentReader,
+    repair_target: &mut impl SyncRepairTarget,
 ) -> Result<(), TableSyncError> {
-    validate_sessions_guest_request(request)?;
-    let (source, target) = build_sessions_guest_recovery_readers(config)?;
-    let source_rows = source.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
-    let target_rows = target.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
-    let sync_config = exact_guest_sync_config(config, request);
-    let mut repair_target = connect_mysql_recovery_target(&sync_config)?;
-    reconcile_loaded_exact_parent(
-        &crate::live::ExactParentRecovery::SessionsGuest(request.clone()),
-        &source_rows,
-        &target_rows,
-        &mut repair_target,
-    )
+    let (source_rows, target_rows) = match request {
+        crate::live::ExactParentRecovery::SessionsGuest(request) => {
+            validate_sessions_guest_request(request)?;
+            let source_rows =
+                source.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
+            let target_rows =
+                target.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
+            (source_rows, target_rows)
+        }
+        crate::live::ExactParentRecovery::HomeFeedCard(request) => {
+            validate_home_feed_card_request(request)?;
+            let source_rows = source.read_home_feed_card_rows_by_id(&request.card_id)?;
+            let source_row = require_exact_home_feed_card_row("source", &source_rows, request)?;
+            let card_type_id =
+                required_row_value(source_row, "card_type_id", "source home feed card")?;
+            let source_id = source_row
+                .values
+                .get("source_id")
+                .and_then(Option::as_deref);
+            let target_rows = target.read_home_feed_card_identity_rows(
+                &request.card_id,
+                card_type_id,
+                source_id,
+            )?;
+            (source_rows, target_rows)
+        }
+    };
+    reconcile_loaded_exact_parent(request, &source_rows, &target_rows, repair_target)
 }
 
-fn reconcile_exact_home_feed_card(
+pub(crate) fn reconcile_exact_parent_live(
     config: &crate::live::ApplyBinlogConfig,
-    request: &crate::live::HomeFeedCardRecovery,
+    request: &crate::live::ExactParentRecovery,
 ) -> Result<(), TableSyncError> {
-    validate_home_feed_card_request(request)?;
+    let sync_config = match request {
+        crate::live::ExactParentRecovery::SessionsGuest(request) => {
+            exact_guest_sync_config(config, request)
+        }
+        crate::live::ExactParentRecovery::HomeFeedCard(request) => {
+            exact_home_feed_card_sync_config(config, request)
+        }
+    };
     let (source, target) = build_sessions_guest_recovery_readers(config)?;
-    let source_rows = source.read_home_feed_card_rows_by_id(&request.card_id)?;
-    let source_row = require_exact_home_feed_card_row("source", &source_rows, request)?;
-    validate_parent_temporal_order(
-        recovery_create_time_epoch(source_row, "home feed card")?,
-        request.child_event_timestamp,
-    )?;
-    let card_type_id = required_row_value(source_row, "card_type_id", "source home feed card")?;
-    let source_id = source_row
-        .values
-        .get("source_id")
-        .and_then(Option::as_deref);
-    let target_rows =
-        target.read_home_feed_card_identity_rows(&request.card_id, card_type_id, source_id)?;
-    let sync_config = exact_home_feed_card_sync_config(config, request);
     let mut repair_target = connect_mysql_recovery_target(&sync_config)?;
-    reconcile_loaded_exact_parent(
-        &crate::live::ExactParentRecovery::HomeFeedCard(request.clone()),
-        &source_rows,
-        &target_rows,
-        &mut repair_target,
-    )
+    reconcile_exact_parent(request, &source, &target, &mut repair_target)
 }
 
 pub(crate) fn reconcile_loaded_exact_parent(

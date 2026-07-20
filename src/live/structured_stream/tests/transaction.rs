@@ -1143,6 +1143,36 @@ struct RecordingExactParentTarget {
     inserted: Vec<crate::snapshot::SnapshotRow>,
 }
 
+struct FixtureExactParentReader {
+    rows: Vec<crate::snapshot::SnapshotRow>,
+}
+
+impl crate::table_sync::ExactParentReader for FixtureExactParentReader {
+    fn read_guest_identity_rows(
+        &self,
+        _guest_id: &str,
+        _guest_hash: &str,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, crate::table_sync::TableSyncError> {
+        panic!("home feed recovery must not query guests")
+    }
+
+    fn read_home_feed_card_rows_by_id(
+        &self,
+        _card_id: &str,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, crate::table_sync::TableSyncError> {
+        Ok(self.rows.clone())
+    }
+
+    fn read_home_feed_card_identity_rows(
+        &self,
+        _card_id: &str,
+        _card_type_id: &str,
+        _source_id: Option<&str>,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, crate::table_sync::TableSyncError> {
+        Ok(self.rows.clone())
+    }
+}
+
 impl crate::table_sync::SyncRepairTarget for RecordingExactParentTarget {
     fn insert_row(
         &mut self,
@@ -1260,14 +1290,13 @@ fn exact_home_feed_event_recovers_parent_then_replays_child_and_xid_checkpoint()
         .expect("exact event must dispatch parent recovery");
 
     let source_parent = exact_home_feed_card_parent_row();
+    let source = FixtureExactParentReader {
+        rows: vec![source_parent.clone()],
+    };
+    let target = FixtureExactParentReader { rows: Vec::new() };
     let mut repair_target = RecordingExactParentTarget::default();
-    crate::table_sync::reconcile_loaded_exact_parent(
-        recovery,
-        std::slice::from_ref(&source_parent),
-        &[],
-        &mut repair_target,
-    )
-    .expect("exact parent reconciliation");
+    crate::table_sync::reconcile_exact_parent(recovery, &source, &target, &mut repair_target)
+        .expect("exact parent reconciliation");
     let mut canonical_parent = source_parent;
     canonical_parent
         .values
