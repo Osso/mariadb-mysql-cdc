@@ -244,8 +244,28 @@ fn run_repair_phase_for_table(request: RepairPhaseRequest<'_>) -> Result<(), Rep
     else {
         return Ok(());
     };
-    let phase_config = phase_config_for_request(&request, table);
-    let phase_report = run_sync_phase(&phase_config, request.phase, request.table_name)?;
+    let mut phase_config = phase_config_for_request(&request, table);
+    let candidate =
+        table_sync::find_compatible_failed_run(&phase_config, request.phase, request.table_name)
+            .map_err(|error| {
+                RepairDriftError::Repair(format!(
+                    "{} {:?}: {error}",
+                    request.table_name, request.phase
+                ))
+            })?;
+    let run_spec_json = candidate
+        .as_ref()
+        .map(|candidate| candidate.run_spec_json.clone());
+    if let Some(candidate) = candidate {
+        phase_config.run_id = candidate.run_id;
+        phase_config.mode = SyncMode::MissingPrimaryKeys;
+    }
+    let phase_report = run_sync_phase(
+        &phase_config,
+        request.phase,
+        run_spec_json.as_deref(),
+        request.table_name,
+    )?;
     complete_phase(request, source_count, target_count, phase_report)
 }
 
@@ -342,9 +362,10 @@ fn record_phase(
 fn run_sync_phase(
     config: &SyncTableConfig,
     phase: SyncPhase,
+    run_spec_json: Option<&str>,
     table_name: &str,
 ) -> Result<table_sync::SyncTableReport, RepairDriftError> {
-    table_sync::run_sync_table_phase(config, phase)
+    table_sync::run_sync_table_phase_with_run_spec(config, phase, run_spec_json)
         .map_err(|error| RepairDriftError::Repair(format!("{table_name} {phase:?}: {error}")))
 }
 

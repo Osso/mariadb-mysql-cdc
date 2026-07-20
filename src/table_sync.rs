@@ -31,17 +31,20 @@ pub(crate) use model::{
 };
 #[cfg(test)]
 pub(crate) use mysql::build_sync_select_sql;
+pub(crate) use progress::{SyncRunCandidate, select_compatible_failed_run};
 #[cfg(test)]
 pub(crate) use range::build_run_spec_json;
 pub(crate) use range::{
     complete_sync_progress, finish_sync_run, persist_sync_run_error, release_on_load_error,
-    validate_resumable_progress,
+    sync_table_with_progress_range_phase_with_run_spec, validate_resumable_progress,
 };
 #[cfg(test)]
 pub(crate) use recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
 pub(crate) use repair::{
     apply_recent_update_chunk, count_extra_target_rows, ensure_delete_allowed, repair_chunk,
 };
-pub(crate) use run::should_record_sync_run_error;
 #[cfg(test)]
 pub(crate) use run::{build_sync_run_scope, retry_sync_table_operation};
+pub(crate) use run::{
+    find_compatible_failed_run, run_sync_table_phase_with_run_spec, should_record_sync_run_error,
+};

@@ -2,6 +2,112 @@ use super::tests_support::*;
 use super::*;
 
 #[test]
+fn selects_only_one_compatible_failed_missing_primary_keys_run() {
+    let candidates = vec![
+        SyncRunCandidate::new(
+            "complete",
+            "guests",
+            r#"{"table":"guests","mode":"missing_primary_keys"}"#,
+            SyncMode::MissingPrimaryKeys,
+            progress::SyncProgressStatus::Complete,
+        ),
+        SyncRunCandidate::new(
+            "wrong-table",
+            "sessions",
+            r#"{"table":"sessions","mode":"missing_primary_keys"}"#,
+            SyncMode::MissingPrimaryKeys,
+            progress::SyncProgressStatus::Error,
+        ),
+        SyncRunCandidate::new(
+            "wrong-spec",
+            "guests",
+            r#"{"table":"sessions","mode":"missing_primary_keys"}"#,
+            SyncMode::MissingPrimaryKeys,
+            progress::SyncProgressStatus::Error,
+        ),
+        SyncRunCandidate::new(
+            "compatible",
+            "guests",
+            r#"{"scope":"durable-fixture","table":"guests","mode":"missing_primary_keys"}"#,
+            SyncMode::MissingPrimaryKeys,
+            progress::SyncProgressStatus::Error,
+        ),
+    ];
+
+    let selected = select_compatible_failed_run(&candidates, "guests", SyncPhase::InsertMissing)
+        .expect("candidate selection")
+        .expect("compatible failed run");
+
+    assert_eq!(selected.run_id, "compatible");
+    assert_eq!(
+        selected.run_spec_json,
+        r#"{"scope":"durable-fixture","table":"guests","mode":"missing_primary_keys"}"#
+    );
+}
+
+#[test]
+fn multiple_compatible_failed_runs_fail_closed() {
+    let candidates = vec![
+        SyncRunCandidate::new(
+            "run-a",
+            "guests",
+            r#"{"table":"guests","mode":"missing_primary_keys"}"#,
+            SyncMode::MissingPrimaryKeys,
+            progress::SyncProgressStatus::Error,
+        ),
+        SyncRunCandidate::new(
+            "run-b",
+            "guests",
+            r#"{"table":"guests","mode":"missing_primary_keys"}"#,
+            SyncMode::MissingPrimaryKeys,
+            progress::SyncProgressStatus::Error,
+        ),
+    ];
+
+    let error = select_compatible_failed_run(&candidates, "guests", SyncPhase::InsertMissing)
+        .expect_err("ambiguous candidates");
+
+    assert_eq!(
+        error.to_string(),
+        "sync progress failed: multiple compatible failed missing-primary-keys runs exist for table `guests`"
+    );
+}
+
+#[test]
+fn candidate_selection_is_disabled_outside_insert_missing_phase() {
+    let candidates = vec![SyncRunCandidate::new(
+        "compatible",
+        "guests",
+        r#"{"table":"guests","mode":"missing_primary_keys"}"#,
+        SyncMode::MissingPrimaryKeys,
+        progress::SyncProgressStatus::Error,
+    )];
+
+    assert_eq!(
+        select_compatible_failed_run(&candidates, "guests", SyncPhase::Verify)
+            .expect("phase selection"),
+        None
+    );
+}
+
+#[test]
+fn malformed_run_spec_is_incompatible() {
+    let candidates = vec![SyncRunCandidate::new(
+        "malformed",
+        "guests",
+        "not-json",
+        SyncMode::MissingPrimaryKeys,
+        progress::SyncProgressStatus::Error,
+    )];
+
+    assert_eq!(
+        select_compatible_failed_run(&candidates, "guests", SyncPhase::InsertMissing)
+            .expect("candidate selection"),
+        None
+    );
+}
+
+#[test]
 fn resumes_from_saved_table_progress_and_saves_each_chunk() {
     let source = FakeReader::new(vec![row("1", "old"), row("2", "bravo"), row("3", "coda")]);
     let target = FakeReader::new(vec![row("2", "bravo"), row("3", "coda")]);

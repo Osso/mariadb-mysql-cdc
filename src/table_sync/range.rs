@@ -29,8 +29,31 @@ pub fn sync_table_with_progress_range_phase(
     progress_store: &mut impl SyncProgressStore,
     phase: SyncPhase,
 ) -> Result<SyncTableReport, TableSyncError> {
+    sync_table_with_progress_range_phase_with_run_spec(
+        table,
+        options,
+        source,
+        target,
+        repair_target,
+        progress_store,
+        phase,
+        None,
+    )
+}
+
+pub(crate) fn sync_table_with_progress_range_phase_with_run_spec(
+    table: &SyncTable,
+    options: SyncRunOptions,
+    source: &impl SyncTableReader,
+    target: &impl SyncTableReader,
+    repair_target: &mut impl SyncRepairTarget,
+    progress_store: &mut impl SyncProgressStore,
+    phase: SyncPhase,
+    run_spec_json: Option<&str>,
+) -> Result<SyncTableReport, TableSyncError> {
     let run_id = options.run_id.clone();
-    let (progress, report, start_after) = prepare_range_sync(table, &options, progress_store)?;
+    let (progress, report, start_after) =
+        prepare_range_sync(table, &options, progress_store, run_spec_json)?;
     let result = execute_range_sync(RangeExecution {
         table,
         options: &options,
@@ -51,10 +74,17 @@ fn prepare_range_sync(
     table: &SyncTable,
     options: &SyncRunOptions,
     progress_store: &mut impl SyncProgressStore,
+    run_spec_json: Option<&str>,
 ) -> Result<(SyncTableProgress, SyncTableReport, Option<Vec<String>>), TableSyncError> {
     validate_sync_table(table, options.chunk_size)?;
     validate_sync_range(table, options.start_after.as_ref(), options.end_at.as_ref())?;
-    let progress = load_range_sync_progress(&options.run_id, table, options, progress_store)?;
+    let progress = load_range_sync_progress(
+        &options.run_id,
+        table,
+        options,
+        progress_store,
+        run_spec_json,
+    )?;
     let report = progress.report();
     let start_after = progress
         .last_primary_key
@@ -162,16 +192,20 @@ fn load_range_sync_progress(
     table: &SyncTable,
     options: &SyncRunOptions,
     progress_store: &mut impl SyncProgressStore,
+    run_spec_override: Option<&str>,
 ) -> Result<SyncTableProgress, TableSyncError> {
-    let run_spec_json = build_run_spec_json(
-        &options.run_scope,
-        table,
-        options.chunk_size,
-        options.mode,
-        &options.start_after,
-        &options.end_at,
-        options.max_deletes,
-    )?;
+    let run_spec_json = match run_spec_override {
+        Some(run_spec_json) => run_spec_json.to_string(),
+        None => build_run_spec_json(
+            &options.run_scope,
+            table,
+            options.chunk_size,
+            options.mode,
+            &options.start_after,
+            &options.end_at,
+            options.max_deletes,
+        )?,
+    };
     load_sync_progress(run_id, &run_spec_json, table, options.mode, progress_store)
 }
 

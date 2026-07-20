@@ -1,4 +1,4 @@
-use super::{SyncMode, SyncTableReport, TableSyncError};
+use super::{SyncMode, SyncPhase, SyncTableReport, TableSyncError};
 use crate::live::TargetMySqlConfig;
 use crate::mysql_client::PersistentProgressWriter;
 use crate::mysql_support::{
@@ -28,6 +28,76 @@ pub enum SyncProgressStatus {
     Running,
     Complete,
     Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyncRunCandidate {
+    pub(crate) run_id: String,
+    pub(crate) table: String,
+    pub(crate) run_spec_json: String,
+    pub(crate) mode: SyncMode,
+    pub(crate) status: SyncProgressStatus,
+}
+
+impl SyncRunCandidate {
+    #[cfg(test)]
+    pub(crate) fn new(
+        run_id: &str,
+        table: &str,
+        run_spec_json: &str,
+        mode: SyncMode,
+        status: SyncProgressStatus,
+    ) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            table: table.to_string(),
+            run_spec_json: run_spec_json.to_string(),
+            mode,
+            status,
+        }
+    }
+}
+
+pub(crate) fn select_compatible_failed_run(
+    candidates: &[SyncRunCandidate],
+    table: &str,
+    phase: SyncPhase,
+) -> Result<Option<SyncRunCandidate>, TableSyncError> {
+    if phase != SyncPhase::InsertMissing {
+        return Ok(None);
+    }
+
+    let compatible = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.table == table
+                && candidate.mode == SyncMode::MissingPrimaryKeys
+                && candidate.status == SyncProgressStatus::Error
+                && compatible_run_spec_json(&candidate.run_spec_json, table)
+        })
+        .collect::<Vec<_>>();
+    match compatible.as_slice() {
+        [] => Ok(None),
+        [candidate] => Ok(Some((*candidate).clone())),
+        _ => Err(TableSyncError::Progress(format!(
+            "multiple compatible failed missing-primary-keys runs exist for table `{table}`"
+        ))),
+    }
+}
+
+fn compatible_run_spec_json(run_spec_json: &str, table: &str) -> bool {
+    let Ok(spec) = serde_json::from_str::<serde_json::Value>(run_spec_json) else {
+        return false;
+    };
+    let table_matches = match spec.get("table") {
+        Some(serde_json::Value::String(name)) => name == table,
+        Some(serde_json::Value::Object(table_spec)) => {
+            table_spec.get("name").and_then(serde_json::Value::as_str) == Some(table)
+        }
+        _ => false,
+    };
+    table_matches
+        && spec.get("mode").and_then(serde_json::Value::as_str) == Some("missing_primary_keys")
 }
 
 pub trait SyncProgressStore {
@@ -137,6 +207,16 @@ impl MySqlSyncRunProgressStore {
         Self {
             inner: MySqlSyncProgressStore::new(target, table),
         }
+    }
+
+    pub(crate) fn find_failed_run_candidates(
+        &self,
+        table: &str,
+    ) -> Result<Vec<SyncRunCandidate>, TableSyncError> {
+        let output = self
+            .inner
+            .query(build_failed_run_candidates_sql(&self.inner.table, table))?;
+        parse_run_candidates(&output)
     }
 }
 
@@ -448,6 +528,14 @@ fn build_sync_run_select_sql(progress_table: &str, run_id: &str) -> String {
     )
 }
 
+fn build_failed_run_candidates_sql(progress_table: &str, table: &str) -> String {
+    format!(
+        "SELECT run_id, table_name, run_spec_json, mode, status FROM {} WHERE table_name = {} AND status = 'error' ORDER BY run_id",
+        quote_identifier_path(progress_table),
+        quote_sql_literal(table)
+    )
+}
+
 pub(crate) fn build_sync_run_upsert_sql(
     progress_table: &str,
     progress: &SyncTableProgress,
@@ -495,6 +583,29 @@ fn build_sync_run_error_sql(progress_table: &str, run_id: &str, error: &TableSyn
         quote_sql_literal(&error.to_string()),
         quote_sql_literal(run_id)
     )
+}
+
+fn parse_run_candidates(output: &str) -> Result<Vec<SyncRunCandidate>, TableSyncError> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() != 5 {
+                return Err(TableSyncError::Progress(format!(
+                    "run candidate row has {} fields, expected 5",
+                    fields.len()
+                )));
+            }
+            Ok(SyncRunCandidate {
+                run_id: fields[0].to_string(),
+                table: fields[1].to_string(),
+                run_spec_json: fields[2].to_string(),
+                mode: SyncMode::parse(fields[3])?,
+                status: SyncProgressStatus::parse(fields[4])?,
+            })
+        })
+        .collect()
 }
 
 fn parse_sync_run_row(
@@ -569,7 +680,7 @@ impl SyncMode {
         match value {
             "dry-run" => Ok(Self::DryRun),
             "apply" => Ok(Self::Apply),
-            "missing-pks" => Ok(Self::MissingPrimaryKeys),
+            "missing-pks" | "missing-primary-keys" => Ok(Self::MissingPrimaryKeys),
             other => Err(TableSyncError::Progress(format!(
                 "unknown sync mode in progress: {other}"
             ))),

@@ -124,6 +124,14 @@ pub fn run_sync_table_phase(
     config: &SyncTableConfig,
     phase: SyncPhase,
 ) -> Result<SyncTableReport, TableSyncError> {
+    run_sync_table_phase_with_run_spec(config, phase, None)
+}
+
+pub(crate) fn run_sync_table_phase_with_run_spec(
+    config: &SyncTableConfig,
+    phase: SyncPhase,
+    run_spec_json: Option<&str>,
+) -> Result<SyncTableReport, TableSyncError> {
     validate_sync_table_config(config)?;
     let source = MySqlSyncReader::new(config.source.clone());
     let target = MySqlSyncReader::new_with_target(target_connection_config(config), &config.target)
@@ -140,6 +148,7 @@ pub fn run_sync_table_phase(
         &mut repair_target,
         &mut progress_store,
         phase,
+        run_spec_json,
     )
 }
 
@@ -185,6 +194,7 @@ fn run_sync_table_with_targets_phase(
     repair_target: &mut impl SyncRepairTarget,
     progress_store: &mut impl SyncProgressStore,
     phase: SyncPhase,
+    run_spec_json: Option<&str>,
 ) -> Result<SyncTableReport, TableSyncError> {
     if phase == SyncPhase::Verify && config.updated_since.is_some() {
         return Err(TableSyncError::InvalidTable(
@@ -199,7 +209,15 @@ fn run_sync_table_with_targets_phase(
             progress_store,
             updated_since.clone(),
         ),
-        None => run_range_sync(config, source, target, repair_target, progress_store, phase),
+        None => run_range_sync(
+            config,
+            source,
+            target,
+            repair_target,
+            progress_store,
+            phase,
+            run_spec_json,
+        ),
     }
 }
 
@@ -232,8 +250,9 @@ fn run_range_sync(
     repair_target: &mut impl SyncRepairTarget,
     progress_store: &mut impl SyncProgressStore,
     phase: SyncPhase,
+    run_spec_json: Option<&str>,
 ) -> Result<SyncTableReport, TableSyncError> {
-    sync_table_with_progress_range_phase(
+    sync_table_with_progress_range_phase_with_run_spec(
         &config.table,
         SyncRunOptions {
             run_id: config.run_id.clone(),
@@ -249,5 +268,23 @@ fn run_range_sync(
         repair_target,
         progress_store,
         phase,
+        run_spec_json,
     )
+}
+
+pub(crate) fn find_compatible_failed_run(
+    config: &SyncTableConfig,
+    phase: SyncPhase,
+    table: &str,
+) -> Result<Option<SyncRunCandidate>, TableSyncError> {
+    if config.mode != SyncMode::Apply || phase != SyncPhase::InsertMissing {
+        return Ok(None);
+    }
+    let mut progress_store = progress::MySqlSyncRunProgressStore::new(
+        config.target.clone(),
+        config.progress_table.clone(),
+    );
+    progress_store.ensure()?;
+    let candidates = progress_store.find_failed_run_candidates(table)?;
+    select_compatible_failed_run(&candidates, table, phase)
 }
