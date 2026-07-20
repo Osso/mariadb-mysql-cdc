@@ -33,16 +33,15 @@ are resolved only after verified equality.
       immutable run specification.
 - [x] Provide a durable conflict schema/SQL contract and resolve rows only after
       verified source/target equality.
-- [ ] Complete the FK-aware phased repair path with canonical child/parent
-      columns, cross-engine rule normalization, filtered dependency-closure
-      inventory/plan hashes, cumulative delete preflight across the full
-      childward scope, child-first deletes, parent-first inserts, resumable
-      per-operation state, selected-scope cycle/schema-mismatch blocking,
-      PK-window bounds, and a non-mutating Verify equality phase over the union
-      of both directional scopes. The planner computes the union, but current
-      orchestration supplies phase inputs only from the parentward
-      InsertMissing/UpdateDivergent scope; delete-only descendants are skipped
-      by DeleteExtras, cumulative preflight, and Verify.
+- [ ] Complete the remaining FK-aware phased repair work: canonical
+      child/parent columns, cross-engine rule normalization, resumable
+      per-operation state, and selected-scope cycle/schema-mismatch blocking.
+- [x] Build read-only and repair inputs from the full `plan.tables` union. Cumulative
+      DeleteExtras preflight and child-first deletes cover every childward table;
+      parentward inserts/updates retain their directional scope. Verify rereads
+      the full union, while source-missing delete-only descendants remain outside
+      selected-root equality so a parent missing-PK recovery is not blocked by a
+      child conflict that belongs to the forward stream.
 
 ## Remaining boundaries
 

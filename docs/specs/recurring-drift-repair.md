@@ -41,20 +41,21 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
       and reject changed plans when reusing an interrupted run.
 - [x] Cycles within either required directional phase scope and FK inventory/schema
       mismatch block before target mutation; disconnected cycles are ignored.
-- [ ] In apply mode, cumulative DeleteExtras preflight must sum extras across every
-      table in the childward scope before target mutation. Current orchestration
-      preflights only tables present in the parentward execution inputs.
+- [x] In apply mode, cumulative DeleteExtras preflight sums extras across every
+      table in the childward scope before target mutation. Read-only and repair
+      inputs come from the full `plan.tables` union, so child-only descendants
+      are deleted child-first.
 - [x] `--start-after`/`--end-at` bound the selected PK window; apply mode always
       carries an explicit `--max-deletes` value.
 - [x] Unresolved conflicts resolve only after verified equality, with run/evidence
       fields, and the real harness proves zero unresolved debt for scope.
 - [x] Secondary-unique collisions remain primary-key scoped and do not mutate the
       conflicting owner row.
-- [ ] Execute DeleteExtras, InsertMissing, UpdateDivergent, then a non-mutating
-      Verify phase over the union of both directional scopes. The planner computes
-      that union, but current orchestration supplies phase inputs only from the
-      parentward InsertMissing/UpdateDivergent scope; delete-only descendants are
-      skipped by DeleteExtras, cumulative preflight, and Verify.
+- [x] Execute DeleteExtras, InsertMissing, UpdateDivergent, then a non-mutating
+      Verify reread over the full `plan.tables` union. Parentward inserts/updates
+      retain their directional scope; source-missing delete-only descendants
+      remain outside selected-root equality so a parent missing-PK recovery is not
+      blocked by a child conflict that belongs to the forward stream.
 - [x] Individual MariaDB 11.4 → MySQL 8.0 Docker scenarios pass.
 
 Remaining eventual-consistency gates are recurring scheduling from unresolved
