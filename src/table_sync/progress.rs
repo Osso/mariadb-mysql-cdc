@@ -627,18 +627,35 @@ pub(crate) fn build_create_progress_schema_sql(table: &str) -> Option<String> {
     ))
 }
 
-const SYNC_RUN_COLUMN_NAMES: &str = "'run_id','table_name','run_spec_json',\
-'last_primary_key_json','chunks','rows_scanned','total_rows','inserts_applied',\
-'updates_applied','extra_target_rows','mode','status','last_error','created_at','updated_at'";
 const SYNC_RUN_COLUMN_COUNT: &str = "15";
+const SYNC_RUN_COLUMN_CONTRACTS: &[&str] = &[
+    "(column_name='run_id' AND column_type='varchar(128)' AND is_nullable='NO')",
+    "(column_name='table_name' AND column_type='varchar(255)' AND is_nullable='NO')",
+    "(column_name='run_spec_json' AND column_type='longtext' AND is_nullable='NO')",
+    "(column_name='last_primary_key_json' AND column_type='text' AND is_nullable='YES')",
+    "(column_name='chunks' AND column_type='bigint unsigned' AND is_nullable='NO')",
+    "(column_name='rows_scanned' AND column_type='bigint unsigned' AND is_nullable='NO')",
+    "(column_name='total_rows' AND column_type='bigint unsigned' AND is_nullable='YES')",
+    "(column_name='inserts_applied' AND column_type='bigint unsigned' AND is_nullable='NO')",
+    "(column_name='updates_applied' AND column_type='bigint unsigned' AND is_nullable='NO')",
+    "(column_name='extra_target_rows' AND column_type='bigint unsigned' AND is_nullable='NO')",
+    "(column_name='mode' AND column_type='varchar(16)' AND is_nullable='NO')",
+    "(column_name='status' AND column_type='varchar(16)' AND is_nullable='NO')",
+    "(column_name='last_error' AND column_type='text' AND is_nullable='YES')",
+    "(column_name='created_at' AND column_type='timestamp' AND is_nullable='NO' AND column_default='CURRENT_TIMESTAMP')",
+    "(column_name='updated_at' AND column_type='timestamp' AND is_nullable='NO' AND column_default='CURRENT_TIMESTAMP' AND extra LIKE '%on update CURRENT_TIMESTAMP%')",
+];
 
 fn build_sync_run_schema_query(default_schema: &str, progress_table: &str) -> String {
     let (schema, table) = qualified_table_parts(default_schema, progress_table);
     let schema = quote_sql_literal(&schema);
     let table = quote_sql_literal(&table);
+    let column_contracts = SYNC_RUN_COLUMN_CONTRACTS.join(" OR ");
     format!(
         "SELECT (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = {schema} AND table_name = {table}),\
-(SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = {schema} AND table_name = {table} AND column_name IN ({SYNC_RUN_COLUMN_NAMES})),\
+(SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = {schema} AND table_name = {table}),\
+(SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = {schema} AND table_name = {table} AND ({column_contracts})),\
+(SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = {schema} AND table_name = {table} AND index_name = 'PRIMARY'),\
 (SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = {schema} AND table_name = {table} AND index_name = 'PRIMARY' AND column_name = 'run_id' AND seq_in_index = 1)"
     )
 }
@@ -648,11 +665,11 @@ fn parse_sync_run_schema_inventory<'a>(
     output: &'a str,
 ) -> Result<Vec<&'a str>, TableSyncError> {
     let fields = output.trim().split('\t').collect::<Vec<_>>();
-    if fields.len() == 3 {
+    if fields.len() == 5 {
         return Ok(fields);
     }
     Err(TableSyncError::Progress(format!(
-        "progress table `{table}` schema inventory returned {} fields, expected 3",
+        "progress table `{table}` schema inventory returned {} fields, expected 5",
         fields.len()
     )))
 }
@@ -670,7 +687,7 @@ fn sync_run_table_exists(table: &str, output: &str) -> Result<bool, TableSyncErr
 
 fn require_sync_run_schema(table: &str, output: &str) -> Result<(), TableSyncError> {
     let fields = parse_sync_run_schema_inventory(table, output)?;
-    if fields == ["1", SYNC_RUN_COLUMN_COUNT, "1"] {
+    if fields == ["1", SYNC_RUN_COLUMN_COUNT, SYNC_RUN_COLUMN_COUNT, "1", "1"] {
         return Ok(());
     }
     Err(TableSyncError::Progress(format!(
@@ -985,18 +1002,25 @@ mod tests {
         assert!(sql.contains("table_schema = 'cdc'"));
         assert!(sql.contains("table_name = 'table_sync_progress'"));
         assert!(sql.contains("information_schema.columns"));
-        assert!(sql.contains("run_id"));
-        assert!(sql.contains("updated_at"));
+        assert!(sql.contains("column_type='varchar(128)'"));
+        assert!(sql.contains("column_type='bigint unsigned'"));
+        assert!(sql.contains("is_nullable='YES'"));
+        assert!(sql.contains("extra LIKE '%on update CURRENT_TIMESTAMP%'"));
         assert!(sql.contains("information_schema.statistics"));
         assert!(sql.contains("index_name = 'PRIMARY'"));
     }
 
     #[test]
     fn existing_run_table_requires_all_columns_and_run_id_primary_key() {
-        require_sync_run_schema("cdc.table_sync_runs", "1\t15\t1")
+        require_sync_run_schema("cdc.table_sync_runs", "1\t15\t15\t1\t1")
             .expect("complete run-scoped schema");
 
-        for malformed in ["1\t14\t1", "1\t15\t0"] {
+        for malformed in [
+            "1\t14\t14\t1\t1",
+            "1\t15\t14\t1\t1",
+            "1\t15\t15\t0\t0",
+            "1\t15\t15\t2\t1",
+        ] {
             let error = require_sync_run_schema("cdc.table_sync_runs", malformed)
                 .expect_err("malformed existing table must fail");
             assert!(
