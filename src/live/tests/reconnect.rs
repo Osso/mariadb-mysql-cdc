@@ -268,6 +268,48 @@ fn recovers_exact_sessions_guest_after_persisted_conflict_before_unchanged_check
 }
 
 #[test]
+fn failed_exact_parent_recovery_returns_typed_error_without_retry_or_checkpoint() {
+    let checkpoint_store =
+        MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.002709", 224_140_888));
+    let config = ApplyBinlogConfig {
+        max_reconnects: 2,
+        ..ApplyBinlogConfig::default()
+    };
+    let request = exact_sessions_guest_recovery();
+    let attempts = RefCell::new(0);
+
+    let error = run_stream_reconnect_loop_with_recovery(
+        &config,
+        Some(&checkpoint_store),
+        |_attempt_config| {
+            *attempts.borrow_mut() += 1;
+            Err(ApplyBinlogError::RowConflictPersisted {
+                message: "fk_sessions_guest".to_string(),
+                sessions_guest_recovery: Some(Box::new(request.clone())),
+            })
+        },
+        |_request| {
+            Err(RecoveryAttemptError::ReconciliationFailed(
+                "target guests row diverges from exact source image".to_string(),
+            ))
+        },
+        |_delay| {},
+    )
+    .expect_err("strict recovery failure must be explicit");
+
+    assert_eq!(*attempts.borrow(), 1);
+    assert!(checkpoint_store.saved.borrow().is_none());
+    assert!(matches!(
+        error,
+        ApplyBinlogError::SessionsGuestRecoveryFailed {
+            conflict,
+            source: RecoveryAttemptError::ReconciliationFailed(ref message),
+        } if *conflict == request
+            && message == "target guests row diverges from exact source image"
+    ));
+}
+
+#[test]
 fn exhausted_reconnect_budget_does_not_recover_parent() {
     let checkpoint_store =
         MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.002709", 224_140_888));

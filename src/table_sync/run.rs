@@ -62,28 +62,7 @@ pub(crate) fn reconcile_exact_sessions_guest(
     request: &crate::live::SessionsGuestRecovery,
 ) -> Result<(), TableSyncError> {
     validate_sessions_guest_request(request)?;
-    let source_config = crate::mysql_snapshot::MySqlConnectionConfig {
-        host: config.source.host.clone(),
-        port: config.source.port,
-        user: config.source.user.clone(),
-        password: config.source.password.clone(),
-        database: config.source.database.clone().ok_or_else(|| {
-            TableSyncError::InvalidTable(
-                "sessions guest recovery requires source database".to_string(),
-            )
-        })?,
-    };
-    let source = MySqlSyncReader::new_with_tls_ca(
-        source_config,
-        (!config.source.tls_ca_file.is_empty()).then(|| config.source.tls_ca_file.clone()),
-    )
-    .with_recovery_utc();
-    let target = MySqlSyncReader::new_with_target(
-        target_connection_config_for_apply(config),
-        &config.target,
-    )
-    .map_err(TableSyncError::Read)?
-    .with_recovery_utc();
+    let (source, target) = build_sessions_guest_recovery_readers(config)?;
     let source_rows = source.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
     let target_rows = target.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
     let reconciliation = plan_loaded_sessions_guest(&source_rows, &target_rows, request)?;
@@ -92,6 +71,33 @@ pub(crate) fn reconcile_exact_sessions_guest(
     };
     let sync_config = exact_guest_sync_config(config, request);
     mysql_recovery_target(&sync_config)?.insert_row(&source_row)
+}
+
+fn build_sessions_guest_recovery_readers(
+    config: &crate::live::ApplyBinlogConfig,
+) -> Result<(MySqlSyncReader, MySqlSyncReader), TableSyncError> {
+    let source_database = config.source.database.clone().ok_or_else(|| {
+        TableSyncError::InvalidTable(
+            "sessions guest recovery requires source database".to_string(),
+        )
+    })?;
+    let source_config = crate::mysql_snapshot::MySqlConnectionConfig {
+        host: config.source.host.clone(),
+        port: config.source.port,
+        user: config.source.user.clone(),
+        password: config.source.password.clone(),
+        database: source_database,
+    };
+    let source_tls_ca =
+        (!config.source.tls_ca_file.is_empty()).then(|| config.source.tls_ca_file.clone());
+    let source = MySqlSyncReader::new_with_tls_ca(source_config, source_tls_ca).with_recovery_utc();
+    let target = MySqlSyncReader::new_with_target(
+        target_connection_config_for_apply(config),
+        &config.target,
+    )
+    .map_err(TableSyncError::Read)?
+    .with_recovery_utc();
+    Ok((source, target))
 }
 
 fn validate_sessions_guest_request(

@@ -220,7 +220,7 @@ fn build_exact_sessions_guest_recovery(
 ) -> Option<crate::live::SessionsGuestRecovery> {
     if table.schema != crate::live::SESSIONS_GUEST_CHILD_SCHEMA
         || table.table != crate::live::SESSIONS_GUEST_CHILD_TABLE
-        || conflict.error_code != 1452
+        || conflict.error_code != crate::live::SESSIONS_GUEST_FK_ERROR_CODE
         || !is_exact_sessions_guest_constraint_error(&conflict.error_text)
     {
         return None;
@@ -246,7 +246,7 @@ fn build_exact_sessions_guest_recovery(
 }
 
 fn is_exact_sessions_guest_constraint_error(error_text: &str) -> bool {
-    error_text.contains("`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`)")
+    error_text.contains(crate::live::SESSIONS_GUEST_FK_SIGNATURE)
         && error_text.contains(crate::live::SESSIONS_GUEST_PARENT_REFERENCE)
 }
 

@@ -88,9 +88,10 @@ runs for a persisted `1452` on the exact `globalcomix.sessions` composite
 `fk_sessions_guest` identity and ordered (`guest_id`, `guest_hash`) columns. The
 failed transaction is rolled back and recorded first. Recovery is evaluated only
 when another reconnect is eligible and at most once per distinct
-`SessionsGuestRecovery` request value per process reconnect loop. The persisted
-conflict record carries at most one recovery request; this is request-value
-deduplication, not a general ledger-identity key. The source `guests` row must
+`SessionsGuestRecovery` value per process reconnect loop. That typed value is
+reconstructed deterministically during replay from the persisted row image and
+conflict identity; it is not stored in `cdc.row_conflicts`. Deduplication is by
+that reconstructed value, not by a general ledger-identity key. The source `guests` row must
 uniquely match
 the guest tuple, and a dedicated `UNIX_TIMESTAMP(create_time)` query epoch must
 not be later than the child event timestamp; session-time-zone-rendered timestamp
@@ -101,7 +102,8 @@ no-match lookup inserts the current source row; an exact row is an idempotent
 success after process loss. Later retries of the same request skip mutation but
 retain reconnect behavior. Unsupported scope, missing/colliding/divergent or
 temporally invalid identities, unavailable connections, and recovery write
-failure stop without replay or checkpoint advance. Structured recovery logs carry
+failure return a contextual non-retryable recovery error without replay, another
+attempt, or checkpoint advance. Structured recovery logs carry
 the source coordinate, child primary key, guest tuple, action, and outcome. Only
 normal child replay commit/checkpoint resolves ledger evidence. This is not
 generic FK repair, performs no historical binlog reconstruction, requires a

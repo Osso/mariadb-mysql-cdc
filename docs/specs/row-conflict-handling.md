@@ -133,19 +133,22 @@ the reconnect loop first verifies that another reconnect is eligible, then
 performs strict source/target `guests` identity validation after rollback and
 durable ledger persistence. Recovery requires the exact MySQL constraint name, ordered child columns (`guest_id`, `guest_hash`), and parent reference `REFERENCES `guests` (`guest_id`, `guest_hash`)`; suffix/name substring or alternate-parent matches are ineligible. The typed request carries the persisted source
 transaction coordinate, child primary key, guest tuple, and child event
-timestamp. Recovery source and target sessions set `time_zone='+00:00'` before full parent reads or insertion. The identity query returns the canonical 23 columns plus a dedicated `UNIX_TIMESTAMP(create_time)` helper epoch. That absolute epoch must be no later
+timestamp. It is reconstructed deterministically from the replayed row image and
+persisted conflict identity, not stored in `cdc.row_conflicts`. Recovery source
+and target connections set `time_zone='+00:00'` once when each connection is
+created, before full parent reads or insertion. The identity query returns the canonical 23 columns plus a dedicated `UNIX_TIMESTAMP(create_time)` helper epoch. That absolute epoch must be no later
 than the child event; the session-time-zone-rendered `create_time` text does not
 control ordering, and the helper is excluded from insert and exact-row comparison.
-Missing or invalid epochs fail closed. The persisted conflict record carries at
-most one recovery request, and one reconciliation attempt is allowed per
-distinct `SessionsGuestRecovery` request value per process reconnect loop; this is
-not ledger-identity deduplication. A later retry of the same request skips
+Missing or invalid epochs fail closed. One reconciliation attempt is allowed per
+distinct reconstructed `SessionsGuestRecovery` value per process reconnect loop;
+this is not ledger-identity deduplication. A later retry of the same request skips
 mutation but still follows normal reconnect policy.
 Existing exact target parents are accepted idempotently after process loss;
 otherwise one current source parent image is inserted only when the target has
 no matching identity. Unsupported, absent, duplicate, colliding, divergent, or
-temporally invalid identities, connection failures, and insert failures stop
-without replay. Recovery emits deterministic attempted/skipped/succeeded/failed
+temporally invalid identities, connection failures, and insert failures return a
+contextual typed recovery failure without replay, another attempt, or checkpoint
+advance. Recovery emits deterministic attempted/skipped/succeeded/failed
 logs. It never resolves the ledger entry; normal child replay must commit and
 checkpoint before the existing resolution path can mark it resolved. Recovery
 is not generic FK repair, performs no historical binlog reconstruction, and

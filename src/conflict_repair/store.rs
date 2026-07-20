@@ -44,24 +44,28 @@ impl InMemoryConflictStore {
     }
 }
 
+fn conflict_key_matches_resolution(
+    key: &ConflictKey,
+    resolution: &ConflictResolution,
+) -> bool {
+    key.source_identity == resolution.source_identity
+        && key.schema == resolution.schema
+        && key.table == resolution.table
+        && key.source_primary_key == resolution.source_primary_key
+}
+
 impl ConflictStore for InMemoryConflictStore {
     fn has_unresolved(&mut self, resolution: &ConflictResolution) -> Result<bool, String> {
         Ok(self.records.values().any(|record| {
             record.status == ConflictStatus::Unresolved
-                && record.key.source_identity == resolution.source_identity
-                && record.key.schema == resolution.schema
-                && record.key.table == resolution.table
-                && record.key.source_primary_key == resolution.source_primary_key
+                && conflict_key_matches_resolution(&record.key, resolution)
         }))
     }
 
     fn resolve_existing(&mut self, resolution: ConflictResolution) -> Result<(), String> {
         if let Some(record) = self.records.values_mut().find(|record| {
             record.status == ConflictStatus::Unresolved
-                && record.key.source_identity == resolution.source_identity
-                && record.key.schema == resolution.schema
-                && record.key.table == resolution.table
-                && record.key.source_primary_key == resolution.source_primary_key
+                && conflict_key_matches_resolution(&record.key, &resolution)
         }) {
             record.status = ConflictStatus::Resolved;
             record.repair_run_id = Some(resolution.repair_run_id);
@@ -75,7 +79,14 @@ impl ConflictStore for InMemoryConflictStore {
     }
 
     fn mark_resolution_committed(&mut self, resolution: ConflictResolution) {
-        let _ = self.resolve_existing(resolution);
+        if let Some(record) = self.records.values_mut().find(|record| {
+            record.status == ConflictStatus::Unresolved
+                && conflict_key_matches_resolution(&record.key, &resolution)
+        }) {
+            record.status = ConflictStatus::Resolved;
+            record.repair_run_id = Some(resolution.repair_run_id);
+            record.resolution_evidence = Some(resolution.evidence);
+        }
     }
 
     fn observe(&mut self, observation: ConflictObservation) -> Result<(), String> {
@@ -437,12 +448,9 @@ impl ConflictStore for MySqlConflictStore {
                 &resolution,
             ))
             .map_err(|error| format!("conflict store resolution failed: {error}"))?;
-        self.unresolved.borrow_mut().retain(|key| {
-            !(key.source_identity == resolution.source_identity
-                && key.schema == resolution.schema
-                && key.table == resolution.table
-                && key.source_primary_key == resolution.source_primary_key)
-        });
+        self.unresolved
+            .borrow_mut()
+            .retain(|key| !conflict_key_matches_resolution(key, &resolution));
         Ok(())
     }
 
@@ -451,12 +459,9 @@ impl ConflictStore for MySqlConflictStore {
     }
 
     fn mark_resolution_committed(&mut self, resolution: ConflictResolution) {
-        self.unresolved.borrow_mut().retain(|key| {
-            !(key.source_identity == resolution.source_identity
-                && key.schema == resolution.schema
-                && key.table == resolution.table
-                && key.source_primary_key == resolution.source_primary_key)
-        });
+        self.unresolved
+            .borrow_mut()
+            .retain(|key| !conflict_key_matches_resolution(key, &resolution));
     }
 
     fn observe(&mut self, observation: ConflictObservation) -> Result<(), String> {
@@ -579,12 +584,8 @@ impl<E: ConflictSqlExecutor> ConflictStore for DurableConflictStore<E> {
         self.executor.execute(
             build_conflict_resolution_for_source_row_sql(&self.table, &resolution).as_str(),
         )?;
-        self.unresolved.retain(|key| {
-            !(key.source_identity == resolution.source_identity
-                && key.schema == resolution.schema
-                && key.table == resolution.table
-                && key.source_primary_key == resolution.source_primary_key)
-        });
+        self.unresolved
+            .retain(|key| !conflict_key_matches_resolution(key, &resolution));
         Ok(())
     }
 
@@ -593,12 +594,8 @@ impl<E: ConflictSqlExecutor> ConflictStore for DurableConflictStore<E> {
     }
 
     fn mark_resolution_committed(&mut self, resolution: ConflictResolution) {
-        self.unresolved.retain(|key| {
-            !(key.source_identity == resolution.source_identity
-                && key.schema == resolution.schema
-                && key.table == resolution.table
-                && key.source_primary_key == resolution.source_primary_key)
-        });
+        self.unresolved
+            .retain(|key| !conflict_key_matches_resolution(key, &resolution));
     }
 
     fn observe(&mut self, observation: ConflictObservation) -> Result<(), String> {

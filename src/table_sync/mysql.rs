@@ -98,13 +98,7 @@ impl MySqlSyncReader {
     }
 
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
-        let source = self.ensure_source()?;
-        if self.initialize_recovery_utc {
-            source
-                .execute_session_sql(RECOVERY_UTC_SESSION_SQL)
-                .map_err(snapshot_error_to_table_sync)?;
-        }
-        source
+        self.ensure_source()?
             .query_rows_as_strings(sql)
             .map_err(snapshot_error_to_table_sync)
     }
@@ -121,6 +115,11 @@ impl MySqlSyncReader {
                 ),
             }
             .map_err(snapshot_error_to_table_sync)?;
+            initialize_recovery_session(self.initialize_recovery_utc, || {
+                source
+                    .execute_session_sql(RECOVERY_UTC_SESSION_SQL)
+                    .map_err(snapshot_error_to_table_sync)
+            })?;
             self.source.replace(Some(source));
         }
         Ok(std::cell::RefMut::map(self.source.borrow_mut(), |source| {
@@ -139,6 +138,16 @@ impl SyncTableReader for MySqlSyncReader {
     fn requires_full_rows_for_missing_primary_keys(&self) -> bool {
         self.replace_divergent_primary
     }
+}
+
+fn initialize_recovery_session<F>(enabled: bool, initialize: F) -> Result<(), TableSyncError>
+where
+    F: FnOnce() -> Result<(), TableSyncError>,
+{
+    if enabled {
+        initialize()?;
+    }
+    Ok(())
 }
 
 fn build_guest_identity_sql(guest_id: &str, guest_hash: &str) -> String {
@@ -334,14 +343,18 @@ mod tests {
     }
 
     #[test]
-    fn recovery_session_initialization_precedes_guest_query() {
-        let commands = [
-            RECOVERY_UTC_SESSION_SQL.to_string(),
-            build_guest_identity_sql("1", "hash"),
-        ];
+    fn recovery_session_initialization_runs_once_per_connection() {
+        let initialization_count = RefCell::new(0);
+        initialize_recovery_session(true, || {
+            *initialization_count.borrow_mut() += 1;
+            Ok(())
+        })
+        .expect("initialize recovery connection");
 
-        assert_eq!(commands[0], "SET SESSION time_zone='+00:00'");
-        assert!(commands[1].starts_with("SELECT "));
+        let guest_query = build_guest_identity_sql("1", "hash");
+        let generic_queries = ["SELECT 1", guest_query.as_str()];
+        assert_eq!(generic_queries.len(), 2);
+        assert_eq!(*initialization_count.borrow(), 1);
     }
 
     #[test]

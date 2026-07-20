@@ -23,8 +23,8 @@ source connection loss without replaying from static startup coordinates.
   23-column source parent only when the target lookup finds no row; accept an
   existing row only when exactly one complete row matches the source image,
   including `guest_id` and `guest_hash`. Compare parent/child ordering using the
-  dedicated `UNIX_TIMESTAMP(create_time)` query epoch, never the session-time-zone-rendered canonical timestamp text; source and target recovery sessions explicitly set `time_zone='+00:00'` before parent reads/writes, while the epoch helper remains excluded from insert and equality.
-  Recovery failure is fail-closed: no replay and no checkpoint advance. Successful child replay writes matching conflict resolution after child DML/checkpoint and before the same target COMMIT; post-commit work only updates process-local cache. Disposable real-database proof remains a
+  dedicated `UNIX_TIMESTAMP(create_time)` query epoch, never the session-time-zone-rendered canonical timestamp text; source and target recovery connections explicitly set `time_zone='+00:00'` once when each connection is created, before parent reads/writes, while the epoch helper remains excluded from insert and equality.
+  The recovery value is reconstructed deterministically from the replayed row image and persisted conflict identity; it is not stored in `cdc.row_conflicts`. Recovery failure returns a contextual typed non-retryable error: no replay, another attempt, or checkpoint advance. Successful child replay writes matching conflict resolution after child DML/checkpoint and before the same target COMMIT; post-commit work only updates process-local cache. Disposable real-database proof remains a
   separate unchecked gap below.
 - [x] Stop and fail explicitly on other non-transient errors such as authentication
   failure, missing binlog file, unsupported event type, quarantine, or target
@@ -41,7 +41,8 @@ unchanged checkpoint is replayed. The parent repair itself does not advance the 
 checkpoint; only successful replay advances it. Recovery requires a durable
 checkpoint store and fails closed on unsupported scope, missing/colliding/divergent
 source or target identity, incomplete source image, connection failure, or target
-insert failure. Retry eligibility is checked before the recovery callback. An
+insert failure. Once strict reconciliation starts, any such failure returns the
+recovery error rather than the original persisted-conflict error. Retry eligibility is checked before the recovery callback. An
 exhausted retry budget returns the persisted conflict without reading or mutating
 the recovery target. This is not generic FK repair or live proof.
 It is not an opportunistic TLS-to-plaintext fallback: the current GlobalComix

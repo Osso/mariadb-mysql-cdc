@@ -1,4 +1,4 @@
-use super::{ApplyBinlogConfig, ApplyBinlogError};
+use super::{ApplyBinlogConfig, ApplyBinlogError, RecoveryAttemptError};
 use crate::checkpoint::{Checkpoint, CheckpointError, FileCheckpointStore, LastEvent};
 use crate::probe::BinlogCoordinate;
 #[cfg(test)]
@@ -136,7 +136,11 @@ where
         config,
         checkpoint_store,
         run_attempt,
-        |_request| Err("sessions guest recovery service unavailable".to_string()),
+        |_request| {
+            Err(RecoveryAttemptError::ReconciliationFailed(
+                "sessions guest recovery service unavailable".to_string(),
+            ))
+        },
         sleep,
     )
 }
@@ -151,7 +155,7 @@ pub(super) fn run_stream_reconnect_loop_with_recovery<C, F, R, S>(
 where
     C: StreamCheckpointStore,
     F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
-    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), String>,
+    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), RecoveryAttemptError>,
     S: Fn(std::time::Duration),
 {
     let mut attempt_config = config.clone();
@@ -170,45 +174,61 @@ where
                 "stale or purged source binlog requires operator repair; checkpoint was not changed; error={error}"
             )));
         }
-        if checkpoint_store.is_none()
-            || !should_reconnect(
-                &error,
-                attempt,
-                config.max_reconnects,
-                config.reconnect_forever,
-            )
-        {
-            if let Some(request) = error.sessions_guest_recovery() {
-                println!(
-                    "{}",
-                    format_recovery_log("skipped", request, "retry_ineligible")
-                );
+        match failed_attempt_action(
+            &error,
+            checkpoint_store.is_some(),
+            attempt,
+            config.max_reconnects,
+            config.reconnect_forever,
+        ) {
+            FailedAttemptAction::Return => {
+                log_skipped_recovery(&error);
+                return Err(error);
             }
-            return Err(error);
+            FailedAttemptAction::Reconnect => {}
         }
-        if attempt_exact_parent_recovery(&error, &mut attempted_recoveries, &mut recover).is_err() {
-            return Err(error);
+        if let Err(source) =
+            attempt_exact_parent_recovery(&error, &mut attempted_recoveries, &mut recover)
+        {
+            let conflict = error
+                .sessions_guest_recovery()
+                .expect("recovery error requires conflict identity")
+                .clone();
+            return Err(ApplyBinlogError::SessionsGuestRecoveryFailed {
+                conflict: Box::new(conflict),
+                source,
+            });
         }
         prepare_next_attempt(&mut attempt_config, checkpoint_store, &mut attempt, &error)?;
         sleep(reconnect_delay(attempt));
     }
 }
 
-#[derive(Debug)]
-enum RecoveryAttemptError {
-    ReconciliationFailed(String),
+enum FailedAttemptAction {
+    Return,
+    Reconnect,
 }
 
-impl std::fmt::Display for RecoveryAttemptError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ReconciliationFailed(message) => {
-                write!(
-                    formatter,
-                    "sessions guest parent reconciliation failed: {message}"
-                )
-            }
-        }
+fn failed_attempt_action(
+    error: &ApplyBinlogError,
+    has_checkpoint_store: bool,
+    attempt: u32,
+    max_reconnects: u32,
+    reconnect_forever: bool,
+) -> FailedAttemptAction {
+    if has_checkpoint_store && should_reconnect(error, attempt, max_reconnects, reconnect_forever) {
+        FailedAttemptAction::Reconnect
+    } else {
+        FailedAttemptAction::Return
+    }
+}
+
+fn log_skipped_recovery(error: &ApplyBinlogError) {
+    if let Some(request) = error.sessions_guest_recovery() {
+        println!(
+            "{}",
+            format_recovery_log("skipped", request, "retry_ineligible")
+        );
     }
 }
 
@@ -218,7 +238,7 @@ fn attempt_exact_parent_recovery<R>(
     recover: &mut R,
 ) -> Result<(), RecoveryAttemptError>
 where
-    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), String>,
+    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), RecoveryAttemptError>,
 {
     let Some(request) = error.sessions_guest_recovery() else {
         return Ok(());
@@ -231,13 +251,13 @@ where
         return Ok(());
     }
     println!("{}", format_recovery_log("attempted", request, "started"));
-    if let Err(message) = recover(request) {
+    if let Err(error) = recover(request) {
         eprintln!(
             "{} error={}",
             format_recovery_log("failed", request, "error"),
-            shell_word(&message)
+            shell_word(&error.to_string())
         );
-        return Err(RecoveryAttemptError::ReconciliationFailed(message));
+        return Err(error);
     }
     println!(
         "{}",

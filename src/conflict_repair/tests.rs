@@ -191,6 +191,32 @@ fn interrupted_phase_resumes_exact_plan_without_repeating_completed_deletes() {
 }
 
 #[test]
+fn committed_resolution_updates_in_memory_cache_infallibly() {
+    let mut ledger = InMemoryConflictStore::default();
+    let mut observation = test_conflict("sessions", "109018328");
+    observation.source_identity = "source-a".to_string();
+    observation.schema = "globalcomix".to_string();
+    ledger.observe(observation).expect("observe conflict");
+
+    ledger.mark_resolution_committed(ConflictResolution {
+        source_identity: "source-a".to_string(),
+        schema: "globalcomix".to_string(),
+        table: "sessions".to_string(),
+        source_primary_key: vec!["109018328".to_string()],
+        repair_run_id: "stream-replay".to_string(),
+        evidence: "child replay committed".to_string(),
+    });
+
+    let record = &ledger.records()[0];
+    assert_eq!(record.status, ConflictStatus::Resolved);
+    assert_eq!(record.repair_run_id.as_deref(), Some("stream-replay"));
+    assert_eq!(
+        record.resolution_evidence.as_deref(),
+        Some("child replay committed")
+    );
+}
+
+#[test]
 fn successful_resolution_never_creates_and_isolated_resolution_matches_source_scope() {
     let mut ledger = InMemoryConflictStore::default();
     ledger

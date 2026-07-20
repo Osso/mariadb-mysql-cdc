@@ -1,4 +1,5 @@
 use super::*;
+use crate::live::RecoveryAttemptError;
 
 pub(crate) fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
     verify_source_binlog_contract(config)?;
@@ -62,7 +63,7 @@ where
         },
         |request| {
             crate::table_sync::reconcile_exact_sessions_guest(config, request)
-                .map_err(|error| error.to_string())
+                .map_err(RecoveryAttemptError::from)
         },
         thread::sleep,
     )
