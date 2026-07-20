@@ -80,7 +80,8 @@ explicit ceiling, it performs zero inserts, updates, or deletes. Normal
 
 ## Completion gates
 
-- [ ] Durable live conflict observations and recurring repair scheduling.
+- [x] Durable live conflict observations and post-repair replay recovery.
+- [ ] Recurring repair scheduling from unresolved durable conflicts.
 - [x] FK-aware real-MySQL phased repair with crash/resume proof for the repaired scope.
 - [x] Zero unresolved conflict debt after verified equality for the repaired scope.
 - [ ] Stable checkpoint/lag, schema parity, and no quarantine/manual/journal debt.

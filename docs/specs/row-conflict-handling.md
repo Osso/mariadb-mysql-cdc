@@ -14,11 +14,15 @@ conflicting secondary key.
       then fail the row event so every earlier target mutation in the same
       source transaction rolls back.
 - [x] Leave the stream checkpoint unchanged when the target transaction rolls
-      back.
+      back, so replay starts at the same source coordinate.
+- [x] Retry a persisted row conflict in-process with bounded backoff and the
+      configured retry limit; other target failures are fatal and are not retried.
 - [x] Emit parseable `cdc_row_conflict_skipped` output with operation, table,
       source coordinate, and source primary key.
 - [x] Replay the same source event into the same identity and increment its
       attempt count; a different source primary key creates a separate identity.
+- [x] After repair proves source/target equality, replay the blocked event,
+      advance its checkpoint, and resolve the conflict with repair evidence.
 - [x] Keep generated columns out of row writes.
 - [x] Provide a durable conflict-record schema/library contract containing source
       identity/server/file/start/end, schema/table/operation, source PK,
@@ -64,14 +68,17 @@ or to select a target row by the secondary key.
 The structured live stream persists row-conflict observations to this durable
 ledger before returning the row failure. The target data transaction rolls back
 and the live target checkpoint does not advance, while the independently persisted
-evidence survives. Replaying the same source identity is idempotent: it updates
-attempt evidence rather than creating a second row; a different source primary
-key remains a distinct identity. Startup validates the ledger schema, guards,
-trigger inventory, and exact grants before source replication. `repair-drift`
-resolves rows only after its non-mutating Verify phase proves full-scope equality,
-then records the run ID plus evidence. The Docker harness proves multi-row
-rollback, durable idempotent evidence, different-primary-key isolation,
-unchanged checkpoints, and zero unresolved debt for repaired scope.
+evidence survives. The reconnect loop retries this classified failure in process,
+from the unchanged checkpoint, with bounded backoff/attempts. Replaying the same
+source identity is idempotent: it updates attempt evidence rather than creating
+a second row; a different source primary key remains a distinct identity. After
+`repair-drift` proves full-scope equality, the replay succeeds, advances the
+checkpoint, and records resolution evidence. Other target failures remain fatal
+and do not enter this retry path. Startup validates the ledger schema, guards,
+trigger inventory, and exact grants before source replication. The Docker harness
+proves multi-row rollback, durable idempotent evidence, different-primary-key
+isolation, unchanged checkpoints, bounded retry, post-repair recovery, and zero
+unresolved debt for repaired scope.
 
 - [ ] Schedule recurring repair from unresolved records.
 - [ ] Prove the live deployed path and repeated convergence before cutover.

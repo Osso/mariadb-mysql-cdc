@@ -76,7 +76,11 @@ The code contains a durable row-conflict ledger wired into the live stream and
 an FK-aware phased repair planner. Duplicate and supported constraint conflicts
 persist evidence through an independent control-plane connection before the row
 failure rolls back the target transaction; guarded observation upserts are
-idempotent, and the live target checkpoint does not advance. The admin-bootstrapped
+idempotent, and the live target checkpoint does not advance. The reconnect loop
+retries this persisted conflict in process from the unchanged checkpoint with
+bounded backoff/attempts. After repair proves equality, replay succeeds and the
+checkpoint advances; other target failures are fatal and are not retried. The
+admin-bootstrapped
 `cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory
 procedure, and exact table/procedure grants must validate at startup; runtime never
 creates the table. Different source primary keys remain different conflict

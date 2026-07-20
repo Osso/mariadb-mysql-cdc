@@ -15,11 +15,16 @@ source connection loss without replaying from static startup coordinates.
   manifest's original `--binlog-file` and `--start-position` arguments.
 - [x] Apply bounded retry backoff with clear logs for attempt count, delay, and
   last durable coordinate.
+- [x] Retry a durably persisted row conflict in process from the unchanged
+  checkpoint with bounded backoff and the configured retry limit.
+- [x] After repair proves equality, replay the source event and advance the
+  checkpoint; other target write failures remain fatal and are not retried.
 - [x] Stop and fail explicitly on non-transient errors such as authentication
   failure, missing binlog file, unsupported event type, quarantine, or target
   write failure.
 
-Reconnect/backoff applies only after an established connection loses transport.
+Reconnect/backoff applies only after an established connection loses transport or
+for a durably persisted row conflict. It does not retry arbitrary target errors.
 It is not a TLS fallback: failed CA loading, chain validation, or required
 DNS/hostname identity matching stops immediately. Reconnect attempts retain the
 same TLS configuration; literal IP endpoints continue to skip hostname/IP
@@ -106,6 +111,8 @@ identity matching only.
   reconnect only while positive attempts remain, `--reconnect-forever true`
   allows unlimited transient reconnects, and non-transient source failures do
   not reconnect.
+- `src/live/tests/reconnect.rs` — asserts a persisted row conflict retries from
+  the unchanged checkpoint and unrecoverable target failures do not retry.
 - `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
   selection remain source-identity scoped.
 

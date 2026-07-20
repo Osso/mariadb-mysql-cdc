@@ -80,7 +80,10 @@ identity tuple while retaining every source field for collision checks. This
 SHA-256 statement is limited to conflict identities; it does not claim that
 FNV-based sync-progress IDs migrated. Conflict evidence is persisted on an
 independent connection before the target transaction rolls back, and the live
-target checkpoint does not advance. Startup validates the admin-bootstrap schema,
+target checkpoint does not advance. The reconnect loop retries this classified
+conflict in process from the unchanged checkpoint with bounded backoff/attempts.
+After repair proves equality, replay succeeds and advances the checkpoint; other
+target failures are fatal and are not retried. Startup validates the admin-bootstrap schema,
 guards, constraints, and exact table/application grants before opening the source
 stream; runtime never creates the table. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,

@@ -23,9 +23,12 @@ The applier translates full row images into target DML:
 
 Each row statement runs inside the target transaction. Duplicate-key and
 supported constraint conflicts are recorded in the independent conflict ledger,
-then returned as row failures; the target transaction and its live checkpoint are
-not advanced. Repeating the same source event updates the same conflict record,
-while a different source primary key gets a different record.
+then returned as row failures; the target transaction rolls back and its live
+checkpoint remains at the same source coordinate. The reconnect loop retries this
+persisted conflict in process with bounded backoff/attempts. After repair proves
+equality, replay succeeds and advances the checkpoint; other target failures are
+fatal and are not retried. Repeating the same source event updates the same
+conflict record, while a different source primary key gets a different record.
 
 Primary-key values are extracted from the table map's primary-key columns. A row
 event with no table map, no primary key, or a missing primary-key value fails
