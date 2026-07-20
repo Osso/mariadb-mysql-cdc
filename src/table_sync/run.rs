@@ -127,7 +127,7 @@ fn plan_loaded_sessions_guest(
 ) -> Result<GuestReconciliation, TableSyncError> {
     let source_row = require_exact_guest_row("source", source_rows, request)?;
     validate_parent_temporal_order(
-        recovery_create_time_epoch(&source_row)?,
+        recovery_create_time_epoch(source_row)?,
         request.child_event_timestamp,
     )?;
     let source_row = canonical_guest_row(source_row);
