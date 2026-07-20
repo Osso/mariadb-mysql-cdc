@@ -102,8 +102,8 @@ no-match lookup inserts the current source row; an exact row is an idempotent
 success after process loss. Later retries of the same request skip mutation but
 retain reconnect behavior. Unsupported scope, missing/colliding/divergent or
 temporally invalid identities, unavailable connections, and recovery write
-failure return a contextual non-retryable recovery error without replay, another
-attempt, or checkpoint advance. Structured recovery logs carry
+failure return a contextual typed non-retryable recovery error without replay,
+another attempt, or checkpoint advance. Structured recovery logs carry
 the source coordinate, child primary key, guest tuple, action, and outcome. Only
 normal child replay commit/checkpoint resolves ledger evidence. This is not
 generic FK repair, performs no historical binlog reconstruction, requires a
