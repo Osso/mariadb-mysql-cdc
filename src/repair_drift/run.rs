@@ -8,7 +8,7 @@ use crate::drift_check::{self, DriftCheckConfig};
 use crate::inventory::{InventoryConfig, InventoryEndpointRole, SchemaInventory, build_inventory};
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::table_sync::{self, SyncMode, SyncPhase, SyncTable, SyncTableConfig};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
