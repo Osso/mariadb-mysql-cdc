@@ -131,3 +131,50 @@ fn reconnect_forever_reloads_checkpoint_after_generic_transient_error() {
         ]
     );
 }
+
+#[test]
+fn retries_durably_persisted_row_conflict_from_unchanged_checkpoint() {
+    let checkpoint_store =
+        MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.000001", 120));
+    let config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            binlog_file: "mysqld-bin.000001".to_string(),
+            start_position: 120,
+            ..SourceBinlogConfig::default()
+        },
+        max_reconnects: 2,
+        ..ApplyBinlogConfig::default()
+    };
+    let starts = RefCell::new(Vec::new());
+    let delays = RefCell::new(Vec::new());
+
+    run_stream_reconnect_loop(
+        &config,
+        Some(&checkpoint_store),
+        |attempt_config| {
+            starts
+                .borrow_mut()
+                .push(attempt_config.source.start_position);
+            if starts.borrow().len() == 1 {
+                return Err(ApplyBinlogError::Target(
+                    "row conflict persisted for repair: Cannot add or update a child row: a foreign key constraint fails (1452)"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        },
+        |delay| delays.borrow_mut().push(delay),
+    )
+    .expect("persisted row conflict should retry in-process");
+
+    assert_eq!(starts.into_inner(), vec![120, 120]);
+    assert_eq!(delays.into_inner(), vec![Duration::from_secs(1)]);
+    assert!(checkpoint_store.saved.borrow().is_none());
+}
+
+#[test]
+fn does_not_retry_unrecoverable_target_failure() {
+    let error = ApplyBinlogError::Target("permission denied".to_string());
+
+    assert!(!should_reconnect(&error, 0, 3, false));
+}
