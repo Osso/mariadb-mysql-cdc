@@ -415,8 +415,8 @@ pub(crate) fn reduce_to_dependency_closure(
     inventory: RepairInventory,
     selected_tables: Vec<String>,
 ) -> RepairInventory {
-    let scopes = reduce_to_dependency_scopes(inventory, selected_tables);
-    merge_dependency_scopes(&scopes)
+    let scopes = reduce_to_dependency_scopes(inventory.clone(), selected_tables);
+    merge_dependency_scopes(&inventory, &scopes)
 }
 
 fn reduce_to_dependency_scopes(
@@ -486,35 +486,38 @@ fn filter_repair_inventory(
 }
 
 #[cfg(test)]
-fn merge_dependency_scopes(scopes: &DependencyRepairScopes) -> RepairInventory {
-    let mut tables = Vec::new();
-    let mut seen_tables = BTreeSet::new();
-    for table in scopes
+fn merge_dependency_scopes(
+    inventory: &RepairInventory,
+    scopes: &DependencyRepairScopes,
+) -> RepairInventory {
+    let tables = scopes
         .insert_update
         .tables
         .iter()
         .chain(&scopes.delete.tables)
-    {
-        if seen_tables.insert(table) {
-            tables.push(table.clone());
-        }
-    }
-    let mut foreign_keys = Vec::new();
-    let mut seen_foreign_keys = BTreeSet::new();
-    for foreign_key in scopes
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let foreign_keys = scopes
         .insert_update
         .foreign_keys
         .iter()
         .chain(&scopes.delete.foreign_keys)
-    {
-        if seen_foreign_keys.insert(foreign_key) {
-            foreign_keys.push(foreign_key.clone());
-        }
-    }
+        .cloned()
+        .collect::<BTreeSet<_>>();
     RepairInventory {
-        schema: scopes.insert_update.schema.clone(),
-        tables,
-        foreign_keys,
+        schema: inventory.schema.clone(),
+        tables: inventory
+            .tables
+            .iter()
+            .filter(|table| tables.contains(*table))
+            .cloned()
+            .collect(),
+        foreign_keys: inventory
+            .foreign_keys
+            .iter()
+            .filter(|foreign_key| foreign_keys.contains(*foreign_key))
+            .cloned()
+            .collect(),
     }
 }
 
