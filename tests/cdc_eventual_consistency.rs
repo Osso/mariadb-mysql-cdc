@@ -87,6 +87,24 @@ fn real_fk_selected_dependency_cycle_blocks_selected_guests() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_global_delete_limit_preflights_all_tables_before_mutation() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("global-delete-limit")
+        .output()
+        .expect("run global delete limit harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_reconciliation_owner_should_resume_durable_missing_guest_run() {
     let output = Command::new("python3")
         .arg(harness_script())

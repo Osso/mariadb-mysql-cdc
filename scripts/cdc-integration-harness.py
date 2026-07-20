@@ -82,6 +82,7 @@ SCENARIOS = (
     ScenarioSpec("fk-selected-dependency-cycle-block", True),
     ScenarioSpec("repair-resume", True),
     ScenarioSpec("bounded-delete", True),
+    ScenarioSpec("global-delete-limit", True),
     ScenarioSpec("conflict-resolution-zero-debt", True),
 )
 SCENARIO_BY_NAME = {scenario.name: scenario for scenario in SCENARIOS}
@@ -3093,6 +3094,42 @@ class Harness:
             print(f"{scenario}_converged same_run_id=true changed_plan_rejected=true rows={count}")
             return
 
+        if scenario == "global-delete-limit":
+            first_table = "repair_limit_a"
+            second_table = "repair_limit_b"
+            self.setup_repair_accounts(first_table)
+            self.setup_repair_accounts(second_table)
+            self.admin_sql(
+                self.target,
+                f"INSERT INTO {first_table} VALUES "
+                "(1, 'a-one@example.test', 'extra-one'), "
+                "(2, 'a-two@example.test', 'extra-two'), "
+                "(3, 'a-three@example.test', 'extra-three'); "
+                f"INSERT INTO {second_table} VALUES "
+                "(1, 'b-one@example.test', 'extra-one'), "
+                "(2, 'b-two@example.test', 'extra-two'), "
+                "(3, 'b-three@example.test', 'extra-three');",
+            )
+            result = self.run_repair(
+                tables=[first_table, second_table],
+                max_deletes=5,
+                run_id="global-delete-limit-run",
+            )
+            if result.returncode == 0:
+                raise HarnessError(f"{scenario} unexpectedly accepted six deletes with limit five")
+            remaining = self.query(
+                self.target,
+                f"SELECT COUNT(*) FROM {first_table}; SELECT COUNT(*) FROM {second_table};",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            if remaining != "3\n3":
+                raise HarnessError(
+                    f"{scenario} mutated target before global delete preflight: {remaining!r}"
+                )
+            print(f"{scenario}_blocked total_extras=6 max_deletes=5 no_mutation=true")
+            return
+
         if scenario == "bounded-delete":
             self.setup_repair_accounts("repair_bounded")
             self.admin_sql(self.source, "INSERT INTO repair_bounded VALUES (1, 'one', 'source-one'), (2, 'two', 'source-two'), (3, 'three', 'source-three'), (4, 'four', 'source-four');")
@@ -3379,6 +3416,8 @@ class Harness:
             self.run_repair_scenario("repair-resume")
         elif scenario == "bounded-delete":
             self.run_repair_scenario("bounded-delete")
+        elif scenario == "global-delete-limit":
+            self.run_repair_scenario("global-delete-limit")
         elif scenario == "conflict-resolution-zero-debt":
             self.run_repair_scenario("conflict-resolution-zero-debt")
         else:

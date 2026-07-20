@@ -632,6 +632,38 @@ mod tests {
     }
 
     #[test]
+    fn matching_dependency_table_remains_available_for_verify_input() {
+        let source = schema_inventory(&["customers", "orders"]);
+        let target = schema_inventory(&["customers", "orders"]);
+        let comparisons = vec![
+            DriftComparison {
+                table: "customers".to_string(),
+                source_count: Some(2),
+                target_count: Some(2),
+                content: None,
+            },
+            DriftComparison {
+                table: "orders".to_string(),
+                source_count: Some(3),
+                target_count: Some(2),
+                content: None,
+            },
+        ];
+
+        let (inputs, skipped) = collect_repair_table_inputs(
+            &["customers".to_string(), "orders".to_string()],
+            &comparisons,
+            &source,
+            &target,
+        );
+
+        assert!(skipped.is_empty());
+        assert_eq!(inputs.keys().collect::<Vec<_>>(), vec!["customers", "orders"]);
+        assert_eq!(inputs["customers"].0, 2);
+        assert_eq!(inputs["customers"].1, 2);
+    }
+
+    #[test]
     fn selected_child_candidates_include_parentward_repairs_before_child() {
         let mut config = super::super::config::default_repair_drift_config();
         config.tables = vec!["orders".to_string()];
