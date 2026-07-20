@@ -57,7 +57,7 @@ fn execute_repair_drift(
     }
     let drift = run_drift_check(config, tables.clone())?;
     let (repair_tables, skipped) =
-        collect_repair_table_inputs(&plan.insert_order, &drift.comparisons, &source, &target);
+        collect_repair_table_inputs(&plan.tables, &drift.comparisons, &source, &target);
     preflight_repair_deletes(config, &run_id, &plan, &repair_tables)?;
     let repaired = run_repair_phases(config, &run_id, &plan, &repair_tables)?;
     Ok(RepairDriftReport {
