@@ -2568,10 +2568,17 @@ class Harness:
                 f"before={durable_before!r} after={durable_after!r}"
             )
         owner_run_lines = owner_runs.splitlines()
-        if len(owner_run_lines) != 3 or any(
-            "\tcomplete\t" not in f"\t{line}\t" for line in owner_run_lines
-        ):
-            raise HarnessError(f"reconciliation owner did not complete its remaining fresh child runs: {owner_runs!r}")
+        expected_owner_runs = {
+            f"{owner_run_id}-delete-extras-guests\tcomplete\tapply\t{json.dumps([str(guest_id)])}",
+            f"{owner_run_id}-delete-extras-sessions\tcomplete\tapply\t{json.dumps([str(session_id)])}",
+            f"{owner_run_id}-update-divergent-guests\tcomplete\tapply\t{json.dumps([str(guest_id)])}",
+            f"{owner_run_id}-verify-guests\tcomplete\tapply\t{json.dumps([str(guest_id)])}",
+        }
+        if set(owner_run_lines) != expected_owner_runs:
+            raise HarnessError(
+                "reconciliation owner did not complete its remaining fresh child runs: "
+                f"{owner_runs!r}"
+            )
         if any("\tmissing-pks\t" in f"\t{line}\t" for line in owner_run_lines):
             raise HarnessError(f"reconciliation owner created a fresh missing-PK run: {owner_runs!r}")
         if checkpoint_after_owner.get("source_file") != pre_stream.file or int(
