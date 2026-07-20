@@ -103,8 +103,6 @@ identity matching stops immediately.
 - `docs/design.md` documents overall CDC architecture.
 - `docs/live-migration-log.md` records observed production stream behavior and
   incidents.
-- `docs/wiki/systems/live-stream-reconnect.md` should describe final
-  implementation details after reconnect handling is built.
 
 ## Implementation inventory
 
