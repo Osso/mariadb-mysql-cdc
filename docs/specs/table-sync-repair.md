@@ -20,6 +20,12 @@ are resolved only after verified equality.
       and ambiguity fails closed without reclaiming a run.
 - [x] Persist run-scoped progress in `cdc.table_sync_runs` by default and reject
       concurrent use of the same run ID with a target named lock.
+- [x] For an existing run-progress table, validate the full 15-column contract
+      and `run_id` primary key through `information_schema` without issuing
+      `CREATE` or `ALTER`; reject malformed existing tables without modifying
+      them. Least-privilege runtime use therefore requires an admin-
+      prebootstrapped table with only `SELECT, INSERT, UPDATE` on that table;
+      an absent table still follows the creation path and requires DDL grants.
 - [x] Keep `cdc.table_sync_progress` as catchup-only legacy state.
 - [x] Use bounded MySQL network timeouts: 10 seconds for TCP connect and 30 seconds
       for reads and writes.

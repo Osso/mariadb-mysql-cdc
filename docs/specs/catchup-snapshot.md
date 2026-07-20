@@ -62,6 +62,13 @@ in [catchup.md](../catchup.md).
   bounding live target reads and using a clearly marked stale cache fallback
   when the target read exceeds 1500ms.
 
+### Progress-table privilege boundary
+
+- [ ] Support catchup with an admin-prebootstrapped `cdc.table_sync_progress`
+      and a runtime account limited to table DML. The current legacy catchup
+      ensure path still attempts schema/table creation and a conditional
+      `ALTER`, so prebootstrap alone does not remove its DDL requirement.
+
 ## How it works
 
 - [catchup.md](../catchup.md) documents operator commands and restart behavior.

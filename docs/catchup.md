@@ -53,6 +53,21 @@ mariadb-mysql-cdc catchup-snapshot \
   --parallel-workers 4
 ```
 
+## Progress-table privilege boundary
+
+Repair commands default to `cdc.table_sync_runs`. When an administrator
+prebootstraps that table, runtime `ensure` reads its `information_schema`
+inventory and validates the complete schema and `run_id` primary key without
+`CREATE` or `ALTER`; the runtime grant can remain `SELECT, INSERT, UPDATE` on
+that table. A missing table still uses the creation path and therefore requires
+DDL privileges. A malformed existing table fails unchanged.
+
+`catchup-snapshot` defaults to the legacy `cdc.table_sync_progress` table. Its
+current ensure path still creates the schema/table and conditionally adds
+`total_rows`, so prebootstrapping this table does not yet make catchup
+least-privilege. Do not claim catchup support with a table-DML-only runtime
+account until that path is changed and proved.
+
 ## Recurring drift repair
 
 `repair-drift` creates a fresh orchestration ID, inventories both endpoints, runs
