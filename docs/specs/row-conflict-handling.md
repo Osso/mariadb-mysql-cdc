@@ -42,7 +42,7 @@ conflicting secondary key.
       observations through the independent control-plane connection, and retry
       from the unchanged checkpoint with bounded in-process backoff. Successful
       replay resolves the matching evidence row.
-- [ ] For the sole automatic parent-recovery exception, a persisted `1452` on
+- [x] For the sole automatic parent-recovery exception, a persisted `1452` on
       `globalcomix.sessions` naming `fk_sessions_guest` must carry non-empty
       `session_id`, `guest_id`, and `guest_hash`. Before replay, source `guests`
       must contain exactly one row matching both guest identity fields. Target
@@ -128,8 +128,11 @@ durable ledger persistence. Recovery requires the exact MySQL constraint name
 and ordered child columns (`guest_id`, `guest_hash`); suffix/name substring
 matches are ineligible. The typed request carries the persisted source
 transaction coordinate, child primary key, guest tuple, and child event
-timestamp. Source `create_time` must parse and be no later than the child event;
-missing or invalid times fail closed. One reconciliation attempt is allowed per
+timestamp. The identity query returns the canonical 23 columns plus a dedicated
+`UNIX_TIMESTAMP(create_time)` helper epoch. That absolute epoch must be no later
+than the child event; the session-time-zone-rendered `create_time` text does not
+control ordering, and the helper is excluded from insert and exact-row comparison.
+Missing or invalid epochs fail closed. One reconciliation attempt is allowed per
 exact persisted conflict identity per process reconnect loop. A later retry of
 the same identity skips mutation but still follows normal reconnect policy.
 Existing exact target parents are accepted idempotently after process loss;
@@ -163,8 +166,9 @@ primary key. It then asserts rollback, unchanged checkpoints, and durable
 idempotent evidence for a divergent secondary-unique conflict, different
 primary-key isolation, and a CHECK conflict. The structured-stream transaction
 tests separately assert the same rollback/evidence boundary for a foreign-key
-conflict; the commit adds unit coverage for exact session/guest recovery extraction
-and retry ordering, but not real source/target reads or inserts. The harness's FK
+conflict; unit coverage proves exact session/guest recovery extraction, epoch-based
+temporal ordering, canonical-row handling, and retry ordering, but not real
+source/target reads or inserts. The harness's FK
 scenarios cover repair ordering and cycle blocking.
 
 - [ ] Schedule recurring repair from unresolved records.

@@ -1,6 +1,21 @@
 use super::*;
 use crate::live::reconnect::{reconnect_delay, run_stream_reconnect_loop_with_recovery};
 
+fn exact_sessions_guest_recovery() -> SessionsGuestRecovery {
+    SessionsGuestRecovery {
+        source_file: "mysqld-bin.002709".to_string(),
+        source_start_position: 224_141_039,
+        source_end_position: 224_142_261,
+        child_event_timestamp: 1_752_710_400,
+        schema: "globalcomix".to_string(),
+        table: "sessions".to_string(),
+        constraint: "fk_sessions_guest".to_string(),
+        session_id: "109018328".to_string(),
+        guest_id: "78011674".to_string(),
+        guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
+    }
+}
+
 #[test]
 fn reconnect_delay_caps_at_five_seconds() {
     assert_eq!(reconnect_delay(1), Duration::from_secs(1));
@@ -187,18 +202,7 @@ fn recovers_exact_sessions_guest_after_persisted_conflict_before_unchanged_check
         max_reconnects: 1,
         ..ApplyBinlogConfig::default()
     };
-    let request = SessionsGuestRecovery {
-        source_file: "mysqld-bin.002709".to_string(),
-        source_start_position: 224_141_039,
-        source_end_position: 224_142_261,
-        child_event_timestamp: 1_752_710_400,
-        schema: "globalcomix".to_string(),
-        table: "sessions".to_string(),
-        constraint: "fk_sessions_guest".to_string(),
-        session_id: "109018328".to_string(),
-        guest_id: "78011674".to_string(),
-        guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
-    };
+    let request = exact_sessions_guest_recovery();
     let events = RefCell::new(Vec::new());
     let attempts = RefCell::new(0);
 
@@ -272,18 +276,7 @@ fn exhausted_reconnect_budget_does_not_recover_parent() {
         ..ApplyBinlogConfig::default()
     };
     let recoveries = RefCell::new(0);
-    let request = SessionsGuestRecovery {
-        source_file: "mysqld-bin.002709".to_string(),
-        source_start_position: 224_141_039,
-        source_end_position: 224_142_261,
-        child_event_timestamp: 1_752_710_400,
-        schema: "globalcomix".to_string(),
-        table: "sessions".to_string(),
-        constraint: "fk_sessions_guest".to_string(),
-        session_id: "109018328".to_string(),
-        guest_id: "78011674".to_string(),
-        guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
-    };
+    let request = exact_sessions_guest_recovery();
 
     let error = run_stream_reconnect_loop_with_recovery(
         &config,
@@ -319,18 +312,7 @@ fn recovers_each_exact_persisted_conflict_identity_once_per_loop() {
     };
     let attempts = RefCell::new(0);
     let recoveries = RefCell::new(0);
-    let request = SessionsGuestRecovery {
-        source_file: "mysqld-bin.002709".to_string(),
-        source_start_position: 224_141_039,
-        source_end_position: 224_142_261,
-        child_event_timestamp: 1_752_710_400,
-        schema: "globalcomix".to_string(),
-        table: "sessions".to_string(),
-        constraint: "fk_sessions_guest".to_string(),
-        session_id: "109018328".to_string(),
-        guest_id: "78011674".to_string(),
-        guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
-    };
+    let request = exact_sessions_guest_recovery();
 
     run_stream_reconnect_loop_with_recovery(
         &config,

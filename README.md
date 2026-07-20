@@ -86,8 +86,11 @@ runs for a persisted `1452` on the exact `globalcomix.sessions` composite
 failed transaction is rolled back and recorded first. Recovery is evaluated only
 when another reconnect is eligible and at most once per exact persisted conflict
 identity per process reconnect loop. The source `guests` row must uniquely match
-the guest tuple, its parseable `create_time` must not be later than the child event
-timestamp, and the target must contain no matching identity or one exact row. A
+the guest tuple, and a dedicated `UNIX_TIMESTAMP(create_time)` query epoch must
+not be later than the child event timestamp; session-time-zone-rendered timestamp
+text never controls ordering. The helper epoch is excluded from the canonical
+23-column insert/equality image, and the target must contain no matching identity
+or one exact row. A
 no-match lookup inserts the current source row; an exact row is an idempotent
 success after process loss. Later retries of the same identity skip mutation but
 retain reconnect behavior. Unsupported scope, missing/colliding/divergent or

@@ -30,6 +30,7 @@ pub(super) const GUEST_COLUMNS: [&str; 23] = [
     "supports_cookies",
     "reason",
 ];
+pub(super) const GUEST_CREATE_TIME_EPOCH_ALIAS: &str = "__recovery_create_time_epoch";
 const GUEST_IDENTITY_COLLISION_LIMIT: usize = 3;
 
 pub(crate) struct MySqlSyncReader {
@@ -77,15 +78,14 @@ impl MySqlSyncReader {
         guest_id: &str,
         guest_hash: &str,
     ) -> Result<Vec<SnapshotRow>, TableSyncError> {
-        let columns = guest_columns();
-        let sql = format!(
-            "SELECT {} FROM `guests` WHERE `guest_id` = {} OR `guest_hash` = {} ORDER BY `guest_id` LIMIT {}",
-            quote_ident_list(&columns),
-            quote_sql_literal(guest_id),
-            quote_sql_literal(guest_hash),
-            GUEST_IDENTITY_COLLISION_LIMIT,
-        );
-        parse_sync_rows(&columns, &["guest_id".to_string()], self.query_rows(&sql)?)
+        let mut query_columns = guest_columns();
+        query_columns.push(GUEST_CREATE_TIME_EPOCH_ALIAS.to_string());
+        let sql = build_guest_identity_sql(guest_id, guest_hash);
+        parse_sync_rows(
+            &query_columns,
+            &["guest_id".to_string()],
+            self.query_rows(&sql)?,
+        )
     }
 
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
@@ -124,6 +124,17 @@ impl SyncTableReader for MySqlSyncReader {
     fn requires_full_rows_for_missing_primary_keys(&self) -> bool {
         self.replace_divergent_primary
     }
+}
+
+fn build_guest_identity_sql(guest_id: &str, guest_hash: &str) -> String {
+    format!(
+        "SELECT {}, UNIX_TIMESTAMP(`create_time`) AS {} FROM `guests` WHERE `guest_id` = {} OR `guest_hash` = {} ORDER BY `guest_id` LIMIT {}",
+        quote_ident_list(&guest_columns()),
+        quote_ident(GUEST_CREATE_TIME_EPOCH_ALIAS),
+        quote_sql_literal(guest_id),
+        quote_sql_literal(guest_hash),
+        GUEST_IDENTITY_COLLISION_LIMIT,
+    )
 }
 
 pub(super) fn guest_columns() -> Vec<String> {
@@ -305,6 +316,14 @@ mod tests {
             "artist_id".to_string(),
             "name".to_string(),
         ]
+    }
+
+    #[test]
+    fn guest_identity_query_returns_canonical_columns_with_absolute_epoch_helper() {
+        let sql = build_guest_identity_sql("78011674", "guest-hash");
+
+        assert!(sql.contains("UNIX_TIMESTAMP(`create_time`) AS `__recovery_create_time_epoch`"));
+        assert!(sql.starts_with("SELECT `guest_id`, `guest_hash`,"));
     }
 
     #[test]

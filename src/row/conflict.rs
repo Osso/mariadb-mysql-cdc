@@ -185,7 +185,7 @@ fn skipped_conflict_observation(
     conflict: crate::target::DuplicateConflict,
 ) -> ConflictObservation {
     let sessions_guest_recovery =
-        sessions_guest_recovery(context, coordinate, table, change, &conflict);
+        build_exact_sessions_guest_recovery(context, coordinate, table, change, &conflict);
     ConflictObservation {
         source_identity: context.source_identity.to_string(),
         source_server_id: context.source_server_id,
@@ -211,7 +211,7 @@ fn skipped_conflict_observation(
     }
 }
 
-fn sessions_guest_recovery(
+fn build_exact_sessions_guest_recovery(
     context: &RowConflictContext<'_>,
     coordinate: &BinlogCoordinate,
     table: &RowTableMap,
@@ -221,7 +221,7 @@ fn sessions_guest_recovery(
     if table.schema != "globalcomix"
         || table.table != "sessions"
         || conflict.error_code != 1452
-        || !exact_sessions_guest_constraint_error(&conflict.error_text)
+        || !is_exact_sessions_guest_constraint_error(&conflict.error_text)
     {
         return None;
     }
@@ -245,7 +245,7 @@ fn sessions_guest_recovery(
     })
 }
 
-fn exact_sessions_guest_constraint_error(error_text: &str) -> bool {
+fn is_exact_sessions_guest_constraint_error(error_text: &str) -> bool {
     error_text.contains("`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`)")
 }
 
@@ -356,14 +356,14 @@ pub(crate) fn record_duplicate_conflict<C: ConflictStore>(
 
 #[cfg(test)]
 mod tests {
-    use super::exact_sessions_guest_constraint_error;
+    use super::is_exact_sessions_guest_constraint_error;
 
     #[test]
     fn accepts_only_exact_sessions_guest_constraint_identity() {
         let exact = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))";
         let suffix = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `archive_fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))";
 
-        assert!(exact_sessions_guest_constraint_error(exact));
-        assert!(!exact_sessions_guest_constraint_error(suffix));
+        assert!(is_exact_sessions_guest_constraint_error(exact));
+        assert!(!is_exact_sessions_guest_constraint_error(suffix));
     }
 }

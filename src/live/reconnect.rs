@@ -186,37 +186,62 @@ where
             }
             return Err(error);
         }
-        if let Some(request) = error.sessions_guest_recovery() {
-            if attempted_recoveries.insert(request.clone()) {
-                println!("{}", format_recovery_log("attempted", request, "started"));
-                if let Err(message) = recover(request) {
-                    eprintln!(
-                        "{} error={}",
-                        format_recovery_log("failed", request, "error"),
-                        shell_word(&message)
-                    );
-                    return Err(error);
-                }
-                println!(
-                    "{}",
-                    format_recovery_log("succeeded", request, "parent_reconciled")
-                );
-            } else {
-                println!(
-                    "{}",
-                    format_recovery_log("skipped", request, "already_attempted")
-                );
-            }
+        if attempt_exact_parent_recovery(&error, &mut attempted_recoveries, &mut recover).is_err() {
+            return Err(error);
         }
-        attempt += 1;
-        resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
-        attempt_config.source.validate_start_coordinate()?;
-        println!(
-            "{}",
-            format_reconnect_start(&attempt_config, attempt, &error)
-        );
+        prepare_next_attempt(&mut attempt_config, checkpoint_store, &mut attempt, &error)?;
         sleep(reconnect_delay(attempt));
     }
+}
+
+fn attempt_exact_parent_recovery<R>(
+    error: &ApplyBinlogError,
+    attempted_recoveries: &mut BTreeSet<crate::live::SessionsGuestRecovery>,
+    recover: &mut R,
+) -> Result<(), ()>
+where
+    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), String>,
+{
+    let Some(request) = error.sessions_guest_recovery() else {
+        return Ok(());
+    };
+    if !attempted_recoveries.insert(request.clone()) {
+        println!(
+            "{}",
+            format_recovery_log("skipped", request, "already_attempted")
+        );
+        return Ok(());
+    }
+    println!("{}", format_recovery_log("attempted", request, "started"));
+    if let Err(message) = recover(request) {
+        eprintln!(
+            "{} error={}",
+            format_recovery_log("failed", request, "error"),
+            shell_word(&message)
+        );
+        return Err(());
+    }
+    println!(
+        "{}",
+        format_recovery_log("succeeded", request, "parent_reconciled")
+    );
+    Ok(())
+}
+
+fn prepare_next_attempt<C: StreamCheckpointStore>(
+    attempt_config: &mut ApplyBinlogConfig,
+    checkpoint_store: Option<&C>,
+    attempt: &mut u32,
+    error: &ApplyBinlogError,
+) -> Result<(), ApplyBinlogError> {
+    *attempt += 1;
+    resume_from_checkpoint(attempt_config, checkpoint_store)?;
+    attempt_config.source.validate_start_coordinate()?;
+    println!(
+        "{}",
+        format_reconnect_start(attempt_config, *attempt, error)
+    );
+    Ok(())
 }
 
 fn format_recovery_log(

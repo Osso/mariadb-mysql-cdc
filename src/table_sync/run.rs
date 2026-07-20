@@ -1,4 +1,4 @@
-use super::mysql::{GUEST_COLUMNS, MySqlSyncReader, guest_columns};
+use super::mysql::{GUEST_COLUMNS, GUEST_CREATE_TIME_EPOCH_ALIAS, MySqlSyncReader, guest_columns};
 use super::range::sync_table_with_progress_range;
 use super::recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
 use super::*;
@@ -6,6 +6,11 @@ use std::time::Duration;
 
 const SYNC_CONNECTION_ATTEMPTS: usize = 5;
 const SYNC_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(1);
+const RECOVERY_CHILD_SCHEMA: &str = "globalcomix";
+const RECOVERY_CHILD_TABLE: &str = "sessions";
+const RECOVERY_CONSTRAINT: &str = "fk_sessions_guest";
+const RECOVERY_PARENT_TABLE: &str = "guests";
+const RECOVERY_PARENT_PRIMARY_KEY: &str = "guest_id";
 
 pub fn sync_table(
     table: &SyncTable,
@@ -86,19 +91,13 @@ pub(crate) fn reconcile_exact_sessions_guest(
         return Ok(());
     };
     let sync_config = exact_guest_sync_config(config, request);
-    mysql_repair_target(&sync_config)?.insert_row(source_row)
+    mysql_repair_target(&sync_config)?.insert_row(&source_row)
 }
 
 fn validate_sessions_guest_request(
     request: &crate::live::SessionsGuestRecovery,
 ) -> Result<(), TableSyncError> {
-    if request.schema == "globalcomix"
-        && request.table == "sessions"
-        && request.constraint == "fk_sessions_guest"
-        && !request.session_id.is_empty()
-        && !request.guest_id.is_empty()
-        && !request.guest_hash.is_empty()
-    {
+    if is_supported_recovery_scope(request) && has_complete_recovery_identity(request) {
         return Ok(());
     }
     Err(TableSyncError::InvalidTable(
@@ -106,28 +105,36 @@ fn validate_sessions_guest_request(
     ))
 }
 
-enum GuestReconciliation<'a> {
-    Insert(&'a crate::snapshot::SnapshotRow),
+fn is_supported_recovery_scope(request: &crate::live::SessionsGuestRecovery) -> bool {
+    request.schema == RECOVERY_CHILD_SCHEMA
+        && request.table == RECOVERY_CHILD_TABLE
+        && request.constraint == RECOVERY_CONSTRAINT
+}
+
+fn has_complete_recovery_identity(request: &crate::live::SessionsGuestRecovery) -> bool {
+    !request.session_id.is_empty() && !request.guest_id.is_empty() && !request.guest_hash.is_empty()
+}
+
+enum GuestReconciliation {
+    Insert(crate::snapshot::SnapshotRow),
     Existing,
 }
 
-fn plan_loaded_sessions_guest<'a>(
-    source_rows: &'a [crate::snapshot::SnapshotRow],
+fn plan_loaded_sessions_guest(
+    source_rows: &[crate::snapshot::SnapshotRow],
     target_rows: &[crate::snapshot::SnapshotRow],
     request: &crate::live::SessionsGuestRecovery,
-) -> Result<GuestReconciliation<'a>, TableSyncError> {
+) -> Result<GuestReconciliation, TableSyncError> {
     let source_row = require_exact_guest_row("source", source_rows, request)?;
     validate_parent_temporal_order(
-        source_row
-            .values
-            .get("create_time")
-            .and_then(Option::as_deref),
+        recovery_create_time_epoch(&source_row)?,
         request.child_event_timestamp,
     )?;
+    let source_row = canonical_guest_row(source_row);
     if target_rows.is_empty() {
         return Ok(GuestReconciliation::Insert(source_row));
     }
-    let target_row = require_exact_guest_row("target", target_rows, request)?;
+    let target_row = canonical_guest_row(require_exact_guest_row("target", target_rows, request)?);
     if target_row.values != source_row.values {
         return Err(TableSyncError::Repair(
             "target guests row diverges from exact source image".to_string(),
@@ -148,14 +155,34 @@ fn require_exact_guest_row<'a>(
         && row.primary_key == [request.guest_id.clone()]
         && row.values.get("guest_hash").and_then(Option::as_deref)
             == Some(request.guest_hash.as_str());
-    let has_complete_image = row.values.len() == GUEST_COLUMNS.len()
+    let has_complete_image = row.values.len() == GUEST_COLUMNS.len() + 1
         && GUEST_COLUMNS
             .iter()
-            .all(|column| row.values.contains_key(*column));
+            .all(|column| row.values.contains_key(*column))
+        && row.values.contains_key(GUEST_CREATE_TIME_EPOCH_ALIAS);
     if !has_exact_identity || !has_complete_image {
         return Err(guest_identity_error(side));
     }
     Ok(row)
+}
+
+fn canonical_guest_row(row: &crate::snapshot::SnapshotRow) -> crate::snapshot::SnapshotRow {
+    let mut row = row.clone();
+    row.values.remove(GUEST_CREATE_TIME_EPOCH_ALIAS);
+    row
+}
+
+fn recovery_create_time_epoch(row: &crate::snapshot::SnapshotRow) -> Result<u64, TableSyncError> {
+    row.values
+        .get(GUEST_CREATE_TIME_EPOCH_ALIAS)
+        .and_then(Option::as_deref)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            TableSyncError::Repair(
+                "sessions guest recovery parent create_time epoch is missing or invalid"
+                    .to_string(),
+            )
+        })
 }
 
 fn guest_identity_error(side: &str) -> TableSyncError {
@@ -165,7 +192,7 @@ fn guest_identity_error(side: &str) -> TableSyncError {
 }
 
 fn validate_parent_temporal_order(
-    create_time: Option<&str>,
+    parent_create_time_epoch: u64,
     child_event_timestamp: u64,
 ) -> Result<(), TableSyncError> {
     if child_event_timestamp == 0 {
@@ -173,72 +200,12 @@ fn validate_parent_temporal_order(
             "sessions guest recovery child event timestamp is missing".to_string(),
         ));
     }
-    let create_time = create_time.ok_or_else(|| {
-        TableSyncError::Repair("sessions guest recovery parent create_time is missing".to_string())
-    })?;
-    let parent_timestamp = parse_mysql_datetime(create_time).ok_or_else(|| {
-        TableSyncError::Repair("sessions guest recovery parent create_time is invalid".to_string())
-    })?;
-    if parent_timestamp > child_event_timestamp {
+    if parent_create_time_epoch > child_event_timestamp {
         return Err(TableSyncError::Repair(
             "sessions guest recovery parent was created after child event".to_string(),
         ));
     }
     Ok(())
-}
-
-fn parse_mysql_datetime(value: &str) -> Option<u64> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 19
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b' '
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-    {
-        return None;
-    }
-    let year = value[0..4].parse::<i64>().ok()?;
-    let month = value[5..7].parse::<u32>().ok()?;
-    let day = value[8..10].parse::<u32>().ok()?;
-    let hour = value[11..13].parse::<u32>().ok()?;
-    let minute = value[14..16].parse::<u32>().ok()?;
-    let second = value[17..19].parse::<u32>().ok()?;
-    if !(1..=12).contains(&month)
-        || day == 0
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-    let days = days_from_civil(year, month, day)?;
-    u64::try_from(days)
-        .ok()
-        .map(|days| days * 86_400 + u64::from(hour * 3_600 + minute * 60 + second))
-}
-
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        4 | 6 | 9 | 11 => 30,
-        2 if year.rem_euclid(400) == 0 || year.rem_euclid(4) == 0 && year.rem_euclid(100) != 0 => {
-            29
-        }
-        2 => 28,
-        _ => 31,
-    }
-}
-
-fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
-    let adjusted_year = year - i64::from(month <= 2);
-    let era = adjusted_year.div_euclid(400);
-    let year_of_era = adjusted_year - era * 400;
-    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    (days >= 0).then_some(days)
 }
 
 fn target_connection_config_for_apply(
@@ -263,12 +230,12 @@ fn exact_guest_sync_config(
             port: config.source.port,
             user: config.source.user.clone(),
             password: config.source.password.clone(),
-            database: "globalcomix".to_string(),
+            database: RECOVERY_CHILD_SCHEMA.to_string(),
         },
         target: config.target.clone(),
         table: SyncTable {
-            name: "guests".to_string(),
-            primary_key: vec!["guest_id".to_string()],
+            name: RECOVERY_PARENT_TABLE.to_string(),
+            primary_key: vec![RECOVERY_PARENT_PRIMARY_KEY.to_string()],
             columns: guest_columns(),
         },
         chunk_size: 1,
@@ -570,6 +537,7 @@ mod sessions_guest_recovery_tests {
             ("utm_id", None),
             ("http_user_agent", Some("Mozilla/5.0")),
             ("create_time", Some("2026-06-26 00:00:00")),
+            (GUEST_CREATE_TIME_EPOCH_ALIAS, Some("1782432000")),
             ("is_bot", Some("0")),
             ("params", Some("?reason=recovery")),
             ("application_user_access_token_id", None),
@@ -634,12 +602,25 @@ mod sessions_guest_recovery_tests {
     }
 
     #[test]
-    fn rejects_parent_created_after_child_event() {
-        assert!(
-            validate_parent_temporal_order(Some("2026-07-18 00:00:00"), 1_784_246_400,).is_err()
+    fn recovery_order_uses_epoch_not_timezone_rendered_timestamp_text() {
+        let request = request();
+        let mut earlier_parent = guest_row(&request.guest_id, &request.guest_hash);
+        earlier_parent.values.insert(
+            "create_time".to_string(),
+            Some("2099-12-31 23:59:59".to_string()),
         );
-        assert!(validate_parent_temporal_order(None, 1_784_246_400).is_err());
-        assert!(validate_parent_temporal_order(Some("not-a-timestamp"), 1_784_246_400).is_err());
+        assert!(plan_loaded_sessions_guest(&[earlier_parent], &[], &request).is_ok());
+
+        let mut later_parent = guest_row(&request.guest_id, &request.guest_hash);
+        later_parent.values.insert(
+            "create_time".to_string(),
+            Some("1970-01-01 00:00:00".to_string()),
+        );
+        later_parent.values.insert(
+            GUEST_CREATE_TIME_EPOCH_ALIAS.to_string(),
+            Some((request.child_event_timestamp + 1).to_string()),
+        );
+        assert!(plan_loaded_sessions_guest(&[later_parent], &[], &request).is_err());
     }
 
     #[test]
@@ -669,11 +650,14 @@ mod sessions_guest_recovery_tests {
         };
         let mut target = crate::table_sync::tests_support::RecordingRepairTarget::default();
         target
-            .insert_row(row_to_insert)
+            .insert_row(&row_to_insert)
             .expect("insert exact guest image");
 
         let inserted = target.inserts.borrow();
-        assert_eq!(inserted.as_slice(), std::slice::from_ref(&source_row));
+        assert_eq!(
+            inserted.as_slice(),
+            std::slice::from_ref(&canonical_guest_row(&source_row))
+        );
         assert_eq!(inserted[0].values.len(), 23);
         assert_eq!(inserted[0].values["geo_region_id"].as_deref(), Some("2"));
         assert_eq!(inserted[0].values["first_user_id"], None);

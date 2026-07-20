@@ -22,7 +22,10 @@ source connection loss without replaying from static startup coordinates.
   target `guests` identity before retrying. Insert one complete canonical
   23-column source parent only when the target lookup finds no row; accept an
   existing row only when exactly one complete row matches the source image,
-  including `guest_id` and `guest_hash`. Recovery failure is fail-closed: no
+  including `guest_id` and `guest_hash`. Compare parent/child ordering using the
+  dedicated `UNIX_TIMESTAMP(create_time)` query epoch, never the session-time-zone-
+  rendered canonical timestamp text; exclude that helper from insert and equality.
+  Recovery failure is fail-closed: no
   replay and no checkpoint advance. Disposable real-database proof remains a
   separate unchecked gap below.
 - [x] Stop and fail explicitly on other non-transient errors such as authentication
@@ -130,10 +133,12 @@ identity matching stops immediately.
 - `src/live/tests/reconnect.rs` — asserts exact sessions/guests recovery runs
   only after retry eligibility, observes the unchanged checkpoint, and is bounded
   to one attempt per exact persisted conflict identity per reconnect loop.
-- `src/table_sync/run.rs` — asserts partial three-column parent images are
-  rejected, complete 23-column images preserve required and nullable fields on
-  insert, and an existing target parent must match the complete source image.
-  These are unit tests, not a real source/target recovery proof.
+- `src/table_sync/run.rs` — asserts partial parent images are rejected, the
+  absolute create-time epoch controls ordering independently of rendered TIMESTAMP
+  text, complete 23-column images preserve required and nullable fields on insert,
+  the helper epoch is excluded, and an existing target parent must match the
+  complete canonical source image. These are unit tests, not a real source/target
+  recovery proof.
 - `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
   selection remain source-identity scoped.
 
