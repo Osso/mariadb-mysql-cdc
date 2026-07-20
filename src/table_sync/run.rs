@@ -287,7 +287,6 @@ pub(crate) fn find_compatible_failed_run(
         config.progress_table.clone(),
     );
     progress_store.ensure()?;
-    let candidates = progress_store.find_failed_run_candidates(table)?;
     let mut resumed_config = config.clone();
     resumed_config.mode = SyncMode::MissingPrimaryKeys;
     resumed_config.plan_hash = None;
@@ -300,5 +299,5 @@ pub(crate) fn find_compatible_failed_run(
         &resumed_config.end_at,
         resumed_config.max_deletes,
     )?;
-    select_compatible_failed_run(&candidates, table, phase, &expected_run_spec_json)
+    claim_compatible_failed_run(&mut progress_store, table, phase, &expected_run_spec_json)
 }

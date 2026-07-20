@@ -31,7 +31,9 @@ pub(crate) use model::{
 };
 #[cfg(test)]
 pub(crate) use mysql::build_sync_select_sql;
-pub(crate) use progress::{SyncRunCandidate, select_compatible_failed_run};
+pub(crate) use progress::{SyncRunCandidate, claim_compatible_failed_run};
+#[cfg(test)]
+pub(crate) use progress::{SyncRunSelectionStore, select_compatible_failed_run};
 #[cfg(test)]
 pub(crate) use range::build_run_spec_json;
 pub(crate) use range::{

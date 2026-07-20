@@ -102,6 +102,89 @@ pub trait SyncProgressStore {
     }
 }
 
+pub(crate) trait SyncRunSelectionStore {
+    fn find_failed_run_candidates(
+        &self,
+        table: &str,
+    ) -> Result<Vec<SyncRunCandidate>, TableSyncError>;
+
+    fn acquire_selection_lock(
+        &self,
+        _table: &str,
+        _run_spec_json: &str,
+    ) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+
+    fn release_selection_lock(
+        &self,
+        _table: &str,
+        _run_spec_json: &str,
+    ) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+
+    fn begin_selection_transaction(&self) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+
+    fn commit_selection_transaction(&self) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+
+    fn rollback_selection_transaction(&self) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+}
+
+pub(crate) fn claim_compatible_failed_run<P>(
+    progress_store: &mut P,
+    table: &str,
+    phase: SyncPhase,
+    expected_run_spec_json: &str,
+) -> Result<Option<SyncRunCandidate>, TableSyncError>
+where
+    P: SyncProgressStore + SyncRunSelectionStore,
+{
+    if phase != SyncPhase::InsertMissing {
+        return Ok(None);
+    }
+
+    progress_store.acquire_selection_lock(table, expected_run_spec_json)?;
+    progress_store.begin_selection_transaction()?;
+    let result = (|| {
+        let candidates = progress_store.find_failed_run_candidates(table)?;
+        let Some(candidate) =
+            select_compatible_failed_run(&candidates, table, phase, expected_run_spec_json)?
+        else {
+            progress_store.commit_selection_transaction()?;
+            return Ok(None);
+        };
+        let mut progress = progress_store.load(&candidate.run_id)?.ok_or_else(|| {
+            TableSyncError::Progress(format!(
+                "selected failed run `{}` disappeared before claim",
+                candidate.run_id
+            ))
+        })?;
+        progress.mark_running(candidate.mode);
+        progress_store.save(&progress)?;
+        progress_store.commit_selection_transaction()?;
+        Ok(Some(candidate))
+    })();
+    if result.is_err() {
+        let _ = progress_store.rollback_selection_transaction();
+    }
+    let release_result = progress_store.release_selection_lock(table, expected_run_spec_json);
+    match (result, release_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(release_error)) => Err(TableSyncError::Progress(format!(
+            "{error}; also failed to release compatible-run selection lock: {release_error}"
+        ))),
+    }
+}
+
 pub struct NoopSyncProgressStore;
 
 impl SyncProgressStore for NoopSyncProgressStore {
@@ -203,6 +286,49 @@ impl MySqlSyncRunProgressStore {
             .inner
             .query(build_failed_run_candidates_sql(&self.inner.table, table))?;
         parse_run_candidates(&output)
+    }
+}
+
+impl SyncRunSelectionStore for MySqlSyncRunProgressStore {
+    fn find_failed_run_candidates(
+        &self,
+        table: &str,
+    ) -> Result<Vec<SyncRunCandidate>, TableSyncError> {
+        self.find_failed_run_candidates(table)
+    }
+
+    fn acquire_selection_lock(
+        &self,
+        table: &str,
+        run_spec_json: &str,
+    ) -> Result<(), TableSyncError> {
+        let result = self
+            .inner
+            .query(build_acquire_selection_lock_sql(table, run_spec_json))?;
+        require_selection_lock_result(table, run_spec_json, &result)
+    }
+
+    fn release_selection_lock(
+        &self,
+        table: &str,
+        run_spec_json: &str,
+    ) -> Result<(), TableSyncError> {
+        let result = self
+            .inner
+            .query(build_release_selection_lock_sql(table, run_spec_json))?;
+        require_selection_lock_release(table, run_spec_json, &result)
+    }
+
+    fn begin_selection_transaction(&self) -> Result<(), TableSyncError> {
+        self.inner.execute("START TRANSACTION".to_string())
+    }
+
+    fn commit_selection_transaction(&self) -> Result<(), TableSyncError> {
+        self.inner.execute("COMMIT".to_string())
+    }
+
+    fn rollback_selection_transaction(&self) -> Result<(), TableSyncError> {
+        self.inner.execute("ROLLBACK".to_string())
     }
 }
 
@@ -477,6 +603,22 @@ fn require_sync_run_schema(table: &str, output: &str) -> Result<(), TableSyncErr
     )))
 }
 
+fn build_acquire_selection_lock_sql(table: &str, run_spec_json: &str) -> String {
+    format!(
+        "SELECT GET_LOCK(SHA2(CONCAT('sync-run-claim:',{},':',{}),256),0)",
+        quote_sql_literal(table),
+        quote_sql_literal(run_spec_json)
+    )
+}
+
+fn build_release_selection_lock_sql(table: &str, run_spec_json: &str) -> String {
+    format!(
+        "SELECT RELEASE_LOCK(SHA2(CONCAT('sync-run-claim:',{},':',{}),256))",
+        quote_sql_literal(table),
+        quote_sql_literal(run_spec_json)
+    )
+}
+
 fn build_acquire_run_lock_sql(run_id: &str) -> String {
     format!("SELECT GET_LOCK(SHA2({},256),0)", quote_sql_literal(run_id))
 }
@@ -486,6 +628,32 @@ fn build_release_run_lock_sql(run_id: &str) -> String {
         "SELECT RELEASE_LOCK(SHA2({},256))",
         quote_sql_literal(run_id)
     )
+}
+
+fn require_selection_lock_result(
+    table: &str,
+    run_spec_json: &str,
+    output: &str,
+) -> Result<(), TableSyncError> {
+    if output.trim() == "1" {
+        return Ok(());
+    }
+    Err(TableSyncError::Progress(format!(
+        "compatible failed-run selection is already active for table `{table}` and immutable specification `{run_spec_json}`"
+    )))
+}
+
+fn require_selection_lock_release(
+    table: &str,
+    run_spec_json: &str,
+    output: &str,
+) -> Result<(), TableSyncError> {
+    if output.trim() == "1" {
+        return Ok(());
+    }
+    Err(TableSyncError::Progress(format!(
+        "compatible failed-run selection lock was not owned for table `{table}` and immutable specification `{run_spec_json}`"
+    )))
 }
 
 fn require_run_lock_result(run_id: &str, output: &str) -> Result<(), TableSyncError> {

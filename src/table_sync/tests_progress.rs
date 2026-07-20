@@ -1,5 +1,165 @@
 use super::tests_support::*;
 use super::*;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+
+struct ReclamationProgressStore {
+    progress: RefCell<BTreeMap<String, SyncTableProgress>>,
+    saved: RefCell<Vec<SyncTableProgress>>,
+    transition_after_first_enumeration: RefCell<Option<String>>,
+    enumeration_count: Cell<usize>,
+}
+
+impl ReclamationProgressStore {
+    fn new(progress: Vec<SyncTableProgress>, transition_after_first_enumeration: &str) -> Self {
+        Self {
+            progress: RefCell::new(
+                progress
+                    .into_iter()
+                    .map(|progress| {
+                        (
+                            progress.run_id.clone().expect("run-scoped progress"),
+                            progress,
+                        )
+                    })
+                    .collect(),
+            ),
+            saved: RefCell::new(Vec::new()),
+            transition_after_first_enumeration: RefCell::new(Some(
+                transition_after_first_enumeration.to_string(),
+            )),
+            enumeration_count: Cell::new(0),
+        }
+    }
+
+    fn get(&self, run_id: &str) -> SyncTableProgress {
+        self.progress
+            .borrow()
+            .get(run_id)
+            .cloned()
+            .expect("progress row")
+    }
+}
+
+impl SyncProgressStore for ReclamationProgressStore {
+    fn ensure(&mut self) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+
+    fn load(&self, run_id: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
+        Ok(self.progress.borrow().get(run_id).cloned())
+    }
+
+    fn save(&mut self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
+        let run_id = progress.run_id.clone().expect("run-scoped progress");
+        self.progress.borrow_mut().insert(run_id, progress.clone());
+        self.saved.borrow_mut().push(progress.clone());
+        Ok(())
+    }
+
+    fn save_error(&mut self, run_id: &str, error: &TableSyncError) -> Result<(), TableSyncError> {
+        let mut progress = self.get(run_id);
+        progress.status = progress::SyncProgressStatus::Error;
+        progress.last_error = Some(error.to_string());
+        self.progress
+            .borrow_mut()
+            .insert(run_id.to_string(), progress);
+        Ok(())
+    }
+}
+
+impl SyncRunSelectionStore for ReclamationProgressStore {
+    fn find_failed_run_candidates(
+        &self,
+        table: &str,
+    ) -> Result<Vec<SyncRunCandidate>, TableSyncError> {
+        let enumeration = self.enumeration_count.get() + 1;
+        self.enumeration_count.set(enumeration);
+        let candidates = self
+            .progress
+            .borrow()
+            .values()
+            .filter(|progress| {
+                progress.table == table && progress.status == progress::SyncProgressStatus::Error
+            })
+            .map(|progress| SyncRunCandidate {
+                run_id: progress.run_id.clone().expect("run-scoped progress"),
+                table: progress.table.clone(),
+                run_spec_json: progress.run_spec_json.clone().expect("run specification"),
+                mode: progress.mode,
+                status: progress.status,
+            })
+            .collect();
+        if enumeration == 1 {
+            if let Some(run_id) = self.transition_after_first_enumeration.borrow_mut().take() {
+                let mut progress = self.get(&run_id);
+                progress.status = progress::SyncProgressStatus::Error;
+                progress.last_error = Some("second run failed".to_string());
+                self.progress.borrow_mut().insert(run_id, progress);
+            }
+        }
+        Ok(candidates)
+    }
+}
+
+fn failed_run_progress(
+    run_id: &str,
+    spec: &str,
+    status: progress::SyncProgressStatus,
+) -> SyncTableProgress {
+    SyncTableProgress {
+        run_id: Some(run_id.to_string()),
+        run_spec_json: Some(spec.to_string()),
+        table: "guests".to_string(),
+        last_primary_key: Some(vec!["10".to_string()]),
+        chunks: 2,
+        rows_scanned: 20,
+        total_rows: Some(100),
+        inserts: 3,
+        updates: 4,
+        extra_target_rows: 5,
+        mode: SyncMode::MissingPrimaryKeys,
+        status,
+        last_error: Some("original failure".to_string()),
+    }
+}
+
+#[test]
+fn concurrent_exact_failed_run_appearing_after_enumeration_fails_without_claim_mutation() {
+    let expected_spec =
+        r#"{"scope":"current","table":"guests","chunk_size":1,"mode":"missing_primary_keys"}"#;
+    let selected_before = failed_run_progress(
+        "selected",
+        expected_spec,
+        progress::SyncProgressStatus::Error,
+    );
+    let mut store = ReclamationProgressStore::new(
+        vec![
+            selected_before.clone(),
+            failed_run_progress(
+                "appears-after-enumeration",
+                expected_spec,
+                progress::SyncProgressStatus::Running,
+            ),
+        ],
+        "appears-after-enumeration",
+    );
+
+    let error = claim_compatible_failed_run(
+        &mut store,
+        "guests",
+        SyncPhase::InsertMissing,
+        expected_spec,
+    )
+    .expect_err("new exact-compatible failure must make selection ambiguous");
+
+    assert_eq!(
+        error.to_string(),
+        "sync progress failed: multiple compatible failed missing-primary-keys runs exist for table `guests`"
+    );
+    assert_eq!(store.get("selected"), selected_before);
+    assert!(store.saved.borrow().is_empty());
+}
 
 #[test]
 fn differing_immutable_spec_does_not_make_exact_candidate_ambiguous() {
