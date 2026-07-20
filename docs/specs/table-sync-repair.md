@@ -58,10 +58,12 @@ are resolved only after verified equality.
 ## Required phased behavior before completion
 
 1. Inventory source/target schemas and canonical enforced FK edges; for a
-   selected-table repair, retain only its transitive dependency closure.
-2. Hash the immutable run plan and filtered inventories; fail closed on drift.
-   Disconnected FK cycles are outside the hash and do not block the run, while a
-   cycle involving a selected table or required dependency blocks before mutation.
+   selected-table repair, derive parentward ancestor scope for inserts/updates
+   and childward descendant scope for delete safety independently. Never
+   alternate directions through shared nodes into siblings.
+2. Hash the immutable run plan and filtered directional inventories; fail closed
+   on drift. Disconnected FK cycles are outside the hash and do not block the run,
+   while a cycle in either required phase scope blocks before mutation.
 3. Preflight all delete ceilings and cycles before any mutation.
 4. Delete reviewed extras child-first.
 5. Insert missing rows parent-first.

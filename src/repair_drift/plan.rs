@@ -1,5 +1,8 @@
 use super::{RepairDriftConfig, RepairDriftError, RepairDriftSkip};
-use crate::conflict_repair::{RepairInventory, RepairPlan, RepairPlanError, build_repair_plan};
+use crate::conflict_repair::{
+    CanonicalForeignKey, RepairInventory, RepairPlan, RepairPlanError, build_repair_plan,
+    build_repair_plan_with_directional_scopes,
+};
 use crate::drift_check::DriftComparison;
 use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, SchemaInventory, TableInventory,
@@ -10,6 +13,11 @@ use crate::table_sync::SyncTable;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) type RepairTableInputs = BTreeMap<String, (u64, u64, SyncTable)>;
+
+struct DependencyRepairScopes {
+    insert_update: RepairInventory,
+    delete: RepairInventory,
+}
 
 pub(crate) fn build_fk_aware_repair_plan(
     run_id: &str,
@@ -310,7 +318,7 @@ pub(crate) fn build_runtime_repair_plan(
 fn build_source_repair_inventory(
     config: &RepairDriftConfig,
     inventory: &SchemaInventory,
-) -> Result<RepairInventory, RepairDriftError> {
+) -> Result<DependencyRepairScopes, RepairDriftError> {
     let repair_inventory = build_repair_inventory(
         &config.source,
         InventoryEndpointRole::Source,
@@ -319,7 +327,7 @@ fn build_source_repair_inventory(
         inventory,
     )
     .map_err(|error| RepairDriftError::Inventory(error.to_string()))?;
-    Ok(reduce_to_dependency_closure(
+    Ok(reduce_to_dependency_scopes(
         repair_inventory,
         selected_tables_for_closure(config, inventory),
     ))
@@ -328,7 +336,7 @@ fn build_source_repair_inventory(
 fn build_target_repair_inventory(
     config: &RepairDriftConfig,
     inventory: &SchemaInventory,
-) -> Result<RepairInventory, RepairDriftError> {
+) -> Result<DependencyRepairScopes, RepairDriftError> {
     let target_source = target_as_connection_config(config);
     let mut repair_inventory = build_repair_inventory(
         &target_source,
@@ -339,7 +347,7 @@ fn build_target_repair_inventory(
     )
     .map_err(|error| RepairDriftError::Inventory(error.to_string()))?;
     exclude_progress_table(&mut repair_inventory, &config.progress_table);
-    Ok(reduce_to_dependency_closure(
+    Ok(reduce_to_dependency_scopes(
         repair_inventory,
         selected_tables_for_closure(config, inventory),
     ))
@@ -358,15 +366,17 @@ fn target_as_connection_config(config: &RepairDriftConfig) -> MySqlConnectionCon
 fn build_plan(
     config: &RepairDriftConfig,
     run_id: &str,
-    source: RepairInventory,
-    target: RepairInventory,
+    source: DependencyRepairScopes,
+    target: DependencyRepairScopes,
 ) -> Result<RepairPlan, RepairDriftError> {
-    build_fk_aware_repair_plan(
+    build_repair_plan_with_directional_scopes(
         run_id,
         &config.source_identity,
         &format!("{}:{}", config.target.host, config.target.database),
-        &source,
-        &target,
+        &source.insert_update,
+        &target.insert_update,
+        &source.delete,
+        &target.delete,
         config.max_deletes.unwrap_or(0),
     )
     .map_err(|error| RepairDriftError::Inventory(error.to_string()))
@@ -398,41 +408,101 @@ fn selected_tables_for_closure(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reduce_to_dependency_closure(
     inventory: RepairInventory,
     selected_tables: Vec<String>,
 ) -> RepairInventory {
-    let mut closure = selected_tables.into_iter().collect::<BTreeSet<_>>();
+    let scopes = reduce_to_dependency_scopes(inventory, selected_tables);
+    merge_dependency_scopes(&scopes)
+}
+
+fn reduce_to_dependency_scopes(
+    inventory: RepairInventory,
+    selected_tables: Vec<String>,
+) -> DependencyRepairScopes {
+    let selected = selected_tables.into_iter().collect::<BTreeSet<_>>();
+    let insert_update_tables =
+        directional_table_closure(&inventory.foreign_keys, &selected, |foreign_key| {
+            (&foreign_key.child_table, &foreign_key.parent_table)
+        });
+    let delete_tables =
+        directional_table_closure(&inventory.foreign_keys, &selected, |foreign_key| {
+            (&foreign_key.parent_table, &foreign_key.child_table)
+        });
+    DependencyRepairScopes {
+        insert_update: filter_repair_inventory(&inventory, &insert_update_tables),
+        delete: filter_repair_inventory(&inventory, &delete_tables),
+    }
+}
+
+fn directional_table_closure(
+    foreign_keys: &[CanonicalForeignKey],
+    selected: &BTreeSet<String>,
+    edge: impl Fn(&CanonicalForeignKey) -> (&String, &String),
+) -> BTreeSet<String> {
+    let mut closure = selected.clone();
     loop {
         let previous_size = closure.len();
-        for foreign_key in &inventory.foreign_keys {
-            if closure.contains(&foreign_key.child_table)
-                || closure.contains(&foreign_key.parent_table)
-            {
-                closure.insert(foreign_key.child_table.clone());
-                closure.insert(foreign_key.parent_table.clone());
+        for foreign_key in foreign_keys
+            .iter()
+            .filter(|foreign_key| foreign_key.enforced)
+        {
+            let (from, to) = edge(foreign_key);
+            if closure.contains(from) {
+                closure.insert(to.clone());
             }
         }
         if closure.len() == previous_size {
-            break;
+            return closure;
         }
     }
+}
 
+fn filter_repair_inventory(
+    inventory: &RepairInventory,
+    tables: &BTreeSet<String>,
+) -> RepairInventory {
     RepairInventory {
-        schema: inventory.schema,
+        schema: inventory.schema.clone(),
         tables: inventory
             .tables
-            .into_iter()
-            .filter(|table| closure.contains(table))
+            .iter()
+            .filter(|table| tables.contains(*table))
+            .cloned()
             .collect(),
         foreign_keys: inventory
             .foreign_keys
-            .into_iter()
+            .iter()
             .filter(|foreign_key| {
-                closure.contains(&foreign_key.child_table)
-                    && closure.contains(&foreign_key.parent_table)
+                tables.contains(&foreign_key.child_table)
+                    && tables.contains(&foreign_key.parent_table)
             })
+            .cloned()
             .collect(),
+    }
+}
+
+#[cfg(test)]
+fn merge_dependency_scopes(scopes: &DependencyRepairScopes) -> RepairInventory {
+    let tables = scopes
+        .insert_update
+        .tables
+        .iter()
+        .chain(&scopes.delete.tables)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let foreign_keys = scopes
+        .insert_update
+        .foreign_keys
+        .iter()
+        .chain(&scopes.delete.foreign_keys)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    RepairInventory {
+        schema: scopes.insert_update.schema.clone(),
+        tables: tables.into_iter().collect(),
+        foreign_keys: foreign_keys.into_iter().collect(),
     }
 }
 

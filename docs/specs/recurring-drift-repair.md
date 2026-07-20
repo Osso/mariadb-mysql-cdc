@@ -13,9 +13,11 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
 - [x] Generate a fresh orchestration run ID for each invocation.
 - [x] Inventory source/target base tables and compare counts plus bounded content
       checks.
-- [x] When `--table` selects a subset, reduce each repair inventory to the
-      selected tables' transitive foreign-key dependency closure before planning;
-      disconnected tables and constraints remain outside the repair scope.
+- [x] When `--table` selects a subset, derive independent directional scopes:
+      parentward ancestors for InsertMissing/UpdateDivergent and childward
+      descendants for DeleteExtras; traversal never alternates through a shared
+      node into siblings, and disconnected tables/constraints remain outside the
+      repair scope.
 - [x] Skip missing/incompatible tables with explicit reasons.
 - [x] Require an explicit `--max-deletes` in apply mode.
 - [x] Pass child run IDs to `sync-table`.
@@ -33,12 +35,13 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
 ## Wired phased behavior
 
 - [x] Canonical source/target FK inventory drives child-first deletes and
-      parent-first inserts; `NO ACTION` and `RESTRICT` normalize across engines.
+      parent-first inserts; directional phase scopes keep sibling cycles out of
+      unrelated selections; `NO ACTION` and `RESTRICT` normalize across engines.
 - [x] Immutable plan hashes include the filtered source/target repair inventories
       and reject changed plans when reusing an interrupted run.
-- [x] Cycles within the selected dependency closure, FK inventory/schema mismatch,
-      and delete ceilings block before target mutation; disconnected cycles are
-      ignored.
+- [x] Cycles within either required directional phase scope, FK inventory/schema
+      mismatch, and delete ceilings block before target mutation; disconnected
+      cycles are ignored.
 - [x] `--start-after`/`--end-at` bound the selected PK window; apply mode always
       carries an explicit `--max-deletes` value.
 - [x] Unresolved conflicts resolve only after verified equality, with run/evidence

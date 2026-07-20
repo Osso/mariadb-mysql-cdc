@@ -12,15 +12,49 @@ pub fn build_repair_plan(
     target: &RepairInventory,
     max_deletes: u64,
 ) -> Result<RepairPlan, RepairPlanError> {
-    validate_inventory_match(source, target)?;
-    validate_foreign_keys(source)?;
-    let (insert_order, delete_order) = repair_orders(source)?;
-    let (inventory_hash, plan_hash) = build_plan_hashes(
+    build_repair_plan_with_directional_scopes(
         run_id,
         source_identity,
         target_identity,
         source,
         target,
+        source,
+        target,
+        max_deletes,
+    )
+}
+
+pub fn build_repair_plan_with_directional_scopes(
+    run_id: &str,
+    source_identity: &str,
+    target_identity: &str,
+    source_insert_update: &RepairInventory,
+    target_insert_update: &RepairInventory,
+    source_delete: &RepairInventory,
+    target_delete: &RepairInventory,
+    max_deletes: u64,
+) -> Result<RepairPlan, RepairPlanError> {
+    validate_inventory_match(source_insert_update, target_insert_update)?;
+    validate_inventory_match(source_delete, target_delete)?;
+    validate_foreign_keys(source_insert_update)?;
+    validate_foreign_keys(source_delete)?;
+    let insert_order = topological_order(
+        &source_insert_update.tables,
+        &source_insert_update.foreign_keys,
+    )?;
+    let delete_order = reversed(&topological_order(
+        &source_delete.tables,
+        &source_delete.foreign_keys,
+    )?);
+    let tables = merged_tables(&insert_order, &delete_order);
+    let (inventory_hash, plan_hash) = build_directional_plan_hashes(
+        run_id,
+        source_identity,
+        target_identity,
+        source_insert_update,
+        target_insert_update,
+        source_delete,
+        target_delete,
         max_deletes,
     );
     Ok(assemble_repair_plan(RepairPlanAssemblyInput {
@@ -29,26 +63,29 @@ pub fn build_repair_plan(
         target_identity: target_identity.to_string(),
         inventory_hash,
         plan_hash,
-        insert_order,
+        tables,
+        insert_order: insert_order.clone(),
         delete_order,
         max_deletes,
     }))
 }
 
-fn repair_orders(source: &RepairInventory) -> Result<(Vec<String>, Vec<String>), RepairPlanError> {
-    let insert_order = topological_order(&source.tables, &source.foreign_keys)?;
-    Ok((insert_order.clone(), reversed(&insert_order)))
-}
-
-fn build_plan_hashes(
+fn build_directional_plan_hashes(
     run_id: &str,
     source_identity: &str,
     target_identity: &str,
-    source: &RepairInventory,
-    target: &RepairInventory,
+    source_insert_update: &RepairInventory,
+    target_insert_update: &RepairInventory,
+    source_delete: &RepairInventory,
+    target_delete: &RepairInventory,
     max_deletes: u64,
 ) -> (String, String) {
-    let inventory_hash = stable_hash(&(source.clone(), target.clone()));
+    let inventory_hash = stable_hash(&(
+        source_insert_update,
+        target_insert_update,
+        source_delete,
+        target_delete,
+    ));
     let plan_hash = stable_hash(&(
         run_id,
         source_identity,
@@ -65,6 +102,7 @@ struct RepairPlanAssemblyInput {
     target_identity: String,
     inventory_hash: String,
     plan_hash: String,
+    tables: Vec<String>,
     insert_order: Vec<String>,
     delete_order: Vec<String>,
     max_deletes: u64,
@@ -77,12 +115,22 @@ fn assemble_repair_plan(input: RepairPlanAssemblyInput) -> RepairPlan {
         target_identity: input.target_identity,
         inventory_hash: input.inventory_hash,
         plan_hash: input.plan_hash,
-        tables: input.insert_order.clone(),
+        tables: input.tables,
         delete_order: input.delete_order,
         insert_order: input.insert_order.clone(),
         update_order: input.insert_order,
         max_deletes: input.max_deletes,
     }
+}
+
+fn merged_tables(insert_order: &[String], delete_order: &[String]) -> Vec<String> {
+    insert_order
+        .iter()
+        .chain(delete_order)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn validate_inventory_match(

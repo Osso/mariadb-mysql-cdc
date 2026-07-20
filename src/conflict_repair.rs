@@ -7,7 +7,7 @@ mod store;
 mod tests;
 
 pub use model::*;
-pub use plan::{build_repair_plan, run_phased_repair};
+pub use plan::{build_repair_plan, build_repair_plan_with_directional_scopes, run_phased_repair};
 pub use schema::build_conflict_validation_sql;
 pub use sql::{
     build_conflict_observation_sql, build_conflict_resolution_by_table_sql,
