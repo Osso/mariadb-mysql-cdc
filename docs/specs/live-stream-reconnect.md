@@ -22,10 +22,22 @@ source connection loss without replaying from static startup coordinates.
   target `guests` identity before retrying. Insert one complete canonical
   23-column source parent only when the target lookup finds no row; accept an
   existing row only when exactly one complete row matches the source image,
-  including `guest_id` and `guest_hash`. Compare parent/child ordering using the
-  dedicated `UNIX_TIMESTAMP(create_time)` query epoch, never the session-time-zone-rendered canonical timestamp text; source and target recovery connections explicitly set `time_zone='+00:00'` once when each connection is created, before parent reads/writes, while the epoch helper remains excluded from insert and equality.
-  The recovery value is reconstructed deterministically from the replayed row image and persisted conflict identity; it is not stored in `cdc.row_conflicts`. Recovery failure returns a contextual typed non-retryable error: no replay, another attempt, or checkpoint advance. Successful child replay writes matching conflict resolution after child DML/checkpoint and before the same target COMMIT; post-commit work only updates process-local cache. Disposable real-database proof remains a
-  separate unchecked gap below.
+  including `guest_id` and `guest_hash`.
+- [x] For the exact `globalcomix.home_feed_card_slides` foreign-key error `1452`
+  naming `fk_hfcs_card` (`card_id` → `home_feed_cards.id`), persist the conflict
+  first, then validate positive child IDs and the complete source parent image
+  before retrying. Insert the canonical parent only when the target has no
+  matching identity; accept one exact existing row and fail closed otherwise.
+  Both paths compare parent/child ordering using the dedicated
+  `UNIX_TIMESTAMP(create_time)` query epoch, never rendered timestamp text;
+  recovery connections set `time_zone='+00:00'`, and the helper epoch is excluded
+  from insert and equality. Recovery values are reconstructed deterministically
+  from replay input and conflict context, not stored in `cdc.row_conflicts`.
+  Recovery failure returns a contextual typed non-retryable error: no replay,
+  another attempt, or checkpoint advance. Successful child replay writes matching
+  conflict resolution after child DML/checkpoint and before the same target
+  COMMIT; post-commit work only updates process-local cache. Disposable
+  real-database proof remains a separate unchecked gap below.
 - [x] Stop and fail explicitly on other non-transient errors such as authentication
   failure, missing binlog file, unsupported event type, quarantine, or target
   write failure without durable row-conflict evidence.
@@ -35,7 +47,8 @@ conflict. The default stream budget is 12 reconnects after the initial attempt
 (13 attempts total); `--max-reconnects 0` disables reconnects, and
 `--reconnect-forever true` removes the cap for retryable stream failures,
 including persisted row conflicts. Purged or missing source binlogs and other
-non-transient failures never use that unbounded path. For the admitted sessions/guests case, recovery runs after
+non-transient failures never use that unbounded path. For either admitted exact
+parent-recovery case, recovery runs after
 the failed transaction has rolled back and ledger evidence is durable, before the
 unchanged checkpoint is replayed. The parent repair itself does not advance the stream
 checkpoint; only successful replay advances it. Recovery requires a durable
@@ -109,8 +122,8 @@ identity matching stops immediately.
 - `src/live/structured_stream/` — production native `mysql_cdc` row/DDL stream,
   transaction boundaries, and event-end checkpoint decisions.
 - `src/live/reconnect.rs` — reconnect policy and checkpoint resume semantics.
-- `src/table_sync/run.rs` and `src/table_sync/mysql.rs` — bounded exact
-  sessions/guest recovery using the canonical 23-column source image.
+- `src/table_sync/run.rs` and `src/table_sync/mysql.rs` — bounded exact parent
+  recovery for sessions/guests and home-feed cards using canonical source images.
 - `src/stream_checkpoint.rs` — target-table checkpoint store.
 - `src/live/binlog_command.rs` — text-binlog helper retained for the legacy probe
   and fixture/debug paths, not the production stream.
@@ -131,18 +144,18 @@ identity matching stops immediately.
   reconnect only while positive attempts remain, `--reconnect-forever true`
   allows unlimited retryable stream failures (including persisted row conflicts),
   and non-transient or purged-binlog failures do not reconnect.
-- `src/live/tests/reconnect.rs` — asserts the sessions/guests recovery attempt
-  runs only after retry eligibility, observes the unchanged checkpoint, and is
-  bounded to one attempt per distinct `SessionsGuestRecovery` request value per
-  reconnect loop; this is not ledger-identity deduplication. The same file also
-  proves the zero-budget and repeated-request boundaries, but not real database
-  reads, inserts, or the production reconnect process.
+- `src/live/tests/reconnect.rs` — asserts both exact parent-recovery attempts run
+  only after retry eligibility, observe the unchanged checkpoint, and are bounded
+  to one attempt per distinct `ExactParentRecovery` value per reconnect loop; this
+  is not ledger-identity deduplication. The same file proves the zero-budget and
+  repeated-request boundaries, but not real database reads, inserts, or the
+  production reconnect process.
 - `src/table_sync/run.rs` — asserts partial parent images are rejected, the
   absolute create-time epoch controls ordering independently of rendered TIMESTAMP
-  text, complete 23-column images preserve required and nullable fields on insert,
-  the helper epoch is excluded, and an existing target parent must match the
-  complete canonical source image. These are unit tests, not a real source/target
-  recovery proof.
+  text, canonical guest and home-feed-card images preserve required and nullable
+  fields on insert, the helper epoch is excluded, and an existing target parent
+  must match the complete source image. These are unit tests, not a real
+  source/target recovery proof.
 - `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
   selection remain source-identity scoped.
 
@@ -154,11 +167,11 @@ identity matching stops immediately.
   next stream resumes from the saved checkpoint.
 - [x] Add a failing test where process startup reads an existing checkpoint and
   overrides static startup coordinates.
-- [ ] Prove the sessions/guests recovery against disposable real MariaDB/MySQL,
+- [ ] Prove both exact parent recoveries against disposable real MariaDB/MySQL,
   including source/target identity collisions, recovery failure, parent insert,
   and successful replay/checkpoint advancement. The existing real FK harness
   scenario proves conflict rollback/evidence and manual repair boundaries, not
-  this automatic reconnect callback.
+  these automatic reconnect callbacks.
 - [x] Add a failing test that checkpoint is written only after successful target
   apply.
 - [x] Production streaming uses the native client/reconnect loop; the

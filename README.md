@@ -83,32 +83,23 @@ conflicts retry in-process from that unchanged checkpoint with bounded backoff;
 the stream defaults to 12 reconnects after the initial attempt (13 attempts total),
 `--max-reconnects 0` disables reconnects, and `--reconnect-forever true` removes
 that cap for retryable stream failures, including persisted row conflicts. Successful replay resolves the
-matching evidence. One narrow automatic recovery
-runs for a persisted `1452` on the exact `globalcomix.sessions` composite
-`fk_sessions_guest` identity and ordered (`guest_id`, `guest_hash`) columns. The
-failed transaction is rolled back and recorded first. Recovery is evaluated only
-when another reconnect is eligible and at most once per distinct
-`SessionsGuestRecovery` value per process reconnect loop. That typed value is
-reconstructed deterministically during replay from the replayed binlog row image and
-conflict context; it is not stored in `cdc.row_conflicts`. Deduplication is by
-that reconstructed value, not by a general ledger-identity key. The source `guests` row must
-uniquely match
-the guest tuple, and a dedicated `UNIX_TIMESTAMP(create_time)` query epoch must
-not be later than the child event timestamp; session-time-zone-rendered timestamp
-text never controls ordering. The helper epoch is excluded from the canonical
-23-column insert/equality image, and the target must contain no matching identity
-or one exact row. A
-no-match lookup inserts the current source row; an exact row is an idempotent
-success after process loss. Later retries of the same request skip mutation but
-retain reconnect behavior. Unsupported scope, missing/colliding/divergent or
-temporally invalid identities, unavailable connections, and recovery write
-failure return a contextual typed non-retryable recovery error without replay,
-another attempt, or checkpoint advance. Structured recovery logs carry
-the source coordinate, child primary key, guest tuple, action, and outcome. Only
-normal child replay commit/checkpoint resolves ledger evidence. This is not
-generic FK repair, performs no historical binlog reconstruction, requires a
-durable checkpoint store, and has no real source/target automatic-recovery
-proof in this commit.
+matching evidence. Two narrow automatic parent-first recoveries run for persisted
+`1452`s: the exact `globalcomix.sessions` composite `fk_sessions_guest`
+(`guest_id`, `guest_hash`) parent in `guests`, and the exact
+`globalcomix.home_feed_card_slides` `fk_hfcs_card` (`card_id`) parent in
+`home_feed_cards`. The failed transaction is rolled back and recorded first.
+Recovery is evaluated only when another reconnect is eligible and at most once per
+distinct `ExactParentRecovery` value per process reconnect loop. Each request is
+reconstructed deterministically during replay from the row image and conflict
+context; it is not stored in `cdc.row_conflicts`. Both paths require a complete,
+temporally valid source parent image, accept no matching target identity or one
+exact existing row, insert only on no match, and fail closed on unsupported,
+missing, colliding, divergent, unavailable, or write-failure state. Recovery never
+advances the checkpoint; normal child replay commit/checkpoint resolves ledger
+evidence. Structured logs carry source coordinates, child identity, action, and
+outcome. This is not generic FK repair, performs no historical binlog
+reconstruction, requires a durable checkpoint store, and has no real source/target
+automatic-recovery proof in this commit.
 Guarded observation upserts
 are idempotent. The admin-bootstrapped
 `cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory

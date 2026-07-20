@@ -46,15 +46,17 @@ conflicting secondary key.
       `--reconnect-forever true` removes that cap for retryable stream failures,
       including persisted row conflicts. Successful replay resolves the matching
       evidence row.
-- [x] For the sole automatic parent-recovery exception, a persisted `1452` on
+- [x] For the exact automatic parent-recovery cases, a persisted `1452` on
       `globalcomix.sessions` naming `fk_sessions_guest` must carry non-empty
-      `session_id`, `guest_id`, and `guest_hash`. Before replay, source `guests`
-      must contain exactly one row matching both guest identity fields. Target
-      lookup by either identity must return no row or exactly one equal row; a
-      no-match lookup gets one exact insert, while divergent, colliding, or
-      ambiguous state fails closed.
-      Recovery never updates or deletes a parent and never advances the stream
-      checkpoint; only the subsequent successful replay can do that.
+      `session_id`, `guest_id`, and `guest_hash`; source `guests` must contain
+      exactly one matching row. A persisted `1452` on
+      `globalcomix.home_feed_card_slides` naming `fk_hfcs_card` must carry
+      positive `slide_id` and `card_id`; source `home_feed_cards` must contain
+      exactly one complete row for that card. Each target lookup must return no
+      row or exactly one equal row; a no-match lookup gets one exact insert,
+      while divergent, colliding, or ambiguous state fails closed. Recovery
+      never updates or deletes a parent and never advances the stream checkpoint;
+      only the subsequent successful replay can do that.
 - [x] Emit parseable `cdc_row_conflict_skipped` output with operation, table,
       source coordinate, and source primary key.
 - [x] Replay the same source event into the same identity and increment its
@@ -128,19 +130,26 @@ source-transaction end coordinates, rolls back the target transaction, then
 persists the unresolved observations through the independent durable ledger
 before returning the row failure. The failed transaction and later coordinates
 are not checkpointed, while the independently persisted evidence survives.
-For the exact `globalcomix.sessions` composite `fk_sessions_guest` identity,
-the reconnect loop first verifies that another reconnect is eligible, then
-performs strict source/target `guests` identity validation after rollback and
-durable ledger persistence. Recovery requires the exact MySQL constraint name, ordered child columns (`guest_id`, `guest_hash`), and parent reference `REFERENCES `guests` (`guest_id`, `guest_hash`)`; suffix/name substring or alternate-parent matches are ineligible. The typed request carries the persisted source
-transaction coordinate, child primary key, guest tuple, and child event
-timestamp. It is reconstructed deterministically from the replayed row image and
+For each exact parent-recovery identity, the reconnect loop first verifies that
+another reconnect is eligible, then performs strict source/target parent
+validation after rollback and durable ledger persistence. The `sessions` path
+requires the exact `fk_sessions_guest` scope and `guests` composite identity;
+the home-feed path requires `fk_hfcs_card` and
+`home_feed_card_slides.card_id` → `home_feed_cards.id`. For `sessions`, the exact
+constraint name, ordered child columns (`guest_id`, `guest_hash`), and parent
+reference `REFERENCES `guests` (`guest_id`, `guest_hash`) are required; for
+home-feed cards, the exact constraint and `card_id` parent reference are
+required. Suffix/name substring or alternate-parent matches are ineligible. Each
+typed request carries the persisted source transaction coordinate, child primary
+key, child identity fields, and child event timestamp. It is reconstructed deterministically from the replayed row image and
 persisted conflict identity, not stored in `cdc.row_conflicts`. Recovery source
 and target connections set `time_zone='+00:00'` once when each connection is
-created, before full parent reads or insertion. The identity query returns the canonical 23 columns plus a dedicated `UNIX_TIMESTAMP(create_time)` helper epoch. That absolute epoch must be no later
+created, before full parent reads or insertion. Each identity query returns that path's canonical parent columns plus a dedicated
+`UNIX_TIMESTAMP(create_time)` helper epoch. That absolute epoch must be no later
 than the child event; the session-time-zone-rendered `create_time` text does not
 control ordering, and the helper is excluded from insert and exact-row comparison.
 Missing or invalid epochs fail closed. One reconciliation attempt is allowed per
-distinct reconstructed `SessionsGuestRecovery` value per process reconnect loop;
+distinct reconstructed `ExactParentRecovery` value per process reconnect loop;
 this is not ledger-identity deduplication. A later retry of the same request skips
 mutation but still follows normal reconnect policy.
 Existing exact target parents are accepted idempotently after process loss;
@@ -175,8 +184,9 @@ primary key. It then asserts rollback, unchanged checkpoints, and durable
 idempotent evidence for a divergent secondary-unique conflict, different
 primary-key isolation, and a CHECK conflict. The structured-stream transaction
 tests separately assert the same rollback/evidence boundary for a foreign-key
-conflict; unit coverage proves exact session/guest recovery extraction, epoch-based
-temporal ordering, canonical-row handling, and request-value retry ordering,
+conflict; unit coverage proves exact session/guest and home-feed-card recovery
+extraction, epoch-based temporal ordering, canonical-row handling, and
+request-value retry ordering,
 but not real source/target reads or inserts. The harness's FK
 scenarios cover repair ordering and cycle blocking.
 
