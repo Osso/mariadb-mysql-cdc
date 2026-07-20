@@ -121,13 +121,26 @@ source-transaction end coordinates, rolls back the target transaction, then
 persists the unresolved observations through the independent durable ledger
 before returning the row failure. The failed transaction and later coordinates
 are not checkpointed, while the independently persisted evidence survives.
-For the exact `globalcomix.sessions`/`fk_sessions_guest` case, the reconnect
-loop performs strict source/target `guests` identity validation after the failed
-transaction rolls back and ledger evidence is durable, before retrying from that
-unchanged checkpoint. It inserts one exact source parent only when the target has
-no matching identity; any unsupported, absent, duplicate, colliding, or divergent
-identity, connection failure, or insert failure stops without replay. The recovery
-is not generic FK repair and requires a durable checkpoint store.
+For the exact `globalcomix.sessions` composite `fk_sessions_guest` identity,
+the reconnect loop first verifies that another reconnect is eligible, then
+performs strict source/target `guests` identity validation after rollback and
+durable ledger persistence. Recovery requires the exact MySQL constraint name
+and ordered child columns (`guest_id`, `guest_hash`); suffix/name substring
+matches are ineligible. The typed request carries the persisted source
+transaction coordinate, child primary key, guest tuple, and child event
+timestamp. Source `create_time` must parse and be no later than the child event;
+missing or invalid times fail closed. One reconciliation attempt is allowed per
+exact persisted conflict identity per process reconnect loop. A later retry of
+the same identity skips mutation but still follows normal reconnect policy.
+Existing exact target parents are accepted idempotently after process loss;
+otherwise one current source parent image is inserted only when the target has
+no matching identity. Unsupported, absent, duplicate, colliding, divergent, or
+temporally invalid identities, connection failures, and insert failures stop
+without replay. Recovery emits deterministic attempted/skipped/succeeded/failed
+logs. It never resolves the ledger entry; normal child replay must commit and
+checkpoint before the existing resolution path can mark it resolved. Recovery
+is not generic FK repair, performs no historical binlog reconstruction, and
+requires a durable checkpoint store.
 Equal native ROW `INSERT` duplicates are logged and applied without ledger
 persistence or rollback; divergent native ROW `INSERT` duplicates follow the
 durable conflict path.

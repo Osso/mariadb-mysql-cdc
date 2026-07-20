@@ -81,6 +81,13 @@ pub(crate) fn reconcile_exact_sessions_guest(
     .map_err(TableSyncError::Read)?;
     let source_rows = source.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
     let source_row = require_exact_guest_row("source", &source_rows, request)?;
+    validate_parent_temporal_order(
+        source_row
+            .values
+            .get("create_time")
+            .and_then(Option::as_deref),
+        request.child_event_timestamp,
+    )?;
     let target_rows = target.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
     if target_rows.is_empty() {
         let sync_config = exact_guest_sync_config(config, request);
@@ -124,6 +131,83 @@ fn require_exact_guest_row<'a>(
     Ok(&rows[0])
 }
 
+fn validate_parent_temporal_order(
+    create_time: Option<&str>,
+    child_event_timestamp: u64,
+) -> Result<(), TableSyncError> {
+    if child_event_timestamp == 0 {
+        return Err(TableSyncError::Repair(
+            "sessions guest recovery child event timestamp is missing".to_string(),
+        ));
+    }
+    let create_time = create_time.ok_or_else(|| {
+        TableSyncError::Repair("sessions guest recovery parent create_time is missing".to_string())
+    })?;
+    let parent_timestamp = parse_mysql_datetime(create_time).ok_or_else(|| {
+        TableSyncError::Repair("sessions guest recovery parent create_time is invalid".to_string())
+    })?;
+    if parent_timestamp > child_event_timestamp {
+        return Err(TableSyncError::Repair(
+            "sessions guest recovery parent was created after child event".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_mysql_datetime(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b' '
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year = value[0..4].parse::<i64>().ok()?;
+    let month = value[5..7].parse::<u32>().ok()?;
+    let day = value[8..10].parse::<u32>().ok()?;
+    let hour = value[11..13].parse::<u32>().ok()?;
+    let minute = value[14..16].parse::<u32>().ok()?;
+    let second = value[17..19].parse::<u32>().ok()?;
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    u64::try_from(days)
+        .ok()
+        .map(|days| days * 86_400 + u64::from(hour * 3_600 + minute * 60 + second))
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if year.rem_euclid(400) == 0 || year.rem_euclid(4) == 0 && year.rem_euclid(100) != 0 => {
+            29
+        }
+        2 => 28,
+        _ => 31,
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    (days >= 0).then_some(days)
+}
+
 fn target_connection_config_for_apply(
     config: &crate::live::ApplyBinlogConfig,
 ) -> crate::mysql_snapshot::MySqlConnectionConfig {
@@ -152,7 +236,11 @@ fn exact_guest_sync_config(
         table: SyncTable {
             name: "guests".to_string(),
             primary_key: vec!["guest_id".to_string()],
-            columns: vec!["guest_id".to_string(), "guest_hash".to_string()],
+            columns: vec![
+                "guest_id".to_string(),
+                "guest_hash".to_string(),
+                "create_time".to_string(),
+            ],
         },
         chunk_size: 1,
         mode: SyncMode::MissingPrimaryKeys,
@@ -201,66 +289,6 @@ where
         }
     }
     unreachable!("sync retry loop has at least one attempt")
-}
-
-#[cfg(test)]
-mod sessions_guest_recovery_tests {
-    use super::*;
-    use std::collections::BTreeMap;
-
-    fn request() -> crate::live::SessionsGuestRecovery {
-        crate::live::SessionsGuestRecovery {
-            schema: "globalcomix".to_string(),
-            table: "sessions".to_string(),
-            constraint: "fk_sessions_guest".to_string(),
-            session_id: "109018328".to_string(),
-            guest_id: "78011674".to_string(),
-            guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
-        }
-    }
-
-    fn guest_row(guest_id: &str, guest_hash: &str) -> crate::snapshot::SnapshotRow {
-        crate::snapshot::SnapshotRow {
-            primary_key: vec![guest_id.to_string()],
-            values: BTreeMap::from([
-                ("guest_id".to_string(), Some(guest_id.to_string())),
-                ("guest_hash".to_string(), Some(guest_hash.to_string())),
-            ]),
-        }
-    }
-
-    #[test]
-    fn rejects_unsupported_conflict_scope() {
-        let mut unsupported = request();
-        unsupported.constraint = "other_fk".to_string();
-
-        assert!(validate_sessions_guest_request(&unsupported).is_err());
-    }
-
-    #[test]
-    fn rejects_absent_or_nonmatching_source_parent() {
-        let request = request();
-        assert!(require_exact_guest_row("source", &[], &request).is_err());
-        assert!(
-            require_exact_guest_row(
-                "source",
-                &[guest_row(&request.guest_id, "different")],
-                &request,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_target_id_or_hash_collision() {
-        let request = request();
-        let rows = [
-            guest_row(&request.guest_id, "different"),
-            guest_row("999", &request.guest_hash),
-        ];
-
-        assert!(require_exact_guest_row("target", &rows, &request).is_err());
-    }
 }
 
 fn is_retryable_connection_error(error: &TableSyncError) -> bool {
@@ -472,4 +500,89 @@ pub(crate) fn find_compatible_failed_run(
         resumed_config.max_deletes,
     )?;
     claim_compatible_failed_run(&mut progress_store, table, phase, &expected_run_spec_json)
+}
+
+#[cfg(test)]
+mod sessions_guest_recovery_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn request() -> crate::live::SessionsGuestRecovery {
+        crate::live::SessionsGuestRecovery {
+            source_file: "mysqld-bin.002709".to_string(),
+            source_start_position: 224_141_039,
+            source_end_position: 224_142_261,
+            child_event_timestamp: 1_784_246_400,
+            schema: "globalcomix".to_string(),
+            table: "sessions".to_string(),
+            constraint: "fk_sessions_guest".to_string(),
+            session_id: "109018328".to_string(),
+            guest_id: "78011674".to_string(),
+            guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
+        }
+    }
+
+    fn guest_row(guest_id: &str, guest_hash: &str) -> crate::snapshot::SnapshotRow {
+        crate::snapshot::SnapshotRow {
+            primary_key: vec![guest_id.to_string()],
+            values: BTreeMap::from([
+                ("guest_id".to_string(), Some(guest_id.to_string())),
+                ("guest_hash".to_string(), Some(guest_hash.to_string())),
+                (
+                    "create_time".to_string(),
+                    Some("2026-06-26 00:00:00".to_string()),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_conflict_scope() {
+        let mut unsupported = request();
+        unsupported.constraint = "other_fk".to_string();
+
+        assert!(validate_sessions_guest_request(&unsupported).is_err());
+    }
+
+    #[test]
+    fn rejects_absent_or_nonmatching_source_parent() {
+        let request = request();
+        assert!(require_exact_guest_row("source", &[], &request).is_err());
+        assert!(
+            require_exact_guest_row(
+                "source",
+                &[guest_row(&request.guest_id, "different")],
+                &request,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_target_id_or_hash_collision() {
+        let request = request();
+        let rows = [
+            guest_row(&request.guest_id, "different"),
+            guest_row("999", &request.guest_hash),
+        ];
+
+        assert!(require_exact_guest_row("target", &rows, &request).is_err());
+    }
+
+    #[test]
+    fn rejects_parent_created_after_child_event() {
+        assert!(
+            validate_parent_temporal_order(Some("2026-07-18 00:00:00"), 1_784_246_400,).is_err()
+        );
+        assert!(validate_parent_temporal_order(None, 1_784_246_400).is_err());
+        assert!(validate_parent_temporal_order(Some("not-a-timestamp"), 1_784_246_400).is_err());
+    }
+
+    #[test]
+    fn accepts_exact_existing_parent_after_process_loss() {
+        let request = request();
+        let rows = [guest_row(&request.guest_id, &request.guest_hash)];
+
+        assert!(require_exact_guest_row("target", &rows, &request).is_ok());
+    }
 }

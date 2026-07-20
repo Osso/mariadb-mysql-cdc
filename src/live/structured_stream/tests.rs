@@ -126,8 +126,12 @@ fn bytes(item: &str) -> Value {
 }
 
 fn event_header(event_type: u8, next_event_position: u32) -> EventHeader {
+    event_header_at(event_type, next_event_position, 0)
+}
+
+fn event_header_at(event_type: u8, next_event_position: u32, timestamp: u32) -> EventHeader {
     EventHeader {
-        timestamp: 0,
+        timestamp,
         event_type,
         server_id: 1,
         event_length: 19,
@@ -688,7 +692,7 @@ impl TargetExecutor for TransactionRecordingExecutor {
                     Ok(crate::target::TargetExecutionOutcome::ConstraintConflict(
                         crate::target::DuplicateConflict {
                             error_code: 1452,
-                            error_text: "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest`)"
+                            error_text: "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))"
                                 .to_string(),
                             duplicate_index: None,
                         },

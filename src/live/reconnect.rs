@@ -4,6 +4,7 @@ use crate::probe::BinlogCoordinate;
 #[cfg(test)]
 use crate::statement::StatementEvent;
 use crate::stream_checkpoint::MySqlStreamCheckpointStore;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 const MAX_RECONNECT_DELAY_SECONDS: u64 = 5;
@@ -157,56 +158,83 @@ where
     resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
     attempt_config.source.validate_start_coordinate()?;
     let mut attempt = 0;
+    let mut attempted_recoveries = BTreeSet::new();
 
     loop {
-        match run_attempt(&attempt_config) {
+        let error = match run_attempt(&attempt_config) {
             Ok(()) => return Ok(()),
-            Err(error) if is_stale_or_missing_binlog_error(&error) => {
-                return Err(ApplyBinlogError::SourceCommand(format!(
-                    "stale or purged source binlog requires operator repair; checkpoint was not changed; error={error}"
-                )));
-            }
-            Err(error)
-                if checkpoint_store.is_some()
-                    && recover_before_reconnect(&error, &mut recover)
-                    && should_reconnect(
-                        &error,
-                        attempt,
-                        config.max_reconnects,
-                        config.reconnect_forever,
-                    ) =>
-            {
-                attempt += 1;
-                resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
-                attempt_config.source.validate_start_coordinate()?;
+            Err(error) => error,
+        };
+        if is_stale_or_missing_binlog_error(&error) {
+            return Err(ApplyBinlogError::SourceCommand(format!(
+                "stale or purged source binlog requires operator repair; checkpoint was not changed; error={error}"
+            )));
+        }
+        if checkpoint_store.is_none()
+            || !should_reconnect(
+                &error,
+                attempt,
+                config.max_reconnects,
+                config.reconnect_forever,
+            )
+        {
+            if let Some(request) = error.sessions_guest_recovery() {
                 println!(
                     "{}",
-                    format_reconnect_start(&attempt_config, attempt, &error)
+                    format_recovery_log("skipped", request, "retry_ineligible")
                 );
-                sleep(reconnect_delay(attempt));
             }
-            Err(error) => return Err(error),
+            return Err(error);
         }
+        if let Some(request) = error.sessions_guest_recovery() {
+            if attempted_recoveries.insert(request.clone()) {
+                println!("{}", format_recovery_log("attempted", request, "started"));
+                if let Err(message) = recover(request) {
+                    eprintln!(
+                        "{} error={}",
+                        format_recovery_log("failed", request, "error"),
+                        shell_word(&message)
+                    );
+                    return Err(error);
+                }
+                println!(
+                    "{}",
+                    format_recovery_log("succeeded", request, "parent_reconciled")
+                );
+            } else {
+                println!(
+                    "{}",
+                    format_recovery_log("skipped", request, "already_attempted")
+                );
+            }
+        }
+        attempt += 1;
+        resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
+        attempt_config.source.validate_start_coordinate()?;
+        println!(
+            "{}",
+            format_reconnect_start(&attempt_config, attempt, &error)
+        );
+        sleep(reconnect_delay(attempt));
     }
 }
 
-fn recover_before_reconnect(
-    error: &ApplyBinlogError,
-    recover: &mut impl FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), String>,
-) -> bool {
-    let Some(request) = error.sessions_guest_recovery() else {
-        return true;
-    };
-    match recover(request) {
-        Ok(()) => true,
-        Err(message) => {
-            eprintln!(
-                "cdc_sessions_guest_recovery_failed error={}",
-                shell_word(&message)
-            );
-            false
-        }
-    }
+fn format_recovery_log(
+    action: &str,
+    request: &crate::live::SessionsGuestRecovery,
+    outcome: &str,
+) -> String {
+    format!(
+        "cdc_sessions_guest_recovery action={} source_file={} source_start_position={} source_end_position={} child_pk={} guest_id={} guest_hash={} outcome={}",
+        action,
+        shell_word(&request.source_file),
+        request.source_start_position,
+        request.source_end_position,
+        shell_word(&request.session_id),
+        shell_word(&request.guest_id),
+        shell_word(&request.guest_hash),
+        outcome,
+    )
 }
 
 pub(super) fn resume_from_checkpoint(

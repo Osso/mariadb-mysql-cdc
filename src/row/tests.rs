@@ -142,6 +142,7 @@ fn replaced_divergent_primary_continues_and_records_durable_evidence() {
         source_identity: "source-a",
         source_server_id: 7,
         end_position: 200,
+        child_event_timestamp: 0,
         observed_at_ms: 100,
     };
 
@@ -212,6 +213,7 @@ fn ignored_duplicate_row_continues_without_persisting_conflict() {
         source_identity: "source-a",
         source_server_id: 7,
         end_position: 200,
+        child_event_timestamp: 0,
         observed_at_ms: 100,
     };
 

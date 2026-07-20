@@ -81,18 +81,22 @@ divergent inserts and every non-`INSERT` `1062` unique conflict persist evidence
 roll back, and leave the target transaction/checkpoint uncommitted. Durable row
 conflicts retry in-process with bounded backoff from that unchanged checkpoint;
 successful replay resolves the matching evidence. One narrow automatic recovery
-runs for a persisted `1452` on `globalcomix.sessions` naming `fk_sessions_guest`:
-the failed transaction is rolled back and recorded first, then the source `guests`
-row must be uniquely identified by matching `guest_id` and `guest_hash`; the target
-lookup must find no row matching either identity or exactly one equal row, and only
-a no-match lookup is inserted. The
-stream retries the same source transaction only after that recovery succeeds.
-Unsupported scope, missing/colliding/divergent identities, unavailable connections,
-or recovery write failure stop the stream without replay or checkpoint advance.
-This is not generic FK repair, requires a durable checkpoint store, and has no
-real-MySQL/live proof in this commit. The recovery callback is evaluated before
-retry-budget gating, so an eligible parent check/insert may occur even when no
-reconnect remains; the original source event still does not replay or checkpoint.
+runs for a persisted `1452` on the exact `globalcomix.sessions` composite
+`fk_sessions_guest` identity and ordered (`guest_id`, `guest_hash`) columns. The
+failed transaction is rolled back and recorded first. Recovery is evaluated only
+when another reconnect is eligible and at most once per exact persisted conflict
+identity per process reconnect loop. The source `guests` row must uniquely match
+the guest tuple, its parseable `create_time` must not be later than the child event
+timestamp, and the target must contain no matching identity or one exact row. A
+no-match lookup inserts the current source row; an exact row is an idempotent
+success after process loss. Later retries of the same identity skip mutation but
+retain reconnect behavior. Unsupported scope, missing/colliding/divergent or
+temporally invalid identities, unavailable connections, and recovery write
+failure stop without replay or checkpoint advance. Structured recovery logs carry
+the source coordinate, child primary key, guest tuple, action, and outcome. Only
+normal child replay commit/checkpoint resolves ledger evidence. This is not
+generic FK repair, performs no historical binlog reconstruction, requires a
+durable checkpoint store, and has no real-MySQL/live proof in this commit.
 Guarded observation upserts
 are idempotent. The admin-bootstrapped
 `cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory

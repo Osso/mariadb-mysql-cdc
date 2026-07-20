@@ -153,6 +153,9 @@ impl TargetTransaction {
         let mut observations = std::mem::take(&mut self.pending_conflict_observations);
         for observation in &mut observations {
             observation.coordinate.end_position = end_position;
+            if let Some(request) = &mut observation.sessions_guest_recovery {
+                request.source_end_position = end_position;
+            }
         }
         observations
     }
@@ -250,6 +253,7 @@ where
         source_identity,
         source_server_id: u64::from(header.server_id),
         end_position: u64::from(header.next_event_position),
+        child_event_timestamp: u64::from(header.timestamp),
         observed_at_ms: current_time_ms(),
     };
     let outcome = match handle_structured_event_with_conflicts(
@@ -413,7 +417,8 @@ fn persist_deferred_conflicts(
         .unwrap_or_else(|| "unknown row conflict".to_string());
     let sessions_guest_recovery = observations
         .iter()
-        .find_map(|observation| observation.sessions_guest_recovery.clone());
+        .find_map(|observation| observation.sessions_guest_recovery.clone())
+        .map(Box::new);
     for observation in observations {
         conflict_store
             .observe(observation)

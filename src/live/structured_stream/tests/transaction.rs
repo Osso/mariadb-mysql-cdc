@@ -1027,7 +1027,7 @@ fn sessions_109018328_fk_conflict_carries_exact_guest_recovery_after_rollback_an
             transaction: &mut transaction,
             conflicts: &mut conflicts,
         },
-        &event_header(30, 224_141_058),
+        &event_header_at(30, 224_141_058, 1_784_246_400),
         &event,
         224_142_261,
     );
@@ -1048,6 +1048,10 @@ fn sessions_109018328_fk_conflict_carries_exact_guest_recovery_after_rollback_an
     assert_eq!(
         error.sessions_guest_recovery(),
         Some(&crate::live::SessionsGuestRecovery {
+            source_file: "mysqld-bin.002709".to_string(),
+            source_start_position: 224_141_039,
+            source_end_position: 224_142_261,
+            child_event_timestamp: 1_784_246_400,
             schema: "globalcomix".to_string(),
             table: "sessions".to_string(),
             constraint: "fk_sessions_guest".to_string(),

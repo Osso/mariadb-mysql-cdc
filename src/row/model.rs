@@ -60,6 +60,7 @@ pub struct RowConflictContext<'a> {
     pub source_identity: &'a str,
     pub source_server_id: u64,
     pub end_position: u64,
+    pub child_event_timestamp: u64,
     pub observed_at_ms: u64,
 }
 

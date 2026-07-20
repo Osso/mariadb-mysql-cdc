@@ -338,8 +338,12 @@ pub struct ApplyBinlogReport {
     pub quarantined_statements: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SessionsGuestRecovery {
+    pub source_file: String,
+    pub source_start_position: u64,
+    pub source_end_position: u64,
+    pub child_event_timestamp: u64,
     pub schema: String,
     pub table: String,
     pub constraint: String,
@@ -355,7 +359,7 @@ pub enum ApplyBinlogError {
     Target(String),
     RowConflictPersisted {
         message: String,
-        sessions_guest_recovery: Option<SessionsGuestRecovery>,
+        sessions_guest_recovery: Option<Box<SessionsGuestRecovery>>,
     },
     Statement(String),
     Quarantined(Vec<QuarantinedStatement>),
@@ -391,7 +395,7 @@ impl ApplyBinlogError {
             Self::RowConflictPersisted {
                 sessions_guest_recovery,
                 ..
-            } => sessions_guest_recovery.as_ref(),
+            } => sessions_guest_recovery.as_deref(),
             _ => None,
         }
     }

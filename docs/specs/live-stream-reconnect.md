@@ -124,8 +124,9 @@ identity matching stops immediately.
   allows unlimited transient reconnects, and non-transient source failures do
   not reconnect.
 - `src/live/tests/reconnect.rs` — asserts exact sessions/guests recovery runs
-  before replay and observes the unchanged checkpoint; this is unit coverage,
-  not a real source/target recovery proof.
+  only after retry eligibility, observes the unchanged checkpoint, and is bounded
+  to one attempt per exact persisted conflict identity per reconnect loop; this
+  is unit coverage, not a real source/target recovery proof.
 - `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
   selection remain source-identity scoped.
 

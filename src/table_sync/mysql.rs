@@ -51,12 +51,16 @@ impl MySqlSyncReader {
         guest_hash: &str,
     ) -> Result<Vec<SnapshotRow>, TableSyncError> {
         let sql = format!(
-            "SELECT `guest_id`, `guest_hash` FROM `guests` WHERE `guest_id` = {} OR `guest_hash` = {} ORDER BY `guest_id` LIMIT 3",
+            "SELECT `guest_id`, `guest_hash`, `create_time` FROM `guests` WHERE `guest_id` = {} OR `guest_hash` = {} ORDER BY `guest_id` LIMIT 3",
             quote_sql_literal(guest_id),
             quote_sql_literal(guest_hash),
         );
         parse_sync_rows(
-            &["guest_id".to_string(), "guest_hash".to_string()],
+            &[
+                "guest_id".to_string(),
+                "guest_hash".to_string(),
+                "create_time".to_string(),
+            ],
             &["guest_id".to_string()],
             self.query_rows(&sql)?,
         )
