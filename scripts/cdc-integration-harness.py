@@ -2369,32 +2369,31 @@ class Harness:
 
         self.admin_sql(
             self.target,
-            "CREATE TABLE IF NOT EXISTS globalcomix.table_sync_runs ("
-            "run_id VARCHAR(128) NOT NULL PRIMARY KEY, "
-            "table_name VARCHAR(255) NOT NULL, "
-            "run_spec_json LONGTEXT NOT NULL, "
-            "last_primary_key_json TEXT NULL, "
-            "chunks BIGINT UNSIGNED NOT NULL DEFAULT 0, "
-            "rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0, "
-            "total_rows BIGINT UNSIGNED NULL, "
-            "inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0, "
-            "updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0, "
-            "extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0, "
-            "mode VARCHAR(32) NOT NULL, "
-            "status VARCHAR(16) NOT NULL, "
-            "last_error TEXT NULL, "
-            "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
-            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
-            ") ENGINE=InnoDB; "
-            "INSERT INTO globalcomix.table_sync_runs "
-            "(run_id,table_name,run_spec_json,last_primary_key_json,chunks,rows_scanned,total_rows,"
-            "inserts_applied,updates_applied,extra_target_rows,mode,status,last_error) VALUES ("
-            f"{sql_literal(durable_run_id)},'guests',"
-            "'{\"scope\":\"durable-fixture\",\"table\":\"guests\","
-            "\"mode\":\"missing_primary_keys\"}',"
-            f"{sql_literal(json.dumps([str(resume_pk)]))},1,1,2,1,0,0,"
-            "'missing-primary-keys','error','original blocker cleared; resume required');",
+            "CREATE TRIGGER reject_missing_guest BEFORE INSERT ON guests FOR EACH ROW "
+            f"SET NEW.payload=IF(NEW.guest_id={guest_id},REPEAT('x',128),NEW.payload);",
         )
+        durable_args = self._sync_table_args(self._repair_binary())
+        durable_args[durable_args.index("accounts")] = "guests"
+        durable_args[durable_args.index("id")] = "guest_id"
+        durable_args[durable_args.index("id,email,payload")] = "guest_id,guest_hash,payload"
+        durable_args[durable_args.index("sync-table-source-ca-proof")] = durable_run_id
+        durable_args[durable_args.index("globalcomix.sync_table_tls_progress")] = (
+            "globalcomix.table_sync_runs"
+        )
+        durable_args.extend(["--mode", "missing-primary-keys", "--chunk-size", "1"])
+        durable_failure = run(
+            durable_args,
+            env={
+                **os.environ,
+                "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            },
+            timeout=180,
+            check=False,
+        )
+        if durable_failure.returncode == 0:
+            raise HarnessError("injected durable missing guest blocker unexpectedly succeeded")
+        self.admin_sql(self.target, "DROP TRIGGER reject_missing_guest;")
         durable_before = self.admin_query(
             self.target,
             "SELECT run_id,table_name,last_primary_key_json,chunks,rows_scanned,total_rows,"
@@ -2467,8 +2466,8 @@ class Harness:
                 f"{target_parent_after_owner!r}"
             )
         expected_durable_after = (
-            f"{durable_run_id}\tguests\t{json.dumps([str(guest_id)])}\t2\t2\t2\t2\t0\t0\t"
-            "missing-primary-keys\tcomplete\tNULL"
+            f"{durable_run_id}\tguests\t{json.dumps([str(guest_id)])}\t2\t2\tNULL\t1\t0\t0\t"
+            "missing-pks\tcomplete\tNULL"
         )
         if durable_after != expected_durable_after:
             raise HarnessError(

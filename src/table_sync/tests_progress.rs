@@ -2,6 +2,38 @@ use super::tests_support::*;
 use super::*;
 
 #[test]
+fn differing_immutable_spec_does_not_make_exact_candidate_ambiguous() {
+    let expected_spec = r#"{"scope":"current","table":"guests","chunk_size":1,"mode":"missing_primary_keys"}"#;
+    let candidates = vec![
+        SyncRunCandidate::new(
+            "different-bounds",
+            "guests",
+            r#"{"scope":"current","table":"guests","chunk_size":1,"mode":"missing_primary_keys","start_after":["10"]}"#,
+            SyncMode::MissingPrimaryKeys,
+            progress::SyncProgressStatus::Error,
+        ),
+        SyncRunCandidate::new(
+            "exact",
+            "guests",
+            expected_spec,
+            SyncMode::MissingPrimaryKeys,
+            progress::SyncProgressStatus::Error,
+        ),
+    ];
+
+    let selected = select_compatible_failed_run(
+        &candidates,
+        "guests",
+        SyncPhase::InsertMissing,
+        expected_spec,
+    )
+    .expect("candidate selection")
+    .expect("exact candidate");
+
+    assert_eq!(selected.run_id, "exact");
+}
+
+#[test]
 fn selects_only_one_compatible_failed_missing_primary_keys_run() {
     let candidates = vec![
         SyncRunCandidate::new(
@@ -34,9 +66,14 @@ fn selects_only_one_compatible_failed_missing_primary_keys_run() {
         ),
     ];
 
-    let selected = select_compatible_failed_run(&candidates, "guests", SyncPhase::InsertMissing)
-        .expect("candidate selection")
-        .expect("compatible failed run");
+    let selected = select_compatible_failed_run(
+        &candidates,
+        "guests",
+        SyncPhase::InsertMissing,
+        r#"{"scope":"durable-fixture","table":"guests","mode":"missing_primary_keys"}"#,
+    )
+    .expect("candidate selection")
+    .expect("compatible failed run");
 
     assert_eq!(selected.run_id, "compatible");
     assert_eq!(
@@ -64,8 +101,13 @@ fn multiple_compatible_failed_runs_fail_closed() {
         ),
     ];
 
-    let error = select_compatible_failed_run(&candidates, "guests", SyncPhase::InsertMissing)
-        .expect_err("ambiguous candidates");
+    let error = select_compatible_failed_run(
+        &candidates,
+        "guests",
+        SyncPhase::InsertMissing,
+        r#"{"table":"guests","mode":"missing_primary_keys"}"#,
+    )
+    .expect_err("ambiguous candidates");
 
     assert_eq!(
         error.to_string(),
@@ -84,8 +126,13 @@ fn candidate_selection_is_disabled_outside_insert_missing_phase() {
     )];
 
     assert_eq!(
-        select_compatible_failed_run(&candidates, "guests", SyncPhase::Verify)
-            .expect("phase selection"),
+        select_compatible_failed_run(
+            &candidates,
+            "guests",
+            SyncPhase::Verify,
+            r#"{"table":"guests","mode":"missing_primary_keys"}"#,
+        )
+        .expect("phase selection"),
         None
     );
 }
@@ -101,8 +148,13 @@ fn malformed_run_spec_is_incompatible() {
     )];
 
     assert_eq!(
-        select_compatible_failed_run(&candidates, "guests", SyncPhase::InsertMissing)
-            .expect("candidate selection"),
+        select_compatible_failed_run(
+            &candidates,
+            "guests",
+            SyncPhase::InsertMissing,
+            r#"{"table":"guests","mode":"missing_primary_keys"}"#,
+        )
+        .expect("candidate selection"),
         None
     );
 }

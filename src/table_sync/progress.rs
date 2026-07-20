@@ -62,6 +62,7 @@ pub(crate) fn select_compatible_failed_run(
     candidates: &[SyncRunCandidate],
     table: &str,
     phase: SyncPhase,
+    expected_run_spec_json: &str,
 ) -> Result<Option<SyncRunCandidate>, TableSyncError> {
     if phase != SyncPhase::InsertMissing {
         return Ok(None);
@@ -73,7 +74,7 @@ pub(crate) fn select_compatible_failed_run(
             candidate.table == table
                 && candidate.mode == SyncMode::MissingPrimaryKeys
                 && candidate.status == SyncProgressStatus::Error
-                && compatible_run_spec_json(&candidate.run_spec_json, table)
+                && candidate.run_spec_json == expected_run_spec_json
         })
         .collect::<Vec<_>>();
     match compatible.as_slice() {
@@ -83,21 +84,6 @@ pub(crate) fn select_compatible_failed_run(
             "multiple compatible failed missing-primary-keys runs exist for table `{table}`"
         ))),
     }
-}
-
-fn compatible_run_spec_json(run_spec_json: &str, table: &str) -> bool {
-    let Ok(spec) = serde_json::from_str::<serde_json::Value>(run_spec_json) else {
-        return false;
-    };
-    let table_matches = match spec.get("table") {
-        Some(serde_json::Value::String(name)) => name == table,
-        Some(serde_json::Value::Object(table_spec)) => {
-            table_spec.get("name").and_then(serde_json::Value::as_str) == Some(table)
-        }
-        _ => false,
-    };
-    table_matches
-        && spec.get("mode").and_then(serde_json::Value::as_str) == Some("missing_primary_keys")
 }
 
 pub trait SyncProgressStore {

@@ -286,5 +286,17 @@ pub(crate) fn find_compatible_failed_run(
     );
     progress_store.ensure()?;
     let candidates = progress_store.find_failed_run_candidates(table)?;
-    select_compatible_failed_run(&candidates, table, phase)
+    let mut resumed_config = config.clone();
+    resumed_config.mode = SyncMode::MissingPrimaryKeys;
+    resumed_config.plan_hash = None;
+    let expected_run_spec_json = super::range::build_run_spec_json(
+        &build_sync_run_scope(&resumed_config)?,
+        &resumed_config.table,
+        resumed_config.chunk_size,
+        resumed_config.mode,
+        &resumed_config.start_after,
+        &resumed_config.end_at,
+        resumed_config.max_deletes,
+    )?;
+    select_compatible_failed_run(&candidates, table, phase, &expected_run_spec_json)
 }
