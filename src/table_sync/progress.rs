@@ -154,8 +154,19 @@ where
     progress_store.begin_selection_transaction()?;
     let result = (|| {
         let candidates = progress_store.find_failed_run_candidates(table)?;
-        let Some(candidate) =
-            select_compatible_failed_run(&candidates, table, phase, expected_run_spec_json)?
+        if select_compatible_failed_run(&candidates, table, phase, expected_run_spec_json)?
+            .is_none()
+        {
+            progress_store.commit_selection_transaction()?;
+            return Ok(None);
+        }
+        let revalidated_candidates = progress_store.find_failed_run_candidates(table)?;
+        let Some(candidate) = select_compatible_failed_run(
+            &revalidated_candidates,
+            table,
+            phase,
+            expected_run_spec_json,
+        )?
         else {
             progress_store.commit_selection_transaction()?;
             return Ok(None);
@@ -684,7 +695,7 @@ fn build_sync_run_select_sql(progress_table: &str, run_id: &str) -> String {
 
 fn build_failed_run_candidates_sql(progress_table: &str, table: &str) -> String {
     format!(
-        "SELECT run_id, table_name, run_spec_json, mode, status FROM {} WHERE table_name = {} AND status = 'error' ORDER BY run_id",
+        "SELECT run_id, table_name, run_spec_json, mode, status FROM {} WHERE table_name = {} AND status = 'error' ORDER BY run_id FOR UPDATE",
         quote_identifier_path(progress_table),
         quote_sql_literal(table)
     )
@@ -909,6 +920,34 @@ mod tests {
         assert!(sql.contains("table_schema = 'cdc'"));
         assert!(sql.contains("table_name = 'table_sync_progress'"));
         assert!(sql.contains("column_name IN ('run_id','run_spec_json')"));
+    }
+
+    #[test]
+    fn selection_lock_sql_scopes_table_and_immutable_spec_without_waiting() {
+        assert_eq!(
+            build_acquire_selection_lock_sql("guests", "{\"scope\":\"current\"}"),
+            "SELECT GET_LOCK(SHA2(CONCAT('sync-run-claim:','guests',':','{\"scope\":\"current\"}'),256),0)"
+        );
+        assert_eq!(
+            build_release_selection_lock_sql("guests", "{\"scope\":\"current\"}"),
+            "SELECT RELEASE_LOCK(SHA2(CONCAT('sync-run-claim:','guests',':','{\"scope\":\"current\"}'),256))"
+        );
+        assert_ne!(
+            build_acquire_selection_lock_sql("guests", "spec-a"),
+            build_acquire_selection_lock_sql("guests", "spec-b")
+        );
+        assert_ne!(
+            build_acquire_selection_lock_sql("guests", "spec-a"),
+            build_acquire_selection_lock_sql("sessions", "spec-a")
+        );
+    }
+
+    #[test]
+    fn failed_run_candidate_query_locks_current_rows_for_revalidation() {
+        assert!(
+            build_failed_run_candidates_sql("cdc.table_sync_runs", "guests")
+                .ends_with("ORDER BY run_id FOR UPDATE")
+        );
     }
 
     #[test]
