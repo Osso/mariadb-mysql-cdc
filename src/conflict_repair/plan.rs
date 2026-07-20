@@ -40,7 +40,10 @@ pub(crate) fn build_repair_plan_with_directional_scopes(
     inventories: DirectionalRepairInventories<'_>,
     max_deletes: u64,
 ) -> Result<RepairPlan, RepairPlanError> {
-    validate_inventory_match(inventories.source_insert_update, inventories.target_insert_update)?;
+    validate_inventory_match(
+        inventories.source_insert_update,
+        inventories.target_insert_update,
+    )?;
     validate_inventory_match(inventories.source_delete, inventories.target_delete)?;
     validate_foreign_keys(inventories.source_insert_update)?;
     validate_foreign_keys(inventories.source_delete)?;

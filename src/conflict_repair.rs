@@ -7,9 +7,7 @@ mod store;
 mod tests;
 
 pub use model::*;
-pub(crate) use plan::{
-    build_repair_plan_with_directional_scopes, DirectionalRepairInventories,
-};
+pub(crate) use plan::{DirectionalRepairInventories, build_repair_plan_with_directional_scopes};
 pub use plan::{build_repair_plan, run_phased_repair};
 pub use schema::build_conflict_validation_sql;
 pub use sql::{
