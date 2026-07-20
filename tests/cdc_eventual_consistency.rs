@@ -51,6 +51,42 @@ fn real_missing_pk_two_parent_collision_rolls_back_atomically() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_fk_unrelated_cycle_is_ignored_for_selected_guests() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("fk-unrelated-cycle-ignored")
+        .output()
+        .expect("run unrelated FK cycle repair harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_fk_selected_dependency_cycle_blocks_selected_guests() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("fk-selected-dependency-cycle-block")
+        .output()
+        .expect("run selected dependency FK cycle harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_reconciliation_owner_should_resume_durable_missing_guest_run() {
     let output = Command::new("python3")
         .arg(harness_script())
@@ -347,6 +383,8 @@ fn repair_scenarios_are_executable_and_in_repair_scope() {
         "fk-child-first-delete",
         "fk-parent-first-insert",
         "fk-cycle-block",
+        "fk-unrelated-cycle-ignored",
+        "fk-selected-dependency-cycle-block",
         "repair-resume",
         "bounded-delete",
         "conflict-resolution-zero-debt",
@@ -364,6 +402,8 @@ fn repair_scenarios_have_real_cli_orchestration_dispatch() {
         "fk-child-first-delete",
         "fk-parent-first-insert",
         "fk-cycle-block",
+        "fk-unrelated-cycle-ignored",
+        "fk-selected-dependency-cycle-block",
         "repair-resume",
         "bounded-delete",
         "conflict-resolution-zero-debt",
@@ -433,6 +473,8 @@ fn harness_scenario_listing_has_behavior_or_explicit_prerequisite() {
         "fk-child-first-delete",
         "fk-parent-first-insert",
         "fk-cycle-block",
+        "fk-unrelated-cycle-ignored",
+        "fk-selected-dependency-cycle-block",
         "repair-resume",
         "bounded-delete",
         "conflict-resolution-zero-debt",

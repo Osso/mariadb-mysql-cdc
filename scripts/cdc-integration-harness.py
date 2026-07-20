@@ -78,6 +78,8 @@ SCENARIOS = (
     ScenarioSpec("fk-child-first-delete", True),
     ScenarioSpec("fk-parent-first-insert", True),
     ScenarioSpec("fk-cycle-block", True),
+    ScenarioSpec("fk-unrelated-cycle-ignored", True),
+    ScenarioSpec("fk-selected-dependency-cycle-block", True),
     ScenarioSpec("repair-resume", True),
     ScenarioSpec("bounded-delete", True),
     ScenarioSpec("conflict-resolution-zero-debt", True),
@@ -2942,6 +2944,70 @@ class Harness:
             print(f"{scenario}_converged fk_checks=1 parent_before_child=true")
             return
 
+        if scenario == "fk-unrelated-cycle-ignored":
+            for endpoint in (self.source, self.target):
+                self.admin_sql(
+                    endpoint,
+                    "DROP TABLE IF EXISTS unrelated_cycle_a; DROP TABLE IF EXISTS unrelated_cycle_b; "
+                    "DROP TABLE IF EXISTS guests; "
+                    "CREATE TABLE guests (guest_id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL) ENGINE=InnoDB; "
+                    "CREATE TABLE unrelated_cycle_a (id BIGINT NOT NULL PRIMARY KEY, b_id BIGINT NOT NULL) ENGINE=InnoDB; "
+                    "CREATE TABLE unrelated_cycle_b (id BIGINT NOT NULL PRIMARY KEY, a_id BIGINT NOT NULL) ENGINE=InnoDB; "
+                    "ALTER TABLE unrelated_cycle_a ADD CONSTRAINT unrelated_cycle_a_b_fk FOREIGN KEY (b_id) REFERENCES unrelated_cycle_b (id); "
+                    "ALTER TABLE unrelated_cycle_b ADD CONSTRAINT unrelated_cycle_b_a_fk FOREIGN KEY (a_id) REFERENCES unrelated_cycle_a (id);",
+                )
+            self.assert_foreign_keys_enabled()
+            self.admin_sql(self.source, "INSERT INTO guests VALUES (1, 'source-guest');")
+            result = self.run_repair(tables=["guests"], max_deletes=0, run_id="fk-unrelated-cycle-run")
+            require_success(result, scenario)
+            guests = self.query(
+                self.target,
+                "SELECT guest_id,payload FROM guests ORDER BY guest_id;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            constraints = self.admin_query(
+                self.target,
+                "SELECT COUNT(*) FROM information_schema.referential_constraints "
+                "WHERE constraint_schema='globalcomix' AND table_name IN ('unrelated_cycle_a','unrelated_cycle_b');",
+            ).strip()
+            if guests != "1\tsource-guest" or constraints != "2":
+                raise HarnessError(
+                    f"{scenario} did not repair guests while ignoring unrelated cycle: "
+                    f"guests={guests!r} constraints={constraints!r}"
+                )
+            print(f"{scenario}_converged guests=true unrelated_cycle_ignored=true")
+            return
+
+        if scenario == "fk-selected-dependency-cycle-block":
+            for endpoint in (self.source, self.target):
+                self.admin_sql(
+                    endpoint,
+                    "DROP TABLE IF EXISTS guest_cycle_peer; DROP TABLE IF EXISTS guests; "
+                    "CREATE TABLE guests (guest_id BIGINT NOT NULL PRIMARY KEY, peer_id BIGINT NULL) ENGINE=InnoDB; "
+                    "CREATE TABLE guest_cycle_peer (id BIGINT NOT NULL PRIMARY KEY, guest_id BIGINT NULL) ENGINE=InnoDB; "
+                    "ALTER TABLE guests ADD CONSTRAINT guests_peer_fk FOREIGN KEY (peer_id) REFERENCES guest_cycle_peer (id); "
+                    "ALTER TABLE guest_cycle_peer ADD CONSTRAINT guest_cycle_peer_guest_fk FOREIGN KEY (guest_id) REFERENCES guests (guest_id);",
+                )
+            self.assert_foreign_keys_enabled()
+            self.admin_sql(self.source, "INSERT INTO guests VALUES (1, NULL);")
+            result = self.run_repair(
+                tables=["guests"], max_deletes=0, run_id="fk-selected-dependency-cycle-run"
+            )
+            output = f"{result.stdout}\n{result.stderr}".lower()
+            if result.returncode == 0 or "cycle" not in output:
+                raise HarnessError(f"{scenario} did not block selected dependency cycle: {result}")
+            target_rows = self.query(
+                self.target,
+                "SELECT COUNT(*) FROM guests; SELECT COUNT(*) FROM guest_cycle_peer;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            if target_rows != "0\n0":
+                raise HarnessError(f"{scenario} mutated before cycle block: {target_rows!r}")
+            print(f"{scenario}_blocked cycle=true no_mutation=true")
+            return
+
         if scenario == "fk-cycle-block":
             for endpoint in (self.source, self.target):
                 self.admin_sql(
@@ -3305,6 +3371,10 @@ class Harness:
             self.run_repair_scenario("fk-parent-first-insert")
         elif scenario == "fk-cycle-block":
             self.run_repair_scenario("fk-cycle-block")
+        elif scenario == "fk-unrelated-cycle-ignored":
+            self.run_repair_scenario("fk-unrelated-cycle-ignored")
+        elif scenario == "fk-selected-dependency-cycle-block":
+            self.run_repair_scenario("fk-selected-dependency-cycle-block")
         elif scenario == "repair-resume":
             self.run_repair_scenario("repair-resume")
         elif scenario == "bounded-delete":
