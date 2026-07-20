@@ -311,14 +311,18 @@ fn build_source_repair_inventory(
     config: &RepairDriftConfig,
     inventory: &SchemaInventory,
 ) -> Result<RepairInventory, RepairDriftError> {
-    build_repair_inventory(
+    let repair_inventory = build_repair_inventory(
         &config.source,
         InventoryEndpointRole::Source,
         false,
         None,
         inventory,
     )
-    .map_err(|error| RepairDriftError::Inventory(error.to_string()))
+    .map_err(|error| RepairDriftError::Inventory(error.to_string()))?;
+    Ok(reduce_to_dependency_closure(
+        repair_inventory,
+        selected_tables_for_closure(config, inventory),
+    ))
 }
 
 fn build_target_repair_inventory(
@@ -335,7 +339,10 @@ fn build_target_repair_inventory(
     )
     .map_err(|error| RepairDriftError::Inventory(error.to_string()))?;
     exclude_progress_table(&mut repair_inventory, &config.progress_table);
-    Ok(repair_inventory)
+    Ok(reduce_to_dependency_closure(
+        repair_inventory,
+        selected_tables_for_closure(config, inventory),
+    ))
 }
 
 fn target_as_connection_config(config: &RepairDriftConfig) -> MySqlConnectionConfig {
@@ -370,6 +377,62 @@ pub(crate) fn exclude_progress_table(inventory: &mut RepairInventory, progress_t
         crate::mysql_support::qualified_table_parts(&inventory.schema, progress_table);
     if schema == inventory.schema {
         inventory.tables.retain(|name| name != &table);
+        inventory
+            .foreign_keys
+            .retain(|fk| fk.child_table != table && fk.parent_table != table);
+    }
+}
+
+fn selected_tables_for_closure(
+    config: &RepairDriftConfig,
+    inventory: &SchemaInventory,
+) -> Vec<String> {
+    if config.tables.is_empty() {
+        inventory
+            .tables
+            .iter()
+            .map(|table| table.name.clone())
+            .collect()
+    } else {
+        config.tables.clone()
+    }
+}
+
+pub(crate) fn reduce_to_dependency_closure(
+    inventory: RepairInventory,
+    selected_tables: Vec<String>,
+) -> RepairInventory {
+    let mut closure = selected_tables.into_iter().collect::<BTreeSet<_>>();
+    loop {
+        let previous_size = closure.len();
+        for foreign_key in &inventory.foreign_keys {
+            if closure.contains(&foreign_key.child_table)
+                || closure.contains(&foreign_key.parent_table)
+            {
+                closure.insert(foreign_key.child_table.clone());
+                closure.insert(foreign_key.parent_table.clone());
+            }
+        }
+        if closure.len() == previous_size {
+            break;
+        }
+    }
+
+    RepairInventory {
+        schema: inventory.schema,
+        tables: inventory
+            .tables
+            .into_iter()
+            .filter(|table| closure.contains(table))
+            .collect(),
+        foreign_keys: inventory
+            .foreign_keys
+            .into_iter()
+            .filter(|foreign_key| {
+                closure.contains(&foreign_key.child_table)
+                    && closure.contains(&foreign_key.parent_table)
+            })
+            .collect(),
     }
 }
 

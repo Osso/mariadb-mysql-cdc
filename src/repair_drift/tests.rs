@@ -2,7 +2,10 @@ use super::config::{
     default_repair_drift_config, parse_repair_drift_config, repair_drift_option,
     validate_repair_drift_config,
 };
-use super::plan::{build_runtime_repair_plan, exclude_progress_table, order_table_names};
+use super::plan::{
+    build_runtime_repair_plan, exclude_progress_table, order_table_names,
+    reduce_to_dependency_closure,
+};
 use super::run::{
     build_drift_check_config, can_resolve_verified_conflicts,
     can_resolve_verified_conflicts_after_verify, fresh_run_id, verified_conflict_evidence,
@@ -147,6 +150,80 @@ fn empty_schema_inventory() -> crate::inventory::SchemaInventory {
         routines: Vec::new(),
         events: Vec::new(),
     }
+}
+
+fn canonical_fk(child_table: &str, parent_table: &str) -> CanonicalForeignKey {
+    CanonicalForeignKey {
+        constraint_schema: "globalcomix".to_string(),
+        constraint_name: format!("{child_table}_{parent_table}_fk"),
+        child_schema: "globalcomix".to_string(),
+        child_table: child_table.to_string(),
+        child_columns: vec!["parent_id".to_string()],
+        parent_schema: "globalcomix".to_string(),
+        parent_table: parent_table.to_string(),
+        parent_columns: vec!["id".to_string()],
+        update_rule: "RESTRICT".to_string(),
+        delete_rule: "RESTRICT".to_string(),
+        match_option: "NONE".to_string(),
+        enforced: true,
+    }
+}
+
+#[test]
+fn dependency_closure_ignores_unrelated_cycle() {
+    let inventory = RepairInventory {
+        schema: "globalcomix".to_string(),
+        tables: vec![
+            "guests".to_string(),
+            "unrelated_a".to_string(),
+            "unrelated_b".to_string(),
+        ],
+        foreign_keys: vec![
+            canonical_fk("unrelated_a", "unrelated_b"),
+            canonical_fk("unrelated_b", "unrelated_a"),
+        ],
+    };
+
+    let reduced = reduce_to_dependency_closure(inventory, vec!["guests".to_string()]);
+
+    assert_eq!(reduced.tables, vec!["guests"]);
+    assert!(reduced.foreign_keys.is_empty());
+}
+
+#[test]
+fn dependency_closure_preserves_ancestors_children_and_selected_cycles() {
+    let inventory = RepairInventory {
+        schema: "globalcomix".to_string(),
+        tables: vec![
+            "guest_parents".to_string(),
+            "guests".to_string(),
+            "sessions".to_string(),
+            "cycle_peer".to_string(),
+        ],
+        foreign_keys: vec![
+            canonical_fk("guests", "guest_parents"),
+            canonical_fk("sessions", "guests"),
+            canonical_fk("guests", "cycle_peer"),
+            canonical_fk("cycle_peer", "guests"),
+        ],
+    };
+
+    let reduced = reduce_to_dependency_closure(inventory, vec!["guests".to_string()]);
+
+    assert_eq!(
+        reduced.tables,
+        vec![
+            "guest_parents".to_string(),
+            "guests".to_string(),
+            "sessions".to_string(),
+            "cycle_peer".to_string(),
+        ]
+    );
+    assert_eq!(reduced.foreign_keys.len(), 4);
+    let error =
+        build_fk_aware_repair_plan("selected-cycle", "source", "target", &reduced, &reduced, 0)
+            .expect_err("selected dependency cycle must remain blocked");
+    assert!(matches!(error, RepairPlanError::Cycle(_)));
 }
 
 #[test]
