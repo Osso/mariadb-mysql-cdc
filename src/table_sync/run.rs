@@ -116,7 +116,11 @@ fn is_supported_recovery_scope(request: &crate::live::SessionsGuestRecovery) -> 
 }
 
 fn has_complete_recovery_identity(request: &crate::live::SessionsGuestRecovery) -> bool {
-    !request.session_id.is_empty() && !request.guest_id.is_empty() && !request.guest_hash.is_empty()
+    let has_session_id = !request.session_id.is_empty();
+    let has_guest_id = !request.guest_id.is_empty();
+    let has_guest_hash = !request.guest_hash.is_empty();
+
+    has_session_id && has_guest_id && has_guest_hash
 }
 
 enum GuestReconciliation {
@@ -164,10 +168,10 @@ fn require_exact_guest_row<'a>(
             .iter()
             .all(|column| row.values.contains_key(*column))
         && row.values.contains_key(GUEST_CREATE_TIME_EPOCH_ALIAS);
-    if !has_exact_identity || !has_complete_image {
-        return Err(guest_identity_error(side));
+    if has_exact_identity && has_complete_image {
+        return Ok(row);
     }
-    Ok(row)
+    Err(guest_identity_error(side))
 }
 
 fn canonical_guest_row(row: &crate::snapshot::SnapshotRow) -> crate::snapshot::SnapshotRow {

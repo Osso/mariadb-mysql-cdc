@@ -245,10 +245,13 @@ fn is_exact_sessions_guest_conflict(
     table: &RowTableMap,
     conflict: &crate::target::DuplicateConflict,
 ) -> bool {
-    table.schema == crate::live::SESSIONS_GUEST_CHILD_SCHEMA
-        && table.table == crate::live::SESSIONS_GUEST_CHILD_TABLE
-        && conflict.error_code == crate::live::SESSIONS_GUEST_FK_ERROR_CODE
-        && is_exact_sessions_guest_constraint_error(&conflict.error_text)
+    let has_sessions_guest_scope = table.schema == crate::live::SESSIONS_GUEST_CHILD_SCHEMA
+        && table.table == crate::live::SESSIONS_GUEST_CHILD_TABLE;
+    let has_sessions_guest_foreign_key = conflict.error_code
+        == crate::live::SESSIONS_GUEST_FK_ERROR_CODE
+        && is_exact_sessions_guest_constraint_error(&conflict.error_text);
+
+    has_sessions_guest_scope && has_sessions_guest_foreign_key
 }
 
 fn is_exact_sessions_guest_constraint_error(error_text: &str) -> bool {
