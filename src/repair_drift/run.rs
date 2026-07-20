@@ -455,10 +455,10 @@ fn observe_verify_scope(
     scopes: &mut BTreeMap<String, VerifyScope>,
     phase: SyncPhase,
     table_name: &str,
-    report: &table_sync::SyncTableReport,
+    _report: &table_sync::SyncTableReport,
 ) {
     match phase {
-        SyncPhase::DeleteExtras if report.extra_target_rows > 0 => {
+        SyncPhase::DeleteExtras => {
             scopes.insert(table_name.to_string(), VerifyScope::NoTargetExtras);
         }
         SyncPhase::InsertMissing | SyncPhase::UpdateDivergent => {
@@ -718,10 +718,7 @@ mod tests {
             &mut scopes,
             SyncPhase::DeleteExtras,
             "orders",
-            &table_sync::SyncTableReport {
-                extra_target_rows: 1,
-                ..Default::default()
-            },
+            &table_sync::SyncTableReport::default(),
         );
         observe_verify_scope(
             &mut scopes,
