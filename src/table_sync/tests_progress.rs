@@ -90,13 +90,13 @@ impl SyncRunSelectionStore for ReclamationProgressStore {
                 status: progress.status,
             })
             .collect();
-        if enumeration == 1 {
-            if let Some(run_id) = self.transition_after_first_enumeration.borrow_mut().take() {
-                let mut progress = self.get(&run_id);
-                progress.status = progress::SyncProgressStatus::Error;
-                progress.last_error = Some("second run failed".to_string());
-                self.progress.borrow_mut().insert(run_id, progress);
-            }
+        if enumeration == 1
+            && let Some(run_id) = self.transition_after_first_enumeration.borrow_mut().take()
+        {
+            let mut progress = self.get(&run_id);
+            progress.status = progress::SyncProgressStatus::Error;
+            progress.last_error = Some("second run failed".to_string());
+            self.progress.borrow_mut().insert(run_id, progress);
         }
         Ok(candidates)
     }

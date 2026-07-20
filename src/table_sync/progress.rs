@@ -151,13 +151,16 @@ where
     }
 
     progress_store.acquire_selection_lock(table, expected_run_spec_json)?;
-    progress_store.begin_selection_transaction()?;
+    let mut transaction_started = false;
     let result = (|| {
+        progress_store.begin_selection_transaction()?;
+        transaction_started = true;
         let candidates = progress_store.find_failed_run_candidates(table)?;
         if select_compatible_failed_run(&candidates, table, phase, expected_run_spec_json)?
             .is_none()
         {
             progress_store.commit_selection_transaction()?;
+            transaction_started = false;
             return Ok(None);
         }
         let revalidated_candidates = progress_store.find_failed_run_candidates(table)?;
@@ -169,6 +172,7 @@ where
         )?
         else {
             progress_store.commit_selection_transaction()?;
+            transaction_started = false;
             return Ok(None);
         };
         #[cfg(feature = "integration-failpoints")]
@@ -185,11 +189,21 @@ where
         progress.mark_running(candidate.mode);
         progress_store.save(&progress)?;
         progress_store.commit_selection_transaction()?;
+        transaction_started = false;
         Ok(Some(candidate))
     })();
-    if result.is_err() {
-        let _ = progress_store.rollback_selection_transaction();
-    }
+    let result = if transaction_started {
+        match (result, progress_store.rollback_selection_transaction()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(rollback_error)) => Err(rollback_error),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(rollback_error)) => Err(TableSyncError::Progress(format!(
+                "{error}; also failed to roll back compatible-run selection transaction: {rollback_error}"
+            ))),
+        }
+    } else {
+        result
+    };
     let release_result = progress_store.release_selection_lock(table, expected_run_spec_json);
     match (result, release_result) {
         (Ok(value), Ok(())) => Ok(value),
@@ -336,6 +350,8 @@ impl SyncRunSelectionStore for MySqlSyncRunProgressStore {
     }
 
     fn begin_selection_transaction(&self) -> Result<(), TableSyncError> {
+        self.inner
+            .execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ".to_string())?;
         self.inner.execute("START TRANSACTION".to_string())
     }
 
