@@ -1,9 +1,8 @@
 use super::{RepairDriftConfig, RepairDriftError, RepairDriftSkip};
 use crate::conflict_repair::{
     CanonicalForeignKey, DirectionalRepairInventories, RepairInventory, RepairPlan,
-    RepairPlanError, build_repair_plan,
-    build_repair_plan_with_directional_scopes,
-}
+    RepairPlanError, build_repair_plan, build_repair_plan_with_directional_scopes,
+};
 use crate::drift_check::DriftComparison;
 use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, SchemaInventory, TableInventory,
