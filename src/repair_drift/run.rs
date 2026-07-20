@@ -209,7 +209,7 @@ fn repair_phases(plan: &crate::repair_drift::RepairPlan) -> [(SyncPhase, &[Strin
         (SyncPhase::DeleteExtras, &plan.delete_order),
         (SyncPhase::InsertMissing, &plan.insert_order),
         (SyncPhase::UpdateDivergent, &plan.update_order),
-        (SyncPhase::Verify, &plan.update_order),
+        (SyncPhase::Verify, &plan.tables),
     ]
 }
 

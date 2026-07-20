@@ -526,15 +526,8 @@ pub(crate) fn ordered_candidate_tables(
     source_inventory: &SchemaInventory,
     plan: &RepairPlan,
 ) -> Result<Vec<String>, RepairDriftError> {
-    let candidates =
-        candidate_table_names(config, source_inventory).map_err(RepairDriftError::Config)?;
-    let candidate_set = candidates.iter().collect::<BTreeSet<_>>();
-    Ok(plan
-        .insert_order
-        .iter()
-        .filter(|table| candidate_set.contains(table))
-        .cloned()
-        .collect())
+    candidate_table_names(config, source_inventory).map_err(RepairDriftError::Config)?;
+    Ok(plan.tables.clone())
 }
 
 fn build_repair_inventory(
