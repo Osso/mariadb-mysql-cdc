@@ -190,7 +190,7 @@ pub(super) fn should_reconnect(
     max_reconnects: u32,
     reconnect_forever: bool,
 ) -> bool {
-    (reconnect_forever || attempt < max_reconnects) && is_transient_source_error(error)
+    (reconnect_forever || attempt < max_reconnects) && is_retryable_stream_error(error)
 }
 
 pub(super) fn is_stale_or_missing_binlog_error(error: &ApplyBinlogError) -> bool {
@@ -226,7 +226,10 @@ pub(super) fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn is_transient_source_error(error: &ApplyBinlogError) -> bool {
+fn is_retryable_stream_error(error: &ApplyBinlogError) -> bool {
+    if matches!(error, ApplyBinlogError::RowConflictPersisted(_)) {
+        return true;
+    }
     let ApplyBinlogError::SourceCommand(message) = error else {
         return false;
     };

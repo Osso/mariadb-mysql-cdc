@@ -420,9 +420,7 @@ fn persist_deferred_conflicts(
         .unresolved_count_result()
         .map_err(ApplyBinlogError::Target)?;
     println!("cdc_row_conflict_progress unresolved_count={unresolved_count}");
-    Err(ApplyBinlogError::Target(format!(
-        "row conflict persisted for repair: {error_text}"
-    )))
+    Err(ApplyBinlogError::RowConflictPersisted(error_text))
 }
 
 fn finalize_conflict_resolutions(

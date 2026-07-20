@@ -156,8 +156,8 @@ fn retries_durably_persisted_row_conflict_from_unchanged_checkpoint() {
                 .borrow_mut()
                 .push(attempt_config.source.start_position);
             if starts.borrow().len() == 1 {
-                return Err(ApplyBinlogError::Target(
-                    "row conflict persisted for repair: Cannot add or update a child row: a foreign key constraint fails (1452)"
+                return Err(ApplyBinlogError::RowConflictPersisted(
+                    "Cannot add or update a child row: a foreign key constraint fails (1452)"
                         .to_string(),
                 ));
             }

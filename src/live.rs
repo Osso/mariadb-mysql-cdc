@@ -343,6 +343,7 @@ pub enum ApplyBinlogError {
     Config(String),
     SourceCommand(String),
     Target(String),
+    RowConflictPersisted(String),
     Statement(String),
     Quarantined(Vec<QuarantinedStatement>),
     Checkpoint(String),
@@ -356,6 +357,9 @@ impl fmt::Display for ApplyBinlogError {
                 write!(formatter, "source binlog command failed: {message}")
             }
             Self::Target(message) => write!(formatter, "target apply failed: {message}"),
+            Self::RowConflictPersisted(message) => {
+                write!(formatter, "row conflict persisted for repair: {message}")
+            }
             Self::Statement(message) => write!(formatter, "statement apply failed: {message}"),
             Self::Quarantined(statements) => write!(
                 formatter,

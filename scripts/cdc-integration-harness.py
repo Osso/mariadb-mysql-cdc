@@ -70,6 +70,7 @@ SCENARIOS = (
     ScenarioSpec("reconciliation-owner-missing-guest", True),
     ScenarioSpec("failed-run-claim-post-revalidation-race", True),
     ScenarioSpec("row-conflict-rollback", True),
+    ScenarioSpec("durable-row-conflict-retry", True),
     ScenarioSpec("pre-state-drift", True),
     ScenarioSpec("coordinate-reuse", True),
     ScenarioSpec("raw-sql-reuse", True),
@@ -2892,6 +2893,67 @@ class Harness:
             "constraint_attempts=2 checkpoint_unchanged=true"
         )
 
+    def run_durable_row_conflict_retry(self) -> None:
+        assert self.source and self.target
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "DROP TABLE IF EXISTS retry_children; DROP TABLE IF EXISTS retry_parents; "
+                "CREATE TABLE retry_parents (id BIGINT NOT NULL PRIMARY KEY) ENGINE=InnoDB; "
+                "CREATE TABLE retry_children (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT NOT NULL, "
+                "CONSTRAINT retry_children_parent_fk FOREIGN KEY (parent_id) REFERENCES retry_parents (id)) ENGINE=InnoDB;",
+            )
+        self.admin_sql(self.source, "INSERT INTO retry_parents VALUES (1);")
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(self.source, "INSERT INTO retry_children VALUES (10, 1);")
+        stop = self.coordinate()
+        process, _log_path = self.start_stream(
+            start,
+            stop,
+            max_reconnects=12,
+            label="durable-row-conflict-retry",
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            evidence = self.admin_query(
+                self.target,
+                "SELECT error_code,attempt_count,status FROM cdc.row_conflicts "
+                "WHERE table_name='retry_children' AND source_primary_key_json=JSON_ARRAY('10');",
+            ).strip()
+            if evidence:
+                break
+            if process.poll() is not None:
+                raise HarnessError(f"stream exited before durable FK evidence: {self.process_output(process)}")
+            time.sleep(0.1)
+        else:
+            raise HarnessError(f"stream did not persist durable FK evidence: {self.process_output(process)}")
+        if not evidence.startswith("1452\t1\tunresolved"):
+            raise HarnessError(f"unexpected durable FK evidence: {evidence!r}")
+        if process.poll() is not None:
+            raise HarnessError(f"stream exited after durable FK evidence: {self.process_output(process)}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
+            raise HarnessError(f"durable FK conflict advanced checkpoint: {checkpoint}")
+
+        self.admin_sql(self.target, "INSERT INTO retry_parents VALUES (1);")
+        result = self.finish_stream(process)
+        require_success(result, "durable-row-conflict-retry")
+        child = self.admin_query(self.target, "SELECT id,parent_id FROM retry_children;").strip()
+        if child != "10\t1":
+            raise HarnessError(f"same process did not replay FK child: {child!r}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
+            raise HarnessError(f"successful replay did not advance checkpoint: {checkpoint}")
+        evidence = self.admin_query(
+            self.target,
+            "SELECT COUNT(*),MIN(status),MAX(attempt_count) FROM cdc.row_conflicts "
+            "WHERE table_name='retry_children' AND source_primary_key_json=JSON_ARRAY('10');",
+        ).strip()
+        if evidence != "1\tresolved\t1":
+            raise HarnessError(f"durable FK evidence duplicated or unresolved: {evidence!r}")
+        print("durable-row-conflict-retry_ok process_alive=true checkpoint_unchanged=true replayed=true checkpoint_advanced=true evidence_rows=1")
+
     def assert_foreign_keys_enabled(self) -> None:
         assert self.source and self.target
         for endpoint, label in ((self.source, "source"), (self.target, "target")):
@@ -3497,6 +3559,8 @@ class Harness:
             self.run_failed_run_claim_post_revalidation_race()
         elif scenario == "row-conflict-rollback":
             self.run_row_conflict_rollback()
+        elif scenario == "durable-row-conflict-retry":
+            self.run_durable_row_conflict_retry()
         elif scenario == "pre-state-drift":
             self.run_journal_mismatch_scenario("pre-state-drift")
         elif scenario == "coordinate-reuse":
