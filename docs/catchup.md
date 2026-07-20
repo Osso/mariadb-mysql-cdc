@@ -81,10 +81,12 @@ assume lexical order can satisfy parent-first inserts and child-first deletes.
 
 ## Table repair runs
 
-Every `sync-table` invocation requires `--run-id`. Reuse an ID only for the exact
-interrupted immutable run; a completed ID is terminal. A changed endpoint,
+Every `sync-table` invocation requires `--run-id`. Direct reuse is limited to the
+exact interrupted immutable run; a completed ID is terminal. A changed endpoint,
 table shape, bounds, mode, delete ceiling, or `updated-since` specification needs
-a fresh ID.
+a fresh ID. During apply-mode InsertMissing, `repair-drift` may reclaim exactly
+one failed missing-PK run only when its complete immutable specification matches;
+multiple compatible candidates fail closed.
 
 Apply mode preflights target extras before mutating. If extras exceed the
 explicit ceiling, it performs zero inserts, updates, or deletes. Normal

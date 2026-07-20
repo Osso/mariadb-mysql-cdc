@@ -11,8 +11,10 @@ are resolved only after verified equality.
 - [x] Report missing source rows, divergent rows, and target extras.
 - [x] Require explicit `--max-deletes` for apply-mode orphan deletion and preflight
       the ceiling before mutation.
-- [x] Require `--run-id`; resume only the exact interrupted run and reject a
-      completed ID.
+- [x] Require `--run-id`; direct `sync-table` resumes only the exact interrupted
+      run and rejects a completed ID. Apply-mode `repair-drift` InsertMissing may
+      reclaim one specification-identical failed missing-PK run and fails closed
+      on ambiguity.
 - [x] Persist run-scoped progress in `cdc.table_sync_runs` by default and reject
       concurrent use of the same run ID with a target named lock.
 - [x] Keep `cdc.table_sync_progress` as catchup-only legacy state.

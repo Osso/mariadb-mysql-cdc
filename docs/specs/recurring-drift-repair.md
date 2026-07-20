@@ -1,8 +1,10 @@
 # Recurring Drift Repair
 
 `repair-drift` orchestrates bounded, run-scoped phased repairs after forward CDC
-application. Each recurrence gets a fresh orchestration ID; only the exact
-interrupted run may be resumed. The real Docker harness defines 34 executable
+application. Each recurrence gets a fresh orchestration ID. Direct child-run
+reuse remains limited to the exact interrupted run; an apply-mode InsertMissing
+phase may reclaim exactly one failed `missing-primary-keys` run whose full
+immutable specification matches. The real Docker harness defines 34 executable
 scenarios and proves FK ordering, fail-closed planning, resumable runs, PK-window
 bounds, secondary-unique safety, and zero unresolved debt for the repaired scope.
 
@@ -14,6 +16,9 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
 - [x] Skip missing/incompatible tables with explicit reasons.
 - [x] Require an explicit `--max-deletes` in apply mode.
 - [x] Pass child run IDs to `sync-table`.
+- [x] Reclaim exactly one specification-identical failed `missing-primary-keys`
+      run during apply-mode InsertMissing; exclude completed/incompatible runs
+      and fail closed on ambiguity.
 - [x] Keep content-check bounds visible; at most 1,000 mismatch ranges are
       recorded and floating-point columns are skipped.
 - [x] Keep target writes primary-key based.
@@ -40,6 +45,7 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
 Remaining eventual-consistency gates are recurring scheduling from unresolved
 conflicts, full-tree parity, and deployment/cutover proof. Until a scheduler exists,
 operators must start each recurrence with a fresh bounded orchestration ID and
-review the persisted child run states.
+review the persisted child run states. Reclamation occurs only when that invoked
+cycle encounters one compatible failed missing-PK child; it is not scheduling.
 
 Out of scope: unbounded deletion and automatic cutover.
