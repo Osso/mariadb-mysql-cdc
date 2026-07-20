@@ -30,6 +30,8 @@ pub struct RepairDriftConfig {
     pub max_deletes_explicit: bool,
     pub run_id: Option<String>,
     pub run_id_prefix: String,
+    #[cfg(feature = "integration-failpoints")]
+    pub integration_failpoint: Option<crate::live::IntegrationFailpoint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

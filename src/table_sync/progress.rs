@@ -171,6 +171,11 @@ where
             progress_store.commit_selection_transaction()?;
             return Ok(None);
         };
+        #[cfg(feature = "integration-failpoints")]
+        crate::live::wait_for_integration_barrier(
+            crate::live::IntegrationFailpoint::FailedRunClaimRevalidated,
+            "failed-run-claim-revalidated",
+        );
         let mut progress = progress_store.load(&candidate.run_id)?.ok_or_else(|| {
             TableSyncError::Progress(format!(
                 "selected failed run `{}` disappeared before claim",

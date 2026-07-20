@@ -68,6 +68,7 @@ SCENARIOS = (
     ScenarioSpec("replace-divergent-pk", True),
     ScenarioSpec("missing-pk-two-parent-collision", True),
     ScenarioSpec("reconciliation-owner-missing-guest", True),
+    ScenarioSpec("failed-run-claim-post-revalidation-race", True),
     ScenarioSpec("row-conflict-rollback", True),
     ScenarioSpec("pre-state-drift", True),
     ScenarioSpec("coordinate-reuse", True),
@@ -380,6 +381,40 @@ class Harness:
     def query(self, endpoint: Endpoint, sql: str, *, user: str, password: str) -> str:
         return self._mysql(endpoint, sql, user, password)
 
+    def start_query(
+        self,
+        endpoint: Endpoint,
+        sql: str,
+        *,
+        user: str,
+        password: str,
+    ) -> subprocess.Popen[str]:
+        process = subprocess.Popen(
+            [
+                "mariadb",
+                "--protocol=tcp",
+                "--ssl",
+                f"--ssl-ca={self.ca_file}",
+                "--ssl-verify-server-cert",
+                "--host=127.0.0.1",
+                f"--port={endpoint.port}",
+                f"--user={user}",
+                f"--password={password}",
+                f"--database={APP_SCHEMA}",
+                "--batch",
+                "--raw",
+                "--skip-column-names",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdin is not None
+        process.stdin.write(sql)
+        process.stdin.close()
+        return process
+
     def _mysql(self, endpoint: Endpoint, sql: str, user: str, password: str) -> str:
         result = run(
             [
@@ -624,10 +659,16 @@ class Harness:
             "globalcomix.sync_table_tls_progress",
         ]
 
-    def _repair_binary(self) -> Path:
+    def _repair_binary(self, integration_failpoint: str | None = None) -> Path:
         binary = self.binary or self.repo / "target/debug/mariadb-mysql-cdc"
-        if not binary.is_file():
-            run(["cargo", "build", "--bin", "mariadb-mysql-cdc"], cwd=self.repo)
+        if integration_failpoint is not None and self.binary is not None:
+            raise HarnessSkip("failed-run claim race requires a feature-enabled source build")
+        if not binary.is_file() or integration_failpoint is not None:
+            build = ["cargo", "build"]
+            if integration_failpoint is not None:
+                build.extend(["--features", "integration-failpoints"])
+            build.extend(["--bin", "mariadb-mysql-cdc"])
+            run(build, cwd=self.repo)
         if not binary.is_file():
             raise HarnessError(f"CDC binary build did not produce {binary}")
         return binary
@@ -644,6 +685,7 @@ class Harness:
         start_after: list[str] | None = None,
         end_at: list[str] | None = None,
         progress_table: str = "globalcomix.table_sync_runs",
+        integration_failpoint: str | None = None,
     ) -> list[str]:
         args = [
             str(binary),
@@ -689,6 +731,8 @@ class Harness:
             args.extend(["--start-after-json", json.dumps(start_after)])
         if end_at is not None:
             args.extend(["--end-at-json", json.dumps(end_at)])
+        if integration_failpoint is not None:
+            args.extend(["--integration-failpoint", integration_failpoint])
         return args
 
     def run_repair(
@@ -737,9 +781,11 @@ class Harness:
         run_id: str,
         chunk_size: int,
         progress_table: str = "globalcomix.table_sync_runs",
+        integration_failpoint: str | None = None,
+        barrier_dir: Path | None = None,
     ) -> tuple[subprocess.Popen[str], Path]:
         assert self.source and self.target
-        binary = self._repair_binary()
+        binary = self._repair_binary(integration_failpoint)
         env = {
             **os.environ,
             "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
@@ -756,9 +802,13 @@ class Harness:
                 run_id=run_id,
                 chunk_size=chunk_size,
                 progress_table=progress_table,
+                integration_failpoint=integration_failpoint,
             ),
             cwd=self.repo,
-            env=env,
+            env={
+                **env,
+                **({"CDC_INTEGRATION_BARRIER_DIR": str(barrier_dir)} if barrier_dir is not None else {}),
+            },
             stdout=log,
             stderr=subprocess.STDOUT,
             text=True,
@@ -2491,6 +2541,147 @@ class Harness:
                 f"before={cleared_evidence!r} after={owner_evidence!r}"
             )
 
+    def run_failed_run_claim_post_revalidation_race(self) -> None:
+        assert self.source and self.target
+        first_run_id = "claim-race-first"
+        second_run_id = "claim-race-second"
+        owner_run_id = "claim-race-owner"
+        guest_id = 78486038
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "DROP TABLE IF EXISTS guests; "
+                "CREATE TABLE guests ("
+                "guest_id BIGINT NOT NULL PRIMARY KEY, "
+                "guest_hash VARCHAR(64) NOT NULL, "
+                "payload VARCHAR(64) NOT NULL"
+                ") ENGINE=InnoDB;",
+            )
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO guests VALUES ({guest_id}, 'claim-race-hash', 'source-parent');",
+        )
+        self.admin_sql(
+            self.target,
+            "CREATE TRIGGER reject_claim_race_guest BEFORE INSERT ON guests FOR EACH ROW "
+            f"SET NEW.payload=IF(NEW.guest_id={guest_id},REPEAT('x',128),NEW.payload);",
+        )
+        failed_args = self._sync_table_args(self._repair_binary())
+        failed_args[failed_args.index("accounts")] = "guests"
+        failed_args[failed_args.index("id")] = "guest_id"
+        failed_args[failed_args.index("id,email,payload")] = "guest_id,guest_hash,payload"
+        failed_args[failed_args.index("sync-table-source-ca-proof")] = first_run_id
+        failed_args[failed_args.index("globalcomix.sync_table_tls_progress")] = (
+            "globalcomix.table_sync_runs"
+        )
+        failed_args.extend(["--mode", "missing-primary-keys", "--chunk-size", "1"])
+        failure = run(
+            failed_args,
+            cwd=self.repo,
+            env={
+                **os.environ,
+                "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            },
+            timeout=180,
+            check=False,
+        )
+        self.admin_sql(self.target, "DROP TRIGGER reject_claim_race_guest;")
+        if failure.returncode == 0:
+            raise HarnessError("claim-race setup failure unexpectedly succeeded")
+        first_state = self.admin_query(
+            self.target,
+            "SELECT status,mode FROM globalcomix.table_sync_runs "
+            f"WHERE run_id={sql_literal(first_run_id)};",
+        ).strip()
+        if first_state != "error\tmissing-pks":
+            raise HarnessError(f"claim-race setup did not persist one failed candidate: {first_state!r}")
+
+        self.admin_sql(self.target, "SET GLOBAL transaction_isolation='READ-COMMITTED';")
+        isolation = self.admin_query(self.target, "SELECT @@GLOBAL.transaction_isolation;").strip()
+        if isolation != "READ-COMMITTED":
+            raise HarnessError(f"claim-race disposable target is not READ COMMITTED: {isolation!r}")
+
+        barrier_dir = self.tempdir / "failed-run-claim-race"
+        owner = None
+        second = None
+        try:
+            owner, _log = self.start_repair(
+                tables=["guests"],
+                max_deletes=0,
+                run_id=owner_run_id,
+                chunk_size=1,
+                progress_table="globalcomix.table_sync_runs",
+                integration_failpoint="failed-run-claim-revalidated",
+                barrier_dir=barrier_dir,
+            )
+            self.wait_for_barrier(owner, barrier_dir, "failed-run-claim-revalidated")
+            second_sql = (
+                "INSERT INTO globalcomix.table_sync_runs "
+                "(run_id,table_name,run_spec_json,last_primary_key_json,chunks,rows_scanned,total_rows,"
+                "inserts_applied,updates_applied,extra_target_rows,mode,status,last_error) "
+                "SELECT "
+                f"{sql_literal(second_run_id)},table_name,run_spec_json,last_primary_key_json,chunks,rows_scanned,"
+                "total_rows,inserts_applied,updates_applied,extra_target_rows,mode,'error',"
+                f"{sql_literal('second exact failure')} "
+                "FROM globalcomix.table_sync_runs "
+                f"WHERE run_id={sql_literal(first_run_id)};"
+            )
+            second = self.start_query(
+                self.target,
+                second_sql,
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and second.poll() is None:
+                time.sleep(0.05)
+            if second.poll() is not None:
+                stdout, stderr = second.communicate()
+                raise HarnessError(
+                    "second exact candidate committed before first claim transaction completed: "
+                    f"exit={second.returncode} stdout={stdout!r} stderr={stderr!r}"
+                )
+            self.release_barrier(barrier_dir, "failed-run-claim-revalidated")
+            owner.wait(timeout=180)
+            owner_output = self.process_output(owner)
+            owner_log = getattr(owner, "_cdc_log", None)
+            if owner_log is not None:
+                owner_log.close()
+            stdout, stderr = second.communicate(timeout=30)
+            if owner.returncode != 0:
+                raise HarnessError(
+                    "claim-race owner failed after serialized claim: "
+                    f"exit={owner.returncode} output={owner_output}"
+                )
+            if second.returncode != 0:
+                raise HarnessError(
+                    "second exact candidate did not commit after first claim: "
+                    f"exit={second.returncode} stdout={stdout!r} stderr={stderr!r}"
+                )
+        finally:
+            self.release_barrier(barrier_dir, "failed-run-claim-revalidated")
+            for process in (second, owner):
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
+
+        final_states = self.admin_query(
+            self.target,
+            "SELECT run_id,status FROM globalcomix.table_sync_runs "
+            f"WHERE run_id IN ({sql_literal(first_run_id)},{sql_literal(second_run_id)}) "
+            "ORDER BY run_id;",
+        ).strip()
+        if final_states != f"{first_run_id}\tcomplete\n{second_run_id}\terror":
+            raise HarnessError(f"claim-race final states were not serialized: {final_states!r}")
+        target_row = self.admin_query(
+            self.target,
+            f"SELECT guest_id,guest_hash,payload FROM guests WHERE guest_id={guest_id};",
+        ).strip()
+        if target_row != f"{guest_id}\tclaim-race-hash\tsource-parent":
+            raise HarnessError(f"claim-race owner did not repair target row: {target_row!r}")
+        print(f"failed_run_claim_post_revalidation_race_ok states={final_states!r}")
+
     def run_row_conflict_rollback(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
@@ -3059,6 +3250,8 @@ class Harness:
             self.run_missing_pk_two_parent_collision()
         elif scenario == "reconciliation-owner-missing-guest":
             self.run_reconciliation_owner_missing_guest()
+        elif scenario == "failed-run-claim-post-revalidation-race":
+            self.run_failed_run_claim_post_revalidation_race()
         elif scenario == "row-conflict-rollback":
             self.run_row_conflict_rollback()
         elif scenario == "pre-state-drift":

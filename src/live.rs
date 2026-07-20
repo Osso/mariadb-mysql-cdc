@@ -53,6 +53,7 @@ pub enum IntegrationFailpoint {
     CheckpointTransaction,
     SourceConnectionLoss,
     TargetConnectionLoss,
+    FailedRunClaimRevalidated,
 }
 
 #[cfg(feature = "integration-failpoints")]
@@ -65,6 +66,7 @@ impl IntegrationFailpoint {
             "checkpoint-transaction" => Ok(Self::CheckpointTransaction),
             "source-connection-loss" => Ok(Self::SourceConnectionLoss),
             "target-connection-loss" => Ok(Self::TargetConnectionLoss),
+            "failed-run-claim-revalidated" => Ok(Self::FailedRunClaimRevalidated),
             other => Err(format!("unknown integration failpoint: {other}")),
         }
     }
@@ -77,6 +79,7 @@ impl IntegrationFailpoint {
             Self::CheckpointTransaction => 4,
             Self::SourceConnectionLoss => 5,
             Self::TargetConnectionLoss => 6,
+            Self::FailedRunClaimRevalidated => 7,
         }
     }
 }

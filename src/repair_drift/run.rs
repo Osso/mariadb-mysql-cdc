@@ -17,6 +17,8 @@ static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn run_repair_drift(
     config: &RepairDriftConfig,
 ) -> Result<RepairDriftReport, RepairDriftError> {
+    #[cfg(feature = "integration-failpoints")]
+    crate::live::configure_integration_failpoint(config.integration_failpoint);
     validate_repair_drift_config(config).map_err(RepairDriftError::Config)?;
     let run_id = configured_run_id(config);
     let (source, target) = load_inventories(config)?;

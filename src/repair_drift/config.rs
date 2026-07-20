@@ -35,6 +35,8 @@ pub(crate) fn default_repair_drift_config() -> RepairDriftConfig {
         max_deletes_explicit: false,
         run_id: None,
         run_id_prefix: "repair-drift".to_string(),
+        #[cfg(feature = "integration-failpoints")]
+        integration_failpoint: None,
     }
 }
 
@@ -47,6 +49,8 @@ const REPAIR_OPTION_GROUPS: &[RepairOptionGroup] = &[
     apply_repair_window_option,
     apply_repair_execution_option,
     apply_repair_run_option,
+    #[cfg(feature = "integration-failpoints")]
+    apply_repair_failpoint_option,
 ];
 
 pub(crate) fn repair_drift_option(
@@ -156,6 +160,19 @@ fn apply_repair_run_option(
         "--run-id-prefix" => config.run_id_prefix = value.to_string(),
         _ => return Ok(false),
     }
+    Ok(true)
+}
+
+#[cfg(feature = "integration-failpoints")]
+fn apply_repair_failpoint_option(
+    config: &mut RepairDriftConfig,
+    flag: &str,
+    value: &str,
+) -> Result<bool, String> {
+    if flag != "--integration-failpoint" {
+        return Ok(false);
+    }
+    config.integration_failpoint = Some(crate::live::IntegrationFailpoint::parse(value)?);
     Ok(true)
 }
 

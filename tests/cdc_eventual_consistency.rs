@@ -69,6 +69,24 @@ fn real_reconciliation_owner_should_resume_durable_missing_guest_run() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_failed_run_claim_post_revalidation_race_is_serialized() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("failed-run-claim-post-revalidation-race")
+        .output()
+        .expect("run failed-run claim post-revalidation race harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_create_table_crash_restart_harness_smoke() {
     let output = Command::new("python3")
         .arg(harness_script())
