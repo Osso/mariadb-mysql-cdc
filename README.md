@@ -78,9 +78,10 @@ evidence through an independent control-plane connection before the row failure
 rolls back the target transaction. Under `ignore-duplicate`, only an equal native
 ROW `INSERT` duplicate may be logged and committed without ledger persistence;
 divergent inserts and every non-`INSERT` `1062` unique conflict persist evidence,
-abort, and leave the target transaction/checkpoint uncommitted. Guarded
-observation upserts are idempotent, and the live target checkpoint does not
-advance for durable constraint conflicts. The admin-bootstrapped
+roll back, and leave the target transaction/checkpoint uncommitted. Durable row
+conflicts retry in-process with bounded backoff from that unchanged checkpoint;
+successful replay resolves the matching evidence. Guarded observation upserts
+are idempotent. The admin-bootstrapped
 `cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory
 procedure, and exact table/procedure grants must validate at startup; runtime never
 creates the table. Different source primary keys remain different conflict

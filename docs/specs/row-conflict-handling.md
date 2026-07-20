@@ -39,8 +39,9 @@ conflicting secondary key.
 - [x] Stage supported constraint-conflict observations within the source
       transaction; at its XID, finalize their source-transaction end
       coordinates, roll back the target transaction, persist the unresolved
-      observations through the independent control-plane connection, and fail
-      without checkpointing past the failed transaction.
+      observations through the independent control-plane connection, and retry
+      from the unchanged checkpoint with bounded in-process backoff. Successful
+      replay resolves the matching evidence row.
 - [x] Emit parseable `cdc_row_conflict_skipped` output with operation, table,
       source coordinate, and source primary key.
 - [x] Replay the same source event into the same identity and increment its

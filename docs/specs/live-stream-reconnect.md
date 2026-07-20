@@ -15,12 +15,14 @@ source connection loss without replaying from static startup coordinates.
   manifest's original `--binlog-file` and `--start-position` arguments.
 - [x] Apply bounded retry backoff with clear logs for attempt count, delay, and
   last durable coordinate.
-- [x] Stop and fail explicitly on non-transient errors such as authentication
+- [x] After a durably persisted row conflict, roll back, keep the checkpoint
+  unchanged, and retry the same transaction in-process with bounded backoff.
+- [x] Stop and fail explicitly on other non-transient errors such as authentication
   failure, missing binlog file, unsupported event type, quarantine, or target
-  write failure.
+  write failure without durable row-conflict evidence.
 
-Reconnect/backoff applies only after an established source connection loses
-transport. It is not an opportunistic TLS-to-plaintext fallback: the current
+Reconnect/backoff applies after transient source loss and after a durable row
+conflict. It is not an opportunistic TLS-to-plaintext fallback: the current
 GlobalComix source uses explicit plaintext mode from the start. Target TLS
 configuration is separate; failed target CA loading, chain validation, or
 required DNS/hostname identity matching stops immediately.
