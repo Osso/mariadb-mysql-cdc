@@ -905,6 +905,7 @@ fn recovery_scenarios_are_executable_and_use_failpoint_binary() {
     assert!(script.contains("--integration-failpoint"));
 }
 
+#[cfg(not(feature = "integration-failpoints"))]
 #[test]
 fn failpoints_are_absent_from_default_build_surface_and_not_env_backdoors() {
     let binary = env!("CARGO_BIN_EXE_mariadb-mysql-cdc");
