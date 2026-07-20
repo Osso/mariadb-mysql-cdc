@@ -3128,7 +3128,12 @@ class Harness:
                     "REFERENCES repair_delete_customers (id)"
                     ") ENGINE=InnoDB;",
                 )
-            self.admin_sql(self.source, "INSERT INTO repair_delete_customers VALUES (1, 'keep');")
+            self.admin_sql(
+                self.source,
+                "INSERT INTO repair_delete_customers VALUES (1, 'keep'); "
+                "INSERT INTO repair_delete_orders VALUES (10, 1, 'source'); "
+                "INSERT INTO repair_delete_invoices VALUES (11, 1, 'source');",
+            )
             self.admin_sql(
                 self.target,
                 "INSERT INTO repair_delete_customers VALUES (1, 'keep'), (2, 'extra'); "
