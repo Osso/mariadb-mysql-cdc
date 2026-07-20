@@ -13,8 +13,10 @@ are resolved only after verified equality.
       the ceiling before mutation.
 - [x] Require `--run-id`; direct `sync-table` resumes only the exact interrupted
       run and rejects a completed ID. Apply-mode `repair-drift` InsertMissing may
-      reclaim one specification-identical failed missing-PK run and fails closed
-      on ambiguity.
+      atomically claim one specification-identical failed missing-PK run within
+      the table and immutable-specification scope; compatibility and uniqueness
+      are revalidated before marking it running, and ambiguity fails closed
+      without reclaiming a run.
 - [x] Persist run-scoped progress in `cdc.table_sync_runs` by default and reject
       concurrent use of the same run ID with a target named lock.
 - [x] Keep `cdc.table_sync_progress` as catchup-only legacy state.

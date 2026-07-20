@@ -16,9 +16,11 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
 - [x] Skip missing/incompatible tables with explicit reasons.
 - [x] Require an explicit `--max-deletes` in apply mode.
 - [x] Pass child run IDs to `sync-table`.
-- [x] Reclaim exactly one specification-identical failed `missing-primary-keys`
-      run during apply-mode InsertMissing; exclude completed/incompatible runs
-      and fail closed on ambiguity.
+- [x] Atomically claim exactly one specification-identical failed
+      `missing-primary-keys` run during apply-mode InsertMissing within the table
+      and immutable-specification scope; revalidate compatibility and uniqueness
+      before marking it running, exclude completed/incompatible runs, and fail
+      closed on ambiguity without reclaiming a run.
 - [x] Keep content-check bounds visible; at most 1,000 mismatch ranges are
       recorded and floating-point columns are skipped.
 - [x] Keep target writes primary-key based.

@@ -85,8 +85,10 @@ Every `sync-table` invocation requires `--run-id`. Direct reuse is limited to th
 exact interrupted immutable run; a completed ID is terminal. A changed endpoint,
 table shape, bounds, mode, delete ceiling, or `updated-since` specification needs
 a fresh ID. During apply-mode InsertMissing, `repair-drift` may reclaim exactly
-one failed missing-PK run only when its complete immutable specification matches;
-multiple compatible candidates fail closed.
+one failed missing-PK run only when its complete immutable specification matches.
+Reclamation is an atomic claim scoped to the table and immutable specification:
+compatibility and uniqueness are revalidated before the selected row is marked
+running; multiple compatible candidates fail closed without reclaiming a run.
 
 Apply mode preflights target extras before mutating. If extras exceed the
 explicit ceiling, it performs zero inserts, updates, or deletes. Normal
