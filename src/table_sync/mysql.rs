@@ -5,6 +5,33 @@ use crate::snapshot::{SnapshotError, SnapshotRow};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+pub(super) const GUEST_COLUMNS: [&str; 23] = [
+    "guest_id",
+    "guest_hash",
+    "country",
+    "original_ref",
+    "original_uri",
+    "first_user_id",
+    "geo_region_id",
+    "ui_lang",
+    "device_type",
+    "et_id",
+    "utm_medium",
+    "utm_source",
+    "utm_campaign",
+    "utm_term",
+    "utm_id",
+    "http_user_agent",
+    "create_time",
+    "is_bot",
+    "params",
+    "application_user_access_token_id",
+    "application_id",
+    "supports_cookies",
+    "reason",
+];
+const GUEST_IDENTITY_COLLISION_LIMIT: usize = 3;
+
 pub(crate) struct MySqlSyncReader {
     config: crate::mysql_snapshot::MySqlConnectionConfig,
     tls_ca_file: Option<String>,
@@ -50,20 +77,15 @@ impl MySqlSyncReader {
         guest_id: &str,
         guest_hash: &str,
     ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        let columns = guest_columns();
         let sql = format!(
-            "SELECT `guest_id`, `guest_hash`, `create_time` FROM `guests` WHERE `guest_id` = {} OR `guest_hash` = {} ORDER BY `guest_id` LIMIT 3",
+            "SELECT {} FROM `guests` WHERE `guest_id` = {} OR `guest_hash` = {} ORDER BY `guest_id` LIMIT {}",
+            quote_ident_list(&columns),
             quote_sql_literal(guest_id),
             quote_sql_literal(guest_hash),
+            GUEST_IDENTITY_COLLISION_LIMIT,
         );
-        parse_sync_rows(
-            &[
-                "guest_id".to_string(),
-                "guest_hash".to_string(),
-                "create_time".to_string(),
-            ],
-            &["guest_id".to_string()],
-            self.query_rows(&sql)?,
-        )
+        parse_sync_rows(&columns, &["guest_id".to_string()], self.query_rows(&sql)?)
     }
 
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
@@ -102,6 +124,13 @@ impl SyncTableReader for MySqlSyncReader {
     fn requires_full_rows_for_missing_primary_keys(&self) -> bool {
         self.replace_divergent_primary
     }
+}
+
+pub(super) fn guest_columns() -> Vec<String> {
+    GUEST_COLUMNS
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect()
 }
 
 fn snapshot_error_to_table_sync(error: SnapshotError) -> TableSyncError {

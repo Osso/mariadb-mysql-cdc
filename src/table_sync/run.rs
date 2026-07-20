@@ -1,4 +1,4 @@
-use super::mysql::MySqlSyncReader;
+use super::mysql::{GUEST_COLUMNS, MySqlSyncReader, guest_columns};
 use super::range::sync_table_with_progress_range;
 use super::recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
 use super::*;
@@ -80,21 +80,13 @@ pub(crate) fn reconcile_exact_sessions_guest(
     )
     .map_err(TableSyncError::Read)?;
     let source_rows = source.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
-    let source_row = require_exact_guest_row("source", &source_rows, request)?;
-    validate_parent_temporal_order(
-        source_row
-            .values
-            .get("create_time")
-            .and_then(Option::as_deref),
-        request.child_event_timestamp,
-    )?;
     let target_rows = target.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
-    if target_rows.is_empty() {
-        let sync_config = exact_guest_sync_config(config, request);
-        mysql_repair_target(&sync_config)?.insert_row(source_row)?;
+    let reconciliation = plan_loaded_sessions_guest(&source_rows, &target_rows, request)?;
+    let GuestReconciliation::Insert(source_row) = reconciliation else {
         return Ok(());
-    }
-    require_exact_guest_row("target", &target_rows, request).map(|_| ())
+    };
+    let sync_config = exact_guest_sync_config(config, request);
+    mysql_repair_target(&sync_config)?.insert_row(source_row)
 }
 
 fn validate_sessions_guest_request(
@@ -114,21 +106,62 @@ fn validate_sessions_guest_request(
     ))
 }
 
+enum GuestReconciliation<'a> {
+    Insert(&'a crate::snapshot::SnapshotRow),
+    Existing,
+}
+
+fn plan_loaded_sessions_guest<'a>(
+    source_rows: &'a [crate::snapshot::SnapshotRow],
+    target_rows: &[crate::snapshot::SnapshotRow],
+    request: &crate::live::SessionsGuestRecovery,
+) -> Result<GuestReconciliation<'a>, TableSyncError> {
+    let source_row = require_exact_guest_row("source", source_rows, request)?;
+    validate_parent_temporal_order(
+        source_row
+            .values
+            .get("create_time")
+            .and_then(Option::as_deref),
+        request.child_event_timestamp,
+    )?;
+    if target_rows.is_empty() {
+        return Ok(GuestReconciliation::Insert(source_row));
+    }
+    let target_row = require_exact_guest_row("target", target_rows, request)?;
+    if target_row.values != source_row.values {
+        return Err(TableSyncError::Repair(
+            "target guests row diverges from exact source image".to_string(),
+        ));
+    }
+    Ok(GuestReconciliation::Existing)
+}
+
 fn require_exact_guest_row<'a>(
     side: &str,
     rows: &'a [crate::snapshot::SnapshotRow],
     request: &crate::live::SessionsGuestRecovery,
 ) -> Result<&'a crate::snapshot::SnapshotRow, TableSyncError> {
-    if rows.len() != 1
-        || rows[0].primary_key != [request.guest_id.clone()]
-        || rows[0].values.get("guest_hash").and_then(Option::as_deref)
-            != Some(request.guest_hash.as_str())
-    {
-        return Err(TableSyncError::Repair(format!(
-            "{side} guests identity is absent, colliding, or divergent"
-        )));
+    let Some(row) = rows.first() else {
+        return Err(guest_identity_error(side));
+    };
+    let has_exact_identity = rows.len() == 1
+        && row.primary_key == [request.guest_id.clone()]
+        && row.values.get("guest_hash").and_then(Option::as_deref)
+            == Some(request.guest_hash.as_str());
+    let has_complete_image = row.values.len() == GUEST_COLUMNS.len()
+        && GUEST_COLUMNS
+            .iter()
+            .all(|column| row.values.contains_key(*column));
+    if !has_exact_identity || !has_complete_image {
+        return Err(guest_identity_error(side));
     }
-    Ok(&rows[0])
+    Ok(row)
+}
+
+fn guest_identity_error(side: &str) -> TableSyncError {
+    TableSyncError::Repair(format!(
+        "{side} guests identity is absent, colliding, divergent, or incomplete"
+    ))
 }
 
 fn validate_parent_temporal_order(
@@ -236,11 +269,7 @@ fn exact_guest_sync_config(
         table: SyncTable {
             name: "guests".to_string(),
             primary_key: vec!["guest_id".to_string()],
-            columns: vec![
-                "guest_id".to_string(),
-                "guest_hash".to_string(),
-                "create_time".to_string(),
-            ],
+            columns: guest_columns(),
         },
         chunk_size: 1,
         mode: SyncMode::MissingPrimaryKeys,
@@ -523,6 +552,41 @@ mod sessions_guest_recovery_tests {
     }
 
     fn guest_row(guest_id: &str, guest_hash: &str) -> crate::snapshot::SnapshotRow {
+        let values = [
+            ("guest_id", Some(guest_id)),
+            ("guest_hash", Some(guest_hash)),
+            ("country", Some("us")),
+            ("original_ref", Some("https://globalcomix.com/")),
+            ("original_uri", Some("/browse")),
+            ("first_user_id", None),
+            ("geo_region_id", Some("2")),
+            ("ui_lang", Some("en")),
+            ("device_type", Some("0")),
+            ("et_id", None),
+            ("utm_medium", Some("organic")),
+            ("utm_source", None),
+            ("utm_campaign", None),
+            ("utm_term", None),
+            ("utm_id", None),
+            ("http_user_agent", Some("Mozilla/5.0")),
+            ("create_time", Some("2026-06-26 00:00:00")),
+            ("is_bot", Some("0")),
+            ("params", Some("?reason=recovery")),
+            ("application_user_access_token_id", None),
+            ("application_id", Some("1")),
+            ("supports_cookies", Some("1")),
+            ("reason", None),
+        ];
+        crate::snapshot::SnapshotRow {
+            primary_key: vec![guest_id.to_string()],
+            values: values
+                .into_iter()
+                .map(|(column, value)| (column.to_string(), value.map(ToString::to_string)))
+                .collect(),
+        }
+    }
+
+    fn partial_guest_row(guest_id: &str, guest_hash: &str) -> crate::snapshot::SnapshotRow {
         crate::snapshot::SnapshotRow {
             primary_key: vec![guest_id.to_string()],
             values: BTreeMap::from([
@@ -579,10 +643,70 @@ mod sessions_guest_recovery_tests {
     }
 
     #[test]
-    fn accepts_exact_existing_parent_after_process_loss() {
+    fn rejects_partial_guest_source_image_and_requires_all_canonical_columns() {
         let request = request();
-        let rows = [guest_row(&request.guest_id, &request.guest_hash)];
+        let rows = [partial_guest_row(&request.guest_id, &request.guest_hash)];
 
-        assert!(require_exact_guest_row("target", &rows, &request).is_ok());
+        assert!(require_exact_guest_row("source", &rows, &request).is_err());
+        assert_eq!(
+            exact_guest_sync_config(&crate::live::ApplyBinlogConfig::default(), &request)
+                .table
+                .columns
+                .len(),
+            23
+        );
+    }
+
+    #[test]
+    fn inserts_complete_source_guest_image_with_required_and_nullable_fields() {
+        let request = request();
+        let source_row = guest_row(&request.guest_id, &request.guest_hash);
+        let reconciliation =
+            plan_loaded_sessions_guest(std::slice::from_ref(&source_row), &[], &request)
+                .expect("plan exact guest insert");
+        let GuestReconciliation::Insert(row_to_insert) = reconciliation else {
+            panic!("missing target guest must require insert");
+        };
+        let mut target = crate::table_sync::tests_support::RecordingRepairTarget::default();
+        target
+            .insert_row(row_to_insert)
+            .expect("insert exact guest image");
+
+        let inserted = target.inserts.borrow();
+        assert_eq!(inserted.as_slice(), std::slice::from_ref(&source_row));
+        assert_eq!(inserted[0].values.len(), 23);
+        assert_eq!(inserted[0].values["geo_region_id"].as_deref(), Some("2"));
+        assert_eq!(inserted[0].values["first_user_id"], None);
+        assert_eq!(
+            inserted[0].values["params"].as_deref(),
+            Some("?reason=recovery")
+        );
+    }
+
+    #[test]
+    fn accepts_only_complete_existing_parent_matching_source_image() {
+        let request = request();
+        let source_row = guest_row(&request.guest_id, &request.guest_hash);
+        let mut target_row = source_row.clone();
+        target_row
+            .values
+            .insert("country".to_string(), Some("ca".to_string()));
+
+        assert!(
+            plan_loaded_sessions_guest(
+                std::slice::from_ref(&source_row),
+                std::slice::from_ref(&target_row),
+                &request,
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            plan_loaded_sessions_guest(
+                std::slice::from_ref(&source_row),
+                std::slice::from_ref(&source_row),
+                &request,
+            ),
+            Ok(GuestReconciliation::Existing)
+        ));
     }
 }

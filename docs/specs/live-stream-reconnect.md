@@ -17,12 +17,14 @@ source connection loss without replaying from static startup coordinates.
   last durable coordinate.
 - [x] After a durably persisted row conflict, roll back, keep the checkpoint
   unchanged, and retry the same transaction in-process with bounded backoff.
-- [ ] For the exact `globalcomix.sessions` foreign-key error `1452` naming
+- [x] For the exact `globalcomix.sessions` foreign-key error `1452` naming
   `fk_sessions_guest`, persist the conflict first, then validate the source and
-  target `guests` identity before retrying. Insert one exact source parent only
-  when the target lookup finds no row; accept an existing row only when exactly
-  one row has matching `guest_id` and `guest_hash`. Recovery failure is
-  fail-closed: no replay and no checkpoint advance.
+  target `guests` identity before retrying. Insert one complete canonical
+  23-column source parent only when the target lookup finds no row; accept an
+  existing row only when exactly one complete row matches the source image,
+  including `guest_id` and `guest_hash`. Recovery failure is fail-closed: no
+  replay and no checkpoint advance. Disposable real-database proof remains a
+  separate unchecked gap below.
 - [x] Stop and fail explicitly on other non-transient errors such as authentication
   failure, missing binlog file, unsupported event type, quarantine, or target
   write failure without durable row-conflict evidence.
@@ -33,10 +35,10 @@ transaction has rolled back and ledger evidence is durable, before the unchanged
 checkpoint is replayed. The parent repair itself does not advance the stream
 checkpoint; only successful replay advances it. Recovery requires a durable
 checkpoint store and fails closed on unsupported scope, missing/colliding/divergent
-source or target identity, connection failure, or target insert failure. The
-callback is evaluated before retry-budget gating, so it may perform the strict
-parent check/insert even when no reconnect remains; the source event still cannot
-replay or checkpoint in that case. This is not generic FK repair or live proof.
+source or target identity, incomplete source image, connection failure, or target
+insert failure. Retry eligibility is checked before the recovery callback. An
+exhausted retry budget returns the persisted conflict without reading or mutating
+the recovery target. This is not generic FK repair or live proof.
 It is not an opportunistic TLS-to-plaintext fallback: the current GlobalComix
 source uses explicit plaintext mode from the start. Target TLS configuration is
 separate; failed target CA loading, chain validation, or required DNS/hostname
@@ -103,6 +105,8 @@ identity matching stops immediately.
 - `src/live/structured_stream/` — production native `mysql_cdc` row/DDL stream,
   transaction boundaries, and event-end checkpoint decisions.
 - `src/live/reconnect.rs` — reconnect policy and checkpoint resume semantics.
+- `src/table_sync/run.rs` and `src/table_sync/mysql.rs` — bounded exact
+  sessions/guest recovery using the canonical 23-column source image.
 - `src/stream_checkpoint.rs` — target-table checkpoint store.
 - `src/live/binlog_command.rs` — text-binlog helper retained for the legacy probe
   and fixture/debug paths, not the production stream.
@@ -125,8 +129,11 @@ identity matching stops immediately.
   not reconnect.
 - `src/live/tests/reconnect.rs` — asserts exact sessions/guests recovery runs
   only after retry eligibility, observes the unchanged checkpoint, and is bounded
-  to one attempt per exact persisted conflict identity per reconnect loop; this
-  is unit coverage, not a real source/target recovery proof.
+  to one attempt per exact persisted conflict identity per reconnect loop.
+- `src/table_sync/run.rs` — asserts partial three-column parent images are
+  rejected, complete 23-column images preserve required and nullable fields on
+  insert, and an existing target parent must match the complete source image.
+  These are unit tests, not a real source/target recovery proof.
 - `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
   selection remain source-identity scoped.
 
