@@ -119,15 +119,38 @@ pub(super) fn coordinate_checkpoint(coordinate: &BinlogCoordinate, event_type: &
     }
 }
 
+#[cfg(test)]
 pub(super) fn run_stream_reconnect_loop<C, F, S>(
     config: &ApplyBinlogConfig,
     checkpoint_store: Option<&C>,
-    mut run_attempt: F,
+    run_attempt: F,
     sleep: S,
 ) -> Result<(), ApplyBinlogError>
 where
     C: StreamCheckpointStore,
     F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
+    S: Fn(std::time::Duration),
+{
+    run_stream_reconnect_loop_with_recovery(
+        config,
+        checkpoint_store,
+        run_attempt,
+        |_request| Err("sessions guest recovery service unavailable".to_string()),
+        sleep,
+    )
+}
+
+pub(super) fn run_stream_reconnect_loop_with_recovery<C, F, R, S>(
+    config: &ApplyBinlogConfig,
+    checkpoint_store: Option<&C>,
+    mut run_attempt: F,
+    mut recover: R,
+    sleep: S,
+) -> Result<(), ApplyBinlogError>
+where
+    C: StreamCheckpointStore,
+    F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
+    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), String>,
     S: Fn(std::time::Duration),
 {
     let mut attempt_config = config.clone();
@@ -145,6 +168,7 @@ where
             }
             Err(error)
                 if checkpoint_store.is_some()
+                    && recover_before_reconnect(&error, &mut recover)
                     && should_reconnect(
                         &error,
                         attempt,
@@ -162,6 +186,25 @@ where
                 sleep(reconnect_delay(attempt));
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+fn recover_before_reconnect(
+    error: &ApplyBinlogError,
+    recover: &mut impl FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), String>,
+) -> bool {
+    let Some(request) = error.sessions_guest_recovery() else {
+        return true;
+    };
+    match recover(request) {
+        Ok(()) => true,
+        Err(message) => {
+            eprintln!(
+                "cdc_sessions_guest_recovery_failed error={}",
+                shell_word(&message)
+            );
+            false
         }
     }
 }
@@ -227,7 +270,7 @@ pub(super) fn reconnect_delay(attempt: u32) -> Duration {
 }
 
 fn is_retryable_stream_error(error: &ApplyBinlogError) -> bool {
-    if matches!(error, ApplyBinlogError::RowConflictPersisted(_)) {
+    if matches!(error, ApplyBinlogError::RowConflictPersisted { .. }) {
         return true;
     }
     let ApplyBinlogError::SourceCommand(message) = error else {

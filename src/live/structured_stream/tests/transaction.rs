@@ -683,6 +683,7 @@ fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
             error_code: 1062,
             error_text: "prior replacement conflict".to_string(),
             observed_at_ms: 1,
+            sessions_guest_recovery: None,
         },
     )
     .expect("prior conflict");
@@ -764,6 +765,16 @@ fn apply_deferred_conflict_at_xid(
     header: &EventHeader,
     event: &BinlogEvent,
 ) -> ApplyBinlogError {
+    apply_deferred_conflict_at_xid_position(applier, fixture, header, event, 260)
+}
+
+fn apply_deferred_conflict_at_xid_position(
+    applier: &mut crate::row::RowApplier<TransactionRecordingExecutor>,
+    fixture: DeferredConflictFixture<'_>,
+    header: &EventHeader,
+    event: &BinlogEvent,
+    xid_end_position: u32,
+) -> ApplyBinlogError {
     let DeferredConflictFixture {
         resolver,
         state,
@@ -808,7 +819,7 @@ fn apply_deferred_conflict_at_xid(
     apply_stream_event_transactionally_with_conflicts(
         applier,
         &mut context,
-        &event_header(16, 260),
+        &event_header(16, xid_end_position),
         &BinlogEvent::XidEvent(XidEvent { xid: 42 }),
         "test-source",
         conflicts,
@@ -981,6 +992,70 @@ fn duplicate_insert_under_default_error_policy_rolls_back_without_ledger_entry()
         ["BEGIN", "EXEC", "ROLLBACK"]
     );
     assert!(conflicts.records().is_empty());
+}
+
+#[test]
+fn sessions_109018328_fk_conflict_carries_exact_guest_recovery_after_rollback_and_persistence() {
+    let executor = TransactionRecordingExecutor::with_foreign_key_conflict_second_row_change();
+    let mut applier = crate::row::RowApplier::new(executor);
+    applier.apply_table_map(sessions_row_table_map());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let mut current_file = "mysqld-bin.002709".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    let event = BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id: 20,
+        flags: 0,
+        columns_number: 3,
+        columns_present: vec![true, true, true],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(109_018_328)),
+            Some(MySqlValue::Int(78_011_674)),
+            Some(MySqlValue::String(
+                "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
+            )),
+        ])],
+    });
+
+    let error = apply_deferred_conflict_at_xid_position(
+        &mut applier,
+        DeferredConflictFixture {
+            resolver: &resolver,
+            state: &mut state,
+            current_file: &mut current_file,
+            transaction: &mut transaction,
+            conflicts: &mut conflicts,
+        },
+        &event_header(30, 224_141_058),
+        &event,
+        224_142_261,
+    );
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "ROLLBACK"]
+    );
+    assert_eq!(conflicts.records().len(), 1);
+    assert_eq!(
+        conflicts.records()[0].key.coordinate.start_position,
+        224_141_039
+    );
+    assert_eq!(
+        conflicts.records()[0].key.coordinate.end_position,
+        224_142_261
+    );
+    assert_eq!(
+        error.sessions_guest_recovery(),
+        Some(&crate::live::SessionsGuestRecovery {
+            schema: "globalcomix".to_string(),
+            table: "sessions".to_string(),
+            constraint: "fk_sessions_guest".to_string(),
+            session_id: "109018328".to_string(),
+            guest_id: "78011674".to_string(),
+            guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
+        })
+    );
 }
 
 #[test]

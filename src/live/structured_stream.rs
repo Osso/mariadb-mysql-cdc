@@ -45,7 +45,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::progress::{StreamProgress, format_stream_progress};
-use super::reconnect::{StreamCheckpointStore, run_stream_reconnect_loop};
+use super::reconnect::{StreamCheckpointStore, run_stream_reconnect_loop_with_recovery};
 
 const DEFAULT_REPLICA_SERVER_ID: u32 = 65_535;
 const MYSQL_CDC_HEARTBEAT_SECONDS: u64 = 30;

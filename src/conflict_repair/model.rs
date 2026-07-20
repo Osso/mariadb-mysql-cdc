@@ -205,6 +205,8 @@ pub struct ConflictObservation {
     pub error_code: u16,
     pub error_text: String,
     pub observed_at_ms: u64,
+    #[serde(skip)]
+    pub sessions_guest_recovery: Option<crate::live::SessionsGuestRecovery>,
 }
 
 impl ConflictObservation {

@@ -32,6 +32,7 @@ pub(crate) fn build_duplicate_conflict_observation(
         error_code: input.error_code,
         error_text: input.error_text.to_string(),
         observed_at_ms: input.observed_at_ms,
+        sessions_guest_recovery: None,
     }
 }
 
@@ -85,7 +86,7 @@ where
                 "{}",
                 format_row_conflict_skipped(operation, table, coordinate, primary_key)
             );
-            record_skipped_conflict(context, coordinate, table, operation, primary_key, conflict)
+            record_skipped_conflict(context, coordinate, table, operation, &change, conflict)
         }
     }
 }
@@ -163,14 +164,14 @@ fn record_skipped_conflict(
     coordinate: &BinlogCoordinate,
     table: &RowTableMap,
     operation: RowOperation,
-    primary_key: &[Value],
+    change: &TargetRowChange,
     conflict: crate::target::DuplicateConflict,
 ) -> RowResult<()> {
     let Some(context) = context else {
         return Ok(());
     };
     let observation =
-        skipped_conflict_observation(context, coordinate, table, operation, primary_key, conflict);
+        skipped_conflict_observation(context, coordinate, table, operation, change, conflict);
     context.pending_observations.push(observation);
     Ok(())
 }
@@ -180,9 +181,10 @@ fn skipped_conflict_observation(
     coordinate: &BinlogCoordinate,
     table: &RowTableMap,
     operation: RowOperation,
-    primary_key: &[Value],
+    change: &TargetRowChange,
     conflict: crate::target::DuplicateConflict,
 ) -> ConflictObservation {
+    let sessions_guest_recovery = sessions_guest_recovery(table, change, &conflict);
     ConflictObservation {
         source_identity: context.source_identity.to_string(),
         source_server_id: context.source_server_id,
@@ -194,13 +196,46 @@ fn skipped_conflict_observation(
         schema: table.schema.clone(),
         table: table.table.clone(),
         operation: conflict_operation(operation),
-        source_primary_key: primary_key.iter().map(value_to_conflict_key).collect(),
+        source_primary_key: change
+            .primary_key_values
+            .iter()
+            .map(value_to_conflict_key)
+            .collect(),
         duplicate_index: conflict.duplicate_index,
         duplicate_owner_primary_key: None,
         error_code: conflict.error_code,
+        sessions_guest_recovery,
         error_text: conflict.error_text,
         observed_at_ms: context.observed_at_ms,
     }
+}
+
+fn sessions_guest_recovery(
+    table: &RowTableMap,
+    change: &TargetRowChange,
+    conflict: &crate::target::DuplicateConflict,
+) -> Option<crate::live::SessionsGuestRecovery> {
+    if table.schema != "globalcomix"
+        || table.table != "sessions"
+        || conflict.error_code != 1452
+        || !conflict.error_text.contains("fk_sessions_guest")
+    {
+        return None;
+    }
+    let values = change
+        .writable_columns
+        .iter()
+        .zip(&change.source_values)
+        .map(|(column, value)| (column.as_str(), value_to_conflict_key(value)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    Some(crate::live::SessionsGuestRecovery {
+        schema: table.schema.clone(),
+        table: table.table.clone(),
+        constraint: "fk_sessions_guest".to_string(),
+        session_id: values.get("session_id")?.clone(),
+        guest_id: values.get("guest_id")?.clone(),
+        guest_hash: values.get("guest_hash")?.clone(),
+    })
 }
 
 fn conflict_store_error(

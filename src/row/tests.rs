@@ -199,6 +199,7 @@ fn ignored_duplicate_row_continues_without_persisting_conflict() {
             error_code: 1062,
             error_text: "prior replacement conflict".to_string(),
             observed_at_ms: 1,
+            sessions_guest_recovery: None,
         },
     )
     .expect("prior conflict");

@@ -81,6 +81,27 @@ fn accounts_row_table_map() -> crate::row::TableMapEvent {
     }
 }
 
+fn sessions_row_table_map() -> crate::row::TableMapEvent {
+    crate::row::TableMapEvent {
+        coordinate: stream_coordinate(224_141_039),
+        table: crate::row::RowTableMap {
+            table_id: 20,
+            schema: "globalcomix".to_string(),
+            table: "sessions".to_string(),
+            columns: vec![
+                "session_id".to_string(),
+                "guest_id".to_string(),
+                "guest_hash".to_string(),
+            ],
+            primary_key: vec!["session_id".to_string()],
+            generated_columns: Vec::new(),
+            signed_columns: Vec::new(),
+            enum_columns: BTreeMap::new(),
+            set_columns: BTreeMap::new(),
+        },
+    }
+}
+
 fn accounts_table_map_event(column_count: usize) -> MysqlCdcTableMapEvent {
     MysqlCdcTableMapEvent {
         table_id: 18,
@@ -124,7 +145,7 @@ impl TableSchemaResolver for FixtureSchemaResolver {
         table: &str,
         column_count: usize,
     ) -> Result<ResolvedTableSchema, ApplyBinlogError> {
-        assert_eq!(schema, "fixture_cdc");
+        assert!(matches!(schema, "fixture_cdc" | "globalcomix"));
         fixture_table_schema(table, column_count)
     }
 }
@@ -667,9 +688,8 @@ impl TargetExecutor for TransactionRecordingExecutor {
                     Ok(crate::target::TargetExecutionOutcome::ConstraintConflict(
                         crate::target::DuplicateConflict {
                             error_code: 1452,
-                            error_text:
-                                "Cannot add or update a child row: a foreign key constraint fails"
-                                    .to_string(),
+                            error_text: "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest`)"
+                                .to_string(),
                             duplicate_index: None,
                         },
                     ))

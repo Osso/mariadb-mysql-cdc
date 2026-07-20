@@ -49,7 +49,7 @@ pub(super) fn stream_with_checkpoint_store<C>(
 where
     C: StreamCheckpointStore,
 {
-    run_stream_reconnect_loop(
+    run_stream_reconnect_loop_with_recovery(
         config,
         checkpoint_store,
         |attempt_config| {
@@ -59,6 +59,10 @@ where
                 transaction_checkpoint_table,
                 transaction_checkpoint_name,
             )
+        },
+        |request| {
+            crate::table_sync::reconcile_exact_sessions_guest(config, request)
+                .map_err(|error| error.to_string())
         },
         thread::sleep,
     )

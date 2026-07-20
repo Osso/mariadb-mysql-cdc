@@ -1,5 +1,5 @@
 use super::*;
-use crate::live::reconnect::reconnect_delay;
+use crate::live::reconnect::{reconnect_delay, run_stream_reconnect_loop_with_recovery};
 
 #[test]
 fn reconnect_delay_caps_at_five_seconds() {
@@ -156,10 +156,12 @@ fn retries_durably_persisted_row_conflict_from_unchanged_checkpoint() {
                 .borrow_mut()
                 .push(attempt_config.source.start_position);
             if starts.borrow().len() == 1 {
-                return Err(ApplyBinlogError::RowConflictPersisted(
-                    "Cannot add or update a child row: a foreign key constraint fails (1452)"
-                        .to_string(),
-                ));
+                return Err(ApplyBinlogError::RowConflictPersisted {
+                    message:
+                        "Cannot add or update a child row: a foreign key constraint fails (1452)"
+                            .to_string(),
+                    sessions_guest_recovery: None,
+                });
             }
             Ok(())
         },
@@ -170,6 +172,91 @@ fn retries_durably_persisted_row_conflict_from_unchanged_checkpoint() {
     assert_eq!(starts.into_inner(), vec![120, 120]);
     assert_eq!(delays.into_inner(), vec![Duration::from_secs(1)]);
     assert!(checkpoint_store.saved.borrow().is_none());
+}
+
+#[test]
+fn recovers_exact_sessions_guest_after_persisted_conflict_before_unchanged_checkpoint_retry() {
+    let checkpoint_store =
+        MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.002709", 224_140_888));
+    let config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            binlog_file: "mysqld-bin.002709".to_string(),
+            start_position: 224_140_888,
+            ..SourceBinlogConfig::default()
+        },
+        max_reconnects: 1,
+        ..ApplyBinlogConfig::default()
+    };
+    let request = SessionsGuestRecovery {
+        schema: "globalcomix".to_string(),
+        table: "sessions".to_string(),
+        constraint: "fk_sessions_guest".to_string(),
+        session_id: "109018328".to_string(),
+        guest_id: "78011674".to_string(),
+        guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
+    };
+    let events = RefCell::new(Vec::new());
+    let attempts = RefCell::new(0);
+
+    run_stream_reconnect_loop_with_recovery(
+        &config,
+        Some(&checkpoint_store),
+        |attempt_config| {
+            events
+                .borrow_mut()
+                .push(format!("attempt:{}", attempt_config.source.start_position));
+            let mut count = attempts.borrow_mut();
+            *count += 1;
+            if *count == 1 {
+                events
+                    .borrow_mut()
+                    .push("rolled-back-and-persisted".to_string());
+                return Err(ApplyBinlogError::RowConflictPersisted {
+                    message: "fk_sessions_guest".to_string(),
+                    sessions_guest_recovery: Some(request.clone()),
+                });
+            }
+            checkpoint_store
+                .save_checkpoint(&checkpoint_at("mysqld-bin.002709", 224_142_261))
+                .expect("child replay checkpoint");
+            events.borrow_mut().push("child-committed".to_string());
+            Ok(())
+        },
+        |actual| {
+            assert_eq!(actual, &request);
+            assert_eq!(
+                checkpoint_store
+                    .load_checkpoint()
+                    .expect("load unchanged checkpoint")
+                    .unwrap()
+                    .source_position,
+                224_140_888
+            );
+            events.borrow_mut().push("parent-recovered".to_string());
+            Ok(())
+        },
+        |_delay| {},
+    )
+    .expect("parent recovery retries unchanged checkpoint");
+
+    assert_eq!(
+        events.into_inner(),
+        vec![
+            "attempt:224140888",
+            "rolled-back-and-persisted",
+            "parent-recovered",
+            "attempt:224140888",
+            "child-committed",
+        ]
+    );
+    assert_eq!(
+        checkpoint_store
+            .load_checkpoint()
+            .unwrap()
+            .unwrap()
+            .source_position,
+        224_142_261
+    );
 }
 
 #[test]

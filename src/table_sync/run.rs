@@ -54,6 +54,118 @@ pub fn sync_table_with_progress(
     )
 }
 
+pub(crate) fn reconcile_exact_sessions_guest(
+    config: &crate::live::ApplyBinlogConfig,
+    request: &crate::live::SessionsGuestRecovery,
+) -> Result<(), TableSyncError> {
+    validate_sessions_guest_request(request)?;
+    let source_config = crate::mysql_snapshot::MySqlConnectionConfig {
+        host: config.source.host.clone(),
+        port: config.source.port,
+        user: config.source.user.clone(),
+        password: config.source.password.clone(),
+        database: config.source.database.clone().ok_or_else(|| {
+            TableSyncError::InvalidTable(
+                "sessions guest recovery requires source database".to_string(),
+            )
+        })?,
+    };
+    let source = MySqlSyncReader::new_with_tls_ca(
+        source_config,
+        (!config.source.tls_ca_file.is_empty()).then(|| config.source.tls_ca_file.clone()),
+    );
+    let target = MySqlSyncReader::new_with_target(
+        target_connection_config_for_apply(config),
+        &config.target,
+    )
+    .map_err(TableSyncError::Read)?;
+    let source_rows = source.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
+    let source_row = require_exact_guest_row("source", &source_rows, request)?;
+    let target_rows = target.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
+    if target_rows.is_empty() {
+        let sync_config = exact_guest_sync_config(config, request);
+        mysql_repair_target(&sync_config)?.insert_row(source_row)?;
+        return Ok(());
+    }
+    require_exact_guest_row("target", &target_rows, request).map(|_| ())
+}
+
+fn validate_sessions_guest_request(
+    request: &crate::live::SessionsGuestRecovery,
+) -> Result<(), TableSyncError> {
+    if request.schema == "globalcomix"
+        && request.table == "sessions"
+        && request.constraint == "fk_sessions_guest"
+        && !request.session_id.is_empty()
+        && !request.guest_id.is_empty()
+        && !request.guest_hash.is_empty()
+    {
+        return Ok(());
+    }
+    Err(TableSyncError::InvalidTable(
+        "unsupported sessions guest recovery request".to_string(),
+    ))
+}
+
+fn require_exact_guest_row<'a>(
+    side: &str,
+    rows: &'a [crate::snapshot::SnapshotRow],
+    request: &crate::live::SessionsGuestRecovery,
+) -> Result<&'a crate::snapshot::SnapshotRow, TableSyncError> {
+    if rows.len() != 1
+        || rows[0].primary_key != [request.guest_id.clone()]
+        || rows[0].values.get("guest_hash").and_then(Option::as_deref)
+            != Some(request.guest_hash.as_str())
+    {
+        return Err(TableSyncError::Repair(format!(
+            "{side} guests identity is absent, colliding, or divergent"
+        )));
+    }
+    Ok(&rows[0])
+}
+
+fn target_connection_config_for_apply(
+    config: &crate::live::ApplyBinlogConfig,
+) -> crate::mysql_snapshot::MySqlConnectionConfig {
+    crate::mysql_snapshot::MySqlConnectionConfig {
+        host: config.target.host.clone(),
+        port: config.target.port,
+        user: config.target.user.clone(),
+        password: config.target.password.clone(),
+        database: config.target.database.clone(),
+    }
+}
+
+fn exact_guest_sync_config(
+    config: &crate::live::ApplyBinlogConfig,
+    request: &crate::live::SessionsGuestRecovery,
+) -> SyncTableConfig {
+    SyncTableConfig {
+        source: crate::mysql_snapshot::MySqlConnectionConfig {
+            host: config.source.host.clone(),
+            port: config.source.port,
+            user: config.source.user.clone(),
+            password: config.source.password.clone(),
+            database: "globalcomix".to_string(),
+        },
+        target: config.target.clone(),
+        table: SyncTable {
+            name: "guests".to_string(),
+            primary_key: vec!["guest_id".to_string()],
+            columns: vec!["guest_id".to_string(), "guest_hash".to_string()],
+        },
+        chunk_size: 1,
+        mode: SyncMode::MissingPrimaryKeys,
+        progress_table: "cdc.sync_table_progress".to_string(),
+        run_id: format!("stream-sessions-{}", request.session_id),
+        start_after: None,
+        end_at: Some(vec![request.guest_id.clone()]),
+        max_deletes: Some(0),
+        updated_since: None,
+        plan_hash: None,
+    }
+}
+
 pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, TableSyncError> {
     retry_sync_table_operation(
         config.mode,
@@ -89,6 +201,66 @@ where
         }
     }
     unreachable!("sync retry loop has at least one attempt")
+}
+
+#[cfg(test)]
+mod sessions_guest_recovery_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn request() -> crate::live::SessionsGuestRecovery {
+        crate::live::SessionsGuestRecovery {
+            schema: "globalcomix".to_string(),
+            table: "sessions".to_string(),
+            constraint: "fk_sessions_guest".to_string(),
+            session_id: "109018328".to_string(),
+            guest_id: "78011674".to_string(),
+            guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
+        }
+    }
+
+    fn guest_row(guest_id: &str, guest_hash: &str) -> crate::snapshot::SnapshotRow {
+        crate::snapshot::SnapshotRow {
+            primary_key: vec![guest_id.to_string()],
+            values: BTreeMap::from([
+                ("guest_id".to_string(), Some(guest_id.to_string())),
+                ("guest_hash".to_string(), Some(guest_hash.to_string())),
+            ]),
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_conflict_scope() {
+        let mut unsupported = request();
+        unsupported.constraint = "other_fk".to_string();
+
+        assert!(validate_sessions_guest_request(&unsupported).is_err());
+    }
+
+    #[test]
+    fn rejects_absent_or_nonmatching_source_parent() {
+        let request = request();
+        assert!(require_exact_guest_row("source", &[], &request).is_err());
+        assert!(
+            require_exact_guest_row(
+                "source",
+                &[guest_row(&request.guest_id, "different")],
+                &request,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_target_id_or_hash_collision() {
+        let request = request();
+        let rows = [
+            guest_row(&request.guest_id, "different"),
+            guest_row("999", &request.guest_hash),
+        ];
+
+        assert!(require_exact_guest_row("target", &rows, &request).is_err());
+    }
 }
 
 fn is_retryable_connection_error(error: &TableSyncError) -> bool {

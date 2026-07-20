@@ -45,6 +45,23 @@ impl MySqlSyncReader {
         })
     }
 
+    pub(crate) fn read_guest_identity_rows(
+        &self,
+        guest_id: &str,
+        guest_hash: &str,
+    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        let sql = format!(
+            "SELECT `guest_id`, `guest_hash` FROM `guests` WHERE `guest_id` = {} OR `guest_hash` = {} ORDER BY `guest_id` LIMIT 3",
+            quote_sql_literal(guest_id),
+            quote_sql_literal(guest_hash),
+        );
+        parse_sync_rows(
+            &["guest_id".to_string(), "guest_hash".to_string()],
+            &["guest_id".to_string()],
+            self.query_rows(&sql)?,
+        )
+    }
+
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
         self.ensure_source()?
             .query_rows_as_strings(sql)

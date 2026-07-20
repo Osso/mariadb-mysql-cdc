@@ -338,12 +338,25 @@ pub struct ApplyBinlogReport {
     pub quarantined_statements: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionsGuestRecovery {
+    pub schema: String,
+    pub table: String,
+    pub constraint: String,
+    pub session_id: String,
+    pub guest_id: String,
+    pub guest_hash: String,
+}
+
 #[derive(Debug)]
 pub enum ApplyBinlogError {
     Config(String),
     SourceCommand(String),
     Target(String),
-    RowConflictPersisted(String),
+    RowConflictPersisted {
+        message: String,
+        sessions_guest_recovery: Option<SessionsGuestRecovery>,
+    },
     Statement(String),
     Quarantined(Vec<QuarantinedStatement>),
     Checkpoint(String),
@@ -357,7 +370,7 @@ impl fmt::Display for ApplyBinlogError {
                 write!(formatter, "source binlog command failed: {message}")
             }
             Self::Target(message) => write!(formatter, "target apply failed: {message}"),
-            Self::RowConflictPersisted(message) => {
+            Self::RowConflictPersisted { message, .. } => {
                 write!(formatter, "row conflict persisted for repair: {message}")
             }
             Self::Statement(message) => write!(formatter, "statement apply failed: {message}"),
@@ -368,6 +381,18 @@ impl fmt::Display for ApplyBinlogError {
                 format_quarantined_statements(statements)
             ),
             Self::Checkpoint(message) => write!(formatter, "checkpoint failed: {message}"),
+        }
+    }
+}
+
+impl ApplyBinlogError {
+    pub(super) fn sessions_guest_recovery(&self) -> Option<&SessionsGuestRecovery> {
+        match self {
+            Self::RowConflictPersisted {
+                sessions_guest_recovery,
+                ..
+            } => sessions_guest_recovery.as_ref(),
+            _ => None,
         }
     }
 }
