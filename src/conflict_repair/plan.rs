@@ -4,6 +4,13 @@ use crate::snapshot::SnapshotRow;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) struct DirectionalRepairInventories<'a> {
+    pub source_insert_update: &'a RepairInventory,
+    pub target_insert_update: &'a RepairInventory,
+    pub source_delete: &'a RepairInventory,
+    pub target_delete: &'a RepairInventory,
+}
+
 pub fn build_repair_plan(
     run_id: &str,
     source_identity: &str,
@@ -16,45 +23,41 @@ pub fn build_repair_plan(
         run_id,
         source_identity,
         target_identity,
-        source,
-        target,
-        source,
-        target,
+        DirectionalRepairInventories {
+            source_insert_update: source,
+            target_insert_update: target,
+            source_delete: source,
+            target_delete: target,
+        },
         max_deletes,
     )
 }
 
-pub fn build_repair_plan_with_directional_scopes(
+pub(crate) fn build_repair_plan_with_directional_scopes(
     run_id: &str,
     source_identity: &str,
     target_identity: &str,
-    source_insert_update: &RepairInventory,
-    target_insert_update: &RepairInventory,
-    source_delete: &RepairInventory,
-    target_delete: &RepairInventory,
+    inventories: DirectionalRepairInventories<'_>,
     max_deletes: u64,
 ) -> Result<RepairPlan, RepairPlanError> {
-    validate_inventory_match(source_insert_update, target_insert_update)?;
-    validate_inventory_match(source_delete, target_delete)?;
-    validate_foreign_keys(source_insert_update)?;
-    validate_foreign_keys(source_delete)?;
+    validate_inventory_match(inventories.source_insert_update, inventories.target_insert_update)?;
+    validate_inventory_match(inventories.source_delete, inventories.target_delete)?;
+    validate_foreign_keys(inventories.source_insert_update)?;
+    validate_foreign_keys(inventories.source_delete)?;
     let insert_order = topological_order(
-        &source_insert_update.tables,
-        &source_insert_update.foreign_keys,
+        &inventories.source_insert_update.tables,
+        &inventories.source_insert_update.foreign_keys,
     )?;
     let delete_order = reversed(&topological_order(
-        &source_delete.tables,
-        &source_delete.foreign_keys,
+        &inventories.source_delete.tables,
+        &inventories.source_delete.foreign_keys,
     )?);
     let tables = merged_tables(&insert_order, &delete_order);
     let (inventory_hash, plan_hash) = build_directional_plan_hashes(
         run_id,
         source_identity,
         target_identity,
-        source_insert_update,
-        target_insert_update,
-        source_delete,
-        target_delete,
+        inventories,
         max_deletes,
     );
     Ok(assemble_repair_plan(RepairPlanAssemblyInput {
@@ -74,17 +77,14 @@ fn build_directional_plan_hashes(
     run_id: &str,
     source_identity: &str,
     target_identity: &str,
-    source_insert_update: &RepairInventory,
-    target_insert_update: &RepairInventory,
-    source_delete: &RepairInventory,
-    target_delete: &RepairInventory,
+    inventories: DirectionalRepairInventories<'_>,
     max_deletes: u64,
 ) -> (String, String) {
     let inventory_hash = stable_hash(&(
-        source_insert_update,
-        target_insert_update,
-        source_delete,
-        target_delete,
+        inventories.source_insert_update,
+        inventories.target_insert_update,
+        inventories.source_delete,
+        inventories.target_delete,
     ));
     let plan_hash = stable_hash(&(
         run_id,

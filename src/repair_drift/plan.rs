@@ -1,8 +1,9 @@
 use super::{RepairDriftConfig, RepairDriftError, RepairDriftSkip};
 use crate::conflict_repair::{
-    CanonicalForeignKey, RepairInventory, RepairPlan, RepairPlanError, build_repair_plan,
+    CanonicalForeignKey, DirectionalRepairInventories, RepairInventory, RepairPlan,
+    RepairPlanError, build_repair_plan,
     build_repair_plan_with_directional_scopes,
-};
+}
 use crate::drift_check::DriftComparison;
 use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, SchemaInventory, TableInventory,
@@ -373,10 +374,12 @@ fn build_plan(
         run_id,
         &config.source_identity,
         &format!("{}:{}", config.target.host, config.target.database),
-        &source.insert_update,
-        &target.insert_update,
-        &source.delete,
-        &target.delete,
+        DirectionalRepairInventories {
+            source_insert_update: &source.insert_update,
+            target_insert_update: &target.insert_update,
+            source_delete: &source.delete,
+            target_delete: &target.delete,
+        },
         config.max_deletes.unwrap_or(0),
     )
     .map_err(|error| RepairDriftError::Inventory(error.to_string()))
@@ -485,24 +488,34 @@ fn filter_repair_inventory(
 
 #[cfg(test)]
 fn merge_dependency_scopes(scopes: &DependencyRepairScopes) -> RepairInventory {
-    let tables = scopes
+    let mut tables = Vec::new();
+    let mut seen_tables = BTreeSet::new();
+    for table in scopes
         .insert_update
         .tables
         .iter()
         .chain(&scopes.delete.tables)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let foreign_keys = scopes
+    {
+        if seen_tables.insert(table) {
+            tables.push(table.clone());
+        }
+    }
+    let mut foreign_keys = Vec::new();
+    let mut seen_foreign_keys = BTreeSet::new();
+    for foreign_key in scopes
         .insert_update
         .foreign_keys
         .iter()
         .chain(&scopes.delete.foreign_keys)
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    {
+        if seen_foreign_keys.insert(foreign_key) {
+            foreign_keys.push(foreign_key.clone());
+        }
+    }
     RepairInventory {
         schema: scopes.insert_update.schema.clone(),
-        tables: tables.into_iter().collect(),
-        foreign_keys: foreign_keys.into_iter().collect(),
+        tables,
+        foreign_keys,
     }
 }
 
