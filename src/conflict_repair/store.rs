@@ -42,6 +42,18 @@ impl InMemoryConflictStore {
     pub fn records(&self) -> Vec<RowConflictRecord> {
         self.records.values().cloned().collect()
     }
+
+    fn mark_matching_resolution(&mut self, resolution: ConflictResolution) {
+        let Some(record) = self.records.values_mut().find(|record| {
+            record.status == ConflictStatus::Unresolved
+                && conflict_key_matches_resolution(&record.key, &resolution)
+        }) else {
+            return;
+        };
+        record.status = ConflictStatus::Resolved;
+        record.repair_run_id = Some(resolution.repair_run_id);
+        record.resolution_evidence = Some(resolution.evidence);
+    }
 }
 
 fn conflict_key_matches_resolution(key: &ConflictKey, resolution: &ConflictResolution) -> bool {
@@ -60,14 +72,7 @@ impl ConflictStore for InMemoryConflictStore {
     }
 
     fn resolve_existing(&mut self, resolution: ConflictResolution) -> Result<(), String> {
-        if let Some(record) = self.records.values_mut().find(|record| {
-            record.status == ConflictStatus::Unresolved
-                && conflict_key_matches_resolution(&record.key, &resolution)
-        }) {
-            record.status = ConflictStatus::Resolved;
-            record.repair_run_id = Some(resolution.repair_run_id);
-            record.resolution_evidence = Some(resolution.evidence);
-        }
+        self.mark_matching_resolution(resolution);
         Ok(())
     }
 
@@ -76,14 +81,7 @@ impl ConflictStore for InMemoryConflictStore {
     }
 
     fn mark_resolution_committed(&mut self, resolution: ConflictResolution) {
-        if let Some(record) = self.records.values_mut().find(|record| {
-            record.status == ConflictStatus::Unresolved
-                && conflict_key_matches_resolution(&record.key, &resolution)
-        }) {
-            record.status = ConflictStatus::Resolved;
-            record.repair_run_id = Some(resolution.repair_run_id);
-            record.resolution_evidence = Some(resolution.evidence);
-        }
+        self.mark_matching_resolution(resolution);
     }
 
     fn observe(&mut self, observation: ConflictObservation) -> Result<(), String> {

@@ -89,8 +89,8 @@ runs for a persisted `1452` on the exact `globalcomix.sessions` composite
 failed transaction is rolled back and recorded first. Recovery is evaluated only
 when another reconnect is eligible and at most once per distinct
 `SessionsGuestRecovery` value per process reconnect loop. That typed value is
-reconstructed deterministically during replay from the persisted row image and
-conflict identity; it is not stored in `cdc.row_conflicts`. Deduplication is by
+reconstructed deterministically during replay from the replayed binlog row image and
+conflict context; it is not stored in `cdc.row_conflicts`. Deduplication is by
 that reconstructed value, not by a general ledger-identity key. The source `guests` row must
 uniquely match
 the guest tuple, and a dedicated `UNIX_TIMESTAMP(create_time)` query epoch must

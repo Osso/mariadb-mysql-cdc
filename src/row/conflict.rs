@@ -218,11 +218,7 @@ fn build_exact_sessions_guest_recovery(
     change: &TargetRowChange,
     conflict: &crate::target::DuplicateConflict,
 ) -> Option<crate::live::SessionsGuestRecovery> {
-    if table.schema != crate::live::SESSIONS_GUEST_CHILD_SCHEMA
-        || table.table != crate::live::SESSIONS_GUEST_CHILD_TABLE
-        || conflict.error_code != crate::live::SESSIONS_GUEST_FK_ERROR_CODE
-        || !is_exact_sessions_guest_constraint_error(&conflict.error_text)
-    {
+    if !is_exact_sessions_guest_conflict(table, conflict) {
         return None;
     }
     let values = change
@@ -243,6 +239,16 @@ fn build_exact_sessions_guest_recovery(
         guest_id: values.get("guest_id")?.clone(),
         guest_hash: values.get("guest_hash")?.clone(),
     })
+}
+
+fn is_exact_sessions_guest_conflict(
+    table: &RowTableMap,
+    conflict: &crate::target::DuplicateConflict,
+) -> bool {
+    table.schema == crate::live::SESSIONS_GUEST_CHILD_SCHEMA
+        && table.table == crate::live::SESSIONS_GUEST_CHILD_TABLE
+        && conflict.error_code == crate::live::SESSIONS_GUEST_FK_ERROR_CODE
+        && is_exact_sessions_guest_constraint_error(&conflict.error_text)
 }
 
 fn is_exact_sessions_guest_constraint_error(error_text: &str) -> bool {

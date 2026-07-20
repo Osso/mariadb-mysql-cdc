@@ -169,38 +169,70 @@ where
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
-        if is_stale_or_missing_binlog_error(&error) {
-            return Err(ApplyBinlogError::SourceCommand(format!(
-                "stale or purged source binlog requires operator repair; checkpoint was not changed; error={error}"
-            )));
-        }
-        match failed_attempt_action(
-            &error,
+        let error = handle_failed_attempt(
+            error,
             checkpoint_store.is_some(),
+            attempt,
+            config,
+            &mut attempted_recoveries,
+            &mut recover,
+        )?;
+        prepare_next_attempt(&mut attempt_config, checkpoint_store, &mut attempt, &error)?;
+        sleep(reconnect_delay(attempt));
+    }
+}
+
+fn handle_failed_attempt<R>(
+    error: ApplyBinlogError,
+    has_checkpoint_store: bool,
+    attempt: u32,
+    config: &ApplyBinlogConfig,
+    attempted_recoveries: &mut BTreeSet<crate::live::SessionsGuestRecovery>,
+    recover: &mut R,
+) -> Result<ApplyBinlogError, ApplyBinlogError>
+where
+    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), RecoveryAttemptError>,
+{
+    if let Some(stale_error) = stale_binlog_error(&error) {
+        return Err(stale_error);
+    }
+    if matches!(
+        failed_attempt_action(
+            &error,
+            has_checkpoint_store,
             attempt,
             config.max_reconnects,
             config.reconnect_forever,
-        ) {
-            FailedAttemptAction::Return => {
-                log_skipped_recovery(&error);
-                return Err(error);
-            }
-            FailedAttemptAction::Reconnect => {}
-        }
-        if let Err(source) =
-            attempt_exact_parent_recovery(&error, &mut attempted_recoveries, &mut recover)
-        {
-            let conflict = error
-                .sessions_guest_recovery()
-                .expect("recovery error requires conflict identity")
-                .clone();
-            return Err(ApplyBinlogError::SessionsGuestRecoveryFailed {
-                conflict: Box::new(conflict),
-                source,
-            });
-        }
-        prepare_next_attempt(&mut attempt_config, checkpoint_store, &mut attempt, &error)?;
-        sleep(reconnect_delay(attempt));
+        ),
+        FailedAttemptAction::Return
+    ) {
+        log_skipped_recovery(&error);
+        return Err(error);
+    }
+    attempt_exact_parent_recovery(&error, attempted_recoveries, recover)
+        .map_err(|source| sessions_guest_recovery_error(&error, source))?;
+    Ok(error)
+}
+
+fn stale_binlog_error(error: &ApplyBinlogError) -> Option<ApplyBinlogError> {
+    is_stale_or_missing_binlog_error(error).then(|| {
+        ApplyBinlogError::SourceCommand(format!(
+            "stale or purged source binlog requires operator repair; checkpoint was not changed; error={error}"
+        ))
+    })
+}
+
+fn sessions_guest_recovery_error(
+    error: &ApplyBinlogError,
+    source: RecoveryAttemptError,
+) -> ApplyBinlogError {
+    let conflict = error
+        .sessions_guest_recovery()
+        .expect("recovery error requires conflict identity")
+        .clone();
+    ApplyBinlogError::SessionsGuestRecoveryFailed {
+        conflict: Box::new(conflict),
+        source,
     }
 }
 

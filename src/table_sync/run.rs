@@ -70,7 +70,7 @@ pub(crate) fn reconcile_exact_sessions_guest(
         return Ok(());
     };
     let sync_config = exact_guest_sync_config(config, request);
-    mysql_recovery_target(&sync_config)?.insert_row(&source_row)
+    connect_mysql_recovery_target(&sync_config)?.insert_row(&source_row)
 }
 
 fn build_sessions_guest_recovery_readers(
@@ -356,7 +356,7 @@ pub(crate) fn should_record_sync_run_error(error: &TableSyncError) -> bool {
     matches!(error, TableSyncError::Read(_) | TableSyncError::Repair(_))
 }
 
-fn mysql_recovery_target(
+fn connect_mysql_recovery_target(
     config: &SyncTableConfig,
 ) -> Result<MySqlSyncRepairTarget, TableSyncError> {
     let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)

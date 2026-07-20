@@ -98,12 +98,12 @@ impl MySqlSyncReader {
     }
 
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
-        self.ensure_source()?
+        self.connect_source_if_needed()?
             .query_rows_as_strings(sql)
             .map_err(snapshot_error_to_table_sync)
     }
 
-    fn ensure_source(
+    fn connect_source_if_needed(
         &self,
     ) -> Result<std::cell::RefMut<'_, PersistentMySqlSource>, TableSyncError> {
         if self.source.borrow().is_none() {

@@ -16,6 +16,7 @@ mod insert_conflict;
 mod mysql_cli;
 mod progress;
 mod reconnect;
+mod recovery;
 #[cfg(test)]
 mod repair;
 mod schema_recovery;
@@ -39,6 +40,12 @@ use progress::{StreamProgress, format_stream_progress, format_stream_quarantine}
 use reconnect::{StreamCheckpointStore, run_stream_reconnect_loop, save_stream_checkpoint};
 #[cfg(test)]
 use reconnect::{is_stale_or_missing_binlog_error, resume_from_checkpoint, should_reconnect};
+pub use recovery::{RecoveryAttemptError, SessionsGuestRecovery};
+pub(crate) use recovery::{
+    SESSIONS_GUEST_CHILD_SCHEMA, SESSIONS_GUEST_CHILD_TABLE, SESSIONS_GUEST_CONSTRAINT,
+    SESSIONS_GUEST_FK_ERROR_CODE, SESSIONS_GUEST_FK_SIGNATURE, SESSIONS_GUEST_PARENT_PRIMARY_KEY,
+    SESSIONS_GUEST_PARENT_REFERENCE, SESSIONS_GUEST_PARENT_TABLE,
+};
 #[cfg(test)]
 use repair::{FailedStatementRepairer, repair_failed_statement};
 pub(crate) use schema_recovery::mysql_compatible_create_table;
@@ -336,54 +343,6 @@ impl TargetMySqlConfig {
 pub struct ApplyBinlogReport {
     pub applied_statements: u64,
     pub quarantined_statements: u64,
-}
-
-pub(crate) const SESSIONS_GUEST_CHILD_SCHEMA: &str = "globalcomix";
-pub(crate) const SESSIONS_GUEST_CHILD_TABLE: &str = "sessions";
-pub(crate) const SESSIONS_GUEST_CONSTRAINT: &str = "fk_sessions_guest";
-pub(crate) const SESSIONS_GUEST_FK_ERROR_CODE: u16 = 1452;
-pub(crate) const SESSIONS_GUEST_FK_SIGNATURE: &str = "`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`)";
-pub(crate) const SESSIONS_GUEST_PARENT_REFERENCE: &str =
-    "REFERENCES `guests` (`guest_id`, `guest_hash`)";
-pub(crate) const SESSIONS_GUEST_PARENT_TABLE: &str = "guests";
-pub(crate) const SESSIONS_GUEST_PARENT_PRIMARY_KEY: &str = "guest_id";
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct SessionsGuestRecovery {
-    pub source_file: String,
-    pub source_start_position: u64,
-    pub source_end_position: u64,
-    pub child_event_timestamp: u64,
-    pub schema: String,
-    pub table: String,
-    pub constraint: String,
-    pub session_id: String,
-    pub guest_id: String,
-    pub guest_hash: String,
-}
-
-#[derive(Debug)]
-pub enum RecoveryAttemptError {
-    ReconciliationFailed(String),
-}
-
-impl fmt::Display for RecoveryAttemptError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ReconciliationFailed(message) => {
-                write!(
-                    formatter,
-                    "sessions guest parent reconciliation failed: {message}"
-                )
-            }
-        }
-    }
-}
-
-impl From<crate::table_sync::TableSyncError> for RecoveryAttemptError {
-    fn from(error: crate::table_sync::TableSyncError) -> Self {
-        Self::ReconciliationFailed(error.to_string())
-    }
 }
 
 #[derive(Debug)]
