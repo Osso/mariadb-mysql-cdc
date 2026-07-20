@@ -3174,9 +3174,9 @@ class Harness:
                 "ORDER BY run_id;",
             ).strip()
             expected_verify_runs = (
-                "delete-only-descendants-success-verify-repair_delete_customers\tcomplete\n"
-                "delete-only-descendants-success-verify-repair_delete_invoices\tcomplete\n"
-                "delete-only-descendants-success-verify-repair_delete_orders\tcomplete"
+                "delete-only-descendants-success-verify-repair-delete-customers\tcomplete\n"
+                "delete-only-descendants-success-verify-repair-delete-invoices\tcomplete\n"
+                "delete-only-descendants-success-verify-repair-delete-orders\tcomplete"
             )
             if verify_runs != expected_verify_runs:
                 raise HarnessError(f"{scenario} did not reread the full Verify union: {verify_runs!r}")
