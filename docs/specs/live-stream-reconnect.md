@@ -17,15 +17,30 @@ source connection loss without replaying from static startup coordinates.
   last durable coordinate.
 - [x] After a durably persisted row conflict, roll back, keep the checkpoint
   unchanged, and retry the same transaction in-process with bounded backoff.
+- [ ] For the exact `globalcomix.sessions` foreign-key error `1452` naming
+  `fk_sessions_guest`, persist the conflict first, then validate the source and
+  target `guests` identity before retrying. Insert one exact source parent only
+  when the target lookup finds no row; accept an existing row only when exactly
+  one row has matching `guest_id` and `guest_hash`. Recovery failure is
+  fail-closed: no replay and no checkpoint advance.
 - [x] Stop and fail explicitly on other non-transient errors such as authentication
   failure, missing binlog file, unsupported event type, quarantine, or target
   write failure without durable row-conflict evidence.
 
 Reconnect/backoff applies after transient source loss and after a durable row
-conflict. It is not an opportunistic TLS-to-plaintext fallback: the current
-GlobalComix source uses explicit plaintext mode from the start. Target TLS
-configuration is separate; failed target CA loading, chain validation, or
-required DNS/hostname identity matching stops immediately.
+conflict. For the admitted sessions/guests case, recovery runs after the failed
+transaction has rolled back and ledger evidence is durable, before the unchanged
+checkpoint is replayed. The parent repair itself does not advance the stream
+checkpoint; only successful replay advances it. Recovery requires a durable
+checkpoint store and fails closed on unsupported scope, missing/colliding/divergent
+source or target identity, connection failure, or target insert failure. The
+callback is evaluated before retry-budget gating, so it may perform the strict
+parent check/insert even when no reconnect remains; the source event still cannot
+replay or checkpoint in that case. This is not generic FK repair or live proof.
+It is not an opportunistic TLS-to-plaintext fallback: the current GlobalComix
+source uses explicit plaintext mode from the start. Target TLS configuration is
+separate; failed target CA loading, chain validation, or required DNS/hostname
+identity matching stops immediately.
 
 ### Durable checkpointing
 
@@ -108,6 +123,9 @@ required DNS/hostname identity matching stops immediately.
   reconnect only while positive attempts remain, `--reconnect-forever true`
   allows unlimited transient reconnects, and non-transient source failures do
   not reconnect.
+- `src/live/tests/reconnect.rs` — asserts exact sessions/guests recovery runs
+  before replay and observes the unchanged checkpoint; this is unit coverage,
+  not a real source/target recovery proof.
 - `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
   selection remain source-identity scoped.
 
@@ -119,6 +137,9 @@ required DNS/hostname identity matching stops immediately.
   next stream resumes from the saved checkpoint.
 - [x] Add a failing test where process startup reads an existing checkpoint and
   overrides static startup coordinates.
+- [ ] Prove the sessions/guests recovery against disposable real MariaDB/MySQL,
+  including source/target identity collisions, recovery failure, parent insert,
+  and successful replay/checkpoint advancement.
 - [x] Add a failing test that checkpoint is written only after successful target
   apply.
 - [x] Production streaming uses the native client/reconnect loop; the

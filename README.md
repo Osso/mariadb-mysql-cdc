@@ -80,7 +80,20 @@ ROW `INSERT` duplicate may be logged and committed without ledger persistence;
 divergent inserts and every non-`INSERT` `1062` unique conflict persist evidence,
 roll back, and leave the target transaction/checkpoint uncommitted. Durable row
 conflicts retry in-process with bounded backoff from that unchanged checkpoint;
-successful replay resolves the matching evidence. Guarded observation upserts
+successful replay resolves the matching evidence. One narrow automatic recovery
+runs for a persisted `1452` on `globalcomix.sessions` naming `fk_sessions_guest`:
+the failed transaction is rolled back and recorded first, then the source `guests`
+row must be uniquely identified by matching `guest_id` and `guest_hash`; the target
+lookup must find no row matching either identity or exactly one equal row, and only
+a no-match lookup is inserted. The
+stream retries the same source transaction only after that recovery succeeds.
+Unsupported scope, missing/colliding/divergent identities, unavailable connections,
+or recovery write failure stop the stream without replay or checkpoint advance.
+This is not generic FK repair, requires a durable checkpoint store, and has no
+real-MySQL/live proof in this commit. The recovery callback is evaluated before
+retry-budget gating, so an eligible parent check/insert may occur even when no
+reconnect remains; the original source event still does not replay or checkpoint.
+Guarded observation upserts
 are idempotent. The admin-bootstrapped
 `cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory
 procedure, and exact table/procedure grants must validate at startup; runtime never

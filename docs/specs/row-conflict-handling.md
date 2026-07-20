@@ -42,6 +42,15 @@ conflicting secondary key.
       observations through the independent control-plane connection, and retry
       from the unchanged checkpoint with bounded in-process backoff. Successful
       replay resolves the matching evidence row.
+- [ ] For the sole automatic parent-recovery exception, a persisted `1452` on
+      `globalcomix.sessions` naming `fk_sessions_guest` must carry non-empty
+      `session_id`, `guest_id`, and `guest_hash`. Before replay, source `guests`
+      must contain exactly one row matching both guest identity fields. Target
+      lookup by either identity must return no row or exactly one equal row; a
+      no-match lookup gets one exact insert, while divergent, colliding, or
+      ambiguous state fails closed.
+      Recovery never updates or deletes a parent and never advances the stream
+      checkpoint; only the subsequent successful replay can do that.
 - [x] Emit parseable `cdc_row_conflict_skipped` output with operation, table,
       source coordinate, and source primary key.
 - [x] Replay the same source event into the same identity and increment its
@@ -112,6 +121,13 @@ source-transaction end coordinates, rolls back the target transaction, then
 persists the unresolved observations through the independent durable ledger
 before returning the row failure. The failed transaction and later coordinates
 are not checkpointed, while the independently persisted evidence survives.
+For the exact `globalcomix.sessions`/`fk_sessions_guest` case, the reconnect
+loop performs strict source/target `guests` identity validation after the failed
+transaction rolls back and ledger evidence is durable, before retrying from that
+unchanged checkpoint. It inserts one exact source parent only when the target has
+no matching identity; any unsupported, absent, duplicate, colliding, or divergent
+identity, connection failure, or insert failure stops without replay. The recovery
+is not generic FK repair and requires a durable checkpoint store.
 Equal native ROW `INSERT` duplicates are logged and applied without ledger
 persistence or rollback; divergent native ROW `INSERT` duplicates follow the
 durable conflict path.
@@ -134,7 +150,9 @@ primary key. It then asserts rollback, unchanged checkpoints, and durable
 idempotent evidence for a divergent secondary-unique conflict, different
 primary-key isolation, and a CHECK conflict. The structured-stream transaction
 tests separately assert the same rollback/evidence boundary for a foreign-key
-conflict; the harness's FK scenarios cover repair ordering and cycle blocking.
+conflict; the commit adds unit coverage for exact session/guest recovery extraction
+and retry ordering, but not real source/target reads or inserts. The harness's FK
+scenarios cover repair ordering and cycle blocking.
 
 - [ ] Schedule recurring repair from unresolved records.
 - [ ] Prove the live deployed path and repeated convergence before cutover.
