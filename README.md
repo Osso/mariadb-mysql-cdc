@@ -84,22 +84,26 @@ successful replay resolves the matching evidence. One narrow automatic recovery
 runs for a persisted `1452` on the exact `globalcomix.sessions` composite
 `fk_sessions_guest` identity and ordered (`guest_id`, `guest_hash`) columns. The
 failed transaction is rolled back and recorded first. Recovery is evaluated only
-when another reconnect is eligible and at most once per exact persisted conflict
-identity per process reconnect loop. The source `guests` row must uniquely match
+when another reconnect is eligible and at most once per distinct
+`SessionsGuestRecovery` request value per process reconnect loop. The persisted
+conflict record carries at most one recovery request; this is request-value
+deduplication, not a general ledger-identity key. The source `guests` row must
+uniquely match
 the guest tuple, and a dedicated `UNIX_TIMESTAMP(create_time)` query epoch must
 not be later than the child event timestamp; session-time-zone-rendered timestamp
 text never controls ordering. The helper epoch is excluded from the canonical
 23-column insert/equality image, and the target must contain no matching identity
 or one exact row. A
 no-match lookup inserts the current source row; an exact row is an idempotent
-success after process loss. Later retries of the same identity skip mutation but
+success after process loss. Later retries of the same request skip mutation but
 retain reconnect behavior. Unsupported scope, missing/colliding/divergent or
 temporally invalid identities, unavailable connections, and recovery write
 failure stop without replay or checkpoint advance. Structured recovery logs carry
 the source coordinate, child primary key, guest tuple, action, and outcome. Only
 normal child replay commit/checkpoint resolves ledger evidence. This is not
 generic FK repair, performs no historical binlog reconstruction, requires a
-durable checkpoint store, and has no real-MySQL/live proof in this commit.
+durable checkpoint store, and has no real source/target automatic-recovery
+proof in this commit.
 Guarded observation upserts
 are idempotent. The admin-bootstrapped
 `cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory

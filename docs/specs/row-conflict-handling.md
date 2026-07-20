@@ -132,9 +132,11 @@ timestamp. The identity query returns the canonical 23 columns plus a dedicated
 `UNIX_TIMESTAMP(create_time)` helper epoch. That absolute epoch must be no later
 than the child event; the session-time-zone-rendered `create_time` text does not
 control ordering, and the helper is excluded from insert and exact-row comparison.
-Missing or invalid epochs fail closed. One reconciliation attempt is allowed per
-exact persisted conflict identity per process reconnect loop. A later retry of
-the same identity skips mutation but still follows normal reconnect policy.
+Missing or invalid epochs fail closed. The persisted conflict record carries at
+most one recovery request, and one reconciliation attempt is allowed per
+distinct `SessionsGuestRecovery` request value per process reconnect loop; this is
+not ledger-identity deduplication. A later retry of the same request skips
+mutation but still follows normal reconnect policy.
 Existing exact target parents are accepted idempotently after process loss;
 otherwise one current source parent image is inserted only when the target has
 no matching identity. Unsupported, absent, duplicate, colliding, divergent, or
@@ -167,8 +169,8 @@ idempotent evidence for a divergent secondary-unique conflict, different
 primary-key isolation, and a CHECK conflict. The structured-stream transaction
 tests separately assert the same rollback/evidence boundary for a foreign-key
 conflict; unit coverage proves exact session/guest recovery extraction, epoch-based
-temporal ordering, canonical-row handling, and retry ordering, but not real
-source/target reads or inserts. The harness's FK
+temporal ordering, canonical-row handling, and request-value retry ordering,
+but not real source/target reads or inserts. The harness's FK
 scenarios cover repair ordering and cycle blocking.
 
 - [ ] Schedule recurring repair from unresolved records.

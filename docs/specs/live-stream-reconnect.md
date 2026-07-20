@@ -130,9 +130,10 @@ identity matching stops immediately.
   reconnect only while positive attempts remain, `--reconnect-forever true`
   allows unlimited transient reconnects, and non-transient source failures do
   not reconnect.
-- `src/live/tests/reconnect.rs` — asserts exact sessions/guests recovery runs
-  only after retry eligibility, observes the unchanged checkpoint, and is bounded
-  to one attempt per exact persisted conflict identity per reconnect loop.
+- `src/live/tests/reconnect.rs` — asserts the sessions/guests recovery attempt
+  runs only after retry eligibility, observes the unchanged checkpoint, and is
+  bounded to one attempt per distinct `SessionsGuestRecovery` request value per
+  reconnect loop; this is not ledger-identity deduplication.
 - `src/table_sync/run.rs` — asserts partial parent images are rejected, the
   absolute create-time epoch controls ordering independently of rendered TIMESTAMP
   text, complete 23-column images preserve required and nullable fields on insert,
