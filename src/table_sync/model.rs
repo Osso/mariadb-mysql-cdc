@@ -56,6 +56,13 @@ pub enum SyncPhase {
     InsertMissing,
     UpdateDivergent,
     Verify,
+    VerifyNoTargetExtras,
+}
+
+impl SyncPhase {
+    pub(crate) fn is_verification(self) -> bool {
+        matches!(self, Self::Verify | Self::VerifyNoTargetExtras)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

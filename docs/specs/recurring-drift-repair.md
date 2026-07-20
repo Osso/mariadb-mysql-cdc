@@ -51,11 +51,12 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
       fields, and the real harness proves zero unresolved debt for scope.
 - [x] Secondary-unique collisions remain primary-key scoped and do not mutate the
       conflicting owner row.
-- [x] Execute DeleteExtras, InsertMissing, UpdateDivergent, then a non-mutating
-      Verify reread over the full `plan.tables` union. Parentward inserts/updates
-      retain their directional scope; source-missing delete-only descendants
-      remain outside selected-root equality so a parent missing-PK recovery is not
-      blocked by a child conflict that belongs to the forward stream.
+- [x] Execute DeleteExtras, InsertMissing, UpdateDivergent, then non-mutating
+      verification over the observed repair scope. Tables with observed
+      InsertMissing/UpdateDivergent reports receive full equality Verify; delete-only
+      descendants with observed deletes verify only that no target extras remain.
+      Source-only rows in delete-only descendants remain outside equality because
+      InsertMissing is intentionally excluded there.
 - [x] Individual MariaDB 11.4 → MySQL 8.0 Docker scenarios pass.
 
 Remaining eventual-consistency gates are recurring scheduling from unresolved

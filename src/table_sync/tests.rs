@@ -608,6 +608,38 @@ fn verify_fails_for_missing_rows_without_mutation() {
 }
 
 #[test]
+fn verify_no_target_extras_allows_source_missing_rows_without_mutation() {
+    let source = FakeReader::new(vec![row("1", "alpha"), row("2", "source-only")]);
+    let target = FakeReader::new(vec![row("1", "alpha")]);
+    let mut repair_target = RecordingRepairTarget::default();
+    let mut progress_store = RecordingProgressStore::default();
+
+    let report = sync_table_with_progress_range_phase(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "verify-no-target-extras".to_string(),
+            run_scope: "verify-no-target-extras-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+        SyncPhase::VerifyNoTargetExtras,
+    )
+    .expect("source-only rows are outside delete-only verification scope");
+
+    assert_eq!(report.inserts, 0);
+    assert_eq!(report.updates, 0);
+    assert_eq!(report.extra_target_rows, 0);
+    assert!(repair_target.operations.borrow().is_empty());
+}
+
+#[test]
 fn verify_fails_for_extra_rows_without_mutation() {
     let source = FakeReader::new(vec![row("1", "alpha")]);
     let target = FakeReader::new(vec![row("1", "alpha"), row("2", "extra")]);

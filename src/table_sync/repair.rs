@@ -21,6 +21,10 @@ pub(crate) fn repair_chunk(
         verify_chunk(&source_by_key, &target_by_key, report);
         return Ok(());
     }
+    if phase == SyncPhase::VerifyNoTargetExtras {
+        verify_no_target_extras_chunk(&source_by_key, &target_by_key, report);
+        return Ok(());
+    }
     if matches!(phase, SyncPhase::All | SyncPhase::DeleteExtras) {
         repair_extra_rows(
             &source_by_key,
@@ -58,6 +62,14 @@ fn verify_chunk(
                 .is_some_and(|target| source.values != target.values)
         })
         .count() as u64;
+    verify_no_target_extras_chunk(source_by_key, target_by_key, report);
+}
+
+fn verify_no_target_extras_chunk(
+    source_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
+    target_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
+    report: &mut SyncTableReport,
+) {
     report.extra_target_rows += target_by_key
         .keys()
         .filter(|primary_key| !source_by_key.contains_key(*primary_key))

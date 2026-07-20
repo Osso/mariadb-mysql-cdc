@@ -38,10 +38,9 @@ are resolved only after verified equality.
       per-operation state, and selected-scope cycle/schema-mismatch blocking.
 - [x] Build read-only and repair inputs from the full `plan.tables` union. Cumulative
       DeleteExtras preflight and child-first deletes cover every childward table;
-      parentward inserts/updates retain their directional scope. Verify rereads
-      the full union, while source-missing delete-only descendants remain outside
-      selected-root equality so a parent missing-PK recovery is not blocked by a
-      child conflict that belongs to the forward stream.
+      parentward inserts/updates retain their directional scope. Verification uses
+      observed phase outcomes: insert/update scope receives full equality, while
+      delete-only descendants verify only that target extras are gone.
 
 ## Remaining boundaries
 
@@ -73,9 +72,10 @@ are resolved only after verified equality.
 5. Insert missing rows parent-first.
 6. Update divergent rows after blockers are removed; handle FK/unique key changes
    explicitly.
-7. Run the real Verify phase over the union of both directional scopes: reread
-   that full scope, make no target mutations, and fail on any missing, extra, or
-   divergent row before recording conflict resolution evidence.
+7. Run non-mutating verification over the union of both directional scopes:
+   reread full equality for selected/parentward insert-update tables, and reread
+   only target extras for delete-only descendants. Fail on any property that the
+   corresponding phase repaired before recording conflict resolution evidence.
 8. Run a fresh second pass and require zero actionable mismatches and unresolved
    conflict/manual/journal debt.
 

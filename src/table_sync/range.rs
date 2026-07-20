@@ -173,7 +173,7 @@ where
     loop {
         let next_start_after = sync_next_range_chunk(context)?;
         let Some(next_start_after) = next_start_after else {
-            if context.phase == SyncPhase::Verify {
+            if context.phase.is_verification() {
                 return verification_result(context);
             }
             complete_sync_progress(&mut context.progress, context.progress_store)?;
@@ -479,7 +479,7 @@ where
     P: SyncProgressStore,
 {
     if context.mode != SyncMode::MissingPrimaryKeys
-        || context.phase == SyncPhase::Verify
+        || context.phase.is_verification()
         || !context.target.requires_full_rows_for_missing_primary_keys()
     {
         return Ok(false);
@@ -802,14 +802,20 @@ where
     R: SyncRepairTarget,
     P: SyncProgressStore,
 {
-    if context.report.inserts > 0
-        || context.report.updates > 0
-        || context.report.extra_target_rows > 0
-    {
+    let has_unrepaired_rows = match context.phase {
+        SyncPhase::Verify => {
+            context.report.inserts > 0
+                || context.report.updates > 0
+                || context.report.extra_target_rows > 0
+        }
+        SyncPhase::VerifyNoTargetExtras => context.report.extra_target_rows > 0,
+        _ => false,
+    };
+    if has_unrepaired_rows {
         return Err(TableSyncError::Repair(format!(
             "verification failed: table={} scope={} missing_rows={} extra_rows={} divergent_rows={}",
             context.table.name,
-            verification_scope(context.options),
+            verification_scope(context.options, context.phase),
             context.report.inserts,
             context.report.extra_target_rows,
             context.report.updates,
@@ -819,15 +825,20 @@ where
     Ok(context.report.clone())
 }
 
-fn verification_scope(options: &SyncRunOptions) -> String {
-    if options.start_after.is_none() && options.end_at.is_none() {
-        return "full-table".to_string();
+fn verification_scope(options: &SyncRunOptions, phase: SyncPhase) -> String {
+    let scope = if options.start_after.is_none() && options.end_at.is_none() {
+        "full-table".to_string()
+    } else {
+        format!(
+            "primary-key-window start_after={} end_at={}",
+            format_bound(options.start_after.as_ref()),
+            format_bound(options.end_at.as_ref())
+        )
+    };
+    if phase == SyncPhase::VerifyNoTargetExtras {
+        return format!("no-target-extras {scope}");
     }
-    format!(
-        "primary-key-window start_after={} end_at={}",
-        format_bound(options.start_after.as_ref()),
-        format_bound(options.end_at.as_ref())
-    )
+    scope
 }
 
 fn format_bound(values: Option<&Vec<String>>) -> String {

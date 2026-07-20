@@ -3186,15 +3186,15 @@ class Harness:
                 "ORDER BY run_id;",
             ).strip()
             expected_verify_runs = (
-                "delete-only-descendants-success-verify-repair-delete-customers\tcomplete\n"
-                "delete-only-descendants-success-verify-repair-delete-invoices\tcomplete\n"
-                "delete-only-descendants-success-verify-repair-delete-orders\tcomplete"
+                "delete-only-descendants-success-verify-no-target-extras-repair-delete-invoices\tcomplete\n"
+                "delete-only-descendants-success-verify-no-target-extras-repair-delete-orders\tcomplete\n"
+                "delete-only-descendants-success-verify-repair-delete-customers\tcomplete"
             )
             if verify_runs != expected_verify_runs:
                 raise HarnessError(f"{scenario} did not reread the full Verify union: {verify_runs!r}")
             print(
                 f"{scenario}_converged cumulative_deletes=3 child_before_parent=true "
-                "verify_union=true"
+                "verify_scopes=true"
             )
             return
 

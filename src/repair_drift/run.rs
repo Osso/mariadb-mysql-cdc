@@ -8,7 +8,7 @@ use crate::drift_check::{self, DriftCheckConfig};
 use crate::inventory::{InventoryConfig, InventoryEndpointRole, SchemaInventory, build_inventory};
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::table_sync::{self, SyncMode, SyncPhase, SyncTable, SyncTableConfig};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -212,14 +212,20 @@ fn run_repair_phases(
     let mut state = RepairState {
         deleted_rows: 0,
         repaired_by_table: BTreeMap::new(),
+        observed_verify_scopes: BTreeMap::new(),
     };
-    let verify_tables = required_verify_tables(plan, repair_tables);
     for (phase, order) in repair_phases(plan) {
-        let order = if phase == SyncPhase::Verify {
-            verify_tables.as_slice()
-        } else {
-            order
-        };
+        if phase == SyncPhase::Verify {
+            run_verification_phases(
+                config,
+                run_id,
+                plan,
+                repair_tables,
+                &mut conflict_store,
+                &mut state,
+            )?;
+            continue;
+        }
         for table_name in order {
             run_repair_phase_for_table(RepairPhaseRequest {
                 config,
@@ -238,9 +244,16 @@ fn run_repair_phases(
     Ok(state.repaired_by_table.into_values().collect())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerifyScope {
+    FullEquality,
+    NoTargetExtras,
+}
+
 struct RepairState {
     deleted_rows: u64,
     repaired_by_table: BTreeMap<String, RepairDriftTableReport>,
+    observed_verify_scopes: BTreeMap<String, VerifyScope>,
 }
 
 fn repair_phases(plan: &crate::repair_drift::RepairPlan) -> [(SyncPhase, &[String]); 4] {
@@ -252,23 +265,36 @@ fn repair_phases(plan: &crate::repair_drift::RepairPlan) -> [(SyncPhase, &[Strin
     ]
 }
 
-fn required_verify_tables(
+fn run_verification_phases(
+    config: &RepairDriftConfig,
+    run_id: &str,
     plan: &crate::repair_drift::RepairPlan,
     repair_tables: &RepairTableInputs,
-) -> Vec<String> {
-    let parentward_tables = plan.insert_order.iter().collect::<BTreeSet<_>>();
-    plan.tables
-        .iter()
-        .filter(|table_name| {
-            if parentward_tables.contains(table_name) {
-                return true;
-            }
-            repair_tables
-                .get(*table_name)
-                .is_some_and(|(source_count, target_count, _)| source_count <= target_count)
-        })
-        .cloned()
-        .collect()
+    conflict_store: &mut Option<crate::conflict_repair::MySqlConflictStore>,
+    state: &mut RepairState,
+) -> Result<(), RepairDriftError> {
+    for table_name in &plan.tables {
+        let Some(scope) = state.observed_verify_scopes.get(table_name).copied() else {
+            continue;
+        };
+        let phase = match scope {
+            VerifyScope::FullEquality => SyncPhase::Verify,
+            VerifyScope::NoTargetExtras => SyncPhase::VerifyNoTargetExtras,
+        };
+        run_repair_phase_for_table(RepairPhaseRequest {
+            config,
+            run_id,
+            plan,
+            repair_tables,
+            phase,
+            table_name,
+            run: RepairPhaseRun {
+                conflict_store,
+                state,
+            },
+        })?;
+    }
+    Ok(())
 }
 
 fn initialize_conflict_store(
@@ -400,6 +426,12 @@ fn record_phase(
     input: RecordPhaseInput,
 ) -> Result<(), RepairDriftError> {
     context.run.state.deleted_rows += input.phase_report.extra_target_rows;
+    observe_verify_scope(
+        &mut context.run.state.observed_verify_scopes,
+        context.phase,
+        context.table_name,
+        &input.phase_report,
+    );
     resolve_verified_conflicts(
         context.config,
         context.run_id,
@@ -417,6 +449,23 @@ fn record_phase(
         input.phase_report,
     );
     Ok(())
+}
+
+fn observe_verify_scope(
+    scopes: &mut BTreeMap<String, VerifyScope>,
+    phase: SyncPhase,
+    table_name: &str,
+    report: &table_sync::SyncTableReport,
+) {
+    match phase {
+        SyncPhase::DeleteExtras if report.extra_target_rows > 0 => {
+            scopes.insert(table_name.to_string(), VerifyScope::NoTargetExtras);
+        }
+        SyncPhase::InsertMissing | SyncPhase::UpdateDivergent => {
+            scopes.insert(table_name.to_string(), VerifyScope::FullEquality);
+        }
+        _ => {}
+    }
 }
 
 fn run_sync_phase(
@@ -593,6 +642,7 @@ fn phase_name(phase: SyncPhase) -> &'static str {
         SyncPhase::InsertMissing => "insert-missing",
         SyncPhase::UpdateDivergent => "update-divergent",
         SyncPhase::Verify => "verify",
+        SyncPhase::VerifyNoTargetExtras => "verify-no-target-extras",
     }
 }
 
@@ -662,46 +712,33 @@ mod tests {
     }
 
     #[test]
-    fn verify_scope_keeps_delete_only_target_extras_but_not_source_missing_rows() {
-        let plan = crate::conflict_repair::RepairPlan {
-            run_id: "run".to_string(),
-            source_identity: "source".to_string(),
-            target_identity: "target".to_string(),
-            inventory_hash: "inventory".to_string(),
-            plan_hash: "plan".to_string(),
-            tables: vec![
-                "customers".to_string(),
-                "invoices".to_string(),
-                "orders".to_string(),
-            ],
-            delete_order: vec![
-                "orders".to_string(),
-                "invoices".to_string(),
-                "customers".to_string(),
-            ],
-            insert_order: vec!["customers".to_string()],
-            update_order: vec!["customers".to_string()],
-            max_deletes: 0,
-        };
-        let table = crate::table_sync::SyncTable {
-            name: "child".to_string(),
-            primary_key: vec!["id".to_string()],
-            columns: vec!["id".to_string()],
-        };
-        let repair_tables = [("customers", 1, 1), ("invoices", 0, 1), ("orders", 1, 0)]
-            .into_iter()
-            .map(|(name, source_count, target_count)| {
-                (
-                    name.to_string(),
-                    (source_count, target_count, table.clone()),
-                )
-            })
-            .collect();
-
-        assert_eq!(
-            required_verify_tables(&plan, &repair_tables),
-            vec!["customers", "invoices"]
+    fn observed_phase_reports_select_verification_property() {
+        let mut scopes = BTreeMap::new();
+        observe_verify_scope(
+            &mut scopes,
+            SyncPhase::DeleteExtras,
+            "orders",
+            &table_sync::SyncTableReport {
+                extra_target_rows: 1,
+                ..Default::default()
+            },
         );
+        observe_verify_scope(
+            &mut scopes,
+            SyncPhase::InsertMissing,
+            "customers",
+            &table_sync::SyncTableReport::default(),
+        );
+        observe_verify_scope(
+            &mut scopes,
+            SyncPhase::UpdateDivergent,
+            "invoices",
+            &table_sync::SyncTableReport::default(),
+        );
+
+        assert_eq!(scopes["orders"], VerifyScope::NoTargetExtras);
+        assert_eq!(scopes["customers"], VerifyScope::FullEquality);
+        assert_eq!(scopes["invoices"], VerifyScope::FullEquality);
     }
 
     #[test]

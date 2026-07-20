@@ -196,7 +196,7 @@ fn run_sync_table_with_targets_phase(
     phase: SyncPhase,
     run_spec_json: Option<&str>,
 ) -> Result<SyncTableReport, TableSyncError> {
-    if phase == SyncPhase::Verify && config.updated_since.is_some() {
+    if phase.is_verification() && config.updated_since.is_some() {
         return Err(TableSyncError::InvalidTable(
             "verify phase cannot use updated_since".to_string(),
         ));
