@@ -3048,9 +3048,46 @@ class Harness:
             "SELECT run_id,table_name,rows_scanned,inserts_applied,status "
             "FROM cdc.table_sync_runs ORDER BY run_id;",
         ).strip()
-        if progress != "least-privilege-progress:repair_accounts:insert-missing\trepair_accounts\t1\t1\tcomplete":
+        expected_progress = "\n".join(
+            [
+                "least-privilege-progress-delete-extras-repair-accounts\trepair_accounts\t1\t0\tcomplete",
+                "least-privilege-progress-insert-missing-repair-accounts\trepair_accounts\t1\t1\tcomplete",
+                "least-privilege-progress-update-divergent-repair-accounts\trepair_accounts\t1\t0\tcomplete",
+                "least-privilege-progress-verify-repair-accounts\trepair_accounts\t1\t0\tcomplete",
+            ]
+        )
+        if progress != expected_progress:
             raise HarnessError(f"unexpected bounded sync progress: {progress!r}")
-        print("run-progress-least-privilege_ok rows=1 progress_rows=1 status=complete schema_ddl=false")
+
+        self.admin_sql(
+            self.target,
+            "DROP TABLE cdc.table_sync_runs; "
+            "CREATE TABLE cdc.table_sync_runs ("
+            "run_id VARCHAR(128) NOT NULL PRIMARY KEY,"
+            "run_spec_json LONGTEXT NOT NULL"
+            ") ENGINE=InnoDB;",
+        )
+        malformed = self.run_repair(
+            tables=["repair_accounts"],
+            max_deletes=0,
+            run_id="malformed-progress",
+            chunk_size=1,
+            progress_table="cdc.table_sync_runs",
+        )
+        malformed_output = f"{malformed.stdout}\n{malformed.stderr}".lower()
+        if malformed.returncode == 0 or "not a run-scoped progress table" not in malformed_output:
+            raise HarnessError(f"malformed progress table did not fail explicitly: {malformed}")
+        malformed_columns = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.columns "
+            "WHERE table_schema='cdc' AND table_name='table_sync_runs';",
+        ).strip()
+        if malformed_columns != "2":
+            raise HarnessError(f"malformed progress table was altered: columns={malformed_columns!r}")
+        print(
+            "run-progress-least-privilege_ok rows=1 progress_rows=4 status=complete "
+            "schema_ddl=false malformed_rejected=true malformed_unchanged=true"
+        )
 
     def run_repair_scenario(self, scenario: str) -> None:
         assert self.source and self.target

@@ -372,16 +372,20 @@ impl SyncRunSelectionStore for MySqlSyncRunProgressStore {
 
 impl SyncProgressStore for MySqlSyncRunProgressStore {
     fn ensure(&mut self) -> Result<(), TableSyncError> {
+        let schema_query =
+            build_sync_run_schema_query(&self.inner.target.database, &self.inner.table);
+        let schema_inventory = self.inner.query(schema_query.clone())?;
+        if sync_run_table_exists(&self.inner.table, &schema_inventory)? {
+            return require_sync_run_schema(&self.inner.table, &schema_inventory);
+        }
+
         if let Some(schema_sql) = build_create_progress_schema_sql(&self.inner.table) {
             self.inner.execute(schema_sql)?;
         }
         self.inner
             .execute(build_create_sync_run_table_sql(&self.inner.table))?;
-        let schema_count = self.inner.query(build_sync_run_schema_query(
-            &self.inner.target.database,
-            &self.inner.table,
-        ))?;
-        require_sync_run_schema(&self.inner.table, &schema_count)
+        let schema_inventory = self.inner.query(schema_query)?;
+        require_sync_run_schema(&self.inner.table, &schema_inventory)
     }
 
     fn acquire_run(&self, run_id: &str) -> Result<(), TableSyncError> {
@@ -623,17 +627,50 @@ pub(crate) fn build_create_progress_schema_sql(table: &str) -> Option<String> {
     ))
 }
 
+const SYNC_RUN_COLUMN_NAMES: &str = "'run_id','table_name','run_spec_json',\
+'last_primary_key_json','chunks','rows_scanned','total_rows','inserts_applied',\
+'updates_applied','extra_target_rows','mode','status','last_error','created_at','updated_at'";
+const SYNC_RUN_COLUMN_COUNT: &str = "15";
+
 fn build_sync_run_schema_query(default_schema: &str, progress_table: &str) -> String {
     let (schema, table) = qualified_table_parts(default_schema, progress_table);
+    let schema = quote_sql_literal(&schema);
+    let table = quote_sql_literal(&table);
     format!(
-        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = {} AND table_name = {} AND column_name IN ('run_id','run_spec_json')",
-        quote_sql_literal(&schema),
-        quote_sql_literal(&table)
+        "SELECT (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = {schema} AND table_name = {table}),\
+(SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = {schema} AND table_name = {table} AND column_name IN ({SYNC_RUN_COLUMN_NAMES})),\
+(SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = {schema} AND table_name = {table} AND index_name = 'PRIMARY' AND column_name = 'run_id' AND seq_in_index = 1)"
     )
 }
 
+fn parse_sync_run_schema_inventory<'a>(
+    table: &str,
+    output: &'a str,
+) -> Result<Vec<&'a str>, TableSyncError> {
+    let fields = output.trim().split('\t').collect::<Vec<_>>();
+    if fields.len() == 3 {
+        return Ok(fields);
+    }
+    Err(TableSyncError::Progress(format!(
+        "progress table `{table}` schema inventory returned {} fields, expected 3",
+        fields.len()
+    )))
+}
+
+fn sync_run_table_exists(table: &str, output: &str) -> Result<bool, TableSyncError> {
+    let fields = parse_sync_run_schema_inventory(table, output)?;
+    match fields[0] {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        count => Err(TableSyncError::Progress(format!(
+            "progress table `{table}` schema inventory returned invalid table count `{count}`"
+        ))),
+    }
+}
+
 fn require_sync_run_schema(table: &str, output: &str) -> Result<(), TableSyncError> {
-    if output.trim() == "2" {
+    let fields = parse_sync_run_schema_inventory(table, output)?;
+    if fields == ["1", SYNC_RUN_COLUMN_COUNT, "1"] {
         return Ok(());
     }
     Err(TableSyncError::Progress(format!(
@@ -941,12 +978,33 @@ mod tests {
     }
 
     #[test]
-    fn run_table_schema_query_requires_both_identity_columns() {
+    fn run_table_schema_query_validates_existing_table_contract() {
         let sql = build_sync_run_schema_query("globalcomix", "cdc.table_sync_progress");
 
+        assert!(sql.contains("information_schema.tables"));
         assert!(sql.contains("table_schema = 'cdc'"));
         assert!(sql.contains("table_name = 'table_sync_progress'"));
-        assert!(sql.contains("column_name IN ('run_id','run_spec_json')"));
+        assert!(sql.contains("information_schema.columns"));
+        assert!(sql.contains("run_id"));
+        assert!(sql.contains("updated_at"));
+        assert!(sql.contains("information_schema.statistics"));
+        assert!(sql.contains("index_name = 'PRIMARY'"));
+    }
+
+    #[test]
+    fn existing_run_table_requires_all_columns_and_run_id_primary_key() {
+        require_sync_run_schema("cdc.table_sync_runs", "1\t15\t1")
+            .expect("complete run-scoped schema");
+
+        for malformed in ["1\t14\t1", "1\t15\t0"] {
+            let error = require_sync_run_schema("cdc.table_sync_runs", malformed)
+                .expect_err("malformed existing table must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("not a run-scoped progress table")
+            );
+        }
     }
 
     #[test]
