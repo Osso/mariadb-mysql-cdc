@@ -102,6 +102,23 @@ fn sessions_row_table_map() -> crate::row::TableMapEvent {
     }
 }
 
+fn home_feed_card_slides_row_table_map() -> crate::row::TableMapEvent {
+    crate::row::TableMapEvent {
+        coordinate: stream_coordinate(308_259_855),
+        table: crate::row::RowTableMap {
+            table_id: 21,
+            schema: "globalcomix".to_string(),
+            table: "home_feed_card_slides".to_string(),
+            columns: vec!["id".to_string(), "card_id".to_string()],
+            primary_key: vec!["id".to_string()],
+            generated_columns: Vec::new(),
+            signed_columns: Vec::new(),
+            enum_columns: BTreeMap::new(),
+            set_columns: BTreeMap::new(),
+        },
+    }
+}
+
 fn accounts_table_map_event(column_count: usize) -> MysqlCdcTableMapEvent {
     MysqlCdcTableMapEvent {
         table_id: 18,
@@ -501,6 +518,7 @@ enum DuplicateMode {
     Replaced,
     DefaultError,
     ForeignKey,
+    HomeFeedCardForeignKey,
     Check,
     UpdateUnique,
 }
@@ -615,6 +633,14 @@ impl TransactionRecordingExecutor {
         }
     }
 
+    fn with_home_feed_card_foreign_key_conflict() -> Self {
+        Self {
+            duplicate_row_change_number: Some(1),
+            duplicate_mode: DuplicateMode::HomeFeedCardForeignKey,
+            ..Self::default()
+        }
+    }
+
     fn with_check_conflict_second_row_change() -> Self {
         Self {
             duplicate_row_change_number: Some(1),
@@ -693,6 +719,16 @@ impl TargetExecutor for TransactionRecordingExecutor {
                         crate::target::DuplicateConflict {
                             error_code: 1452,
                             error_text: "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))"
+                                .to_string(),
+                            duplicate_index: None,
+                        },
+                    ))
+                }
+                DuplicateMode::HomeFeedCardForeignKey => {
+                    Ok(crate::target::TargetExecutionOutcome::ConstraintConflict(
+                        crate::target::DuplicateConflict {
+                            error_code: 1452,
+                            error_text: "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`home_feed_card_slides`, CONSTRAINT `fk_hfcs_card` FOREIGN KEY (`card_id`) REFERENCES `home_feed_cards` (`id`))"
                                 .to_string(),
                             duplicate_index: None,
                         },

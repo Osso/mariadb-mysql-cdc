@@ -695,7 +695,7 @@ fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
             error_code: 1062,
             error_text: "prior replacement conflict".to_string(),
             observed_at_ms: 1,
-            sessions_guest_recovery: None,
+            parent_recovery: None,
         },
     )
     .expect("prior conflict");
@@ -1078,6 +1078,63 @@ fn sessions_109018328_fk_conflict_carries_exact_guest_recovery_after_rollback_an
             guest_id: "78011674".to_string(),
             guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
         })
+    );
+}
+
+#[test]
+fn home_feed_slide_4508905_fk_conflict_carries_exact_card_recovery_boundary() {
+    let executor = TransactionRecordingExecutor::with_home_feed_card_foreign_key_conflict();
+    let mut applier = crate::row::RowApplier::new(executor);
+    applier.apply_table_map(home_feed_card_slides_row_table_map());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let mut current_file = "mysqld-bin.002709".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    let event = BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
+        table_id: 21,
+        flags: 0,
+        columns_number: 2,
+        columns_present: vec![true, true],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(4_508_905)),
+            Some(MySqlValue::Int(2_492_683)),
+        ])],
+    });
+
+    let error = apply_deferred_conflict_at_xid_position(
+        &mut applier,
+        DeferredConflictFixture {
+            resolver: &resolver,
+            state: &mut state,
+            current_file: &mut current_file,
+            transaction: &mut transaction,
+            conflicts: &mut conflicts,
+        },
+        &event_header_at(30, 308_259_874, 1_784_588_463),
+        &event,
+        308_261_441,
+    );
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "ROLLBACK"]
+    );
+    assert_eq!(
+        error.parent_recovery(),
+        Some(&crate::live::ExactParentRecovery::HomeFeedCard(
+            crate::live::HomeFeedCardRecovery {
+                source_file: "mysqld-bin.002709".to_string(),
+                source_start_position: 308_259_855,
+                source_end_position: 308_261_441,
+                child_event_timestamp: 1_784_588_463,
+                schema: "globalcomix".to_string(),
+                table: "home_feed_card_slides".to_string(),
+                constraint: "fk_hfcs_card".to_string(),
+                slide_id: "4508905".to_string(),
+                card_id: "2492683".to_string(),
+            }
+        ))
     );
 }
 

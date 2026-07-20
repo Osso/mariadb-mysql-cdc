@@ -157,8 +157,8 @@ impl TargetTransaction {
         let mut observations = std::mem::take(&mut self.pending_conflict_observations);
         for observation in &mut observations {
             observation.coordinate.end_position = end_position;
-            if let Some(request) = &mut observation.sessions_guest_recovery {
-                request.source_end_position = end_position;
+            if let Some(request) = &mut observation.parent_recovery {
+                request.set_source_end_position(end_position);
             }
         }
         observations
@@ -423,9 +423,9 @@ fn persist_deferred_conflicts(
         .first()
         .map(|observation| observation.error_text.clone())
         .unwrap_or_else(|| "unknown row conflict".to_string());
-    let sessions_guest_recovery = observations
+    let parent_recovery = observations
         .iter()
-        .find_map(|observation| observation.sessions_guest_recovery.clone())
+        .find_map(|observation| observation.parent_recovery.clone())
         .map(Box::new);
     for observation in observations {
         conflict_store
@@ -438,7 +438,7 @@ fn persist_deferred_conflicts(
     println!("cdc_row_conflict_progress unresolved_count={unresolved_count}");
     Err(ApplyBinlogError::RowConflictPersisted {
         message: error_text,
-        sessions_guest_recovery,
+        parent_recovery,
     })
 }
 

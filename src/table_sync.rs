@@ -49,6 +49,6 @@ pub(crate) use repair::{
 #[cfg(test)]
 pub(crate) use run::{build_sync_run_scope, retry_sync_table_operation};
 pub(crate) use run::{
-    find_compatible_failed_run, reconcile_exact_sessions_guest, run_sync_table_phase_with_run_spec,
+    find_compatible_failed_run, reconcile_exact_parent, run_sync_table_phase_with_run_spec,
     should_record_sync_run_error,
 };

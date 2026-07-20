@@ -32,7 +32,7 @@ pub(crate) fn build_duplicate_conflict_observation(
         error_code: input.error_code,
         error_text: input.error_text.to_string(),
         observed_at_ms: input.observed_at_ms,
-        sessions_guest_recovery: None,
+        parent_recovery: None,
     }
 }
 
@@ -184,8 +184,8 @@ fn skipped_conflict_observation(
     change: &TargetRowChange,
     conflict: crate::target::DuplicateConflict,
 ) -> ConflictObservation {
-    let sessions_guest_recovery =
-        build_exact_sessions_guest_recovery(context, coordinate, table, change, &conflict);
+    let parent_recovery =
+        build_exact_parent_recovery(context, coordinate, table, change, &conflict);
     ConflictObservation {
         source_identity: context.source_identity.to_string(),
         source_server_id: context.source_server_id,
@@ -205,40 +205,57 @@ fn skipped_conflict_observation(
         duplicate_index: conflict.duplicate_index,
         duplicate_owner_primary_key: None,
         error_code: conflict.error_code,
-        sessions_guest_recovery,
+        parent_recovery,
         error_text: conflict.error_text,
         observed_at_ms: context.observed_at_ms,
     }
 }
 
-fn build_exact_sessions_guest_recovery(
+fn build_exact_parent_recovery(
     context: &RowConflictContext<'_>,
     coordinate: &BinlogCoordinate,
     table: &RowTableMap,
     change: &TargetRowChange,
     conflict: &crate::target::DuplicateConflict,
-) -> Option<crate::live::SessionsGuestRecovery> {
-    if !is_exact_sessions_guest_conflict(table, conflict) {
-        return None;
-    }
+) -> Option<crate::live::ExactParentRecovery> {
     let values = change
         .writable_columns
         .iter()
         .zip(&change.source_values)
         .map(|(column, value)| (column.as_str(), value_to_conflict_key(value)))
         .collect::<std::collections::BTreeMap<_, _>>();
-    Some(crate::live::SessionsGuestRecovery {
-        source_file: coordinate.file.clone(),
-        source_start_position: coordinate.position,
-        source_end_position: context.end_position,
-        child_event_timestamp: context.child_event_timestamp,
-        schema: table.schema.clone(),
-        table: table.table.clone(),
-        constraint: crate::live::SESSIONS_GUEST_CONSTRAINT.to_string(),
-        session_id: values.get("session_id")?.clone(),
-        guest_id: values.get("guest_id")?.clone(),
-        guest_hash: values.get("guest_hash")?.clone(),
-    })
+    if is_exact_sessions_guest_conflict(table, conflict) {
+        return Some(crate::live::ExactParentRecovery::SessionsGuest(
+            crate::live::SessionsGuestRecovery {
+                source_file: coordinate.file.clone(),
+                source_start_position: coordinate.position,
+                source_end_position: context.end_position,
+                child_event_timestamp: context.child_event_timestamp,
+                schema: table.schema.clone(),
+                table: table.table.clone(),
+                constraint: crate::live::SESSIONS_GUEST_CONSTRAINT.to_string(),
+                session_id: values.get("session_id")?.clone(),
+                guest_id: values.get("guest_id")?.clone(),
+                guest_hash: values.get("guest_hash")?.clone(),
+            },
+        ));
+    }
+    if is_exact_home_feed_card_conflict(table, conflict) {
+        return Some(crate::live::ExactParentRecovery::HomeFeedCard(
+            crate::live::HomeFeedCardRecovery {
+                source_file: coordinate.file.clone(),
+                source_start_position: coordinate.position,
+                source_end_position: context.end_position,
+                child_event_timestamp: context.child_event_timestamp,
+                schema: table.schema.clone(),
+                table: table.table.clone(),
+                constraint: crate::live::HOME_FEED_SLIDE_CONSTRAINT.to_string(),
+                slide_id: values.get("id")?.clone(),
+                card_id: values.get("card_id")?.clone(),
+            },
+        ));
+    }
+    None
 }
 
 fn is_exact_sessions_guest_conflict(
@@ -257,6 +274,23 @@ fn is_exact_sessions_guest_conflict(
 fn is_exact_sessions_guest_constraint_error(error_text: &str) -> bool {
     error_text.contains(crate::live::SESSIONS_GUEST_FK_SIGNATURE)
         && error_text.contains(crate::live::SESSIONS_GUEST_PARENT_REFERENCE)
+}
+
+fn is_exact_home_feed_card_conflict(
+    table: &RowTableMap,
+    conflict: &crate::target::DuplicateConflict,
+) -> bool {
+    let has_slide_scope = table.schema == crate::live::HOME_FEED_SLIDE_CHILD_SCHEMA
+        && table.table == crate::live::HOME_FEED_SLIDE_CHILD_TABLE;
+    let has_card_foreign_key = conflict.error_code == crate::live::HOME_FEED_SLIDE_FK_ERROR_CODE
+        && conflict
+            .error_text
+            .contains(crate::live::HOME_FEED_SLIDE_FK_SIGNATURE)
+        && conflict
+            .error_text
+            .contains(crate::live::HOME_FEED_SLIDE_PARENT_REFERENCE);
+
+    has_slide_scope && has_card_foreign_key
 }
 
 fn conflict_store_error(

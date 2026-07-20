@@ -40,10 +40,15 @@ use progress::{StreamProgress, format_stream_progress, format_stream_quarantine}
 use reconnect::{StreamCheckpointStore, run_stream_reconnect_loop, save_stream_checkpoint};
 #[cfg(test)]
 use reconnect::{is_stale_or_missing_binlog_error, resume_from_checkpoint, should_reconnect};
-pub use recovery::{RecoveryAttemptError, SessionsGuestRecovery};
+pub use recovery::{
+    ExactParentRecovery, HomeFeedCardRecovery, RecoveryAttemptError, SessionsGuestRecovery,
+};
 pub(crate) use recovery::{
-    SESSIONS_GUEST_CHILD_SCHEMA, SESSIONS_GUEST_CHILD_TABLE, SESSIONS_GUEST_CONSTRAINT,
-    SESSIONS_GUEST_FK_ERROR_CODE, SESSIONS_GUEST_FK_SIGNATURE, SESSIONS_GUEST_PARENT_PRIMARY_KEY,
+    HOME_FEED_CARD_PARENT_PRIMARY_KEY, HOME_FEED_CARD_PARENT_TABLE, HOME_FEED_SLIDE_CHILD_SCHEMA,
+    HOME_FEED_SLIDE_CHILD_TABLE, HOME_FEED_SLIDE_CONSTRAINT, HOME_FEED_SLIDE_FK_ERROR_CODE,
+    HOME_FEED_SLIDE_FK_SIGNATURE, HOME_FEED_SLIDE_PARENT_REFERENCE, SESSIONS_GUEST_CHILD_SCHEMA,
+    SESSIONS_GUEST_CHILD_TABLE, SESSIONS_GUEST_CONSTRAINT, SESSIONS_GUEST_FK_ERROR_CODE,
+    SESSIONS_GUEST_FK_SIGNATURE, SESSIONS_GUEST_PARENT_PRIMARY_KEY,
     SESSIONS_GUEST_PARENT_REFERENCE, SESSIONS_GUEST_PARENT_TABLE,
 };
 #[cfg(test)]
@@ -352,10 +357,10 @@ pub enum ApplyBinlogError {
     Target(String),
     RowConflictPersisted {
         message: String,
-        sessions_guest_recovery: Option<Box<SessionsGuestRecovery>>,
+        parent_recovery: Option<Box<ExactParentRecovery>>,
     },
-    SessionsGuestRecoveryFailed {
-        conflict: Box<SessionsGuestRecovery>,
+    ParentRecoveryFailed {
+        conflict: Box<ExactParentRecovery>,
         source: RecoveryAttemptError,
     },
     Statement(String),
@@ -374,10 +379,13 @@ impl fmt::Display for ApplyBinlogError {
             Self::RowConflictPersisted { message, .. } => {
                 write!(formatter, "row conflict persisted for repair: {message}")
             }
-            Self::SessionsGuestRecoveryFailed { conflict, source } => write!(
+            Self::ParentRecoveryFailed { conflict, source } => write!(
                 formatter,
-                "sessions guest recovery failed for {}:{} child_pk={}: {source}",
-                conflict.source_file, conflict.source_start_position, conflict.session_id
+                "{} recovery failed for {}:{} child_pk={}: {source}",
+                conflict.recovery_kind(),
+                conflict.source_file(),
+                conflict.source_start_position(),
+                conflict.child_primary_key()
             ),
             Self::Statement(message) => write!(formatter, "statement apply failed: {message}"),
             Self::Quarantined(statements) => write!(
@@ -392,12 +400,19 @@ impl fmt::Display for ApplyBinlogError {
 }
 
 impl ApplyBinlogError {
-    pub(super) fn sessions_guest_recovery(&self) -> Option<&SessionsGuestRecovery> {
+    pub(super) fn parent_recovery(&self) -> Option<&ExactParentRecovery> {
         match self {
             Self::RowConflictPersisted {
-                sessions_guest_recovery,
-                ..
-            } => sessions_guest_recovery.as_deref(),
+                parent_recovery, ..
+            } => parent_recovery.as_deref(),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn sessions_guest_recovery(&self) -> Option<&SessionsGuestRecovery> {
+        match self.parent_recovery() {
+            Some(ExactParentRecovery::SessionsGuest(request)) => Some(request),
             _ => None,
         }
     }

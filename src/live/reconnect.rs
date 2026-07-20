@@ -138,7 +138,7 @@ where
         run_attempt,
         |_request| {
             Err(RecoveryAttemptError::ReconciliationFailed(
-                "sessions guest recovery service unavailable".to_string(),
+                "exact parent recovery service unavailable".to_string(),
             ))
         },
         sleep,
@@ -155,7 +155,7 @@ pub(super) fn run_stream_reconnect_loop_with_recovery<C, F, R, S>(
 where
     C: StreamCheckpointStore,
     F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
-    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), RecoveryAttemptError>,
+    R: FnMut(&crate::live::ExactParentRecovery) -> Result<(), RecoveryAttemptError>,
     S: Fn(std::time::Duration),
 {
     let mut attempt_config = config.clone();
@@ -200,11 +200,11 @@ fn retry_or_stop_after_failed_attempt<R>(
     has_checkpoint_store: bool,
     attempt: u32,
     config: &ApplyBinlogConfig,
-    attempted_recoveries: &mut BTreeSet<crate::live::SessionsGuestRecovery>,
+    attempted_recoveries: &mut BTreeSet<crate::live::ExactParentRecovery>,
     recover: &mut R,
 ) -> Result<FailedAttemptOutcome, ApplyBinlogError>
 where
-    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), RecoveryAttemptError>,
+    R: FnMut(&crate::live::ExactParentRecovery) -> Result<(), RecoveryAttemptError>,
 {
     if let Some(stale_error) = stale_binlog_error(&error) {
         return Ok(FailedAttemptOutcome::Stop(stale_error));
@@ -221,7 +221,7 @@ where
         return Ok(FailedAttemptOutcome::Stop(error));
     }
     attempt_exact_parent_recovery(&error, attempted_recoveries, recover)
-        .map_err(|source| sessions_guest_recovery_error(&error, source))?;
+        .map_err(|source| parent_recovery_error(&error, source))?;
     Ok(FailedAttemptOutcome::Retry(error))
 }
 
@@ -233,22 +233,22 @@ fn stale_binlog_error(error: &ApplyBinlogError) -> Option<ApplyBinlogError> {
     })
 }
 
-fn sessions_guest_recovery_error(
+fn parent_recovery_error(
     error: &ApplyBinlogError,
     source: RecoveryAttemptError,
 ) -> ApplyBinlogError {
     let conflict = error
-        .sessions_guest_recovery()
+        .parent_recovery()
         .expect("recovery error requires conflict identity")
         .clone();
-    ApplyBinlogError::SessionsGuestRecoveryFailed {
+    ApplyBinlogError::ParentRecoveryFailed {
         conflict: Box::new(conflict),
         source,
     }
 }
 
 fn log_skipped_recovery(error: &ApplyBinlogError) {
-    if let Some(request) = error.sessions_guest_recovery() {
+    if let Some(request) = error.parent_recovery() {
         println!(
             "{}",
             format_recovery_log("skipped", request, "retry_ineligible")
@@ -258,13 +258,13 @@ fn log_skipped_recovery(error: &ApplyBinlogError) {
 
 fn attempt_exact_parent_recovery<R>(
     error: &ApplyBinlogError,
-    attempted_recoveries: &mut BTreeSet<crate::live::SessionsGuestRecovery>,
+    attempted_recoveries: &mut BTreeSet<crate::live::ExactParentRecovery>,
     recover: &mut R,
 ) -> Result<(), RecoveryAttemptError>
 where
-    R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), RecoveryAttemptError>,
+    R: FnMut(&crate::live::ExactParentRecovery) -> Result<(), RecoveryAttemptError>,
 {
-    let Some(request) = error.sessions_guest_recovery() else {
+    let Some(request) = error.parent_recovery() else {
         return Ok(());
     };
     if !attempted_recoveries.insert(request.clone()) {
@@ -300,18 +300,18 @@ fn log_reconnect_start(config: &ApplyBinlogConfig, attempt: u32, error: &ApplyBi
 
 fn format_recovery_log(
     action: &str,
-    request: &crate::live::SessionsGuestRecovery,
+    request: &crate::live::ExactParentRecovery,
     outcome: &str,
 ) -> String {
     format!(
-        "cdc_sessions_guest_recovery action={} source_file={} source_start_position={} source_end_position={} child_pk={} guest_id={} guest_hash={} outcome={}",
+        "cdc_exact_parent_recovery kind={} action={} source_file={} source_start_position={} source_end_position={} child_pk={} parent_identity={} outcome={}",
+        request.recovery_kind(),
         action,
-        shell_word(&request.source_file),
-        request.source_start_position,
-        request.source_end_position,
-        shell_word(&request.session_id),
-        shell_word(&request.guest_id),
-        shell_word(&request.guest_hash),
+        shell_word(request.source_file()),
+        request.source_start_position(),
+        request.source_end_position(),
+        shell_word(request.child_primary_key()),
+        shell_word(&request.parent_identity()),
         outcome,
     )
 }

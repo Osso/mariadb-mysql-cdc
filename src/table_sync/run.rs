@@ -1,6 +1,6 @@
 use super::mysql::{
-    GUEST_COLUMNS, GUEST_CREATE_TIME_EPOCH_ALIAS, MySqlSyncReader, RECOVERY_UTC_SESSION_SQL,
-    guest_columns,
+    GUEST_COLUMNS, HOME_FEED_CARD_COLUMNS, MySqlSyncReader, RECOVERY_CREATE_TIME_EPOCH_ALIAS,
+    RECOVERY_UTC_SESSION_SQL, guest_columns, home_feed_card_columns,
 };
 use super::range::sync_table_with_progress_range;
 use super::recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
@@ -57,7 +57,21 @@ pub fn sync_table_with_progress(
     )
 }
 
-pub(crate) fn reconcile_exact_sessions_guest(
+pub(crate) fn reconcile_exact_parent(
+    config: &crate::live::ApplyBinlogConfig,
+    request: &crate::live::ExactParentRecovery,
+) -> Result<(), TableSyncError> {
+    match request {
+        crate::live::ExactParentRecovery::SessionsGuest(request) => {
+            reconcile_exact_sessions_guest(config, request)
+        }
+        crate::live::ExactParentRecovery::HomeFeedCard(request) => {
+            reconcile_exact_home_feed_card(config, request)
+        }
+    }
+}
+
+fn reconcile_exact_sessions_guest(
     config: &crate::live::ApplyBinlogConfig,
     request: &crate::live::SessionsGuestRecovery,
 ) -> Result<(), TableSyncError> {
@@ -70,6 +84,33 @@ pub(crate) fn reconcile_exact_sessions_guest(
         return Ok(());
     };
     let sync_config = exact_guest_sync_config(config, request);
+    connect_mysql_recovery_target(&sync_config)?.insert_row(&source_row)
+}
+
+fn reconcile_exact_home_feed_card(
+    config: &crate::live::ApplyBinlogConfig,
+    request: &crate::live::HomeFeedCardRecovery,
+) -> Result<(), TableSyncError> {
+    validate_home_feed_card_request(request)?;
+    let (source, target) = build_sessions_guest_recovery_readers(config)?;
+    let source_rows = source.read_home_feed_card_rows_by_id(&request.card_id)?;
+    let source_row = require_exact_home_feed_card_row("source", &source_rows, request)?;
+    validate_parent_temporal_order(
+        recovery_create_time_epoch(source_row, "home feed card")?,
+        request.child_event_timestamp,
+    )?;
+    let card_type_id = required_row_value(source_row, "card_type_id", "source home feed card")?;
+    let source_id = source_row
+        .values
+        .get("source_id")
+        .and_then(Option::as_deref);
+    let target_rows =
+        target.read_home_feed_card_identity_rows(&request.card_id, card_type_id, source_id)?;
+    let reconciliation = plan_loaded_home_feed_card(source_row, &target_rows, request)?;
+    let GuestReconciliation::Insert(source_row) = reconciliation else {
+        return Ok(());
+    };
+    let sync_config = exact_home_feed_card_sync_config(config, request);
     connect_mysql_recovery_target(&sync_config)?.insert_row(&source_row)
 }
 
@@ -123,6 +164,26 @@ fn has_complete_recovery_identity(request: &crate::live::SessionsGuestRecovery) 
     has_session_id && has_guest_id && has_guest_hash
 }
 
+fn validate_home_feed_card_request(
+    request: &crate::live::HomeFeedCardRecovery,
+) -> Result<(), TableSyncError> {
+    let has_exact_scope = request.schema == crate::live::HOME_FEED_SLIDE_CHILD_SCHEMA
+        && request.table == crate::live::HOME_FEED_SLIDE_CHILD_TABLE
+        && request.constraint == crate::live::HOME_FEED_SLIDE_CONSTRAINT;
+    let has_valid_identity = parse_positive_integer(&request.slide_id).is_some()
+        && parse_positive_integer(&request.card_id).is_some();
+    if has_exact_scope && has_valid_identity {
+        return Ok(());
+    }
+    Err(TableSyncError::InvalidTable(
+        "unsupported home feed card recovery request".to_string(),
+    ))
+}
+
+fn parse_positive_integer(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().filter(|value| *value > 0)
+}
+
 enum GuestReconciliation {
     Insert(crate::snapshot::SnapshotRow),
     Existing,
@@ -135,7 +196,7 @@ fn plan_loaded_sessions_guest(
 ) -> Result<GuestReconciliation, TableSyncError> {
     let source_row = require_exact_guest_row("source", source_rows, request)?;
     validate_parent_temporal_order(
-        recovery_create_time_epoch(source_row)?,
+        recovery_create_time_epoch(source_row, "sessions guest")?,
         request.child_event_timestamp,
     )?;
     let source_row = canonical_guest_row(source_row);
@@ -149,6 +210,61 @@ fn plan_loaded_sessions_guest(
         ));
     }
     Ok(GuestReconciliation::Existing)
+}
+
+fn plan_loaded_home_feed_card(
+    source_row: &crate::snapshot::SnapshotRow,
+    target_rows: &[crate::snapshot::SnapshotRow],
+    request: &crate::live::HomeFeedCardRecovery,
+) -> Result<GuestReconciliation, TableSyncError> {
+    let source_row = canonical_recovery_row(source_row);
+    if target_rows.is_empty() {
+        return Ok(GuestReconciliation::Insert(source_row));
+    }
+    let target_row = require_exact_home_feed_card_row("target", target_rows, request)?;
+    if canonical_recovery_row(target_row).values != source_row.values {
+        return Err(TableSyncError::Repair(
+            "target home_feed_cards row diverges from exact source image".to_string(),
+        ));
+    }
+    Ok(GuestReconciliation::Existing)
+}
+
+fn require_exact_home_feed_card_row<'a>(
+    side: &str,
+    rows: &'a [crate::snapshot::SnapshotRow],
+    request: &crate::live::HomeFeedCardRecovery,
+) -> Result<&'a crate::snapshot::SnapshotRow, TableSyncError> {
+    let Some(row) = rows.first() else {
+        return Err(home_feed_card_identity_error(side));
+    };
+    let has_exact_identity = rows.len() == 1 && row.primary_key == [request.card_id.clone()];
+    let has_complete_image = row.values.len() == HOME_FEED_CARD_COLUMNS.len() + 1
+        && HOME_FEED_CARD_COLUMNS
+            .iter()
+            .all(|column| row.values.contains_key(*column))
+        && row.values.contains_key(RECOVERY_CREATE_TIME_EPOCH_ALIAS);
+    if has_exact_identity && has_complete_image {
+        return Ok(row);
+    }
+    Err(home_feed_card_identity_error(side))
+}
+
+fn required_row_value<'a>(
+    row: &'a crate::snapshot::SnapshotRow,
+    column: &str,
+    row_name: &str,
+) -> Result<&'a str, TableSyncError> {
+    row.values
+        .get(column)
+        .and_then(Option::as_deref)
+        .ok_or_else(|| TableSyncError::Repair(format!("{row_name} {column} is missing")))
+}
+
+fn home_feed_card_identity_error(side: &str) -> TableSyncError {
+    TableSyncError::Repair(format!(
+        "{side} home_feed_cards identity is absent, colliding, divergent, or incomplete"
+    ))
 }
 
 fn require_exact_guest_row<'a>(
@@ -167,7 +283,7 @@ fn require_exact_guest_row<'a>(
         && GUEST_COLUMNS
             .iter()
             .all(|column| row.values.contains_key(*column))
-        && row.values.contains_key(GUEST_CREATE_TIME_EPOCH_ALIAS);
+        && row.values.contains_key(RECOVERY_CREATE_TIME_EPOCH_ALIAS);
     if has_exact_identity && has_complete_image {
         return Ok(row);
     }
@@ -175,21 +291,27 @@ fn require_exact_guest_row<'a>(
 }
 
 fn canonical_guest_row(row: &crate::snapshot::SnapshotRow) -> crate::snapshot::SnapshotRow {
+    canonical_recovery_row(row)
+}
+
+fn canonical_recovery_row(row: &crate::snapshot::SnapshotRow) -> crate::snapshot::SnapshotRow {
     let mut row = row.clone();
-    row.values.remove(GUEST_CREATE_TIME_EPOCH_ALIAS);
+    row.values.remove(RECOVERY_CREATE_TIME_EPOCH_ALIAS);
     row
 }
 
-fn recovery_create_time_epoch(row: &crate::snapshot::SnapshotRow) -> Result<u64, TableSyncError> {
+fn recovery_create_time_epoch(
+    row: &crate::snapshot::SnapshotRow,
+    recovery_name: &str,
+) -> Result<u64, TableSyncError> {
     row.values
-        .get(GUEST_CREATE_TIME_EPOCH_ALIAS)
+        .get(RECOVERY_CREATE_TIME_EPOCH_ALIAS)
         .and_then(Option::as_deref)
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| {
-            TableSyncError::Repair(
-                "sessions guest recovery parent create_time epoch is missing or invalid"
-                    .to_string(),
-            )
+            TableSyncError::Repair(format!(
+                "{recovery_name} recovery parent create_time epoch is missing or invalid"
+            ))
         })
 }
 
@@ -225,6 +347,36 @@ fn target_connection_config_for_apply(
         user: config.target.user.clone(),
         password: config.target.password.clone(),
         database: config.target.database.clone(),
+    }
+}
+
+fn exact_home_feed_card_sync_config(
+    config: &crate::live::ApplyBinlogConfig,
+    request: &crate::live::HomeFeedCardRecovery,
+) -> SyncTableConfig {
+    SyncTableConfig {
+        source: crate::mysql_snapshot::MySqlConnectionConfig {
+            host: config.source.host.clone(),
+            port: config.source.port,
+            user: config.source.user.clone(),
+            password: config.source.password.clone(),
+            database: crate::live::HOME_FEED_SLIDE_CHILD_SCHEMA.to_string(),
+        },
+        target: config.target.clone(),
+        table: SyncTable {
+            name: crate::live::HOME_FEED_CARD_PARENT_TABLE.to_string(),
+            primary_key: vec![crate::live::HOME_FEED_CARD_PARENT_PRIMARY_KEY.to_string()],
+            columns: home_feed_card_columns(),
+        },
+        chunk_size: 1,
+        mode: SyncMode::MissingPrimaryKeys,
+        progress_table: "cdc.sync_table_progress".to_string(),
+        run_id: format!("stream-home-feed-slide-{}", request.slide_id),
+        start_after: None,
+        end_at: Some(vec![request.card_id.clone()]),
+        max_deletes: Some(0),
+        updated_since: None,
+        plan_hash: None,
     }
 }
 
@@ -561,7 +713,7 @@ mod sessions_guest_recovery_tests {
             ("utm_id", None),
             ("http_user_agent", Some("Mozilla/5.0")),
             ("create_time", Some("2026-06-26 00:00:00")),
-            (GUEST_CREATE_TIME_EPOCH_ALIAS, Some("1782432000")),
+            (RECOVERY_CREATE_TIME_EPOCH_ALIAS, Some("1782432000")),
             ("is_bot", Some("0")),
             ("params", Some("?reason=recovery")),
             ("application_user_access_token_id", None),
@@ -641,7 +793,7 @@ mod sessions_guest_recovery_tests {
             Some("1970-01-01 00:00:00".to_string()),
         );
         later_parent.values.insert(
-            GUEST_CREATE_TIME_EPOCH_ALIAS.to_string(),
+            RECOVERY_CREATE_TIME_EPOCH_ALIAS.to_string(),
             Some((request.child_event_timestamp + 1).to_string()),
         );
         assert!(plan_loaded_sessions_guest(&[later_parent], &[], &request).is_err());
@@ -716,5 +868,128 @@ mod sessions_guest_recovery_tests {
             ),
             Ok(GuestReconciliation::Existing)
         ));
+    }
+}
+
+#[cfg(test)]
+mod home_feed_card_recovery_tests {
+    use super::*;
+
+    fn request() -> crate::live::HomeFeedCardRecovery {
+        crate::live::HomeFeedCardRecovery {
+            source_file: "mysqld-bin.002709".to_string(),
+            source_start_position: 308_259_855,
+            source_end_position: 308_261_441,
+            child_event_timestamp: 1_784_588_463,
+            schema: "globalcomix".to_string(),
+            table: "home_feed_card_slides".to_string(),
+            constraint: "fk_hfcs_card".to_string(),
+            slide_id: "4508905".to_string(),
+            card_id: "2492683".to_string(),
+        }
+    }
+
+    fn card_row(card_id: &str) -> crate::snapshot::SnapshotRow {
+        let values = [
+            ("id", Some(card_id)),
+            ("card_type_id", Some("1")),
+            ("status", Some("active")),
+            ("reading_direction", Some("l")),
+            ("comic_id", Some("10175")),
+            ("release_id", Some("50715")),
+            ("caption", Some("exact source caption")),
+            ("hook_image_url", Some("https://example.test/hook.jpg")),
+            ("source_id", Some("50151")),
+            ("filter_reason", None),
+            ("retired_reason", None),
+            ("first_published", None),
+            ("last_active_time", Some("2026-07-20 22:01:03")),
+            ("view_count", Some("0")),
+            ("reaction_count", Some("0")),
+            ("click_count", Some("0")),
+            ("curator_user_id", None),
+            ("curated_score", None),
+            ("facets_json", None),
+            ("create_time", Some("2026-06-23 05:01:16")),
+            (RECOVERY_CREATE_TIME_EPOCH_ALIAS, Some("1782190876")),
+        ];
+        crate::snapshot::SnapshotRow {
+            primary_key: vec![card_id.to_string()],
+            values: values
+                .into_iter()
+                .map(|(column, value)| (column.to_string(), value.map(ToString::to_string)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validates_only_exact_home_feed_card_recovery_scope_and_positive_ids() {
+        let mut invalid = request();
+        invalid.constraint = "other_fk".to_string();
+        assert!(validate_home_feed_card_request(&invalid).is_err());
+
+        let mut invalid = request();
+        invalid.card_id = "0".to_string();
+        assert!(validate_home_feed_card_request(&invalid).is_err());
+        assert!(validate_home_feed_card_request(&request()).is_ok());
+    }
+
+    #[test]
+    fn inserts_all_twenty_canonical_parent_columns() {
+        let request = request();
+        let source_row = card_row(&request.card_id);
+        let source_row =
+            require_exact_home_feed_card_row("source", std::slice::from_ref(&source_row), &request)
+                .expect("complete exact source row");
+        let GuestReconciliation::Insert(row) =
+            plan_loaded_home_feed_card(source_row, &[], &request).expect("plan insert")
+        else {
+            panic!("missing target card must require insert");
+        };
+
+        assert_eq!(row.values.len(), HOME_FEED_CARD_COLUMNS.len());
+        assert_eq!(row.values["source_id"].as_deref(), Some("50151"));
+        assert_eq!(row.values["filter_reason"], None);
+        assert_eq!(
+            exact_home_feed_card_sync_config(&crate::live::ApplyBinlogConfig::default(), &request,)
+                .table
+                .columns,
+            home_feed_card_columns()
+        );
+    }
+
+    #[test]
+    fn rejects_missing_partial_late_divergent_and_unique_collision_rows() {
+        let request = request();
+        assert!(require_exact_home_feed_card_row("source", &[], &request).is_err());
+
+        let mut partial = card_row(&request.card_id);
+        partial.values.remove("caption");
+        assert!(require_exact_home_feed_card_row("source", &[partial], &request).is_err());
+
+        let mut late = card_row(&request.card_id);
+        late.values.insert(
+            RECOVERY_CREATE_TIME_EPOCH_ALIAS.to_string(),
+            Some((request.child_event_timestamp + 1).to_string()),
+        );
+        assert!(
+            validate_parent_temporal_order(
+                recovery_create_time_epoch(&late, "home feed card").unwrap(),
+                request.child_event_timestamp,
+            )
+            .is_err()
+        );
+
+        let source = card_row(&request.card_id);
+        let mut divergent = source.clone();
+        divergent
+            .values
+            .insert("caption".to_string(), Some("different".to_string()));
+        assert!(plan_loaded_home_feed_card(&source, &[divergent], &request).is_err());
+
+        let collision = card_row("9999999");
+        assert!(
+            plan_loaded_home_feed_card(&source, &[source.clone(), collision], &request).is_err()
+        );
     }
 }

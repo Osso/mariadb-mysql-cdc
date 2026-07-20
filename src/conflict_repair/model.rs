@@ -206,7 +206,7 @@ pub struct ConflictObservation {
     pub error_text: String,
     pub observed_at_ms: u64,
     #[serde(skip)]
-    pub sessions_guest_recovery: Option<crate::live::SessionsGuestRecovery>,
+    pub parent_recovery: Option<crate::live::ExactParentRecovery>,
 }
 
 impl ConflictObservation {

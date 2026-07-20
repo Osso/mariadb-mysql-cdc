@@ -30,8 +30,31 @@ pub(super) const GUEST_COLUMNS: [&str; 23] = [
     "supports_cookies",
     "reason",
 ];
-pub(super) const GUEST_CREATE_TIME_EPOCH_ALIAS: &str = "__recovery_create_time_epoch";
+pub(super) const HOME_FEED_CARD_COLUMNS: [&str; 20] = [
+    "id",
+    "card_type_id",
+    "status",
+    "reading_direction",
+    "comic_id",
+    "release_id",
+    "caption",
+    "hook_image_url",
+    "source_id",
+    "filter_reason",
+    "retired_reason",
+    "first_published",
+    "last_active_time",
+    "view_count",
+    "reaction_count",
+    "click_count",
+    "curator_user_id",
+    "curated_score",
+    "facets_json",
+    "create_time",
+];
+pub(super) const RECOVERY_CREATE_TIME_EPOCH_ALIAS: &str = "__recovery_create_time_epoch";
 const GUEST_IDENTITY_COLLISION_LIMIT: usize = 3;
+const HOME_FEED_CARD_IDENTITY_COLLISION_LIMIT: usize = 3;
 pub(super) const RECOVERY_UTC_SESSION_SQL: &str = "SET SESSION time_zone='+00:00'";
 
 pub(crate) struct MySqlSyncReader {
@@ -88,13 +111,31 @@ impl MySqlSyncReader {
         guest_hash: &str,
     ) -> Result<Vec<SnapshotRow>, TableSyncError> {
         let mut query_columns = guest_columns();
-        query_columns.push(GUEST_CREATE_TIME_EPOCH_ALIAS.to_string());
+        query_columns.push(RECOVERY_CREATE_TIME_EPOCH_ALIAS.to_string());
         let sql = build_guest_identity_sql(guest_id, guest_hash);
         parse_sync_rows(
             &query_columns,
             &["guest_id".to_string()],
             self.query_rows(&sql)?,
         )
+    }
+
+    pub(crate) fn read_home_feed_card_rows_by_id(
+        &self,
+        card_id: &str,
+    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        let sql = build_home_feed_card_id_sql(card_id);
+        parse_home_feed_card_rows(self.query_rows(&sql)?)
+    }
+
+    pub(crate) fn read_home_feed_card_identity_rows(
+        &self,
+        card_id: &str,
+        card_type_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        let sql = build_home_feed_card_identity_sql(card_id, card_type_id, source_id);
+        parse_home_feed_card_rows(self.query_rows(&sql)?)
     }
 
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
@@ -154,11 +195,58 @@ fn build_guest_identity_sql(guest_id: &str, guest_hash: &str) -> String {
     format!(
         "SELECT {}, UNIX_TIMESTAMP(`create_time`) AS {} FROM `guests` WHERE `guest_id` = {} OR `guest_hash` = {} ORDER BY `guest_id` LIMIT {}",
         quote_ident_list(&guest_columns()),
-        quote_ident(GUEST_CREATE_TIME_EPOCH_ALIAS),
+        quote_ident(RECOVERY_CREATE_TIME_EPOCH_ALIAS),
         quote_sql_literal(guest_id),
         quote_sql_literal(guest_hash),
         GUEST_IDENTITY_COLLISION_LIMIT,
     )
+}
+
+fn build_home_feed_card_id_sql(card_id: &str) -> String {
+    format!(
+        "SELECT {}, UNIX_TIMESTAMP(`create_time`) AS {} FROM `home_feed_cards` WHERE `id` = {} ORDER BY `id` LIMIT {}",
+        quote_ident_list(&home_feed_card_columns()),
+        quote_ident(RECOVERY_CREATE_TIME_EPOCH_ALIAS),
+        quote_sql_literal(card_id),
+        HOME_FEED_CARD_IDENTITY_COLLISION_LIMIT,
+    )
+}
+
+fn build_home_feed_card_identity_sql(
+    card_id: &str,
+    card_type_id: &str,
+    source_id: Option<&str>,
+) -> String {
+    let unique_collision = source_id.map(|source_id| {
+        format!(
+            " OR (`card_type_id` = {} AND `source_id` = {})",
+            quote_sql_literal(card_type_id),
+            quote_sql_literal(source_id),
+        )
+    });
+    format!(
+        "SELECT {}, UNIX_TIMESTAMP(`create_time`) AS {} FROM `home_feed_cards` WHERE `id` = {}{} ORDER BY `id` LIMIT {}",
+        quote_ident_list(&home_feed_card_columns()),
+        quote_ident(RECOVERY_CREATE_TIME_EPOCH_ALIAS),
+        quote_sql_literal(card_id),
+        unique_collision.unwrap_or_default(),
+        HOME_FEED_CARD_IDENTITY_COLLISION_LIMIT,
+    )
+}
+
+fn parse_home_feed_card_rows(
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<Vec<SnapshotRow>, TableSyncError> {
+    let mut query_columns = home_feed_card_columns();
+    query_columns.push(RECOVERY_CREATE_TIME_EPOCH_ALIAS.to_string());
+    parse_sync_rows(&query_columns, &["id".to_string()], rows)
+}
+
+pub(super) fn home_feed_card_columns() -> Vec<String> {
+    HOME_FEED_CARD_COLUMNS
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect()
 }
 
 pub(super) fn guest_columns() -> Vec<String> {
@@ -363,6 +451,20 @@ mod tests {
 
         assert!(sql.contains("UNIX_TIMESTAMP(`create_time`) AS `__recovery_create_time_epoch`"));
         assert!(sql.starts_with("SELECT `guest_id`, `guest_hash`,"));
+    }
+
+    #[test]
+    fn home_feed_card_identity_query_checks_primary_and_non_null_unique_owner() {
+        let sql = build_home_feed_card_identity_sql("2492683", "1", Some("50151"));
+
+        assert!(sql.contains("FROM `home_feed_cards`"));
+        assert!(sql.contains("`id` = '2492683'"));
+        assert!(sql.contains("`card_type_id` = '1' AND `source_id` = '50151'"));
+        assert!(sql.contains("UNIX_TIMESTAMP(`create_time`)"));
+        assert_eq!(home_feed_card_columns().len(), 20);
+
+        let null_source_sql = build_home_feed_card_identity_sql("2492683", "1", None);
+        assert!(!null_source_sql.contains("`card_type_id` ="));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use super::*;
 use crate::live::reconnect::{reconnect_delay, run_stream_reconnect_loop_with_recovery};
 
-fn exact_sessions_guest_recovery() -> SessionsGuestRecovery {
-    SessionsGuestRecovery {
+fn exact_sessions_guest_recovery() -> ExactParentRecovery {
+    ExactParentRecovery::SessionsGuest(SessionsGuestRecovery {
         source_file: "mysqld-bin.002709".to_string(),
         source_start_position: 224_141_039,
         source_end_position: 224_142_261,
@@ -13,7 +13,7 @@ fn exact_sessions_guest_recovery() -> SessionsGuestRecovery {
         session_id: "109018328".to_string(),
         guest_id: "78011674".to_string(),
         guest_hash: "fb42c5a9-b717-4022-9f27-6b467e0ca28d515m".to_string(),
-    }
+    })
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn retries_durably_persisted_row_conflict_from_unchanged_checkpoint() {
                     message:
                         "Cannot add or update a child row: a foreign key constraint fails (1452)"
                             .to_string(),
-                    sessions_guest_recovery: None,
+                    parent_recovery: None,
                 });
             }
             Ok(())
@@ -221,7 +221,7 @@ fn recovers_exact_sessions_guest_after_persisted_conflict_before_unchanged_check
                     .push("rolled-back-and-persisted".to_string());
                 return Err(ApplyBinlogError::RowConflictPersisted {
                     message: "fk_sessions_guest".to_string(),
-                    sessions_guest_recovery: Some(Box::new(request.clone())),
+                    parent_recovery: Some(Box::new(request.clone())),
                 });
             }
             checkpoint_store
@@ -268,6 +268,94 @@ fn recovers_exact_sessions_guest_after_persisted_conflict_before_unchanged_check
 }
 
 #[test]
+fn recovers_home_feed_card_2492683_before_replaying_slide_4508905_to_xid() {
+    let checkpoint_store =
+        MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.002709", 308_259_725));
+    let config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            binlog_file: "mysqld-bin.002709".to_string(),
+            start_position: 308_259_725,
+            ..SourceBinlogConfig::default()
+        },
+        max_reconnects: 1,
+        ..ApplyBinlogConfig::default()
+    };
+    let request = ExactParentRecovery::HomeFeedCard(HomeFeedCardRecovery {
+        source_file: "mysqld-bin.002709".to_string(),
+        source_start_position: 308_259_855,
+        source_end_position: 308_261_441,
+        child_event_timestamp: 1_784_588_463,
+        schema: "globalcomix".to_string(),
+        table: "home_feed_card_slides".to_string(),
+        constraint: "fk_hfcs_card".to_string(),
+        slide_id: "4508905".to_string(),
+        card_id: "2492683".to_string(),
+    });
+    let events = RefCell::new(Vec::new());
+    let attempts = RefCell::new(0);
+
+    run_stream_reconnect_loop_with_recovery(
+        &config,
+        Some(&checkpoint_store),
+        |attempt_config| {
+            events
+                .borrow_mut()
+                .push(format!("attempt:{}", attempt_config.source.start_position));
+            let mut count = attempts.borrow_mut();
+            *count += 1;
+            if *count == 1 {
+                events.borrow_mut().push("child-rolled-back".to_string());
+                return Err(ApplyBinlogError::RowConflictPersisted {
+                    message: "fk_hfcs_card".to_string(),
+                    parent_recovery: Some(Box::new(request.clone())),
+                });
+            }
+            checkpoint_store
+                .save_checkpoint(&checkpoint_at("mysqld-bin.002709", 308_261_441))
+                .expect("unchanged child replay XID checkpoint");
+            events.borrow_mut().push("child-replayed".to_string());
+            Ok(())
+        },
+        |actual| {
+            assert_eq!(actual, &request);
+            assert_eq!(
+                checkpoint_store
+                    .load_checkpoint()
+                    .expect("load unchanged checkpoint")
+                    .unwrap()
+                    .source_position,
+                308_259_725
+            );
+            events
+                .borrow_mut()
+                .push("full-parent-recovered".to_string());
+            Ok(())
+        },
+        |_delay| {},
+    )
+    .expect("card recovery retries unchanged child event");
+
+    assert_eq!(
+        events.into_inner(),
+        vec![
+            "attempt:308259725",
+            "child-rolled-back",
+            "full-parent-recovered",
+            "attempt:308259725",
+            "child-replayed",
+        ]
+    );
+    assert_eq!(
+        checkpoint_store
+            .load_checkpoint()
+            .unwrap()
+            .unwrap()
+            .source_position,
+        308_261_441
+    );
+}
+
+#[test]
 fn failed_exact_parent_recovery_returns_typed_error_without_retry_or_checkpoint() {
     let checkpoint_store =
         MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.002709", 224_140_888));
@@ -285,7 +373,7 @@ fn failed_exact_parent_recovery_returns_typed_error_without_retry_or_checkpoint(
             *attempts.borrow_mut() += 1;
             Err(ApplyBinlogError::RowConflictPersisted {
                 message: "fk_sessions_guest".to_string(),
-                sessions_guest_recovery: Some(Box::new(request.clone())),
+                parent_recovery: Some(Box::new(request.clone())),
             })
         },
         |_request| {
@@ -301,7 +389,7 @@ fn failed_exact_parent_recovery_returns_typed_error_without_retry_or_checkpoint(
     assert!(checkpoint_store.saved.borrow().is_none());
     assert!(matches!(
         error,
-        ApplyBinlogError::SessionsGuestRecoveryFailed {
+        ApplyBinlogError::ParentRecoveryFailed {
             conflict,
             source: RecoveryAttemptError::ReconciliationFailed(ref message),
         } if *conflict == request
@@ -326,7 +414,7 @@ fn exhausted_reconnect_budget_does_not_recover_parent() {
         |_attempt_config| {
             Err(ApplyBinlogError::RowConflictPersisted {
                 message: "fk_sessions_guest".to_string(),
-                sessions_guest_recovery: Some(Box::new(request.clone())),
+                parent_recovery: Some(Box::new(request.clone())),
             })
         },
         |_request| {
@@ -365,7 +453,7 @@ fn recovers_each_exact_persisted_conflict_identity_once_per_loop() {
             if *count <= 2 {
                 return Err(ApplyBinlogError::RowConflictPersisted {
                     message: "fk_sessions_guest".to_string(),
-                    sessions_guest_recovery: Some(Box::new(request.clone())),
+                    parent_recovery: Some(Box::new(request.clone())),
                 });
             }
             Ok(())

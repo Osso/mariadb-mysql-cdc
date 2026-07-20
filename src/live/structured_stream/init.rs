@@ -62,7 +62,7 @@ where
             )
         },
         |request| {
-            crate::table_sync::reconcile_exact_sessions_guest(config, request)
+            crate::table_sync::reconcile_exact_parent(config, request)
                 .map_err(RecoveryAttemptError::from)
         },
         thread::sleep,
