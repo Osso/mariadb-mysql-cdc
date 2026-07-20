@@ -83,6 +83,7 @@ SCENARIOS = (
     ScenarioSpec("fk-selected-dependency-cycle-block", True),
     ScenarioSpec("repair-resume", True),
     ScenarioSpec("run-progress-least-privilege", True),
+    ScenarioSpec("run-progress-composite-pk-rejected", True),
     ScenarioSpec("bounded-delete", True),
     ScenarioSpec("global-delete-limit", True),
     ScenarioSpec("delete-only-descendants", True),
@@ -3089,6 +3090,66 @@ class Harness:
             "schema_ddl=false malformed_rejected=true malformed_unchanged=true"
         )
 
+    def run_run_progress_composite_pk_rejected(self) -> None:
+        assert self.source and self.target
+        self.setup_repair_accounts()
+        self.admin_sql(self.source, "INSERT INTO repair_accounts VALUES (1, 'one@example.test', 'one');")
+        self.admin_sql(
+            self.target,
+            "CREATE TABLE cdc.table_sync_runs ("
+            "run_id VARCHAR(128) NOT NULL,"
+            "table_name VARCHAR(255) NOT NULL,"
+            "run_spec_json LONGTEXT NOT NULL,"
+            "last_primary_key_json TEXT NULL,"
+            "chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "total_rows BIGINT UNSIGNED NULL,"
+            "inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,"
+            "mode VARCHAR(16) NOT NULL,"
+            "status VARCHAR(16) NOT NULL,"
+            "last_error TEXT NULL,"
+            "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+            "PRIMARY KEY (run_id, table_name)"
+            ") ENGINE=InnoDB; "
+            "GRANT SELECT, INSERT, UPDATE ON cdc.table_sync_runs TO 'cdc_stream'@'%'; "
+            "FLUSH PRIVILEGES;",
+        )
+        schema_before = self.admin_query(self.target, "SHOW CREATE TABLE cdc.table_sync_runs;")
+
+        result = self.run_repair(
+            tables=["repair_accounts"],
+            max_deletes=0,
+            run_id="composite-primary-key",
+            chunk_size=1,
+            progress_table="cdc.table_sync_runs",
+        )
+        output = f"{result.stdout}\n{result.stderr}".lower()
+        if result.returncode == 0 or "not a run-scoped progress table" not in output:
+            raise HarnessError(f"composite progress primary key was not rejected: {result}")
+        schema_after = self.admin_query(self.target, "SHOW CREATE TABLE cdc.table_sync_runs;")
+        if schema_after != schema_before:
+            raise HarnessError("composite progress table schema changed during rejection")
+        progress_rows = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM cdc.table_sync_runs;",
+        ).strip()
+        target_rows = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM repair_accounts;",
+        ).strip()
+        if progress_rows != "0" or target_rows != "0":
+            raise HarnessError(
+                "composite progress schema rejection happened after writes: "
+                f"progress_rows={progress_rows!r} target_rows={target_rows!r}"
+            )
+        print(
+            "run-progress-composite-pk-rejected_ok schema_unchanged=true "
+            "progress_rows=0 target_rows=0"
+        )
+
     def run_repair_scenario(self, scenario: str) -> None:
         assert self.source and self.target
         if scenario in {"fk-child-first-delete", "fk-parent-first-insert"}:
@@ -3689,6 +3750,8 @@ class Harness:
             self.run_repair_scenario("repair-resume")
         elif scenario == "run-progress-least-privilege":
             self.run_run_progress_least_privilege()
+        elif scenario == "run-progress-composite-pk-rejected":
+            self.run_run_progress_composite_pk_rejected()
         elif scenario == "bounded-delete":
             self.run_repair_scenario("bounded-delete")
         elif scenario == "global-delete-limit":
