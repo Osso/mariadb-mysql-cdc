@@ -33,12 +33,16 @@ are resolved only after verified equality.
       immutable run specification.
 - [x] Provide a durable conflict schema/SQL contract and resolve rows only after
       verified source/target equality.
-- [x] Provide and wire an FK-aware phased repair path with canonical child/parent
+- [ ] Complete the FK-aware phased repair path with canonical child/parent
       columns, cross-engine rule normalization, filtered dependency-closure
-      inventory/plan hashes, global delete preflight, child-first deletes,
-      parent-first inserts, resumable per-operation state, selected-scope
-      cycle/schema-mismatch blocking, PK-window bounds, a
-      non-mutating full-scope Verify equality phase, and real Docker proof.
+      inventory/plan hashes, cumulative delete preflight across the full
+      childward scope, child-first deletes, parent-first inserts, resumable
+      per-operation state, selected-scope cycle/schema-mismatch blocking,
+      PK-window bounds, and a non-mutating Verify equality phase over the union
+      of both directional scopes. The planner computes the union, but current
+      orchestration supplies phase inputs only from the parentward
+      InsertMissing/UpdateDivergent scope; delete-only descendants are skipped
+      by DeleteExtras, cumulative preflight, and Verify.
 
 ## Remaining boundaries
 
@@ -64,14 +68,15 @@ are resolved only after verified equality.
 2. Hash the immutable run plan and filtered directional inventories; fail closed
    on drift. Disconnected FK cycles are outside the hash and do not block the run,
    while a cycle in either required phase scope blocks before mutation.
-3. Preflight all delete ceilings and cycles before any mutation.
+3. Preflight the cumulative delete ceiling across every table in the childward
+   scope, and preflight cycles, before any mutation.
 4. Delete reviewed extras child-first.
 5. Insert missing rows parent-first.
 6. Update divergent rows after blockers are removed; handle FK/unique key changes
    explicitly.
-7. Run the real Verify phase: reread the full configured scope, make no target
-   mutations, and fail on any missing, extra, or divergent row before recording
-   conflict resolution evidence.
+7. Run the real Verify phase over the union of both directional scopes: reread
+   that full scope, make no target mutations, and fail on any missing, extra, or
+   divergent row before recording conflict resolution evidence.
 8. Run a fresh second pass and require zero actionable mismatches and unresolved
    conflict/manual/journal debt.
 
