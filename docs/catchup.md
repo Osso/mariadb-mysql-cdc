@@ -89,6 +89,11 @@ one failed missing-PK run only when its complete immutable specification matches
 Reclamation is an atomic claim scoped to the table and immutable specification:
 compatibility and uniqueness are revalidated before the selected row is marked
 running; multiple compatible candidates fail closed without reclaiming a run.
+The claim acquires a table/specification-scoped `GET_LOCK`, then uses a target
+transaction explicitly set to `REPEATABLE READ`; candidate enumerations use
+`FOR UPDATE`, the selected row is marked `running` and committed, and only then
+is the advisory lock released. Any failure rolls back the selection transaction
+before lock release.
 
 Apply mode preflights target extras before mutating. If extras exceed the
 explicit ceiling, it performs zero inserts, updates, or deletes. Normal

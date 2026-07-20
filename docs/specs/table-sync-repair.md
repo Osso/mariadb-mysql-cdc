@@ -15,8 +15,9 @@ are resolved only after verified equality.
       run and rejects a completed ID. Apply-mode `repair-drift` InsertMissing may
       atomically claim one specification-identical failed missing-PK run within
       the table and immutable-specification scope; compatibility and uniqueness
-      are revalidated before marking it running, and ambiguity fails closed
-      without reclaiming a run.
+      are revalidated in a per-transaction `REPEATABLE READ` selection
+      transaction with `FOR UPDATE` candidate reads before marking it running,
+      and ambiguity fails closed without reclaiming a run.
 - [x] Persist run-scoped progress in `cdc.table_sync_runs` by default and reject
       concurrent use of the same run ID with a target named lock.
 - [x] Keep `cdc.table_sync_progress` as catchup-only legacy state.

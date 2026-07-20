@@ -214,8 +214,10 @@ The default policy is `error`.
 `cdc.table_sync_runs` by default. A new recurrence needs a new ID; direct
 `sync-table` reuse is allowed only for the exact interrupted run. In apply mode,
 `repair-drift` may reclaim exactly one failed `missing-primary-keys` child whose
-full immutable specification matches the current insert phase; ambiguity fails
-closed. `repair-drift` otherwise creates a fresh orchestration ID, derives FK-safe phase order, and accepts bounded
+full immutable specification matches the current insert phase. The claim uses a
+per-transaction `REPEATABLE READ` transaction with `FOR UPDATE` candidate
+locking; ambiguity fails closed. `repair-drift` otherwise creates a fresh
+orchestration ID, derives FK-safe phase order, and accepts bounded
 `--start-after`/`--end-at` windows. Apply mode requires an explicit
 `--max-deletes` allowance.
 

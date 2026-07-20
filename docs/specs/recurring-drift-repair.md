@@ -19,8 +19,10 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
 - [x] Atomically claim exactly one specification-identical failed
       `missing-primary-keys` run during apply-mode InsertMissing within the table
       and immutable-specification scope; revalidate compatibility and uniqueness
-      before marking it running, exclude completed/incompatible runs, and fail
-      closed on ambiguity without reclaiming a run.
+      in a per-transaction `REPEATABLE READ` selection transaction with
+      `FOR UPDATE` candidate reads before marking it running, exclude
+      completed/incompatible runs, and fail closed on ambiguity without
+      reclaiming a run.
 - [x] Keep content-check bounds visible; at most 1,000 mismatch ranges are
       recorded and floating-point columns are skipped.
 - [x] Keep target writes primary-key based.
