@@ -191,6 +191,34 @@ fn dependency_closure_ignores_unrelated_cycle() {
 }
 
 #[test]
+fn selected_orders_do_not_pull_sibling_cycle_into_repair_plan() {
+    let inventory = RepairInventory {
+        schema: "globalcomix".to_string(),
+        tables: vec![
+            "customers".to_string(),
+            "orders".to_string(),
+            "invoices".to_string(),
+            "ledger".to_string(),
+        ],
+        foreign_keys: vec![
+            canonical_fk("orders", "customers"),
+            canonical_fk("invoices", "customers"),
+            canonical_fk("invoices", "ledger"),
+            canonical_fk("ledger", "invoices"),
+        ],
+    };
+
+    let reduced = reduce_to_dependency_closure(inventory, vec!["orders".to_string()]);
+
+    assert_eq!(reduced.tables, vec!["customers", "orders"]);
+    let plan =
+        build_fk_aware_repair_plan("selected-orders", "source", "target", &reduced, &reduced, 0)
+            .expect("selected orders plan must not be blocked by sibling cycle");
+    assert_eq!(plan.insert_order, vec!["customers", "orders"]);
+    assert_eq!(plan.delete_order, vec!["orders", "customers"]);
+}
+
+#[test]
 fn dependency_closure_preserves_ancestors_children_and_selected_cycles() {
     let inventory = RepairInventory {
         schema: "globalcomix".to_string(),
