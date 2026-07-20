@@ -35,8 +35,9 @@ pub(crate) use progress::{SyncRunCandidate, select_compatible_failed_run};
 #[cfg(test)]
 pub(crate) use range::build_run_spec_json;
 pub(crate) use range::{
-    complete_sync_progress, finish_sync_run, persist_sync_run_error, release_on_load_error,
-    sync_table_with_progress_range_phase_with_run_spec, validate_resumable_progress,
+    RangeSyncRequest, complete_sync_progress, finish_sync_run, persist_sync_run_error,
+    release_on_load_error, sync_table_with_progress_range_phase_with_run_spec,
+    validate_resumable_progress,
 };
 #[cfg(test)]
 pub(crate) use recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};

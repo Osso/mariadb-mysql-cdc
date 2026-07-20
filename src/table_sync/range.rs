@@ -30,6 +30,40 @@ pub fn sync_table_with_progress_range_phase(
     phase: SyncPhase,
 ) -> Result<SyncTableReport, TableSyncError> {
     sync_table_with_progress_range_phase_with_run_spec(
+        RangeSyncRequest {
+            table,
+            options,
+            source,
+            target,
+            repair_target,
+            progress_store,
+            phase,
+        },
+        None,
+    )
+}
+
+pub(crate) struct RangeSyncRequest<'a, S, T, R, P> {
+    pub(crate) table: &'a SyncTable,
+    pub(crate) options: SyncRunOptions,
+    pub(crate) source: &'a S,
+    pub(crate) target: &'a T,
+    pub(crate) repair_target: &'a mut R,
+    pub(crate) progress_store: &'a mut P,
+    pub(crate) phase: SyncPhase,
+}
+
+pub(crate) fn sync_table_with_progress_range_phase_with_run_spec<S, T, R, P>(
+    request: RangeSyncRequest<'_, S, T, R, P>,
+    run_spec_json: Option<&str>,
+) -> Result<SyncTableReport, TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let RangeSyncRequest {
         table,
         options,
         source,
@@ -37,20 +71,7 @@ pub fn sync_table_with_progress_range_phase(
         repair_target,
         progress_store,
         phase,
-        None,
-    )
-}
-
-pub(crate) fn sync_table_with_progress_range_phase_with_run_spec(
-    table: &SyncTable,
-    options: SyncRunOptions,
-    source: &impl SyncTableReader,
-    target: &impl SyncTableReader,
-    repair_target: &mut impl SyncRepairTarget,
-    progress_store: &mut impl SyncProgressStore,
-    phase: SyncPhase,
-    run_spec_json: Option<&str>,
-) -> Result<SyncTableReport, TableSyncError> {
+    } = request;
     let run_id = options.run_id.clone();
     let (progress, report, start_after) =
         prepare_range_sync(table, &options, progress_store, run_spec_json)?;

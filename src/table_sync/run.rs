@@ -253,21 +253,23 @@ fn run_range_sync(
     run_spec_json: Option<&str>,
 ) -> Result<SyncTableReport, TableSyncError> {
     sync_table_with_progress_range_phase_with_run_spec(
-        &config.table,
-        SyncRunOptions {
-            run_id: config.run_id.clone(),
-            run_scope: build_sync_run_scope(config)?,
-            chunk_size: config.chunk_size,
-            mode: config.mode,
-            start_after: config.start_after.clone(),
-            end_at: config.end_at.clone(),
-            max_deletes: config.max_deletes,
+        RangeSyncRequest {
+            table: &config.table,
+            options: SyncRunOptions {
+                run_id: config.run_id.clone(),
+                run_scope: build_sync_run_scope(config)?,
+                chunk_size: config.chunk_size,
+                mode: config.mode,
+                start_after: config.start_after.clone(),
+                end_at: config.end_at.clone(),
+                max_deletes: config.max_deletes,
+            },
+            source,
+            target,
+            repair_target,
+            progress_store,
+            phase,
         },
-        source,
-        target,
-        repair_target,
-        progress_store,
-        phase,
         run_spec_json,
     )
 }

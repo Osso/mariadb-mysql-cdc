@@ -3,7 +3,8 @@ use super::*;
 
 #[test]
 fn differing_immutable_spec_does_not_make_exact_candidate_ambiguous() {
-    let expected_spec = r#"{"scope":"current","table":"guests","chunk_size":1,"mode":"missing_primary_keys"}"#;
+    let expected_spec =
+        r#"{"scope":"current","table":"guests","chunk_size":1,"mode":"missing_primary_keys"}"#;
     let candidates = vec![
         SyncRunCandidate::new(
             "different-bounds",
