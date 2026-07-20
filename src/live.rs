@@ -342,8 +342,7 @@ pub(crate) const SESSIONS_GUEST_CHILD_SCHEMA: &str = "globalcomix";
 pub(crate) const SESSIONS_GUEST_CHILD_TABLE: &str = "sessions";
 pub(crate) const SESSIONS_GUEST_CONSTRAINT: &str = "fk_sessions_guest";
 pub(crate) const SESSIONS_GUEST_FK_ERROR_CODE: u16 = 1452;
-pub(crate) const SESSIONS_GUEST_FK_SIGNATURE: &str =
-    "`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`)";
+pub(crate) const SESSIONS_GUEST_FK_SIGNATURE: &str = "`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`)";
 pub(crate) const SESSIONS_GUEST_PARENT_REFERENCE: &str =
     "REFERENCES `guests` (`guest_id`, `guest_hash`)";
 pub(crate) const SESSIONS_GUEST_PARENT_TABLE: &str = "guests";
@@ -372,7 +371,10 @@ impl fmt::Display for RecoveryAttemptError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReconciliationFailed(message) => {
-                write!(formatter, "sessions guest parent reconciliation failed: {message}")
+                write!(
+                    formatter,
+                    "sessions guest parent reconciliation failed: {message}"
+                )
             }
         }
     }

@@ -44,10 +44,7 @@ impl InMemoryConflictStore {
     }
 }
 
-fn conflict_key_matches_resolution(
-    key: &ConflictKey,
-    resolution: &ConflictResolution,
-) -> bool {
+fn conflict_key_matches_resolution(key: &ConflictKey, resolution: &ConflictResolution) -> bool {
     key.source_identity == resolution.source_identity
         && key.schema == resolution.schema
         && key.table == resolution.table

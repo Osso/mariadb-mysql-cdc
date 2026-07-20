@@ -77,9 +77,7 @@ fn build_sessions_guest_recovery_readers(
     config: &crate::live::ApplyBinlogConfig,
 ) -> Result<(MySqlSyncReader, MySqlSyncReader), TableSyncError> {
     let source_database = config.source.database.clone().ok_or_else(|| {
-        TableSyncError::InvalidTable(
-            "sessions guest recovery requires source database".to_string(),
-        )
+        TableSyncError::InvalidTable("sessions guest recovery requires source database".to_string())
     })?;
     let source_config = crate::mysql_snapshot::MySqlConnectionConfig {
         host: config.source.host.clone(),
