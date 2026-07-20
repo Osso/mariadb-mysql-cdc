@@ -34,9 +34,10 @@ are resolved only after verified equality.
 - [x] Provide a durable conflict schema/SQL contract and resolve rows only after
       verified source/target equality.
 - [x] Provide and wire an FK-aware phased repair path with canonical child/parent
-      columns, cross-engine rule normalization, inventory/plan hashes, global
-      delete preflight, child-first deletes, parent-first inserts, resumable
-      per-operation state, cycle/schema-mismatch blocking, PK-window bounds, a
+      columns, cross-engine rule normalization, filtered dependency-closure
+      inventory/plan hashes, global delete preflight, child-first deletes,
+      parent-first inserts, resumable per-operation state, selected-scope
+      cycle/schema-mismatch blocking, PK-window bounds, a
       non-mutating full-scope Verify equality phase, and real Docker proof.
 
 ## Remaining boundaries
@@ -56,8 +57,11 @@ are resolved only after verified equality.
 
 ## Required phased behavior before completion
 
-1. Inventory source/target schemas and canonical enforced FK edges.
-2. Hash the immutable run plan and inventories; fail closed on drift.
+1. Inventory source/target schemas and canonical enforced FK edges; for a
+   selected-table repair, retain only its transitive dependency closure.
+2. Hash the immutable run plan and filtered inventories; fail closed on drift.
+   Disconnected FK cycles are outside the hash and do not block the run, while a
+   cycle involving a selected table or required dependency blocks before mutation.
 3. Preflight all delete ceilings and cycles before any mutation.
 4. Delete reviewed extras child-first.
 5. Insert missing rows parent-first.
