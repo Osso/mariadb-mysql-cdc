@@ -2573,6 +2573,7 @@ class Harness:
             f"{owner_run_id}-delete-extras-sessions\tcomplete\tapply\t{json.dumps([str(session_id)])}",
             f"{owner_run_id}-update-divergent-guests\tcomplete\tapply\t{json.dumps([str(guest_id)])}",
             f"{owner_run_id}-verify-guests\tcomplete\tapply\t{json.dumps([str(guest_id)])}",
+            f"{owner_run_id}-verify-no-target-extras-sessions\tcomplete\tapply\t{json.dumps([str(session_id)])}",
         }
         if set(owner_run_lines) != expected_owner_runs:
             raise HarnessError(
