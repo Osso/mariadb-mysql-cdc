@@ -31,9 +31,13 @@ source connection loss without replaying from static startup coordinates.
   write failure without durable row-conflict evidence.
 
 Reconnect/backoff applies after transient source loss and after a durable row
-conflict. For the admitted sessions/guests case, recovery runs after the failed
-transaction has rolled back and ledger evidence is durable, before the unchanged
-checkpoint is replayed. The parent repair itself does not advance the stream
+conflict. The default stream budget is 12 reconnects after the initial attempt
+(13 attempts total); `--max-reconnects 0` disables reconnects, and
+`--reconnect-forever true` removes the cap for retryable stream failures,
+including persisted row conflicts. Purged or missing source binlogs and other
+non-transient failures never use that unbounded path. For the admitted sessions/guests case, recovery runs after
+the failed transaction has rolled back and ledger evidence is durable, before the
+unchanged checkpoint is replayed. The parent repair itself does not advance the stream
 checkpoint; only successful replay advances it. Recovery requires a durable
 checkpoint store and fails closed on unsupported scope, missing/colliding/divergent
 source or target identity, incomplete source image, connection failure, or target
@@ -126,12 +130,14 @@ identity matching stops immediately.
   target apply and not saved after failed target apply.
 - `src/live/tests.rs` — asserts transient TLS/connection-reset source failures
   reconnect only while positive attempts remain, `--reconnect-forever true`
-  allows unlimited transient reconnects, and non-transient source failures do
-  not reconnect.
+  allows unlimited retryable stream failures (including persisted row conflicts),
+  and non-transient or purged-binlog failures do not reconnect.
 - `src/live/tests/reconnect.rs` — asserts the sessions/guests recovery attempt
   runs only after retry eligibility, observes the unchanged checkpoint, and is
   bounded to one attempt per distinct `SessionsGuestRecovery` request value per
-  reconnect loop; this is not ledger-identity deduplication.
+  reconnect loop; this is not ledger-identity deduplication. The same file also
+  proves the zero-budget and repeated-request boundaries, but not real database
+  reads, inserts, or the production reconnect process.
 - `src/table_sync/run.rs` — asserts partial parent images are rejected, the
   absolute create-time epoch controls ordering independently of rendered TIMESTAMP
   text, complete 23-column images preserve required and nullable fields on insert,
@@ -151,7 +157,9 @@ identity matching stops immediately.
   overrides static startup coordinates.
 - [ ] Prove the sessions/guests recovery against disposable real MariaDB/MySQL,
   including source/target identity collisions, recovery failure, parent insert,
-  and successful replay/checkpoint advancement.
+  and successful replay/checkpoint advancement. The existing real FK harness
+  scenario proves conflict rollback/evidence and manual repair boundaries, not
+  this automatic reconnect callback.
 - [x] Add a failing test that checkpoint is written only after successful target
   apply.
 - [x] Production streaming uses the native client/reconnect loop; the

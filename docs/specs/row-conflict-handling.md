@@ -40,8 +40,12 @@ conflicting secondary key.
       transaction; at its XID, finalize their source-transaction end
       coordinates, roll back the target transaction, persist the unresolved
       observations through the independent control-plane connection, and retry
-      from the unchanged checkpoint with bounded in-process backoff. Successful
-      replay resolves the matching evidence row.
+      from the unchanged checkpoint with bounded in-process backoff. The live
+      stream defaults to 12 reconnects after the initial attempt (13 attempts
+      total); `--max-reconnects 0` disables reconnects, while
+      `--reconnect-forever true` removes that cap for retryable stream failures,
+      including persisted row conflicts. Successful replay resolves the matching
+      evidence row.
 - [x] For the sole automatic parent-recovery exception, a persisted `1452` on
       `globalcomix.sessions` naming `fk_sessions_guest` must carry non-empty
       `session_id`, `guest_id`, and `guest_hash`. Before replay, source `guests`
@@ -76,10 +80,14 @@ a matching unresolved conflict already exists, then continues so the target
 transaction/checkpoint can commit. Successful no-op/replacement events never
 create ledger rows. Secondary-unique, foreign-key, CHECK, and replacement-update
 conflicts always persist evidence and abort. The accepted overwrite risk is
-explicit. Resolution SQL is staged and executed through the transactional target connection after child DML and checkpoint but before the same COMMIT. A crash after COMMIT therefore cannot leave the checkpoint advanced with matching ledger evidence unresolved. Only the in-process unresolved cache is updated after commit; rollback leaves existing evidence unresolved. Generic statement execution does not gain an
-unsafe replacement fallback. Snapshot/catchup writes and normal range repairs use
-explicit `INSERT IGNORE` independently of the flag; the `sync-table
---updated-since` path uses an upsert.
+explicit. On the live target-table checkpoint path, the stream locks and validates
+the predecessor checkpoint, writes the event-end checkpoint in that same target
+transaction, executes staged resolution SQL, and commits once; only after COMMIT
+does it mark the in-process resolution cache committed. A rollback or commit
+failure therefore leaves target DML, checkpoint, and ledger resolution unresolved.
+Generic statement execution does not gain an unsafe replacement fallback.
+Snapshot/catchup writes and normal range repairs use explicit `INSERT IGNORE`
+independently of the flag; the `sync-table --updated-since` path uses an upsert.
 
 ## Durable conflict control plane
 

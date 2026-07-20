@@ -79,8 +79,11 @@ rolls back the target transaction. Under `ignore-duplicate`, only an equal nativ
 ROW `INSERT` duplicate may be logged and committed without ledger persistence;
 divergent inserts and every non-`INSERT` `1062` unique conflict persist evidence,
 roll back, and leave the target transaction/checkpoint uncommitted. Durable row
-conflicts retry in-process with bounded backoff from that unchanged checkpoint;
-successful replay resolves the matching evidence. One narrow automatic recovery
+conflicts retry in-process from that unchanged checkpoint with bounded backoff;
+the stream defaults to 12 reconnects after the initial attempt (13 attempts total),
+`--max-reconnects 0` disables reconnects, and `--reconnect-forever true` removes
+that cap for retryable stream failures, including persisted row conflicts. Successful replay resolves the
+matching evidence. One narrow automatic recovery
 runs for a persisted `1452` on the exact `globalcomix.sessions` composite
 `fk_sessions_guest` identity and ordered (`guest_id`, `guest_hash`) columns. The
 failed transaction is rolled back and recorded first. Recovery is evaluated only
@@ -112,7 +115,7 @@ creates the table. Different source primary keys remain different conflict
 identities. `repair-drift` now invokes the planner for child-first deletes,
 parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
 windows, a non-mutating full-scope Verify equality phase, and evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 34 executable scenarios.
+conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 44 executable scenarios.
 Earlier TLS harness coverage used a disposable TLS-enabled source, but the live
 GlobalComix source MariaDB (`source-mariadb.example` / `192.0.2.10`) is
 plaintext-only by accepted operational policy. Current production safety is:

@@ -4,7 +4,7 @@
 application. Each recurrence gets a fresh orchestration ID. Direct child-run
 reuse remains limited to the exact interrupted run; an apply-mode InsertMissing
 phase may reclaim exactly one failed `missing-primary-keys` run whose full
-immutable specification matches. The real Docker harness defines 34 executable
+immutable specification matches. The real Docker harness defines 44 executable
 scenarios and proves FK ordering, fail-closed planning, resumable runs, PK-window
 bounds, secondary-unique safety, and zero unresolved debt for the repaired scope.
 
