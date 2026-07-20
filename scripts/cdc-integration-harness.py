@@ -45,6 +45,7 @@ class ScenarioSpec:
 
 SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
+    ScenarioSpec("home-feed-card-parent-recovery", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
@@ -937,6 +938,95 @@ class Harness:
         """
         self.admin_sql(self.source, schema)
         self.admin_sql(self.target, schema)
+
+    def run_home_feed_card_parent_recovery(self) -> None:
+        assert self.source and self.target
+        parent_schema = """
+            CREATE TABLE home_feed_cards (
+                id BIGINT NOT NULL PRIMARY KEY,
+                card_type_id BIGINT NOT NULL,
+                status VARCHAR(32) NOT NULL,
+                reading_direction VARCHAR(8) NOT NULL,
+                comic_id BIGINT NULL,
+                release_id BIGINT NULL,
+                caption TEXT NULL,
+                hook_image_url TEXT NULL,
+                source_id BIGINT NULL,
+                filter_reason VARCHAR(255) NULL,
+                retired_reason VARCHAR(255) NULL,
+                first_published DATETIME NULL,
+                last_active_time DATETIME NULL,
+                view_count BIGINT NOT NULL,
+                reaction_count BIGINT NOT NULL,
+                click_count BIGINT NOT NULL,
+                curator_user_id BIGINT NULL,
+                curated_score DECIMAL(10,4) NULL,
+                facets_json JSON NULL,
+                create_time DATETIME NOT NULL,
+                UNIQUE KEY uq_home_feed_card_source (card_type_id, source_id)
+            ) ENGINE=InnoDB;
+            CREATE TABLE home_feed_card_slides (
+                id BIGINT NOT NULL PRIMARY KEY,
+                card_id BIGINT NOT NULL,
+                CONSTRAINT fk_hfcs_card FOREIGN KEY (card_id)
+                    REFERENCES home_feed_cards(id)
+            ) ENGINE=InnoDB;
+        """
+        self.admin_sql(self.source, parent_schema)
+        self.admin_sql(self.target, parent_schema)
+        parent_values = (
+            "2492683,1,'active','l',10175,50715,'exact source caption',"
+            "'https://example.test/hook.jpg',50151,NULL,NULL,NULL,"
+            "'2026-07-20 22:01:03',0,0,0,NULL,NULL,NULL,'2026-06-23 05:01:16'"
+        )
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO home_feed_cards VALUES ({parent_values});",
+        )
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO home_feed_card_slides VALUES (4508905,2492683);",
+        )
+        stop = self.coordinate()
+
+        result = self.run_stream(start, stop, max_reconnects=1)
+        require_success(result, "exact home-feed parent recovery")
+
+        parent = self.query(
+            self.target,
+            "SELECT id,card_type_id,status,reading_direction,comic_id,release_id,caption,"
+            "hook_image_url,source_id,filter_reason,retired_reason,first_published,"
+            "last_active_time,view_count,reaction_count,click_count,curator_user_id,"
+            "curated_score,facets_json,create_time FROM home_feed_cards WHERE id=2492683;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        expected_parent = (
+            "2492683\t1\tactive\tl\t10175\t50715\texact source caption\t"
+            "https://example.test/hook.jpg\t50151\tNULL\tNULL\tNULL\t"
+            "2026-07-20 22:01:03\t0\t0\t0\tNULL\tNULL\tNULL\t2026-06-23 05:01:16"
+        )
+        if parent != expected_parent:
+            raise HarnessError(f"exact recovered parent mismatch: {parent!r}")
+        child = self.query(
+            self.target,
+            "SELECT id,card_id FROM home_feed_card_slides WHERE id=4508905;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if child != "4508905\t2492683":
+            raise HarnessError(f"unchanged child replay mismatch: {child!r}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
+            raise HarnessError(f"child XID checkpoint mismatch: expected={stop} actual={checkpoint}")
+        print(
+            "home_feed_card_parent_recovery_ok "
+            "production_boundary=mysqld-bin.002709:308259855-308261441 "
+            f"fixture_boundary={stop.file}:{start.position}-{stop.position} "
+            "parent_id=2492683 parent_columns=20 child_id=4508905"
+        )
 
     def _assert_catchup_target_unchanged(self) -> None:
         assert self.target
@@ -3683,6 +3773,8 @@ class Harness:
         self.prepare()
         if scenario == "strict-secondary-btree":
             self.run_strict_secondary_btree()
+        elif scenario == "home-feed-card-parent-recovery":
+            self.run_home_feed_card_parent_recovery()
         elif scenario == "production-alter-table":
             self.run_production_alter_table()
         elif scenario == "create-table-crash-restart":
