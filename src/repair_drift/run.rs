@@ -57,7 +57,8 @@ fn execute_repair_drift(
     }
     let drift = run_drift_check(config, tables.clone())?;
     let (repair_tables, skipped) =
-        collect_repair_table_inputs(&tables, &drift.comparisons, &source, &target);
+        collect_repair_table_inputs(&plan.insert_order, &drift.comparisons, &source, &target);
+    preflight_repair_deletes(config, &run_id, &plan, &repair_tables)?;
     let repaired = run_repair_phases(config, &run_id, &plan, &repair_tables)?;
     Ok(RepairDriftReport {
         run_id,
@@ -167,6 +168,38 @@ pub(crate) fn build_drift_check_config(
         content_check: config.content_check,
         chunk_size: config.chunk_size,
     }
+}
+
+fn preflight_repair_deletes(
+    config: &RepairDriftConfig,
+    run_id: &str,
+    plan: &crate::repair_drift::RepairPlan,
+    repair_tables: &RepairTableInputs,
+) -> Result<(), RepairDriftError> {
+    if config.mode != SyncMode::Apply {
+        return Ok(());
+    }
+
+    let mut total_deletes = 0;
+    for table_name in &plan.delete_order {
+        let Some((_, _, table)) = repair_tables.get(table_name) else {
+            continue;
+        };
+        let phase_config = sync_config(
+            config,
+            table.clone(),
+            child_run_id(&format!("{run_id}-delete-preflight"), table_name),
+            &plan.plan_hash,
+        );
+        let extra_rows =
+            table_sync::read_table_extra_row_count(&phase_config).map_err(|error| {
+                RepairDriftError::Repair(format!("{table_name} DeleteExtras preflight: {error}"))
+            })?;
+        total_deletes += extra_rows;
+    }
+
+    table_sync::ensure_delete_allowed(total_deletes, config.max_deletes, config.mode)
+        .map_err(|error| RepairDriftError::Repair(format!("DeleteExtras preflight: {error}")))
 }
 
 fn run_repair_phases(

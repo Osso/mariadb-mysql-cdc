@@ -216,9 +216,6 @@ fn collect_repair_table(
     let Some(comparison) = comparisons.iter().find(|item| item.table == table_name) else {
         return;
     };
-    if comparison.matches() {
-        return;
-    }
     match collect_repair_table_input(comparison, source_by_name, target_by_name) {
         Ok(Some(input)) => {
             inputs.insert(comparison.table.clone(), input);
@@ -658,7 +655,10 @@ mod tests {
         );
 
         assert!(skipped.is_empty());
-        assert_eq!(inputs.keys().collect::<Vec<_>>(), vec!["customers", "orders"]);
+        assert_eq!(
+            inputs.keys().collect::<Vec<_>>(),
+            vec!["customers", "orders"]
+        );
         assert_eq!(inputs["customers"].0, 2);
         assert_eq!(inputs["customers"].1, 2);
     }

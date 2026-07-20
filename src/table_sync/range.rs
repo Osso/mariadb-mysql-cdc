@@ -1,3 +1,4 @@
+use super::mysql::MySqlSyncReader;
 use super::*;
 use crate::snapshot::SnapshotRow;
 
@@ -328,6 +329,22 @@ where
     range_end_at: Option<Vec<String>>,
     source: &'a S,
     target: &'a T,
+}
+
+pub(crate) fn read_table_extra_row_count(config: &SyncTableConfig) -> Result<u64, TableSyncError> {
+    let source = MySqlSyncReader::new(config.source.clone());
+    let target = MySqlSyncReader::new_with_target(target_connection_config(config), &config.target)
+        .map_err(TableSyncError::Read)?;
+    count_total_extra_rows(
+        ExtraRowCount {
+            table: &config.table,
+            chunk_size: config.chunk_size,
+            range_end_at: config.end_at.clone(),
+            source: &source,
+            target: &target,
+        },
+        config.start_after.clone(),
+    )
 }
 
 fn count_total_extra_rows<S, T>(
