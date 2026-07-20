@@ -756,6 +756,11 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
         Ok(())
     }
 
+    fn execute_transaction_sql(&self, _sql: &str) -> Result<(), crate::target::TargetExecuteError> {
+        self.operations.borrow_mut().push("RESOLUTION");
+        Ok(())
+    }
+
     fn commit_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
         self.operations.borrow_mut().push("COMMIT");
         Ok(())

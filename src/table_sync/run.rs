@@ -1,4 +1,7 @@
-use super::mysql::{GUEST_COLUMNS, GUEST_CREATE_TIME_EPOCH_ALIAS, MySqlSyncReader, guest_columns};
+use super::mysql::{
+    GUEST_COLUMNS, GUEST_CREATE_TIME_EPOCH_ALIAS, MySqlSyncReader, RECOVERY_UTC_SESSION_SQL,
+    guest_columns,
+};
 use super::range::sync_table_with_progress_range;
 use super::recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
 use super::*;
@@ -6,11 +9,6 @@ use std::time::Duration;
 
 const SYNC_CONNECTION_ATTEMPTS: usize = 5;
 const SYNC_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(1);
-const RECOVERY_CHILD_SCHEMA: &str = "globalcomix";
-const RECOVERY_CHILD_TABLE: &str = "sessions";
-const RECOVERY_CONSTRAINT: &str = "fk_sessions_guest";
-const RECOVERY_PARENT_TABLE: &str = "guests";
-const RECOVERY_PARENT_PRIMARY_KEY: &str = "guest_id";
 
 pub fn sync_table(
     table: &SyncTable,
@@ -78,12 +76,14 @@ pub(crate) fn reconcile_exact_sessions_guest(
     let source = MySqlSyncReader::new_with_tls_ca(
         source_config,
         (!config.source.tls_ca_file.is_empty()).then(|| config.source.tls_ca_file.clone()),
-    );
+    )
+    .with_recovery_utc();
     let target = MySqlSyncReader::new_with_target(
         target_connection_config_for_apply(config),
         &config.target,
     )
-    .map_err(TableSyncError::Read)?;
+    .map_err(TableSyncError::Read)?
+    .with_recovery_utc();
     let source_rows = source.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
     let target_rows = target.read_guest_identity_rows(&request.guest_id, &request.guest_hash)?;
     let reconciliation = plan_loaded_sessions_guest(&source_rows, &target_rows, request)?;
@@ -91,7 +91,7 @@ pub(crate) fn reconcile_exact_sessions_guest(
         return Ok(());
     };
     let sync_config = exact_guest_sync_config(config, request);
-    mysql_repair_target(&sync_config)?.insert_row(&source_row)
+    mysql_recovery_target(&sync_config)?.insert_row(&source_row)
 }
 
 fn validate_sessions_guest_request(
@@ -106,9 +106,9 @@ fn validate_sessions_guest_request(
 }
 
 fn is_supported_recovery_scope(request: &crate::live::SessionsGuestRecovery) -> bool {
-    request.schema == RECOVERY_CHILD_SCHEMA
-        && request.table == RECOVERY_CHILD_TABLE
-        && request.constraint == RECOVERY_CONSTRAINT
+    request.schema == crate::live::SESSIONS_GUEST_CHILD_SCHEMA
+        && request.table == crate::live::SESSIONS_GUEST_CHILD_TABLE
+        && request.constraint == crate::live::SESSIONS_GUEST_CONSTRAINT
 }
 
 fn has_complete_recovery_identity(request: &crate::live::SessionsGuestRecovery) -> bool {
@@ -230,12 +230,12 @@ fn exact_guest_sync_config(
             port: config.source.port,
             user: config.source.user.clone(),
             password: config.source.password.clone(),
-            database: RECOVERY_CHILD_SCHEMA.to_string(),
+            database: crate::live::SESSIONS_GUEST_CHILD_SCHEMA.to_string(),
         },
         target: config.target.clone(),
         table: SyncTable {
-            name: RECOVERY_PARENT_TABLE.to_string(),
-            primary_key: vec![RECOVERY_PARENT_PRIMARY_KEY.to_string()],
+            name: crate::live::SESSIONS_GUEST_PARENT_TABLE.to_string(),
+            primary_key: vec![crate::live::SESSIONS_GUEST_PARENT_PRIMARY_KEY.to_string()],
             columns: guest_columns(),
         },
         chunk_size: 1,
@@ -352,15 +352,31 @@ pub(crate) fn should_record_sync_run_error(error: &TableSyncError) -> bool {
     matches!(error, TableSyncError::Read(_) | TableSyncError::Repair(_))
 }
 
+fn mysql_recovery_target(
+    config: &SyncTableConfig,
+) -> Result<MySqlSyncRepairTarget, TableSyncError> {
+    let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
+        .map_err(|error| TableSyncError::Repair(error.to_string()))?;
+    executor
+        .execute_raw_sql(RECOVERY_UTC_SESSION_SQL)
+        .map_err(|error| TableSyncError::Repair(error.to_string()))?;
+    Ok(build_mysql_repair_target(config, executor))
+}
+
 fn mysql_repair_target(config: &SyncTableConfig) -> Result<MySqlSyncRepairTarget, TableSyncError> {
     let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
         .map_err(|error| TableSyncError::Repair(error.to_string()))?;
-    Ok(MySqlSyncRepairTarget::new(
-        crate::target::TargetMySqlWriter::from_snapshot_table(
-            &snapshot_table(&config.table),
-            executor,
-            sync_insert_mode(config),
-        ),
+    Ok(build_mysql_repair_target(config, executor))
+}
+
+fn build_mysql_repair_target(
+    config: &SyncTableConfig,
+    executor: crate::mysql_client::PersistentTargetExecutor,
+) -> MySqlSyncRepairTarget {
+    MySqlSyncRepairTarget::new(crate::target::TargetMySqlWriter::from_snapshot_table(
+        &snapshot_table(&config.table),
+        executor,
+        sync_insert_mode(config),
     ))
 }
 

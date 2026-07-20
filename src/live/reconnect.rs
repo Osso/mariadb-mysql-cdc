@@ -194,11 +194,29 @@ where
     }
 }
 
+#[derive(Debug)]
+enum RecoveryAttemptError {
+    ReconciliationFailed(String),
+}
+
+impl std::fmt::Display for RecoveryAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReconciliationFailed(message) => {
+                write!(
+                    formatter,
+                    "sessions guest parent reconciliation failed: {message}"
+                )
+            }
+        }
+    }
+}
+
 fn attempt_exact_parent_recovery<R>(
     error: &ApplyBinlogError,
     attempted_recoveries: &mut BTreeSet<crate::live::SessionsGuestRecovery>,
     recover: &mut R,
-) -> Result<(), ()>
+) -> Result<(), RecoveryAttemptError>
 where
     R: FnMut(&crate::live::SessionsGuestRecovery) -> Result<(), String>,
 {
@@ -219,7 +237,7 @@ where
             format_recovery_log("failed", request, "error"),
             shell_word(&message)
         );
-        return Err(());
+        return Err(RecoveryAttemptError::ReconciliationFailed(message));
     }
     println!(
         "{}",

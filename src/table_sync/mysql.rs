@@ -32,6 +32,7 @@ pub(super) const GUEST_COLUMNS: [&str; 23] = [
 ];
 pub(super) const GUEST_CREATE_TIME_EPOCH_ALIAS: &str = "__recovery_create_time_epoch";
 const GUEST_IDENTITY_COLLISION_LIMIT: usize = 3;
+pub(super) const RECOVERY_UTC_SESSION_SQL: &str = "SET SESSION time_zone='+00:00'";
 
 pub(crate) struct MySqlSyncReader {
     config: crate::mysql_snapshot::MySqlConnectionConfig,
@@ -39,6 +40,7 @@ pub(crate) struct MySqlSyncReader {
     source: RefCell<Option<PersistentMySqlSource>>,
     target_opts: Option<mysql::Opts>,
     replace_divergent_primary: bool,
+    initialize_recovery_utc: bool,
 }
 
 impl MySqlSyncReader {
@@ -56,6 +58,7 @@ impl MySqlSyncReader {
             source: RefCell::new(None),
             target_opts: None,
             replace_divergent_primary: false,
+            initialize_recovery_utc: false,
         }
     }
 
@@ -70,7 +73,13 @@ impl MySqlSyncReader {
             target_opts: Some(target_reader_opts(target)?),
             replace_divergent_primary: target.insert_conflict_policy
                 == crate::live::InsertConflictPolicy::ReplaceDivergentPk,
+            initialize_recovery_utc: false,
         })
+    }
+
+    pub(crate) fn with_recovery_utc(mut self) -> Self {
+        self.initialize_recovery_utc = true;
+        self
     }
 
     pub(crate) fn read_guest_identity_rows(
@@ -89,7 +98,13 @@ impl MySqlSyncReader {
     }
 
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
-        self.ensure_source()?
+        let source = self.ensure_source()?;
+        if self.initialize_recovery_utc {
+            source
+                .execute_session_sql(RECOVERY_UTC_SESSION_SQL)
+                .map_err(snapshot_error_to_table_sync)?;
+        }
+        source
             .query_rows_as_strings(sql)
             .map_err(snapshot_error_to_table_sync)
     }
@@ -316,6 +331,17 @@ mod tests {
             "artist_id".to_string(),
             "name".to_string(),
         ]
+    }
+
+    #[test]
+    fn recovery_session_initialization_precedes_guest_query() {
+        let commands = [
+            RECOVERY_UTC_SESSION_SQL.to_string(),
+            build_guest_identity_sql("1", "hash"),
+        ];
+
+        assert_eq!(commands[0], "SET SESSION time_zone='+00:00'");
+        assert!(commands[1].starts_with("SELECT "));
     }
 
     #[test]

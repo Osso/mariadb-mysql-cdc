@@ -76,8 +76,7 @@ a matching unresolved conflict already exists, then continues so the target
 transaction/checkpoint can commit. Successful no-op/replacement events never
 create ledger rows. Secondary-unique, foreign-key, CHECK, and replacement-update
 conflicts always persist evidence and abort. The accepted overwrite risk is
-explicit. Resolution is staged until target commit/checkpoint success; rollback
-leaves existing evidence unresolved. Generic statement execution does not gain an
+explicit. Resolution SQL is staged and executed through the transactional target connection after child DML and checkpoint but before the same COMMIT. A crash after COMMIT therefore cannot leave the checkpoint advanced with matching ledger evidence unresolved. Only the in-process unresolved cache is updated after commit; rollback leaves existing evidence unresolved. Generic statement execution does not gain an
 unsafe replacement fallback. Snapshot/catchup writes and normal range repairs use
 explicit `INSERT IGNORE` independently of the flag; the `sync-table
 --updated-since` path uses an upsert.
@@ -124,12 +123,9 @@ are not checkpointed, while the independently persisted evidence survives.
 For the exact `globalcomix.sessions` composite `fk_sessions_guest` identity,
 the reconnect loop first verifies that another reconnect is eligible, then
 performs strict source/target `guests` identity validation after rollback and
-durable ledger persistence. Recovery requires the exact MySQL constraint name
-and ordered child columns (`guest_id`, `guest_hash`); suffix/name substring
-matches are ineligible. The typed request carries the persisted source
+durable ledger persistence. Recovery requires the exact MySQL constraint name, ordered child columns (`guest_id`, `guest_hash`), and parent reference `REFERENCES `guests` (`guest_id`, `guest_hash`)`; suffix/name substring or alternate-parent matches are ineligible. The typed request carries the persisted source
 transaction coordinate, child primary key, guest tuple, and child event
-timestamp. The identity query returns the canonical 23 columns plus a dedicated
-`UNIX_TIMESTAMP(create_time)` helper epoch. That absolute epoch must be no later
+timestamp. Recovery source and target sessions set `time_zone='+00:00'` before full parent reads or insertion. The identity query returns the canonical 23 columns plus a dedicated `UNIX_TIMESTAMP(create_time)` helper epoch. That absolute epoch must be no later
 than the child event; the session-time-zone-rendered `create_time` text does not
 control ordering, and the helper is excluded from insert and exact-row comparison.
 Missing or invalid epochs fail closed. The persisted conflict record carries at

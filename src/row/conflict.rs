@@ -218,8 +218,8 @@ fn build_exact_sessions_guest_recovery(
     change: &TargetRowChange,
     conflict: &crate::target::DuplicateConflict,
 ) -> Option<crate::live::SessionsGuestRecovery> {
-    if table.schema != "globalcomix"
-        || table.table != "sessions"
+    if table.schema != crate::live::SESSIONS_GUEST_CHILD_SCHEMA
+        || table.table != crate::live::SESSIONS_GUEST_CHILD_TABLE
         || conflict.error_code != 1452
         || !is_exact_sessions_guest_constraint_error(&conflict.error_text)
     {
@@ -238,7 +238,7 @@ fn build_exact_sessions_guest_recovery(
         child_event_timestamp: context.child_event_timestamp,
         schema: table.schema.clone(),
         table: table.table.clone(),
-        constraint: "fk_sessions_guest".to_string(),
+        constraint: crate::live::SESSIONS_GUEST_CONSTRAINT.to_string(),
         session_id: values.get("session_id")?.clone(),
         guest_id: values.get("guest_id")?.clone(),
         guest_hash: values.get("guest_hash")?.clone(),
@@ -247,6 +247,7 @@ fn build_exact_sessions_guest_recovery(
 
 fn is_exact_sessions_guest_constraint_error(error_text: &str) -> bool {
     error_text.contains("`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`)")
+        && error_text.contains(crate::live::SESSIONS_GUEST_PARENT_REFERENCE)
 }
 
 fn conflict_store_error(
@@ -362,8 +363,12 @@ mod tests {
     fn accepts_only_exact_sessions_guest_constraint_identity() {
         let exact = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))";
         let suffix = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `archive_fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))";
+        let archived_parent = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests_archive` (`guest_id`, `guest_hash`))";
+        let alternate_columns = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`archived_guest_id`, `guest_hash`))";
 
         assert!(is_exact_sessions_guest_constraint_error(exact));
         assert!(!is_exact_sessions_guest_constraint_error(suffix));
+        assert!(!is_exact_sessions_guest_constraint_error(archived_parent));
+        assert!(!is_exact_sessions_guest_constraint_error(alternate_columns));
     }
 }

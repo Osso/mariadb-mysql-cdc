@@ -164,6 +164,13 @@ impl PersistentMySqlSource {
             .ok_or_else(|| SnapshotError::InvalidTable(format!("{table} DDL was empty")))
     }
 
+    pub(crate) fn execute_session_sql(&self, sql: &str) -> Result<(), SnapshotError> {
+        self.conn
+            .borrow_mut()
+            .query_drop(sql)
+            .map_err(snapshot_query_error)
+    }
+
     pub(crate) fn query_rows_as_strings(
         &self,
         sql: &str,

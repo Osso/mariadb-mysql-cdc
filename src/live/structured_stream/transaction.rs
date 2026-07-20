@@ -142,6 +142,10 @@ impl TargetTransaction {
         !self.pending_conflict_resolutions.is_empty()
     }
 
+    fn pending_conflict_resolutions(&self) -> &[crate::conflict_repair::ConflictResolution] {
+        &self.pending_conflict_resolutions
+    }
+
     pub(super) fn has_pending_conflict_observations(&self) -> bool {
         !self.pending_conflict_observations.is_empty()
     }
@@ -339,8 +343,9 @@ where
                 .target_transaction
                 .has_pending_conflict_resolutions()
         {
+            execute_conflict_resolutions_in_target_transaction(executor, context, conflict_store)?;
             let resolutions = context.target_transaction.commit_if_open(executor)?;
-            finalize_conflict_resolutions(conflict_store, resolutions)?;
+            finalize_conflict_resolution_cache(conflict_store, resolutions);
         }
         return Ok(());
     }
@@ -372,7 +377,7 @@ where
 fn flush_grouped_transaction_with_conflicts<E, R, C>(
     executor: &E,
     context: &mut StreamEventContext<'_, R, C>,
-    conflict_store: Option<&mut dyn crate::conflict_repair::ConflictStore>,
+    mut conflict_store: Option<&mut dyn crate::conflict_repair::ConflictStore>,
 ) -> Result<(), ApplyBinlogError>
 where
     E: TransactionalTargetExecutor,
@@ -385,6 +390,9 @@ where
         return Ok(());
     }
     let checkpoint = context.target_transaction.take_file_checkpoint();
+    if let Some(conflict_store) = conflict_store.as_deref_mut() {
+        execute_conflict_resolutions_in_target_transaction(executor, context, conflict_store)?;
+    }
     let resolutions = match context.target_transaction.commit_if_open(executor) {
         Ok(resolutions) => resolutions,
         Err(error) => {
@@ -402,7 +410,7 @@ where
         store.save_checkpoint(&checkpoint)?;
     }
     if let Some(conflict_store) = conflict_store {
-        finalize_conflict_resolutions(conflict_store, resolutions)?;
+        finalize_conflict_resolution_cache(conflict_store, resolutions);
     }
     Ok(())
 }
@@ -434,16 +442,32 @@ fn persist_deferred_conflicts(
     })
 }
 
-fn finalize_conflict_resolutions(
-    conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
-    resolutions: Vec<crate::conflict_repair::ConflictResolution>,
-) -> Result<(), ApplyBinlogError> {
-    for resolution in resolutions {
-        conflict_store
-            .resolve_existing(resolution)
-            .map_err(ApplyBinlogError::Target)?;
+fn execute_conflict_resolutions_in_target_transaction<E, R, C>(
+    executor: &E,
+    context: &mut StreamEventContext<'_, R, C>,
+    conflict_store: &dyn crate::conflict_repair::ConflictStore,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    C: StreamCheckpointStore,
+{
+    for resolution in context.target_transaction.pending_conflict_resolutions() {
+        let sql = conflict_store.resolution_sql(resolution);
+        if let Err(error) = executor.execute_transaction_sql(&sql) {
+            context.target_transaction.rollback_if_open(executor)?;
+            return Err(ApplyBinlogError::Target(error.to_string()));
+        }
     }
     Ok(())
+}
+
+fn finalize_conflict_resolution_cache(
+    conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
+    resolutions: Vec<crate::conflict_repair::ConflictResolution>,
+) {
+    for resolution in resolutions {
+        conflict_store.mark_resolution_committed(resolution);
+    }
 }
 
 pub(super) fn remember_file_checkpoint<R, C>(

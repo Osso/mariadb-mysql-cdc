@@ -333,7 +333,7 @@ fn equal_duplicate_commits_multi_row_transaction_and_checkpoints() {
 }
 
 #[test]
-fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
+fn child_replay_resolves_ledger_before_single_commit_at_crash_boundary() {
     let divergent_executor = TransactionRecordingExecutor {
         duplicate_row_change_number: Some(2),
         duplicate_mode: DuplicateMode::Divergent,
@@ -453,6 +453,18 @@ fn records_sessions_conflict_and_equal_resolution_with_real_row_boundary() {
     )
     .expect("XID replay");
 
+    assert_eq!(
+        equal_applier.executor().operations().as_slice(),
+        [
+            "BEGIN",
+            "EXEC",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "RESOLUTION",
+            "COMMIT"
+        ]
+    );
     let record = &conflicts.records()[0];
     let evidence = record
         .resolution_evidence
@@ -734,7 +746,14 @@ fn replaced_divergent_primary_commits_and_checkpoints_with_durable_evidence() {
 
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
+        [
+            "BEGIN",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "RESOLUTION",
+            "COMMIT"
+        ]
     );
     let record = &conflicts.records()[0];
     assert_eq!(

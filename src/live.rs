@@ -338,6 +338,14 @@ pub struct ApplyBinlogReport {
     pub quarantined_statements: u64,
 }
 
+pub(crate) const SESSIONS_GUEST_CHILD_SCHEMA: &str = "globalcomix";
+pub(crate) const SESSIONS_GUEST_CHILD_TABLE: &str = "sessions";
+pub(crate) const SESSIONS_GUEST_CONSTRAINT: &str = "fk_sessions_guest";
+pub(crate) const SESSIONS_GUEST_PARENT_REFERENCE: &str =
+    "REFERENCES `guests` (`guest_id`, `guest_hash`)";
+pub(crate) const SESSIONS_GUEST_PARENT_TABLE: &str = "guests";
+pub(crate) const SESSIONS_GUEST_PARENT_PRIMARY_KEY: &str = "guest_id";
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SessionsGuestRecovery {
     pub source_file: String,

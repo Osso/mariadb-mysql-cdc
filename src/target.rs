@@ -91,6 +91,12 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
         checkpoint_name: &str,
         checkpoint: &Checkpoint,
     ) -> Result<(), TargetExecuteError>;
+    fn execute_transaction_sql(&self, sql: &str) -> Result<(), TargetExecuteError> {
+        self.execute(&SqlStatement {
+            sql: sql.to_string(),
+            params: Vec::new(),
+        })
+    }
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
 }
