@@ -153,6 +153,43 @@ fn apply_repairs_missing_different_and_extra_target_rows() {
 }
 
 #[test]
+fn apply_batches_divergent_rows_before_checkpointing_the_chunk() {
+    let source = FakeReader::new(vec![row("1", "alpha"), row("2", "bravo")]);
+    let target = FakeReader::new(vec![row("1", "old-alpha"), row("2", "old-bravo")]);
+    let mut repair_target = RecordingRepairTarget::default();
+    let mut progress_store = RecordingProgressStore::default();
+
+    let report = sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "batched-updates".to_string(),
+            run_scope: "batched-updates-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect("sync report");
+
+    assert_eq!(report.updates, 2);
+    assert_eq!(
+        repair_target.operations.borrow().as_slice(),
+        &["update-batch:1,2"]
+    );
+    let saved = progress_store.saved.borrow();
+    assert_eq!(
+        saved.last().expect("saved progress").last_primary_key,
+        Some(vec!["2".to_string()])
+    );
+}
+
+#[test]
 fn apply_stops_before_deleting_above_safety_threshold() {
     let source = FakeReader::new(vec![row("1", "alpha")]);
     let target = FakeReader::new(vec![row("0", "extra"), row("1", "alpha")]);

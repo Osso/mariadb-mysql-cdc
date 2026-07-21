@@ -7,6 +7,12 @@ use std::collections::BTreeMap;
 pub trait SyncRepairTarget {
     fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError>;
     fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError>;
+    fn update_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        for row in rows {
+            self.update_row(row)?;
+        }
+        Ok(())
+    }
     fn delete_row(&mut self, primary_key: &[String]) -> Result<(), TableSyncError>;
 
     fn restore_displaced_owner_and_insert(
@@ -34,6 +40,11 @@ where
 
     fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
         crate::target::TargetMySqlWriter::update_row(self, row)
+            .map_err(|error| TableSyncError::Repair(error.to_string()))
+    }
+
+    fn update_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        crate::target::TargetMySqlWriter::update_rows(self, rows)
             .map_err(|error| TableSyncError::Repair(error.to_string()))
     }
 
@@ -65,6 +76,11 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
 
     fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
         crate::target::TargetMySqlWriter::update_row(&self.writer, row)
+            .map_err(|error| TableSyncError::Repair(error.to_string()))
+    }
+
+    fn update_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        crate::target::TargetMySqlWriter::update_rows(&self.writer, rows)
             .map_err(|error| TableSyncError::Repair(error.to_string()))
     }
 

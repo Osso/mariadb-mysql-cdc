@@ -108,15 +108,19 @@ fn repair_changed_rows(
     repair_target: &mut impl SyncRepairTarget,
     report: &mut SyncTableReport,
 ) -> Result<(), TableSyncError> {
-    for (primary_key, source) in source_by_key {
-        if target_by_key
-            .get(primary_key)
-            .is_some_and(|target| source.values != target.values)
-        {
-            apply_update(source, mode, repair_target)?;
-            report.updates += 1;
-        }
+    let changed_rows = source_by_key
+        .iter()
+        .filter_map(|(primary_key, source)| {
+            target_by_key
+                .get(primary_key)
+                .is_some_and(|target| source.values != target.values)
+                .then_some(*source)
+        })
+        .collect::<Vec<_>>();
+    if mode == SyncMode::Apply && !changed_rows.is_empty() {
+        repair_target.update_rows(&changed_rows)?;
     }
+    report.updates += changed_rows.len() as u64;
     Ok(())
 }
 
@@ -191,17 +195,6 @@ fn apply_insert(
 ) -> Result<(), TableSyncError> {
     if mode != SyncMode::DryRun {
         repair_target.insert_row(row)?;
-    }
-    Ok(())
-}
-
-fn apply_update(
-    row: &SnapshotRow,
-    mode: SyncMode,
-    repair_target: &mut impl SyncRepairTarget,
-) -> Result<(), TableSyncError> {
-    if mode == SyncMode::Apply {
-        repair_target.update_row(row)?;
     }
     Ok(())
 }

@@ -601,6 +601,15 @@ where
         self.execute_with_context("update", 1, statement)
     }
 
+    pub fn update_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TargetWriteError> {
+        for batch in rows.chunks(max_insert_rows_per_statement(self.columns.len())) {
+            let statement =
+                build_update_rows_statement(&self.table, &self.primary_key, &self.columns, batch);
+            self.execute_with_context("update", batch.len(), statement)?;
+        }
+        Ok(())
+    }
+
     pub fn delete_row(&self, primary_key: &PrimaryKey) -> Result<(), TargetWriteError> {
         let statement = build_delete_statement(&self.table, &self.primary_key, primary_key);
         self.execute_with_context("delete", 1, statement)
@@ -774,6 +783,71 @@ fn build_insert_statement(
 fn max_insert_rows_per_statement(column_count: usize) -> usize {
     let divisor = column_count.max(1);
     (MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS / divisor).max(1)
+}
+
+fn build_update_rows_statement(
+    table: &str,
+    primary_key: &[String],
+    columns: &[String],
+    rows: &[&SnapshotRow],
+) -> SqlStatement {
+    let derived_rows = derived_update_rows(columns, rows.len());
+    let join_predicate = qualified_column_pairs(primary_key, "target", "source", " AND ");
+    let changed_columns = non_primary_columns(columns, primary_key);
+    let assignments = qualified_column_pairs(&changed_columns, "target", "source", ", ");
+    let params = rows
+        .iter()
+        .flat_map(|row| ordered_values(row, columns))
+        .collect();
+
+    SqlStatement {
+        sql: format!(
+            "UPDATE {} AS {} JOIN ({derived_rows}) AS {} ON {join_predicate} SET {assignments}",
+            quote_ident(table),
+            quote_ident("target"),
+            quote_ident("source"),
+        ),
+        params,
+    }
+}
+
+fn derived_update_rows(columns: &[String], row_count: usize) -> String {
+    let first_row = columns
+        .iter()
+        .map(|column| format!("? AS {}", quote_ident(column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = std::iter::repeat_n("?", columns.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining_rows = std::iter::repeat_n(
+        format!("SELECT {placeholders}"),
+        row_count.saturating_sub(1),
+    );
+    std::iter::once(format!("SELECT {first_row}"))
+        .chain(remaining_rows)
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+fn qualified_column_pairs(
+    columns: &[String],
+    left_alias: &str,
+    right_alias: &str,
+    separator: &str,
+) -> String {
+    columns
+        .iter()
+        .map(|column| {
+            let column = quote_ident(column);
+            format!(
+                "{}.{column} = {}.{column}",
+                quote_ident(left_alias),
+                quote_ident(right_alias),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(separator)
 }
 
 fn build_update_statement(
