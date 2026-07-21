@@ -39,6 +39,13 @@ if a later conflict rolls back the target transaction, the replacement rolls bac
 but its independent ledger observation survives. Supported non-duplicate
 constraint conflicts remain durable repair debt regardless of this policy.
 
+`--insert-conflict-policy ignore-duplicate` applies to this native ROW path.
+A MySQL `1062` from either a ROW `INSERT` or `UPDATE` is logged as skipped,
+without durable conflict evidence, so the target transaction and checkpoint can
+advance. With the default `error` policy, the duplicate fails the row event and
+blocks checkpoint advancement. Supported non-duplicate constraint conflicts
+remain durable repair debt regardless of this policy.
+
 Primary-key values are extracted from the table map's primary-key columns. A row
 event with no table map, no primary key, or a missing primary-key value fails
 before reaching the target.
