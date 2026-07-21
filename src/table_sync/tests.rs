@@ -190,6 +190,30 @@ fn apply_batches_divergent_rows_before_checkpointing_the_chunk() {
 }
 
 #[test]
+fn apply_batches_divergent_rows_in_source_primary_key_order() {
+    let source = FakeReader::new(vec![row("99", "ninety-nine"), row("100", "one-hundred")]);
+    let target = FakeReader::new(vec![row("99", "old-99"), row("100", "old-100")]);
+    let mut repair_target = RecordingRepairTarget::default();
+
+    let mut report = SyncTableReport::default();
+    repair_chunk(
+        &source.rows,
+        &target.rows,
+        SyncMode::Apply,
+        &mut repair_target,
+        &mut report,
+        Some(0),
+        SyncPhase::All,
+    )
+    .expect("repair chunk");
+
+    assert_eq!(
+        repair_target.operations.borrow().as_slice(),
+        &["update-batch:99,100"]
+    );
+}
+
+#[test]
 fn apply_stops_before_deleting_above_safety_threshold() {
     let source = FakeReader::new(vec![row("1", "alpha")]);
     let target = FakeReader::new(vec![row("0", "extra"), row("1", "alpha")]);

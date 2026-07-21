@@ -36,7 +36,7 @@ pub(crate) fn repair_chunk(
         )?;
     }
     if matches!(phase, SyncPhase::All | SyncPhase::UpdateDivergent) {
-        repair_changed_rows(&source_by_key, &target_by_key, mode, repair_target, report)?;
+        repair_changed_rows(source_rows, &target_by_key, mode, repair_target, report)?;
     }
     if matches!(phase, SyncPhase::All | SyncPhase::InsertMissing) {
         repair_missing_rows(&source_by_key, &target_by_key, mode, repair_target, report)?;
@@ -102,19 +102,18 @@ fn repair_extra_rows(
 }
 
 fn repair_changed_rows(
-    source_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
+    source_rows: &[SnapshotRow],
     target_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
     mode: SyncMode,
     repair_target: &mut impl SyncRepairTarget,
     report: &mut SyncTableReport,
 ) -> Result<(), TableSyncError> {
-    let changed_rows = source_by_key
+    let changed_rows = source_rows
         .iter()
-        .filter_map(|(primary_key, source)| {
+        .filter(|source| {
             target_by_key
-                .get(primary_key)
+                .get(&source.primary_key)
                 .is_some_and(|target| source.values != target.values)
-                .then_some(*source)
         })
         .collect::<Vec<_>>();
     if mode == SyncMode::Apply && !changed_rows.is_empty() {
