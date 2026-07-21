@@ -220,9 +220,12 @@ where
         log_skipped_recovery(&error);
         return Ok(FailedAttemptOutcome::Stop(error));
     }
-    attempt_exact_parent_recovery(&error, attempted_recoveries, recover)
-        .map_err(|source| parent_recovery_error(&error, source))?;
-    Ok(FailedAttemptOutcome::Retry(error))
+    match attempt_exact_parent_recovery(&error, attempted_recoveries, recover) {
+        Ok(()) => Ok(FailedAttemptOutcome::Retry(error)),
+        Err(source) => Ok(FailedAttemptOutcome::Retry(parent_recovery_error(
+            &error, source,
+        ))),
+    }
 }
 
 fn stale_binlog_error(error: &ApplyBinlogError) -> Option<ApplyBinlogError> {
@@ -267,7 +270,7 @@ where
     let Some(request) = error.parent_recovery() else {
         return Ok(());
     };
-    if !attempted_recoveries.insert(request.clone()) {
+    if attempted_recoveries.contains(request) {
         println!(
             "{}",
             format_recovery_log("skipped", request, "already_attempted")
@@ -283,6 +286,7 @@ where
         );
         return Err(error);
     }
+    attempted_recoveries.insert(request.clone());
     println!(
         "{}",
         format_recovery_log("succeeded", request, "parent_reconciled")
@@ -393,7 +397,11 @@ pub(super) fn reconnect_delay(attempt: u32) -> Duration {
 }
 
 fn is_retryable_stream_error(error: &ApplyBinlogError) -> bool {
-    if matches!(error, ApplyBinlogError::RowConflictPersisted { .. }) {
+    if matches!(
+        error,
+        ApplyBinlogError::RowConflictPersisted { .. }
+            | ApplyBinlogError::ParentRecoveryFailed { .. }
+    ) {
         return true;
     }
     let ApplyBinlogError::SourceCommand(message) = error else {

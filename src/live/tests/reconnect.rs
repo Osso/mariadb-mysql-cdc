@@ -356,7 +356,7 @@ fn recovers_home_feed_card_2492683_before_replaying_slide_4508905_to_xid() {
 }
 
 #[test]
-fn failed_exact_parent_recovery_returns_typed_error_without_retry_or_checkpoint() {
+fn failed_exact_parent_recovery_retries_same_checkpoint_then_succeeds() {
     let checkpoint_store =
         MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.002709", 224_140_888));
     let config = ApplyBinlogConfig {
@@ -365,36 +365,75 @@ fn failed_exact_parent_recovery_returns_typed_error_without_retry_or_checkpoint(
     };
     let request = exact_sessions_guest_recovery();
     let attempts = RefCell::new(0);
+    let recoveries = RefCell::new(0);
+    let events = RefCell::new(Vec::new());
 
-    let error = run_stream_reconnect_loop_with_recovery(
+    run_stream_reconnect_loop_with_recovery(
         &config,
         Some(&checkpoint_store),
-        |_attempt_config| {
-            *attempts.borrow_mut() += 1;
-            Err(ApplyBinlogError::RowConflictPersisted {
-                message: "fk_sessions_guest".to_string(),
-                parent_recovery: Some(Box::new(request.clone())),
-            })
+        |attempt_config| {
+            assert_eq!(attempt_config.source.start_position, 224_140_888);
+            let mut attempt = attempts.borrow_mut();
+            *attempt += 1;
+            events.borrow_mut().push(format!("attempt:{}", *attempt));
+            if *attempt <= 2 {
+                return Err(ApplyBinlogError::RowConflictPersisted {
+                    message: "fk_sessions_guest".to_string(),
+                    parent_recovery: Some(Box::new(request.clone())),
+                });
+            }
+            checkpoint_store
+                .save_checkpoint(&checkpoint_at("mysqld-bin.002709", 224_142_261))
+                .expect("unchanged child replay XID checkpoint");
+            events.borrow_mut().push("child-replayed".to_string());
+            Ok(())
         },
-        |_request| {
-            Err(RecoveryAttemptError::ReconciliationFailed(
-                "target guests row diverges from exact source image".to_string(),
-            ))
+        |actual| {
+            assert_eq!(actual, &request);
+            assert_eq!(
+                checkpoint_store
+                    .load_checkpoint()
+                    .expect("load unchanged checkpoint")
+                    .unwrap()
+                    .source_position,
+                224_140_888
+            );
+            let mut recovery = recoveries.borrow_mut();
+            *recovery += 1;
+            if *recovery == 1 {
+                events.borrow_mut().push("recovery-failed".to_string());
+                return Err(RecoveryAttemptError::ReconciliationFailed(
+                    "target guests row diverges from exact source image".to_string(),
+                ));
+            }
+            events.borrow_mut().push("recovery-succeeded".to_string());
+            Ok(())
         },
         |_delay| {},
     )
-    .expect_err("strict recovery failure must be explicit");
+    .expect("failed recovery reconnects from the unchanged checkpoint");
 
-    assert_eq!(*attempts.borrow(), 1);
-    assert!(checkpoint_store.saved.borrow().is_none());
-    assert!(matches!(
-        error,
-        ApplyBinlogError::ParentRecoveryFailed {
-            conflict,
-            source: RecoveryAttemptError::ReconciliationFailed(ref message),
-        } if *conflict == request
-            && message == "target guests row diverges from exact source image"
-    ));
+    assert_eq!(*attempts.borrow(), 3);
+    assert_eq!(*recoveries.borrow(), 2);
+    assert_eq!(
+        events.into_inner(),
+        vec![
+            "attempt:1",
+            "recovery-failed",
+            "attempt:2",
+            "recovery-succeeded",
+            "attempt:3",
+            "child-replayed",
+        ]
+    );
+    assert_eq!(
+        checkpoint_store
+            .load_checkpoint()
+            .unwrap()
+            .unwrap()
+            .source_position,
+        224_142_261
+    );
 }
 
 #[test]
