@@ -526,6 +526,7 @@ enum DuplicateMode {
 struct TransactionRecordingExecutor {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     fail_execute: bool,
+    fail_row_change_number: Option<usize>,
     duplicate_row_change_number: Option<usize>,
     duplicate_mode: DuplicateMode,
     row_change_count: std::cell::Cell<usize>,
@@ -537,6 +538,7 @@ impl Default for TransactionRecordingExecutor {
         Self {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: false,
+            fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::Equal,
             row_change_count: std::cell::Cell::new(0),
@@ -559,6 +561,7 @@ impl TransactionRecordingExecutor {
         Self {
             operations,
             fail_execute: false,
+            fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::Equal,
             row_change_count: std::cell::Cell::new(0),
@@ -579,6 +582,7 @@ impl TransactionRecordingExecutor {
         Self {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: true,
+            fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::DefaultError,
             row_change_count: std::cell::Cell::new(0),
@@ -589,6 +593,15 @@ impl TransactionRecordingExecutor {
     fn with_locked_checkpoint(checkpoint: crate::checkpoint::Checkpoint) -> Self {
         Self {
             locked_checkpoint: Some(checkpoint),
+            ..Self::default()
+        }
+    }
+
+    fn with_deferred_conflict_then_hard_failure() -> Self {
+        Self {
+            duplicate_row_change_number: Some(2),
+            duplicate_mode: DuplicateMode::ForeignKey,
+            fail_row_change_number: Some(3),
             ..Self::default()
         }
     }
@@ -685,6 +698,11 @@ impl TargetExecutor for TransactionRecordingExecutor {
         self.execute(&change.statement)?;
         let row_change_number = self.row_change_count.get() + 1;
         self.row_change_count.set(row_change_number);
+        if self.fail_row_change_number == Some(row_change_number) {
+            return Err(crate::target::TargetExecuteError::new(
+                "forced post-conflict target failure",
+            ));
+        }
         if self
             .duplicate_row_change_number
             .is_some_and(|interval| row_change_number.is_multiple_of(interval))
