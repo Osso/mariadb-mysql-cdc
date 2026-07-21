@@ -79,6 +79,10 @@ pub(super) fn stream_once(
     super::super::configure_integration_failpoint(config.integration_failpoint);
 
     let mut runtime = StreamRuntime::initialize(config)?;
+    #[cfg(feature = "integration-failpoints")]
+    if let Some(source_file) = &config.integration_logical_source_file {
+        runtime.current_file.clone_from(source_file);
+    }
     while let Ok(result) = runtime.event_receiver.recv() {
         let (header, event, source_position) = match result {
             Ok(event) => event,
@@ -242,6 +246,42 @@ pub(super) struct SourceStreamEvent<'a> {
     pub(super) source_position: u64,
 }
 
+#[cfg(feature = "integration-failpoints")]
+fn logical_integration_coordinate(
+    config: &ApplyBinlogConfig,
+    header: &EventHeader,
+    event: &BinlogEvent,
+    source_position: u64,
+) -> (EventHeader, u64) {
+    let mut logical_header = EventHeader {
+        timestamp: header.timestamp,
+        event_type: header.event_type,
+        server_id: header.server_id,
+        event_length: header.event_length,
+        next_event_position: header.next_event_position,
+        event_flags: header.event_flags,
+    };
+    let logical_source_position = if matches!(
+        event,
+        BinlogEvent::WriteRowsEvent(_)
+            | BinlogEvent::UpdateRowsEvent(_)
+            | BinlogEvent::DeleteRowsEvent(_)
+    ) {
+        config
+            .integration_logical_start_position
+            .unwrap_or(source_position)
+    } else {
+        source_position
+    };
+    if matches!(event, BinlogEvent::XidEvent(_)) {
+        if let Some(end_position) = config.integration_logical_end_position {
+            logical_header.next_event_position = u32::try_from(end_position)
+                .expect("integration logical end position must fit a binlog header");
+        }
+    }
+    (logical_header, logical_source_position)
+}
+
 pub(super) fn process_stream_event<C>(
     config: &ApplyBinlogConfig,
     runtime: &mut StreamRuntime,
@@ -251,26 +291,42 @@ pub(super) fn process_stream_event<C>(
 where
     C: StreamCheckpointStore,
 {
-    if let Err(error) = stop_position_decision(
+    let stop_decision = match stop_position_decision(
         config.source.stop_position,
         input.header,
         runtime.source_row_transaction_open,
     ) {
-        rollback_stream_transaction(runtime)?;
-        return Err(error);
+        Ok(decision) => decision,
+        Err(error) => {
+            rollback_stream_transaction(runtime)?;
+            return Err(error);
+        }
+    };
+    #[cfg(feature = "integration-failpoints")]
+    if let Some(source_file) = &config.integration_logical_source_file {
+        runtime.current_file.clone_from(source_file);
     }
+    #[cfg(feature = "integration-failpoints")]
+    let (logical_header, logical_source_position) =
+        logical_integration_coordinate(config, input.header, input.event, input.source_position);
+    #[cfg(feature = "integration-failpoints")]
+    let input = SourceStreamEvent {
+        header: &logical_header,
+        event: input.event,
+        source_position: logical_source_position,
+    };
     let mut state = std::mem::replace(
         &mut runtime.state,
         StructuredEventState::new(config.source.database.clone()),
     );
     let mut progress = runtime.progress.clone();
     let mut source_row_transaction_open = runtime.source_row_transaction_open;
-    let result = process_stream_event_core(
-        config,
+    let result = process_stream_event_core_after_stop_decision(
         &mut state,
         &mut progress,
         &mut source_row_transaction_open,
         input,
+        stop_decision,
         |state, input| dispatch_stream_event(runtime, state, &checkpoint, input),
     );
     runtime.state = state;
@@ -290,13 +346,14 @@ where
     result.map(|(stop_decision, _)| stop_decision)
 }
 
+#[cfg(test)]
 pub(super) fn process_stream_event_core<D>(
     config: &ApplyBinlogConfig,
     state: &mut StructuredEventState,
     progress: &mut StreamProgress,
     source_row_transaction_open: &mut bool,
     input: SourceStreamEvent<'_>,
-    mut dispatch: D,
+    dispatch: D,
 ) -> Result<(StopPositionDecision, StructuredEventOutcome), ApplyBinlogError>
 where
     D: FnMut(
@@ -309,6 +366,30 @@ where
         input.header,
         *source_row_transaction_open,
     )?;
+    process_stream_event_core_after_stop_decision(
+        state,
+        progress,
+        source_row_transaction_open,
+        input,
+        stop_decision,
+        dispatch,
+    )
+}
+
+fn process_stream_event_core_after_stop_decision<D>(
+    state: &mut StructuredEventState,
+    progress: &mut StreamProgress,
+    source_row_transaction_open: &mut bool,
+    input: SourceStreamEvent<'_>,
+    stop_decision: StopPositionDecision,
+    mut dispatch: D,
+) -> Result<(StopPositionDecision, StructuredEventOutcome), ApplyBinlogError>
+where
+    D: FnMut(
+        &mut StructuredEventState,
+        SourceStreamEvent<'_>,
+    ) -> Result<StructuredEventOutcome, ApplyBinlogError>,
+{
     state.record_event_position(input.source_position);
     let outcome = dispatch(state, input)?;
     log_stream_progress(progress, &outcome);

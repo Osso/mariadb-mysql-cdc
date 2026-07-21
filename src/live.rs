@@ -154,6 +154,12 @@ pub struct ApplyBinlogConfig {
     pub target_transaction_group_timeout_ms: u64,
     #[cfg(feature = "integration-failpoints")]
     pub integration_failpoint: Option<IntegrationFailpoint>,
+    #[cfg(feature = "integration-failpoints")]
+    pub integration_logical_source_file: Option<String>,
+    #[cfg(feature = "integration-failpoints")]
+    pub integration_logical_start_position: Option<u64>,
+    #[cfg(feature = "integration-failpoints")]
+    pub integration_logical_end_position: Option<u64>,
 }
 
 impl Default for ApplyBinlogConfig {
@@ -170,6 +176,12 @@ impl Default for ApplyBinlogConfig {
             target_transaction_group_timeout_ms: 0,
             #[cfg(feature = "integration-failpoints")]
             integration_failpoint: None,
+            #[cfg(feature = "integration-failpoints")]
+            integration_logical_source_file: None,
+            #[cfg(feature = "integration-failpoints")]
+            integration_logical_start_position: None,
+            #[cfg(feature = "integration-failpoints")]
+            integration_logical_end_position: None,
         }
     }
 }

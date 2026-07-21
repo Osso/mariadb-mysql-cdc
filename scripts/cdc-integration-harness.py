@@ -113,6 +113,10 @@ class Coordinate:
     position: int
 
 
+HOME_FEED_PRODUCTION_START = Coordinate("mysqld-bin.002709", 308_259_855)
+HOME_FEED_PRODUCTION_END = Coordinate("mysqld-bin.002709", 308_261_441)
+
+
 @dataclass
 class CommandResult:
     command: tuple[str, ...]
@@ -547,6 +551,8 @@ class Harness:
         integration_failpoint: str | None,
         max_reconnects: int,
         insert_conflict_policy: str | None = None,
+        logical_start: Coordinate | None = None,
+        logical_end: Coordinate | None = None,
     ) -> list[str]:
         assert self.source and self.target
         args = [
@@ -589,6 +595,17 @@ class Harness:
             args.extend(["--insert-conflict-policy", insert_conflict_policy])
         if integration_failpoint is not None:
             args.extend(["--integration-failpoint", integration_failpoint])
+        if logical_start is not None and logical_end is not None:
+            args.extend(
+                [
+                    "--integration-logical-source-file",
+                    logical_start.file,
+                    "--integration-logical-start-position",
+                    str(logical_start.position),
+                    "--integration-logical-end-position",
+                    str(logical_end.position),
+                ]
+            )
         return args
 
     def run_stream(
@@ -599,8 +616,13 @@ class Harness:
         max_reconnects: int = 0,
         barrier_dir: Path | None = None,
         insert_conflict_policy: str | None = None,
+        logical_start: Coordinate | None = None,
+        logical_end: Coordinate | None = None,
     ) -> CommandResult:
-        binary = self._stream_binary(integration_failpoint)
+        build_feature = integration_failpoint
+        if logical_start is not None:
+            build_feature = build_feature or "logical-coordinate"
+        binary = self._stream_binary(build_feature)
         env = {**os.environ, "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD, "CDC_TARGET_PASSWORD": TARGET_PASSWORD}
         if barrier_dir is not None:
             env["CDC_INTEGRATION_BARRIER_DIR"] = str(barrier_dir)
@@ -612,6 +634,8 @@ class Harness:
                 integration_failpoint,
                 max_reconnects,
                 insert_conflict_policy,
+                logical_start,
+                logical_end,
             ),
             env=env,
             timeout=90,
@@ -991,7 +1015,13 @@ class Harness:
         )
         stop = self.coordinate()
 
-        result = self.run_stream(start, stop, max_reconnects=1)
+        result = self.run_stream(
+            start,
+            stop,
+            max_reconnects=1,
+            logical_start=HOME_FEED_PRODUCTION_START,
+            logical_end=HOME_FEED_PRODUCTION_END,
+        )
         require_success(result, "exact home-feed parent recovery")
 
         parent = self.query(
@@ -1018,13 +1048,29 @@ class Harness:
         ).strip()
         if child != "4508905\t2492683":
             raise HarnessError(f"unchanged child replay mismatch: {child!r}")
+        conflict = self.query(
+            self.target,
+            "SELECT source_file,source_start_position,source_end_position,status "
+            "FROM cdc.row_conflicts WHERE schema_name='globalcomix' "
+            "AND table_name='home_feed_card_slides' AND source_primary_key_json='[\"4508905\"]';",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        expected_conflict = "mysqld-bin.002709\t308259855\t308261441\tresolved"
+        if conflict != expected_conflict:
+            raise HarnessError(f"logical recovery conflict evidence mismatch: {conflict!r}")
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
-            raise HarnessError(f"child XID checkpoint mismatch: expected={stop} actual={checkpoint}")
+        if (
+            checkpoint.get("source_file") != HOME_FEED_PRODUCTION_END.file
+            or int(checkpoint.get("source_position", 0)) != HOME_FEED_PRODUCTION_END.position
+        ):
+            raise HarnessError(
+                f"logical child XID checkpoint mismatch: expected={HOME_FEED_PRODUCTION_END} actual={checkpoint}"
+            )
         print(
             "home_feed_card_parent_recovery_ok "
-            "production_boundary=mysqld-bin.002709:308259855-308261441 "
-            f"fixture_boundary={stop.file}:{start.position}-{stop.position} "
+            "logical_boundary=mysqld-bin.002709:308259855-308261441 "
+            f"physical_fixture_boundary={stop.file}:{start.position}-{stop.position} "
             "parent_id=2492683 parent_columns=20 child_id=4508905"
         )
 

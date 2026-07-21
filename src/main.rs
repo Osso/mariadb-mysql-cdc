@@ -563,6 +563,18 @@ fn apply_binlog_transaction_option(
         "--integration-failpoint" => {
             config.integration_failpoint = Some(live::IntegrationFailpoint::parse(value)?);
         }
+        #[cfg(feature = "integration-failpoints")]
+        "--integration-logical-source-file" => {
+            config.integration_logical_source_file = Some(value.to_string());
+        }
+        #[cfg(feature = "integration-failpoints")]
+        "--integration-logical-start-position" => {
+            config.integration_logical_start_position = Some(parse_u64(flag, value)?);
+        }
+        #[cfg(feature = "integration-failpoints")]
+        "--integration-logical-end-position" => {
+            config.integration_logical_end_position = Some(parse_u64(flag, value)?);
+        }
         _ => return Ok(false),
     }
 
