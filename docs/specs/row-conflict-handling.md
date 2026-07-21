@@ -148,16 +148,19 @@ created, before full parent reads or insertion. Each identity query returns that
 `UNIX_TIMESTAMP(create_time)` helper epoch. That absolute epoch must be no later
 than the child event; the session-time-zone-rendered `create_time` text does not
 control ordering, and the helper is excluded from insert and exact-row comparison.
-Missing or invalid epochs fail closed. One reconciliation attempt is allowed per
-distinct reconstructed `ExactParentRecovery` value per process reconnect loop;
-this is not ledger-identity deduplication. A later retry of the same request skips
-mutation but still follows normal reconnect policy.
+Missing or invalid epochs fail closed. A successful reconciliation is recorded
+at most once per distinct reconstructed `ExactParentRecovery` value per process
+reconnect loop; failed attempts remain eligible for retry. This is not
+ledger-identity deduplication. A failed reconciliation remains eligible
+for another recovery attempt; after a successful reconciliation, a later retry of
+that request skips mutation but still follows normal reconnect policy.
 Existing exact target parents are accepted idempotently after process loss;
 otherwise one current source parent image is inserted only when the target has
 no matching identity. Unsupported, absent, duplicate, colliding, divergent, or
 temporally invalid identities, connection failures, and insert failures return a
-contextual typed recovery failure without replay, another attempt, or checkpoint
-advance. Recovery emits deterministic attempted/skipped/succeeded/failed
+contextual typed recovery failure; the reconnect loop retries it under normal
+policy without replay or checkpoint advance. Recovery emits deterministic
+attempted/skipped/succeeded/failed
 logs. It never resolves the ledger entry; normal child replay must commit and
 checkpoint before the existing resolution path can mark it resolved. Recovery
 is not generic FK repair, performs no historical binlog reconstruction, and

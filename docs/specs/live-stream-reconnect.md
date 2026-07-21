@@ -33,8 +33,10 @@ source connection loss without replaying from static startup coordinates.
   recovery connections set `time_zone='+00:00'`, and the helper epoch is excluded
   from insert and equality. Recovery values are reconstructed deterministically
   from replay input and conflict context, not stored in `cdc.row_conflicts`.
-  Recovery failure returns a contextual typed non-retryable error: no replay,
-  another attempt, or checkpoint advance. Successful child replay writes matching
+  Recovery failure returns a contextual typed error; the reconnect loop treats it
+  as retryable under normal reconnect policy, preserving the unchanged checkpoint
+  for another attempt. The failed recovery performs no replay or checkpoint
+  advance. Successful child replay writes matching
   conflict resolution after child DML/checkpoint and before the same target
   COMMIT; post-commit work only updates process-local cache. Disposable
   real-database proof remains a separate unchecked gap below.
