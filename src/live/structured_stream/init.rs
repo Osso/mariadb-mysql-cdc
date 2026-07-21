@@ -273,11 +273,11 @@ fn logical_integration_coordinate(
     } else {
         source_position
     };
-    if matches!(event, BinlogEvent::XidEvent(_)) {
-        if let Some(end_position) = config.integration_logical_end_position {
-            logical_header.next_event_position = u32::try_from(end_position)
-                .expect("integration logical end position must fit a binlog header");
-        }
+    if matches!(event, BinlogEvent::XidEvent(_))
+        && let Some(end_position) = config.integration_logical_end_position
+    {
+        logical_header.next_event_position = u32::try_from(end_position)
+            .expect("integration logical end position must fit a binlog header");
     }
     (logical_header, logical_source_position)
 }
