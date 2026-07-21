@@ -104,8 +104,8 @@ instead of maintained as compatibility paths.
 - [ ] Prove target schema/data convergence and lag after deployment.
 - [ ] Prove GTID persistence/resume; live checkpoints currently store file/position
       with `gtid: null`.
-- [ ] Schedule recurring repair from durable unresolved conflicts and prove
-      repeated convergence before cutover.
+- [ ] Schedule recurring repair from durable unresolved conflicts before
+      cutover.
 
 ## Retired manual ledger
 
