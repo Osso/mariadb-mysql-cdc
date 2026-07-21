@@ -597,15 +597,6 @@ impl TransactionRecordingExecutor {
         }
     }
 
-    fn with_deferred_conflict_then_hard_failure() -> Self {
-        Self {
-            duplicate_row_change_number: Some(2),
-            duplicate_mode: DuplicateMode::ForeignKey,
-            fail_row_change_number: Some(3),
-            ..Self::default()
-        }
-    }
-
     fn with_equal_duplicate_second_row_change() -> Self {
         Self {
             duplicate_row_change_number: Some(2),
