@@ -540,7 +540,12 @@ fn apply_accepts_exact_total_extra_row_ceiling() {
     assert_eq!(
         repair_target.operations.borrow().as_slice(),
         &[
-            "update:1", "insert:2", "delete:4", "delete:5", "insert:3", "insert:6",
+            "update-batch:1",
+            "insert:2",
+            "delete:4",
+            "delete:5",
+            "insert:3",
+            "insert:6",
         ]
     );
 }
@@ -563,7 +568,7 @@ fn apply_releases_unique_conflicts_before_inserting_missing_rows() {
 
     assert_eq!(
         repair_target.operations.borrow().as_slice(),
-        &["update:20".to_string(), "insert:10".to_string()]
+        &["update-batch:20".to_string(), "insert:10".to_string()]
     );
 }
 
