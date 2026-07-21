@@ -602,7 +602,10 @@ where
     }
 
     pub fn update_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TargetWriteError> {
-        for batch in rows.chunks(max_insert_rows_per_statement(self.columns.len())) {
+        let changed_column_count = self.columns.len().saturating_sub(self.primary_key.len());
+        let batch_size =
+            max_update_rows_per_statement(self.primary_key.len(), changed_column_count);
+        for batch in rows.chunks(batch_size) {
             let statement =
                 build_update_rows_statement(&self.table, &self.primary_key, &self.columns, batch);
             self.execute_with_context("update", batch.len(), statement)?;
@@ -791,63 +794,79 @@ fn build_update_rows_statement(
     columns: &[String],
     rows: &[&SnapshotRow],
 ) -> SqlStatement {
-    let derived_rows = derived_update_rows(columns, rows.len());
-    let join_predicate = qualified_column_pairs(primary_key, "target", "source", " AND ");
     let changed_columns = non_primary_columns(columns, primary_key);
-    let assignments = qualified_column_pairs(&changed_columns, "target", "source", ", ");
-    let params = rows
+    let assignments = changed_columns
         .iter()
-        .flat_map(|row| ordered_values(row, columns))
-        .collect();
+        .map(|column| ordered_case_assignment(column, primary_key, rows.len()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let row_filter = primary_key_row_filter(primary_key, rows.len());
+    let order = primary_key
+        .iter()
+        .map(|column| quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let params = ordered_update_params(&changed_columns, rows);
 
     SqlStatement {
         sql: format!(
-            "UPDATE {} AS {} JOIN ({derived_rows}) AS {} ON {join_predicate} SET {assignments}",
+            "UPDATE {} SET {assignments} WHERE {row_filter} ORDER BY {order}",
             quote_ident(table),
-            quote_ident("target"),
-            quote_ident("source"),
         ),
         params,
     }
 }
 
-fn derived_update_rows(columns: &[String], row_count: usize) -> String {
-    let first_row = columns
-        .iter()
-        .map(|column| format!("? AS {}", quote_ident(column)))
+fn ordered_case_assignment(column: &str, primary_key: &[String], row_count: usize) -> String {
+    let predicate = primary_key_predicates(primary_key).join(" AND ");
+    let cases = std::iter::repeat_n(format!("WHEN {predicate} THEN ?"), row_count)
         .collect::<Vec<_>>()
-        .join(", ");
-    let placeholders = std::iter::repeat_n("?", columns.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let remaining_rows = std::iter::repeat_n(
-        format!("SELECT {placeholders}"),
-        row_count.saturating_sub(1),
-    );
-    std::iter::once(format!("SELECT {first_row}"))
-        .chain(remaining_rows)
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ")
+        .join(" ");
+    format!(
+        "{} = CASE {cases} ELSE {} END",
+        quote_ident(column),
+        quote_ident(column),
+    )
 }
 
-fn qualified_column_pairs(
-    columns: &[String],
-    left_alias: &str,
-    right_alias: &str,
-    separator: &str,
-) -> String {
-    columns
+fn primary_key_row_filter(primary_key: &[String], row_count: usize) -> String {
+    if primary_key.len() == 1 {
+        let values = std::iter::repeat_n("?", row_count)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{} IN ({values})", quote_ident(&primary_key[0]));
+    }
+    let columns = primary_key
         .iter()
-        .map(|column| {
-            let column = quote_ident(column);
-            format!(
-                "{}.{column} = {}.{column}",
-                quote_ident(left_alias),
-                quote_ident(right_alias),
-            )
-        })
+        .map(|column| quote_ident(column))
         .collect::<Vec<_>>()
-        .join(separator)
+        .join(", ");
+    format!(
+        "({columns}) IN ({})",
+        row_placeholders(primary_key.len(), row_count)
+    )
+}
+
+fn ordered_update_params(changed_columns: &[String], rows: &[&SnapshotRow]) -> Vec<Value> {
+    let mut params = Vec::new();
+    for column in changed_columns {
+        for row in rows {
+            params.extend(row.primary_key.iter().cloned().map(string_param));
+            params.extend(ordered_values(row, std::slice::from_ref(column)));
+        }
+    }
+    for row in rows {
+        params.extend(row.primary_key.iter().cloned().map(string_param));
+    }
+    params
+}
+
+fn max_update_rows_per_statement(primary_key_count: usize, changed_column_count: usize) -> usize {
+    let placeholders_per_row = changed_column_count
+        .saturating_mul(primary_key_count.saturating_add(1))
+        .saturating_add(primary_key_count)
+        .max(1);
+    (MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS / placeholders_per_row).max(1)
 }
 
 fn build_update_statement(
@@ -1035,6 +1054,28 @@ mod tests {
         assert_eq!(executed[0].params, values(["updated", "7"]));
         assert_eq!(executed[1].sql, "DELETE FROM `accounts` WHERE `id` = ?");
         assert_eq!(executed[1].params, values(["7"]));
+    }
+
+    #[test]
+    fn batches_updates_in_primary_key_order() {
+        let executor = RecordingExecutor::default();
+        let writer = TargetMySqlWriter::new("accounts", vec!["id"], vec!["id", "name"], executor);
+        let rows = [row("1", "alpha"), row("2", "beta")];
+
+        writer
+            .update_rows(&rows.iter().collect::<Vec<_>>())
+            .expect("update rows");
+
+        let executed = writer.executor.statements.borrow();
+        assert_eq!(executed.len(), 1);
+        assert_eq!(
+            executed[0].sql,
+            "UPDATE `accounts` SET `name` = CASE WHEN `id` = ? THEN ? WHEN `id` = ? THEN ? ELSE `name` END WHERE `id` IN (?, ?) ORDER BY `id`"
+        );
+        assert_eq!(
+            executed[0].params,
+            values(["1", "alpha", "2", "beta", "1", "2"])
+        );
     }
 
     #[test]
