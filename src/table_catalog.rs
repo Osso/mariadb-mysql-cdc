@@ -211,7 +211,7 @@ pub fn build_catalogs(
     estimated_rows: &BTreeMap<String, u64>,
 ) -> Catalogs {
     let (mut candidates, mut excluded) = classify_source_tables(source, target, estimated_rows);
-    propagate_non_syncable_dependencies(&mut candidates, &mut excluded);
+    propagate_non_syncable_dependencies(source, &mut candidates, &mut excluded);
     Catalogs {
         syncable: sorted_syncable_entries(candidates),
         non_syncable: sorted_non_syncable_entries(excluded, estimated_rows),
@@ -305,29 +305,40 @@ fn syncable_entry(
 }
 
 fn propagate_non_syncable_dependencies(
+    inventory: &SchemaInventory,
     candidates: &mut BTreeMap<String, SyncableTableEntry>,
     excluded: &mut BTreeMap<String, BTreeSet<NonSyncableReason>>,
 ) {
+    let dependencies = inventory
+        .foreign_keys
+        .iter()
+        .filter(|foreign_key| foreign_key.table != foreign_key.referenced_table)
+        .fold(
+            BTreeMap::<String, BTreeSet<String>>::new(),
+            |mut result, foreign_key| {
+                result
+                    .entry(foreign_key.table.clone())
+                    .or_default()
+                    .insert(foreign_key.referenced_table.clone());
+                result
+            },
+        );
     loop {
-        let dependent = candidates
+        let dependent = dependencies
             .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .parent_dependencies
-                    .iter()
-                    .any(|parent| excluded.contains_key(parent))
-            })
+            .filter(|(_, parents)| parents.iter().any(|parent| excluded.contains_key(parent)))
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
-        if dependent.is_empty() {
-            return;
-        }
+        let mut changed = false;
         for name in dependent {
             candidates.remove(&name);
-            excluded
+            changed |= excluded
                 .entry(name)
                 .or_default()
                 .insert(NonSyncableReason::DependencyOnNonSyncable);
+        }
+        if !changed {
+            return;
         }
     }
 }
@@ -501,6 +512,79 @@ pub(crate) struct SyncWorkerReservation {
     _connection: Conn,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActiveRunRow {
+    run_id: String,
+    table: String,
+    run_spec_json: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ActiveRunInspection {
+    legacy_active_count: usize,
+    requested_table_active: bool,
+}
+
+fn inspect_active_run_rows<F>(
+    rows: &[ActiveRunRow],
+    requested_database: &str,
+    requested_table: &str,
+    mut table_reservation_is_held: F,
+) -> Result<ActiveRunInspection, String>
+where
+    F: FnMut(&str, &str) -> Result<bool, String>,
+{
+    let mut inspection = ActiveRunInspection::default();
+    for row in rows {
+        let (database, table) = active_run_identity(row)?;
+        if database == requested_database && table == requested_table {
+            inspection.requested_table_active = true;
+        }
+        if !table_reservation_is_held(&database, &table)? {
+            inspection.legacy_active_count += 1;
+        }
+    }
+    Ok(inspection)
+}
+
+fn active_run_identity(row: &ActiveRunRow) -> Result<(String, String), String> {
+    let spec = serde_json::from_str::<serde_json::Value>(&row.run_spec_json)
+        .map_err(|error| malformed_active_run_spec(row, error))?;
+    let scope_json = spec
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| malformed_active_run_spec(row, "missing string scope"))?;
+    let scope = serde_json::from_str::<serde_json::Value>(scope_json)
+        .map_err(|error| malformed_active_run_spec(row, error))?;
+    let database = scope
+        .get("target_database")
+        .and_then(serde_json::Value::as_str)
+        .filter(|database| !database.is_empty())
+        .ok_or_else(|| malformed_active_run_spec(row, "missing target_database"))?;
+    let spec_table = spec
+        .pointer("/table/name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|table| !table.is_empty())
+        .ok_or_else(|| malformed_active_run_spec(row, "missing table name"))?;
+    if spec_table != row.table {
+        return Err(malformed_active_run_spec(
+            row,
+            format!(
+                "table_name `{}` differs from spec table `{spec_table}`",
+                row.table
+            ),
+        ));
+    }
+    Ok((database.to_string(), spec_table.to_string()))
+}
+
+fn malformed_active_run_spec(row: &ActiveRunRow, detail: impl std::fmt::Display) -> String {
+    format!(
+        "active run `{}` has malformed immutable specification: {detail}",
+        row.run_id
+    )
+}
+
 #[cfg(test)]
 trait NamedLockSet {
     type Reservation;
@@ -575,9 +659,20 @@ fn reserve_under_admission_lock(
     active_count: usize,
 ) -> Result<bool, String> {
     let occupied_slots = count_occupied_slots(connection, server_namespace)?;
-    let legacy_runs =
-        count_legacy_active_runs(connection, server_namespace, database, progress_table)?;
-    if !admission_has_capacity(legacy_runs, occupied_slots, active_count) {
+    let active_runs = inspect_active_runs(
+        connection,
+        server_namespace,
+        database,
+        progress_table,
+        table,
+    )?;
+    if active_runs.requested_table_active
+        || !admission_has_capacity(
+            active_runs.legacy_active_count,
+            occupied_slots,
+            active_count,
+        )
+    {
         return Ok(false);
     }
     let table_lock = sync_table_lock_name(server_namespace, database, table);
@@ -605,30 +700,33 @@ fn count_occupied_slots(connection: &mut Conn, server_namespace: &str) -> Result
     Ok(occupied)
 }
 
-fn count_legacy_active_runs(
+fn inspect_active_runs(
     connection: &mut Conn,
     server_namespace: &str,
     database: &str,
     progress_table: &str,
-) -> Result<usize, String> {
+    table: &str,
+) -> Result<ActiveRunInspection, String> {
     let table_path = quote_identifier_path(progress_table);
     let sql = format!(
-        "SELECT run_id, table_name, IS_USED_LOCK(SHA2(run_id,256)) FROM {table_path} WHERE status IN ('running','complete','error')"
+        "SELECT run_id, table_name, run_spec_json, IS_USED_LOCK(SHA2(run_id,256)) FROM {table_path} WHERE status IN ('running','complete','error')"
     );
     let rows = connection
-        .query::<(String, String, Option<u64>), _>(sql)
-        .map_err(|error| format!("failed to count active table sync runs: {error}"))?;
-    let mut count = 0;
-    for (_run_id, table, owner) in rows {
-        if owner.is_none() {
-            continue;
-        }
-        let table_lock = sync_table_lock_name(server_namespace, database, &table);
-        if named_lock_owner(connection, &table_lock)?.is_none() {
-            count += 1;
-        }
-    }
-    Ok(count)
+        .query::<(String, String, String, Option<u64>), _>(sql)
+        .map_err(|error| format!("failed to inspect active table sync runs: {error}"))?
+        .into_iter()
+        .filter_map(|(run_id, table, run_spec_json, owner)| {
+            owner.map(|_| ActiveRunRow {
+                run_id,
+                table,
+                run_spec_json,
+            })
+        })
+        .collect::<Vec<_>>();
+    inspect_active_run_rows(&rows, database, table, |active_database, active_table| {
+        let table_lock = sync_table_lock_name(server_namespace, active_database, active_table);
+        named_lock_owner(connection, &table_lock).map(|owner| owner.is_some())
+    })
 }
 
 fn admission_has_capacity(
@@ -1161,6 +1259,81 @@ mod tests {
     use crate::inventory::{ColumnInventory, ForeignKeyInventory, SchemaInventory, TableInventory};
 
     #[test]
+    fn excluded_child_keeps_own_reason_and_dependency_reason() {
+        let source = inventory(
+            vec![
+                table("child", vec![column("parent_id")], vec![]),
+                table("parent", vec![column("id")], vec!["id"]),
+            ],
+            vec![foreign_key("child", "parent")],
+        );
+        let target = inventory(
+            vec![table("child", vec![column("parent_id")], vec![])],
+            vec![],
+        );
+
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+        let child = catalogs
+            .non_syncable
+            .iter()
+            .find(|entry| entry.name == "child")
+            .expect("excluded child");
+
+        assert_eq!(
+            child.reasons,
+            vec![
+                NonSyncableReason::MissingPrimaryKey,
+                NonSyncableReason::DependencyOnNonSyncable,
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_run_lock_rejects_different_run_for_same_database_and_table() {
+        let rows = vec![active_run_row(
+            "guests-full-apply-20260721",
+            "guests",
+            "globalcomix",
+        )];
+        let inspection = inspect_active_run_rows(&rows, "globalcomix", "guests", |_, _| Ok(false))
+            .expect("legacy active run inspection");
+
+        assert!(inspection.requested_table_active);
+        assert_eq!(inspection.legacy_active_count, 1);
+    }
+
+    #[test]
+    fn active_reserved_run_uses_stored_database_for_table_reservation() {
+        let rows = vec![active_run_row("run-a", "items", "database_a")];
+        let mut inspected = Vec::new();
+        let inspection =
+            inspect_active_run_rows(&rows, "database_b", "items", |database, table| {
+                inspected.push((database.to_string(), table.to_string()));
+                Ok(database == "database_a" && table == "items")
+            })
+            .expect("cross-database active run inspection");
+
+        assert_eq!(inspected, vec![("database_a".into(), "items".into())]);
+        assert!(!inspection.requested_table_active);
+        assert_eq!(inspection.legacy_active_count, 0);
+    }
+
+    #[test]
+    fn malformed_active_run_spec_fails_closed() {
+        let rows = vec![ActiveRunRow {
+            run_id: "broken".into(),
+            table: "items".into(),
+            run_spec_json: "not-json".into(),
+        }];
+
+        let error = inspect_active_run_rows(&rows, "database_b", "items", |_, _| Ok(false))
+            .expect_err("malformed active spec");
+
+        assert!(error.contains("broken"));
+        assert!(error.contains("malformed"));
+    }
+
+    #[test]
     fn catalogs_pk_tables_by_estimated_rows_and_propagates_exclusions() {
         let source = inventory(
             vec![
@@ -1686,6 +1859,38 @@ mod tests {
             for name in names {
                 self.held.remove(&name);
             }
+        }
+    }
+
+    fn active_run_row(run_id: &str, table: &str, target_database: &str) -> ActiveRunRow {
+        let scope = serde_json::json!({
+            "source_host": "source",
+            "source_port": 3306,
+            "source_database": "source_db",
+            "target_host": "target",
+            "target_port": 25060,
+            "target_database": target_database,
+            "insert_conflict_policy": "error",
+            "plan_hash": null,
+        });
+        ActiveRunRow {
+            run_id: run_id.into(),
+            table: table.into(),
+            run_spec_json: serde_json::json!({
+                "scope": scope.to_string(),
+                "table": {
+                    "name": table,
+                    "primary_key": ["id"],
+                    "columns": ["id"],
+                },
+                "chunk_size": 10000,
+                "mode": "apply",
+                "start_after": null,
+                "end_at": null,
+                "max_deletes": 0,
+                "updated_since": null,
+            })
+            .to_string(),
         }
     }
 
