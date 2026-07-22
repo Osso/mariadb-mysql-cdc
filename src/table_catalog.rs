@@ -550,8 +550,7 @@ fn validate_catalog(catalog: &SyncableCatalog) -> Result<(), String> {
 }
 
 fn schemas_are_compatible(source: &TableInventory, target: &TableInventory) -> bool {
-    source.primary_key == target.primary_key
-        && writable_column_signatures(source) == writable_column_signatures(target)
+    source.primary_key == target.primary_key && writable_columns(source) == writable_columns(target)
 }
 
 fn writable_columns(table: &TableInventory) -> Vec<String> {
@@ -560,21 +559,6 @@ fn writable_columns(table: &TableInventory) -> Vec<String> {
         .iter()
         .filter(|column| column.generated.is_none())
         .map(|column| column.name.clone())
-        .collect()
-}
-
-fn writable_column_signatures(table: &TableInventory) -> Vec<(&str, &str, bool)> {
-    table
-        .columns
-        .iter()
-        .filter(|column| column.generated.is_none())
-        .map(|column| {
-            (
-                column.name.as_str(),
-                column.column_type.as_str(),
-                column.is_nullable,
-            )
-        })
         .collect()
 }
 
@@ -858,6 +842,39 @@ mod tests {
     }
 
     #[test]
+    fn compatible_writable_columns_allow_target_type_widening() {
+        let source_table = table(
+            "items",
+            vec![
+                typed_column("id", "int", false),
+                typed_column("name", "varchar(20)", true),
+            ],
+            vec!["id"],
+        );
+        let target_table = table(
+            "items",
+            vec![
+                typed_column("id", "bigint", false),
+                typed_column("name", "varchar(80)", false),
+            ],
+            vec!["id"],
+        );
+        let catalogs = build_catalogs(
+            &inventory(vec![source_table], vec![]),
+            &inventory(vec![target_table], vec![]),
+            &BTreeMap::from([("items".to_string(), 5)]),
+        );
+        assert_eq!(
+            catalogs
+                .syncable
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["items"]
+        );
+    }
+
+    #[test]
     fn scheduler_reserves_external_slots_and_orders_ready_tables_by_size() {
         let catalog = SyncableCatalog {
             tables: vec![
@@ -979,12 +996,15 @@ mod tests {
         }
     }
     fn column(name: &str) -> ColumnInventory {
+        typed_column(name, "bigint", false)
+    }
+    fn typed_column(name: &str, column_type: &str, is_nullable: bool) -> ColumnInventory {
         ColumnInventory {
             name: name.into(),
             ordinal_position: 1,
-            column_type: "bigint".into(),
-            data_type: "bigint".into(),
-            is_nullable: false,
+            column_type: column_type.into(),
+            data_type: column_type.split('(').next().unwrap_or(column_type).into(),
+            is_nullable,
             default_value: None,
             extra: String::new(),
             comment: String::new(),
