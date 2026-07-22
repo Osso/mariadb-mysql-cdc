@@ -373,41 +373,15 @@ fn write_table_catalogs(config: &TableCatalogConfig) -> Result<(), String> {
 }
 
 fn run_sync_catalog(config: &SyncCatalogConfig) -> Result<(), String> {
-    let bytes = fs::read(&config.catalog)
-        .map_err(|error| format!("failed to read {}: {error}", config.catalog.display()))?;
-    let catalog: SyncableCatalog = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("failed to decode {}: {error}", config.catalog.display()))?;
+    let catalog = read_syncable_catalog(&config.catalog)?;
     validate_catalog(&catalog)?;
-    MySqlSyncRunProgressStore::new(
-        config.connections.target.clone(),
-        config.progress_table.clone(),
-    )
-    .ensure()
-    .map_err(|error| error.to_string())?;
+    ensure_progress_table(config)?;
     let mut state =
         CatalogRunState::new(catalog.clone(), MAX_CATALOG_CONCURRENCY, BTreeSet::new(), 0);
     let (sender, receiver) = mpsc::channel::<(String, Result<(), String>)>();
 
     loop {
-        let statuses = read_run_statuses(config, &catalog)?;
-        let catalog_workers_visible_in_progress = state
-            .running
-            .intersection(&statuses.external_active)
-            .count();
-        state.external_active = statuses.external_active;
-        state.external_active_count = statuses
-            .external_active_count
-            .saturating_sub(catalog_workers_visible_in_progress);
-        for table in statuses.completed {
-            state.mark_completed(&table);
-        }
-        while let Ok((table, result)) = receiver.try_recv() {
-            match result {
-                Ok(()) => state.mark_completed(&table),
-                Err(error) => state.mark_failed(&table, &error),
-            }
-        }
-
+        refresh_run_state(config, &catalog, &receiver, &mut state)?;
         let failures = state.all_failures();
         if !failures.is_empty() && state.running.is_empty() {
             return Err(format_catalog_failures(&failures));
@@ -415,42 +389,96 @@ fn run_sync_catalog(config: &SyncCatalogConfig) -> Result<(), String> {
         if state.completed.len() == catalog.tables.len() {
             return Ok(());
         }
-
-        let slots = state.available_slots();
-        let ready = if failures.is_empty() {
-            state.ready_tables()
-        } else {
-            Vec::new()
-        };
-        for table_name in ready
-            .into_iter()
-            .take(slots)
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-        {
-            let entry = catalog
-                .tables
-                .iter()
-                .find(|entry| entry.name == table_name)
-                .cloned()
-                .expect("ready catalog entry");
-            state.mark_running(&table_name);
-            let worker_config = config.clone();
-            let worker_sender = sender.clone();
-            thread::spawn(move || {
-                let result = run_catalog_table(&worker_config, &entry);
-                let _ = worker_sender.send((entry.name, result));
-            });
-        }
-
-        if state.running.is_empty()
-            && state.available_slots() > 0
-            && state.ready_tables().is_empty()
-        {
+        spawn_ready_tables(config, &catalog, &sender, &mut state, failures.is_empty());
+        if catalog_dependencies_are_stuck(&state) {
             return Err("catalog has unresolved or cyclic dependencies".to_string());
         }
         thread::sleep(Duration::from_secs(2));
     }
+}
+
+fn read_syncable_catalog(path: &Path) -> Result<SyncableCatalog, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to decode {}: {error}", path.display()))
+}
+
+fn ensure_progress_table(config: &SyncCatalogConfig) -> Result<(), String> {
+    MySqlSyncRunProgressStore::new(
+        config.connections.target.clone(),
+        config.progress_table.clone(),
+    )
+    .ensure()
+    .map_err(|error| error.to_string())
+}
+
+fn refresh_run_state(
+    config: &SyncCatalogConfig,
+    catalog: &SyncableCatalog,
+    receiver: &mpsc::Receiver<(String, Result<(), String>)>,
+    state: &mut CatalogRunState,
+) -> Result<(), String> {
+    let statuses = read_run_statuses(config, catalog)?;
+    let visible_catalog_workers = state
+        .running
+        .intersection(&statuses.external_active)
+        .count();
+    state.external_active = statuses.external_active;
+    state.external_active_count = statuses
+        .external_active_count
+        .saturating_sub(visible_catalog_workers);
+    for table in statuses.completed {
+        state.mark_completed(&table);
+    }
+    while let Ok((table, result)) = receiver.try_recv() {
+        match result {
+            Ok(()) => state.mark_completed(&table),
+            Err(error) => state.mark_failed(&table, &error),
+        }
+    }
+    Ok(())
+}
+
+fn spawn_ready_tables(
+    config: &SyncCatalogConfig,
+    catalog: &SyncableCatalog,
+    sender: &mpsc::Sender<(String, Result<(), String>)>,
+    state: &mut CatalogRunState,
+    can_start: bool,
+) {
+    let ready = if can_start {
+        state.ready_tables()
+    } else {
+        Vec::new()
+    };
+    let table_names = ready
+        .into_iter()
+        .take(state.available_slots())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for table_name in table_names {
+        let entry = catalog
+            .tables
+            .iter()
+            .find(|entry| entry.name == table_name)
+            .cloned()
+            .expect("ready catalog entry");
+        state.mark_running(&table_name);
+        let worker_config = config.clone();
+        let worker_sender = sender.clone();
+        thread::spawn(move || {
+            let result = run_catalog_table(&worker_config, &entry);
+            let _ = worker_sender.send((entry.name, result));
+        });
+    }
+}
+
+fn catalog_dependencies_are_stuck(state: &CatalogRunState) -> bool {
+    state.running.is_empty()
+        && state.available_slots() > 0
+        && state.ready_tables().is_empty()
+        && state.all_failures().is_empty()
 }
 
 #[derive(Default)]
