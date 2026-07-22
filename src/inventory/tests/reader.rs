@@ -41,6 +41,15 @@ fn inventory_options_enable_tls_when_configured() {
     );
     assert!(!ssl.accept_invalid_certs());
     assert!(!ssl.skip_domain_validation());
+    assert_eq!(
+        opts.get_tcp_connect_timeout(),
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(opts.get_tcp_keepalive_time_ms(), Some(10_000));
+    assert_eq!(opts.get_read_timeout(), None);
+    assert_eq!(opts.get_write_timeout(), None);
+    #[cfg(target_os = "linux")]
+    assert_eq!(opts.get_tcp_user_timeout_ms(), Some(30_000));
 }
 
 #[test]

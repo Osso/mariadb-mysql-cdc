@@ -179,7 +179,9 @@ fn source_opts(source: &SourceBinlogConfig) -> Result<Opts, String> {
         .user(Some(&source.user))
         .pass(Some(&source.password))
         .prefer_socket(false);
-    Ok(Opts::from(builder))
+    Ok(Opts::from(
+        crate::mysql_support::apply_mysql_connection_liveness(builder),
+    ))
 }
 
 fn missing_target_table_name(error: &str) -> Option<String> {
@@ -223,6 +225,15 @@ mod tests {
         assert_eq!(opts.get_ip_or_hostname().as_ref(), "source-db");
         assert_eq!(opts.get_tcp_port(), 3306);
         assert!(opts.get_ssl_opts().is_none());
+        assert_eq!(
+            opts.get_tcp_connect_timeout(),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(opts.get_tcp_keepalive_time_ms(), Some(10_000));
+        assert_eq!(opts.get_read_timeout(), None);
+        assert_eq!(opts.get_write_timeout(), None);
+        #[cfg(target_os = "linux")]
+        assert_eq!(opts.get_tcp_user_timeout_ms(), Some(30_000));
     }
 
     #[test]

@@ -8,7 +8,7 @@ pub(super) fn snapshot_target_for_table(
     source: &PersistentMySqlSource,
     table: &SnapshotTable,
 ) -> Result<TargetMySqlWriter<PersistentTargetExecutor>, SnapshotError> {
-    let executor = PersistentTargetExecutor::new(&config.target)
+    let executor = PersistentTargetExecutor::new_for_sync(&config.target)
         .map_err(|error| SnapshotError::InvalidTable(error.to_string()))?;
     let target_columns = read_or_create_target_table(source, &executor, table)?;
     validate_target_table_columns(table, &target_columns)?;

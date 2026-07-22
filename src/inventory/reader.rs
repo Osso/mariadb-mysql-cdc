@@ -388,5 +388,7 @@ pub(crate) fn inventory_opts(config: &InventoryConfig) -> Result<Opts, String> {
             ca_file,
         )?);
     }
-    Ok(Opts::from(builder))
+    Ok(Opts::from(
+        crate::mysql_support::apply_mysql_connection_liveness(builder),
+    ))
 }

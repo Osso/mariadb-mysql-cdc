@@ -221,7 +221,7 @@ fn catchup_snapshot_uses_persistent_clients_for_chunk_io() {
     let target_schema = include_str!("target_schema.rs");
 
     assert!(source.contains("PersistentMySqlSource::new(&config.source)"));
-    assert!(target_schema.contains("PersistentTargetExecutor::new(&config.target)"));
+    assert!(target_schema.contains("PersistentTargetExecutor::new_for_sync(&config.target)"));
     assert!(source.contains("PersistentProgressWriter::new(&config.target"));
     assert!(!source.contains("MysqlCliExecutor"));
     assert!(!source.contains("Command::new"));
