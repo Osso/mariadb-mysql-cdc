@@ -10,7 +10,7 @@ are resolved only after verified equality.
 - [x] Compare rows by configured primary-key columns.
 - [x] Report missing source rows, divergent rows, and target extras.
 - [x] Apply divergent rows in bounded primary-key update batches, with at most
-      256 rows per SQL statement, further split to stay under MySQL's
+      128 rows per SQL statement, further split to stay under MySQL's
       prepared-statement placeholder limit; persist run progress only after the
       source chunk's update batch succeeds, leaving a failed chunk uncheckpointed
       for retry.

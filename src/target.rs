@@ -4,7 +4,7 @@ use mysql::Value;
 use std::fmt;
 
 const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
-const MAX_UPDATE_ROWS_PER_STATEMENT: usize = 256;
+const MAX_UPDATE_ROWS_PER_STATEMENT: usize = 128;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlStatement {
@@ -1084,7 +1084,7 @@ mod tests {
     fn caps_update_batch_size_for_bounded_execution_time() {
         let executor = RecordingExecutor::default();
         let writer = TargetMySqlWriter::new("accounts", vec!["id"], vec!["id", "name"], executor);
-        let rows = (1..=257)
+        let rows = (1..=129)
             .map(|id| row(&id.to_string(), "updated"))
             .collect::<Vec<_>>();
 
