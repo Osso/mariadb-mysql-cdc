@@ -182,6 +182,66 @@ cargo run -- sync-catalog \
   --catalog syncable-tables.json --run-id-prefix catalog-20260722
 ```
 
+### Table catalog JSON and execution contract
+
+`table-catalog` writes two pretty JSON objects, each with a top-level `tables`
+array. Syncable entries have exactly `name`, `primary_key`, `columns`,
+`estimated_source_rows`, and `parent_dependencies`; non-syncable entries have
+exactly `name`, `estimated_source_rows`, and `reasons`:
+
+```json
+{
+  "tables": [
+    {
+      "name": "orders",
+      "primary_key": ["id"],
+      "columns": ["id", "updated_at"],
+      "estimated_source_rows": 123,
+      "parent_dependencies": ["users"]
+    }
+  ]
+}
+```
+
+```json
+{
+  "tables": [
+    {
+      "name": "audit_log",
+      "estimated_source_rows": 456,
+      "reasons": ["missing_primary_key"]
+    }
+  ]
+}
+```
+
+Reason codes are `missing_primary_key`, `missing_target_table`,
+`incompatible_schema`, `unsupported_generated_columns`, and
+`dependency_on_non_syncable`. Catalog arrays are ordered by estimated source
+rows, then table name; primary-key and writable-column arrays retain inventory
+order, parent-dependency arrays are unique and lexicographically ordered, and
+reason arrays use enum declaration order. Compatibility requires matching table
+default character sets (derived from table collations) and exact per-column
+`CHARACTER_SET_NAME`/`COLLATION_NAME` values for corresponding writable columns;
+a mismatch is `incompatible_schema`.
+
+`sync-catalog` reads only the syncable catalog and starts apply mode immediately;
+there is no dry-run/plan mode and `table-catalog` does not launch it. The command
+waits until all entries complete or a failure is returned. Each table uses run ID
+`<run-id-prefix>-<table>`; the prefix is required and non-empty, and every
+generated ID must be at most 128 bytes. Interrupted exact IDs resume; a matching
+`status='complete'` row is terminal and is not rerun. Direct `sync-table` and
+`sync-catalog` workers share target-server named reservations keyed by target
+database: each holds the table-specific reservation and one of four global slot
+reservations, preventing same-table overlap and limiting both modes to four
+active syncs. Progress-table rows with a held run-ID advisory lock count toward
+capacity, including rows for tables outside the catalog; stale unlocked rows do
+not. Children start only after all listed FK parents complete. Failed, missing,
+or cyclic dependencies fail closed. Each catalog child forces `max_deletes=0`; the
+option is not configurable, so target orphans are never deleted. The
+non-syncable catalog is classification/operator input only; full-dump execution
+is out of scope.
+
 ```bash
 cargo run -- catchup-snapshot \
   --source-host 127.0.0.1 --source-user reader \

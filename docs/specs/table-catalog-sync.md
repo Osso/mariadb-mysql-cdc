@@ -9,19 +9,23 @@ engine. Operational details belong in [the table catalog sync wiki](../wiki/syst
 ### Catalog generation
 
 - [x] Write deterministic, pretty JSON syncable and non-syncable catalogs without using `COUNT(*)`.
+- [x] Emit a syncable catalog as `{"tables":[{"name":"...","primary_key":["..."],"columns":["..."],"estimated_source_rows":0,"parent_dependencies":["..."]}]}` and a non-syncable catalog as `{"tables":[{"name":"...","estimated_source_rows":0,"reasons":["..."]}]}`. Field types are strings, string arrays, and a non-negative integer row estimate; generated syncable entries have non-empty primary-key and column arrays, parent dependencies may be empty, and non-syncable reasons are non-empty.
 - [x] Include only source base tables that exist on target, have compatible writable schemas, contain no unsupported generated columns, and have a non-empty primary key.
-- [x] Order syncable entries by estimated source `information_schema.TABLE_ROWS`, then table name.
+- [x] Require source and target table default character sets (derived from table collations) to match, and require each corresponding writable column's `CHARACTER_SET_NAME` and `COLLATION_NAME` to match exactly; classify any mismatch as `incompatible_schema`.
+- [x] Order both catalog entry arrays by estimated source `information_schema.TABLE_ROWS`, then table name. Preserve primary-key and writable-column inventory order; emit unique parent dependencies lexicographically and reason arrays in enum declaration order.
 - [x] Include ordered primary-key columns, writable sync columns, estimated source rows, and FK parent dependencies.
-- [x] Classify every excluded source base table with stable reason codes and propagate `dependency_on_non_syncable` to children.
+- [x] Classify every excluded source base table with these stable snake-case reason codes: `missing_primary_key` (source has no primary key), `missing_target_table` (target table is absent), `incompatible_schema` (writable schema is not compatible), `unsupported_generated_columns` (source has a generated column), and `dependency_on_non_syncable` (a parent dependency was excluded); propagate `dependency_on_non_syncable` to children.
 
 ### Catalog execution
 
-- [x] Apply catalog tables through the existing table-sync engine with `max_deletes=0` and deterministic run IDs derived from a required prefix.
-- [x] Limit total active table syncs to four, counting externally lock-active runs in `cdc.table_sync_runs` and never duplicating an active table.
+- [x] `sync-catalog` reads the supplied syncable JSON and immediately starts apply-mode table syncs, blocking until all entries complete or a failure is returned; it has no dry-run/plan mode. `table-catalog` only writes catalogs and does not start either syncs or full dumps.
+- [x] Apply catalog tables through the existing table-sync engine with a hard-coded `max_deletes=0`; `sync-catalog` exposes no override, so catalog execution never deletes target orphans.
+- [x] Use deterministic per-table run IDs in the exact form `<run-id-prefix>-<table>`, where `--run-id-prefix` is required and non-empty; reject any generated ID over 128 bytes before execution.
+- [x] Limit table-sync capacity to four global target-server named slots shared by direct `sync-table` and `sync-catalog` workers. Each worker reserves a table-specific lock and one slot lock, preventing same-table overlap across modes and runners. Progress-table rows with held run-ID advisory locks count toward capacity, including tables outside the catalog; stale unlocked rows do not.
 - [x] Schedule dependency-ready tables by catalog order, which is smallest estimated row count then name.
-- [x] Start children only after all catalog parents complete; explicitly fail when a parent fails or dependencies cannot resolve.
-- [x] Resume interrupted exact run IDs and treat completed exact run IDs as terminal.
-- [x] Read catalog JSON without mutating it and never execute full dumps.
+- [x] During catalog generation, exclude children of non-syncable parents with `dependency_on_non_syncable`; during execution, gate each child on every listed non-self FK parent completing. A failed parent blocks its descendants; missing or cyclic dependencies fail closed.
+- [x] Resume interrupted exact run IDs; a matching `status='complete'` row is terminal and is not rerun.
+- [x] Read catalog JSON without mutating it and never execute full dumps; the non-syncable catalog is classification/operator input only.
 
 ## How it works
 
@@ -43,6 +47,6 @@ None.
 
 ## Out of scope
 
-- Full-dump execution; the non-syncable catalog is an operator input only.
-- Deployment or automatically starting a catalog sync after catalog generation.
-- More than four simultaneous table syncs.
+- Full-dump execution; the non-syncable catalog is an operator input only and is never consumed by `sync-catalog`.
+- Deployment or automatically starting `sync-catalog` after `table-catalog` generation.
+- More than four simultaneous table syncs, including externally active runs.
