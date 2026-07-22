@@ -222,12 +222,14 @@ displacement is repaired transactionally: the displaced target owner is restored
 from the same source chunk, the missing owner is inserted, affected child rows
 are verified unchanged, and run progress commits on the same target connection.
 Ambiguous chains, absent source owners, verification failures, and constraint
-failures roll back parents and progress. Other conflicts remain errors. MySQL
-connections use a 10-second TCP connect timeout
-and 30-second read/write timeouts. Transient connection failures retry up to
-five attempts total (the initial attempt plus four retries), with each retry
-resuming from durable `cdc.table_sync_runs` progress; non-transient errors and
-exhausted retries fail.
+failures roll back parents and progress. Other conflicts remain errors. The
+sync-table source, target, and progress connections use a 10-second TCP connect
+timeout and 30-second read/write operation timeouts. All MySQL connections
+share TCP liveness bounds; live CDC/DDL connections do not use the sync
+operation timeouts. Transient connection failures retry up to five attempts
+total (the initial attempt plus four retries), with each retry resuming from
+durable `cdc.table_sync_runs` progress; non-transient errors and exhausted
+retries fail.
 
 The default policy is `error`.
 
