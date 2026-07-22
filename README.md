@@ -234,11 +234,13 @@ a mismatch is `incompatible_schema`.
 `sync-catalog` reads only the syncable catalog and starts apply mode immediately;
 there is no dry-run/plan mode and `table-catalog` does not launch it. The command
 waits until all entries complete or a failure is returned. Each table uses run ID
-`<run-id-prefix>-<table>`; the prefix is required and non-empty, and every
-generated ID must be at most 128 bytes. Interrupted exact IDs resume; a matching
-`status='complete'` row is terminal only when its immutable run specification
-exactly matches the current catalog child; a different stored specification
-fails closed instead of being treated as terminal. Direct `sync-table` and
+`<run-id-prefix>-<normalized-target-database>-<table>`; the database component
+preserves ASCII letters, digits, `_`, and `-`, and hex-escapes every other UTF-8
+byte. The prefix is required and non-empty, and every generated ID must be at
+most 128 bytes. Interrupted exact IDs resume; a matching `status='complete'` row
+is terminal only when its immutable run specification exactly matches the current
+catalog child; a different stored specification fails closed instead of being
+treated as terminal. Direct `sync-table` and
 `sync-catalog` workers share one admission lock and four slot reservations keyed
 by the lower-cased target host plus port, so databases on the same host and port
 share capacity. Each worker also holds a database/table-specific reservation,
@@ -252,8 +254,10 @@ legacy run-ID advisory lock for the requested same database/table excludes that
 table even without a table reservation. Rows in `running`, `complete`, or
 `error` with a held legacy run-ID advisory lock but no table reservation count
 toward the same four-worker limit, including rows for tables outside the supplied
-catalog; stale or unlocked rows do not. Malformed active immutable specifications
-fail closed before reservation. Reservation sessions set MySQL `wait_timeout` to
+catalog. Unlocked stale `running` or `error` rows are ignored before parsing their
+immutable specifications. Lock-active rows fail closed when malformed. An
+expected completed child is always parsed and must exactly match its immutable
+specification before it is treated as terminal. Reservation sessions set MySQL `wait_timeout` to
 86,400 seconds so an idle lock connection can span long table runs; this does not
 provide recovery from network disconnects. Children start only after all listed FK parents complete. Missing
 dependencies are rejected before workers start; owned failures return after owned

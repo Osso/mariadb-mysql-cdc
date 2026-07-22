@@ -417,7 +417,11 @@ fn write_table_catalogs(config: &TableCatalogConfig) -> Result<(), String> {
 fn run_sync_catalog(config: &SyncCatalogConfig) -> Result<(), String> {
     let catalog = read_syncable_catalog(&config.catalog)?;
     validate_catalog(&catalog)?;
-    validate_catalog_run_ids(&catalog, &config.run_id_prefix)?;
+    validate_catalog_run_ids(
+        &catalog,
+        &config.run_id_prefix,
+        &config.connections.target.database,
+    )?;
     ensure_progress_table(config)?;
     let mut state =
         CatalogRunState::new(catalog.clone(), MAX_CATALOG_CONCURRENCY, BTreeSet::new(), 0);
@@ -872,25 +876,29 @@ fn classify_run_statuses(
         .collect::<BTreeSet<_>>();
     let mut statuses = RunStatuses::default();
     for (run_id, table, run_spec_json, status, _error, lock_owner) in rows {
+        let expected_catalog_child = catalog_names.contains(table.as_str())
+            && run_id == deterministic_run_id(run_id_prefix, target_database, &table);
+        let active = lock_owner.is_some();
+        if !active && !(status == "complete" && expected_catalog_child) {
+            continue;
+        }
+
         let row = ActiveRunRow {
             run_id: run_id.clone(),
-            table: table.clone(),
+            table,
             run_spec_json: run_spec_json.clone(),
         };
         let (database, spec_table) = active_run_identity(&row)?;
-        if lock_owner.is_some() {
+        if active {
             statuses.external_active_count += 1;
             if database == target_database {
                 statuses.external_active.insert(spec_table.clone());
             }
         }
-        let expected = deterministic_run_id(run_id_prefix, &spec_table);
-        if database == target_database
-            && run_id == expected
-            && catalog_names.contains(spec_table.as_str())
-            && status == "complete"
-        {
-            if expected_specs.get(&spec_table) != Some(&run_spec_json) {
+        if status == "complete" && expected_catalog_child {
+            if database != target_database
+                || expected_specs.get(&spec_table) != Some(&run_spec_json)
+            {
                 return Err(format!(
                     "run id `{run_id}` already exists with a different immutable specification"
                 ));
@@ -926,7 +934,11 @@ fn catalog_table_sync_config(
         chunk_size: config.chunk_size,
         mode: table_sync::SyncMode::Apply,
         progress_table: config.progress_table.clone(),
-        run_id: deterministic_run_id(&config.run_id_prefix, &entry.name),
+        run_id: deterministic_run_id(
+            &config.run_id_prefix,
+            &config.connections.target.database,
+            &entry.name,
+        ),
         start_after: None,
         end_at: None,
         max_deletes: Some(0),
@@ -935,13 +947,29 @@ fn catalog_table_sync_config(
     }
 }
 
-fn deterministic_run_id(prefix: &str, table: &str) -> String {
-    format!("{prefix}-{table}")
+fn deterministic_run_id(prefix: &str, target_database: &str, table: &str) -> String {
+    let database = normalize_run_id_component(target_database);
+    format!("{prefix}-{database}-{table}")
 }
 
-fn validate_catalog_run_ids(catalog: &SyncableCatalog, prefix: &str) -> Result<(), String> {
+fn normalize_run_id_component(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => char::from(*byte).to_string(),
+            _ => format!("_{byte:02x}"),
+        })
+        .collect()
+}
+
+fn validate_catalog_run_ids(
+    catalog: &SyncableCatalog,
+    prefix: &str,
+    target_database: &str,
+) -> Result<(), String> {
     for entry in &catalog.tables {
-        let run_id = deterministic_run_id(prefix, &entry.name);
+        let run_id = deterministic_run_id(prefix, target_database, &entry.name);
         if run_id.len() > 128 {
             return Err(format!(
                 "generated run id for table `{}` is {} bytes; cdc.table_sync_runs.run_id allows at most 128",
@@ -1858,7 +1886,8 @@ mod tests {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
         };
-        let run_spec_json = active_run_row("batch-a", "a", "db").run_spec_json;
+        let run_id = deterministic_run_id("batch", "db", "a");
+        let run_spec_json = active_run_row(&run_id, "a", "db").run_spec_json;
         let expected_specs = BTreeMap::from([("a".to_string(), run_spec_json.clone())]);
         let statuses = classify_run_statuses(
             &catalog,
@@ -1866,7 +1895,7 @@ mod tests {
             "db",
             &expected_specs,
             vec![(
-                "batch-a".into(),
+                run_id,
                 "a".into(),
                 run_spec_json,
                 "complete".into(),
@@ -1939,7 +1968,8 @@ mod tests {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
         };
-        let run_spec_json = active_run_row("batch-a", "a", "db").run_spec_json;
+        let run_id = deterministic_run_id("batch", "db", "a");
+        let run_spec_json = active_run_row(&run_id, "a", "db").run_spec_json;
         let expected_specs = BTreeMap::from([("a".to_string(), "different".to_string())]);
         let error = classify_run_statuses(
             &catalog,
@@ -1947,7 +1977,7 @@ mod tests {
             "db",
             &expected_specs,
             vec![(
-                "batch-a".into(),
+                run_id,
                 "a".into(),
                 run_spec_json,
                 "complete".into(),
@@ -1965,7 +1995,6 @@ mod tests {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
         };
-        let run_spec_json = active_run_row("other-a", "a", "db").run_spec_json;
         let statuses = classify_run_statuses(
             &catalog,
             "batch",
@@ -1974,15 +2003,62 @@ mod tests {
             vec![(
                 "other-a".into(),
                 "a".into(),
-                run_spec_json,
+                "not json".into(),
                 "running".into(),
                 String::new(),
                 None,
             )],
         )
-        .expect("stale run");
+        .expect("stale malformed run is irrelevant");
         assert_eq!(statuses.external_active_count, 0);
         assert!(statuses.external_active.is_empty());
+    }
+
+    #[test]
+    fn stale_error_rows_without_advisory_locks_ignore_malformed_specs() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &[])],
+        };
+        let statuses = classify_run_statuses(
+            &catalog,
+            "batch",
+            "db",
+            &BTreeMap::new(),
+            vec![(
+                "other-a".into(),
+                "a".into(),
+                "not json".into(),
+                "error".into(),
+                "old failure".into(),
+                None,
+            )],
+        )
+        .expect("stale malformed error is irrelevant");
+        assert!(statuses.completed.is_empty());
+        assert_eq!(statuses.external_active_count, 0);
+    }
+
+    #[test]
+    fn malformed_locked_rows_fail_closed() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &[])],
+        };
+        let error = classify_run_statuses(
+            &catalog,
+            "batch",
+            "db",
+            &BTreeMap::new(),
+            vec![(
+                "active-a".into(),
+                "a".into(),
+                "not json".into(),
+                "running".into(),
+                String::new(),
+                Some(7),
+            )],
+        )
+        .expect_err("active malformed run must fail closed");
+        assert!(error.contains("malformed immutable specification"));
     }
 
     #[test]
@@ -2050,7 +2126,8 @@ mod tests {
         let catalog = SyncableCatalog {
             tables: vec![entry("items", 1, &[])],
         };
-        let error = validate_catalog_run_ids(&catalog, &prefix).expect_err("oversized run id");
+        let error =
+            validate_catalog_run_ids(&catalog, &prefix, "database").expect_err("oversized run id");
         assert!(error.contains("128"));
     }
 
@@ -2083,8 +2160,16 @@ mod tests {
         let second = serde_json::to_string_pretty(&catalog).expect("json");
         assert_eq!(first, second);
         assert_eq!(
-            deterministic_run_id("full-20260722", "a"),
-            "full-20260722-a"
+            deterministic_run_id("full-20260722", "globalcomix", "a"),
+            "full-20260722-globalcomix-a"
+        );
+        assert_ne!(
+            deterministic_run_id("full-20260722", "globalcomix", "a"),
+            deterministic_run_id("full-20260722", "external2_env", "a")
+        );
+        assert_eq!(
+            deterministic_run_id("full-20260722", "tenant/db", "a"),
+            "full-20260722-tenant_2fdb-a"
         );
     }
 
