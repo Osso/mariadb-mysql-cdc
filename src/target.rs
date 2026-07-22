@@ -4,6 +4,7 @@ use mysql::Value;
 use std::fmt;
 
 const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
+const MAX_UPDATE_ROWS_PER_STATEMENT: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlStatement {
@@ -866,7 +867,8 @@ fn max_update_rows_per_statement(primary_key_count: usize, changed_column_count:
         .saturating_mul(primary_key_count.saturating_add(1))
         .saturating_add(primary_key_count)
         .max(1);
-    (MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS / placeholders_per_row).max(1)
+    (MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS / placeholders_per_row)
+        .clamp(1, MAX_UPDATE_ROWS_PER_STATEMENT)
 }
 
 fn build_update_statement(
@@ -1076,6 +1078,21 @@ mod tests {
             executed[0].params,
             values(["1", "alpha", "2", "beta", "1", "2"])
         );
+    }
+
+    #[test]
+    fn caps_update_batch_size_for_bounded_execution_time() {
+        let executor = RecordingExecutor::default();
+        let writer = TargetMySqlWriter::new("accounts", vec!["id"], vec!["id", "name"], executor);
+        let rows = (1..=257)
+            .map(|id| row(&id.to_string(), "updated"))
+            .collect::<Vec<_>>();
+
+        writer
+            .update_rows(&rows.iter().collect::<Vec<_>>())
+            .expect("update rows");
+
+        assert_eq!(writer.executor.statements.borrow().len(), 2);
     }
 
     #[test]
