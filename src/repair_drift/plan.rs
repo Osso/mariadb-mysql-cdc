@@ -573,6 +573,8 @@ mod tests {
                 column_type: "bigint".to_string(),
                 data_type: "bigint".to_string(),
                 is_nullable: false,
+                character_set: None,
+                collation: None,
                 default_value: None,
                 extra: String::new(),
                 comment: String::new(),

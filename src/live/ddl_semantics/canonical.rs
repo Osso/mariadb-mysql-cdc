@@ -291,6 +291,8 @@ fn expected_create_table_post_state(
                     .unwrap_or_default()
                     .to_ascii_lowercase(),
                 is_nullable: column.nullable,
+                character_set: None,
+                collation: None,
                 default_value: None,
                 extra: String::new(),
                 comment: String::new(),
@@ -439,6 +441,8 @@ fn apply_add_column(
             column_type: column.column_type.clone(),
             data_type: column.data_type.clone(),
             is_nullable: column.nullable,
+            character_set: None,
+            collation: None,
             default_value: column.default_value.clone(),
             extra: String::new(),
             comment: column.comment.clone(),

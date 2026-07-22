@@ -20,6 +20,7 @@ pub use progress::{
 };
 pub use range::{sync_table_with_progress_range, sync_table_with_progress_range_phase};
 pub use recent::sync_recent_updates;
+pub(crate) use run::run_sync_table_reserved;
 pub use run::{run_sync_table, run_sync_table_phase, sync_table, sync_table_with_progress};
 pub(crate) use target::MySqlSyncRepairTarget;
 pub use target::SyncRepairTarget;

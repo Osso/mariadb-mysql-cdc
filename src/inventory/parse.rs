@@ -72,7 +72,7 @@ pub(crate) fn parse_table_row(fields: &[String]) -> Result<TableRow, InventoryEr
 }
 
 pub(crate) fn parse_column_row(fields: &[String]) -> Result<ColumnRow, InventoryError> {
-    require_len(fields, 10, "column")?;
+    require_len(fields, 12, "column")?;
 
     Ok(ColumnRow {
         table_name: fields[0].clone(),
@@ -81,10 +81,12 @@ pub(crate) fn parse_column_row(fields: &[String]) -> Result<ColumnRow, Inventory
         column_type: fields[3].clone(),
         data_type: fields[4].clone(),
         is_nullable: fields[5] == "YES",
-        column_default: optional_string(&fields[6]),
-        extra: fields[7].clone(),
-        column_comment: fields[8].clone(),
-        generation_expression: optional_string(&fields[9]),
+        character_set: optional_string(&fields[6]),
+        collation: optional_string(&fields[7]),
+        column_default: optional_string(&fields[8]),
+        extra: fields[9].clone(),
+        column_comment: fields[10].clone(),
+        generation_expression: optional_string(&fields[11]),
     })
 }
 

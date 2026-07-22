@@ -92,6 +92,8 @@ pub(crate) fn build_column(row: ColumnRow) -> ColumnInventory {
         column_type: row.column_type,
         data_type: row.data_type,
         is_nullable: row.is_nullable,
+        character_set: row.character_set,
+        collation: row.collation,
         default_value: row.column_default,
         extra: row.extra.clone(),
         comment: row.column_comment,

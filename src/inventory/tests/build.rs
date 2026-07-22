@@ -97,6 +97,8 @@ fn classifies_stored_generated_columns() {
         column_type: "int".to_string(),
         data_type: "int".to_string(),
         is_nullable: false,
+        character_set: None,
+        collation: None,
         column_default: None,
         extra: "STORED GENERATED".to_string(),
         column_comment: "copied balance".to_string(),

@@ -432,6 +432,8 @@ fn inventory_column(name: &str) -> crate::inventory::ColumnInventory {
         column_type: "varchar(64)".to_string(),
         data_type: "varchar".to_string(),
         is_nullable: false,
+        character_set: None,
+        collation: None,
         default_value: None,
         extra: String::new(),
         comment: String::new(),

@@ -33,6 +33,10 @@ pub struct ColumnInventory {
     pub column_type: String,
     pub data_type: String,
     pub is_nullable: bool,
+    #[serde(default)]
+    pub character_set: Option<String>,
+    #[serde(default)]
+    pub collation: Option<String>,
     pub default_value: Option<String>,
     pub extra: String,
     #[serde(default)]
@@ -209,6 +213,8 @@ pub struct ColumnRow {
     pub column_type: String,
     pub data_type: String,
     pub is_nullable: bool,
+    pub character_set: Option<String>,
+    pub collation: Option<String>,
     pub column_default: Option<String>,
     pub extra: String,
     pub column_comment: String,

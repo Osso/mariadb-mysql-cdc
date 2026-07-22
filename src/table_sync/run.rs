@@ -478,6 +478,21 @@ fn exact_guest_sync_config(
 }
 
 pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, TableSyncError> {
+    let _reservation =
+        crate::table_catalog::reserve_sync_worker(&config.target, &config.table.name)
+            .map_err(TableSyncError::Progress)?
+            .ok_or_else(|| {
+                TableSyncError::Progress(format!(
+                    "table sync capacity or table reservation unavailable for `{}`",
+                    config.table.name
+                ))
+            })?;
+    run_sync_table_reserved(config)
+}
+
+pub(crate) fn run_sync_table_reserved(
+    config: &SyncTableConfig,
+) -> Result<SyncTableReport, TableSyncError> {
     retry_sync_table_operation(
         config.mode,
         SYNC_CONNECTION_ATTEMPTS,
