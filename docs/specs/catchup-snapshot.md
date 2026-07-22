@@ -28,6 +28,10 @@ in [catchup.md](../catchup.md).
   rows.
 - [x] Use persistent source, target, and progress database connections during
   chunk copy work.
+- [x] Bound those persistent MySQL connections with a 10-second TCP connect
+  timeout, 30-second read/write timeouts, and TCP keepalive beginning after
+  10 seconds idle; on Linux, probes run every 5 seconds for 3 attempts with
+  a 30-second TCP user timeout.
 - [x] Split large target inserts so MySQL prepared statements stay under the
   placeholder limit.
 - [x] Create missing target tables from source DDL before row copy starts.

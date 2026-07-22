@@ -31,8 +31,10 @@ are resolved only after verified equality.
       prebootstrapped table with only `SELECT, INSERT, UPDATE` on that table;
       an absent table still follows the creation path and requires DDL grants.
 - [x] Keep `cdc.table_sync_progress` as catchup-only legacy state.
-- [x] Use bounded MySQL network timeouts: 10 seconds for TCP connect and 30 seconds
-      for reads and writes.
+- [x] Bound persistent source, target, and progress MySQL connections with a
+      10-second TCP connect timeout, 30-second read/write timeouts, and TCP
+      keepalive beginning after 10 seconds idle; on Linux, probes run every
+      5 seconds for 3 attempts with a 30-second TCP user timeout.
 - [x] In `missing-primary-keys` mode, retry transient connection failures up to
       five attempts total, resuming each retry from durable run progress.
 - [x] With `replace-divergent-pk`, repair only exact one-hop parent displacement
