@@ -377,16 +377,14 @@ impl SyncProgressStore for MySqlSyncRunProgressStore {
             build_sync_run_schema_query(&self.inner.target.database, &self.inner.table);
         let schema_inventory = self.inner.query(schema_query.clone())?;
         if sync_run_table_exists(&self.inner.table, &schema_inventory)? {
-            if legacy_sync_run_schema(&self.inner.table, &schema_inventory)? {
-                self.inner
-                    .execute(build_add_delete_preflight_complete_column_sql(
-                        &self.inner.target.database,
-                        &self.inner.table,
-                    ))?;
-                let migrated_inventory = self.inner.query(schema_query)?;
-                return require_sync_run_schema(&self.inner.table, &migrated_inventory);
-            }
-            return require_sync_run_schema(&self.inner.table, &schema_inventory);
+            let mut query_schema = || self.inner.query(schema_query.clone());
+            let mut execute_migration = |sql| self.inner.execute(sql);
+            return ensure_existing_sync_run_schema(
+                &self.inner.target.database,
+                &self.inner.table,
+                &mut query_schema,
+                &mut execute_migration,
+            );
         }
 
         if let Some(schema_sql) = build_create_progress_schema_sql(&self.inner.table) {
@@ -716,6 +714,37 @@ fn sync_run_table_exists(table: &str, output: &str) -> Result<bool, TableSyncErr
         count => Err(TableSyncError::Progress(format!(
             "progress table `{table}` schema inventory returned invalid table count `{count}`"
         ))),
+    }
+}
+
+fn ensure_existing_sync_run_schema<Q, E>(
+    default_schema: &str,
+    table: &str,
+    query_schema: &mut Q,
+    execute_migration: &mut E,
+) -> Result<(), TableSyncError>
+where
+    Q: FnMut() -> Result<String, TableSyncError>,
+    E: FnMut(String) -> Result<(), TableSyncError>,
+{
+    let schema_inventory = query_schema()?;
+    if !legacy_sync_run_schema(table, &schema_inventory)? {
+        return require_sync_run_schema(table, &schema_inventory);
+    }
+
+    let migration_result = execute_migration(build_add_delete_preflight_complete_column_sql(
+        default_schema,
+        table,
+    ));
+    let migrated_inventory = query_schema()?;
+    match require_sync_run_schema(table, &migrated_inventory) {
+        Ok(()) => Ok(()),
+        Err(schema_error) => match migration_result {
+            Ok(()) => Err(schema_error),
+            Err(migration_error) => Err(TableSyncError::Progress(format!(
+                "{migration_error}; schema after migration attempt is incompatible: {schema_error}"
+            ))),
+        },
     }
 }
 
@@ -1075,6 +1104,30 @@ mod tests {
         assert!(sql.contains("extra LIKE '%on update CURRENT_TIMESTAMP%'"));
         assert!(sql.contains("information_schema.statistics"));
         assert!(sql.contains("index_name = 'PRIMARY'"));
+    }
+
+    #[test]
+    fn concurrent_legacy_migration_accepts_schema_completed_by_other_connection() {
+        let mut inventories =
+            vec!["1\t15\t15\t1\t1".to_string(), "1\t16\t16\t1\t1".to_string()].into_iter();
+        let mut query = || {
+            inventories
+                .next()
+                .ok_or_else(|| TableSyncError::Progress("unexpected schema query".to_string()))
+        };
+        let mut execute = |_sql: String| {
+            Err(TableSyncError::Progress(
+                "duplicate column delete_preflight_complete".to_string(),
+            ))
+        };
+
+        ensure_existing_sync_run_schema(
+            "globalcomix",
+            "cdc.table_sync_runs",
+            &mut query,
+            &mut execute,
+        )
+        .expect("concurrent migration winner leaves compatible schema");
     }
 
     #[test]
