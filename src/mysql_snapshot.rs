@@ -416,6 +416,7 @@ fn save_mysql_snapshot_progress(
             inserts: table_progress.rows_copied,
             updates: 0,
             extra_target_rows: 0,
+            delete_preflight_complete: false,
             mode: SyncMode::Apply,
             status,
             last_error: None,

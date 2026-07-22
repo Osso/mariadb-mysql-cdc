@@ -309,6 +309,7 @@ fn recent_update_retry_restarts_from_beginning_to_catch_newly_eligible_rows() {
         inserts: 0,
         updates: 1,
         extra_target_rows: 0,
+        delete_preflight_complete: false,
         mode: SyncMode::Apply,
         status: progress::SyncProgressStatus::Running,
         last_error: None,

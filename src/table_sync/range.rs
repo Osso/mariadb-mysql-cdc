@@ -143,7 +143,11 @@ where
     R: SyncRepairTarget,
     P: SyncProgressStore,
 {
-    if matches!(context.phase, SyncPhase::All | SyncPhase::DeleteExtras) {
+    if matches!(context.phase, SyncPhase::All | SyncPhase::DeleteExtras)
+        && context.options.mode == SyncMode::Apply
+        && context.options.max_deletes.is_some()
+        && !context.progress.delete_preflight_complete
+    {
         preflight_delete_budget(
             DeletePreflightOptions {
                 table: context.table,
@@ -157,6 +161,8 @@ where
             context.source,
             context.target,
         )?;
+        context.progress.delete_preflight_complete = true;
+        context.progress_store.save(&context.progress)?;
     }
     run_range_chunks(&mut context)
 }

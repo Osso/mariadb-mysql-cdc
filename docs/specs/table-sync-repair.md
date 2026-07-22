@@ -15,7 +15,9 @@ are resolved only after verified equality.
       source chunk's update batch succeeds, leaving a failed chunk uncheckpointed
       for retry.
 - [x] Require explicit `--max-deletes` for apply-mode orphan deletion and preflight
-      the ceiling before mutation.
+      the ceiling before mutation. Persist successful preflight completion on the
+      immutable run row before repair starts, so reconnects skip the completed
+      scan; failed or incomplete preflights remain unmarked and rerun.
 - [x] Require `--run-id`; direct `sync-table` resumes only the exact interrupted
       run and rejects a completed ID. Apply-mode `repair-drift` InsertMissing may
       atomically claim one specification-identical failed missing-PK run within
@@ -25,12 +27,13 @@ are resolved only after verified equality.
       and ambiguity fails closed without reclaiming a run.
 - [x] Persist run-scoped progress in `cdc.table_sync_runs` by default and reject
       concurrent use of the same run ID with a target named lock.
-- [x] For an existing run-progress table, validate the full 15-column contract
-      and `run_id` primary key through `information_schema` without issuing
-      `CREATE` or `ALTER`; reject malformed existing tables without modifying
-      them. Least-privilege runtime use therefore requires an admin-
-      prebootstrapped table with only `SELECT, INSERT, UPDATE` on that table;
-      an absent table still follows the creation path and requires DDL grants.
+- [x] For an existing run-progress table, validate the full 16-column contract
+      and `run_id` primary key through `information_schema`. Migrate only the
+      exact legacy 15-column contract by adding `delete_preflight_complete`
+      with default false, preserving existing runs as requiring preflight;
+      reject malformed tables without modifying them. After migration,
+      least-privilege runtime use requires only `SELECT, INSERT, UPDATE` on the
+      prebootstrapped table; absent or legacy tables require DDL grants.
 - [x] Keep `cdc.table_sync_progress` as catchup-only legacy state.
 - [x] Keep shared MySQL TCP liveness bounds on persistent source, target, and
       progress connections: 10-second TCP connect timeout and TCP keepalive

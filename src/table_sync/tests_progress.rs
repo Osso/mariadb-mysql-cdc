@@ -2,6 +2,66 @@ use super::tests_support::*;
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::rc::Rc;
+
+struct SharedProgressStore {
+    progress: Rc<RefCell<Option<SyncTableProgress>>>,
+}
+
+impl SharedProgressStore {
+    fn new(progress: Rc<RefCell<Option<SyncTableProgress>>>) -> Self {
+        Self { progress }
+    }
+}
+
+impl SyncProgressStore for SharedProgressStore {
+    fn ensure(&mut self) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+
+    fn load(&self, _run_id: &str) -> Result<Option<SyncTableProgress>, TableSyncError> {
+        Ok(self.progress.borrow().clone())
+    }
+
+    fn save(&mut self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
+        self.progress.replace(Some(progress.clone()));
+        Ok(())
+    }
+
+    fn save_error(&mut self, _run_id: &str, error: &TableSyncError) -> Result<(), TableSyncError> {
+        let mut progress = self.progress.borrow().clone().expect("progress row");
+        progress.status = progress::SyncProgressStatus::Error;
+        progress.last_error = Some(error.to_string());
+        self.progress.replace(Some(progress));
+        Ok(())
+    }
+}
+
+struct FailOnReadReader {
+    reader: FakeReader,
+    fail_on_read: usize,
+}
+
+impl FailOnReadReader {
+    fn new(rows: Vec<crate::snapshot::SnapshotRow>, fail_on_read: usize) -> Self {
+        Self {
+            reader: FakeReader::new(rows),
+            fail_on_read,
+        }
+    }
+}
+
+impl SyncTableReader for FailOnReadReader {
+    fn read_rows(
+        &self,
+        request: &SyncChunkRequest,
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
+        if self.reader.requests.borrow().len() + 1 == self.fail_on_read {
+            return Err(TableSyncError::Read("repair connection lost".to_string()));
+        }
+        self.reader.read_rows(request)
+    }
+}
 
 struct ReclamationProgressStore {
     progress: RefCell<BTreeMap<String, SyncTableProgress>>,
@@ -243,6 +303,7 @@ fn failed_run_progress(
         inserts: 3,
         updates: 4,
         extra_target_rows: 5,
+        delete_preflight_complete: false,
         mode: SyncMode::MissingPrimaryKeys,
         status,
         last_error: Some("original failure".to_string()),
@@ -472,6 +533,7 @@ fn resumes_from_saved_table_progress_and_saves_each_chunk() {
         inserts: 0,
         updates: 0,
         extra_target_rows: 0,
+        delete_preflight_complete: false,
         mode: SyncMode::Apply,
         status: progress::SyncProgressStatus::Running,
         last_error: None,
@@ -502,6 +564,62 @@ fn resumes_from_saved_table_progress_and_saves_each_chunk() {
         saved.last().expect("saved progress").status,
         progress::SyncProgressStatus::Complete
     );
+}
+
+#[test]
+fn reconnect_skips_successful_delete_preflight_before_repair_resumes() {
+    let durable_progress = Rc::new(RefCell::new(None));
+    let source_rows = vec![row("1", "alpha")];
+    let first_source = FailOnReadReader::new(source_rows.clone(), 2);
+    let target = FakeReader::new(vec![row("1", "alpha")]);
+    let mut first_repair_target = RecordingRepairTarget::default();
+    let mut first_store = SharedProgressStore::new(Rc::clone(&durable_progress));
+    let first_error = sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "preflight-resume".to_string(),
+            run_scope: "preflight-resume-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &first_source,
+        &target,
+        &mut first_repair_target,
+        &mut first_store,
+    )
+    .expect_err("repair read fails after successful preflight");
+    assert_eq!(
+        first_error.to_string(),
+        "sync read failed: repair connection lost"
+    );
+
+    let resumed_source = FakeReader::new(source_rows);
+    let resumed_target = FakeReader::new(vec![row("1", "alpha")]);
+    let mut resumed_repair_target = RecordingRepairTarget::default();
+    let mut resumed_store = SharedProgressStore::new(durable_progress);
+
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "preflight-resume".to_string(),
+            run_scope: "preflight-resume-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &resumed_source,
+        &resumed_target,
+        &mut resumed_repair_target,
+        &mut resumed_store,
+    )
+    .expect("repair resumes after reconnect");
+
+    assert_eq!(resumed_source.requests.borrow().len(), 1);
 }
 
 #[test]
@@ -586,6 +704,7 @@ fn run_id_rejects_changed_immutable_specification() {
         inserts: 0,
         updates: 0,
         extra_target_rows: 0,
+        delete_preflight_complete: false,
         mode: SyncMode::Apply,
         status: progress::SyncProgressStatus::Running,
         last_error: None,
@@ -643,6 +762,7 @@ fn completed_run_id_is_terminal() {
         inserts: 10,
         updates: 20,
         extra_target_rows: 3,
+        delete_preflight_complete: false,
         mode: SyncMode::Apply,
         status: progress::SyncProgressStatus::Complete,
         last_error: None,

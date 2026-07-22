@@ -215,6 +215,7 @@ fn record_parallel_table_complete(
                 inserts: rows_copied,
                 updates: 0,
                 extra_target_rows: 0,
+                delete_preflight_complete: false,
                 mode: SyncMode::Apply,
                 status: SyncProgressStatus::Complete,
                 last_error: None,

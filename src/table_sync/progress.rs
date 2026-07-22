@@ -18,6 +18,7 @@ pub struct SyncTableProgress {
     pub inserts: u64,
     pub updates: u64,
     pub extra_target_rows: u64,
+    pub delete_preflight_complete: bool,
     pub mode: SyncMode,
     pub status: SyncProgressStatus,
     pub last_error: Option<String>,
@@ -376,6 +377,15 @@ impl SyncProgressStore for MySqlSyncRunProgressStore {
             build_sync_run_schema_query(&self.inner.target.database, &self.inner.table);
         let schema_inventory = self.inner.query(schema_query.clone())?;
         if sync_run_table_exists(&self.inner.table, &schema_inventory)? {
+            if legacy_sync_run_schema(&self.inner.table, &schema_inventory)? {
+                self.inner
+                    .execute(build_add_delete_preflight_complete_column_sql(
+                        &self.inner.target.database,
+                        &self.inner.table,
+                    ))?;
+                let migrated_inventory = self.inner.query(schema_query)?;
+                return require_sync_run_schema(&self.inner.table, &migrated_inventory);
+            }
             return require_sync_run_schema(&self.inner.table, &schema_inventory);
         }
 
@@ -433,6 +443,7 @@ impl SyncTableProgress {
             inserts: 0,
             updates: 0,
             extra_target_rows: 0,
+            delete_preflight_complete: false,
             mode,
             status: SyncProgressStatus::Running,
             last_error: None,
@@ -476,6 +487,8 @@ const CREATE_PROGRESS_TABLE_NAME_COLUMN: &str = "table_name VARCHAR(255) NOT NUL
 const CREATE_SYNC_RUN_TABLE_NAME_COLUMN: &str = "table_name VARCHAR(255) NOT NULL";
 const CREATE_RUN_ID_COLUMN: &str = "run_id VARCHAR(128) NOT NULL PRIMARY KEY";
 const CREATE_RUN_SPEC_COLUMN: &str = "run_spec_json LONGTEXT NOT NULL";
+const CREATE_DELETE_PREFLIGHT_COMPLETE_COLUMN: &str =
+    "delete_preflight_complete BOOLEAN NOT NULL DEFAULT FALSE";
 const CREATE_PROGRESS_TABLE_COLUMNS: &str = "last_primary_key_json TEXT NULL,\
 chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,\
 rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,\
@@ -567,6 +580,7 @@ fn parse_progress_row(
         inserts: parse_u64("inserts_applied", fields[4])?,
         updates: parse_u64("updates_applied", fields[5])?,
         extra_target_rows: parse_u64("extra_target_rows", fields[6])?,
+        delete_preflight_complete: false,
         mode: SyncMode::parse(fields[7])?,
         status: SyncProgressStatus::parse(fields[8])?,
         last_error: non_empty(fields[9]),
@@ -597,8 +611,26 @@ pub(crate) fn build_create_sync_run_table_sql(table: &str) -> String {
             CREATE_RUN_ID_COLUMN,
             CREATE_SYNC_RUN_TABLE_NAME_COLUMN,
             CREATE_RUN_SPEC_COLUMN,
+            CREATE_DELETE_PREFLIGHT_COMPLETE_COLUMN,
             CREATE_PROGRESS_TABLE_COLUMNS,
         ],
+    )
+}
+
+fn build_add_delete_preflight_complete_column_sql(
+    default_schema: &str,
+    progress_table: &str,
+) -> String {
+    let (schema, table) = qualified_table_parts(default_schema, progress_table);
+    let alter_table = format!(
+        "ALTER TABLE {} ADD COLUMN delete_preflight_complete BOOLEAN NOT NULL DEFAULT FALSE AFTER run_spec_json",
+        quote_identifier_path(progress_table)
+    );
+    format!(
+        "SET @cdc_delete_preflight_ddl = (SELECT IF(COUNT(*) = 0, {}, 'SELECT 1') FROM information_schema.columns WHERE table_schema = {} AND table_name = {} AND column_name = 'delete_preflight_complete'); PREPARE cdc_delete_preflight_stmt FROM @cdc_delete_preflight_ddl; EXECUTE cdc_delete_preflight_stmt; DEALLOCATE PREPARE cdc_delete_preflight_stmt",
+        quote_sql_literal(&alter_table),
+        quote_sql_literal(&schema),
+        quote_sql_literal(&table)
     )
 }
 
@@ -627,11 +659,13 @@ pub(crate) fn build_create_progress_schema_sql(table: &str) -> Option<String> {
     ))
 }
 
-const SYNC_RUN_COLUMN_COUNT: &str = "15";
+const LEGACY_SYNC_RUN_COLUMN_COUNT: &str = "15";
+const SYNC_RUN_COLUMN_COUNT: &str = "16";
 const SYNC_RUN_COLUMN_CONTRACTS: &[&str] = &[
     "(column_name='run_id' AND column_type='varchar(128)' AND is_nullable='NO')",
     "(column_name='table_name' AND column_type='varchar(255)' AND is_nullable='NO')",
     "(column_name='run_spec_json' AND column_type='longtext' AND is_nullable='NO')",
+    "(column_name='delete_preflight_complete' AND column_type='tinyint(1)' AND is_nullable='NO' AND column_default='0')",
     "(column_name='last_primary_key_json' AND column_type='text' AND is_nullable='YES')",
     "(column_name='chunks' AND column_type='bigint unsigned' AND is_nullable='NO')",
     "(column_name='rows_scanned' AND column_type='bigint unsigned' AND is_nullable='NO')",
@@ -683,6 +717,18 @@ fn sync_run_table_exists(table: &str, output: &str) -> Result<bool, TableSyncErr
             "progress table `{table}` schema inventory returned invalid table count `{count}`"
         ))),
     }
+}
+
+fn legacy_sync_run_schema(table: &str, output: &str) -> Result<bool, TableSyncError> {
+    let fields = parse_sync_run_schema_inventory(table, output)?;
+    Ok(fields
+        == [
+            "1",
+            LEGACY_SYNC_RUN_COLUMN_COUNT,
+            LEGACY_SYNC_RUN_COLUMN_COUNT,
+            "1",
+            "1",
+        ])
 }
 
 fn require_sync_run_schema(table: &str, output: &str) -> Result<(), TableSyncError> {
@@ -768,7 +814,7 @@ fn require_run_lock_release(run_id: &str, output: &str) -> Result<(), TableSyncE
 
 fn build_sync_run_select_sql(progress_table: &str, run_id: &str) -> String {
     format!(
-        "SELECT table_name, run_spec_json, COALESCE(last_primary_key_json, ''), chunks, rows_scanned, COALESCE(total_rows, ''), inserts_applied, updates_applied, extra_target_rows, mode, status, COALESCE(last_error, '') FROM {} WHERE run_id = {} LIMIT 1",
+        "SELECT table_name, run_spec_json, delete_preflight_complete, COALESCE(last_primary_key_json, ''), chunks, rows_scanned, COALESCE(total_rows, ''), inserts_applied, updates_applied, extra_target_rows, mode, status, COALESCE(last_error, '') FROM {} WHERE run_id = {} LIMIT 1",
         quote_identifier_path(progress_table),
         quote_sql_literal(run_id)
     )
@@ -788,11 +834,12 @@ pub(crate) fn build_sync_run_upsert_sql(
 ) -> String {
     let (run_id, run_spec_json, last_primary_key) = sync_run_upsert_identity(progress);
     format!(
-        "INSERT INTO {} (run_id,table_name,run_spec_json,last_primary_key_json,chunks,rows_scanned,total_rows,inserts_applied,updates_applied,extra_target_rows,mode,status,last_error) VALUES ({},{},{},{},{},{},{},{},{},{},{},{},NULL) ON DUPLICATE KEY UPDATE last_primary_key_json=VALUES(last_primary_key_json),chunks=VALUES(chunks),rows_scanned=VALUES(rows_scanned),total_rows=VALUES(total_rows),inserts_applied=VALUES(inserts_applied),updates_applied=VALUES(updates_applied),extra_target_rows=VALUES(extra_target_rows),status=VALUES(status),last_error=NULL",
+        "INSERT INTO {} (run_id,table_name,run_spec_json,delete_preflight_complete,last_primary_key_json,chunks,rows_scanned,total_rows,inserts_applied,updates_applied,extra_target_rows,mode,status,last_error) VALUES ({},{},{},{},{},{},{},{},{},{},{},{},{},NULL) ON DUPLICATE KEY UPDATE delete_preflight_complete=VALUES(delete_preflight_complete),last_primary_key_json=VALUES(last_primary_key_json),chunks=VALUES(chunks),rows_scanned=VALUES(rows_scanned),total_rows=VALUES(total_rows),inserts_applied=VALUES(inserts_applied),updates_applied=VALUES(updates_applied),extra_target_rows=VALUES(extra_target_rows),status=VALUES(status),last_error=NULL",
         quote_identifier_path(progress_table),
         quote_sql_literal(run_id),
         quote_sql_literal(&progress.table),
         quote_sql_literal(run_spec_json),
+        u8::from(progress.delete_preflight_complete),
         nullable_sql_literal(&last_primary_key),
         progress.chunks,
         progress.rows_scanned,
@@ -858,23 +905,24 @@ fn parse_sync_run_row(
     run_id: &str,
     output: &str,
 ) -> Result<Option<SyncTableProgress>, TableSyncError> {
-    let Some(fields) = parse_progress_fields(output, 12)? else {
+    let Some(fields) = parse_progress_fields(output, 13)? else {
         return Ok(None);
     };
     Ok(Some(SyncTableProgress {
         run_id: Some(run_id.to_string()),
         table: fields[0].to_string(),
         run_spec_json: Some(fields[1].to_string()),
-        last_primary_key: parse_primary_key_json(fields[2])?,
-        chunks: parse_u64("chunks", fields[3])?,
-        rows_scanned: parse_u64("rows_scanned", fields[4])?,
-        total_rows: parse_optional_u64("total_rows", fields[5])?,
-        inserts: parse_u64("inserts_applied", fields[6])?,
-        updates: parse_u64("updates_applied", fields[7])?,
-        extra_target_rows: parse_u64("extra_target_rows", fields[8])?,
-        mode: SyncMode::parse(fields[9])?,
-        status: SyncProgressStatus::parse(fields[10])?,
-        last_error: non_empty(fields[11]),
+        delete_preflight_complete: parse_bool("delete_preflight_complete", fields[2])?,
+        last_primary_key: parse_primary_key_json(fields[3])?,
+        chunks: parse_u64("chunks", fields[4])?,
+        rows_scanned: parse_u64("rows_scanned", fields[5])?,
+        total_rows: parse_optional_u64("total_rows", fields[6])?,
+        inserts: parse_u64("inserts_applied", fields[7])?,
+        updates: parse_u64("updates_applied", fields[8])?,
+        extra_target_rows: parse_u64("extra_target_rows", fields[9])?,
+        mode: SyncMode::parse(fields[10])?,
+        status: SyncProgressStatus::parse(fields[11])?,
+        last_error: non_empty(fields[12]),
     }))
 }
 
@@ -892,6 +940,14 @@ fn parse_u64(field: &str, value: &str) -> Result<u64, TableSyncError> {
     value
         .parse()
         .map_err(|_| TableSyncError::Progress(format!("{field} must be an integer")))
+}
+
+fn parse_bool(field: &str, value: &str) -> Result<bool, TableSyncError> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(TableSyncError::Progress(format!("{field} must be 0 or 1"))),
+    }
 }
 
 fn parse_optional_u64(field: &str, value: &str) -> Result<Option<u64>, TableSyncError> {
@@ -981,7 +1037,7 @@ mod tests {
         );
         assert_eq!(
             build_create_sync_run_table_sql("cdc.table_sync_runs"),
-            "CREATE TABLE IF NOT EXISTS `cdc`.`table_sync_runs` (run_id VARCHAR(128) NOT NULL PRIMARY KEY,table_name VARCHAR(255) NOT NULL,run_spec_json LONGTEXT NOT NULL,last_primary_key_json TEXT NULL,chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,total_rows BIGINT UNSIGNED NULL,inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,mode VARCHAR(16) NOT NULL,status VARCHAR(16) NOT NULL,last_error TEXT NULL,created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)"
+            "CREATE TABLE IF NOT EXISTS `cdc`.`table_sync_runs` (run_id VARCHAR(128) NOT NULL PRIMARY KEY,table_name VARCHAR(255) NOT NULL,run_spec_json LONGTEXT NOT NULL,delete_preflight_complete BOOLEAN NOT NULL DEFAULT FALSE,last_primary_key_json TEXT NULL,chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,total_rows BIGINT UNSIGNED NULL,inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,extra_target_rows BIGINT UNSIGNED NOT NULL DEFAULT 0,mode VARCHAR(16) NOT NULL,status VARCHAR(16) NOT NULL,last_error TEXT NULL,created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)"
         );
     }
 
@@ -992,6 +1048,17 @@ mod tests {
         assert!(sql.contains("information_schema.columns"));
         assert!(sql.contains("column_name = 'total_rows'"));
         assert!(sql.contains("ALTER TABLE `cdc`.`table_sync_progress` ADD COLUMN total_rows"));
+    }
+
+    #[test]
+    fn add_delete_preflight_column_sql_preserves_existing_runs_as_incomplete() {
+        let sql =
+            build_add_delete_preflight_complete_column_sql("globalcomix", "cdc.table_sync_runs");
+
+        assert!(sql.contains("column_name = 'delete_preflight_complete'"));
+        assert!(sql.contains(
+            "ALTER TABLE `cdc`.`table_sync_runs` ADD COLUMN delete_preflight_complete BOOLEAN NOT NULL DEFAULT FALSE"
+        ));
     }
 
     #[test]
@@ -1012,14 +1079,18 @@ mod tests {
 
     #[test]
     fn existing_run_table_requires_all_columns_and_run_id_primary_key() {
-        require_sync_run_schema("cdc.table_sync_runs", "1\t15\t15\t1\t1")
+        require_sync_run_schema("cdc.table_sync_runs", "1\t16\t16\t1\t1")
             .expect("complete run-scoped schema");
+        assert!(
+            legacy_sync_run_schema("cdc.table_sync_runs", "1\t15\t15\t1\t1")
+                .expect("legacy run-scoped schema")
+        );
 
         for malformed in [
             "1\t14\t14\t1\t1",
-            "1\t15\t14\t1\t1",
-            "1\t15\t15\t0\t0",
-            "1\t15\t15\t2\t1",
+            "1\t16\t15\t1\t1",
+            "1\t16\t16\t0\t0",
+            "1\t16\t16\t2\t1",
         ] {
             let error = require_sync_run_schema("cdc.table_sync_runs", malformed)
                 .expect_err("malformed existing table must fail");
@@ -1096,6 +1167,7 @@ mod tests {
             inserts: 3,
             updates: 4,
             extra_target_rows: 5,
+            delete_preflight_complete: true,
             mode: SyncMode::Apply,
             status: SyncProgressStatus::Running,
             last_error: None,
@@ -1107,7 +1179,8 @@ mod tests {
         assert!(sql.contains("'{\"table\":\"releases\"}'"));
         assert!(sql.contains("'releases'"));
         assert!(sql.contains("'[\"42\"]'"));
-        assert!(sql.contains("2,2000,5000,3,4,5"));
+        assert!(sql.contains("delete_preflight_complete"));
+        assert!(sql.contains("1,'[\"42\"]',2,2000,5000,3,4,5"));
         assert!(sql.contains("'apply','running'"));
     }
 
@@ -1122,7 +1195,7 @@ mod tests {
 
     #[test]
     fn parse_progress_row_restores_resume_state() {
-        let row = "releases\t{\"table\":\"releases\"}\t[\"42\"]\t2\t2000\t5000\t3\t4\t5\tapply\trunning\t";
+        let row = "releases\t{\"table\":\"releases\"}\t1\t[\"42\"]\t2\t2000\t5000\t3\t4\t5\tapply\trunning\t";
 
         let progress = parse_sync_run_row("repair-20260710-01", row)
             .expect("parse progress")
@@ -1141,6 +1214,7 @@ mod tests {
         assert_eq!(progress.inserts, 3);
         assert_eq!(progress.updates, 4);
         assert_eq!(progress.extra_target_rows, 5);
+        assert!(progress.delete_preflight_complete);
         assert_eq!(progress.mode, SyncMode::Apply);
         assert_eq!(progress.status, SyncProgressStatus::Running);
     }
