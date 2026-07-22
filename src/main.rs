@@ -19,6 +19,7 @@ pub mod statement;
 pub mod stream_checkpoint;
 mod sync_cli;
 mod sync_progress_cli;
+pub mod table_catalog;
 pub mod table_sync;
 pub mod target;
 pub mod validation;
@@ -35,6 +36,8 @@ Usage:
   mariadb-mysql-cdc catchup-progress --progress-file PATH
   mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS --run-id ID [options]
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
+  mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
+  mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -51,6 +54,10 @@ Commands:
           Compare one source/target table by primary-key chunks and optionally repair target gaps.
   sync-progress
           Print table sync progress, stream checkpoint, rates, and ETA when source counts are supplied.
+  table-catalog
+          Write deterministic syncable and non-syncable table catalogs ordered by estimated source rows.
+  sync-catalog
+          Apply a syncable table catalog with dependency ordering and four total sync slots.
   drift-check
           Read-only source/target COUNT(*) drift check for selected tables, or all source base tables when no --table is supplied.
   repair-drift
@@ -161,6 +168,8 @@ fn main() {
         Some("sync-progress") => {
             sync_progress_cli::run_sync_progress_command(args.collect(), USAGE)
         }
+        Some("table-catalog") => table_catalog::run_table_catalog_command(args.collect(), USAGE),
+        Some("sync-catalog") => table_catalog::run_sync_catalog_command(args.collect(), USAGE),
         Some("drift-check") => run_drift_check_command(args.collect()),
         Some("repair-drift") => repair_drift::run_repair_drift_command(args.collect(), USAGE),
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),

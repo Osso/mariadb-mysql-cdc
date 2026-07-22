@@ -163,6 +163,23 @@ cargo run -- sync-table --source-host 127.0.0.1 --source-user reader \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
   --table accounts --primary-key id --columns id,email,updated_at \
   --mode apply --run-id accounts-repair-20260710-01
+
+cargo run -- table-catalog \
+  --source-host 127.0.0.1 --source-user reader \
+  --source-password-env SOURCE_PASSWORD --source-database app \
+  --target-host 127.0.0.1 --target-user writer \
+  --target-password-env TARGET_PASSWORD --target-database app \
+  --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
+  --syncable-output syncable-tables.json \
+  --non-syncable-output full-dump-tables.json
+
+cargo run -- sync-catalog \
+  --source-host 127.0.0.1 --source-user reader \
+  --source-password-env SOURCE_PASSWORD --source-database app \
+  --target-host 127.0.0.1 --target-user writer \
+  --target-password-env TARGET_PASSWORD --target-database app \
+  --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
+  --catalog syncable-tables.json --run-id-prefix catalog-20260722
 ```
 
 ```bash
