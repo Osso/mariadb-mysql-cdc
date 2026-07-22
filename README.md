@@ -229,15 +229,17 @@ unique and lexicographically ordered, and reason arrays use enum declaration
 order. Compatibility requires matching table
 default character sets (derived from table collations) and exact per-column
 `CHARACTER_SET_NAME`/`COLLATION_NAME` values for corresponding writable columns;
-a mismatch is `incompatible_schema`.
+a mismatch is `incompatible_schema`. `table-catalog` rejects identical
+`--syncable-output` and `--non-syncable-output` paths before writing either file.
 
 `sync-catalog` reads only the syncable catalog and starts apply mode immediately;
 there is no dry-run/plan mode and `table-catalog` does not launch it. The command
 waits until all entries complete or a failure is returned. Each table uses run ID
 `<run-id-prefix>-<normalized-target-database>-<table>`; the database component
-preserves ASCII letters, digits, `_`, and `-`, and hex-escapes every other UTF-8
-byte. The prefix is required and non-empty, and every generated ID must be at
-most 128 bytes. Interrupted exact IDs resume; a matching `status='complete'` row
+preserves only ASCII letters and digits and encodes every other UTF-8 byte as
+`_xx`, including `_` and `-`. Thus `a b` becomes `a_20b`, while literal `a_20b`
+becomes `a_5f20b`. The prefix is required and non-empty, and every fully encoded
+generated ID must be at most 128 bytes. Interrupted exact IDs resume; a matching `status='complete'` row
 is terminal only when its immutable run specification exactly matches the current
 catalog child; a different stored specification fails closed instead of being
 treated as terminal. Direct `sync-table` and

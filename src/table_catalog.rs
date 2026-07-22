@@ -396,6 +396,7 @@ pub fn run_sync_catalog_command(args: Vec<String>, usage: &str) {
 }
 
 fn write_table_catalogs(config: &TableCatalogConfig) -> Result<(), String> {
+    validate_distinct_catalog_output_paths(&config.syncable_output, &config.non_syncable_output)?;
     let source = read_inventory_source(&config.connections.source)?;
     let target = read_inventory_target(&config.connections.target)?;
     let estimated_rows = read_estimated_rows(&config.connections.source)?;
@@ -958,7 +959,7 @@ fn normalize_run_id_component(value: &str) -> String {
         .as_bytes()
         .iter()
         .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => char::from(*byte).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => char::from(*byte).to_string(),
             _ => format!("_{byte:02x}"),
         })
         .collect()
@@ -1086,6 +1087,18 @@ fn writable_columns(table: &TableInventory) -> Vec<String> {
         .filter(|column| column.generated.is_none())
         .map(|column| column.name.clone())
         .collect()
+}
+
+fn validate_distinct_catalog_output_paths(
+    syncable_output: &Path,
+    non_syncable_output: &Path,
+) -> Result<(), String> {
+    if syncable_output == non_syncable_output {
+        return Err(
+            "--syncable-output and --non-syncable-output must be different paths".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn write_pretty_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -2172,6 +2185,51 @@ mod tests {
             deterministic_run_id("full-20260722", "tenant/db", "a"),
             "full-20260722-tenant_2fdb-a"
         );
+        assert_ne!(
+            deterministic_run_id("full-20260722", "a b", "items"),
+            deterministic_run_id("full-20260722", "a_20b", "items")
+        );
+        assert_eq!(
+            deterministic_run_id("full-20260722", "a_20b", "items"),
+            "full-20260722-a_5f20b-items"
+        );
+    }
+
+    #[test]
+    fn identical_catalog_output_paths_fail_before_writing() {
+        let path = std::env::temp_dir().join(format!(
+            "cdc-identical-catalog-output-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_file(&path);
+        let config = TableCatalogConfig {
+            connections: CatalogConnectionConfig {
+                source: mysql_snapshot::MySqlConnectionConfig {
+                    host: "unreachable-source".to_string(),
+                    port: 3306,
+                    user: "reader".to_string(),
+                    password: "secret".to_string(),
+                    database: "source".to_string(),
+                },
+                target: live::TargetMySqlConfig {
+                    host: "unreachable-target".to_string(),
+                    port: 25060,
+                    user: "writer".to_string(),
+                    password: "secret".to_string(),
+                    database: "target".to_string(),
+                    tls_ca_file: "/missing/ca.pem".to_string(),
+                    insert_conflict_policy: live::InsertConflictPolicy::Error,
+                },
+            },
+            syncable_output: path.clone(),
+            non_syncable_output: path.clone(),
+        };
+
+        let error = write_table_catalogs(&config).expect_err("identical output paths");
+
+        assert!(error.contains("must be different"), "{error}");
+        assert!(!path.exists(), "identical output path was created");
     }
 
     #[derive(Default)]

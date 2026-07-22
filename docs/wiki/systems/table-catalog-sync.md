@@ -9,7 +9,7 @@
 - a PK-backed syncable catalog ordered by estimated rows, then table name;
 - a non-syncable catalog with stable exclusion reasons for full-dump planning.
 
-Classification compares writable columns, generated-column support, character sets, collations, and local FK dependencies. Catalog generation is read-only and does not start repair or dump work.
+Classification compares writable columns, generated-column support, character sets, collations, and local FK dependencies. Catalog generation rejects identical syncable and non-syncable output paths before writing either file. It is otherwise read-only and does not start repair or dump work.
 
 ## Scheduling
 
@@ -17,7 +17,7 @@ Classification compares writable columns, generated-column support, character se
 
 Direct `sync-table` and catalog workers share four target-server slots. Admission is serialized, and each worker holds one server slot plus a database/table reservation. Reservation, admission, and slot lock preimages use separate internal domains from legacy run-ID locks. Existing run-ID lock hashing remains unchanged so active and legacy runs remain detectable.
 
-Each child uses `<run-id-prefix>-<normalized-target-database>-<table>`, applies with `max_deletes=0`, and persists progress in the configured run table. The database component preserves ASCII letters, digits, `_`, and `-` and hex-escapes every other UTF-8 byte. This prevents the same prefix/table pair from colliding across target databases. An interrupted child resumes only with the same immutable specification. An expected completed child is parsed and terminal only when its specification matches exactly. Stale unlocked running/error rows are ignored before spec parsing; malformed lock-active rows fail closed.
+Each child uses `<run-id-prefix>-<normalized-target-database>-<table>`, applies with `max_deletes=0`, and persists progress in the configured run table. The database component preserves only ASCII letters and digits and encodes every other UTF-8 byte as `_xx`, including `_` and `-`. For example, `a b` becomes `a_20b`, while literal `a_20b` becomes `a_5f20b`. The final encoded run ID must fit the 128-byte progress column. This prevents the same prefix/table pair from colliding across target databases. An interrupted child resumes only with the same immutable specification. An expected completed child is parsed and terminal only when its specification matches exactly. Stale unlocked running/error rows are ignored before spec parsing; malformed lock-active rows fail closed.
 
 ## Failure and recovery
 

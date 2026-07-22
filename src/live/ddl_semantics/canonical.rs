@@ -280,23 +280,31 @@ fn expected_create_table_post_state(
             .columns
             .iter()
             .enumerate()
-            .map(|(index, column)| crate::inventory::ColumnInventory {
-                name: column.name.clone(),
-                ordinal_position: (index + 1) as u32,
-                column_type: column.column_type.to_ascii_lowercase(),
-                data_type: column
+            .map(|(index, column)| {
+                let data_type = column
                     .column_type
                     .split('(')
                     .next()
                     .unwrap_or_default()
-                    .to_ascii_lowercase(),
-                is_nullable: column.nullable,
-                character_set: None,
-                collation: None,
-                default_value: None,
-                extra: String::new(),
-                comment: String::new(),
-                generated: None,
+                    .to_ascii_lowercase();
+                let (character_set, collation) = column_default_encoding(
+                    &data_type,
+                    &defaults.character_set,
+                    &defaults.collation,
+                );
+                crate::inventory::ColumnInventory {
+                    name: column.name.clone(),
+                    ordinal_position: (index + 1) as u32,
+                    column_type: column.column_type.to_ascii_lowercase(),
+                    data_type,
+                    is_nullable: column.nullable,
+                    character_set,
+                    collation,
+                    default_value: None,
+                    extra: String::new(),
+                    comment: String::new(),
+                    generated: None,
+                }
             })
             .collect(),
     };
@@ -433,6 +441,13 @@ fn apply_add_column(
             })?,
         None => table.columns.len(),
     };
+    let table_collation = table
+        .collation
+        .as_deref()
+        .ok_or_else(|| format!("ALTER TABLE target `{table_name}` has no default collation"))?;
+    let table_character_set = table_collation.split('_').next().unwrap_or(table_collation);
+    let (character_set, collation) =
+        column_default_encoding(&column.data_type, table_character_set, table_collation);
     table.columns.insert(
         insertion,
         crate::inventory::ColumnInventory {
@@ -441,8 +456,8 @@ fn apply_add_column(
             column_type: column.column_type.clone(),
             data_type: column.data_type.clone(),
             is_nullable: column.nullable,
-            character_set: None,
-            collation: None,
+            character_set,
+            collation,
             default_value: column.default_value.clone(),
             extra: String::new(),
             comment: column.comment.clone(),
@@ -453,6 +468,21 @@ fn apply_add_column(
         item.ordinal_position = (index + 1) as u32;
     }
     Ok(())
+}
+
+fn column_default_encoding(
+    data_type: &str,
+    character_set: &str,
+    collation: &str,
+) -> (Option<String>, Option<String>) {
+    if matches!(
+        data_type,
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set"
+    ) {
+        (Some(character_set.to_string()), Some(collation.to_string()))
+    } else {
+        (None, None)
+    }
 }
 
 fn apply_drop_column(

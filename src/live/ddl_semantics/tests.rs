@@ -537,6 +537,31 @@ fn target_inventory_must_be_stable_across_evidence_capture() {
 }
 
 #[test]
+fn add_varchar_column_expected_state_uses_table_default_encoding() {
+    let mut target = semantic_snapshot(7, Some(8));
+    target.inventory.tables[0].collation = Some("utf8mb4_unicode_ci".to_string());
+    target.inventory.tables[0].columns[1].character_set = Some("utf8mb4".to_string());
+    target.inventory.tables[0].columns[1].collation = Some("utf8mb4_unicode_ci".to_string());
+    let operation = parse_ddl_operation(
+        "ALTER TABLE accounts ADD COLUMN profile_slug VARCHAR(64) DEFAULT NULL AFTER handle",
+    )
+    .expect("alter");
+
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("table evidence");
+    let post: serde_json::Value =
+        serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
+    let profile_slug = post["definition"]["columns"]
+        .as_array()
+        .expect("columns")
+        .iter()
+        .find(|column| column["name"] == "profile_slug")
+        .expect("profile_slug column");
+
+    assert_eq!(profile_slug["character_set"], "utf8mb4");
+    assert_eq!(profile_slug["collation"], "utf8mb4_unicode_ci");
+}
+
+#[test]
 fn add_column_evidence_derives_post_state_without_live_source_snapshot() {
     let target = semantic_snapshot(7, Some(8));
     let operation = parse_ddl_operation(
@@ -1039,8 +1064,8 @@ fn fixture_create_table_expected_post_state_matches_observed_inventory_exactly()
                         column_type: "varchar(255)".to_string(),
                         data_type: "varchar".to_string(),
                         is_nullable: false,
-                        character_set: None,
-                        collation: None,
+                        character_set: Some("utf8mb4".to_string()),
+                        collation: Some("utf8mb4_unicode_ci".to_string()),
                         default_value: None,
                         extra: String::new(),
                         comment: String::new(),
@@ -1052,8 +1077,8 @@ fn fixture_create_table_expected_post_state_matches_observed_inventory_exactly()
                         column_type: "varchar(64)".to_string(),
                         data_type: "varchar".to_string(),
                         is_nullable: false,
-                        character_set: None,
-                        collation: None,
+                        character_set: Some("utf8mb4".to_string()),
+                        collation: Some("utf8mb4_unicode_ci".to_string()),
                         default_value: None,
                         extra: String::new(),
                         comment: String::new(),
