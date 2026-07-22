@@ -567,6 +567,187 @@ fn resumes_from_saved_table_progress_and_saves_each_chunk() {
 }
 
 #[test]
+fn mysql_progress_reconnect_persists_preflight_marker_and_skips_repeat_scan() {
+    let database = Rc::new(progress::TestProgressSqlDatabase::default());
+    let source_rows = vec![row("1", "alpha")];
+    let first_source = FailOnReadReader::new(source_rows.clone(), 2);
+    let target = FakeReader::new(vec![row("1", "alpha")]);
+    let mut first_repair_target = RecordingRepairTarget::default();
+    let mut first_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
+        Rc::clone(&database),
+        "cdc.table_sync_runs".to_string(),
+    );
+
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "mysql-preflight-resume".to_string(),
+            run_scope: "mysql-preflight-resume-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &first_source,
+        &target,
+        &mut first_repair_target,
+        &mut first_store,
+    )
+    .expect_err("repair read fails after successful preflight");
+
+    let resumed_source = FakeReader::new(source_rows);
+    let resumed_target = FakeReader::new(vec![row("1", "alpha")]);
+    let mut resumed_repair_target = RecordingRepairTarget::default();
+    let mut resumed_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
+        database,
+        "cdc.table_sync_runs".to_string(),
+    );
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "mysql-preflight-resume".to_string(),
+            run_scope: "mysql-preflight-resume-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &resumed_source,
+        &resumed_target,
+        &mut resumed_repair_target,
+        &mut resumed_store,
+    )
+    .expect("fresh MySQL progress store resumes after reconnect");
+
+    assert_eq!(resumed_source.requests.borrow().len(), 1);
+}
+
+#[test]
+fn mysql_progress_reconnect_retries_incomplete_preflight() {
+    let database = Rc::new(progress::TestProgressSqlDatabase::default());
+    let source_rows = vec![row("1", "alpha")];
+    let first_source = FailOnReadReader::new(source_rows.clone(), 1);
+    let target = FakeReader::new(vec![row("1", "alpha")]);
+    let mut first_repair_target = RecordingRepairTarget::default();
+    let mut first_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
+        Rc::clone(&database),
+        "cdc.table_sync_runs".to_string(),
+    );
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "mysql-incomplete-preflight".to_string(),
+            run_scope: "mysql-incomplete-preflight-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &first_source,
+        &target,
+        &mut first_repair_target,
+        &mut first_store,
+    )
+    .expect_err("preflight read fails before marker persistence");
+    assert_eq!(
+        database.stored_preflight_marker("mysql-incomplete-preflight"),
+        Some(false)
+    );
+
+    let resumed_source = FakeReader::new(source_rows);
+    let resumed_target = FakeReader::new(vec![row("1", "alpha")]);
+    let mut resumed_repair_target = RecordingRepairTarget::default();
+    let mut resumed_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
+        database,
+        "cdc.table_sync_runs".to_string(),
+    );
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "mysql-incomplete-preflight".to_string(),
+            run_scope: "mysql-incomplete-preflight-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &resumed_source,
+        &resumed_target,
+        &mut resumed_repair_target,
+        &mut resumed_store,
+    )
+    .expect("incomplete preflight is retried");
+
+    assert_eq!(resumed_source.requests.borrow().len(), 2);
+}
+
+#[test]
+fn mysql_progress_reconnect_retries_preflight_when_marker_save_fails() {
+    let database = Rc::new(progress::TestProgressSqlDatabase::default());
+    database.fail_next_completed_preflight_save();
+    let source_rows = vec![row("1", "alpha")];
+    let first_source = FakeReader::new(source_rows.clone());
+    let target = FakeReader::new(vec![row("1", "alpha")]);
+    let mut first_repair_target = RecordingRepairTarget::default();
+    let mut first_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
+        Rc::clone(&database),
+        "cdc.table_sync_runs".to_string(),
+    );
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "mysql-marker-save-failure".to_string(),
+            run_scope: "mysql-marker-save-failure-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &first_source,
+        &target,
+        &mut first_repair_target,
+        &mut first_store,
+    )
+    .expect_err("completed-preflight marker save fails");
+    assert_eq!(
+        database.stored_preflight_marker("mysql-marker-save-failure"),
+        Some(false)
+    );
+
+    let resumed_source = FakeReader::new(source_rows);
+    let resumed_target = FakeReader::new(vec![row("1", "alpha")]);
+    let mut resumed_repair_target = RecordingRepairTarget::default();
+    let mut resumed_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
+        database,
+        "cdc.table_sync_runs".to_string(),
+    );
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "mysql-marker-save-failure".to_string(),
+            run_scope: "mysql-marker-save-failure-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &resumed_source,
+        &resumed_target,
+        &mut resumed_repair_target,
+        &mut resumed_store,
+    )
+    .expect("failed marker save leaves preflight retryable");
+
+    assert_eq!(resumed_source.requests.borrow().len(), 2);
+}
+
+#[test]
 fn reconnect_skips_successful_delete_preflight_before_repair_resumes() {
     let durable_progress = Rc::new(RefCell::new(None));
     let source_rows = vec![row("1", "alpha")];
