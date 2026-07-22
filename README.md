@@ -216,8 +216,11 @@ exactly `name`, `estimated_source_rows`, and `reasons`:
 ```
 
 Reason codes are `missing_primary_key`, `missing_target_table`,
-`incompatible_schema`, `unsupported_generated_columns`, and
-`dependency_on_non_syncable`. Entries may carry multiple reasons: dependency
+`incompatible_schema`, `unsupported_generated_columns`,
+`cross_schema_dependency`, and `dependency_on_non_syncable`. A source table
+whose FK references another schema receives `cross_schema_dependency`; a
+same-named table in the source schema does not satisfy that dependency. Entries
+may carry multiple reasons: dependency
 propagation preserves existing exclusion reasons and adds
 `dependency_on_non_syncable` transitively to every affected descendant. Catalog
 arrays are ordered by estimated source rows, then table name; primary-key and
@@ -239,16 +242,20 @@ fails closed instead of being treated as terminal. Direct `sync-table` and
 `sync-catalog` workers share one admission lock and four slot reservations keyed
 by the lower-cased target host plus port, so databases on the same host and port
 share capacity. Each worker also holds a database/table-specific reservation,
-preventing same-table overlap. For legacy progress rows, the table identity is
+preventing same-table overlap. These admission and slot locks are scoped to the
+target server host and port. Legacy run-lock accounting and same-table detection
+inspect only the configured progress table. Within that table, identity is
 derived from the immutable run specification's `scope.target_database` and
 `table.name`, not from `table_name` alone, so same-named tables in different target
-databases remain distinct. A held legacy run-ID advisory lock for the requested
-same database/table excludes that table even without a table reservation.
-Progress-table rows in `running`, `complete`, or `error` with a held legacy
-run-ID advisory lock but no table reservation count toward the same four-worker
-limit, including rows for tables outside the supplied catalog; stale or unlocked
-rows do not. Malformed active immutable specifications fail closed before
-reservation. Children start only after all listed FK parents complete. Missing
+databases remain distinct and cannot satisfy each other's dependencies. A held
+legacy run-ID advisory lock for the requested same database/table excludes that
+table even without a table reservation. Rows in `running`, `complete`, or
+`error` with a held legacy run-ID advisory lock but no table reservation count
+toward the same four-worker limit, including rows for tables outside the supplied
+catalog; stale or unlocked rows do not. Malformed active immutable specifications
+fail closed before reservation. Reservation sessions set MySQL `wait_timeout` to
+86,400 seconds so an idle lock connection can span long table runs; this does not
+provide recovery from network disconnects. Children start only after all listed FK parents complete. Missing
 dependencies are rejected before workers start; owned failures return after owned
 work settles, and dependency cycles fail closed without waiting for unrelated
 external syncs. Each catalog child forces `max_deletes=0`; the

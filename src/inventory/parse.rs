@@ -124,14 +124,15 @@ pub(crate) fn parse_index_row(fields: &[String]) -> Result<IndexRow, InventoryEr
 }
 
 pub(crate) fn parse_foreign_key_row(fields: &[String]) -> Result<ForeignKeyRow, InventoryError> {
-    require_len(fields, 6, "foreign key")?;
+    require_len(fields, 7, "foreign key")?;
     Ok(ForeignKeyRow {
         table_name: fields[0].clone(),
         constraint_name: fields[1].clone(),
         column_name: fields[2].clone(),
         sequence: parse_u32(&fields[3], "foreign key sequence")?,
-        referenced_table: fields[4].clone(),
-        referenced_column: fields[5].clone(),
+        referenced_schema: fields[4].clone(),
+        referenced_table: fields[5].clone(),
+        referenced_column: fields[6].clone(),
     })
 }
 

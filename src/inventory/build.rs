@@ -150,6 +150,10 @@ pub(crate) fn build_foreign_keys(rows: Vec<ForeignKeyRow>) -> Vec<ForeignKeyInve
         .into_iter()
         .map(|((table, name), mut rows)| {
             rows.sort_by_key(|row| row.sequence);
+            let referenced_schema = rows
+                .first()
+                .map(|row| row.referenced_schema.clone())
+                .unwrap_or_default();
             let referenced_table = rows
                 .first()
                 .map(|row| row.referenced_table.clone())
@@ -158,6 +162,7 @@ pub(crate) fn build_foreign_keys(rows: Vec<ForeignKeyRow>) -> Vec<ForeignKeyInve
                 table,
                 name,
                 columns: rows.iter().map(|row| row.column_name.clone()).collect(),
+                referenced_schema,
                 referenced_table,
                 referenced_columns: rows.into_iter().map(|row| row.referenced_column).collect(),
             }

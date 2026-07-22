@@ -34,11 +34,29 @@ fn builds_information_schema_queries_with_quoted_schema() {
     assert!(triggers_query(schema).contains(&format!("TRIGGER_SCHEMA = {quoted}")));
     assert!(routines_query(schema).contains(&format!("ROUTINE_SCHEMA = {quoted}")));
     assert!(events_query(schema).contains(&format!("EVENT_SCHEMA = {quoted}")));
+    assert!(foreign_keys_query(schema).contains("REFERENCED_TABLE_SCHEMA"));
     let foreign_keys = canonical_foreign_keys_query(schema);
     assert!(foreign_keys.contains("REFERENTIAL_CONSTRAINTS"));
     assert!(foreign_keys.contains("UPDATE_RULE"));
     assert!(foreign_keys.contains("DELETE_RULE"));
     assert!(foreign_keys.contains("ORDINAL_POSITION"));
+}
+
+#[test]
+fn parses_foreign_key_parent_schema() {
+    let parsed = parse_foreign_key_row(&[
+        "children".to_string(),
+        "child_parent_fk".to_string(),
+        "parent_id".to_string(),
+        "1".to_string(),
+        "shared".to_string(),
+        "parents".to_string(),
+        "id".to_string(),
+    ])
+    .expect("foreign-key row");
+
+    assert_eq!(parsed.referenced_schema, "shared");
+    assert_eq!(parsed.referenced_table, "parents");
 }
 
 #[test]

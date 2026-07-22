@@ -78,6 +78,7 @@ pub struct ForeignKeyInventory {
     pub table: String,
     pub name: String,
     pub columns: Vec<String>,
+    pub referenced_schema: String,
     pub referenced_table: String,
     pub referenced_columns: Vec<String>,
 }
@@ -248,6 +249,7 @@ pub struct ForeignKeyRow {
     pub constraint_name: String,
     pub column_name: String,
     pub sequence: u32,
+    pub referenced_schema: String,
     pub referenced_table: String,
     pub referenced_column: String,
 }

@@ -485,6 +485,7 @@ fn drop_index_with_fk_dependency_or_incomplete_metadata_is_manual() {
         table: "accounts".to_string(),
         name: "accounts_fk".to_string(),
         columns: vec!["handle".to_string()],
+        referenced_schema: "fixture_cdc".to_string(),
         referenced_table: "users".to_string(),
         referenced_columns: vec!["id".to_string()],
     }];

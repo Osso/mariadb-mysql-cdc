@@ -1,6 +1,8 @@
 use super::fixtures::*;
-use crate::inventory::build::{build_column, build_inventory, group_primary_keys};
-use crate::inventory::{ColumnRow, GeneratedColumn, PrimaryKeyRow, TableRow};
+use crate::inventory::build::{
+    build_column, build_foreign_keys, build_inventory, group_primary_keys,
+};
+use crate::inventory::{ColumnRow, ForeignKeyRow, GeneratedColumn, PrimaryKeyRow, TableRow};
 
 #[test]
 fn builds_inventory_with_primary_keys_and_generated_columns() {
@@ -86,6 +88,22 @@ fn orders_composite_primary_keys_by_ordinal_position() {
     ]);
 
     assert_eq!(keys["edges"], vec!["left_id", "right_id"]);
+}
+
+#[test]
+fn preserves_referenced_schema_in_foreign_key_inventory() {
+    let foreign_keys = build_foreign_keys(vec![ForeignKeyRow {
+        table_name: "children".to_string(),
+        constraint_name: "child_parent_fk".to_string(),
+        column_name: "parent_id".to_string(),
+        sequence: 1,
+        referenced_schema: "shared".to_string(),
+        referenced_table: "parents".to_string(),
+        referenced_column: "id".to_string(),
+    }]);
+
+    assert_eq!(foreign_keys[0].referenced_schema, "shared");
+    assert_eq!(foreign_keys[0].referenced_table, "parents");
 }
 
 #[test]

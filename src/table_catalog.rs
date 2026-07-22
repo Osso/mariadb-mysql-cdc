@@ -17,6 +17,7 @@ use std::time::Duration;
 const MAX_CATALOG_CONCURRENCY: usize = 4;
 const DEFAULT_CHUNK_SIZE: usize = 10_000;
 const DB_TIMEOUT: Duration = Duration::from_secs(30);
+const RESERVATION_SESSION_WAIT_TIMEOUT_SECONDS: u64 = 86_400;
 
 #[derive(Clone, Debug)]
 pub struct CatalogConnectionConfig {
@@ -66,6 +67,7 @@ pub enum NonSyncableReason {
     MissingTargetTable,
     IncompatibleSchema,
     UnsupportedGeneratedColumns,
+    CrossSchemaDependency,
     DependencyOnNonSyncable,
 }
 
@@ -238,10 +240,15 @@ fn classify_source_tables(
         .iter()
         .filter(|table| table.table_type == "BASE TABLE")
     {
-        let reasons = exclusion_reasons(
+        let mut reasons = exclusion_reasons(
             source_table,
             target_tables.get(source_table.name.as_str()).copied(),
         );
+        if source.foreign_keys.iter().any(|foreign_key| {
+            foreign_key.table == source_table.name && foreign_key.referenced_schema != source.schema
+        }) {
+            reasons.insert(NonSyncableReason::CrossSchemaDependency);
+        }
         if reasons.is_empty() {
             candidates.insert(
                 source_table.name.clone(),
@@ -295,7 +302,9 @@ fn syncable_entry(
             .foreign_keys
             .iter()
             .filter(|foreign_key| {
-                foreign_key.table == table.name && foreign_key.referenced_table != table.name
+                foreign_key.table == table.name
+                    && foreign_key.referenced_schema == inventory.schema
+                    && foreign_key.referenced_table != table.name
             })
             .map(|foreign_key| foreign_key.referenced_table.clone())
             .collect::<BTreeSet<_>>()
@@ -312,7 +321,10 @@ fn propagate_non_syncable_dependencies(
     let dependencies = inventory
         .foreign_keys
         .iter()
-        .filter(|foreign_key| foreign_key.table != foreign_key.referenced_table)
+        .filter(|foreign_key| {
+            foreign_key.referenced_schema == inventory.schema
+                && foreign_key.table != foreign_key.referenced_table
+        })
         .fold(
             BTreeMap::<String, BTreeSet<String>>::new(),
             |mut result, foreign_key| {
@@ -629,6 +641,7 @@ fn reserve_sync_worker_with_active_count(
         return Ok(None);
     }
     let mut connection = target_connection(target)?;
+    configure_reservation_session(&mut connection)?;
     let server_namespace = sync_server_lock_namespace(&target.host, target.port);
     let admission_lock = catalog_admission_lock_name(&server_namespace);
     if !acquire_named_lock(&mut connection, &admission_lock)? {
@@ -821,7 +834,13 @@ fn read_run_statuses(
         .query::<(String, String, String, String, String, Option<u64>), _>(sql)
         .map_err(|error| format!("failed to read catalog run status: {error}"))?;
     let expected_specs = expected_catalog_run_specs(config, catalog)?;
-    classify_run_statuses(catalog, &config.run_id_prefix, &expected_specs, rows)
+    classify_run_statuses(
+        catalog,
+        &config.run_id_prefix,
+        &config.connections.target.database,
+        &expected_specs,
+        rows,
+    )
 }
 
 fn expected_catalog_run_specs(
@@ -843,6 +862,7 @@ fn expected_catalog_run_specs(
 fn classify_run_statuses(
     catalog: &SyncableCatalog,
     run_id_prefix: &str,
+    target_database: &str,
     expected_specs: &BTreeMap<String, String>,
     rows: Vec<(String, String, String, String, String, Option<u64>)>,
 ) -> Result<RunStatuses, String> {
@@ -853,18 +873,30 @@ fn classify_run_statuses(
         .collect::<BTreeSet<_>>();
     let mut statuses = RunStatuses::default();
     for (run_id, table, run_spec_json, status, _error, lock_owner) in rows {
+        let row = ActiveRunRow {
+            run_id: run_id.clone(),
+            table: table.clone(),
+            run_spec_json: run_spec_json.clone(),
+        };
+        let (database, spec_table) = active_run_identity(&row)?;
         if lock_owner.is_some() {
             statuses.external_active_count += 1;
-            statuses.external_active.insert(table.clone());
+            if database == target_database {
+                statuses.external_active.insert(spec_table.clone());
+            }
         }
-        let expected = deterministic_run_id(run_id_prefix, &table);
-        if run_id == expected && catalog_names.contains(table.as_str()) && status == "complete" {
-            if expected_specs.get(&table) != Some(&run_spec_json) {
+        let expected = deterministic_run_id(run_id_prefix, &spec_table);
+        if database == target_database
+            && run_id == expected
+            && catalog_names.contains(spec_table.as_str())
+            && status == "complete"
+        {
+            if expected_specs.get(&spec_table) != Some(&run_spec_json) {
                 return Err(format!(
                     "run id `{run_id}` already exists with a different immutable specification"
                 ));
             }
-            statuses.completed.push(table);
+            statuses.completed.push(spec_table);
         }
     }
     Ok(statuses)
@@ -1088,6 +1120,25 @@ fn source_connection(config: &mysql_snapshot::MySqlConnectionConfig) -> Result<C
             .write_timeout(Some(DB_TIMEOUT)),
     );
     Conn::new(opts).map_err(|error| format!("source connection failed: {error}"))
+}
+
+trait ReservationSession {
+    fn execute_session_setup(&mut self, sql: &str) -> Result<(), String>;
+}
+
+impl ReservationSession for Conn {
+    fn execute_session_setup(&mut self, sql: &str) -> Result<(), String> {
+        self.query_drop(sql)
+            .map_err(|error| format!("failed to configure reservation session: {error}"))
+    }
+}
+
+fn reservation_session_setup_sql() -> String {
+    format!("SET SESSION wait_timeout = {RESERVATION_SESSION_WAIT_TIMEOUT_SECONDS}")
+}
+
+fn configure_reservation_session(connection: &mut impl ReservationSession) -> Result<(), String> {
+    connection.execute_session_setup(&reservation_session_setup_sql())
 }
 
 fn target_connection(config: &live::TargetMySqlConfig) -> Result<Conn, String> {
@@ -1575,6 +1626,89 @@ mod tests {
     }
 
     #[test]
+    fn cross_schema_parent_excludes_child_when_local_parent_is_absent() {
+        let source = inventory(
+            vec![table(
+                "child",
+                vec![column("id"), column("parent_id")],
+                vec!["id"],
+            )],
+            vec![foreign_key_in_schema("child", "parent", "shared")],
+        );
+        let target = inventory(
+            vec![table(
+                "child",
+                vec![column("id"), column("parent_id")],
+                vec!["id"],
+            )],
+            vec![],
+        );
+
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+
+        assert_eq!(
+            catalogs.non_syncable[0].reasons,
+            vec![NonSyncableReason::CrossSchemaDependency]
+        );
+    }
+
+    #[test]
+    fn same_named_local_parent_does_not_satisfy_cross_schema_dependency() {
+        let source = inventory(
+            vec![
+                table("child", vec![column("id"), column("parent_id")], vec!["id"]),
+                table("parent", vec![column("id")], vec!["id"]),
+            ],
+            vec![foreign_key_in_schema("child", "parent", "shared")],
+        );
+        let target = source.clone();
+
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+        let child = catalogs
+            .non_syncable
+            .iter()
+            .find(|entry| entry.name == "child")
+            .expect("cross-schema child");
+
+        assert_eq!(
+            child.reasons,
+            vec![NonSyncableReason::CrossSchemaDependency]
+        );
+        assert!(catalogs.syncable.iter().any(|entry| entry.name == "parent"));
+    }
+
+    #[test]
+    fn cross_schema_exclusion_propagates_to_local_descendants() {
+        let source = inventory(
+            vec![
+                table("child", vec![column("id"), column("parent_id")], vec!["id"]),
+                table(
+                    "grandchild",
+                    vec![column("id"), column("child_id")],
+                    vec!["id"],
+                ),
+            ],
+            vec![
+                foreign_key_in_schema("child", "parent", "shared"),
+                foreign_key("grandchild", "child"),
+            ],
+        );
+        let target = inventory(source.tables.clone(), vec![]);
+
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+        let grandchild = catalogs
+            .non_syncable
+            .iter()
+            .find(|entry| entry.name == "grandchild")
+            .expect("dependent grandchild");
+
+        assert_eq!(
+            grandchild.reasons,
+            vec![NonSyncableReason::DependencyOnNonSyncable]
+        );
+    }
+
+    #[test]
     fn self_referencing_fk_does_not_block_table_start() {
         let source = inventory(
             vec![table(
@@ -1684,14 +1818,16 @@ mod tests {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
         };
+        let run_spec_json = active_run_row("batch-a", "a", "db").run_spec_json;
         let statuses = classify_run_statuses(
             &catalog,
             "batch",
+            "db",
             &BTreeMap::new(),
             vec![(
                 "batch-a".into(),
                 "a".into(),
-                "spec".into(),
+                run_spec_json,
                 "error".into(),
                 "temporary".into(),
                 Some(7),
@@ -1707,15 +1843,17 @@ mod tests {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
         };
-        let expected_specs = BTreeMap::from([("a".to_string(), "expected".to_string())]);
+        let run_spec_json = active_run_row("batch-a", "a", "db").run_spec_json;
+        let expected_specs = BTreeMap::from([("a".to_string(), run_spec_json.clone())]);
         let statuses = classify_run_statuses(
             &catalog,
             "batch",
+            "db",
             &expected_specs,
             vec![(
                 "batch-a".into(),
                 "a".into(),
-                "expected".into(),
+                run_spec_json,
                 "complete".into(),
                 String::new(),
                 None,
@@ -1726,19 +1864,77 @@ mod tests {
     }
 
     #[test]
-    fn complete_catalog_child_with_changed_spec_fails_closed() {
+    fn same_table_in_another_database_neither_blocks_nor_completes_catalog_entry() {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
         };
         let expected_specs = BTreeMap::from([("a".to_string(), "expected".to_string())]);
-        let error = classify_run_statuses(
+        let other_database_spec = active_run_row("batch-a", "a", "other_database").run_spec_json;
+        let statuses = classify_run_statuses(
             &catalog,
             "batch",
+            "catalog_database",
             &expected_specs,
             vec![(
                 "batch-a".into(),
                 "a".into(),
-                "stale".into(),
+                other_database_spec,
+                "complete".into(),
+                String::new(),
+                Some(7),
+            )],
+        )
+        .expect("cross-database status");
+
+        assert!(statuses.external_active.is_empty());
+        assert!(statuses.completed.is_empty());
+        assert_eq!(statuses.external_active_count, 1);
+    }
+
+    #[test]
+    fn same_table_error_in_another_database_does_not_block_dependency() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("parent", 1, &[]), entry("child", 2, &["parent"])],
+        };
+        let expected_specs = BTreeMap::new();
+        let other_database_spec =
+            active_run_row("batch-parent", "parent", "other_database").run_spec_json;
+        let statuses = classify_run_statuses(
+            &catalog,
+            "batch",
+            "catalog_database",
+            &expected_specs,
+            vec![(
+                "batch-parent".into(),
+                "parent".into(),
+                other_database_spec,
+                "error".into(),
+                "boom".into(),
+                None,
+            )],
+        )
+        .expect("cross-database error");
+
+        assert!(statuses.completed.is_empty());
+        assert!(statuses.external_active.is_empty());
+    }
+
+    #[test]
+    fn complete_catalog_child_with_changed_spec_fails_closed() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &[])],
+        };
+        let run_spec_json = active_run_row("batch-a", "a", "db").run_spec_json;
+        let expected_specs = BTreeMap::from([("a".to_string(), "different".to_string())]);
+        let error = classify_run_statuses(
+            &catalog,
+            "batch",
+            "db",
+            &expected_specs,
+            vec![(
+                "batch-a".into(),
+                "a".into(),
+                run_spec_json,
                 "complete".into(),
                 String::new(),
                 None,
@@ -1754,14 +1950,16 @@ mod tests {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
         };
+        let run_spec_json = active_run_row("other-a", "a", "db").run_spec_json;
         let statuses = classify_run_statuses(
             &catalog,
             "batch",
+            "db",
             &BTreeMap::new(),
             vec![(
                 "other-a".into(),
                 "a".into(),
-                "spec".into(),
+                run_spec_json,
                 "running".into(),
                 String::new(),
                 None,
@@ -1821,6 +2019,26 @@ mod tests {
         };
         let error = validate_catalog_run_ids(&catalog, &prefix).expect_err("oversized run id");
         assert!(error.contains("128"));
+    }
+
+    #[test]
+    fn reservation_connection_sets_long_session_idle_timeout() {
+        #[derive(Default)]
+        struct RecordingSession {
+            statements: Vec<String>,
+        }
+
+        impl ReservationSession for RecordingSession {
+            fn execute_session_setup(&mut self, sql: &str) -> Result<(), String> {
+                self.statements.push(sql.to_string());
+                Ok(())
+            }
+        }
+
+        let mut session = RecordingSession::default();
+        configure_reservation_session(&mut session).expect("reservation session setup");
+
+        assert_eq!(session.statements, vec!["SET SESSION wait_timeout = 86400"]);
     }
 
     #[test]
@@ -1942,10 +2160,19 @@ mod tests {
         }
     }
     fn foreign_key(table: &str, parent: &str) -> ForeignKeyInventory {
+        foreign_key_in_schema(table, parent, "db")
+    }
+
+    fn foreign_key_in_schema(
+        table: &str,
+        parent: &str,
+        referenced_schema: &str,
+    ) -> ForeignKeyInventory {
         ForeignKeyInventory {
             table: table.into(),
             name: format!("fk_{table}_{parent}"),
             columns: vec!["parent_id".into()],
+            referenced_schema: referenced_schema.into(),
             referenced_table: parent.into(),
             referenced_columns: vec!["id".into()],
         }
