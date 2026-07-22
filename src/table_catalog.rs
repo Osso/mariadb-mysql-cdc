@@ -144,6 +144,7 @@ impl CatalogRunState {
 
     pub fn mark_completed(&mut self, table: &str) {
         self.running.remove(table);
+        self.failures.remove(table);
         self.completed.insert(table.to_string());
     }
 
@@ -277,7 +278,9 @@ fn syncable_entry(
         parent_dependencies: inventory
             .foreign_keys
             .iter()
-            .filter(|foreign_key| foreign_key.table == table.name)
+            .filter(|foreign_key| {
+                foreign_key.table == table.name && foreign_key.referenced_table != table.name
+            })
             .map(|foreign_key| foreign_key.referenced_table.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -383,13 +386,13 @@ fn run_sync_catalog(config: &SyncCatalogConfig) -> Result<(), String> {
     loop {
         refresh_run_state(config, &catalog, &receiver, &mut state)?;
         let failures = state.all_failures();
-        if !failures.is_empty() && state.running.is_empty() {
+        if !failures.is_empty() && state.running.is_empty() && state.ready_tables().is_empty() {
             return Err(format_catalog_failures(&failures));
         }
         if state.completed.len() == catalog.tables.len() {
             return Ok(());
         }
-        spawn_ready_tables(config, &catalog, &sender, &mut state, failures.is_empty());
+        spawn_ready_tables(config, &catalog, &sender, &mut state);
         if catalog_dependencies_are_stuck(&state) {
             return Err("catalog has unresolved or cyclic dependencies".to_string());
         }
@@ -445,19 +448,21 @@ fn spawn_ready_tables(
     catalog: &SyncableCatalog,
     sender: &mpsc::Sender<(String, Result<(), String>)>,
     state: &mut CatalogRunState,
-    can_start: bool,
 ) {
-    let ready = if can_start {
-        state.ready_tables()
-    } else {
-        Vec::new()
-    };
-    let table_names = ready
+    let table_names = state
+        .ready_tables()
         .into_iter()
-        .take(state.available_slots())
         .map(str::to_string)
         .collect::<Vec<_>>();
     for table_name in table_names {
+        if state.available_slots() == 0 {
+            return;
+        }
+        let active_count = state.external_active_count + state.running.len();
+        let Ok(Some(reservation)) = reserve_catalog_worker(config, &table_name, active_count)
+        else {
+            continue;
+        };
         let entry = catalog
             .tables
             .iter()
@@ -468,14 +473,76 @@ fn spawn_ready_tables(
         let worker_config = config.clone();
         let worker_sender = sender.clone();
         thread::spawn(move || {
+            let _reservation = reservation;
             let result = run_catalog_table(&worker_config, &entry);
             let _ = worker_sender.send((entry.name, result));
         });
     }
 }
 
+struct CatalogWorkerReservation {
+    _connection: Conn,
+}
+
+fn reserve_catalog_worker(
+    config: &SyncCatalogConfig,
+    table: &str,
+    active_count: usize,
+) -> Result<Option<CatalogWorkerReservation>, String> {
+    let mut connection = target_connection(&config.connections.target)?;
+    let table_lock = format!(
+        "sync-catalog-table:{}:{}",
+        config.connections.target.database, table
+    );
+    if !acquire_named_lock(&mut connection, &table_lock)? {
+        return Ok(None);
+    }
+    if table_has_active_run(&mut connection, &config.progress_table, table)? {
+        return Ok(None);
+    }
+    for slot in catalog_slot_candidates(active_count) {
+        let slot_lock = format!(
+            "sync-catalog-slot:{}:{}:{slot}",
+            config.connections.target.host, config.connections.target.database
+        );
+        if acquire_named_lock(&mut connection, &slot_lock)? {
+            return Ok(Some(CatalogWorkerReservation {
+                _connection: connection,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn catalog_slot_candidates(active_count: usize) -> Vec<usize> {
+    (active_count.min(MAX_CATALOG_CONCURRENCY)..MAX_CATALOG_CONCURRENCY).collect()
+}
+
+fn acquire_named_lock(connection: &mut Conn, name: &str) -> Result<bool, String> {
+    connection
+        .exec_first::<u8, _, _>("SELECT GET_LOCK(SHA2(?,256),0)", (name,))
+        .map(|value| value == Some(1))
+        .map_err(|error| format!("failed to reserve catalog lock `{name}`: {error}"))
+}
+
+fn table_has_active_run(
+    connection: &mut Conn,
+    progress_table: &str,
+    table: &str,
+) -> Result<bool, String> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE table_name = ? AND IS_USED_LOCK(SHA2(run_id,256)) IS NOT NULL",
+        quote_identifier_path(progress_table)
+    );
+    connection
+        .exec_first::<u64, _, _>(sql, (table,))
+        .map(|count| count.unwrap_or(0) > 0)
+        .map_err(|error| format!("failed to check active sync for `{table}`: {error}"))
+}
+
 fn catalog_dependencies_are_stuck(state: &CatalogRunState) -> bool {
     state.running.is_empty()
+        && state.external_active.is_empty()
         && state.available_slots() > 0
         && state.ready_tables().is_empty()
         && state.all_failures().is_empty()
@@ -515,7 +582,7 @@ fn classify_run_statuses(
         .collect::<BTreeSet<_>>();
     let mut statuses = RunStatuses::default();
     for (run_id, table, status, _error, lock_owner) in rows {
-        if status == "running" && lock_owner.is_some() {
+        if lock_owner.is_some() {
             statuses.external_active_count += 1;
             statuses.external_active.insert(table.clone());
         }
@@ -578,7 +645,59 @@ fn validate_catalog(catalog: &SyncableCatalog) -> Result<(), String> {
 }
 
 fn schemas_are_compatible(source: &TableInventory, target: &TableInventory) -> bool {
-    source.primary_key == target.primary_key && writable_columns(source) == writable_columns(target)
+    source.primary_key == target.primary_key
+        && writable_columns(source) == writable_columns(target)
+        && source
+            .columns
+            .iter()
+            .filter(|column| column.generated.is_none())
+            .zip(
+                target
+                    .columns
+                    .iter()
+                    .filter(|column| column.generated.is_none()),
+            )
+            .all(|(source, target)| column_type_is_compatible(source, target))
+}
+
+fn column_type_is_compatible(
+    source: &crate::inventory::ColumnInventory,
+    target: &crate::inventory::ColumnInventory,
+) -> bool {
+    if source.data_type == target.data_type {
+        return if matches!(
+            source.data_type.as_str(),
+            "char" | "varchar" | "binary" | "varbinary"
+        ) {
+            variable_length_capacity(&target.column_type)
+                >= variable_length_capacity(&source.column_type)
+        } else {
+            source.column_type == target.column_type
+        };
+    }
+    integer_rank(&target.data_type) >= integer_rank(&source.data_type)
+        && integer_rank(&source.data_type) > 0
+        && source.column_type.contains("unsigned") == target.column_type.contains("unsigned")
+}
+
+fn variable_length_capacity(column_type: &str) -> usize {
+    column_type
+        .split_once('(')
+        .and_then(|(_, suffix)| suffix.split(')').next())
+        .and_then(|value| value.split(',').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(usize::MAX)
+}
+
+fn integer_rank(data_type: &str) -> usize {
+    match data_type {
+        "tinyint" => 1,
+        "smallint" => 2,
+        "mediumint" => 3,
+        "int" | "integer" => 4,
+        "bigint" => 5,
+        _ => 0,
+    }
 }
 
 fn writable_columns(table: &TableInventory) -> Vec<String> {
@@ -870,6 +989,36 @@ mod tests {
     }
 
     #[test]
+    fn completed_status_clears_prior_worker_failure() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &[])],
+        };
+        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::new(), 0);
+        state.mark_failed("a", "temporary");
+        state.mark_completed("a");
+        assert!(state.all_failures().is_empty());
+    }
+
+    #[test]
+    fn unrelated_tables_remain_ready_after_failure() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("failed", 1, &[]), entry("independent", 2, &[])],
+        };
+        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::new(), 0);
+        state.mark_failed("failed", "boom");
+        assert_eq!(state.ready_tables(), vec!["independent"]);
+    }
+
+    #[test]
+    fn external_activity_is_waiting_not_dependency_deadlock() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &[])],
+        };
+        let state = CatalogRunState::new(catalog, 4, BTreeSet::from(["a".into()]), 1);
+        assert!(!catalog_dependencies_are_stuck(&state));
+    }
+
+    #[test]
     fn compatible_writable_columns_allow_target_type_widening() {
         let source_table = table(
             "items",
@@ -900,6 +1049,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["items"]
         );
+    }
+
+    #[test]
+    fn incompatible_numeric_narrowing_is_excluded() {
+        let source_table = table(
+            "items",
+            vec![typed_column("id", "bigint", false)],
+            vec!["id"],
+        );
+        let target_table = table("items", vec![typed_column("id", "int", false)], vec!["id"]);
+        let catalogs = build_catalogs(
+            &inventory(vec![source_table], vec![]),
+            &inventory(vec![target_table], vec![]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            catalogs.non_syncable[0].reasons,
+            vec![NonSyncableReason::IncompatibleSchema]
+        );
+    }
+
+    #[test]
+    fn self_referencing_fk_does_not_block_table_start() {
+        let source = inventory(
+            vec![table(
+                "nodes",
+                vec![column("id"), column("parent_id")],
+                vec!["id"],
+            )],
+            vec![foreign_key("nodes", "nodes")],
+        );
+        let target = inventory(
+            vec![table(
+                "nodes",
+                vec![column("id"), column("parent_id")],
+                vec!["id"],
+            )],
+            vec![],
+        );
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+        assert!(catalogs.syncable[0].parent_dependencies.is_empty());
     }
 
     #[test]
@@ -965,6 +1155,26 @@ mod tests {
     }
 
     #[test]
+    fn lock_active_error_rows_consume_slots() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &[])],
+        };
+        let statuses = classify_run_statuses(
+            &catalog,
+            "batch",
+            vec![(
+                "batch-a".into(),
+                "a".into(),
+                "error".into(),
+                "temporary".into(),
+                Some(7),
+            )],
+        );
+        assert_eq!(statuses.external_active_count, 1);
+        assert!(statuses.external_active.contains("a"));
+    }
+
+    #[test]
     fn stale_running_rows_without_advisory_locks_do_not_consume_slots() {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
@@ -982,6 +1192,13 @@ mod tests {
         );
         assert_eq!(statuses.external_active_count, 0);
         assert!(statuses.external_active.is_empty());
+    }
+
+    #[test]
+    fn slot_candidates_reserve_only_capacity_not_used_by_active_runs() {
+        assert_eq!(catalog_slot_candidates(0), vec![0, 1, 2, 3]);
+        assert_eq!(catalog_slot_candidates(1), vec![1, 2, 3]);
+        assert_eq!(catalog_slot_candidates(4), Vec::<usize>::new());
     }
 
     #[test]
