@@ -217,10 +217,13 @@ exactly `name`, `estimated_source_rows`, and `reasons`:
 
 Reason codes are `missing_primary_key`, `missing_target_table`,
 `incompatible_schema`, `unsupported_generated_columns`, and
-`dependency_on_non_syncable`. Catalog arrays are ordered by estimated source
-rows, then table name; primary-key and writable-column arrays retain inventory
-order, parent-dependency arrays are unique and lexicographically ordered, and
-reason arrays use enum declaration order. Compatibility requires matching table
+`dependency_on_non_syncable`. Entries may carry multiple reasons: dependency
+propagation preserves existing exclusion reasons and adds
+`dependency_on_non_syncable` transitively to every affected descendant. Catalog
+arrays are ordered by estimated source rows, then table name; primary-key and
+writable-column arrays retain inventory order, parent-dependency arrays are
+unique and lexicographically ordered, and reason arrays use enum declaration
+order. Compatibility requires matching table
 default character sets (derived from table collations) and exact per-column
 `CHARACTER_SET_NAME`/`COLLATION_NAME` values for corresponding writable columns;
 a mismatch is `incompatible_schema`.
@@ -231,14 +234,24 @@ waits until all entries complete or a failure is returned. Each table uses run I
 `<run-id-prefix>-<table>`; the prefix is required and non-empty, and every
 generated ID must be at most 128 bytes. Interrupted exact IDs resume; a matching
 `status='complete'` row is terminal only when its immutable run specification
-matches the current catalog child. Direct `sync-table` and `sync-catalog`
-workers share one admission lock and four slot reservations keyed by target
-host and port, so databases on the same server share capacity. Each worker also
-holds a database/table-specific reservation, preventing same-table overlap.
-Progress-table rows with a held legacy run-ID advisory lock count toward the
-same four-worker limit; stale unlocked rows do not. Children start only after
-all listed FK parents complete. Owned failures and dependency cycles return
-after owned workers settle without waiting for unrelated external syncs. Each catalog child forces `max_deletes=0`; the
+exactly matches the current catalog child; a different stored specification
+fails closed instead of being treated as terminal. Direct `sync-table` and
+`sync-catalog` workers share one admission lock and four slot reservations keyed
+by the lower-cased target host plus port, so databases on the same host and port
+share capacity. Each worker also holds a database/table-specific reservation,
+preventing same-table overlap. For legacy progress rows, the table identity is
+derived from the immutable run specification's `scope.target_database` and
+`table.name`, not from `table_name` alone, so same-named tables in different target
+databases remain distinct. A held legacy run-ID advisory lock for the requested
+same database/table excludes that table even without a table reservation.
+Progress-table rows in `running`, `complete`, or `error` with a held legacy
+run-ID advisory lock but no table reservation count toward the same four-worker
+limit, including rows for tables outside the supplied catalog; stale or unlocked
+rows do not. Malformed active immutable specifications fail closed before
+reservation. Children start only after all listed FK parents complete. Missing
+dependencies are rejected before workers start; owned failures return after owned
+work settles, and dependency cycles fail closed without waiting for unrelated
+external syncs. Each catalog child forces `max_deletes=0`; the
 option is not configurable, so target orphans are never deleted. The
 non-syncable catalog is classification/operator input only; full-dump execution
 is out of scope.
@@ -260,10 +273,11 @@ The live GlobalComix source MariaDB (`source-mariadb.example` /
 require or attempt a source CA for that endpoint. Source transport is explicitly
 plaintext-only for the current source.
 
-All target-using commands accept `--target-tls-ca-file PATH`; it defaults to
-`/etc/mariadb-mysql-cdc/do-ca.pem`. Target DigitalOcean MySQL connections must
-use the configured CA and hostname verification. Do not weaken target CA or
-hostname verification when changing source transport. See [connection policy](docs/schema-inventory.md#connection-policy).
+The `table-catalog` and `sync-catalog` commands require an explicit, non-empty
+`--target-tls-ca-file PATH`; their command contract defines no default path.
+Target DigitalOcean MySQL connections must use the configured CA and hostname
+verification. Do not weaken target CA or hostname verification when changing
+source transport. See [connection policy](docs/schema-inventory.md#connection-policy).
 
 ## Insert conflict policy
 
