@@ -57,6 +57,13 @@ fn shared_connection_opts_have_bounded_network_timeouts() {
     );
     assert_eq!(opts.get_read_timeout(), Some(&Duration::from_secs(30)));
     assert_eq!(opts.get_write_timeout(), Some(&Duration::from_secs(30)));
+    assert_eq!(opts.get_tcp_keepalive_time_ms(), Some(10_000));
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(opts.get_tcp_keepalive_probe_interval_secs(), Some(5));
+        assert_eq!(opts.get_tcp_keepalive_probe_count(), Some(3));
+        assert_eq!(opts.get_tcp_user_timeout_ms(), Some(30_000));
+    }
 }
 
 #[test]

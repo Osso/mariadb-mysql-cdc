@@ -3,20 +3,49 @@ use mysql::{Opts, OptsBuilder, SslOpts};
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const TARGET_TLS_CA_FILE: &str = "/etc/mariadb-mysql-cdc/do-ca.pem";
+pub(crate) const DEFAULT_MYSQL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_MYSQL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_MYSQL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const MYSQL_TCP_KEEPALIVE_TIME_MS: u32 = 10_000;
+#[cfg(target_os = "linux")]
+const MYSQL_TCP_KEEPALIVE_INTERVAL_SECS: u32 = 5;
+#[cfg(target_os = "linux")]
+const MYSQL_TCP_KEEPALIVE_PROBE_COUNT: u32 = 3;
+#[cfg(target_os = "linux")]
+const MYSQL_TCP_USER_TIMEOUT_MS: u32 = 30_000;
 
 pub fn target_mysql_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
-    Ok(Opts::from(
-        OptsBuilder::default()
-            .ip_or_hostname(Some(target.host.clone()))
-            .tcp_port(target.port)
-            .user(Some(target.user.clone()))
-            .pass(Some(target.password.clone()))
-            .db_name(Some(target.database.clone()))
-            .prefer_socket(false)
-            .ssl_opts(Some(target_ssl_opts(target)?)),
-    ))
+    let builder = OptsBuilder::default()
+        .ip_or_hostname(Some(target.host.clone()))
+        .tcp_port(target.port)
+        .user(Some(target.user.clone()))
+        .pass(Some(target.password.clone()))
+        .db_name(Some(target.database.clone()))
+        .prefer_socket(false)
+        .ssl_opts(Some(target_ssl_opts(target)?));
+    Ok(Opts::from(apply_default_mysql_network_bounds(builder)))
+}
+
+pub(crate) fn apply_default_mysql_network_bounds(builder: OptsBuilder) -> OptsBuilder {
+    apply_mysql_tcp_liveness(
+        builder
+            .tcp_connect_timeout(Some(DEFAULT_MYSQL_CONNECT_TIMEOUT))
+            .read_timeout(Some(DEFAULT_MYSQL_READ_TIMEOUT))
+            .write_timeout(Some(DEFAULT_MYSQL_WRITE_TIMEOUT)),
+    )
+}
+
+pub(crate) fn apply_mysql_tcp_liveness(builder: OptsBuilder) -> OptsBuilder {
+    let builder = builder.tcp_keepalive_time_ms(Some(MYSQL_TCP_KEEPALIVE_TIME_MS));
+    #[cfg(target_os = "linux")]
+    let builder = builder
+        .tcp_keepalive_probe_interval_secs(Some(MYSQL_TCP_KEEPALIVE_INTERVAL_SECS))
+        .tcp_keepalive_probe_count(Some(MYSQL_TCP_KEEPALIVE_PROBE_COUNT))
+        .tcp_user_timeout_ms(Some(MYSQL_TCP_USER_TIMEOUT_MS));
+    builder
 }
 
 pub fn validate_target_tls_ca_file(target: &TargetMySqlConfig) -> Result<(), String> {
@@ -177,6 +206,25 @@ mod tests {
         );
         assert!(!ssl.accept_invalid_certs());
         assert!(!ssl.skip_domain_validation());
+        assert_eq!(
+            opts.get_tcp_connect_timeout(),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            opts.get_read_timeout(),
+            Some(&std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            opts.get_write_timeout(),
+            Some(&std::time::Duration::from_secs(30))
+        );
+        assert_eq!(opts.get_tcp_keepalive_time_ms(), Some(10_000));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(opts.get_tcp_keepalive_probe_interval_secs(), Some(5));
+            assert_eq!(opts.get_tcp_keepalive_probe_count(), Some(3));
+            assert_eq!(opts.get_tcp_user_timeout_ms(), Some(30_000));
+        }
     }
 
     #[test]

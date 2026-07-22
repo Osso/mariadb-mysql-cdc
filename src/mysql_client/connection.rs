@@ -1,4 +1,7 @@
-use crate::mysql_support::ssl_opts_from_ca;
+use crate::mysql_support::{
+    DEFAULT_MYSQL_CONNECT_TIMEOUT, DEFAULT_MYSQL_READ_TIMEOUT, DEFAULT_MYSQL_WRITE_TIMEOUT,
+    apply_mysql_tcp_liveness, ssl_opts_from_ca,
+};
 use crate::snapshot::SnapshotError;
 use crate::table_sync::TableSyncError;
 use crate::target::TargetExecuteError;
@@ -6,9 +9,9 @@ use mysql::{Conn, Opts, OptsBuilder};
 use std::time::Duration;
 
 const DEFAULT_NETWORK_TIMEOUTS: NetworkTimeouts = NetworkTimeouts {
-    connect: Duration::from_secs(10),
-    read: Duration::from_secs(30),
-    write: Duration::from_secs(30),
+    connect: DEFAULT_MYSQL_CONNECT_TIMEOUT,
+    read: DEFAULT_MYSQL_READ_TIMEOUT,
+    write: DEFAULT_MYSQL_WRITE_TIMEOUT,
 };
 
 #[derive(Clone, Copy)]
@@ -22,10 +25,12 @@ pub(crate) fn apply_network_timeouts(
     builder: OptsBuilder,
     timeouts: NetworkTimeouts,
 ) -> OptsBuilder {
-    builder
-        .tcp_connect_timeout(Some(timeouts.connect))
-        .read_timeout(Some(timeouts.read))
-        .write_timeout(Some(timeouts.write))
+    apply_mysql_tcp_liveness(
+        builder
+            .tcp_connect_timeout(Some(timeouts.connect))
+            .read_timeout(Some(timeouts.read))
+            .write_timeout(Some(timeouts.write)),
+    )
 }
 
 pub(crate) fn base_opts(
