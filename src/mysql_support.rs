@@ -26,7 +26,11 @@ pub fn target_mysql_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
         .db_name(Some(target.database.clone()))
         .prefer_socket(false)
         .ssl_opts(Some(target_ssl_opts(target)?));
-    Ok(Opts::from(apply_default_mysql_network_bounds(builder)))
+    Ok(Opts::from(apply_mysql_connection_liveness(builder)))
+}
+
+pub(crate) fn apply_mysql_connection_liveness(builder: OptsBuilder) -> OptsBuilder {
+    apply_mysql_tcp_liveness(builder.tcp_connect_timeout(Some(DEFAULT_MYSQL_CONNECT_TIMEOUT)))
 }
 
 pub(crate) fn apply_default_mysql_network_bounds(builder: OptsBuilder) -> OptsBuilder {
@@ -210,14 +214,8 @@ mod tests {
             opts.get_tcp_connect_timeout(),
             Some(std::time::Duration::from_secs(10))
         );
-        assert_eq!(
-            opts.get_read_timeout(),
-            Some(&std::time::Duration::from_secs(30))
-        );
-        assert_eq!(
-            opts.get_write_timeout(),
-            Some(&std::time::Duration::from_secs(30))
-        );
+        assert_eq!(opts.get_read_timeout(), None);
+        assert_eq!(opts.get_write_timeout(), None);
         assert_eq!(opts.get_tcp_keepalive_time_ms(), Some(10_000));
         #[cfg(target_os = "linux")]
         {

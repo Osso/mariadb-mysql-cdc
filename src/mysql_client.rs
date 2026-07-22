@@ -4,7 +4,7 @@ use crate::live::{
     should_replace_divergent_primary,
 };
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::target_mysql_opts;
+use crate::mysql_support::{apply_default_mysql_network_bounds, target_mysql_opts};
 use crate::snapshot::{ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource};
 use crate::table_sync::progress::{
     build_add_total_rows_column_sql, build_create_progress_schema_sql,
@@ -17,7 +17,7 @@ use crate::target::{
     build_primary_key_replacement_statement, primary_key_replacement_outcome,
 };
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, Params};
+use mysql::{Conn, Opts, OptsBuilder, Params};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -55,6 +55,11 @@ pub struct PersistentProgressWriter {
     conn: RefCell<Conn>,
     default_database: String,
     progress_table: String,
+}
+
+pub(crate) fn sync_target_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
+    let builder = OptsBuilder::from_opts(target_mysql_opts(target)?);
+    Ok(Opts::from(apply_default_mysql_network_bounds(builder)))
 }
 
 pub(crate) fn target_reader_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
@@ -201,7 +206,20 @@ impl SnapshotSource for PersistentMySqlSource {
 
 impl PersistentTargetExecutor {
     pub fn new(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
-        let opts = target_mysql_opts(config).map_err(TargetExecuteError::new)?;
+        Self::new_with_opts(
+            config,
+            target_mysql_opts(config).map_err(TargetExecuteError::new)?,
+        )
+    }
+
+    pub(crate) fn new_for_sync(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
+        Self::new_with_opts(
+            config,
+            sync_target_opts(config).map_err(TargetExecuteError::new)?,
+        )
+    }
+
+    fn new_with_opts(config: &TargetMySqlConfig, opts: Opts) -> Result<Self, TargetExecuteError> {
         let mut conn = open_conn(opts).map_err(target_connect_error)?;
         conn.query_drop(crate::live::target_session_init_command())
             .map_err(target_query_error)?;
@@ -543,7 +561,7 @@ impl PersistentTargetExecutor {
 
 impl PersistentProgressWriter {
     pub fn new(config: &TargetMySqlConfig, progress_table: String) -> Result<Self, TableSyncError> {
-        let opts = target_mysql_opts(config).map_err(TableSyncError::Progress)?;
+        let opts = sync_target_opts(config).map_err(TableSyncError::Progress)?;
         let mut conn = open_conn(opts).map_err(progress_connect_error)?;
         conn.query_drop(crate::live::target_session_init_command())
             .map_err(progress_query_error)?;

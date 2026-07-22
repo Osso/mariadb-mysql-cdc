@@ -108,6 +108,23 @@ fn stalled_mysql_handshake_returns_within_read_timeout() {
 }
 
 #[test]
+fn sync_target_writer_opts_have_bounded_operation_timeouts() {
+    let target = TargetMySqlConfig {
+        host: "target-db.example".to_string(),
+        tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
+        ..TargetMySqlConfig::default()
+    };
+
+    let opts = sync_target_opts(&target).expect("sync target options");
+
+    assert_eq!(opts.get_read_timeout(), Some(&Duration::from_secs(30)));
+    assert_eq!(opts.get_write_timeout(), Some(&Duration::from_secs(30)));
+    assert_eq!(opts.get_tcp_keepalive_time_ms(), Some(10_000));
+    #[cfg(target_os = "linux")]
+    assert_eq!(opts.get_tcp_user_timeout_ms(), Some(30_000));
+}
+
+#[test]
 fn target_reader_opts_use_configured_ca_and_dns_verification() {
     let target = TargetMySqlConfig {
         host: "target-db.example".to_string(),

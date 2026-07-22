@@ -582,7 +582,7 @@ pub(crate) fn should_record_sync_run_error(error: &TableSyncError) -> bool {
 fn connect_mysql_recovery_target(
     config: &SyncTableConfig,
 ) -> Result<MySqlSyncRepairTarget, TableSyncError> {
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
+    let executor = crate::mysql_client::PersistentTargetExecutor::new_for_sync(&config.target)
         .map_err(|error| TableSyncError::Repair(error.to_string()))?;
     executor
         .execute_raw_sql(RECOVERY_UTC_SESSION_SQL)
@@ -591,7 +591,7 @@ fn connect_mysql_recovery_target(
 }
 
 fn mysql_repair_target(config: &SyncTableConfig) -> Result<MySqlSyncRepairTarget, TableSyncError> {
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
+    let executor = crate::mysql_client::PersistentTargetExecutor::new_for_sync(&config.target)
         .map_err(|error| TableSyncError::Repair(error.to_string()))?;
     Ok(build_mysql_repair_target(config, executor))
 }
