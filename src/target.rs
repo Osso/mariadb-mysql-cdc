@@ -1082,16 +1082,25 @@ mod tests {
 
     #[test]
     fn caps_update_batch_size_for_bounded_execution_time() {
-        let executor = RecordingExecutor::default();
-        let writer = TargetMySqlWriter::new("accounts", vec!["id"], vec!["id", "name"], executor);
         let rows = (1..=129)
             .map(|id| row(&id.to_string(), "updated"))
             .collect::<Vec<_>>();
+        let writer = TargetMySqlWriter::new(
+            "accounts",
+            vec!["id"],
+            vec!["id", "name"],
+            RecordingExecutor::default(),
+        );
 
         writer
-            .update_rows(&rows.iter().collect::<Vec<_>>())
-            .expect("update rows");
+            .update_rows(&rows[..128].iter().collect::<Vec<_>>())
+            .expect("update rows at cap");
+        assert_eq!(writer.executor.statements.borrow().len(), 1);
 
+        writer.executor.statements.borrow_mut().clear();
+        writer
+            .update_rows(&rows.iter().collect::<Vec<_>>())
+            .expect("update rows beyond cap");
         assert_eq!(writer.executor.statements.borrow().len(), 2);
     }
 
