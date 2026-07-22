@@ -769,15 +769,15 @@ fn sync_server_lock_namespace(host: &str, port: u16) -> String {
 }
 
 fn sync_table_lock_name(server_namespace: &str, database: &str, table: &str) -> String {
-    format!("sync-table:{server_namespace}:{database}:{table}")
+    format!("\0mariadb-mysql-cdc:table-reservation:{server_namespace}:{database}:{table}")
 }
 
 fn catalog_slot_lock_name(server_namespace: &str, slot: usize) -> String {
-    format!("sync-table-slot:{server_namespace}:{slot}")
+    format!("\0mariadb-mysql-cdc:sync-slot:{server_namespace}:{slot}")
 }
 
 fn catalog_admission_lock_name(server_namespace: &str) -> String {
-    format!("sync-table-admission:{server_namespace}")
+    format!("\0mariadb-mysql-cdc:sync-admission:{server_namespace}")
 }
 
 fn acquire_named_lock(connection: &mut Conn, name: &str) -> Result<bool, String> {
@@ -809,7 +809,6 @@ fn catalog_dependencies_are_stuck(state: &CatalogRunState) -> bool {
     });
     state.running.is_empty()
         && !waiting_for_catalog_table
-        && state.available_slots() > 0
         && state.ready_tables().is_empty()
         && state.all_failures().is_empty()
 }
@@ -1485,6 +1484,22 @@ mod tests {
     }
 
     #[test]
+    fn four_external_slots_do_not_hide_owned_dependency_cycle() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &["b"]), entry("b", 2, &["a"])],
+        };
+        let external = BTreeSet::from([
+            "external_a".into(),
+            "external_b".into(),
+            "external_c".into(),
+            "external_d".into(),
+        ]);
+        let state = CatalogRunState::new(catalog, 4, external, 4);
+
+        assert!(catalog_dependencies_are_stuck(&state));
+    }
+
+    #[test]
     fn nullable_source_requires_nullable_target() {
         let source_table = table(
             "items",
@@ -2009,6 +2024,24 @@ mod tests {
                 .expect("catalog retry")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn user_run_id_cannot_collide_with_table_reservation_key() {
+        let run_id = "sync-table:db:3306:app:users";
+        let table_reservation = sync_table_lock_name("db:3306", "app", "users");
+        let admission = catalog_admission_lock_name("db:3306");
+        let slot = catalog_slot_lock_name("db:3306", 0);
+
+        assert!(table_reservation.starts_with('\0'));
+        assert!(admission.starts_with('\0'));
+        assert!(slot.starts_with('\0'));
+        assert_ne!(run_id, table_reservation);
+        assert_ne!(run_id, admission);
+        assert_ne!(run_id, slot);
+        assert_ne!(table_reservation, admission);
+        assert_ne!(table_reservation, slot);
+        assert_ne!(admission, slot);
     }
 
     #[test]
