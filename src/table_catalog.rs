@@ -879,7 +879,8 @@ fn classify_run_statuses(
         let expected_catalog_child = catalog_names.contains(table.as_str())
             && run_id == deterministic_run_id(run_id_prefix, target_database, &table);
         let active = lock_owner.is_some();
-        if !active && !(status == "complete" && expected_catalog_child) {
+        let relevant = active || (status == "complete" && expected_catalog_child);
+        if !relevant {
             continue;
         }
 
