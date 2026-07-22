@@ -55,12 +55,14 @@ mariadb-mysql-cdc catchup-snapshot \
 
 ## Progress-table privilege boundary
 
-Repair commands default to `cdc.table_sync_runs`. When an administrator
-prebootstraps that table, runtime `ensure` reads its `information_schema`
-inventory and validates the complete schema and `run_id` primary key without
-`CREATE` or `ALTER`; the runtime grant can remain `SELECT, INSERT, UPDATE` on
-that table. A missing table still uses the creation path and therefore requires
-DDL privileges. A malformed existing table fails unchanged.
+Repair commands default to `cdc.table_sync_runs`. Runtime `ensure` validates
+its complete 16-column schema and `run_id` primary key through
+`information_schema`; an administrator-prebootstrapped current table therefore
+needs only `SELECT, INSERT, UPDATE` at runtime. An exact legacy 15-column table
+is migrated once by adding the `delete_preflight_complete` column as
+`BOOLEAN NOT NULL DEFAULT FALSE`, so that upgrade path requires `ALTER` and
+preserves existing runs as requiring preflight. A missing table uses the
+creation path and a malformed existing table fails unchanged.
 
 `catchup-snapshot` defaults to the legacy `cdc.table_sync_progress` table. Its
 current ensure path still creates the schema/table and conditionally adds
@@ -110,7 +112,10 @@ transaction explicitly set to `REPEATABLE READ`; candidate enumerations use
 is the advisory lock released. Any failure rolls back the selection transaction
 before lock release.
 
-Apply mode preflights target extras before mutating. If extras exceed the
+Apply mode preflights target extras before mutating. For `All` and
+`DeleteExtras`, a successful preflight sets `delete_preflight_complete` on the
+run row before repair starts; reconnects skip that completed scan, while failed
+or incomplete preflights remain unmarked and rerun. If extras exceed the
 explicit ceiling, it performs zero inserts, updates, or deletes. Normal
 `sync-table` repair never deletes or updates by a secondary key.
 
