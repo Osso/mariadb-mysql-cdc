@@ -218,28 +218,30 @@ exactly `name`, `estimated_source_rows`, and `reasons`:
 Reason codes are `missing_primary_key`, `missing_target_table`,
 `incompatible_schema`, `unsupported_generated_columns`,
 `cross_schema_dependency`, and `dependency_on_non_syncable`. A source table
-whose FK references another schema receives `cross_schema_dependency`; a
-same-named table in the source schema does not satisfy that dependency. Entries
+whose source or target FK references another schema receives
+`cross_schema_dependency`; a same-named local table does not satisfy that
+dependency. Entries
 may carry multiple reasons: dependency
 propagation preserves existing exclusion reasons and adds
 `dependency_on_non_syncable` transitively to every affected descendant. Catalog
 arrays are ordered by estimated source rows, then table name; primary-key and
 writable-column arrays retain inventory order, parent-dependency arrays are
-unique and lexicographically ordered, and reason arrays use enum declaration
-order. Compatibility requires matching table
+unique and lexicographically ordered from the union of applicable source and
+target FKs, and reason arrays use enum declaration order. Target-only local FKs
+gate scheduling. Compatibility requires matching table
 default character sets (derived from table collations) and exact per-column
 `CHARACTER_SET_NAME`/`COLLATION_NAME` values for corresponding writable columns;
-a mismatch is `incompatible_schema`. `table-catalog` rejects identical
-`--syncable-output` and `--non-syncable-output` paths before writing either file.
+a mismatch is `incompatible_schema`. `table-catalog` rejects output paths that
+resolve to the same filesystem destination before writing either file, including
+lexical aliases, existing symlinks, and hardlinks.
 
 `sync-catalog` reads only the syncable catalog and starts apply mode immediately;
 there is no dry-run/plan mode and `table-catalog` does not launch it. The command
-waits until all entries complete or a failure is returned. Each table uses run ID
-`<run-id-prefix>-<normalized-target-database>-<table>`; the database component
-preserves only ASCII letters and digits and encodes every other UTF-8 byte as
-`_xx`, including `_` and `-`. Thus `a b` becomes `a_20b`, while literal `a_20b`
-becomes `a_5f20b`. The prefix is required and non-empty, and every fully encoded
-generated ID must be at most 128 bytes. Interrupted exact IDs resume; a matching `status='complete'` row
+waits until all entries complete or a failure is returned. Each table uses a
+versioned run ID that length-frames and hexadecimal-encodes every byte of the
+`(run-id prefix, target database, table)` tuple. The prefix is required and
+non-empty, and every generated ID must be at most 128 bytes; delimiters inside
+components cannot create collisions. Interrupted exact IDs resume; a matching `status='complete'` row
 is terminal only when its immutable run specification exactly matches the current
 catalog child; a different stored specification fails closed instead of being
 treated as terminal. Direct `sync-table` and

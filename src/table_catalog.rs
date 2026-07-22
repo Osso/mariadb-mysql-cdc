@@ -212,12 +212,38 @@ pub fn build_catalogs(
     target: &SchemaInventory,
     estimated_rows: &BTreeMap<String, u64>,
 ) -> Catalogs {
-    let (mut candidates, mut excluded) = classify_source_tables(source, target, estimated_rows);
-    propagate_non_syncable_dependencies(source, &mut candidates, &mut excluded);
+    let dependency_inventory = dependency_inventory(source, target);
+    let (mut candidates, mut excluded) =
+        classify_source_tables(&dependency_inventory, target, estimated_rows);
+    propagate_non_syncable_dependencies(&dependency_inventory, &mut candidates, &mut excluded);
     Catalogs {
         syncable: sorted_syncable_entries(candidates),
         non_syncable: sorted_non_syncable_entries(excluded, estimated_rows),
     }
+}
+
+fn dependency_inventory(source: &SchemaInventory, target: &SchemaInventory) -> SchemaInventory {
+    let mut dependencies = BTreeMap::new();
+    for (inventory, local_schema) in [
+        (source, source.schema.as_str()),
+        (target, target.schema.as_str()),
+    ] {
+        for foreign_key in &inventory.foreign_keys {
+            let mut dependency = foreign_key.clone();
+            if dependency.referenced_schema == local_schema {
+                dependency.referenced_schema = source.schema.clone();
+            }
+            let key = (
+                dependency.table.clone(),
+                dependency.referenced_schema.clone(),
+                dependency.referenced_table.clone(),
+            );
+            dependencies.entry(key).or_insert(dependency);
+        }
+    }
+    let mut inventory = source.clone();
+    inventory.foreign_keys = dependencies.into_values().collect();
+    inventory
 }
 
 fn classify_source_tables(
@@ -950,19 +976,19 @@ fn catalog_table_sync_config(
 }
 
 fn deterministic_run_id(prefix: &str, target_database: &str, table: &str) -> String {
-    let database = normalize_run_id_component(target_database);
-    format!("{prefix}-{database}-{table}")
+    let prefix = encode_run_id_component(prefix);
+    let database = encode_run_id_component(target_database);
+    let table = encode_run_id_component(table);
+    format!("v1:{prefix}:{database}:{table}")
 }
 
-fn normalize_run_id_component(value: &str) -> String {
-    value
+fn encode_run_id_component(value: &str) -> String {
+    let encoded = value
         .as_bytes()
         .iter()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => char::from(*byte).to_string(),
-            _ => format!("_{byte:02x}"),
-        })
-        .collect()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{}:{encoded}", value.len())
 }
 
 fn validate_catalog_run_ids(
@@ -1093,12 +1119,73 @@ fn validate_distinct_catalog_output_paths(
     syncable_output: &Path,
     non_syncable_output: &Path,
 ) -> Result<(), String> {
-    if syncable_output == non_syncable_output {
+    let syncable = catalog_output_destination(syncable_output)?;
+    let non_syncable = catalog_output_destination(non_syncable_output)?;
+    if syncable.path == non_syncable.path || same_existing_file(&syncable, &non_syncable) {
         return Err(
-            "--syncable-output and --non-syncable-output must be different paths".to_string(),
+            "--syncable-output and --non-syncable-output must not resolve to the same filesystem destination"
+                .to_string(),
         );
     }
     Ok(())
+}
+
+struct CatalogOutputDestination {
+    path: PathBuf,
+    #[cfg(unix)]
+    file_identity: Option<(u64, u64)>,
+}
+
+fn catalog_output_destination(path: &Path) -> Result<CatalogOutputDestination, String> {
+    if let Ok(metadata) = fs::metadata(path) {
+        return Ok(CatalogOutputDestination {
+            path: fs::canonicalize(path).map_err(|error| {
+                format!(
+                    "failed to resolve catalog output {}: {error}",
+                    path.display()
+                )
+            })?,
+            #[cfg(unix)]
+            file_identity: Some(file_identity(&metadata)),
+        });
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("catalog output {} has no file name", path.display()))?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "failed to resolve catalog output parent {}: {error}",
+            parent.display()
+        )
+    })?;
+    Ok(CatalogOutputDestination {
+        path: canonical_parent.join(file_name),
+        #[cfg(unix)]
+        file_identity: None,
+    })
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+fn same_existing_file(first: &CatalogOutputDestination, second: &CatalogOutputDestination) -> bool {
+    #[cfg(unix)]
+    {
+        first.file_identity.is_some() && first.file_identity == second.file_identity
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (first, second);
+        false
+    }
 }
 
 fn write_pretty_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -1766,6 +1853,63 @@ mod tests {
     }
 
     #[test]
+    fn target_only_local_fk_gates_child_on_parent() {
+        let tables = vec![
+            table("child", vec![column("id"), column("parent_id")], vec!["id"]),
+            table("parent", vec![column("id")], vec!["id"]),
+        ];
+        let source = inventory(tables.clone(), vec![]);
+        let target = inventory(tables, vec![foreign_key("child", "parent")]);
+
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+        let child = catalogs
+            .syncable
+            .iter()
+            .find(|entry| entry.name == "child")
+            .expect("target-constrained child");
+
+        assert_eq!(child.parent_dependencies, vec!["parent"]);
+    }
+
+    #[test]
+    fn target_only_cross_schema_fk_excludes_child_and_descendants() {
+        let tables = vec![
+            table("child", vec![column("id"), column("parent_id")], vec!["id"]),
+            table(
+                "grandchild",
+                vec![column("id"), column("child_id")],
+                vec!["id"],
+            ),
+        ];
+        let source = inventory(tables.clone(), vec![foreign_key("grandchild", "child")]);
+        let target = inventory(
+            tables,
+            vec![foreign_key_in_schema("child", "parent", "shared")],
+        );
+
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+        let child = catalogs
+            .non_syncable
+            .iter()
+            .find(|entry| entry.name == "child")
+            .expect("target cross-schema child");
+        let grandchild = catalogs
+            .non_syncable
+            .iter()
+            .find(|entry| entry.name == "grandchild")
+            .expect("dependent grandchild");
+
+        assert_eq!(
+            child.reasons,
+            vec![NonSyncableReason::CrossSchemaDependency]
+        );
+        assert_eq!(
+            grandchild.reasons,
+            vec![NonSyncableReason::DependencyOnNonSyncable]
+        );
+    }
+
+    #[test]
     fn self_referencing_fk_does_not_block_table_start() {
         let source = inventory(
             vec![table(
@@ -2175,23 +2319,20 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             deterministic_run_id("full-20260722", "globalcomix", "a"),
-            "full-20260722-globalcomix-a"
+            "v1:13:66756c6c2d3230323630373232:11:676c6f62616c636f6d6978:1:61"
         );
         assert_ne!(
             deterministic_run_id("full-20260722", "globalcomix", "a"),
             deterministic_run_id("full-20260722", "external2_env", "a")
         );
-        assert_eq!(
-            deterministic_run_id("full-20260722", "tenant/db", "a"),
-            "full-20260722-tenant_2fdb-a"
-        );
+        assert!(deterministic_run_id("full-20260722", "tenant/db", "a").starts_with("v1:"));
         assert_ne!(
             deterministic_run_id("full-20260722", "a b", "items"),
             deterministic_run_id("full-20260722", "a_20b", "items")
         );
-        assert_eq!(
-            deterministic_run_id("full-20260722", "a_20b", "items"),
-            "full-20260722-a_5f20b-items"
+        assert_ne!(
+            deterministic_run_id("a-b", "c", "d"),
+            deterministic_run_id("a", "b", "c-d")
         );
     }
 
@@ -2228,8 +2369,61 @@ mod tests {
 
         let error = write_table_catalogs(&config).expect_err("identical output paths");
 
-        assert!(error.contains("must be different"), "{error}");
+        assert!(error.contains("same filesystem destination"), "{error}");
         assert!(!path.exists(), "identical output path was created");
+    }
+
+    #[test]
+    fn lexical_alias_catalog_outputs_fail_before_writing() {
+        let directory = unique_catalog_test_directory("lexical-alias");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let first = directory.join("catalog.json");
+        let second = directory.join("subdir").join("..").join("catalog.json");
+        fs::create_dir(directory.join("subdir")).expect("create alias directory");
+
+        let error = validate_distinct_catalog_output_paths(&first, &second)
+            .expect_err("lexical aliases must conflict");
+
+        assert!(error.contains("same filesystem destination"), "{error}");
+        assert!(!first.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_catalog_outputs_fail_without_overwriting_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = unique_catalog_test_directory("symlink");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let target = directory.join("catalog.json");
+        let alias = directory.join("catalog-link.json");
+        fs::write(&target, b"preserve").expect("write target");
+        symlink(&target, &alias).expect("create symlink");
+
+        let error = validate_distinct_catalog_output_paths(&target, &alias)
+            .expect_err("symlink aliases must conflict");
+
+        assert!(error.contains("same filesystem destination"), "{error}");
+        assert_eq!(fs::read(&target).expect("read target"), b"preserve");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn hardlink_catalog_outputs_fail_without_overwriting_target() {
+        let directory = unique_catalog_test_directory("hardlink");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let target = directory.join("catalog.json");
+        let alias = directory.join("catalog-hardlink.json");
+        fs::write(&target, b"preserve").expect("write target");
+        fs::hard_link(&target, &alias).expect("create hardlink");
+
+        let error = validate_distinct_catalog_output_paths(&target, &alias)
+            .expect_err("hardlink aliases must conflict");
+
+        assert!(error.contains("same filesystem destination"), "{error}");
+        assert_eq!(fs::read(&target).expect("read target"), b"preserve");
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[derive(Default)]
@@ -2287,6 +2481,14 @@ mod tests {
             })
             .to_string(),
         }
+    }
+
+    fn unique_catalog_test_directory(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cdc-table-catalog-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
     }
 
     fn inventory(
