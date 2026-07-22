@@ -167,19 +167,35 @@ impl CatalogRunState {
     }
 
     pub fn blocked_failures(&self) -> Vec<CatalogTableFailure> {
-        self.catalog
-            .tables
-            .iter()
-            .filter(|entry| !self.is_accounted_for(&entry.name))
-            .filter_map(|entry| {
-                entry.parent_dependencies.iter().find_map(|parent| {
-                    self.failures.get(parent).map(|reason| CatalogTableFailure {
-                        table: entry.name.clone(),
-                        reason: format!("parent `{parent}` failed: {reason}"),
+        let mut blocked = BTreeMap::<String, String>::new();
+        loop {
+            let mut changed = false;
+            for entry in &self.catalog.tables {
+                if self.is_accounted_for(&entry.name) || blocked.contains_key(&entry.name) {
+                    continue;
+                }
+                if let Some((parent, reason)) =
+                    entry.parent_dependencies.iter().find_map(|parent| {
+                        self.failures
+                            .get(parent)
+                            .or_else(|| blocked.get(parent))
+                            .map(|reason| (parent, reason))
                     })
-                })
-            })
-            .collect()
+                {
+                    blocked.insert(
+                        entry.name.clone(),
+                        format!("parent `{parent}` failed: {reason}"),
+                    );
+                    changed = true;
+                }
+            }
+            if !changed {
+                return blocked
+                    .into_iter()
+                    .map(|(table, reason)| CatalogTableFailure { table, reason })
+                    .collect();
+            }
+        }
     }
 
     fn is_accounted_for(&self, table: &str) -> bool {
@@ -386,13 +402,17 @@ fn run_sync_catalog(config: &SyncCatalogConfig) -> Result<(), String> {
     loop {
         refresh_run_state(config, &catalog, &receiver, &mut state)?;
         let failures = state.all_failures();
-        if !failures.is_empty() && state.running.is_empty() && state.ready_tables().is_empty() {
+        if !failures.is_empty()
+            && state.running.is_empty()
+            && state.external_active.is_empty()
+            && state.ready_tables().is_empty()
+        {
             return Err(format_catalog_failures(&failures));
         }
         if state.completed.len() == catalog.tables.len() {
             return Ok(());
         }
-        spawn_ready_tables(config, &catalog, &sender, &mut state);
+        spawn_ready_tables(config, &catalog, &sender, &mut state)?;
         if catalog_dependencies_are_stuck(&state) {
             return Err("catalog has unresolved or cyclic dependencies".to_string());
         }
@@ -448,7 +468,7 @@ fn spawn_ready_tables(
     catalog: &SyncableCatalog,
     sender: &mpsc::Sender<(String, Result<(), String>)>,
     state: &mut CatalogRunState,
-) {
+) -> Result<(), String> {
     let table_names = state
         .ready_tables()
         .into_iter()
@@ -456,11 +476,10 @@ fn spawn_ready_tables(
         .collect::<Vec<_>>();
     for table_name in table_names {
         if state.available_slots() == 0 {
-            return;
+            return Ok(());
         }
         let active_count = state.external_active_count + state.running.len();
-        let Ok(Some(reservation)) = reserve_catalog_worker(config, &table_name, active_count)
-        else {
+        let Some(reservation) = reserve_catalog_worker(config, &table_name, active_count)? else {
             continue;
         };
         let entry = catalog
@@ -478,6 +497,7 @@ fn spawn_ready_tables(
             let _ = worker_sender.send((entry.name, result));
         });
     }
+    Ok(())
 }
 
 struct CatalogWorkerReservation {
@@ -501,10 +521,7 @@ fn reserve_catalog_worker(
         return Ok(None);
     }
     for slot in catalog_slot_candidates(active_count) {
-        let slot_lock = format!(
-            "sync-catalog-slot:{}:{}:{slot}",
-            config.connections.target.host, config.connections.target.database
-        );
+        let slot_lock = catalog_slot_lock_name(&config.connections.target.database, slot);
         if acquire_named_lock(&mut connection, &slot_lock)? {
             return Ok(Some(CatalogWorkerReservation {
                 _connection: connection,
@@ -512,6 +529,10 @@ fn reserve_catalog_worker(
         }
     }
     Ok(None)
+}
+
+fn catalog_slot_lock_name(database: &str, slot: usize) -> String {
+    format!("sync-catalog-slot:{database}:{slot}")
 }
 
 fn catalog_slot_candidates(active_count: usize) -> Vec<usize> {
@@ -646,6 +667,7 @@ fn validate_catalog(catalog: &SyncableCatalog) -> Result<(), String> {
 
 fn schemas_are_compatible(source: &TableInventory, target: &TableInventory) -> bool {
     source.primary_key == target.primary_key
+        && compatible_character_set(source.collation.as_deref(), target.collation.as_deref())
         && writable_columns(source) == writable_columns(target)
         && source
             .columns
@@ -660,11 +682,26 @@ fn schemas_are_compatible(source: &TableInventory, target: &TableInventory) -> b
             .all(|(source, target)| column_type_is_compatible(source, target))
 }
 
+fn compatible_character_set(source: Option<&str>, target: Option<&str>) -> bool {
+    source.map(collation_character_set) == target.map(collation_character_set)
+}
+
+fn collation_character_set(collation: &str) -> &str {
+    collation.split('_').next().unwrap_or(collation)
+}
+
 fn column_type_is_compatible(
     source: &crate::inventory::ColumnInventory,
     target: &crate::inventory::ColumnInventory,
 ) -> bool {
+    if source.is_nullable && !target.is_nullable {
+        return false;
+    }
     if source.data_type == target.data_type {
+        if integer_rank(&source.data_type) > 0 {
+            return source.column_type.contains("unsigned")
+                == target.column_type.contains("unsigned");
+        }
         return if matches!(
             source.data_type.as_str(),
             "char" | "varchar" | "binary" | "varbinary"
@@ -1019,6 +1056,50 @@ mod tests {
     }
 
     #[test]
+    fn nullable_source_requires_nullable_target() {
+        let source_table = table(
+            "items",
+            vec![typed_column("id", "bigint", true)],
+            vec!["id"],
+        );
+        let target_table = table(
+            "items",
+            vec![typed_column("id", "bigint", false)],
+            vec!["id"],
+        );
+        let catalogs = build_catalogs(
+            &inventory(vec![source_table], vec![]),
+            &inventory(vec![target_table], vec![]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            catalogs.non_syncable[0].reasons,
+            vec![NonSyncableReason::IncompatibleSchema]
+        );
+    }
+
+    #[test]
+    fn incompatible_character_sets_are_excluded() {
+        let mut source_table = table(
+            "items",
+            vec![typed_column("id", "bigint", false)],
+            vec!["id"],
+        );
+        source_table.collation = Some("utf8mb4_unicode_ci".into());
+        let mut target_table = source_table.clone();
+        target_table.collation = Some("latin1_swedish_ci".into());
+        let catalogs = build_catalogs(
+            &inventory(vec![source_table], vec![]),
+            &inventory(vec![target_table], vec![]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            catalogs.non_syncable[0].reasons,
+            vec![NonSyncableReason::IncompatibleSchema]
+        );
+    }
+
+    #[test]
     fn compatible_writable_columns_allow_target_type_widening() {
         let source_table = table(
             "items",
@@ -1032,7 +1113,7 @@ mod tests {
             "items",
             vec![
                 typed_column("id", "bigint", false),
-                typed_column("name", "varchar(80)", false),
+                typed_column("name", "varchar(80)", true),
             ],
             vec!["id"],
         );
@@ -1049,6 +1130,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["items"]
         );
+    }
+
+    #[test]
+    fn integer_display_width_differences_are_compatible() {
+        let source_table = table(
+            "items",
+            vec![typed_column("id", "int(18) unsigned", false)],
+            vec!["id"],
+        );
+        let target_table = table(
+            "items",
+            vec![typed_column("id", "int unsigned", false)],
+            vec!["id"],
+        );
+        let catalogs = build_catalogs(
+            &inventory(vec![source_table], vec![]),
+            &inventory(vec![target_table], vec![]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(catalogs.syncable.len(), 1);
     }
 
     #[test]
@@ -1139,6 +1240,27 @@ mod tests {
     }
 
     #[test]
+    fn blocked_failure_reporting_is_transitive() {
+        let catalog = SyncableCatalog {
+            tables: vec![
+                entry("a", 1, &[]),
+                entry("b", 2, &["a"]),
+                entry("c", 3, &["b"]),
+            ],
+        };
+        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::new(), 0);
+        state.mark_failed("a", "boom");
+        assert_eq!(
+            state
+                .all_failures()
+                .iter()
+                .map(|failure| failure.table.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
     fn failed_parent_blocks_child_explicitly() {
         let catalog = SyncableCatalog {
             tables: vec![entry("parent", 1, &[]), entry("child", 2, &["parent"])],
@@ -1195,6 +1317,14 @@ mod tests {
     }
 
     #[test]
+    fn slot_lock_namespace_is_server_local_not_hostname_specific() {
+        assert_eq!(
+            catalog_slot_lock_name("globalcomix", 2),
+            "sync-catalog-slot:globalcomix:2"
+        );
+    }
+
+    #[test]
     fn slot_candidates_reserve_only_capacity_not_used_by_active_runs() {
         assert_eq!(catalog_slot_candidates(0), vec![0, 1, 2, 3]);
         assert_eq!(catalog_slot_candidates(1), vec![1, 2, 3]);
@@ -1248,7 +1378,11 @@ mod tests {
             name: name.into(),
             ordinal_position: 1,
             column_type: column_type.into(),
-            data_type: column_type.split('(').next().unwrap_or(column_type).into(),
+            data_type: column_type
+                .split(['(', ' '])
+                .next()
+                .unwrap_or(column_type)
+                .into(),
             is_nullable,
             default_value: None,
             extra: String::new(),
