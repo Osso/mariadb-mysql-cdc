@@ -21,10 +21,10 @@ engine. Operational details belong in [the table catalog sync wiki](../wiki/syst
 - [x] `sync-catalog` reads the supplied syncable JSON and immediately starts apply-mode table syncs, blocking until all entries complete or a failure is returned; it has no dry-run/plan mode. `table-catalog` only writes catalogs and does not start either syncs or full dumps.
 - [x] Apply catalog tables through the existing table-sync engine with a hard-coded `max_deletes=0`; `sync-catalog` exposes no override, so catalog execution never deletes target orphans.
 - [x] Use deterministic per-table run IDs in the exact form `<run-id-prefix>-<table>`, where `--run-id-prefix` is required and non-empty; reject any generated ID over 128 bytes before execution.
-- [x] Limit table-sync capacity to four global target-server named slots shared by direct `sync-table` and `sync-catalog` workers. Each worker reserves a table-specific lock and one slot lock, preventing same-table overlap across modes and runners. Progress-table rows with held run-ID advisory locks count toward capacity, including tables outside the catalog; stale unlocked rows do not.
+- [x] Limit table-sync capacity to four target-server slots shared by direct `sync-table` and `sync-catalog` workers. Admission is serialized by target host and port, so databases on the same server share capacity. Each worker reserves a database/table-specific lock and one slot; held legacy progress run-ID locks without reservations consume equivalent capacity. Stale unlocked rows do not.
 - [x] Schedule dependency-ready tables by catalog order, which is smallest estimated row count then name.
-- [x] During catalog generation, exclude children of non-syncable parents with `dependency_on_non_syncable`; during execution, gate each child on every listed non-self FK parent completing. A failed parent blocks its descendants; missing or cyclic dependencies fail closed.
-- [x] Resume interrupted exact run IDs; a matching `status='complete'` row is terminal and is not rerun.
+- [x] During catalog generation, exclude children of non-syncable parents with `dependency_on_non_syncable`; during execution, gate each child on every listed non-self FK parent completing. A failed parent blocks its descendants; missing or cyclic dependencies fail closed after owned workers settle, without waiting for unrelated external syncs.
+- [x] Resume interrupted exact run IDs; a `status='complete'` row is terminal only when its stored immutable run specification exactly matches the current catalog child.
 - [x] Read catalog JSON without mutating it and never execute full dumps; the non-syncable catalog is classification/operator input only.
 
 ## How it works

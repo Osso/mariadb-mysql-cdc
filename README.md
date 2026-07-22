@@ -230,14 +230,15 @@ there is no dry-run/plan mode and `table-catalog` does not launch it. The comman
 waits until all entries complete or a failure is returned. Each table uses run ID
 `<run-id-prefix>-<table>`; the prefix is required and non-empty, and every
 generated ID must be at most 128 bytes. Interrupted exact IDs resume; a matching
-`status='complete'` row is terminal and is not rerun. Direct `sync-table` and
-`sync-catalog` workers share target-server named reservations keyed by target
-database: each holds the table-specific reservation and one of four global slot
-reservations, preventing same-table overlap and limiting both modes to four
-active syncs. Progress-table rows with a held run-ID advisory lock count toward
-capacity, including rows for tables outside the catalog; stale unlocked rows do
-not. Children start only after all listed FK parents complete. Failed, missing,
-or cyclic dependencies fail closed. Each catalog child forces `max_deletes=0`; the
+`status='complete'` row is terminal only when its immutable run specification
+matches the current catalog child. Direct `sync-table` and `sync-catalog`
+workers share one admission lock and four slot reservations keyed by target
+host and port, so databases on the same server share capacity. Each worker also
+holds a database/table-specific reservation, preventing same-table overlap.
+Progress-table rows with a held legacy run-ID advisory lock count toward the
+same four-worker limit; stale unlocked rows do not. Children start only after
+all listed FK parents complete. Owned failures and dependency cycles return
+after owned workers settle without waiting for unrelated external syncs. Each catalog child forces `max_deletes=0`; the
 option is not configurable, so target orphans are never deleted. The
 non-syncable catalog is classification/operator input only; full-dump execution
 is out of scope.

@@ -52,6 +52,6 @@ pub(crate) use run::{
     ExactParentReader, build_sync_run_scope, reconcile_exact_parent, retry_sync_table_operation,
 };
 pub(crate) use run::{
-    find_compatible_failed_run, reconcile_exact_parent_live, run_sync_table_phase_with_run_spec,
-    should_record_sync_run_error,
+    expected_sync_run_spec_json, find_compatible_failed_run, reconcile_exact_parent_live,
+    run_sync_table_phase_with_run_spec, should_record_sync_run_error,
 };

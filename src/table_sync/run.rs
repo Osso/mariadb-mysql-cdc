@@ -478,15 +478,20 @@ fn exact_guest_sync_config(
 }
 
 pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, TableSyncError> {
-    let _reservation =
-        crate::table_catalog::reserve_sync_worker(&config.target, &config.table.name)
-            .map_err(TableSyncError::Progress)?
-            .ok_or_else(|| {
-                TableSyncError::Progress(format!(
-                    "table sync capacity or table reservation unavailable for `{}`",
-                    config.table.name
-                ))
-            })?;
+    progress::MySqlSyncRunProgressStore::new(config.target.clone(), config.progress_table.clone())
+        .ensure()?;
+    let _reservation = crate::table_catalog::reserve_sync_worker(
+        &config.target,
+        &config.progress_table,
+        &config.table.name,
+    )
+    .map_err(TableSyncError::Progress)?
+    .ok_or_else(|| {
+        TableSyncError::Progress(format!(
+            "table sync capacity or table reservation unavailable for `{}`",
+            config.table.name
+        ))
+    })?;
     run_sync_table_reserved(config)
 }
 
@@ -620,6 +625,20 @@ fn build_mysql_repair_target(
         executor,
         sync_insert_mode(config),
     ))
+}
+
+pub(crate) fn expected_sync_run_spec_json(
+    config: &SyncTableConfig,
+) -> Result<String, TableSyncError> {
+    super::range::build_run_spec_json(
+        &build_sync_run_scope(config)?,
+        &config.table,
+        config.chunk_size,
+        config.mode,
+        &config.start_after,
+        &config.end_at,
+        config.max_deletes,
+    )
 }
 
 pub(crate) fn build_sync_run_scope(config: &SyncTableConfig) -> Result<String, TableSyncError> {

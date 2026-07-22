@@ -403,11 +403,7 @@ fn run_sync_catalog(config: &SyncCatalogConfig) -> Result<(), String> {
     loop {
         refresh_run_state(config, &catalog, &receiver, &mut state)?;
         let failures = state.all_failures();
-        if !failures.is_empty()
-            && state.running.is_empty()
-            && state.external_active.is_empty()
-            && state.ready_tables().is_empty()
-        {
+        if !failures.is_empty() && owned_catalog_work_has_settled(&state) {
             return Err(format_catalog_failures(&failures));
         }
         if state.completed.len() == catalog.tables.len() {
@@ -505,41 +501,24 @@ pub(crate) struct SyncWorkerReservation {
     _connection: Conn,
 }
 
+#[cfg(test)]
 trait NamedLockSet {
     type Reservation;
 
     fn try_reserve(&mut self, names: &[String]) -> Result<Option<Self::Reservation>, String>;
 }
 
-struct MySqlNamedLocks {
-    connection: Option<Conn>,
-}
-
-impl NamedLockSet for MySqlNamedLocks {
-    type Reservation = SyncWorkerReservation;
-
-    fn try_reserve(&mut self, names: &[String]) -> Result<Option<Self::Reservation>, String> {
-        let connection = self.connection.as_mut().expect("reservation connection");
-        for name in names {
-            if !acquire_named_lock(connection, name)? {
-                return Ok(None);
-            }
-        }
-        Ok(Some(SyncWorkerReservation {
-            _connection: self.connection.take().expect("reserved connection"),
-        }))
-    }
-}
-
+#[cfg(test)]
 fn acquire_sync_reservation<L: NamedLockSet>(
     locks: &mut L,
+    server_namespace: &str,
     database: &str,
     table: &str,
 ) -> Result<Option<L::Reservation>, String> {
     for slot in 0..MAX_CATALOG_CONCURRENCY {
         let names = vec![
-            sync_table_lock_name(database, table),
-            catalog_slot_lock_name(database, slot),
+            sync_table_lock_name(server_namespace, database, table),
+            catalog_slot_lock_name(server_namespace, slot),
         ];
         if let Some(reservation) = locks.try_reserve(&names)? {
             return Ok(Some(reservation));
@@ -550,32 +529,144 @@ fn acquire_sync_reservation<L: NamedLockSet>(
 
 pub(crate) fn reserve_sync_worker(
     target: &live::TargetMySqlConfig,
+    progress_table: &str,
     table: &str,
 ) -> Result<Option<SyncWorkerReservation>, String> {
-    let connection = target_connection(target)?;
-    acquire_sync_reservation(
-        &mut MySqlNamedLocks {
-            connection: Some(connection),
-        },
+    reserve_sync_worker_with_active_count(target, progress_table, table, 0)
+}
+
+fn reserve_sync_worker_with_active_count(
+    target: &live::TargetMySqlConfig,
+    progress_table: &str,
+    table: &str,
+    active_count: usize,
+) -> Result<Option<SyncWorkerReservation>, String> {
+    if active_count >= MAX_CATALOG_CONCURRENCY {
+        return Ok(None);
+    }
+    let mut connection = target_connection(target)?;
+    let server_namespace = sync_server_lock_namespace(&target.host, target.port);
+    let admission_lock = catalog_admission_lock_name(&server_namespace);
+    if !acquire_named_lock(&mut connection, &admission_lock)? {
+        return Ok(None);
+    }
+    let result = reserve_under_admission_lock(
+        &mut connection,
+        &server_namespace,
         &target.database,
+        progress_table,
         table,
-    )
+        active_count,
+    );
+    release_named_lock(&mut connection, &admission_lock)?;
+    result.map(|reserved| {
+        reserved.then_some(SyncWorkerReservation {
+            _connection: connection,
+        })
+    })
+}
+
+fn reserve_under_admission_lock(
+    connection: &mut Conn,
+    server_namespace: &str,
+    database: &str,
+    progress_table: &str,
+    table: &str,
+    active_count: usize,
+) -> Result<bool, String> {
+    let occupied_slots = count_occupied_slots(connection, server_namespace)?;
+    let legacy_runs =
+        count_legacy_active_runs(connection, server_namespace, database, progress_table)?;
+    if !admission_has_capacity(legacy_runs, occupied_slots, active_count) {
+        return Ok(false);
+    }
+    let table_lock = sync_table_lock_name(server_namespace, database, table);
+    if !acquire_named_lock(connection, &table_lock)? {
+        return Ok(false);
+    }
+    for slot in 0..MAX_CATALOG_CONCURRENCY {
+        let slot_lock = catalog_slot_lock_name(server_namespace, slot);
+        if acquire_named_lock(connection, &slot_lock)? {
+            return Ok(true);
+        }
+    }
+    release_named_lock(connection, &table_lock)?;
+    Ok(false)
+}
+
+fn count_occupied_slots(connection: &mut Conn, server_namespace: &str) -> Result<usize, String> {
+    let mut occupied = 0;
+    for slot in 0..MAX_CATALOG_CONCURRENCY {
+        let name = catalog_slot_lock_name(server_namespace, slot);
+        if named_lock_owner(connection, &name)?.is_some() {
+            occupied += 1;
+        }
+    }
+    Ok(occupied)
+}
+
+fn count_legacy_active_runs(
+    connection: &mut Conn,
+    server_namespace: &str,
+    database: &str,
+    progress_table: &str,
+) -> Result<usize, String> {
+    let table_path = quote_identifier_path(progress_table);
+    let sql = format!(
+        "SELECT run_id, table_name, IS_USED_LOCK(SHA2(run_id,256)) FROM {table_path} WHERE status IN ('running','complete','error')"
+    );
+    let rows = connection
+        .query::<(String, String, Option<u64>), _>(sql)
+        .map_err(|error| format!("failed to count active table sync runs: {error}"))?;
+    let mut count = 0;
+    for (_run_id, table, owner) in rows {
+        if owner.is_none() {
+            continue;
+        }
+        let table_lock = sync_table_lock_name(server_namespace, database, &table);
+        if named_lock_owner(connection, &table_lock)?.is_none() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn admission_has_capacity(
+    legacy_active_runs: usize,
+    occupied_slots: usize,
+    observed_active_count: usize,
+) -> bool {
+    legacy_active_runs + occupied_slots < MAX_CATALOG_CONCURRENCY
+        && observed_active_count < MAX_CATALOG_CONCURRENCY
 }
 
 fn reserve_catalog_worker(
     config: &SyncCatalogConfig,
     table: &str,
-    _active_count: usize,
+    active_count: usize,
 ) -> Result<Option<SyncWorkerReservation>, String> {
-    reserve_sync_worker(&config.connections.target, table)
+    reserve_sync_worker_with_active_count(
+        &config.connections.target,
+        &config.progress_table,
+        table,
+        active_count,
+    )
 }
 
-fn sync_table_lock_name(database: &str, table: &str) -> String {
-    format!("sync-table:{database}:{table}")
+fn sync_server_lock_namespace(host: &str, port: u16) -> String {
+    format!("{}:{port}", host.to_ascii_lowercase())
 }
 
-fn catalog_slot_lock_name(database: &str, slot: usize) -> String {
-    format!("sync-table-slot:{database}:{slot}")
+fn sync_table_lock_name(server_namespace: &str, database: &str, table: &str) -> String {
+    format!("sync-table:{server_namespace}:{database}:{table}")
+}
+
+fn catalog_slot_lock_name(server_namespace: &str, slot: usize) -> String {
+    format!("sync-table-slot:{server_namespace}:{slot}")
+}
+
+fn catalog_admission_lock_name(server_namespace: &str) -> String {
+    format!("sync-table-admission:{server_namespace}")
 }
 
 fn acquire_named_lock(connection: &mut Conn, name: &str) -> Result<bool, String> {
@@ -585,15 +676,34 @@ fn acquire_named_lock(connection: &mut Conn, name: &str) -> Result<bool, String>
         .map_err(|error| format!("failed to reserve catalog lock `{name}`: {error}"))
 }
 
+fn release_named_lock(connection: &mut Conn, name: &str) -> Result<(), String> {
+    connection
+        .exec_drop("SELECT RELEASE_LOCK(SHA2(?,256))", (name,))
+        .map_err(|error| format!("failed to release catalog lock `{name}`: {error}"))
+}
+
+fn named_lock_owner(connection: &mut Conn, name: &str) -> Result<Option<u64>, String> {
+    connection
+        .exec_first("SELECT IS_USED_LOCK(SHA2(?,256))", (name,))
+        .map_err(|error| format!("failed to inspect catalog lock `{name}`: {error}"))
+}
+
+fn owned_catalog_work_has_settled(state: &CatalogRunState) -> bool {
+    state.running.is_empty() && state.ready_tables().is_empty()
+}
+
 fn catalog_dependencies_are_stuck(state: &CatalogRunState) -> bool {
+    let waiting_for_catalog_table = state.catalog.tables.iter().any(|entry| {
+        !state.is_accounted_for(&entry.name) && state.external_active.contains(&entry.name)
+    });
     state.running.is_empty()
-        && state.external_active.is_empty()
+        && !waiting_for_catalog_table
         && state.available_slots() > 0
         && state.ready_tables().is_empty()
         && state.all_failures().is_empty()
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct RunStatuses {
     external_active: BTreeSet<String>,
     completed: Vec<String>,
@@ -607,43 +717,76 @@ fn read_run_statuses(
     let mut connection = target_connection(&config.connections.target)?;
     let table_path = quote_identifier_path(&config.progress_table);
     let sql = format!(
-        "SELECT run_id, table_name, status, COALESCE(last_error, ''), IS_USED_LOCK(SHA2(run_id, 256)) FROM {table_path} WHERE status IN ('running','complete','error')"
+        "SELECT run_id, table_name, run_spec_json, status, COALESCE(last_error, ''), IS_USED_LOCK(SHA2(run_id, 256)) FROM {table_path} WHERE status IN ('running','complete','error')"
     );
     let rows = connection
-        .query::<(String, String, String, String, Option<u64>), _>(sql)
+        .query::<(String, String, String, String, String, Option<u64>), _>(sql)
         .map_err(|error| format!("failed to read catalog run status: {error}"))?;
-    Ok(classify_run_statuses(catalog, &config.run_id_prefix, rows))
+    let expected_specs = expected_catalog_run_specs(config, catalog)?;
+    classify_run_statuses(catalog, &config.run_id_prefix, &expected_specs, rows)
+}
+
+fn expected_catalog_run_specs(
+    config: &SyncCatalogConfig,
+    catalog: &SyncableCatalog,
+) -> Result<BTreeMap<String, String>, String> {
+    catalog
+        .tables
+        .iter()
+        .map(|entry| {
+            let sync_config = catalog_table_sync_config(config, entry);
+            table_sync::expected_sync_run_spec_json(&sync_config)
+                .map(|spec| (entry.name.clone(), spec))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
 }
 
 fn classify_run_statuses(
     catalog: &SyncableCatalog,
     run_id_prefix: &str,
-    rows: Vec<(String, String, String, String, Option<u64>)>,
-) -> RunStatuses {
+    expected_specs: &BTreeMap<String, String>,
+    rows: Vec<(String, String, String, String, String, Option<u64>)>,
+) -> Result<RunStatuses, String> {
     let catalog_names = catalog
         .tables
         .iter()
         .map(|entry| entry.name.as_str())
         .collect::<BTreeSet<_>>();
     let mut statuses = RunStatuses::default();
-    for (run_id, table, status, _error, lock_owner) in rows {
+    for (run_id, table, run_spec_json, status, _error, lock_owner) in rows {
         if lock_owner.is_some() {
             statuses.external_active_count += 1;
             statuses.external_active.insert(table.clone());
         }
         let expected = deterministic_run_id(run_id_prefix, &table);
         if run_id == expected && catalog_names.contains(table.as_str()) && status == "complete" {
+            if expected_specs.get(&table) != Some(&run_spec_json) {
+                return Err(format!(
+                    "run id `{run_id}` already exists with a different immutable specification"
+                ));
+            }
             statuses.completed.push(table);
         }
     }
-    statuses
+    Ok(statuses)
 }
 
 fn run_catalog_table_reserved(
     config: &SyncCatalogConfig,
     entry: &SyncableTableEntry,
 ) -> Result<(), String> {
-    let sync_config = table_sync::SyncTableConfig {
+    let sync_config = catalog_table_sync_config(config, entry);
+    table_sync::run_sync_table_reserved(&sync_config)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn catalog_table_sync_config(
+    config: &SyncCatalogConfig,
+    entry: &SyncableTableEntry,
+) -> table_sync::SyncTableConfig {
+    table_sync::SyncTableConfig {
         source: config.connections.source.clone(),
         target: config.connections.target.clone(),
         table: table_sync::SyncTable {
@@ -660,10 +803,7 @@ fn run_catalog_table_reserved(
         max_deletes: Some(0),
         updated_since: None,
         plan_hash: None,
-    };
-    table_sync::run_sync_table_reserved(&sync_config)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    }
 }
 
 fn deterministic_run_id(prefix: &str, table: &str) -> String {
@@ -1100,6 +1240,27 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_external_sync_does_not_delay_owned_failure_return() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("parent", 1, &[]), entry("child", 2, &["parent"])],
+        };
+        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::from(["unrelated".into()]), 1);
+        state.mark_failed("parent", "boom");
+
+        assert!(owned_catalog_work_has_settled(&state));
+    }
+
+    #[test]
+    fn unrelated_external_sync_does_not_hide_dependency_cycle() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &["b"]), entry("b", 2, &["a"])],
+        };
+        let state = CatalogRunState::new(catalog, 4, BTreeSet::from(["unrelated".into()]), 1);
+
+        assert!(catalog_dependencies_are_stuck(&state));
+    }
+
+    #[test]
     fn nullable_source_requires_nullable_target() {
         let source_table = table(
             "items",
@@ -1353,14 +1514,17 @@ mod tests {
         let statuses = classify_run_statuses(
             &catalog,
             "batch",
+            &BTreeMap::new(),
             vec![(
                 "batch-a".into(),
                 "a".into(),
+                "spec".into(),
                 "error".into(),
                 "temporary".into(),
                 Some(7),
             )],
-        );
+        )
+        .expect("active error run");
         assert_eq!(statuses.external_active_count, 1);
         assert!(statuses.external_active.contains("a"));
     }
@@ -1370,18 +1534,46 @@ mod tests {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
         };
+        let expected_specs = BTreeMap::from([("a".to_string(), "expected".to_string())]);
         let statuses = classify_run_statuses(
             &catalog,
             "batch",
+            &expected_specs,
             vec![(
                 "batch-a".into(),
                 "a".into(),
+                "expected".into(),
                 "complete".into(),
                 String::new(),
                 None,
             )],
-        );
+        )
+        .expect("matching complete run");
         assert_eq!(statuses.completed, vec!["a"]);
+    }
+
+    #[test]
+    fn complete_catalog_child_with_changed_spec_fails_closed() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &[])],
+        };
+        let expected_specs = BTreeMap::from([("a".to_string(), "expected".to_string())]);
+        let error = classify_run_statuses(
+            &catalog,
+            "batch",
+            &expected_specs,
+            vec![(
+                "batch-a".into(),
+                "a".into(),
+                "stale".into(),
+                "complete".into(),
+                String::new(),
+                None,
+            )],
+        )
+        .expect_err("mismatched completed spec");
+
+        assert!(error.contains("different immutable specification"));
     }
 
     #[test]
@@ -1392,40 +1584,57 @@ mod tests {
         let statuses = classify_run_statuses(
             &catalog,
             "batch",
+            &BTreeMap::new(),
             vec![(
                 "other-a".into(),
                 "a".into(),
+                "spec".into(),
                 "running".into(),
                 String::new(),
                 None,
             )],
-        );
+        )
+        .expect("stale run");
         assert_eq!(statuses.external_active_count, 0);
         assert!(statuses.external_active.is_empty());
     }
 
     #[test]
-    fn slot_lock_namespace_is_server_local_not_hostname_specific() {
+    fn slot_lock_namespace_is_shared_across_databases_on_one_server() {
+        let first = sync_server_lock_namespace("mysql.example.com", 25060);
+        let second = sync_server_lock_namespace("mysql.example.com", 25060);
+
         assert_eq!(
-            catalog_slot_lock_name("globalcomix", 2),
-            "sync-table-slot:globalcomix:2"
+            catalog_slot_lock_name(&first, 2),
+            catalog_slot_lock_name(&second, 2)
         );
+        assert_eq!(
+            catalog_admission_lock_name(&first),
+            catalog_admission_lock_name(&second)
+        );
+    }
+
+    #[test]
+    fn admission_counts_legacy_run_locks_and_new_slot_reservations() {
+        assert!(!admission_has_capacity(1, 3, 0));
+        assert!(!admission_has_capacity(0, 3, 4));
+        assert!(admission_has_capacity(1, 2, 3));
     }
 
     #[test]
     fn direct_and_catalog_reservations_cannot_overlap_the_same_table() {
         let mut locks = TestNamedLocks::default();
-        let direct = acquire_sync_reservation(&mut locks, "db", "items")
+        let direct = acquire_sync_reservation(&mut locks, "server:25060", "db", "items")
             .expect("direct reservation")
             .expect("direct acquired");
         assert!(
-            acquire_sync_reservation(&mut locks, "db", "items")
+            acquire_sync_reservation(&mut locks, "server:25060", "db", "items")
                 .expect("catalog reservation")
                 .is_none()
         );
         locks.release(direct);
         assert!(
-            acquire_sync_reservation(&mut locks, "db", "items")
+            acquire_sync_reservation(&mut locks, "server:25060", "db", "items")
                 .expect("catalog retry")
                 .is_some()
         );
