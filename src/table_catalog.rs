@@ -1044,6 +1044,8 @@ fn catalog_table_sync_config(
     }
 }
 
+const CATALOG_RUN_ID_V2_DOMAIN: &[u8] = b"mariadb-mysql-cdc:catalog-run-id:v2\0";
+
 fn deterministic_run_id(prefix: &str, target_database: &str, table: &str) -> String {
     let tuple = format!(
         "{}:{}:{}",
@@ -1051,7 +1053,10 @@ fn deterministic_run_id(prefix: &str, target_database: &str, table: &str) -> Str
         encode_run_id_component(target_database),
         encode_run_id_component(table)
     );
-    let digest = Sha256::digest(tuple.as_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update(CATALOG_RUN_ID_V2_DOMAIN);
+    hasher.update(tuple.as_bytes());
+    let digest = hasher.finalize();
     format!("catalog-v2-{digest:x}")
 }
 
@@ -2731,6 +2736,26 @@ mod tests {
     }
 
     #[test]
+    fn catalog_run_id_hashes_a_domain_tagged_framed_tuple() {
+        let tuple = format!(
+            "{}:{}:{}",
+            encode_run_id_component("j"),
+            encode_run_id_component("globalcomix"),
+            encode_run_id_component("items")
+        );
+        let domain_tag = b"mariadb-mysql-cdc:catalog-run-id:v2\0";
+        let mut tagged_preimage = domain_tag.to_vec();
+        tagged_preimage.extend_from_slice(tuple.as_bytes());
+        let tagged_digest = Sha256::digest(&tagged_preimage);
+        let untagged_digest = Sha256::digest(tuple.as_bytes());
+        let run_id = deterministic_run_id("j", "globalcomix", "items");
+
+        assert_eq!(run_id, format!("catalog-v2-{tagged_digest:x}"));
+        assert_ne!(run_id, format!("catalog-v2-{untagged_digest:x}"));
+        assert_eq!(run_id.len(), 75);
+    }
+
+    #[test]
     fn deterministic_json_and_run_ids_are_stable() {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
@@ -2740,7 +2765,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             deterministic_run_id("full-20260722", "globalcomix", "a"),
-            "catalog-v2-ae0defa6c464a5c1ec07f58277573c666a7052f5753eadd8b554713c5db7f98a"
+            "catalog-v2-49302b7889e4d58992c95bb4fc390331327fa95b9d9207ebc01c28ff7e789dd2"
         );
         assert_ne!(
             deterministic_run_id("full-20260722", "globalcomix", "a"),
