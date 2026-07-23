@@ -407,7 +407,14 @@ fn duplicate_payment_trigger_outcome<T: AsRef<str>>(
             columns
                 .iter()
                 .position(|column| column.as_ref() == *identity_column)
-                .is_some_and(|index| source_values.get(index) == existing_rows[0].get(index))
+                .is_some_and(|index| {
+                    let source_value = source_values.get(index).cloned().and_then(value_to_string);
+                    let existing_value = existing_rows[0]
+                        .get(index)
+                        .cloned()
+                        .and_then(value_to_string);
+                    source_value == existing_value
+                })
         });
     if identity_matches {
         TargetExecutionOutcome::DuplicateIgnored(conflict)

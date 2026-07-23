@@ -334,25 +334,23 @@ fn treats_matching_existing_payment_identity_as_already_applied() {
         "authorization_id",
     ];
     let source = [
-        "420054",
-        "427524",
-        "8",
-        "6",
-        "tx",
-        "original",
-        "authorization",
-    ]
-    .map(|value| Value::Bytes(value.as_bytes().to_vec()));
+        Value::Int(420054),
+        Value::Int(427524),
+        Value::Int(8),
+        Value::Int(6),
+        Value::Bytes(b"tx".to_vec()),
+        Value::Bytes(b"original".to_vec()),
+        Value::Bytes(b"authorization".to_vec()),
+    ];
     let existing = [
-        "420054",
-        "427524",
-        "8",
-        "3",
-        "tx",
-        "original",
-        "authorization",
-    ]
-    .map(|value| Value::Bytes(value.as_bytes().to_vec()));
+        Value::UInt(420054),
+        Value::UInt(427524),
+        Value::UInt(8),
+        Value::UInt(3),
+        Value::Bytes(b"tx".to_vec()),
+        Value::Bytes(b"original".to_vec()),
+        Value::Bytes(b"authorization".to_vec()),
+    ];
 
     assert_eq!(
         duplicate_payment_trigger_outcome(
