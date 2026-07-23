@@ -1023,6 +1023,14 @@ fn validate_catalog(catalog: &SyncableCatalog) -> Result<(), String> {
     if names.len() != catalog.tables.len() {
         return Err("catalog contains duplicate table names".to_string());
     }
+    validate_catalog_dependencies_exist(catalog, &names)?;
+    validate_catalog_dependencies_are_acyclic(catalog, names)
+}
+
+fn validate_catalog_dependencies_exist(
+    catalog: &SyncableCatalog,
+    names: &BTreeSet<&str>,
+) -> Result<(), String> {
     for entry in &catalog.tables {
         for parent in &entry.parent_dependencies {
             if !names.contains(parent.as_str()) {
@@ -1033,6 +1041,13 @@ fn validate_catalog(catalog: &SyncableCatalog) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+fn validate_catalog_dependencies_are_acyclic<'a>(
+    catalog: &'a SyncableCatalog,
+    mut remaining: BTreeSet<&'a str>,
+) -> Result<(), String> {
     let dependencies = catalog
         .tables
         .iter()
@@ -1047,23 +1062,16 @@ fn validate_catalog(catalog: &SyncableCatalog) -> Result<(), String> {
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut remaining = names;
     while !remaining.is_empty() {
         let ready = remaining
             .iter()
-            .filter(|name| {
-                dependencies
-                    .get(**name)
-                    .is_some_and(|parents| parents.is_disjoint(&remaining))
-            })
+            .filter(|name| dependencies[*name].is_disjoint(&remaining))
             .copied()
             .collect::<Vec<_>>();
         if ready.is_empty() {
             return Err("catalog has unresolved or cyclic dependencies".to_string());
         }
-        for name in ready {
-            remaining.remove(name);
-        }
+        remaining.retain(|name| !ready.contains(name));
     }
     Ok(())
 }
@@ -1191,38 +1199,9 @@ fn resolve_catalog_output_destination(
     let normalized = normalize_lexical_path(path);
     match fs::symlink_metadata(&normalized) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            if !visited_links.insert(normalized.clone()) {
-                return Err(format!(
-                    "failed to resolve catalog output {}: symbolic link cycle",
-                    path.display()
-                ));
-            }
-            let target = fs::read_link(&normalized).map_err(|error| {
-                format!(
-                    "failed to resolve catalog output {}: {error}",
-                    path.display()
-                )
-            })?;
-            let target = if target.is_absolute() {
-                target
-            } else {
-                normalized
-                    .parent()
-                    .unwrap_or_else(|| Path::new("/"))
-                    .join(target)
-            };
-            resolve_catalog_output_destination(&target, visited_links)
+            resolve_catalog_output_symlink(&normalized, visited_links)
         }
-        Ok(metadata) => Ok(CatalogOutputDestination {
-            path: fs::canonicalize(&normalized).map_err(|error| {
-                format!(
-                    "failed to resolve catalog output {}: {error}",
-                    path.display()
-                )
-            })?,
-            #[cfg(unix)]
-            file_identity: Some(file_identity(&metadata)),
-        }),
+        Ok(metadata) => existing_catalog_output_destination(&normalized, &metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             unresolved_catalog_output_destination(&normalized)
         }
@@ -1231,6 +1210,46 @@ fn resolve_catalog_output_destination(
             path.display()
         )),
     }
+}
+
+fn resolve_catalog_output_symlink(
+    path: &Path,
+    visited_links: &mut BTreeSet<PathBuf>,
+) -> Result<CatalogOutputDestination, String> {
+    if !visited_links.insert(path.to_path_buf()) {
+        return Err(format!(
+            "failed to resolve catalog output {}: symbolic link cycle",
+            path.display()
+        ));
+    }
+    let target = fs::read_link(path).map_err(|error| {
+        format!(
+            "failed to resolve catalog output {}: {error}",
+            path.display()
+        )
+    })?;
+    let target = if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or_else(|| Path::new("/")).join(target)
+    };
+    resolve_catalog_output_destination(&target, visited_links)
+}
+
+fn existing_catalog_output_destination(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<CatalogOutputDestination, String> {
+    Ok(CatalogOutputDestination {
+        path: fs::canonicalize(path).map_err(|error| {
+            format!(
+                "failed to resolve catalog output {}: {error}",
+                path.display()
+            )
+        })?,
+        #[cfg(unix)]
+        file_identity: Some(file_identity(metadata)),
+    })
 }
 
 fn unresolved_catalog_output_destination(path: &Path) -> Result<CatalogOutputDestination, String> {
