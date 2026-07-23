@@ -296,9 +296,10 @@ plaintext-only for the current source.
 
 The `table-catalog` and `sync-catalog` commands require an explicit, non-empty
 `--target-tls-ca-file PATH`; their command contract defines no default path.
-Target DigitalOcean MySQL connections must use the configured CA and hostname
-verification. Do not weaken target CA or hostname verification when changing
-source transport. See [connection policy](docs/schema-inventory.md#connection-policy).
+Target DigitalOcean MySQL connections must use the configured CA. DNS/hostname
+endpoints must also verify certificate identity; IP endpoints retain CA/chain
+validation but skip DNS name matching. Do not weaken target CA or hostname
+verification when changing source transport. See [connection policy](docs/schema-inventory.md#connection-policy).
 
 ## Insert conflict policy
 
