@@ -1265,18 +1265,25 @@ fn existing_catalog_output_destination(
 }
 
 fn unresolved_catalog_output_destination(path: &Path) -> Result<CatalogOutputDestination, String> {
-    let mut existing_ancestor = path.to_path_buf();
-    let mut unresolved_components = Vec::new();
-    let canonical_ancestor = loop {
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect::<Vec<_>>();
+    for split in (0..components.len()).rev() {
+        let existing_ancestor = components[..split].iter().collect::<PathBuf>();
         match fs::canonicalize(&existing_ancestor) {
-            Ok(canonical) => break canonical,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let component = existing_ancestor.file_name().ok_or_else(|| {
-                    format!("catalog output {} has no existing ancestor", path.display())
-                })?;
-                unresolved_components.push(component.to_os_string());
-                existing_ancestor.pop();
+            Ok(canonical_ancestor) => {
+                let mut resolved = canonical_ancestor;
+                for component in &components[split..] {
+                    resolved.push(component);
+                }
+                return Ok(CatalogOutputDestination {
+                    path: normalize_lexical_path(&resolved),
+                    #[cfg(unix)]
+                    file_identity: None,
+                });
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(format!(
                     "failed to resolve catalog output ancestor {}: {error}",
@@ -1284,16 +1291,11 @@ fn unresolved_catalog_output_destination(path: &Path) -> Result<CatalogOutputDes
                 ));
             }
         }
-    };
-    let mut resolved = canonical_ancestor;
-    for component in unresolved_components.iter().rev() {
-        resolved.push(component);
     }
-    Ok(CatalogOutputDestination {
-        path: normalize_lexical_path(&resolved),
-        #[cfg(unix)]
-        file_identity: None,
-    })
+    Err(format!(
+        "catalog output {} has no existing ancestor",
+        path.display()
+    ))
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -2586,6 +2588,24 @@ mod tests {
 
         assert!(error.contains("same filesystem destination"), "{error}");
         assert!(!first.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn nonexistent_parent_components_are_resolved_after_physical_ancestor() {
+        let directory = unique_catalog_test_directory("nonexistent-parent-components");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let physical = directory.join("catalog.json");
+        let alias = directory
+            .join("missing-parent")
+            .join("..")
+            .join("catalog.json");
+
+        let error = validate_distinct_catalog_output_paths(&physical, &alias)
+            .expect_err("nonexistent parent alias must conflict");
+
+        assert!(error.contains("same filesystem destination"), "{error}");
+        assert!(!physical.exists(), "catalog output was created");
         let _ = fs::remove_dir_all(directory);
     }
 
