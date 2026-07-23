@@ -360,7 +360,8 @@ fn propagate_non_syncable_dependencies(
         .foreign_keys
         .iter()
         .filter(|foreign_key| {
-            foreign_key.referenced_schema == inventory.schema
+            source_tables.contains(foreign_key.table.as_str())
+                && foreign_key.referenced_schema == inventory.schema
                 && foreign_key.table != foreign_key.referenced_table
         })
         .fold(
@@ -2154,6 +2155,23 @@ mod tests {
             vec![NonSyncableReason::DependencyOnNonSyncable]
         );
         assert!(catalogs.syncable.is_empty());
+    }
+
+    #[test]
+    fn target_only_fk_does_not_create_catalog_entry_without_source_child() {
+        let source = inventory(vec![], vec![]);
+        let target = inventory(
+            vec![
+                table("child", vec![column("id"), column("parent_id")], vec!["id"]),
+                table("parent", vec![column("id")], vec!["id"]),
+            ],
+            vec![foreign_key("child", "parent")],
+        );
+
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+
+        assert!(catalogs.syncable.is_empty());
+        assert!(catalogs.non_syncable.is_empty());
     }
 
     #[test]
