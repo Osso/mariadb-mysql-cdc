@@ -27,6 +27,24 @@ conflicting secondary key.
       divergent `ROW INSERT` values and every non-`INSERT` `1062` unique conflict
       persist evidence and abort. Only equal `ROW INSERT` duplicates continue;
       the default `error` policy fails native row duplicates.
+- [x] The only secondary-unique exception is a superseded historical insert on
+      `globalcomix.users`: a ROW `INSERT` whose duplicate index is exactly
+      `users.name` may be deferred as one row-level candidate. At XID, the
+      verifier retains the complete historical image, opens one source
+      consistent snapshot, captures its binlog coordinate, and requires that
+      coordinate to be beyond the candidate transaction. It requires exactly
+      one complete source row for the historical primary key and exactly one
+      complete source row owning the historical name, with the historical
+      primary key no longer owning that name and the owner having a different
+      primary key. The active target transaction re-reads both identities with
+      `SELECT ... FOR UPDATE`; complete canonical source and target row hashes
+      must match. Only then is that insert treated as a no-op; later rows in
+      the same source transaction still apply. The XID checkpoint, exact
+      conflict observation/resolution evidence, and remaining row effects are
+      committed atomically. Any failed predicate or commit rolls back target
+      effects and checkpoint advancement and leaves unresolved conflict
+      evidence; every other secondary-unique conflict keeps the ordinary abort
+      path.
 - [x] Successful equal native ROW `INSERT` no-ops and successful
       `replace-divergent-pk` replacements never create a new ledger row; they
       stage resolution of an already-recorded unresolved row only.
@@ -42,9 +60,11 @@ conflicting secondary key.
       source-image column by that primary-key predicate, and require exactly one
       matched target row. Missing/multiple PK rows or any other update count persist
       conflict evidence and abort without checkpoint advancement.
-      Secondary-unique, foreign-key, CHECK, and replacement-update conflicts never
-      use this path and remain durable aborting conflicts. The accepted policy risk
-      is overwriting the divergent target row. Replacement keeps applying rows and
+      Foreign-key, CHECK, and replacement-update conflicts never use this path
+      and remain durable aborting conflicts. Secondary-unique conflicts also
+      remain durable aborting conflicts except for the separately specified
+      superseded `globalcomix.users`/`users.name` insert proof above. The accepted
+      policy risk is overwriting the divergent target row. Replacement keeps applying rows and
       may checkpoint; if its enclosing target transaction later rolls back, the
       independent ledger evidence survives while the replacement itself rolls back.
 - [x] Stage supported constraint-conflict observations within the source
@@ -98,8 +118,10 @@ is native ROW-only and replaces unequal rows only for a `PRIMARY` duplicate usin
 a primary-key UPDATE of the source image; it records durable evidence only when
 a matching unresolved conflict already exists, then continues so the target
 transaction/checkpoint can commit. Successful no-op/replacement events never
-create ledger rows. Secondary-unique, foreign-key, CHECK, and replacement-update
-conflicts always persist evidence and abort. The accepted overwrite risk is
+create ledger rows. Foreign-key, CHECK, and replacement-update conflicts always
+persist evidence and abort. Secondary-unique conflicts do too, except for the
+separately specified superseded `globalcomix.users`/`users.name` insert proof,
+which can commit only after its full source/target proof. The accepted overwrite risk is
 explicit. On the live target-table checkpoint path, the stream locks and validates
 the predecessor checkpoint, writes the event-end checkpoint in that same target
 transaction, executes staged resolution SQL, and commits once; only after COMMIT

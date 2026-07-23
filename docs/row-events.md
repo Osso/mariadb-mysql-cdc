@@ -33,11 +33,18 @@ ledger evidence only when the target row fetched by source primary key exactly
 equals the source row. `replace-divergent-pk` replaces an unequal row only when
 MySQL reports `PRIMARY`, using a primary-key UPDATE of the source image; it
 records durable replacement evidence and allows checkpoint advancement. The
-accepted risk is overwriting the divergent target row. Secondary-unique,
-foreign-key, CHECK, and replacement-update conflicts persist evidence and abort;
-if a later conflict rolls back the target transaction, the replacement rolls back
-but its independent ledger observation survives. Supported non-duplicate
-constraint conflicts remain durable repair debt regardless of this policy.
+accepted risk is overwriting the divergent target row. Foreign-key, CHECK, and
+replacement-update conflicts persist evidence and abort. Secondary-unique
+conflicts do too, except the narrow superseded historical `globalcomix.users`
+ROW `INSERT` on the exact `users.name` index: the stream defers only that row,
+proves complete source/target convergence for the historical PK and current
+unique owner using a source consistent snapshot plus active-transaction
+`SELECT ... FOR UPDATE`, then commits the remaining source-transaction rows,
+exact observation/resolution evidence, and XID checkpoint atomically. Any proof
+or commit failure rolls back target effects and checkpoint advancement. If a later
+conflict rolls back the target transaction, the replacement rolls back but its
+independent ledger observation survives. Supported non-duplicate constraint
+conflicts remain durable repair debt regardless of this policy.
 
 `--insert-conflict-policy ignore-duplicate` applies to this native ROW path.
 A MySQL `1062` from either a ROW `INSERT` or `UPDATE` is logged as skipped,

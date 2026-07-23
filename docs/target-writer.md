@@ -32,9 +32,16 @@ one row and the in-place primary-key UPDATE matches exactly one target row. Miss
 or multiple lookup rows, zero/multiple matched rows, and update failures persist
 evidence and abort without checkpoint advancement. The accepted overwrite risk is
 explicit; replacement evidence is durable and a successful replacement can
-checkpoint. Secondary-unique, foreign-key, CHECK, and replacement-update conflicts
-persist evidence and abort, rolling back the target transaction/checkpoint. If a
-later conflict rolls back the enclosing transaction, the replacement rolls back but
+checkpoint. Foreign-key, CHECK, and replacement-update conflicts persist evidence
+and abort, rolling back the target transaction/checkpoint. Secondary-unique
+conflicts follow that same path except the narrow superseded historical
+`globalcomix.users` ROW `INSERT` on exact `users.name`: the live stream defers
+only that row, requires complete source/target PK and unique-owner convergence
+from one source consistent snapshot plus active-transaction `SELECT ... FOR
+UPDATE` reads, then commits remaining source-transaction rows, exact
+observation/resolution evidence, and the XID checkpoint atomically. Any failed
+proof or commit rolls back target effects/checkpoint advancement. If a later
+conflict rolls back the enclosing transaction, the replacement rolls back but
 the independent ledger evidence remains. The default `error` policy fails native
 row duplicates.
 
