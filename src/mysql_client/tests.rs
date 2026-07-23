@@ -248,6 +248,43 @@ fn connection_opts_use_explicit_ca_for_tls() {
 }
 
 #[test]
+fn locked_users_evidence_sql_uses_complete_ordered_columns_parameters_and_row_locks() {
+    assert_eq!(
+        USERS_COLUMNS_FOR_EVIDENCE_SQL,
+        "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='users' ORDER BY ordinal_position"
+    );
+    let sql = build_locked_users_evidence_sql(&[
+        "id".to_string(),
+        "email".to_string(),
+        "name".to_string(),
+    ])
+    .expect("metadata columns");
+
+    assert_eq!(
+        sql,
+        "SELECT `id`, `email`, `name` FROM `globalcomix`.`users` WHERE `id` = ? OR `name` = ? ORDER BY `id` FOR UPDATE"
+    );
+    assert_eq!(sql.matches('?').count(), 2);
+}
+
+#[test]
+fn locked_users_evidence_query_failure_is_explicit() {
+    let error = build_locked_users_evidence(
+        vec!["id".to_string()],
+        Err(TargetExecuteError::new("locked users query failed")),
+    )
+    .expect_err("query failure must propagate");
+
+    assert_eq!(error.to_string(), "locked users query failed");
+}
+
+#[test]
+fn locked_users_evidence_rejects_missing_metadata() {
+    let error = build_locked_users_evidence_sql(&[]).expect_err("empty metadata must fail");
+    assert!(error.to_string().contains("no columns"));
+}
+
+#[test]
 fn stream_lease_uses_nonblocking_hashed_mysql_lock() {
     assert_eq!(
         build_stream_lease_sql("cdc-stream:globalcomix"),

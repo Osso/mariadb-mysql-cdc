@@ -135,10 +135,12 @@ fn replaced_divergent_primary_continues_and_records_durable_evidence() {
         .expect("seed conflict");
     let mut pending_resolutions = Vec::new();
     let mut pending_observations = Vec::new();
+    let mut deferred_superseded_inserts = Vec::new();
     let mut context = RowConflictContext {
         store: &mut ledger,
         pending_resolutions: &mut pending_resolutions,
         pending_observations: &mut pending_observations,
+        deferred_superseded_inserts: &mut deferred_superseded_inserts,
         source_identity: "source-a",
         source_server_id: 7,
         end_position: 200,
@@ -206,10 +208,12 @@ fn ignored_duplicate_row_continues_without_persisting_conflict() {
     .expect("prior conflict");
     let mut pending_resolutions = Vec::new();
     let mut pending_observations = Vec::new();
+    let mut deferred_superseded_inserts = Vec::new();
     let mut context = RowConflictContext {
         store: &mut ledger,
         pending_resolutions: &mut pending_resolutions,
         pending_observations: &mut pending_observations,
+        deferred_superseded_inserts: &mut deferred_superseded_inserts,
         source_identity: "source-a",
         source_server_id: 7,
         end_position: 200,

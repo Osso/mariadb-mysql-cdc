@@ -53,10 +53,17 @@ pub struct RowUpdate {
     pub after: RowImage,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeferredSupersededInsertCandidate {
+    pub observation: crate::conflict_repair::ConflictObservation,
+    pub historical_change: crate::target::TargetRowChange,
+}
+
 pub struct RowConflictContext<'a> {
     pub store: &'a mut dyn ConflictStore,
     pub pending_resolutions: &'a mut Vec<ConflictResolution>,
     pub pending_observations: &'a mut Vec<crate::conflict_repair::ConflictObservation>,
+    pub deferred_superseded_inserts: &'a mut Vec<DeferredSupersededInsertCandidate>,
     pub source_identity: &'a str,
     pub source_server_id: u64,
     pub end_position: u64,

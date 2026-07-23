@@ -1,6 +1,7 @@
 use crate::checkpoint::Checkpoint;
 use crate::snapshot::{SnapshotRow, SnapshotTarget};
 use mysql::Value;
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
@@ -76,6 +77,24 @@ pub trait TargetExecutor {
     }
 }
 
+/// One complete `globalcomix.users` row locked on the target executor's active transaction.
+///
+/// `values` follow `UsersActiveTransactionEvidence::columns` exactly. `row_hash` is SHA-256
+/// over that ordered row using distinct type tags, explicit byte lengths, and a distinct NULL tag.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LockedUsersRowEvidence {
+    pub values: Vec<Value>,
+    pub row_hash: String,
+}
+
+/// Complete locked target rows matching either the historical primary key or historical name.
+/// Cardinality is preserved so callers must reject missing or ambiguous evidence explicitly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsersActiveTransactionEvidence {
+    pub columns: Vec<String>,
+    pub rows: Vec<LockedUsersRowEvidence>,
+}
+
 pub trait TransactionalTargetExecutor: TargetExecutor {
     fn acquire_stream_lease(&self, _lease_name: &str) -> Result<(), TargetExecuteError> {
         Ok(())
@@ -98,8 +117,79 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
             params: Vec::new(),
         })
     }
+    fn read_locked_users_supersession_evidence(
+        &self,
+        _historical_primary_key: &Value,
+        _historical_name: &Value,
+    ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+        Err(TargetExecuteError::new(
+            "active-transaction users supersession evidence is unsupported by this target executor",
+        ))
+    }
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
+}
+
+pub(crate) fn hash_ordered_mysql_row(values: &[Value]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mariadb-mysql-cdc:typed-mysql-row:v1\0");
+    for value in values {
+        hash_mysql_value(&mut hasher, value);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_mysql_value(hasher: &mut Sha256, value: &Value) {
+    match value {
+        Value::NULL => hasher.update([0]),
+        Value::Bytes(bytes) => hash_tagged_bytes(hasher, 1, bytes),
+        Value::Int(number) => hash_tagged_bytes(hasher, 2, &number.to_be_bytes()),
+        Value::UInt(number) => hash_tagged_bytes(hasher, 3, &number.to_be_bytes()),
+        Value::Float(number) => hash_tagged_bytes(hasher, 4, &number.to_bits().to_be_bytes()),
+        Value::Double(number) => hash_tagged_bytes(hasher, 5, &number.to_bits().to_be_bytes()),
+        Value::Date(year, month, day, hour, minute, second, micros) => {
+            let mut encoded = Vec::with_capacity(11);
+            encoded.extend_from_slice(&year.to_be_bytes());
+            encoded.extend_from_slice(&[*month, *day, *hour, *minute, *second]);
+            encoded.extend_from_slice(&micros.to_be_bytes());
+            hash_tagged_bytes(hasher, 6, &encoded);
+        }
+        Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            let mut encoded = Vec::with_capacity(12);
+            encoded.push(u8::from(*negative));
+            encoded.extend_from_slice(&days.to_be_bytes());
+            encoded.extend_from_slice(&[*hours, *minutes, *seconds]);
+            encoded.extend_from_slice(&micros.to_be_bytes());
+            hash_tagged_bytes(hasher, 7, &encoded);
+        }
+    }
+}
+
+fn hash_tagged_bytes(hasher: &mut Sha256, tag: u8, bytes: &[u8]) {
+    hasher.update([tag]);
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+pub(crate) fn locked_users_evidence(
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+    let expected = columns.len();
+    let rows = rows
+        .into_iter()
+        .map(|values| {
+            if values.len() != expected {
+                return Err(TargetExecuteError::new(format!(
+                    "locked globalcomix.users row returned {} values, expected {expected}",
+                    values.len()
+                )));
+            }
+            let row_hash = hash_ordered_mysql_row(&values);
+            Ok(LockedUsersRowEvidence { values, row_hash })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(UsersActiveTransactionEvidence { columns, rows })
 }
 
 pub(crate) fn build_primary_key_replacement_statement(change: &TargetRowChange) -> SqlStatement {
@@ -522,6 +612,14 @@ where
         checkpoint: &Checkpoint,
     ) -> Result<(), TargetExecuteError> {
         (*self).save_transaction_checkpoint(checkpoint_table, checkpoint_name, checkpoint)
+    }
+
+    fn read_locked_users_supersession_evidence(
+        &self,
+        historical_primary_key: &Value,
+        historical_name: &Value,
+    ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+        (*self).read_locked_users_supersession_evidence(historical_primary_key, historical_name)
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
@@ -1170,6 +1268,54 @@ mod tests {
     }
 
     #[test]
+    fn default_active_transaction_users_evidence_fails_explicitly() {
+        let executor = RecordingExecutor::default();
+        let error = TransactionalRecordingExecutor(executor)
+            .read_locked_users_supersession_evidence(
+                &Value::Int(2_070_980),
+                &Value::Bytes(b"-3572".to_vec()),
+            )
+            .expect_err("default implementation must reject unsupported evidence reads");
+
+        assert!(error.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn typed_row_hash_changes_for_every_full_row_difference() {
+        let base = vec![Value::Int(7), Value::Bytes(b"name".to_vec()), Value::NULL];
+        let base_hash = hash_ordered_mysql_row(&base);
+        for changed in [
+            vec![Value::Int(8), Value::Bytes(b"name".to_vec()), Value::NULL],
+            vec![Value::Int(7), Value::Bytes(b"other".to_vec()), Value::NULL],
+            vec![
+                Value::Int(7),
+                Value::Bytes(b"name".to_vec()),
+                Value::Bytes(b"NULL".to_vec()),
+            ],
+            vec![Value::UInt(7), Value::Bytes(b"name".to_vec()), Value::NULL],
+        ] {
+            assert_ne!(hash_ordered_mysql_row(&changed), base_hash);
+        }
+    }
+
+    #[test]
+    fn locked_users_evidence_preserves_zero_one_and_multiple_rows() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        for rows in [
+            vec![],
+            vec![vec![Value::Int(1), Value::Bytes(b"one".to_vec())]],
+            vec![
+                vec![Value::Int(1), Value::Bytes(b"one".to_vec())],
+                vec![Value::Int(2), Value::Bytes(b"two".to_vec())],
+            ],
+        ] {
+            let expected = rows.len();
+            let evidence = locked_users_evidence(columns.clone(), rows).expect("valid rows");
+            assert_eq!(evidence.rows.len(), expected);
+        }
+    }
+
+    #[test]
     fn builds_primary_key_replacement_update_from_source_image() {
         let change = TargetRowChange {
             statement: SqlStatement {
@@ -1390,6 +1536,45 @@ mod tests {
                 Some(message) => Err(TargetExecuteError::new(message)),
                 None => Ok(()),
             }
+        }
+    }
+
+    struct TransactionalRecordingExecutor(RecordingExecutor);
+
+    impl TargetExecutor for TransactionalRecordingExecutor {
+        fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
+            self.0.execute(statement)
+        }
+    }
+
+    impl TransactionalTargetExecutor for TransactionalRecordingExecutor {
+        fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
+            Ok(())
+        }
+
+        fn load_transaction_checkpoint_for_update(
+            &self,
+            _checkpoint_table: &str,
+            _checkpoint_name: &str,
+        ) -> Result<Option<Checkpoint>, TargetExecuteError> {
+            Ok(None)
+        }
+
+        fn save_transaction_checkpoint(
+            &self,
+            _checkpoint_table: &str,
+            _checkpoint_name: &str,
+            _checkpoint: &Checkpoint,
+        ) -> Result<(), TargetExecuteError> {
+            Ok(())
+        }
+
+        fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
+            Ok(())
+        }
+
+        fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
+            Ok(())
         }
     }
 }

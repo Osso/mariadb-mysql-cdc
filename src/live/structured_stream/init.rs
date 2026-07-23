@@ -327,7 +327,7 @@ where
         &mut source_row_transaction_open,
         input,
         stop_decision,
-        |state, input| dispatch_stream_event(runtime, state, &checkpoint, input),
+        |state, input| dispatch_stream_event(config, runtime, state, &checkpoint, input),
     );
     runtime.state = state;
     runtime.progress = progress;
@@ -398,6 +398,7 @@ where
 }
 
 fn dispatch_stream_event<C>(
+    config: &ApplyBinlogConfig,
     runtime: &mut StreamRuntime,
     state: &mut StructuredEventState,
     checkpoint: &StreamCheckpointContext<'_, C>,
@@ -418,6 +419,42 @@ where
         source_identity,
         ..
     } = runtime;
+    if matches!(input.event, BinlogEvent::XidEvent(_))
+        && target_transaction.has_deferred_superseded_inserts()
+    {
+        let source = superseded_source_connection_config(config)?;
+        let checkpoint_table = checkpoint.table.ok_or_else(|| {
+            ApplyBinlogError::Checkpoint(
+                "superseded insert recovery requires transactional checkpoint table".to_string(),
+            )
+        })?;
+        let checkpoint_name = checkpoint.name.ok_or_else(|| {
+            ApplyBinlogError::Checkpoint(
+                "superseded insert recovery requires checkpoint name".to_string(),
+            )
+        })?;
+        let xid_end_position = u64::from(input.header.next_event_position);
+        target_transaction.finalize_deferred_superseded_inserts_at(xid_end_position);
+        let mut verifier = super::superseded_verifier::ProductionSupersededInsertVerifier::new(
+            &source,
+            applier.executor(),
+        );
+        target_transaction.verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            applier.executor(),
+            &mut verifier,
+            conflict_store,
+            xid_end_position,
+            checkpoint_table,
+            checkpoint_name,
+        )?;
+        return Ok(StructuredEventOutcome {
+            policy: EventPolicy::CommitTransaction,
+            resume_coordinate: Some(BinlogCoordinate {
+                file: current_file.clone(),
+                position: xid_end_position,
+            }),
+        });
+    }
     let mut context = StreamEventContext {
         schema_resolver,
         state,
@@ -628,6 +665,23 @@ pub(super) fn validate_source_binlog_settings(
         "stream-binlog requires source binlog_format=ROW and binlog_row_image=FULL; found format={} row_image={}",
         settings.format, settings.row_image
     )))
+}
+
+fn superseded_source_connection_config(
+    config: &ApplyBinlogConfig,
+) -> Result<crate::mysql_snapshot::MySqlConnectionConfig, ApplyBinlogError> {
+    let database = config.source.database.clone().ok_or_else(|| {
+        ApplyBinlogError::Target(
+            "superseded insert recovery requires a source database".to_string(),
+        )
+    })?;
+    Ok(crate::mysql_snapshot::MySqlConnectionConfig {
+        host: config.source.host.clone(),
+        port: config.source.port,
+        user: config.source.user.clone(),
+        password: config.source.password.clone(),
+        database,
+    })
 }
 
 pub(super) fn source_inventory_config(config: &ApplyBinlogConfig) -> InventoryConfig {

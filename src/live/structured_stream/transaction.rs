@@ -24,6 +24,20 @@ impl Default for TargetTransactionGroupConfig {
     }
 }
 
+pub(super) trait SupersededInsertVerifier {
+    fn verify(
+        &mut self,
+        candidate: &crate::row::DeferredSupersededInsertCandidate,
+        xid_end_position: u64,
+    ) -> Result<super::superseded_insert::SupersededInsertProof, String>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct VerifiedSupersededInsert {
+    pub(super) resolution_evidence: String,
+    pub(super) checkpoint: crate::checkpoint::Checkpoint,
+}
+
 #[derive(Default)]
 pub(super) struct TargetTransaction {
     open: bool,
@@ -32,6 +46,7 @@ pub(super) struct TargetTransaction {
     pending_file_checkpoint: Option<crate::checkpoint::Checkpoint>,
     pending_conflict_resolutions: Vec<crate::conflict_repair::ConflictResolution>,
     pending_conflict_observations: Vec<crate::conflict_repair::ConflictObservation>,
+    deferred_superseded_inserts: Vec<crate::row::DeferredSupersededInsertCandidate>,
 }
 
 impl TargetTransaction {
@@ -131,11 +146,168 @@ impl TargetTransaction {
     ) -> (
         &mut Vec<crate::conflict_repair::ConflictResolution>,
         &mut Vec<crate::conflict_repair::ConflictObservation>,
+        &mut Vec<crate::row::DeferredSupersededInsertCandidate>,
     ) {
         (
             &mut self.pending_conflict_resolutions,
             &mut self.pending_conflict_observations,
+            &mut self.deferred_superseded_inserts,
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn defer_superseded_insert(
+        &mut self,
+        candidate: crate::row::DeferredSupersededInsertCandidate,
+    ) {
+        self.deferred_superseded_inserts.push(candidate);
+    }
+
+    pub(super) fn has_deferred_superseded_inserts(&self) -> bool {
+        !self.deferred_superseded_inserts.is_empty()
+    }
+
+    pub(super) fn finalize_deferred_superseded_inserts_at(&mut self, end_position: u64) {
+        for candidate in &mut self.deferred_superseded_inserts {
+            candidate.observation.coordinate.end_position = end_position;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn verify_deferred_superseded_inserts_at_xid<E, V>(
+        &mut self,
+        executor: &E,
+        verifier: &mut V,
+        xid_end_position: u64,
+        checkpoint_table: &str,
+        checkpoint_name: &str,
+    ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
+    where
+        E: TransactionalTargetExecutor,
+        V: SupersededInsertVerifier,
+    {
+        let result = self.verify_and_commit_deferred_superseded_inserts(
+            executor,
+            verifier,
+            xid_end_position,
+            checkpoint_table,
+            checkpoint_name,
+        );
+        if result.is_err() {
+            self.rollback_if_open(executor)?;
+        }
+        result
+    }
+
+    pub(super) fn verify_deferred_superseded_inserts_at_xid_with_conflicts<E, V>(
+        &mut self,
+        executor: &E,
+        verifier: &mut V,
+        conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
+        xid_end_position: u64,
+        checkpoint_table: &str,
+        checkpoint_name: &str,
+    ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
+    where
+        E: TransactionalTargetExecutor,
+        V: SupersededInsertVerifier,
+    {
+        self.finalize_deferred_superseded_inserts_at(xid_end_position);
+        let observation = self
+            .deferred_superseded_inserts
+            .first()
+            .map(|candidate| candidate.observation.clone())
+            .ok_or_else(|| {
+                ApplyBinlogError::Target("missing deferred superseded insert".to_string())
+            })?;
+        let result = self.verify_and_commit_deferred_superseded_inserts(
+            executor,
+            verifier,
+            xid_end_position,
+            checkpoint_table,
+            checkpoint_name,
+        );
+        match result {
+            Ok(verified) => {
+                conflict_store
+                    .observe(observation.clone())
+                    .map_err(ApplyBinlogError::Target)?;
+                conflict_store
+                    .resolve_existing(conflict_resolution(
+                        &observation,
+                        &verified.resolution_evidence,
+                    ))
+                    .map_err(ApplyBinlogError::Target)?;
+                Ok(verified)
+            }
+            Err(error) => {
+                self.rollback_if_open(executor)?;
+                conflict_store
+                    .observe(observation)
+                    .map_err(ApplyBinlogError::Target)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn verify_and_commit_deferred_superseded_inserts<E, V>(
+        &mut self,
+        executor: &E,
+        verifier: &mut V,
+        xid_end_position: u64,
+        checkpoint_table: &str,
+        checkpoint_name: &str,
+    ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
+    where
+        E: TransactionalTargetExecutor,
+        V: SupersededInsertVerifier,
+    {
+        let candidate = self.deferred_superseded_inserts.first().ok_or_else(|| {
+            ApplyBinlogError::Target("missing deferred superseded insert".to_string())
+        })?;
+        let proof = verifier
+            .verify(candidate, xid_end_position)
+            .map_err(ApplyBinlogError::Target)?;
+        let evidence = proof.resolution_evidence();
+        let checkpoint = crate::checkpoint::Checkpoint {
+            source_file: candidate.observation.coordinate.file.clone(),
+            source_position: xid_end_position,
+            gtid: None,
+            event_timestamp: 0,
+            last_event: crate::checkpoint::LastEvent {
+                event_type: "XidEvent".to_string(),
+                description: format!(
+                    "verified superseded insert transaction at {}:{xid_end_position}",
+                    candidate.observation.coordinate.file
+                ),
+            },
+        };
+        executor
+            .load_transaction_checkpoint_for_update(checkpoint_table, checkpoint_name)
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        executor
+            .save_transaction_checkpoint(checkpoint_table, checkpoint_name, &checkpoint)
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        let resolution = conflict_resolution(&candidate.observation, &evidence);
+        executor
+            .execute_transaction_sql(&crate::conflict_repair::build_conflict_observation_sql(
+                "cdc.row_conflicts",
+                &candidate.observation,
+            ))
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        executor
+            .execute_transaction_sql(
+                &crate::conflict_repair::build_conflict_resolution_for_source_row_sql(
+                    "cdc.row_conflicts",
+                    &resolution,
+                ),
+            )
+            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        self.commit_if_open(executor)?;
+        Ok(VerifiedSupersededInsert {
+            resolution_evidence: evidence,
+            checkpoint,
+        })
     }
 
     pub(super) fn has_pending_conflict_resolutions(&self) -> bool {
@@ -180,10 +352,30 @@ impl TargetTransaction {
         self.pending_file_checkpoint = None;
         self.pending_conflict_resolutions.clear();
         self.pending_conflict_observations.clear();
+        self.deferred_superseded_inserts.clear();
     }
 
     pub(super) fn is_open(&self) -> bool {
         self.open
+    }
+}
+
+fn conflict_resolution(
+    observation: &crate::conflict_repair::ConflictObservation,
+    evidence: &str,
+) -> crate::conflict_repair::ConflictResolution {
+    crate::conflict_repair::ConflictResolution {
+        source_identity: observation.source_identity.clone(),
+        schema: observation.schema.clone(),
+        table: observation.table.clone(),
+        source_primary_key: observation.source_primary_key.clone(),
+        repair_run_id: format!(
+            "stream-superseded-{}-{}-{}",
+            observation.coordinate.file.replace('/', "_"),
+            observation.coordinate.start_position,
+            observation.table,
+        ),
+        evidence: evidence.to_string(),
     }
 }
 
@@ -248,12 +440,13 @@ where
             .begin_if_needed(applier.executor())?;
     }
 
-    let (pending_resolutions, pending_observations) =
+    let (pending_resolutions, pending_observations, deferred_superseded_inserts) =
         context.target_transaction.pending_conflicts_mut();
     let mut conflict_context = RowConflictContext {
         store: conflict_store,
         pending_resolutions,
         pending_observations,
+        deferred_superseded_inserts,
         source_identity,
         source_server_id: u64::from(header.server_id),
         end_position: u64::from(header.next_event_position),

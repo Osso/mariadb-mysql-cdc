@@ -1,4 +1,5 @@
 use super::*;
+use crate::row::DeferredSupersededInsertCandidate;
 
 #[test]
 fn table_map_and_row_events_do_not_checkpoint_without_transaction_boundary() {
@@ -224,6 +225,294 @@ fn staged_success_resolution_is_discarded_on_target_rollback() {
 
     assert!(!transaction.has_pending_conflict_resolutions());
     assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK"]);
+}
+
+#[derive(Clone, Copy)]
+struct SupersededVerificationFixture {
+    verified: bool,
+}
+
+impl SupersededInsertVerifier for SupersededVerificationFixture {
+    fn verify(
+        &mut self,
+        _candidate: &DeferredSupersededInsertCandidate,
+        _xid_end_position: u64,
+    ) -> Result<super::super::superseded_insert::SupersededInsertProof, String> {
+        if !self.verified {
+            return Err("target transactional re-read changed".to_string());
+        }
+        Ok(super::super::superseded_insert::SupersededInsertProof {
+            source_snapshot: super::super::superseded_insert::BinlogCoordinate {
+                file: "mysqld-bin.002740".to_string(),
+                position: 1_004_163_590,
+            },
+            historical_image_hash: "historical-hash".to_string(),
+            source_primary_hash: "source-pk-hash".to_string(),
+            source_owner_hash: "source-owner-hash".to_string(),
+            target_primary_hash: "source-pk-hash".to_string(),
+            target_owner_hash: "source-owner-hash".to_string(),
+        })
+    }
+}
+
+fn users_name_superseded_candidate() -> DeferredSupersededInsertCandidate {
+    DeferredSupersededInsertCandidate {
+        observation: crate::conflict_repair::ConflictObservation {
+            source_identity: "production-source".to_string(),
+            source_server_id: 3,
+            coordinate: crate::conflict_repair::ConflictCoordinate {
+                file: "mysqld-bin.002709".to_string(),
+                start_position: 404_034_840,
+                end_position: 0,
+            },
+            schema: "globalcomix".to_string(),
+            table: "users".to_string(),
+            operation: crate::conflict_repair::ConflictOperation::Insert,
+            source_primary_key: vec!["2070980".to_string()],
+            duplicate_index: Some("users.name".to_string()),
+            duplicate_owner_primary_key: Some(vec!["2071305".to_string()]),
+            error_code: 1062,
+            error_text: "Duplicate entry '-3572' for key 'users.name'".to_string(),
+            observed_at_ms: 1,
+            parent_recovery: None,
+        },
+        historical_change: crate::target::TargetRowChange {
+            statement: crate::target::SqlStatement {
+                sql: "INSERT INTO `globalcomix`.`users` (`id`,`name`) VALUES (?,?)".to_string(),
+                params: vec![
+                    mysql::Value::Int(2_070_980),
+                    mysql::Value::Bytes(b"-3572".to_vec()),
+                ],
+            },
+            kind: crate::target::TargetRowChangeKind::Insert,
+            table: "globalcomix.users".to_string(),
+            primary_key_columns: vec!["id".to_string()],
+            primary_key_values: vec![mysql::Value::Int(2_070_980)],
+            writable_columns: vec!["id".to_string(), "name".to_string()],
+            source_values: vec![
+                mysql::Value::Int(2_070_980),
+                mysql::Value::Bytes(b"-3572".to_vec()),
+            ],
+            set_columns: vec![None, None],
+        },
+    }
+}
+
+#[test]
+fn superseded_insert_verification_failure_rolls_back_later_rows_without_checkpoint() {
+    let executor = TransactionRecordingExecutor::default();
+    let mut transaction = TargetTransaction::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+    executor
+        .execute(&crate::target::SqlStatement {
+            sql: "INSERT INTO globalcomix.users_profiles (id) VALUES (?)".to_string(),
+            params: vec![mysql::Value::Int(2_070_980)],
+        })
+        .expect("subsequent row executes before XID verification");
+
+    let mut verifier = SupersededVerificationFixture { verified: false };
+    let error = transaction
+        .verify_deferred_superseded_inserts_at_xid(
+            &executor,
+            &mut verifier,
+            404_038_011,
+            "cdc.stream_checkpoint",
+            "stream-binlog:production-source",
+        )
+        .expect_err("failed proof must abort the complete source transaction");
+
+    assert!(
+        error
+            .to_string()
+            .contains("target transactional re-read changed")
+    );
+    assert_eq!(executor.operations(), ["BEGIN", "EXEC", "ROLLBACK"]);
+}
+
+#[test]
+fn verified_superseded_insert_commits_later_rows_resolution_and_xid_checkpoint_atomically() {
+    let executor = TransactionRecordingExecutor::default();
+    let mut transaction = TargetTransaction::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+    executor
+        .execute(&crate::target::SqlStatement {
+            sql: "INSERT INTO globalcomix.users_profiles (id) VALUES (?)".to_string(),
+            params: vec![mysql::Value::Int(2_070_980)],
+        })
+        .expect("subsequent row executes before XID verification");
+
+    let mut verifier = SupersededVerificationFixture { verified: true };
+    let proof = transaction
+        .verify_deferred_superseded_inserts_at_xid(
+            &executor,
+            &mut verifier,
+            404_038_011,
+            "cdc.stream_checkpoint",
+            "stream-binlog:production-source",
+        )
+        .expect("verified candidate commits atomically");
+
+    assert!(
+        proof
+            .resolution_evidence
+            .contains("mysqld-bin.002740:1004163590")
+    );
+    assert!(proof.resolution_evidence.contains("source-pk-hash"));
+    assert_eq!(
+        executor.operations(),
+        [
+            "BEGIN",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "OBSERVATION",
+            "RESOLUTION",
+            "COMMIT",
+        ]
+    );
+}
+
+fn execute_users_2070980_followup_effects(executor: &TransactionRecordingExecutor) {
+    executor
+        .execute(&crate::target::SqlStatement {
+            sql: "REPLACE INTO globalcomix.users_profiles (id) VALUES (?)".to_string(),
+            params: vec![mysql::Value::Int(2_070_980)],
+        })
+        .expect("users_profiles effect");
+    for setting_group_id in 2..=9 {
+        executor
+            .execute(&crate::target::SqlStatement {
+                sql: "INSERT INTO globalcomix.users_email_settings (user_id,setting_group_id) VALUES (?,?)"
+                    .to_string(),
+                params: vec![
+                    mysql::Value::Int(2_070_980),
+                    mysql::Value::Int(setting_group_id),
+                ],
+            })
+            .expect("users_email_settings effect");
+    }
+}
+
+fn exact_users_2070980_verifier(verified: bool) -> SupersededVerificationFixture {
+    SupersededVerificationFixture { verified }
+}
+
+#[test]
+fn production_404034840_superseded_users_insert_commits_all_followup_effects_at_xid() {
+    let executor = TransactionRecordingExecutor::default();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    transaction
+        .begin_if_needed(&executor)
+        .expect("begin source transaction");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+
+    execute_users_2070980_followup_effects(&executor);
+    assert_eq!(
+        executor.operations(),
+        [
+            "BEGIN", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC"
+        ]
+    );
+
+    let mut verifier = exact_users_2070980_verifier(true);
+    let proof = transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            404_038_011,
+            "cdc.stream_checkpoint",
+            "stream-binlog:production-source",
+        )
+        .expect("exact production transaction commits atomically");
+
+    assert!(
+        proof
+            .resolution_evidence
+            .contains("mysqld-bin.002740:1004163590")
+    );
+    for full_row_hash in ["historical-hash", "source-pk-hash", "source-owner-hash"] {
+        assert!(proof.resolution_evidence.contains(full_row_hash));
+    }
+    assert_eq!(proof.checkpoint.source_file, "mysqld-bin.002709");
+    assert_eq!(proof.checkpoint.source_position, 404_038_011);
+    assert_eq!(
+        executor.operations(),
+        [
+            "BEGIN",
+            "EXEC",
+            "EXEC",
+            "EXEC",
+            "EXEC",
+            "EXEC",
+            "EXEC",
+            "EXEC",
+            "EXEC",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "OBSERVATION",
+            "RESOLUTION",
+            "COMMIT",
+        ]
+    );
+    assert_eq!(
+        conflicts.records()[0].status,
+        crate::conflict_repair::ConflictStatus::Resolved
+    );
+}
+
+#[test]
+fn production_404034840_failed_verification_rolls_back_every_followup_effect() {
+    let executor = TransactionRecordingExecutor::default();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    transaction
+        .begin_if_needed(&executor)
+        .expect("begin source transaction");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+    execute_users_2070980_followup_effects(&executor);
+
+    let mut verifier = exact_users_2070980_verifier(false);
+    let error = transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            404_038_011,
+            "cdc.stream_checkpoint",
+            "stream-binlog:production-source",
+        )
+        .expect_err("failed verification rolls back complete transaction");
+
+    assert!(
+        error
+            .to_string()
+            .contains("target transactional re-read changed")
+    );
+    assert_eq!(
+        executor.operations(),
+        [
+            "BEGIN", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC", "EXEC",
+            "ROLLBACK"
+        ]
+    );
+    assert!(!executor.operations().contains(&"LOCK_CHECKPOINT"));
+    assert!(!executor.operations().contains(&"CHECKPOINT"));
+    assert!(!executor.operations().contains(&"RESOLUTION"));
+    assert!(!executor.operations().contains(&"COMMIT"));
+    let records = conflicts.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].status,
+        crate::conflict_repair::ConflictStatus::Unresolved
+    );
+    assert_eq!(records[0].key.coordinate.start_position, 404_034_840);
+    assert_eq!(records[0].key.coordinate.end_position, 404_038_011);
+    assert_eq!(records[0].key.source_primary_key, ["2070980"]);
 }
 
 #[test]

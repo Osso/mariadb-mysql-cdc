@@ -172,8 +172,30 @@ fn record_skipped_conflict(
     };
     let observation =
         skipped_conflict_observation(context, coordinate, table, operation, change, conflict);
+    if is_deferred_users_name_insert(table, operation, change, &observation) {
+        context
+            .deferred_superseded_inserts
+            .push(crate::row::DeferredSupersededInsertCandidate {
+                observation,
+                historical_change: change.clone(),
+            });
+        return Ok(());
+    }
     context.pending_observations.push(observation);
     Ok(())
+}
+
+fn is_deferred_users_name_insert(
+    table: &RowTableMap,
+    operation: RowOperation,
+    change: &TargetRowChange,
+    observation: &ConflictObservation,
+) -> bool {
+    table.schema == "globalcomix"
+        && table.table == "users"
+        && operation == RowOperation::Insert
+        && change.kind == crate::target::TargetRowChangeKind::Insert
+        && observation.duplicate_index.as_deref() == Some("users.name")
 }
 
 fn skipped_conflict_observation(

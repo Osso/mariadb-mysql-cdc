@@ -801,8 +801,13 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
         Ok(())
     }
 
-    fn execute_transaction_sql(&self, _sql: &str) -> Result<(), crate::target::TargetExecuteError> {
-        self.operations.borrow_mut().push("RESOLUTION");
+    fn execute_transaction_sql(&self, sql: &str) -> Result<(), crate::target::TargetExecuteError> {
+        let operation = if sql.starts_with("INSERT INTO cdc.row_conflicts") {
+            "OBSERVATION"
+        } else {
+            "RESOLUTION"
+        };
+        self.operations.borrow_mut().push(operation);
         Ok(())
     }
 

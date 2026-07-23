@@ -14,7 +14,8 @@ use crate::table_sync::{SyncTableProgress, TableSyncError};
 use crate::target::{
     DuplicateConflict, SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor,
     TargetRowChange, TargetRowChangeKind, TransactionalTargetExecutor,
-    build_primary_key_replacement_statement, primary_key_replacement_outcome,
+    UsersActiveTransactionEvidence, build_primary_key_replacement_statement, locked_users_evidence,
+    primary_key_replacement_outcome,
 };
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Params};
@@ -436,6 +437,31 @@ fn duplicate_conflict(error: &TargetExecuteError, error_code: u16) -> DuplicateC
     }
 }
 
+const USERS_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='users' ORDER BY ordinal_position";
+
+fn build_locked_users_evidence_sql(columns: &[String]) -> Result<String, TargetExecuteError> {
+    if columns.is_empty() {
+        return Err(TargetExecuteError::new(
+            "globalcomix.users metadata returned no columns",
+        ));
+    }
+    let columns = columns
+        .iter()
+        .map(|column| crate::mysql_support::quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "SELECT {columns} FROM `globalcomix`.`users` WHERE `id` = ? OR `name` = ? ORDER BY `id` FOR UPDATE"
+    ))
+}
+
+fn build_locked_users_evidence(
+    columns: Vec<String>,
+    rows: Result<Vec<Vec<mysql::Value>>, TargetExecuteError>,
+) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+    locked_users_evidence(columns, rows?)
+}
+
 impl TransactionalTargetExecutor for PersistentTargetExecutor {
     fn acquire_stream_lease(&self, lease_name: &str) -> Result<(), TargetExecuteError> {
         let acquired = self
@@ -491,6 +517,34 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
             .borrow_mut()
             .query_drop(sql)
             .map_err(target_query_error)
+    }
+
+    fn read_locked_users_supersession_evidence(
+        &self,
+        historical_primary_key: &mysql::Value,
+        historical_name: &mysql::Value,
+    ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+        let columns = self
+            .conn
+            .borrow_mut()
+            .query::<String, _>(USERS_COLUMNS_FOR_EVIDENCE_SQL)
+            .map_err(target_query_error)?;
+        let sql = build_locked_users_evidence_sql(&columns)?;
+        let rows = self
+            .conn
+            .borrow_mut()
+            .exec::<mysql::Row, _, _>(
+                sql,
+                Params::Positional(vec![
+                    historical_primary_key.clone(),
+                    historical_name.clone(),
+                ]),
+            )
+            .map_err(target_query_error)?
+            .into_iter()
+            .map(mysql::Row::unwrap)
+            .collect();
+        build_locked_users_evidence(columns, Ok(rows))
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
