@@ -332,7 +332,7 @@ fn superseded_insert_verification_failure_rolls_back_later_rows_without_checkpoi
 
 #[test]
 fn verified_superseded_insert_commits_later_rows_resolution_and_xid_checkpoint_atomically() {
-    let executor = TransactionRecordingExecutor::default();
+    let executor = exact_users_predecessor_executor();
     let mut transaction = TargetTransaction::default();
     transaction.begin_if_needed(&executor).expect("begin");
     transaction.defer_superseded_insert(users_name_superseded_candidate());
@@ -399,9 +399,38 @@ fn exact_users_2070980_verifier(verified: bool) -> SupersededVerificationFixture
     SupersededVerificationFixture { verified }
 }
 
+fn checkpoint_at(file: &str, position: u64) -> crate::checkpoint::Checkpoint {
+    crate::checkpoint::Checkpoint {
+        source_file: file.to_string(),
+        source_position: position,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: crate::checkpoint::LastEvent {
+            event_type: "XidEvent".to_string(),
+            description: "test predecessor".to_string(),
+        },
+    }
+}
+
+fn exact_users_predecessor_executor() -> TransactionRecordingExecutor {
+    TransactionRecordingExecutor::with_locked_checkpoint(checkpoint_at(
+        "mysqld-bin.002709",
+        404_034_720,
+    ))
+}
+
+fn ordinary_conflict_observation() -> crate::conflict_repair::ConflictObservation {
+    let mut observation = users_name_superseded_candidate().observation;
+    observation.table = "accounts".to_string();
+    observation.source_primary_key = vec!["99".to_string()];
+    observation.coordinate.start_position = 404_035_100;
+    observation.error_text = "ordinary conflict".to_string();
+    observation
+}
+
 #[test]
 fn production_404034840_superseded_users_insert_commits_all_followup_effects_at_xid() {
-    let executor = TransactionRecordingExecutor::default();
+    let executor = exact_users_predecessor_executor();
     let mut transaction = TargetTransaction::default();
     let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
     transaction
@@ -513,6 +542,141 @@ fn production_404034840_failed_verification_rolls_back_every_followup_effect() {
     assert_eq!(records[0].key.coordinate.start_position, 404_034_840);
     assert_eq!(records[0].key.coordinate.end_position, 404_038_011);
     assert_eq!(records[0].key.source_primary_key, ["2070980"]);
+}
+
+#[test]
+fn superseded_xid_rejects_coexisting_ordinary_conflict_and_persists_both() {
+    let executor = exact_users_predecessor_executor();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+    transaction
+        .pending_conflicts_mut()
+        .1
+        .push(ordinary_conflict_observation());
+
+    let mut verifier = exact_users_2070980_verifier(true);
+    let error = transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            404_038_011,
+            "cdc.stream_checkpoint",
+            "stream-binlog:production-source",
+        )
+        .expect_err("ordinary conflict must block superseded commit");
+
+    assert!(error.to_string().contains("ordinary conflict"));
+    assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK"]);
+    assert_eq!(conflicts.records().len(), 2);
+}
+
+#[test]
+fn superseded_xid_rejects_multiple_candidates_and_persists_all() {
+    let executor = exact_users_predecessor_executor();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+    let mut second = users_name_superseded_candidate();
+    second.observation.source_primary_key = vec!["2070981".to_string()];
+    second.observation.coordinate.start_position = 404_034_900;
+    transaction.defer_superseded_insert(second);
+
+    let mut verifier = exact_users_2070980_verifier(true);
+    let error = transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            404_038_011,
+            "cdc.stream_checkpoint",
+            "stream-binlog:production-source",
+        )
+        .expect_err("multiple candidates must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("exactly one deferred superseded insert")
+    );
+    assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK"]);
+    assert_eq!(conflicts.records().len(), 2);
+}
+
+#[test]
+fn superseded_xid_rejects_invalid_locked_checkpoint_predecessors() {
+    let cases = [
+        (None, "disappeared"),
+        (
+            Some(checkpoint_at("mysqld-bin.002708", 999)),
+            "file mismatch",
+        ),
+        (
+            Some(checkpoint_at("mysqld-bin.002709", 404_034_840)),
+            "concurrently advanced",
+        ),
+        (
+            Some(checkpoint_at("mysqld-bin.002709", 404_038_012)),
+            "regression",
+        ),
+    ];
+
+    for (locked_checkpoint, expected) in cases {
+        let executor = TransactionRecordingExecutor {
+            locked_checkpoint,
+            ..TransactionRecordingExecutor::default()
+        };
+        let mut transaction = TargetTransaction::default();
+        let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+        transaction.begin_if_needed(&executor).expect("begin");
+        transaction.defer_superseded_insert(users_name_superseded_candidate());
+        let mut verifier = exact_users_2070980_verifier(true);
+
+        let error = transaction
+            .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+                &executor,
+                &mut verifier,
+                &mut conflicts,
+                404_038_011,
+                "cdc.stream_checkpoint",
+                "stream-binlog:production-source",
+            )
+            .expect_err("invalid predecessor must fail closed");
+
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(!executor.operations().contains(&"CHECKPOINT"));
+        assert!(!executor.operations().contains(&"COMMIT"));
+        assert_eq!(conflicts.records().len(), 1);
+    }
+}
+
+#[test]
+fn verifier_failure_persists_evidence_even_when_rollback_fails() {
+    let executor = TransactionRecordingExecutor::with_rollback_failure();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+    let mut verifier = exact_users_2070980_verifier(false);
+
+    let error = transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            404_038_011,
+            "cdc.stream_checkpoint",
+            "stream-binlog:production-source",
+        )
+        .expect_err("verification and rollback failures must both surface");
+
+    let message = error.to_string();
+    assert!(message.contains("target transactional re-read changed"));
+    assert!(message.contains("forced rollback failure"));
+    assert_eq!(conflicts.records().len(), 1);
 }
 
 #[test]

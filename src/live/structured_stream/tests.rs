@@ -526,6 +526,7 @@ enum DuplicateMode {
 struct TransactionRecordingExecutor {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     fail_execute: bool,
+    fail_rollback: bool,
     fail_row_change_number: Option<usize>,
     duplicate_row_change_number: Option<usize>,
     duplicate_mode: DuplicateMode,
@@ -538,6 +539,7 @@ impl Default for TransactionRecordingExecutor {
         Self {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: false,
+            fail_rollback: false,
             fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::Equal,
@@ -561,6 +563,7 @@ impl TransactionRecordingExecutor {
         Self {
             operations,
             fail_execute: false,
+            fail_rollback: false,
             fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::Equal,
@@ -582,6 +585,7 @@ impl TransactionRecordingExecutor {
         Self {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: true,
+            fail_rollback: false,
             fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::DefaultError,
@@ -593,6 +597,13 @@ impl TransactionRecordingExecutor {
     fn with_locked_checkpoint(checkpoint: crate::checkpoint::Checkpoint) -> Self {
         Self {
             locked_checkpoint: Some(checkpoint),
+            ..Self::default()
+        }
+    }
+
+    fn with_rollback_failure() -> Self {
+        Self {
+            fail_rollback: true,
             ..Self::default()
         }
     }
@@ -818,6 +829,11 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
 
     fn rollback_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
         self.operations.borrow_mut().push("ROLLBACK");
+        if self.fail_rollback {
+            return Err(crate::target::TargetExecuteError::new(
+                "forced rollback failure",
+            ));
+        }
         Ok(())
     }
 }

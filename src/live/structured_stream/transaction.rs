@@ -212,22 +212,24 @@ impl TargetTransaction {
         E: TransactionalTargetExecutor,
         V: SupersededInsertVerifier,
     {
-        self.finalize_deferred_superseded_inserts_at(xid_end_position);
-        let observation = self
-            .deferred_superseded_inserts
-            .first()
-            .map(|candidate| candidate.observation.clone())
-            .ok_or_else(|| {
-                ApplyBinlogError::Target("missing deferred superseded insert".to_string())
-            })?;
-        let result = self.verify_and_commit_deferred_superseded_inserts(
+        let observations = self.finalized_superseded_observations(xid_end_position);
+        if let Some(error) = self.superseded_preflight_error(&observations) {
+            return fail_superseded_transaction(
+                self,
+                executor,
+                conflict_store,
+                error,
+                observations,
+            );
+        }
+        let observation = observations[0].clone();
+        match self.verify_and_commit_deferred_superseded_inserts(
             executor,
             verifier,
             xid_end_position,
             checkpoint_table,
             checkpoint_name,
-        );
-        match result {
+        ) {
             Ok(verified) => {
                 conflict_store
                     .observe(observation.clone())
@@ -241,13 +243,40 @@ impl TargetTransaction {
                 Ok(verified)
             }
             Err(error) => {
-                self.rollback_if_open(executor)?;
-                conflict_store
-                    .observe(observation)
-                    .map_err(ApplyBinlogError::Target)?;
-                Err(error)
+                fail_superseded_transaction(self, executor, conflict_store, error, observations)
             }
         }
+    }
+
+    fn finalized_superseded_observations(
+        &mut self,
+        xid_end_position: u64,
+    ) -> Vec<crate::conflict_repair::ConflictObservation> {
+        self.finalize_deferred_superseded_inserts_at(xid_end_position);
+        let mut observations = self.take_finalized_conflict_observations(xid_end_position);
+        observations.extend(
+            self.deferred_superseded_inserts
+                .iter()
+                .map(|candidate| candidate.observation.clone()),
+        );
+        observations
+    }
+
+    fn superseded_preflight_error(
+        &self,
+        observations: &[crate::conflict_repair::ConflictObservation],
+    ) -> Option<ApplyBinlogError> {
+        if observations.len() != self.deferred_superseded_inserts.len() {
+            return Some(ApplyBinlogError::Target(
+                "ordinary conflict coexists with deferred superseded insert".to_string(),
+            ));
+        }
+        (self.deferred_superseded_inserts.len() != 1).then(|| {
+            ApplyBinlogError::Target(format!(
+                "superseded recovery requires exactly one deferred superseded insert, found {}",
+                self.deferred_superseded_inserts.len()
+            ))
+        })
     }
 
     fn verify_and_commit_deferred_superseded_inserts<E, V>(
@@ -282,9 +311,15 @@ impl TargetTransaction {
                 ),
             },
         };
-        executor
+        let current = executor
             .load_transaction_checkpoint_for_update(checkpoint_table, checkpoint_name)
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        validate_superseded_checkpoint_predecessor(
+            current.as_ref(),
+            candidate,
+            xid_end_position,
+            checkpoint_name,
+        )?;
         executor
             .save_transaction_checkpoint(checkpoint_table, checkpoint_name, &checkpoint)
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
@@ -358,6 +393,72 @@ impl TargetTransaction {
     pub(super) fn is_open(&self) -> bool {
         self.open
     }
+}
+
+fn fail_superseded_transaction<T, E>(
+    transaction: &mut TargetTransaction,
+    executor: &E,
+    conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
+    error: ApplyBinlogError,
+    observations: Vec<crate::conflict_repair::ConflictObservation>,
+) -> Result<T, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+{
+    let rollback_error = transaction.rollback_if_open(executor).err();
+    let persistence_error = observations
+        .into_iter()
+        .try_for_each(|observation| conflict_store.observe(observation))
+        .err();
+    if rollback_error.is_none() && persistence_error.is_none() {
+        return Err(error);
+    }
+    let mut context = error.to_string();
+    if let Some(rollback_error) = rollback_error {
+        context.push_str(&format!("; rollback failed: {rollback_error}"));
+    }
+    if let Some(persistence_error) = persistence_error {
+        context.push_str(&format!(
+            "; conflict evidence persistence failed: {persistence_error}"
+        ));
+    }
+    Err(ApplyBinlogError::Target(context))
+}
+
+fn validate_superseded_checkpoint_predecessor(
+    current: Option<&crate::checkpoint::Checkpoint>,
+    candidate: &crate::row::DeferredSupersededInsertCandidate,
+    xid_end_position: u64,
+    checkpoint_name: &str,
+) -> Result<(), ApplyBinlogError> {
+    let current = current.ok_or_else(|| {
+        ApplyBinlogError::Checkpoint(format!(
+            "required source-scoped checkpoint `{checkpoint_name}` disappeared during target transaction"
+        ))
+    })?;
+    let expected_file = &candidate.observation.coordinate.file;
+    if current.source_file != *expected_file {
+        return Err(ApplyBinlogError::Checkpoint(format!(
+            "superseded checkpoint predecessor file mismatch: expected {expected_file}, locked {}",
+            current.source_file
+        )));
+    }
+    if current.source_position > xid_end_position {
+        return Err(ApplyBinlogError::Checkpoint(format!(
+            "refusing checkpoint regression from {}:{} to {}:{xid_end_position}",
+            current.source_file, current.source_position, expected_file
+        )));
+    }
+    if current.source_position >= candidate.observation.coordinate.start_position {
+        return Err(ApplyBinlogError::Checkpoint(format!(
+            "superseded checkpoint concurrently advanced to {}:{} at or beyond candidate {}:{}",
+            current.source_file,
+            current.source_position,
+            expected_file,
+            candidate.observation.coordinate.start_position
+        )));
+    }
+    Ok(())
 }
 
 fn conflict_resolution(
