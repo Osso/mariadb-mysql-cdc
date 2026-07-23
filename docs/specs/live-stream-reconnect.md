@@ -33,10 +33,10 @@ source connection loss without replaying from static startup coordinates.
   recovery connections set `time_zone='+00:00'`, and the helper epoch is excluded
   from insert and equality. Recovery values are reconstructed deterministically
   from replay input and conflict context, not stored in `cdc.row_conflicts`.
-  Recovery failure returns a contextual typed error; the reconnect loop treats it
-  as retryable under normal reconnect policy, preserving the unchanged checkpoint
-  for another attempt. The failed recovery performs no replay or checkpoint
-  advance. Successful child replay writes matching
+  Recovery failure returns a contextual typed error; when exact-parent retry is
+  enabled, the reconnect loop retries it while preserving the ordinary transport
+  budget and unchanged checkpoint for another attempt. The failed recovery
+  performs no replay or checkpoint advance. Successful child replay writes matching
   conflict resolution after child DML/checkpoint and before the same target
   COMMIT; post-commit work only updates process-local cache. Disposable
   real-database proof remains a separate unchecked gap below.
@@ -45,21 +45,25 @@ source connection loss without replaying from static startup coordinates.
   write failure without durable row-conflict evidence.
 
 Reconnect/backoff applies after transient source loss and after a durable row
-conflict. The default stream budget is 12 reconnects after the initial attempt
-(13 attempts total); `--max-reconnects 0` disables reconnects, and
-`--reconnect-forever true` removes the cap for retryable stream failures,
-including persisted row conflicts. Purged or missing source binlogs and other
-non-transient failures never use that unbounded path. For either admitted exact
-parent-recovery case, recovery runs after
+conflict. Ordinary transport reconnects use a default budget of 12 after the
+initial attempt (13 attempts total). `--max-reconnects 0` disables reconnects
+unless `--reconnect-forever true` is set; the latter removes the ordinary
+transport cap and admits exact-parent retries even when the max is zero. An
+exact-parent retry is admitted only with a positive `max-reconnects` setting or
+reconnect-forever, and its recovery success or failure preserves the ordinary
+transport budget.
+Thus repeated exact-parent/recovery failures can exceed `max-reconnects`.
+Purged or missing source binlogs and other non-transient failures never use that
+unbounded path. For either admitted exact parent-recovery case, recovery runs after
 the failed transaction has rolled back and ledger evidence is durable, before the
-unchanged checkpoint is replayed. The parent repair itself does not advance the stream
-checkpoint; only successful replay advances it. Recovery requires a durable
-checkpoint store and fails closed on unsupported scope, missing/colliding/divergent
+unchanged checkpoint is replayed. Failed recovery attempts remain eligible on later
+loops; after one succeeds, a later retry of the same request skips parent mutation
+but still replays from the unchanged checkpoint. The parent repair itself does not
+advance the stream checkpoint; only successful replay advances it. Recovery requires
+a durable checkpoint store and fails closed on unsupported scope, missing/colliding/divergent
 source or target identity, incomplete source image, connection failure, or target
 insert failure. Once strict reconciliation starts, any such failure returns the
-recovery error rather than the original persisted-conflict error. Retry eligibility is checked before the recovery callback. An
-exhausted retry budget returns the persisted conflict without reading or mutating
-the recovery target. This is not generic FK repair or live proof.
+recovery error rather than the original persisted-conflict error. Retry eligibility is checked before the recovery callback. With both ordinary reconnects disabled and reconnect-forever false, the persisted conflict returns without reading or mutating the recovery target. This is not generic FK repair or live proof.
 It is not an opportunistic TLS-to-plaintext fallback: the current GlobalComix
 source uses explicit plaintext mode from the start. Target TLS configuration is
 separate; failed target CA loading, chain validation, or required DNS/hostname
@@ -142,14 +146,16 @@ identity matching stops immediately.
   over static CLI coordinates.
 - `src/live/tests.rs` — asserts stream checkpoints are saved after successful
   target apply and not saved after failed target apply.
-- `src/live/tests.rs` — asserts transient TLS/connection-reset source failures
-  reconnect only while positive attempts remain, `--reconnect-forever true`
-  allows unlimited retryable stream failures (including persisted row conflicts),
-  and non-transient or purged-binlog failures do not reconnect.
-- `src/live/tests/reconnect.rs` — asserts both exact parent-recovery attempts run
-  only after retry eligibility, observe the unchanged checkpoint, and are bounded
-  to one attempt per distinct `ExactParentRecovery` value per reconnect loop; this
-  is not ledger-identity deduplication. The same file proves the zero-budget and
+- `src/live/tests.rs` — asserts ordinary transient TLS/connection-reset source
+  failures reconnect only while positive transport attempts remain,
+  `--reconnect-forever true` allows unlimited retryable stream failures, and
+  non-transient or purged-binlog failures do not reconnect. Exact-parent retry
+  budget behavior is covered separately below.
+- `src/live/tests/reconnect.rs` — asserts exact parent recovery is admitted only
+  after its retry gate, observes the unchanged checkpoint, retries failed
+  recoveries beyond the ordinary transport budget, and mutates each distinct
+  `ExactParentRecovery` value at most once after success; this is not
+  ledger-identity deduplication. The same file proves the zero-budget and
   repeated-request boundaries, but not real database reads, inserts, or the
   production reconnect process.
 - `src/table_sync/run.rs` — asserts partial parent images are rejected, the

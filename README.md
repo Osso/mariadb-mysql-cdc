@@ -79,17 +79,22 @@ rolls back the target transaction. Under `ignore-duplicate`, only an equal nativ
 ROW `INSERT` duplicate may be logged and committed without ledger persistence;
 divergent inserts and every non-`INSERT` `1062` unique conflict persist evidence,
 roll back, and leave the target transaction/checkpoint uncommitted. Durable row
-conflicts retry in-process from that unchanged checkpoint with bounded backoff;
-the stream defaults to 12 reconnects after the initial attempt (13 attempts total),
-`--max-reconnects 0` disables reconnects, and `--reconnect-forever true` removes
-that cap for retryable stream failures, including persisted row conflicts. Successful replay resolves the
-matching evidence. Two narrow automatic parent-first recoveries run for persisted
+conflicts retry in-process from that unchanged checkpoint with bounded backoff.
+Ordinary transport reconnects default to 12 after the initial attempt (13 attempts
+total); `--max-reconnects 0` disables them unless `--reconnect-forever true` is
+set. Exact-parent retries require a positive `max-reconnects` setting or
+`--reconnect-forever true`, and preserve the ordinary transport budget, so repeated
+parent-recovery failures can exceed `max-reconnects`. `reconnect-forever` removes
+the ordinary transport cap and admits exact-parent retries when the max is zero.
+Successful replay resolves the matching evidence. Two narrow automatic parent-first recoveries run for persisted
 `1452`s: the exact `globalcomix.sessions` composite `fk_sessions_guest`
 (`guest_id`, `guest_hash`) parent in `guests`, and the exact
 `globalcomix.home_feed_card_slides` `fk_hfcs_card` (`card_id`) parent in
 `home_feed_cards`. The failed transaction is rolled back and recorded first.
-Recovery is evaluated only when another reconnect is eligible and at most once per
-distinct `ExactParentRecovery` value per process reconnect loop. Each request is
+Recovery is evaluated only when exact-parent retry is enabled and the error is
+retryable. A failed recovery is retried on later loops without consuming the
+ordinary transport budget; a successful recovery mutates each distinct
+`ExactParentRecovery` value at most once per process reconnect loop. Each request is
 reconstructed deterministically during replay from the row image and conflict
 context; it is not stored in `cdc.row_conflicts`. Both paths require a complete,
 temporally valid source parent image, accept no matching target identity or one

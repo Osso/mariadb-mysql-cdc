@@ -40,12 +40,14 @@ conflicting secondary key.
       transaction; at its XID, finalize their source-transaction end
       coordinates, roll back the target transaction, persist the unresolved
       observations through the independent control-plane connection, and retry
-      from the unchanged checkpoint with bounded in-process backoff. The live
-      stream defaults to 12 reconnects after the initial attempt (13 attempts
-      total); `--max-reconnects 0` disables reconnects, while
-      `--reconnect-forever true` removes that cap for retryable stream failures,
-      including persisted row conflicts. Successful replay resolves the matching
-      evidence row.
+      from the unchanged checkpoint with bounded in-process backoff. Ordinary
+      transport reconnects default to 12 after the initial attempt (13 attempts
+      total); `--max-reconnects 0` disables them unless
+      `--reconnect-forever true` is set. Exact-parent retries require a positive
+      `max-reconnects` setting or reconnect-forever and preserve the ordinary
+      transport budget, so
+      repeated parent-recovery failures can exceed `max-reconnects`. Successful
+      replay resolves the matching evidence row.
 - [x] For the exact automatic parent-recovery cases, a persisted `1452` on
       `globalcomix.sessions` naming `fk_sessions_guest` must carry non-empty
       `session_id`, `guest_id`, and `guest_hash`; source `guests` must contain
@@ -131,8 +133,11 @@ persists the unresolved observations through the independent durable ledger
 before returning the row failure. The failed transaction and later coordinates
 are not checkpointed, while the independently persisted evidence survives.
 For each exact parent-recovery identity, the reconnect loop first verifies that
-another reconnect is eligible, then performs strict source/target parent
-validation after rollback and durable ledger persistence. The `sessions` path
+exact-parent retry is enabled and the error is retryable, then performs strict
+source/target parent validation after rollback and durable ledger persistence. A
+failed reconciliation remains eligible for another attempt without consuming the
+ordinary transport budget; after success, a later retry of the same request skips
+parent mutation but still replays from the unchanged checkpoint. The `sessions` path
 requires the exact `fk_sessions_guest` scope and `guests` composite identity;
 the home-feed path requires `fk_hfcs_card` and
 `home_feed_card_slides.card_id` → `home_feed_cards.id`. For `sessions`, the exact
@@ -151,15 +156,18 @@ control ordering, and the helper is excluded from insert and exact-row compariso
 Missing or invalid epochs fail closed. A successful reconciliation is recorded
 at most once per distinct reconstructed `ExactParentRecovery` value per process
 reconnect loop; failed attempts remain eligible for retry. This is not
-ledger-identity deduplication. A failed reconciliation remains eligible
-for another recovery attempt; after a successful reconciliation, a later retry of
-that request skips mutation but still follows normal reconnect policy.
+ledger-identity deduplication. Recovery is admitted with a positive
+`max-reconnects` setting or reconnect-forever; with `max_reconnects=0` and
+reconnect-forever false, it is
+skipped without reading or mutating the recovery target. A later retry after
+successful reconciliation skips mutation but still preserves the ordinary
+transport budget.
 Existing exact target parents are accepted idempotently after process loss;
 otherwise one current source parent image is inserted only when the target has
 no matching identity. Unsupported, absent, duplicate, colliding, divergent, or
 temporally invalid identities, connection failures, and insert failures return a
-contextual typed recovery failure; the reconnect loop retries it under normal
-policy without replay or checkpoint advance. Recovery emits deterministic
+contextual typed recovery failure; the reconnect loop retries it under
+exact-parent policy without replay or checkpoint advance. Recovery emits deterministic
 attempted/skipped/succeeded/failed
 logs. It never resolves the ledger entry; normal child replay must commit and
 checkpoint before the existing resolution path can mark it resolved. Recovery
