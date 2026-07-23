@@ -35,14 +35,20 @@ explicit; replacement evidence is durable and a successful replacement can
 checkpoint. Foreign-key, CHECK, and replacement-update conflicts persist evidence
 and abort, rolling back the target transaction/checkpoint. Secondary-unique
 conflicts follow that same path except the narrow superseded historical
-`globalcomix.users` ROW `INSERT` on exact `users.name`: the live stream defers
-only that row, requires complete source/target PK and unique-owner convergence
-from one source consistent snapshot plus active-transaction `SELECT ... FOR
-UPDATE` reads, then commits remaining source-transaction rows, exact
-observation/resolution evidence, and the XID checkpoint atomically. Any failed
-proof or commit rolls back target effects/checkpoint advancement. If a later
-conflict rolls back the enclosing transaction, the replacement rolls back but
-the independent ledger evidence remains. The default `error` policy fails native
+`globalcomix.users` ROW `INSERT` on exact `users.name`: exactly one candidate is
+allowed, and any ordinary conflict mixed into the source transaction fails
+closed. The live stream reads `SHOW MASTER STATUS` before one source consistent
+snapshot; that pre-snapshot coordinate is a conservative lower bound and must
+be beyond the candidate transaction. It requires complete source/target PK and
+unique-owner convergence from that snapshot plus active-transaction `SELECT ...
+FOR UPDATE` reads, then requires an existing same-file checkpoint predecessor
+before the candidate and no later than the XID. Only then does it commit
+remaining source-transaction rows, exact observation/resolution evidence, and
+the XID checkpoint atomically. Any failed proof, predecessor, or commit rolls
+back, then persists all unresolved observations independently; rollback or
+persistence failures are surfaced. If a later conflict rolls back the enclosing
+transaction, the replacement rolls back but the independent ledger evidence
+remains. The default `error` policy fails native
 row duplicates.
 
 Snapshot/catchup writes and normal range table repairs explicitly use

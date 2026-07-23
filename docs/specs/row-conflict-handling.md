@@ -29,11 +29,13 @@ conflicting secondary key.
       the default `error` policy fails native row duplicates.
 - [x] The only secondary-unique exception is a superseded historical insert on
       `globalcomix.users`: a ROW `INSERT` whose duplicate index is exactly
-      `users.name` may be deferred as one row-level candidate. At XID, the
-      verifier retains the complete historical image, opens one source
-      consistent snapshot, captures its binlog coordinate, and requires that
-      coordinate to be beyond the candidate transaction. It requires exactly
-      one complete source row for the historical primary key and exactly one
+      `users.name` may be deferred only as exactly one row-level candidate. At
+      XID, the verifier retains the complete historical image, reads
+      `SHOW MASTER STATUS` before `START TRANSACTION WITH CONSISTENT SNAPSHOT`,
+      and treats that pre-snapshot source coordinate as a conservative lower
+      bound for the snapshot contents; the lower bound must be strictly beyond
+      the candidate transaction. It requires exactly one complete source row
+      for the historical primary key and exactly one
       complete source row owning the historical name, with the historical
       primary key no longer owning that name and the owner having a different
       primary key. The active target transaction re-reads both identities with
@@ -41,9 +43,12 @@ conflicting secondary key.
       must match. Only then is that insert treated as a no-op; later rows in
       the same source transaction still apply. The XID checkpoint, exact
       conflict observation/resolution evidence, and remaining row effects are
-      committed atomically. Any failed predicate or commit rolls back target
-      effects and checkpoint advancement and leaves unresolved conflict
-      evidence; every other secondary-unique conflict keeps the ordinary abort
+      committed atomically. Any ordinary conflict coexisting with the candidate,
+      any second candidate, failed predicate, invalid checkpoint predecessor, or
+      commit failure fails closed: target effects and checkpoint advancement
+      roll back, then all unresolved observations are persisted through the
+      independent conflict store; rollback or evidence-persistence failures are
+      surfaced. Every other secondary-unique conflict keeps the ordinary abort
       path.
 - [x] Successful equal native ROW `INSERT` no-ops and successful
       `replace-divergent-pk` replacements never create a new ledger row; they
@@ -123,8 +128,10 @@ persist evidence and abort. Secondary-unique conflicts do too, except for the
 separately specified superseded `globalcomix.users`/`users.name` insert proof,
 which can commit only after its full source/target proof. The accepted overwrite risk is
 explicit. On the live target-table checkpoint path, the stream locks and validates
-the predecessor checkpoint, writes the event-end checkpoint in that same target
-transaction, executes staged resolution SQL, and commits once; only after COMMIT
+the source-scoped predecessor checkpoint in that same target transaction: it
+must exist, use the candidate's binlog file, remain before the candidate start,
+and not exceed the XID end. The stream then writes the event-end checkpoint,
+executes staged resolution SQL, and commits once; only after COMMIT
 does it mark the in-process resolution cache committed. A rollback or commit
 failure therefore leaves target DML, checkpoint, and ledger resolution unresolved.
 Generic statement execution does not gain an unsafe replacement fallback.

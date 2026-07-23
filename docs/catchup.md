@@ -20,12 +20,18 @@ primary-key UPDATE match; durable audit evidence records the decision. Missing o
 multiple PK rows and secondary-unique, foreign-key, CHECK, or replacement-update
 conflicts still roll back without checkpoint advancement. The live stream has one
 narrow exception for a superseded historical `globalcomix.users` ROW `INSERT` on
-exact `users.name`: it defers only that row and may continue only after a
-consistent-source full-row proof and active-transaction target `FOR UPDATE`
-proof for both historical PK and current unique owner. Remaining rows in that
-source transaction still apply; proof failure rolls back the transaction and
-checkpoint, while success commits its exact observation/resolution evidence and
-XID checkpoint atomically. The accepted overwrite risk is explicit. If a later
+exact `users.name`: it allows exactly one deferred candidate and rejects any
+mixed ordinary conflict. It reads `SHOW MASTER STATUS` before one
+`START TRANSACTION WITH CONSISTENT SNAPSHOT`; that pre-snapshot coordinate is a
+conservative lower bound and must be beyond the candidate transaction. It then
+requires consistent-source full-row proof and active-transaction target `FOR
+UPDATE` proof for both historical PK and current unique owner. Before writing the
+XID checkpoint, the target transaction requires an existing same-file predecessor
+before the candidate and no later than the XID. Remaining rows in that source
+transaction still apply; any proof, predecessor, or commit failure rolls back,
+then persists all unresolved observations independently, surfacing rollback or
+persistence failures. Success commits its exact observation/resolution evidence
+and XID checkpoint atomically. The accepted overwrite risk is explicit. If a later
 conflict rolls back the enclosing target transaction, the replacement rolls back
 while its independent ledger evidence remains. The default `error` policy also
 rolls back on the duplicate.

@@ -85,13 +85,19 @@ and the live target checkpoint does not advance. For native ROW `INSERT` changes
 row fetched by source primary key exactly equals the source row. A divergent or
 otherwise non-equal `ROW INSERT` persists conflict evidence and aborts, rolling
 back the target transaction/checkpoint, except for one explicit superseded
-historical `globalcomix.users` ROW `INSERT` on exact `users.name`. That candidate
-retains its complete historical image; at XID, one source consistent snapshot
-must be beyond the candidate transaction, both complete source rows and both
-active-target `FOR UPDATE` rows must satisfy exact full-row hash predicates, and
-only that insert may be treated as a no-op. Remaining rows still apply, and the
-observation/resolution evidence plus XID checkpoint commit atomically; any proof
-or commit failure rolls back. Every non-`INSERT` `1062` unique conflict also
+historical `globalcomix.users` ROW `INSERT` on exact `users.name`. Exactly one
+candidate is allowed and no ordinary conflict may coexist with it. That candidate
+retains its complete historical image; at XID, `SHOW MASTER STATUS` is read
+before one source `START TRANSACTION WITH CONSISTENT SNAPSHOT`, and that
+pre-snapshot coordinate is only a conservative lower bound that must be beyond
+the candidate transaction. Both complete source rows and both active-target
+`FOR UPDATE` rows must satisfy exact full-row hash predicates, and only that
+insert may be treated as a no-op. Before checkpointing, the target transaction
+must lock an existing same-file predecessor before the candidate and no later
+than the XID. Remaining rows still apply, and the observation/resolution evidence
+plus XID checkpoint commit atomically; any proof, predecessor, or commit failure
+rolls back, then persists all unresolved observations independently; rollback or
+persistence failures are surfaced. Every non-`INSERT` `1062` unique conflict also
 persists evidence and aborts; all other secondary-unique conflicts remain on
 that path.
 Startup validates the admin-bootstrap schema, guards, constraints, and exact
