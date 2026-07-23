@@ -22,7 +22,7 @@ use mysql::{Conn, Opts, OptsBuilder, Params};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-pub(crate) type SharedTargetConnection = Rc<RefCell<Conn>>;
+pub(crate) type SharedTargetConnection = Rc<RefCell<Option<Conn>>>;
 
 mod connection;
 mod query;
@@ -49,6 +49,7 @@ pub struct PersistentMySqlSource {
 
 pub struct PersistentTargetExecutor {
     conn: SharedTargetConnection,
+    connection_opts: Opts,
     insert_conflict_policy: InsertConflictPolicy,
 }
 
@@ -205,6 +206,13 @@ impl SnapshotSource for PersistentMySqlSource {
     }
 }
 
+fn open_initialized_target_connection(opts: Opts) -> Result<Conn, TargetExecuteError> {
+    let mut conn = open_conn(opts).map_err(target_connect_error)?;
+    conn.query_drop(crate::live::target_session_init_command())
+        .map_err(target_query_error)?;
+    Ok(conn)
+}
+
 impl PersistentTargetExecutor {
     pub fn new(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
         Self::new_with_opts(
@@ -221,20 +229,30 @@ impl PersistentTargetExecutor {
     }
 
     fn new_with_opts(config: &TargetMySqlConfig, opts: Opts) -> Result<Self, TargetExecuteError> {
-        let mut conn = open_conn(opts).map_err(target_connect_error)?;
-        conn.query_drop(crate::live::target_session_init_command())
-            .map_err(target_query_error)?;
+        let conn = open_initialized_target_connection(opts.clone())?;
         Ok(Self {
-            conn: Rc::new(RefCell::new(conn)),
+            conn: Rc::new(RefCell::new(Some(conn))),
+            connection_opts: opts,
             insert_conflict_policy: config.insert_conflict_policy,
         })
     }
 
+    fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Conn) -> Result<T, TargetExecuteError>,
+    ) -> Result<T, TargetExecuteError> {
+        let mut connection = self.conn.borrow_mut();
+        let connection = connection
+            .as_mut()
+            .ok_or_else(|| TargetExecuteError::new("target mysql connection is unavailable"))?;
+        operation(connection)
+    }
+
     pub fn read_column_names(&self, table: &str) -> Result<Vec<String>, TargetExecuteError> {
-        self.conn
-            .borrow_mut()
-            .query(build_target_column_select_sql(table))
-            .map_err(target_query_error)
+        self.with_connection(|conn| {
+            conn.query(build_target_column_select_sql(table))
+                .map_err(target_query_error)
+        })
     }
 
     pub(crate) fn query_rows_as_strings(
@@ -242,18 +260,12 @@ impl PersistentTargetExecutor {
         sql: &str,
     ) -> Result<Vec<Vec<Option<String>>>, TargetExecuteError> {
         let rows = self
-            .conn
-            .borrow_mut()
-            .query::<mysql::Row, _>(sql)
-            .map_err(target_query_error)?;
+            .with_connection(|conn| conn.query::<mysql::Row, _>(sql).map_err(target_query_error))?;
         Ok(rows.into_iter().map(row_to_strings).collect())
     }
 
     pub(crate) fn execute_raw_sql(&self, sql: &str) -> Result<(), TargetExecuteError> {
-        self.conn
-            .borrow_mut()
-            .query_drop(sql)
-            .map_err(target_query_error)
+        self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
     }
 
     pub(crate) fn begin_sync_transaction(&self) -> Result<(), TargetExecuteError> {
@@ -464,11 +476,10 @@ fn build_locked_users_evidence(
 
 impl TransactionalTargetExecutor for PersistentTargetExecutor {
     fn acquire_stream_lease(&self, lease_name: &str) -> Result<(), TargetExecuteError> {
-        let acquired = self
-            .conn
-            .borrow_mut()
-            .query_first::<u8, _>(build_stream_lease_sql(lease_name))
-            .map_err(target_query_error)?;
+        let acquired = self.with_connection(|conn| {
+            conn.query_first::<u8, _>(build_stream_lease_sql(lease_name))
+                .map_err(target_query_error)
+        })?;
         ensure_stream_lease_acquired(lease_name, acquired)
     }
 
@@ -485,11 +496,10 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
             checkpoint_table,
             checkpoint_name,
         );
-        let checkpoint_json = self
-            .conn
-            .borrow_mut()
-            .query_first::<String, _>(sql)
-            .map_err(target_query_error)?;
+        let checkpoint_json = self.with_connection(|conn| {
+            conn.query_first::<String, _>(sql)
+                .map_err(target_query_error)
+        })?;
         checkpoint_json
             .map(|json| {
                 serde_json::from_str(&json).map_err(|error| {
@@ -513,10 +523,7 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
             checkpoint,
         )
         .map_err(TargetExecuteError::new)?;
-        self.conn
-            .borrow_mut()
-            .query_drop(sql)
-            .map_err(target_query_error)
+        self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
     }
 
     fn read_locked_users_supersession_evidence(
@@ -524,23 +531,22 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         historical_primary_key: &mysql::Value,
         historical_name: &mysql::Value,
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
-        let columns = self
-            .conn
-            .borrow_mut()
-            .query::<String, _>(USERS_COLUMNS_FOR_EVIDENCE_SQL)
-            .map_err(target_query_error)?;
+        let columns = self.with_connection(|conn| {
+            conn.query::<String, _>(USERS_COLUMNS_FOR_EVIDENCE_SQL)
+                .map_err(target_query_error)
+        })?;
         let sql = build_locked_users_evidence_sql(&columns)?;
         let rows = self
-            .conn
-            .borrow_mut()
-            .exec::<mysql::Row, _, _>(
-                sql,
-                Params::Positional(vec![
-                    historical_primary_key.clone(),
-                    historical_name.clone(),
-                ]),
-            )
-            .map_err(target_query_error)?
+            .with_connection(|conn| {
+                conn.exec::<mysql::Row, _, _>(
+                    sql,
+                    Params::Positional(vec![
+                        historical_primary_key.clone(),
+                        historical_name.clone(),
+                    ]),
+                )
+                .map_err(target_query_error)
+            })?
             .into_iter()
             .map(mysql::Row::unwrap)
             .collect();
@@ -553,6 +559,14 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
 
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
         self.execute_transaction_control("ROLLBACK")
+    }
+
+    fn discard_failed_transaction_connection(&self) -> Result<(), TargetExecuteError> {
+        let failed_connection = self.conn.borrow_mut().take();
+        drop(failed_connection);
+        let replacement = open_initialized_target_connection(self.connection_opts.clone())?;
+        *self.conn.borrow_mut() = Some(replacement);
+        Ok(())
     }
 }
 
@@ -597,18 +611,15 @@ impl PersistentTargetExecutor {
     }
 
     fn execute_transaction_control(&self, sql: &str) -> Result<(), TargetExecuteError> {
-        self.conn
-            .borrow_mut()
-            .query_drop(sql)
-            .map_err(target_query_error)
+        self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
     }
 
     fn execute_statement(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
         let params = statement.params.clone();
-        self.conn
-            .borrow_mut()
-            .exec_drop(&statement.sql, Params::Positional(params))
-            .map_err(target_query_error)
+        self.with_connection(|conn| {
+            conn.exec_drop(&statement.sql, Params::Positional(params))
+                .map_err(target_query_error)
+        })
     }
 
     fn execute_primary_key_replacement_statement(
@@ -616,11 +627,12 @@ impl PersistentTargetExecutor {
         statement: &SqlStatement,
     ) -> Result<u64, TargetExecuteError> {
         let params = statement.params.clone();
-        let mut connection = self.conn.borrow_mut();
-        connection
-            .exec_drop(&statement.sql, Params::Positional(params))
-            .map_err(target_query_error)?;
-        Ok(connection.affected_rows())
+        self.with_connection(|connection| {
+            connection
+                .exec_drop(&statement.sql, Params::Positional(params))
+                .map_err(target_query_error)?;
+            Ok(connection.affected_rows())
+        })
     }
 
     fn retry_or_return_error(
@@ -634,10 +646,7 @@ impl PersistentTargetExecutor {
         let Some(retry_sql) = generated_column_retry_sql(statement, &error.to_string()) else {
             return Err(error);
         };
-        self.conn
-            .borrow_mut()
-            .query_drop(retry_sql)
-            .map_err(target_query_error)
+        self.with_connection(|conn| conn.query_drop(retry_sql).map_err(target_query_error))
     }
 
     fn can_ignore_duplicate_insert(&self, sql: &str, error: &str) -> bool {
@@ -664,11 +673,13 @@ impl PersistentTargetExecutor {
             crate::mysql_support::quote_ident(&change.table),
             predicates.join(" AND ")
         );
-        let rows = self
-            .conn
-            .borrow_mut()
-            .exec::<mysql::Row, _, _>(sql, Params::Positional(change.primary_key_values.clone()))
-            .map_err(target_query_error)?;
+        let rows = self.with_connection(|conn| {
+            conn.exec::<mysql::Row, _, _>(
+                sql,
+                Params::Positional(change.primary_key_values.clone()),
+            )
+            .map_err(target_query_error)
+        })?;
         rows.into_iter()
             .map(|row| {
                 let values = row.unwrap();

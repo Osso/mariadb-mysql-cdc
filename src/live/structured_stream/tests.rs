@@ -527,6 +527,7 @@ struct TransactionRecordingExecutor {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     fail_execute: bool,
     fail_rollback: bool,
+    fail_discard: bool,
     fail_row_change_number: Option<usize>,
     duplicate_row_change_number: Option<usize>,
     duplicate_mode: DuplicateMode,
@@ -540,6 +541,7 @@ impl Default for TransactionRecordingExecutor {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: false,
             fail_rollback: false,
+            fail_discard: false,
             fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::Equal,
@@ -564,6 +566,7 @@ impl TransactionRecordingExecutor {
             operations,
             fail_execute: false,
             fail_rollback: false,
+            fail_discard: false,
             fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::Equal,
@@ -586,6 +589,7 @@ impl TransactionRecordingExecutor {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: true,
             fail_rollback: false,
+            fail_discard: false,
             fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::DefaultError,
@@ -604,6 +608,14 @@ impl TransactionRecordingExecutor {
     fn with_rollback_failure() -> Self {
         Self {
             fail_rollback: true,
+            ..Self::default()
+        }
+    }
+
+    fn with_rollback_and_discard_failure() -> Self {
+        Self {
+            fail_rollback: true,
+            fail_discard: true,
             ..Self::default()
         }
     }
@@ -832,6 +844,18 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
         if self.fail_rollback {
             return Err(crate::target::TargetExecuteError::new(
                 "forced rollback failure",
+            ));
+        }
+        Ok(())
+    }
+
+    fn discard_failed_transaction_connection(
+        &self,
+    ) -> Result<(), crate::target::TargetExecuteError> {
+        self.operations.borrow_mut().push("DISCARD");
+        if self.fail_discard {
+            return Err(crate::target::TargetExecuteError::new(
+                "forced discard failure",
             ));
         }
         Ok(())

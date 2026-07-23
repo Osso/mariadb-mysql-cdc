@@ -653,29 +653,60 @@ fn superseded_xid_rejects_invalid_locked_checkpoint_predecessors() {
     }
 }
 
-#[test]
-fn verifier_failure_persists_evidence_even_when_rollback_fails() {
-    let executor = TransactionRecordingExecutor::with_rollback_failure();
+fn run_failed_superseded_verification(
+    executor: &TransactionRecordingExecutor,
+    conflicts: &mut crate::conflict_repair::InMemoryConflictStore,
+) -> ApplyBinlogError {
     let mut transaction = TargetTransaction::default();
-    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
-    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.begin_if_needed(executor).expect("begin");
     transaction.defer_superseded_insert(users_name_superseded_candidate());
     let mut verifier = exact_users_2070980_verifier(false);
-
-    let error = transaction
+    transaction
         .verify_deferred_superseded_inserts_at_xid_with_conflicts(
-            &executor,
+            executor,
             &mut verifier,
-            &mut conflicts,
+            conflicts,
             404_038_011,
             "cdc.stream_checkpoint",
             "stream-binlog:production-source",
+            "cdc.row_conflicts",
         )
-        .expect_err("verification and rollback failures must both surface");
+        .expect_err("verification failure must abort")
+}
 
-    let message = error.to_string();
-    assert!(message.contains("target transactional re-read changed"));
-    assert!(message.contains("forced rollback failure"));
+#[test]
+fn rollback_failure_discards_connection_before_observing_conflict() {
+    let executor = TransactionRecordingExecutor::with_rollback_failure();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+
+    let error = run_failed_superseded_verification(&executor, &mut conflicts);
+
+    assert!(error.to_string().contains("forced rollback failure"));
+    assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK", "DISCARD"]);
+    assert_eq!(conflicts.records().len(), 1);
+}
+
+#[test]
+fn failed_connection_discard_failure_stops_evidence_persistence() {
+    let executor = TransactionRecordingExecutor::with_rollback_and_discard_failure();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+
+    let error = run_failed_superseded_verification(&executor, &mut conflicts);
+
+    assert!(error.to_string().contains("forced rollback failure"));
+    assert!(error.to_string().contains("forced discard failure"));
+    assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK", "DISCARD"]);
+    assert!(conflicts.records().is_empty());
+}
+
+#[test]
+fn successful_rollback_observes_conflict_without_discarding_connection() {
+    let executor = TransactionRecordingExecutor::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+
+    run_failed_superseded_verification(&executor, &mut conflicts);
+
+    assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK"]);
     assert_eq!(conflicts.records().len(), 1);
 }
 

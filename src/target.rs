@@ -128,6 +128,11 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
     }
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
+    fn discard_failed_transaction_connection(&self) -> Result<(), TargetExecuteError> {
+        Err(TargetExecuteError::new(
+            "discarding a failed transaction connection is unsupported by this target executor",
+        ))
+    }
 }
 
 pub(crate) fn hash_ordered_mysql_row(values: &[Value]) -> String {
@@ -628,6 +633,10 @@ where
 
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
         (*self).rollback_transaction()
+    }
+
+    fn discard_failed_transaction_connection(&self) -> Result<(), TargetExecuteError> {
+        (*self).discard_failed_transaction_connection()
     }
 }
 
@@ -1576,5 +1585,20 @@ mod tests {
         fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn failed_transaction_connection_discard_defaults_to_explicit_failure() {
+        let executor = TransactionalRecordingExecutor(RecordingExecutor::default());
+
+        let error = executor
+            .discard_failed_transaction_connection()
+            .expect_err("unsupported discard must fail explicitly");
+
+        assert!(
+            error
+                .to_string()
+                .contains("discarding a failed transaction connection")
+        );
     }
 }

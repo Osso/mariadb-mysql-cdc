@@ -181,6 +181,7 @@ impl TargetTransaction {
         xid_end_position: u64,
         checkpoint_table: &str,
         checkpoint_name: &str,
+        conflict_table: &str,
     ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
     where
         E: TransactionalTargetExecutor,
@@ -192,6 +193,7 @@ impl TargetTransaction {
             xid_end_position,
             checkpoint_table,
             checkpoint_name,
+            conflict_table,
         );
         if result.is_err() {
             self.rollback_if_open(executor)?;
@@ -207,6 +209,7 @@ impl TargetTransaction {
         xid_end_position: u64,
         checkpoint_table: &str,
         checkpoint_name: &str,
+        conflict_table: &str,
     ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
     where
         E: TransactionalTargetExecutor,
@@ -229,17 +232,12 @@ impl TargetTransaction {
             xid_end_position,
             checkpoint_table,
             checkpoint_name,
+            conflict_table,
         ) {
             Ok(verified) => {
-                conflict_store
-                    .observe(observation.clone())
-                    .map_err(ApplyBinlogError::Target)?;
-                conflict_store
-                    .resolve_existing(conflict_resolution(
-                        &observation,
-                        &verified.resolution_evidence,
-                    ))
-                    .map_err(ApplyBinlogError::Target)?;
+                let resolution = conflict_resolution(&observation, &verified.resolution_evidence);
+                conflict_store.mark_observation_committed(observation);
+                conflict_store.mark_resolution_committed(resolution);
                 Ok(verified)
             }
             Err(error) => {
@@ -286,6 +284,7 @@ impl TargetTransaction {
         xid_end_position: u64,
         checkpoint_table: &str,
         checkpoint_name: &str,
+        conflict_table: &str,
     ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
     where
         E: TransactionalTargetExecutor,
@@ -326,14 +325,14 @@ impl TargetTransaction {
         let resolution = conflict_resolution(&candidate.observation, &evidence);
         executor
             .execute_transaction_sql(&crate::conflict_repair::build_conflict_observation_sql(
-                "cdc.row_conflicts",
+                conflict_table,
                 &candidate.observation,
             ))
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         executor
             .execute_transaction_sql(
                 &crate::conflict_repair::build_conflict_resolution_for_source_row_sql(
-                    "cdc.row_conflicts",
+                    conflict_table,
                     &resolution,
                 ),
             )
@@ -406,16 +405,28 @@ where
     E: TransactionalTargetExecutor,
 {
     let rollback_error = transaction.rollback_if_open(executor).err();
-    let persistence_error = observations
-        .into_iter()
-        .try_for_each(|observation| conflict_store.observe(observation))
-        .err();
+    let discard_error = rollback_error
+        .as_ref()
+        .and_then(|_| executor.discard_failed_transaction_connection().err());
+    let persistence_error = if discard_error.is_none() {
+        observations
+            .into_iter()
+            .try_for_each(|observation| conflict_store.observe(observation))
+            .err()
+    } else {
+        None
+    };
     if rollback_error.is_none() && persistence_error.is_none() {
         return Err(error);
     }
     let mut context = error.to_string();
     if let Some(rollback_error) = rollback_error {
         context.push_str(&format!("; rollback failed: {rollback_error}"));
+    }
+    if let Some(discard_error) = discard_error {
+        context.push_str(&format!(
+            "; failed transaction connection discard failed: {discard_error}"
+        ));
     }
     if let Some(persistence_error) = persistence_error {
         context.push_str(&format!(
