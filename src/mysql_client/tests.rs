@@ -318,6 +318,85 @@ fn classifies_duplicate_external_payment_trigger_as_durable_conflict() {
 }
 
 #[test]
+fn treats_matching_existing_payment_identity_as_already_applied() {
+    let conflict = DuplicateConflict {
+        error_code: 1644,
+        error_text: "duplicate external payment".to_string(),
+        duplicate_index: None,
+    };
+    let columns = [
+        "id",
+        "order_id",
+        "payment_service_id",
+        "payment_status_id",
+        "transaction_id",
+        "original_transaction_id",
+        "authorization_id",
+    ];
+    let source = [
+        "420054",
+        "427524",
+        "8",
+        "6",
+        "tx",
+        "original",
+        "authorization",
+    ]
+    .map(|value| Value::Bytes(value.as_bytes().to_vec()));
+    let existing = [
+        "420054",
+        "427524",
+        "8",
+        "3",
+        "tx",
+        "original",
+        "authorization",
+    ]
+    .map(|value| Value::Bytes(value.as_bytes().to_vec()));
+
+    assert_eq!(
+        duplicate_payment_trigger_outcome(
+            conflict.clone(),
+            &columns,
+            &source,
+            &[existing.to_vec()]
+        ),
+        TargetExecutionOutcome::DuplicateIgnored(conflict)
+    );
+}
+
+#[test]
+fn keeps_divergent_payment_order_as_durable_conflict() {
+    let conflict = DuplicateConflict {
+        error_code: 1644,
+        error_text: "duplicate external payment".to_string(),
+        duplicate_index: None,
+    };
+    let columns = [
+        "id",
+        "order_id",
+        "payment_service_id",
+        "transaction_id",
+        "original_transaction_id",
+        "authorization_id",
+    ];
+    let source = ["420054", "427524", "8", "tx", "original", "authorization"]
+        .map(|value| Value::Bytes(value.as_bytes().to_vec()));
+    let existing = ["420054", "999999", "8", "tx", "original", "authorization"]
+        .map(|value| Value::Bytes(value.as_bytes().to_vec()));
+
+    assert_eq!(
+        duplicate_payment_trigger_outcome(
+            conflict.clone(),
+            &columns,
+            &source,
+            &[existing.to_vec()]
+        ),
+        TargetExecutionOutcome::ConstraintConflict(conflict)
+    );
+}
+
+#[test]
 fn rejects_unrelated_trigger_errors_as_conflict_evidence() {
     let duplicate_payment = TargetExecuteError::from_mysql(
         1644,

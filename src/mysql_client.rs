@@ -331,8 +331,17 @@ impl TargetExecutor for PersistentTargetExecutor {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
                 if let Some(conflict) =
-                    constraint_conflict_for_row_change(change.kind, &change.table, &error)
+                    duplicate_payment_trigger_conflict(change.kind, &change.table, &error)
                 {
+                    let existing_rows = self.read_existing_rows(change)?;
+                    return Ok(duplicate_payment_trigger_outcome(
+                        conflict,
+                        &change.writable_columns,
+                        &change.source_values,
+                        &existing_rows,
+                    ));
+                }
+                if let Some(conflict) = constraint_conflict_from_error(&error) {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
                 self.retry_or_return_error(&change.statement, error)?;
@@ -362,14 +371,49 @@ fn constraint_conflict_for_row_change(
     table: &str,
     error: &TargetExecuteError,
 ) -> Option<DuplicateConflict> {
-    constraint_conflict_from_error(error).or_else(|| {
-        let is_duplicate_payment = kind == TargetRowChangeKind::Insert
-            && table == "payments"
-            && error.mysql_code() == Some(1644)
-            && error.to_string()
-                == "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order }";
-        is_duplicate_payment.then(|| duplicate_conflict(error, 1644))
-    })
+    constraint_conflict_from_error(error)
+        .or_else(|| duplicate_payment_trigger_conflict(kind, table, error))
+}
+
+fn duplicate_payment_trigger_conflict(
+    kind: TargetRowChangeKind,
+    table: &str,
+    error: &TargetExecuteError,
+) -> Option<DuplicateConflict> {
+    let is_duplicate_payment = kind == TargetRowChangeKind::Insert
+        && table == "payments"
+        && error.mysql_code() == Some(1644)
+        && error.to_string()
+            == "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order }";
+    is_duplicate_payment.then(|| duplicate_conflict(error, 1644))
+}
+
+fn duplicate_payment_trigger_outcome<T: AsRef<str>>(
+    conflict: DuplicateConflict,
+    columns: &[T],
+    source_values: &[mysql::Value],
+    existing_rows: &[Vec<mysql::Value>],
+) -> TargetExecutionOutcome {
+    const IDENTITY_COLUMNS: [&str; 6] = [
+        "id",
+        "order_id",
+        "payment_service_id",
+        "transaction_id",
+        "original_transaction_id",
+        "authorization_id",
+    ];
+    let identity_matches = existing_rows.len() == 1
+        && IDENTITY_COLUMNS.iter().all(|identity_column| {
+            columns
+                .iter()
+                .position(|column| column.as_ref() == *identity_column)
+                .is_some_and(|index| source_values.get(index) == existing_rows[0].get(index))
+        });
+    if identity_matches {
+        TargetExecutionOutcome::DuplicateIgnored(conflict)
+    } else {
+        TargetExecutionOutcome::ConstraintConflict(conflict)
+    }
 }
 
 fn constraint_conflict_from_error(error: &TargetExecuteError) -> Option<DuplicateConflict> {
