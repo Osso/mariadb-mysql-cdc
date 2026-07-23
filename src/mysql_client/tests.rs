@@ -306,7 +306,7 @@ fn classifies_supported_mysql_constraint_errors_for_durable_evidence() {
 fn classifies_duplicate_external_payment_trigger_as_durable_conflict() {
     let error = TargetExecuteError::from_mysql(
         1644,
-        "ERROR 1644 (45000): This external payment has already been applied to a previous order",
+        "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order }",
     );
 
     let conflict =
@@ -321,9 +321,12 @@ fn classifies_duplicate_external_payment_trigger_as_durable_conflict() {
 fn rejects_unrelated_trigger_errors_as_conflict_evidence() {
     let duplicate_payment = TargetExecuteError::from_mysql(
         1644,
-        "ERROR 1644 (45000): This external payment has already been applied to a previous order",
+        "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order }",
     );
-    let other_trigger = TargetExecuteError::from_mysql(1644, "other trigger failure");
+    let other_trigger = TargetExecuteError::from_mysql(
+        1644,
+        "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order } additional context",
+    );
 
     assert_eq!(
         constraint_conflict_for_row_change(

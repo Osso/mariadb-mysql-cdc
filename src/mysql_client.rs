@@ -366,9 +366,8 @@ fn constraint_conflict_for_row_change(
         let is_duplicate_payment = kind == TargetRowChangeKind::Insert
             && table == "payments"
             && error.mysql_code() == Some(1644)
-            && error
-                .to_string()
-                .contains("This external payment has already been applied to a previous order");
+            && error.to_string()
+                == "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order }";
         is_duplicate_payment.then(|| duplicate_conflict(error, 1644))
     })
 }
@@ -480,9 +479,11 @@ impl PersistentTargetExecutor {
                 {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
-                if let Some(conflict) =
-                    constraint_conflict_for_row_change(change.kind, &change.table, &error)
-                {
+                if let Some(conflict) = constraint_conflict_for_row_change(
+                    TargetRowChangeKind::Update,
+                    &change.table,
+                    &error,
+                ) {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
                 Err(error)
