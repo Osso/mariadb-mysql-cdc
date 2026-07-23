@@ -212,9 +212,13 @@ pub fn build_catalogs(
     target: &SchemaInventory,
     estimated_rows: &BTreeMap<String, u64>,
 ) -> Catalogs {
-    let dependency_inventory = dependency_inventory(source, target);
-    let (mut candidates, mut excluded) =
-        classify_source_tables(&dependency_inventory, target, estimated_rows);
+    let (dependency_inventory, cross_schema_tables) = dependency_inventory(source, target);
+    let (mut candidates, mut excluded) = classify_source_tables(
+        &dependency_inventory,
+        target,
+        estimated_rows,
+        &cross_schema_tables,
+    );
     propagate_non_syncable_dependencies(&dependency_inventory, &mut candidates, &mut excluded);
     Catalogs {
         syncable: sorted_syncable_entries(candidates),
@@ -222,34 +226,37 @@ pub fn build_catalogs(
     }
 }
 
-fn dependency_inventory(source: &SchemaInventory, target: &SchemaInventory) -> SchemaInventory {
-    let mut dependencies = BTreeMap::new();
-    for (inventory, local_schema) in [
-        (source, source.schema.as_str()),
-        (target, target.schema.as_str()),
-    ] {
+fn dependency_inventory(
+    source: &SchemaInventory,
+    target: &SchemaInventory,
+) -> (SchemaInventory, BTreeSet<String>) {
+    let mut local_dependencies = BTreeMap::new();
+    let mut cross_schema_tables = BTreeSet::new();
+    for inventory in [source, target] {
         for foreign_key in &inventory.foreign_keys {
-            let mut dependency = foreign_key.clone();
-            if dependency.referenced_schema == local_schema {
-                dependency.referenced_schema = source.schema.clone();
+            if foreign_key.referenced_schema != inventory.schema {
+                cross_schema_tables.insert(foreign_key.table.clone());
+                continue;
             }
+            let mut dependency = foreign_key.clone();
+            dependency.referenced_schema = source.schema.clone();
             let key = (
                 dependency.table.clone(),
-                dependency.referenced_schema.clone(),
                 dependency.referenced_table.clone(),
             );
-            dependencies.entry(key).or_insert(dependency);
+            local_dependencies.entry(key).or_insert(dependency);
         }
     }
     let mut inventory = source.clone();
-    inventory.foreign_keys = dependencies.into_values().collect();
-    inventory
+    inventory.foreign_keys = local_dependencies.into_values().collect();
+    (inventory, cross_schema_tables)
 }
 
 fn classify_source_tables(
     source: &SchemaInventory,
     target: &SchemaInventory,
     estimated_rows: &BTreeMap<String, u64>,
+    cross_schema_tables: &BTreeSet<String>,
 ) -> (
     BTreeMap<String, SyncableTableEntry>,
     BTreeMap<String, BTreeSet<NonSyncableReason>>,
@@ -270,9 +277,7 @@ fn classify_source_tables(
             source_table,
             target_tables.get(source_table.name.as_str()).copied(),
         );
-        if source.foreign_keys.iter().any(|foreign_key| {
-            foreign_key.table == source_table.name && foreign_key.referenced_schema != source.schema
-        }) {
+        if cross_schema_tables.contains(&source_table.name) {
             reasons.insert(NonSyncableReason::CrossSchemaDependency);
         }
         if reasons.is_empty() {
@@ -1028,6 +1033,38 @@ fn validate_catalog(catalog: &SyncableCatalog) -> Result<(), String> {
             }
         }
     }
+    let dependencies = catalog
+        .tables
+        .iter()
+        .map(|entry| {
+            (
+                entry.name.as_str(),
+                entry
+                    .parent_dependencies
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining = names;
+    while !remaining.is_empty() {
+        let ready = remaining
+            .iter()
+            .filter(|name| {
+                dependencies
+                    .get(**name)
+                    .is_some_and(|parents| parents.is_disjoint(&remaining))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            return Err("catalog has unresolved or cyclic dependencies".to_string());
+        }
+        for name in ready {
+            remaining.remove(name);
+        }
+    }
     Ok(())
 }
 
@@ -1137,9 +1174,47 @@ struct CatalogOutputDestination {
 }
 
 fn catalog_output_destination(path: &Path) -> Result<CatalogOutputDestination, String> {
-    if let Ok(metadata) = fs::metadata(path) {
-        return Ok(CatalogOutputDestination {
-            path: fs::canonicalize(path).map_err(|error| {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("failed to resolve current directory: {error}"))?
+            .join(path)
+    };
+    resolve_catalog_output_destination(&absolute, &mut BTreeSet::new())
+}
+
+fn resolve_catalog_output_destination(
+    path: &Path,
+    visited_links: &mut BTreeSet<PathBuf>,
+) -> Result<CatalogOutputDestination, String> {
+    let normalized = normalize_lexical_path(path);
+    match fs::symlink_metadata(&normalized) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if !visited_links.insert(normalized.clone()) {
+                return Err(format!(
+                    "failed to resolve catalog output {}: symbolic link cycle",
+                    path.display()
+                ));
+            }
+            let target = fs::read_link(&normalized).map_err(|error| {
+                format!(
+                    "failed to resolve catalog output {}: {error}",
+                    path.display()
+                )
+            })?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                normalized
+                    .parent()
+                    .unwrap_or_else(|| Path::new("/"))
+                    .join(target)
+            };
+            resolve_catalog_output_destination(&target, visited_links)
+        }
+        Ok(metadata) => Ok(CatalogOutputDestination {
+            path: fs::canonicalize(&normalized).map_err(|error| {
                 format!(
                     "failed to resolve catalog output {}: {error}",
                     path.display()
@@ -1147,13 +1222,21 @@ fn catalog_output_destination(path: &Path) -> Result<CatalogOutputDestination, S
             })?,
             #[cfg(unix)]
             file_identity: Some(file_identity(&metadata)),
-        });
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            unresolved_catalog_output_destination(&normalized)
+        }
+        Err(error) => Err(format!(
+            "failed to resolve catalog output {}: {error}",
+            path.display()
+        )),
     }
+}
 
+fn unresolved_catalog_output_destination(path: &Path) -> Result<CatalogOutputDestination, String> {
     let parent = path
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+        .ok_or_else(|| format!("catalog output {} has no parent", path.display()))?;
     let file_name = path
         .file_name()
         .ok_or_else(|| format!("catalog output {} has no file name", path.display()))?;
@@ -1168,6 +1251,24 @@ fn catalog_output_destination(path: &Path) -> Result<CatalogOutputDestination, S
         #[cfg(unix)]
         file_identity: None,
     })
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 #[cfg(unix)]
@@ -1872,6 +1973,36 @@ mod tests {
     }
 
     #[test]
+    fn target_external_schema_matching_source_schema_is_still_cross_schema() {
+        let tables = vec![
+            table("child", vec![column("id"), column("parent_id")], vec!["id"]),
+            table("parent", vec![column("id")], vec!["id"]),
+        ];
+        let mut source = inventory(
+            tables.clone(),
+            vec![foreign_key_in_schema("child", "parent", "app")],
+        );
+        source.schema = "app".into();
+        let mut target = inventory(
+            tables,
+            vec![foreign_key_in_schema("child", "parent", "app")],
+        );
+        target.schema = "app_new".into();
+
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+        let child = catalogs
+            .non_syncable
+            .iter()
+            .find(|entry| entry.name == "child")
+            .expect("target cross-schema child");
+
+        assert_eq!(
+            child.reasons,
+            vec![NonSyncableReason::CrossSchemaDependency]
+        );
+    }
+
+    #[test]
     fn target_only_cross_schema_fk_excludes_child_and_descendants() {
         let tables = vec![
             table("child", vec![column("id"), column("parent_id")], vec!["id"]),
@@ -1929,6 +2060,17 @@ mod tests {
         );
         let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
         assert!(catalogs.syncable[0].parent_dependencies.is_empty());
+    }
+
+    #[test]
+    fn dependency_cycle_is_rejected_before_external_scheduling() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &["b"]), entry("b", 2, &["a"])],
+        };
+
+        let error = validate_catalog(&catalog).expect_err("cycle must fail prevalidation");
+
+        assert!(error.contains("cyclic dependencies"), "{error}");
     }
 
     #[test]
@@ -2386,6 +2528,48 @@ mod tests {
 
         assert!(error.contains("same filesystem destination"), "{error}");
         assert!(!first.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_relative_symlink_catalog_output_conflicts_with_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = unique_catalog_test_directory("dangling-relative-symlink");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let target = directory.join("catalog.json");
+        let alias = directory.join("catalog-link.json");
+        symlink("catalog.json", &alias).expect("create dangling relative symlink");
+
+        let error = validate_distinct_catalog_output_paths(&target, &alias)
+            .expect_err("dangling symlink target must conflict");
+
+        assert!(error.contains("same filesystem destination"), "{error}");
+        assert!(!target.exists(), "target was created");
+        assert!(fs::symlink_metadata(&alias).is_ok(), "symlink was removed");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_output_symlink_cycle_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let directory = unique_catalog_test_directory("symlink-cycle");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let first = directory.join("first.json");
+        let second = directory.join("second.json");
+        symlink("second.json", &first).expect("create first cycle link");
+        symlink("first.json", &second).expect("create second cycle link");
+
+        let error = validate_distinct_catalog_output_paths(&first, &directory.join("other.json"))
+            .expect_err("symlink cycle must fail closed");
+
+        assert!(
+            error.contains("failed to resolve catalog output"),
+            "{error}"
+        );
         let _ = fs::remove_dir_all(directory);
     }
 
