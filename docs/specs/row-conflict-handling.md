@@ -11,6 +11,13 @@ conflicting secondary key.
 - [x] Classify native ROW `1062` as durable repair debt unless
       `ignore-duplicate` proves exact source/target row equality; admitted NOT
       NULL, foreign-key, and CHECK constraint failures are also durable debt.
+- [x] Classify an `INSERT` into `globalcomix.payments` that returns MySQL
+      `1644` with the exact message `This external payment has already been
+      applied to a previous order` as durable row-conflict evidence. Roll back
+      the target transaction, preserve the unchanged checkpoint, and retry
+      through the durable conflict path rather than treating this trigger error
+      as a fatal stream exit. Other `1644` errors, other tables, and non-`INSERT`
+      changes do not receive this classification.
 - [x] Under `ignore-duplicate`, skip a native ROW `INSERT` `1062` only when the
       target row fetched by source primary key exactly equals the source row;
       divergent `ROW INSERT` values and every non-`INSERT` `1062` unique conflict
@@ -77,7 +84,10 @@ conflicting secondary key.
 `--insert-conflict-policy` has three values: `error`, `ignore-duplicate`, and
 `replace-divergent-pk`. `ignore-duplicate` keeps its equality-only native ROW
 behavior: a duplicate continues without ledger evidence only when the target row
-fetched by source primary key exactly equals the source row. `replace-divergent-pk`
+fetched by source primary key exactly equals the source row. The narrow
+`payments` `INSERT`/MySQL `1644` duplicate-trigger classification above is
+independent of `--insert-conflict-policy` and uses durable conflict evidence.
+`replace-divergent-pk`
 is native ROW-only and replaces unequal rows only for a `PRIMARY` duplicate using
 a primary-key UPDATE of the source image; it records durable evidence only when
 a matching unresolved conflict already exists, then continues so the target
