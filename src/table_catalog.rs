@@ -7,6 +7,7 @@ use crate::{live, mysql_snapshot, table_sync};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -1044,10 +1045,14 @@ fn catalog_table_sync_config(
 }
 
 fn deterministic_run_id(prefix: &str, target_database: &str, table: &str) -> String {
-    let prefix = encode_run_id_component(prefix);
-    let database = encode_run_id_component(target_database);
-    let table = encode_run_id_component(table);
-    format!("v1:{prefix}:{database}:{table}")
+    let tuple = format!(
+        "{}:{}:{}",
+        encode_run_id_component(prefix),
+        encode_run_id_component(target_database),
+        encode_run_id_component(table)
+    );
+    let digest = Sha256::digest(tuple.as_bytes());
+    format!("catalog-v2-{digest:x}")
 }
 
 fn encode_run_id_component(value: &str) -> String {
@@ -2691,14 +2696,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_generated_run_ids_longer_than_progress_column() {
-        let prefix = "x".repeat(124);
+    fn long_production_table_name_fits_progress_run_id() {
+        let table = "income_content_summary_2026_03_06_invalidation_backup";
         let catalog = SyncableCatalog {
-            tables: vec![entry("items", 1, &[])],
+            tables: vec![entry(table, 1, &[])],
         };
-        let error =
-            validate_catalog_run_ids(&catalog, &prefix, "database").expect_err("oversized run id");
-        assert!(error.contains("128"));
+
+        validate_catalog_run_ids(&catalog, "j", "globalcomix").expect("valid run id");
+        let run_id = deterministic_run_id("j", "globalcomix", table);
+
+        assert!(run_id.starts_with("catalog-v2-"));
+        assert_eq!(run_id.len(), "catalog-v2-".len() + 64);
+        assert!(run_id.len() <= 128);
     }
 
     #[test]
@@ -2731,13 +2740,13 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             deterministic_run_id("full-20260722", "globalcomix", "a"),
-            "v1:13:66756c6c2d3230323630373232:11:676c6f62616c636f6d6978:1:61"
+            "catalog-v2-ae0defa6c464a5c1ec07f58277573c666a7052f5753eadd8b554713c5db7f98a"
         );
         assert_ne!(
             deterministic_run_id("full-20260722", "globalcomix", "a"),
             deterministic_run_id("full-20260722", "external2_env", "a")
         );
-        assert!(deterministic_run_id("full-20260722", "tenant/db", "a").starts_with("v1:"));
+        assert!(deterministic_run_id("full-20260722", "tenant/db", "a").starts_with("catalog-v2-"));
         assert_ne!(
             deterministic_run_id("full-20260722", "a b", "items"),
             deterministic_run_id("full-20260722", "a_20b", "items")

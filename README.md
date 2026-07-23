@@ -247,10 +247,11 @@ existing content.
 `sync-catalog` reads only the syncable catalog and starts apply mode immediately;
 there is no dry-run/plan mode and `table-catalog` does not launch it. The command
 waits until all entries complete or a failure is returned. Each table uses a
-versioned run ID that length-frames and hexadecimal-encodes every byte of the
-`(run-id prefix, target database, table)` tuple. The prefix is required and
-non-empty, and every generated ID must be at most 128 bytes; delimiters inside
-components cannot create collisions. Interrupted exact IDs resume; a matching `status='complete'` row
+fixed-length `catalog-v2-<SHA-256 hex>` run ID. The digest input is the
+injective length-framed byte tuple `(run-id prefix, target database, table)`, so
+prefix, database, and table changes produce distinct deterministic IDs while
+long valid names still fit the 128-byte progress column. The prefix is required
+and non-empty. Interrupted exact IDs resume; a matching `status='complete'` row
 is terminal only when its immutable run specification exactly matches the current
 catalog child; a different stored specification fails closed instead of being
 treated as terminal. Direct `sync-table` and
