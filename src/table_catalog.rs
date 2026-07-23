@@ -1038,7 +1038,7 @@ fn catalog_table_sync_config(
         ),
         start_after: None,
         end_at: None,
-        max_deletes: Some(0),
+        max_deletes: None,
         updated_since: None,
         plan_hash: None,
     }
@@ -3008,6 +3008,73 @@ mod tests {
             for name in names {
                 self.held.remove(&name);
             }
+        }
+    }
+
+    #[test]
+    fn catalog_sync_removes_delete_limit() {
+        let config = catalog_sync_test_config();
+        let entry = SyncableTableEntry {
+            name: "orphaned_rows".to_string(),
+            primary_key: vec!["id".to_string()],
+            columns: vec!["id".to_string()],
+            estimated_source_rows: 1,
+            parent_dependencies: vec![],
+        };
+
+        let sync_config = catalog_table_sync_config(&config, &entry);
+
+        assert_eq!(sync_config.mode, table_sync::SyncMode::Apply);
+        assert_eq!(sync_config.max_deletes, None);
+        table_sync::ensure_delete_allowed(u64::MAX, sync_config.max_deletes, sync_config.mode)
+            .expect("catalog deletes are unbounded");
+    }
+
+    #[test]
+    fn catalog_run_spec_records_no_delete_limit() {
+        let config = catalog_sync_test_config();
+        let catalog = SyncableCatalog {
+            tables: vec![SyncableTableEntry {
+                name: "orphaned_rows".to_string(),
+                primary_key: vec!["id".to_string()],
+                columns: vec!["id".to_string()],
+                estimated_source_rows: 1,
+                parent_dependencies: vec![],
+            }],
+        };
+
+        let specs = expected_catalog_run_specs(&config, &catalog).expect("catalog run specs");
+        let spec: serde_json::Value =
+            serde_json::from_str(specs.get("orphaned_rows").expect("orphaned rows run spec"))
+                .expect("valid run spec JSON");
+
+        assert_eq!(spec["max_deletes"], serde_json::Value::Null);
+    }
+
+    fn catalog_sync_test_config() -> SyncCatalogConfig {
+        SyncCatalogConfig {
+            connections: CatalogConnectionConfig {
+                source: mysql_snapshot::MySqlConnectionConfig {
+                    host: "source".to_string(),
+                    port: 3306,
+                    user: "reader".to_string(),
+                    password: "secret".to_string(),
+                    database: "source_db".to_string(),
+                },
+                target: live::TargetMySqlConfig {
+                    host: "target".to_string(),
+                    port: 25060,
+                    user: "writer".to_string(),
+                    password: "secret".to_string(),
+                    database: "target_db".to_string(),
+                    tls_ca_file: "/ca.pem".to_string(),
+                    insert_conflict_policy: live::InsertConflictPolicy::Error,
+                },
+            },
+            catalog: PathBuf::from("catalog.json"),
+            progress_table: "cdc.table_sync_runs".to_string(),
+            run_id_prefix: "catalog".to_string(),
+            chunk_size: 10_000,
         }
     }
 

@@ -283,10 +283,13 @@ specification before it is treated as terminal. Reservation sessions set MySQL `
 provide recovery from network disconnects. Children start only after all listed FK parents complete. Missing
 dependencies are rejected before workers start; owned failures return after owned
 work settles, and dependency cycles fail closed without waiting for unrelated
-external syncs. Each catalog child forces `max_deletes=0`; the
-option is not configurable, so target orphans are never deleted. The
-non-syncable catalog is classification/operator input only; full-dump execution
-is out of scope.
+external syncs. Catalog children apply every target orphan deletion planned by
+catalog comparison; `sync-catalog` has no `max_deletes` limit or delete-safety
+gate because the catalog-planned orphan set bounds deletion. This contract is
+specific to `sync-catalog`: direct `sync-table` apply mode and `repair-drift`
+apply mode retain explicit bounded `--max-deletes` allowances. The non-syncable
+catalog is classification/operator input only; full-dump execution is out of
+scope.
 
 ```bash
 cargo run -- catchup-snapshot \
