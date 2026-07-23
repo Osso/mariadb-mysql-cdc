@@ -46,6 +46,7 @@ class ScenarioSpec:
 SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
     ScenarioSpec("home-feed-card-parent-recovery", True),
+    ScenarioSpec("superseded-users-recovery", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
@@ -3031,6 +3032,164 @@ class Harness:
             "constraint_attempts=2 checkpoint_unchanged=true"
         )
 
+    def setup_superseded_users_tables(self) -> None:
+        assert self.source and self.target
+        schema_sql = (
+            "DROP TABLE IF EXISTS users_email_settings; "
+            "DROP TABLE IF EXISTS users_profiles; "
+            "DROP TABLE IF EXISTS users; "
+            "CREATE TABLE users ("
+            "id BIGINT NOT NULL PRIMARY KEY, "
+            "name VARCHAR(64) NOT NULL, "
+            "email VARCHAR(128) NOT NULL, "
+            "UNIQUE KEY name (name), "
+            "UNIQUE KEY email (email)"
+            ") ENGINE=InnoDB; "
+            "CREATE TABLE users_profiles ("
+            "id BIGINT NOT NULL PRIMARY KEY, "
+            "full_name VARCHAR(128) NOT NULL"
+            ") ENGINE=InnoDB; "
+            "CREATE TABLE users_email_settings ("
+            "id BIGINT NOT NULL PRIMARY KEY, "
+            "user_id BIGINT NOT NULL, "
+            "setting_group_id BIGINT NOT NULL, "
+            "setting TINYINT NOT NULL, "
+            "UNIQUE KEY uq_user_setting (user_id, setting_group_id)"
+            ") ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema_sql)
+        self.admin_sql(self.target, "DELETE FROM cdc.row_conflicts WHERE table_name='users';")
+
+    def prepare_superseded_users_case(self, *, target_primary_email: str) -> tuple[Coordinate, Coordinate]:
+        assert self.source and self.target
+        self.setup_superseded_users_tables()
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "START TRANSACTION; "
+            "INSERT INTO users (id,name,email) VALUES (2070980,'-3572','historical@example.test'); "
+            "INSERT INTO users_profiles (id,full_name) VALUES (2070980,'Historical Profile'); "
+            "INSERT INTO users_email_settings (id,user_id,setting_group_id,setting) VALUES "
+            "(16562670,2070980,2,1),(16562671,2070980,3,1),(16562672,2070980,4,1),"
+            "(16562673,2070980,5,1),(16562674,2070980,6,1),(16562675,2070980,7,1),"
+            "(16562676,2070980,8,1),(16562677,2070980,9,1); "
+            "COMMIT;",
+        )
+        historical_stop = self.coordinate()
+        self.admin_sql(
+            self.source,
+            "UPDATE users SET name='vngt',email='current@example.test' WHERE id=2070980; "
+            "INSERT INTO users (id,name,email) VALUES (2071305,'-3572','owner@example.test');",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO users (id,name,email) VALUES "
+            f"(2070980,'vngt',{sql_literal(target_primary_email)}),"
+            "(2071305,'-3572','owner@example.test');",
+        )
+        return start, historical_stop
+
+    def assert_superseded_users_current_rows(self, *, expected_primary_email: str) -> None:
+        assert self.target
+        users = self.admin_query(
+            self.target,
+            "SELECT id,name,email FROM users ORDER BY id;",
+        ).strip()
+        expected = (
+            f"2070980\tvngt\t{expected_primary_email}\n"
+            "2071305\t-3572\towner@example.test"
+        )
+        if users != expected:
+            raise HarnessError(f"superseded users current rows changed: {users!r}")
+
+    def run_superseded_users_recovery(self) -> None:
+        assert self.source and self.target
+        start, historical_stop = self.prepare_superseded_users_case(
+            target_primary_email="current@example.test"
+        )
+        result = self.run_stream(
+            start,
+            historical_stop,
+            insert_conflict_policy="ignore-duplicate",
+        )
+        require_success(result, "superseded users recovery stream")
+        self.assert_superseded_users_current_rows(expected_primary_email="current@example.test")
+        profile = self.admin_query(
+            self.target,
+            "SELECT id,full_name FROM users_profiles WHERE id=2070980;",
+        ).strip()
+        if profile != "2070980\tHistorical Profile":
+            raise HarnessError(f"superseded recovery missed profile effect: {profile!r}")
+        settings = self.admin_query(
+            self.target,
+            "SELECT setting_group_id,setting FROM users_email_settings "
+            "WHERE user_id=2070980 ORDER BY setting_group_id;",
+        ).strip()
+        expected_settings = "\n".join(f"{group_id}\t1" for group_id in range(2, 10))
+        if settings != expected_settings:
+            raise HarnessError(f"superseded recovery missed settings effects: {settings!r}")
+        conflict = self.admin_query(
+            self.target,
+            "SELECT source_primary_key_json,status,repair_run_id,resolution_evidence "
+            "FROM cdc.row_conflicts WHERE table_name='users';",
+        ).strip().split("\t", 3)
+        if len(conflict) != 4 or conflict[0] != '["2070980"]' or conflict[1] != "resolved":
+            raise HarnessError(f"superseded recovery conflict was not resolved: {conflict!r}")
+        if not conflict[2] or "verified superseded historical insert" not in conflict[3]:
+            raise HarnessError(f"superseded recovery evidence missing proof: {conflict!r}")
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint.get("source_file") != historical_stop.file
+            or int(checkpoint.get("source_position", 0)) != historical_stop.position
+        ):
+            raise HarnessError(f"superseded recovery checkpoint mismatch: {checkpoint}")
+
+        mismatch_start, mismatch_stop = self.prepare_superseded_users_case(
+            target_primary_email="mismatch@example.test"
+        )
+        mismatch = self.run_stream(
+            mismatch_start,
+            mismatch_stop,
+            insert_conflict_policy="ignore-duplicate",
+        )
+        mismatch_output = f"{mismatch.stdout}\n{mismatch.stderr}".lower()
+        if mismatch.returncode == 0 or "targetprimaryhashmismatch" not in mismatch_output.replace("_", ""):
+            raise HarnessError(f"target mismatch did not fail closed: {mismatch_output}")
+        self.assert_superseded_users_current_rows(expected_primary_email="mismatch@example.test")
+        profile_count = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM users_profiles WHERE id=2070980;",
+        ).strip()
+        settings_count = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM users_email_settings WHERE user_id=2070980;",
+        ).strip()
+        if profile_count != "0" or settings_count != "0":
+            raise HarnessError(
+                "target mismatch retained rolled-back effects: "
+                f"profiles={profile_count} settings={settings_count}"
+            )
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint.get("source_file") != mismatch_start.file
+            or int(checkpoint.get("source_position", 0)) != mismatch_start.position
+        ):
+            raise HarnessError(f"target mismatch advanced checkpoint: {checkpoint}")
+        unresolved = self.admin_query(
+            self.target,
+            "SELECT source_primary_key_json,status,attempt_count FROM cdc.row_conflicts "
+            "WHERE table_name='users';",
+        ).strip()
+        if unresolved != '["2070980"]\tunresolved\t1':
+            raise HarnessError(f"target mismatch evidence mismatch: {unresolved!r}")
+        print(
+            "superseded_users_recovery_ok current_users_preserved=true "
+            "profile_settings_applied=true checkpoint_advanced=true conflict_resolved=true "
+            "target_mismatch_rollback=true target_mismatch_checkpoint_unchanged=true"
+        )
+
     def run_durable_row_conflict_retry(self) -> None:
         assert self.source and self.target
         for endpoint in (self.source, self.target):
@@ -3821,6 +3980,8 @@ class Harness:
             self.run_strict_secondary_btree()
         elif scenario == "home-feed-card-parent-recovery":
             self.run_home_feed_card_parent_recovery()
+        elif scenario == "superseded-users-recovery":
+            self.run_superseded_users_recovery()
         elif scenario == "production-alter-table":
             self.run_production_alter_table()
         elif scenario == "create-table-crash-restart":

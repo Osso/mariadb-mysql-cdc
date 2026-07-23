@@ -33,6 +33,24 @@ fn real_strict_secondary_btree_harness_smoke() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_superseded_users_recovery_commits_remaining_effects_and_rejects_mismatch() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("superseded-users-recovery")
+        .output()
+        .expect("run superseded users recovery harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_home_feed_card_parent_recovery_replays_child_and_checkpoints() {
     let output = Command::new("python3")
         .arg(harness_script())
