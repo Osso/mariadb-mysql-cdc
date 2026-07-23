@@ -303,6 +303,51 @@ fn classifies_supported_mysql_constraint_errors_for_durable_evidence() {
 }
 
 #[test]
+fn classifies_duplicate_external_payment_trigger_as_durable_conflict() {
+    let error = TargetExecuteError::from_mysql(
+        1644,
+        "ERROR 1644 (45000): This external payment has already been applied to a previous order",
+    );
+
+    let conflict =
+        constraint_conflict_for_row_change(TargetRowChangeKind::Insert, "payments", &error)
+            .expect("payments trigger conflict");
+
+    assert_eq!(conflict.error_code, 1644);
+    assert_eq!(conflict.duplicate_index, None);
+}
+
+#[test]
+fn rejects_unrelated_trigger_errors_as_conflict_evidence() {
+    let duplicate_payment = TargetExecuteError::from_mysql(
+        1644,
+        "ERROR 1644 (45000): This external payment has already been applied to a previous order",
+    );
+    let other_trigger = TargetExecuteError::from_mysql(1644, "other trigger failure");
+
+    assert_eq!(
+        constraint_conflict_for_row_change(
+            TargetRowChangeKind::Insert,
+            "orders",
+            &duplicate_payment,
+        ),
+        None
+    );
+    assert_eq!(
+        constraint_conflict_for_row_change(
+            TargetRowChangeKind::Update,
+            "payments",
+            &duplicate_payment,
+        ),
+        None
+    );
+    assert_eq!(
+        constraint_conflict_for_row_change(TargetRowChangeKind::Insert, "payments", &other_trigger,),
+        None
+    );
+}
+
+#[test]
 fn rejects_non_constraint_mysql_errors_as_conflict_evidence() {
     let error = TargetExecuteError::from_mysql(1142, "permission denied");
 

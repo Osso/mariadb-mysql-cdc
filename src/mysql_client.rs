@@ -330,7 +330,9 @@ impl TargetExecutor for PersistentTargetExecutor {
                 if let Some(conflict) = duplicate_conflict_for_row_change(change.kind, &error) {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
-                if let Some(conflict) = constraint_conflict_from_error(&error) {
+                if let Some(conflict) =
+                    constraint_conflict_for_row_change(change.kind, &change.table, &error)
+                {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
                 self.retry_or_return_error(&change.statement, error)?;
@@ -355,16 +357,33 @@ fn duplicate_conflict_for_row_change(
     })
 }
 
+fn constraint_conflict_for_row_change(
+    kind: TargetRowChangeKind,
+    table: &str,
+    error: &TargetExecuteError,
+) -> Option<DuplicateConflict> {
+    constraint_conflict_from_error(error).or_else(|| {
+        let is_duplicate_payment = kind == TargetRowChangeKind::Insert
+            && table == "payments"
+            && error.mysql_code() == Some(1644)
+            && error
+                .to_string()
+                .contains("This external payment has already been applied to a previous order");
+        is_duplicate_payment.then(|| duplicate_conflict(error, 1644))
+    })
+}
+
 fn constraint_conflict_from_error(error: &TargetExecuteError) -> Option<DuplicateConflict> {
     let code = error.mysql_code()?;
-    if !matches!(code, 1048 | 1451 | 1452 | 3819 | 4025) {
-        return None;
-    }
-    Some(DuplicateConflict {
-        error_code: code,
+    matches!(code, 1048 | 1451 | 1452 | 3819 | 4025).then(|| duplicate_conflict(error, code))
+}
+
+fn duplicate_conflict(error: &TargetExecuteError, error_code: u16) -> DuplicateConflict {
+    DuplicateConflict {
+        error_code,
         error_text: error.to_string(),
         duplicate_index: None,
-    })
+    }
 }
 
 impl TransactionalTargetExecutor for PersistentTargetExecutor {
@@ -461,7 +480,9 @@ impl PersistentTargetExecutor {
                 {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
-                if let Some(conflict) = constraint_conflict_from_error(&error) {
+                if let Some(conflict) =
+                    constraint_conflict_for_row_change(change.kind, &change.table, &error)
+                {
                     return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
                 }
                 Err(error)
