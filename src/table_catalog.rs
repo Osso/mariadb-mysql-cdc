@@ -955,24 +955,43 @@ fn classify_run_statuses(
             }
         }
         if status == "complete" && expected_catalog_child {
-            let expected_table = expected_table.expect("expected catalog child");
-            if table != expected_table {
-                return Err(format!(
-                    "run id `{run_id}` mutable table_name `{table}` disagrees with expected table `{expected_table}`"
-                ));
-            }
-            if database != target_database
-                || spec_table != expected_table
-                || expected_specs.get(expected_table) != Some(&run_spec_json)
-            {
-                return Err(format!(
-                    "run id `{run_id}` already exists with a different immutable specification"
-                ));
-            }
+            validate_completed_catalog_child(
+                &row,
+                target_database,
+                expected_table.expect("expected catalog child"),
+                (&database, &spec_table),
+                expected_specs,
+            )?;
             statuses.completed.push(spec_table);
         }
     }
     Ok(statuses)
+}
+
+fn validate_completed_catalog_child(
+    row: &ActiveRunRow,
+    target_database: &str,
+    expected_table: &str,
+    spec_identity: (&str, &str),
+    expected_specs: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if row.table != expected_table {
+        return Err(format!(
+            "run id `{}` mutable table_name `{}` disagrees with expected table `{expected_table}`",
+            row.run_id, row.table
+        ));
+    }
+    let (spec_database, spec_table) = spec_identity;
+    if spec_database != target_database
+        || spec_table != expected_table
+        || expected_specs.get(expected_table).map(String::as_str) != Some(&row.run_spec_json)
+    {
+        return Err(format!(
+            "run id `{}` already exists with a different immutable specification",
+            row.run_id
+        ));
+    }
+    Ok(())
 }
 
 fn run_catalog_table_reserved(
