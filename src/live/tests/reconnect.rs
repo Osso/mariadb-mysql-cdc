@@ -356,11 +356,11 @@ fn recovers_home_feed_card_2492683_before_replaying_slide_4508905_to_xid() {
 }
 
 #[test]
-fn failed_exact_parent_recovery_retries_same_checkpoint_then_succeeds() {
+fn failed_exact_parent_recovery_outlives_transport_budget_then_succeeds() {
     let checkpoint_store =
         MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.002709", 224_140_888));
     let config = ApplyBinlogConfig {
-        max_reconnects: 2,
+        max_reconnects: 1,
         ..ApplyBinlogConfig::default()
     };
     let request = exact_sessions_guest_recovery();
@@ -376,7 +376,7 @@ fn failed_exact_parent_recovery_retries_same_checkpoint_then_succeeds() {
             let mut attempt = attempts.borrow_mut();
             *attempt += 1;
             events.borrow_mut().push(format!("attempt:{}", *attempt));
-            if *attempt <= 2 {
+            if *attempt <= 4 {
                 return Err(ApplyBinlogError::RowConflictPersisted {
                     message: "fk_sessions_guest".to_string(),
                     parent_recovery: Some(Box::new(request.clone())),
@@ -400,7 +400,7 @@ fn failed_exact_parent_recovery_retries_same_checkpoint_then_succeeds() {
             );
             let mut recovery = recoveries.borrow_mut();
             *recovery += 1;
-            if *recovery == 1 {
+            if *recovery <= 3 {
                 events.borrow_mut().push("recovery-failed".to_string());
                 return Err(RecoveryAttemptError::ReconciliationFailed(
                     "target guests row diverges from exact source image".to_string(),
@@ -413,16 +413,20 @@ fn failed_exact_parent_recovery_retries_same_checkpoint_then_succeeds() {
     )
     .expect("failed recovery reconnects from the unchanged checkpoint");
 
-    assert_eq!(*attempts.borrow(), 3);
-    assert_eq!(*recoveries.borrow(), 2);
+    assert_eq!(*attempts.borrow(), 5);
+    assert_eq!(*recoveries.borrow(), 4);
     assert_eq!(
         events.into_inner(),
         vec![
             "attempt:1",
             "recovery-failed",
             "attempt:2",
-            "recovery-succeeded",
+            "recovery-failed",
             "attempt:3",
+            "recovery-failed",
+            "attempt:4",
+            "recovery-succeeded",
+            "attempt:5",
             "child-replayed",
         ]
     );

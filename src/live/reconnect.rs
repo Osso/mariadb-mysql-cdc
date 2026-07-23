@@ -161,7 +161,8 @@ where
     let mut attempt_config = config.clone();
     resume_from_checkpoint(&mut attempt_config, checkpoint_store)?;
     attempt_config.source.validate_start_coordinate()?;
-    let mut attempt = 0;
+    let mut reconnect_attempt = 0;
+    let mut transport_reconnects = 0;
     let mut attempted_recoveries = BTreeSet::new();
 
     loop {
@@ -172,33 +173,51 @@ where
         let error = match retry_or_stop_after_failed_attempt(
             error,
             checkpoint_store.is_some(),
-            attempt,
+            transport_reconnects,
             config,
             &mut attempted_recoveries,
             &mut recover,
         )? {
-            FailedAttemptOutcome::Retry(error) => error,
+            FailedAttemptOutcome::Retry {
+                error,
+                budget: RetryBudget::ConsumeTransport,
+            } => {
+                transport_reconnects += 1;
+                error
+            }
+            FailedAttemptOutcome::Retry {
+                error,
+                budget: RetryBudget::PreserveTransport,
+            } => error,
             FailedAttemptOutcome::Stop(error) => return Err(error),
         };
 
-        attempt += 1;
+        reconnect_attempt += 1;
         let checkpoint = load_checkpoint_for_resume(checkpoint_store)?;
         update_source_coordinate_from_checkpoint(&mut attempt_config, checkpoint);
         validate_reconnect_start_coordinate(&attempt_config)?;
-        log_reconnect_start(&attempt_config, attempt, &error);
-        sleep(reconnect_delay(attempt));
+        log_reconnect_start(&attempt_config, reconnect_attempt, &error);
+        sleep(reconnect_delay(reconnect_attempt));
     }
 }
 
 enum FailedAttemptOutcome {
-    Retry(ApplyBinlogError),
+    Retry {
+        error: ApplyBinlogError,
+        budget: RetryBudget,
+    },
     Stop(ApplyBinlogError),
+}
+
+enum RetryBudget {
+    ConsumeTransport,
+    PreserveTransport,
 }
 
 fn retry_or_stop_after_failed_attempt<R>(
     error: ApplyBinlogError,
     has_checkpoint_store: bool,
-    attempt: u32,
+    transport_reconnects: u32,
     config: &ApplyBinlogConfig,
     attempted_recoveries: &mut BTreeSet<crate::live::ExactParentRecovery>,
     recover: &mut R,
@@ -209,22 +228,38 @@ where
     if let Some(stale_error) = stale_binlog_error(&error) {
         return Ok(FailedAttemptOutcome::Stop(stale_error));
     }
-    if !has_checkpoint_store
-        || !should_reconnect(
+    let exact_parent_retry = error.parent_recovery().is_some();
+    let reconnect_eligible = if exact_parent_retry {
+        is_retryable_stream_error(&error)
+    } else {
+        should_reconnect(
             &error,
-            attempt,
+            transport_reconnects,
             config.max_reconnects,
             config.reconnect_forever,
         )
-    {
+    };
+    if !has_checkpoint_store || !reconnect_eligible {
         log_skipped_recovery(&error);
         return Ok(FailedAttemptOutcome::Stop(error));
     }
     match attempt_exact_parent_recovery(&error, attempted_recoveries, recover) {
-        Ok(()) => Ok(FailedAttemptOutcome::Retry(error)),
-        Err(source) => Ok(FailedAttemptOutcome::Retry(parent_recovery_error(
-            &error, source,
-        ))),
+        Ok(()) => Ok(FailedAttemptOutcome::Retry {
+            error,
+            budget: retry_budget(exact_parent_retry),
+        }),
+        Err(source) => Ok(FailedAttemptOutcome::Retry {
+            error: parent_recovery_error(&error, source),
+            budget: RetryBudget::PreserveTransport,
+        }),
+    }
+}
+
+fn retry_budget(exact_parent_retry: bool) -> RetryBudget {
+    if exact_parent_retry {
+        RetryBudget::PreserveTransport
+    } else {
+        RetryBudget::ConsumeTransport
     }
 }
 
