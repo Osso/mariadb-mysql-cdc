@@ -32,6 +32,14 @@ pub(super) trait SupersededInsertVerifier {
     ) -> Result<super::superseded_insert::SupersededInsertProof, String>;
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct SupersededXidCommitContext<'a> {
+    pub(super) xid_end_position: u64,
+    pub(super) checkpoint_table: &'a str,
+    pub(super) checkpoint_name: &'a str,
+    pub(super) conflict_table: &'a str,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct VerifiedSupersededInsert {
     pub(super) resolution_evidence: String,
@@ -178,27 +186,19 @@ impl TargetTransaction {
         &mut self,
         executor: &E,
         verifier: &mut V,
-        xid_end_position: u64,
-        checkpoint_table: &str,
-        checkpoint_name: &str,
-        conflict_table: &str,
+        context: SupersededXidCommitContext<'_>,
     ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
     where
         E: TransactionalTargetExecutor,
         V: SupersededInsertVerifier,
     {
-        let result = self.verify_and_commit_deferred_superseded_inserts(
+        let mut conflict_store = crate::conflict_repair::InMemoryConflictStore::default();
+        self.verify_deferred_superseded_inserts_at_xid_with_conflicts(
             executor,
             verifier,
-            xid_end_position,
-            checkpoint_table,
-            checkpoint_name,
-            conflict_table,
-        );
-        if result.is_err() {
-            self.rollback_if_open(executor)?;
-        }
-        result
+            &mut conflict_store,
+            context,
+        )
     }
 
     pub(super) fn verify_deferred_superseded_inserts_at_xid_with_conflicts<E, V>(
@@ -206,16 +206,13 @@ impl TargetTransaction {
         executor: &E,
         verifier: &mut V,
         conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
-        xid_end_position: u64,
-        checkpoint_table: &str,
-        checkpoint_name: &str,
-        conflict_table: &str,
+        context: SupersededXidCommitContext<'_>,
     ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
     where
         E: TransactionalTargetExecutor,
         V: SupersededInsertVerifier,
     {
-        let observations = self.finalized_superseded_observations(xid_end_position);
+        let observations = self.finalized_superseded_observations(context.xid_end_position);
         if let Some(error) = self.superseded_preflight_error(&observations) {
             return fail_superseded_transaction(
                 self,
@@ -229,15 +226,16 @@ impl TargetTransaction {
         match self.verify_and_commit_deferred_superseded_inserts(
             executor,
             verifier,
-            xid_end_position,
-            checkpoint_table,
-            checkpoint_name,
-            conflict_table,
+            conflict_store,
+            context,
         ) {
-            Ok(verified) => {
+            Ok((verified, committed_resolutions)) => {
                 let resolution = conflict_resolution(&observation, &verified.resolution_evidence);
                 conflict_store.mark_observation_committed(observation);
                 conflict_store.mark_resolution_committed(resolution);
+                for committed_resolution in committed_resolutions {
+                    conflict_store.mark_resolution_committed(committed_resolution);
+                }
                 Ok(verified)
             }
             Err(error) => {
@@ -281,67 +279,91 @@ impl TargetTransaction {
         &mut self,
         executor: &E,
         verifier: &mut V,
-        xid_end_position: u64,
-        checkpoint_table: &str,
-        checkpoint_name: &str,
-        conflict_table: &str,
-    ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
+        conflict_store: &dyn crate::conflict_repair::ConflictStore,
+        context: SupersededXidCommitContext<'_>,
+    ) -> Result<
+        (
+            VerifiedSupersededInsert,
+            Vec<crate::conflict_repair::ConflictResolution>,
+        ),
+        ApplyBinlogError,
+    >
     where
         E: TransactionalTargetExecutor,
         V: SupersededInsertVerifier,
     {
-        let candidate = self.deferred_superseded_inserts.first().ok_or_else(|| {
-            ApplyBinlogError::Target("missing deferred superseded insert".to_string())
-        })?;
+        let candidate = self
+            .deferred_superseded_inserts
+            .first()
+            .cloned()
+            .ok_or_else(|| {
+                ApplyBinlogError::Target("missing deferred superseded insert".to_string())
+            })?;
         let proof = verifier
-            .verify(candidate, xid_end_position)
+            .verify(&candidate, context.xid_end_position)
             .map_err(ApplyBinlogError::Target)?;
         let evidence = proof.resolution_evidence();
         let checkpoint = crate::checkpoint::Checkpoint {
             source_file: candidate.observation.coordinate.file.clone(),
-            source_position: xid_end_position,
+            source_position: context.xid_end_position,
             gtid: None,
             event_timestamp: 0,
             last_event: crate::checkpoint::LastEvent {
                 event_type: "XidEvent".to_string(),
                 description: format!(
-                    "verified superseded insert transaction at {}:{xid_end_position}",
-                    candidate.observation.coordinate.file
+                    "verified superseded insert transaction at {}:{}",
+                    candidate.observation.coordinate.file, context.xid_end_position,
                 ),
             },
         };
         let current = executor
-            .load_transaction_checkpoint_for_update(checkpoint_table, checkpoint_name)
+            .load_transaction_checkpoint_for_update(
+                context.checkpoint_table,
+                context.checkpoint_name,
+            )
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         validate_superseded_checkpoint_predecessor(
             current.as_ref(),
-            candidate,
-            xid_end_position,
-            checkpoint_name,
+            &candidate,
+            context.xid_end_position,
+            context.checkpoint_name,
         )?;
         executor
-            .save_transaction_checkpoint(checkpoint_table, checkpoint_name, &checkpoint)
+            .save_transaction_checkpoint(
+                context.checkpoint_table,
+                context.checkpoint_name,
+                &checkpoint,
+            )
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        self.finalize_conflict_resolutions_at(context.xid_end_position);
+        for pending_resolution in self.pending_conflict_resolutions() {
+            executor
+                .execute_transaction_sql(&conflict_store.resolution_sql(pending_resolution))
+                .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        }
         let resolution = conflict_resolution(&candidate.observation, &evidence);
         executor
             .execute_transaction_sql(&crate::conflict_repair::build_conflict_observation_sql(
-                conflict_table,
+                context.conflict_table,
                 &candidate.observation,
             ))
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         executor
             .execute_transaction_sql(
                 &crate::conflict_repair::build_conflict_resolution_for_source_row_sql(
-                    conflict_table,
+                    context.conflict_table,
                     &resolution,
                 ),
             )
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        self.commit_if_open(executor)?;
-        Ok(VerifiedSupersededInsert {
-            resolution_evidence: evidence,
-            checkpoint,
-        })
+        let committed_resolutions = self.commit_if_open(executor)?;
+        Ok((
+            VerifiedSupersededInsert {
+                resolution_evidence: evidence,
+                checkpoint,
+            },
+            committed_resolutions,
+        ))
     }
 
     pub(super) fn has_pending_conflict_resolutions(&self) -> bool {

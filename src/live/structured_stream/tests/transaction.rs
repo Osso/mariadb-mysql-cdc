@@ -316,10 +316,7 @@ fn superseded_insert_verification_failure_rolls_back_later_rows_without_checkpoi
         .verify_deferred_superseded_inserts_at_xid(
             &executor,
             &mut verifier,
-            404_038_011,
-            "cdc.stream_checkpoint",
-            "stream-binlog:production-source",
-            "cdc.row_conflicts",
+            superseded_xid_context("cdc.row_conflicts"),
         )
         .expect_err("failed proof must abort the complete source transaction");
 
@@ -349,10 +346,7 @@ fn verified_superseded_insert_commits_later_rows_resolution_and_xid_checkpoint_a
         .verify_deferred_superseded_inserts_at_xid(
             &executor,
             &mut verifier,
-            404_038_011,
-            "cdc.stream_checkpoint",
-            "stream-binlog:production-source",
-            "cdc.row_conflicts",
+            superseded_xid_context("cdc.row_conflicts"),
         )
         .expect("verified candidate commits atomically");
 
@@ -399,6 +393,15 @@ fn execute_users_2070980_followup_effects(executor: &TransactionRecordingExecuto
 
 fn exact_users_2070980_verifier(verified: bool) -> SupersededVerificationFixture {
     SupersededVerificationFixture { verified }
+}
+
+fn superseded_xid_context(conflict_table: &str) -> SupersededXidCommitContext<'_> {
+    SupersededXidCommitContext {
+        xid_end_position: 404_038_011,
+        checkpoint_table: "cdc.stream_checkpoint",
+        checkpoint_name: "stream-binlog:production-source",
+        conflict_table,
+    }
 }
 
 fn checkpoint_at(file: &str, position: u64) -> crate::checkpoint::Checkpoint {
@@ -454,10 +457,7 @@ fn production_404034840_superseded_users_insert_commits_all_followup_effects_at_
             &executor,
             &mut verifier,
             &mut conflicts,
-            404_038_011,
-            "cdc.stream_checkpoint",
-            "stream-binlog:production-source",
-            "cdc.row_conflicts",
+            superseded_xid_context("cdc.row_conflicts"),
         )
         .expect("exact production transaction commits atomically");
 
@@ -514,10 +514,7 @@ fn production_404034840_failed_verification_rolls_back_every_followup_effect() {
             &executor,
             &mut verifier,
             &mut conflicts,
-            404_038_011,
-            "cdc.stream_checkpoint",
-            "stream-binlog:production-source",
-            "cdc.row_conflicts",
+            superseded_xid_context("cdc.row_conflicts"),
         )
         .expect_err("failed verification rolls back complete transaction");
 
@@ -566,10 +563,7 @@ fn superseded_xid_rejects_coexisting_ordinary_conflict_and_persists_both() {
             &executor,
             &mut verifier,
             &mut conflicts,
-            404_038_011,
-            "cdc.stream_checkpoint",
-            "stream-binlog:production-source",
-            "cdc.row_conflicts",
+            superseded_xid_context("cdc.row_conflicts"),
         )
         .expect_err("ordinary conflict must block superseded commit");
 
@@ -596,10 +590,7 @@ fn superseded_xid_rejects_multiple_candidates_and_persists_all() {
             &executor,
             &mut verifier,
             &mut conflicts,
-            404_038_011,
-            "cdc.stream_checkpoint",
-            "stream-binlog:production-source",
-            "cdc.row_conflicts",
+            superseded_xid_context("cdc.row_conflicts"),
         )
         .expect_err("multiple candidates must fail closed");
 
@@ -646,10 +637,7 @@ fn superseded_xid_rejects_invalid_locked_checkpoint_predecessors() {
                 &executor,
                 &mut verifier,
                 &mut conflicts,
-                404_038_011,
-                "cdc.stream_checkpoint",
-                "stream-binlog:production-source",
-                "cdc.row_conflicts",
+                superseded_xid_context("cdc.row_conflicts"),
             )
             .expect_err("invalid predecessor must fail closed");
 
@@ -673,10 +661,7 @@ fn run_failed_superseded_verification(
             executor,
             &mut verifier,
             conflicts,
-            404_038_011,
-            "cdc.stream_checkpoint",
-            "stream-binlog:production-source",
-            "cdc.row_conflicts",
+            superseded_xid_context("cdc.row_conflicts"),
         )
         .expect_err("verification failure must abort")
 }
@@ -859,10 +844,7 @@ fn superseded_transaction_sql_uses_configured_conflict_table() {
             &executor,
             &mut verifier,
             &mut conflicts,
-            404_038_011,
-            "cdc.stream_checkpoint",
-            "stream-binlog:production-source",
-            "custom.row_conflicts",
+            superseded_xid_context("custom.row_conflicts"),
         )
         .expect("configured conflict table");
 
@@ -875,6 +857,82 @@ fn superseded_transaction_sql_uses_configured_conflict_table() {
     assert!(
         sql.iter()
             .all(|statement| !statement.contains("cdc.row_conflicts"))
+    );
+}
+
+#[test]
+fn superseded_xid_executes_and_cache_finalizes_preexisting_pending_resolutions() {
+    let executor = exact_users_predecessor_executor();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    let observation = crate::conflict_repair::ConflictObservation {
+        source_identity: "production-source".to_string(),
+        source_server_id: 3,
+        coordinate: crate::conflict_repair::ConflictCoordinate {
+            file: "mysqld-bin.002709".to_string(),
+            start_position: 404_030_000,
+            end_position: 404_030_100,
+        },
+        schema: "globalcomix".to_string(),
+        table: "users_profiles".to_string(),
+        operation: crate::conflict_repair::ConflictOperation::Insert,
+        source_primary_key: vec!["2070980".to_string()],
+        duplicate_index: Some("PRIMARY".to_string()),
+        duplicate_owner_primary_key: None,
+        error_code: 1062,
+        error_text: "prior equal users_profiles conflict".to_string(),
+        observed_at_ms: 1,
+        parent_recovery: None,
+    };
+    crate::conflict_repair::ConflictStore::observe(&mut conflicts, observation)
+        .expect("seed pending resolution conflict");
+    transaction.pending_conflict_resolutions_mut().push(
+        crate::conflict_repair::ConflictResolution {
+            source_identity: "production-source".to_string(),
+            schema: "globalcomix".to_string(),
+            table: "users_profiles".to_string(),
+            source_primary_key: vec!["2070980".to_string()],
+            repair_run_id: "prior-users-profiles-resolution".to_string(),
+            evidence: "verified equal users_profiles row".to_string(),
+        },
+    );
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+    let mut verifier = exact_users_2070980_verifier(true);
+
+    transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            superseded_xid_context("cdc.row_conflicts"),
+        )
+        .expect("superseded XID commits every pending resolution");
+
+    assert_eq!(
+        executor.operations(),
+        [
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "RESOLUTION",
+            "OBSERVATION",
+            "RESOLUTION",
+            "COMMIT",
+        ]
+    );
+    let profile_record = conflicts
+        .records()
+        .into_iter()
+        .find(|record| record.key.table == "users_profiles")
+        .expect("pre-existing pending resolution record");
+    assert_eq!(
+        profile_record.status,
+        crate::conflict_repair::ConflictStatus::Resolved
+    );
+    assert_eq!(
+        profile_record.repair_run_id.as_deref(),
+        Some("prior-users-profiles-resolution")
     );
 }
 
@@ -894,10 +952,7 @@ fn successful_superseded_commit_uses_only_infallible_cache_updates_after_commit(
             &executor,
             &mut verifier,
             &mut conflicts,
-            404_038_011,
-            "cdc.stream_checkpoint",
-            "stream-binlog:production-source",
-            "custom.row_conflicts",
+            superseded_xid_context("custom.row_conflicts"),
         )
         .expect("atomic commit followed by cache-only finalization");
 

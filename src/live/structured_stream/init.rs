@@ -443,10 +443,12 @@ where
             applier.executor(),
             &mut verifier,
             conflict_store,
-            xid_end_position,
-            checkpoint_table,
-            checkpoint_name,
-            &config.conflict_table,
+            SupersededXidCommitContext {
+                xid_end_position,
+                checkpoint_table,
+                checkpoint_name,
+                conflict_table: &config.conflict_table,
+            },
         )?;
         return Ok(StructuredEventOutcome {
             policy: EventPolicy::CommitTransaction,
