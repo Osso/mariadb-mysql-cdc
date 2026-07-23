@@ -805,7 +805,15 @@ fn sync_server_lock_namespace(host: &str, port: u16) -> String {
 }
 
 fn sync_table_lock_name(server_namespace: &str, database: &str, table: &str) -> String {
-    format!("\0mariadb-mysql-cdc:table-reservation:{server_namespace}:{database}:{table}")
+    format!(
+        "\0mariadb-mysql-cdc:table-reservation:{server_namespace}:{}:{}",
+        framed_lock_component(database),
+        framed_lock_component(table)
+    )
+}
+
+fn framed_lock_component(value: &str) -> String {
+    encode_run_id_component(value)
 }
 
 fn catalog_slot_lock_name(server_namespace: &str, slot: usize) -> String {
@@ -831,8 +839,13 @@ fn release_named_lock(connection: &mut Conn, name: &str) -> Result<(), String> {
 
 fn named_lock_owner(connection: &mut Conn, name: &str) -> Result<Option<u64>, String> {
     connection
-        .exec_first("SELECT IS_USED_LOCK(SHA2(?,256))", (name,))
+        .exec_first::<Option<u64>, _, _>("SELECT IS_USED_LOCK(SHA2(?,256))", (name,))
+        .map(decode_named_lock_owner)
         .map_err(|error| format!("failed to inspect catalog lock `{name}`: {error}"))
+}
+
+fn decode_named_lock_owner(owner: Option<Option<u64>>) -> Option<u64> {
+    owner.flatten()
 }
 
 fn owned_catalog_work_has_settled(state: &CatalogRunState) -> bool {
@@ -1196,14 +1209,13 @@ fn resolve_catalog_output_destination(
     path: &Path,
     visited_links: &mut BTreeSet<PathBuf>,
 ) -> Result<CatalogOutputDestination, String> {
-    let normalized = normalize_lexical_path(path);
-    match fs::symlink_metadata(&normalized) {
+    match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            resolve_catalog_output_symlink(&normalized, visited_links)
+            resolve_catalog_output_symlink(path, visited_links)
         }
-        Ok(metadata) => existing_catalog_output_destination(&normalized, &metadata),
+        Ok(metadata) => existing_catalog_output_destination(path, &metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            unresolved_catalog_output_destination(&normalized)
+            unresolved_catalog_output_destination(path)
         }
         Err(error) => Err(format!(
             "failed to resolve catalog output {}: {error}",
@@ -1253,20 +1265,32 @@ fn existing_catalog_output_destination(
 }
 
 fn unresolved_catalog_output_destination(path: &Path) -> Result<CatalogOutputDestination, String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("catalog output {} has no parent", path.display()))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| format!("catalog output {} has no file name", path.display()))?;
-    let canonical_parent = fs::canonicalize(parent).map_err(|error| {
-        format!(
-            "failed to resolve catalog output parent {}: {error}",
-            parent.display()
-        )
-    })?;
+    let mut existing_ancestor = path.to_path_buf();
+    let mut unresolved_components = Vec::new();
+    let canonical_ancestor = loop {
+        match fs::canonicalize(&existing_ancestor) {
+            Ok(canonical) => break canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = existing_ancestor.file_name().ok_or_else(|| {
+                    format!("catalog output {} has no existing ancestor", path.display())
+                })?;
+                unresolved_components.push(component.to_os_string());
+                existing_ancestor.pop();
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to resolve catalog output ancestor {}: {error}",
+                    existing_ancestor.display()
+                ));
+            }
+        }
+    };
+    let mut resolved = canonical_ancestor;
+    for component in unresolved_components.iter().rev() {
+        resolved.push(component);
+    }
     Ok(CatalogOutputDestination {
-        path: canonical_parent.join(file_name),
+        path: normalize_lexical_path(&resolved),
         #[cfg(unix)]
         file_identity: None,
     })
@@ -2422,6 +2446,21 @@ mod tests {
     }
 
     #[test]
+    fn absent_named_lock_owner_decodes_as_unheld() {
+        assert_eq!(decode_named_lock_owner(Some(None)), None);
+        assert_eq!(decode_named_lock_owner(Some(Some(42))), Some(42));
+        assert_eq!(decode_named_lock_owner(None), None);
+    }
+
+    #[test]
+    fn table_reservation_components_are_injective() {
+        assert_ne!(
+            sync_table_lock_name("db:3306", "a:b", "c"),
+            sync_table_lock_name("db:3306", "a", "b:c")
+        );
+    }
+
+    #[test]
     fn user_run_id_cannot_collide_with_table_reservation_key() {
         let run_id = "sync-table:db:3306:app:users";
         let table_reservation = sync_table_lock_name("db:3306", "app", "users");
@@ -2547,6 +2586,28 @@ mod tests {
 
         assert!(error.contains("same filesystem destination"), "{error}");
         assert!(!first.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_symlink_parent_alias_conflicts_before_writing() {
+        use std::os::unix::fs::symlink;
+
+        let directory = unique_catalog_test_directory("intermediate-symlink-parent");
+        let first_parent = directory.join("a");
+        let physical_parent = directory.join("b");
+        fs::create_dir_all(physical_parent.join("sub")).expect("create physical parent");
+        fs::create_dir_all(&first_parent).expect("create alias parent");
+        symlink("../b/sub", first_parent.join("link")).expect("create intermediate symlink");
+        let physical = physical_parent.join("catalog.json");
+        let alias = first_parent.join("link").join("..").join("catalog.json");
+
+        let error = validate_distinct_catalog_output_paths(&physical, &alias)
+            .expect_err("physical aliases must conflict");
+
+        assert!(error.contains("same filesystem destination"), "{error}");
+        assert!(!physical.exists(), "catalog output was created");
         let _ = fs::remove_dir_all(directory);
     }
 

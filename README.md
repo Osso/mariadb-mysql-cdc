@@ -228,12 +228,16 @@ arrays are ordered by estimated source rows, then table name; primary-key and
 writable-column arrays retain inventory order, parent-dependency arrays are
 unique and lexicographically ordered from the union of applicable source and
 target FKs, and reason arrays use enum declaration order. Target-only local FKs
-gate scheduling. Compatibility requires matching table
-default character sets (derived from table collations) and exact per-column
-`CHARACTER_SET_NAME`/`COLLATION_NAME` values for corresponding writable columns;
-a mismatch is `incompatible_schema`. `table-catalog` rejects output paths that
-resolve to the same filesystem destination before writing either file, including
-lexical aliases, existing symlinks, and hardlinks.
+gate scheduling. FK locality is evaluated against the schema owning each
+inventory, so a target FK referencing the source schema remains cross-schema.
+Compatibility requires matching table default character sets (derived from table
+collations) and exact per-column `CHARACTER_SET_NAME`/`COLLATION_NAME` values for
+corresponding writable columns; a mismatch is `incompatible_schema`.
+`table-catalog` rejects output paths that resolve to the same filesystem
+destination before writing either file, including lexical aliases, existing
+symlinks, intermediate-symlink-plus-`..` aliases, and hardlinks, and fails closed
+on symlink cycles. Resolution canonicalizes the longest existing physical
+ancestor before normalizing any nonexistent suffix.
 
 `sync-catalog` reads only the syncable catalog and starts apply mode immediately;
 there is no dry-run/plan mode and `table-catalog` does not launch it. The command
@@ -248,7 +252,9 @@ treated as terminal. Direct `sync-table` and
 `sync-catalog` workers share one admission lock and four slot reservations keyed
 by the lower-cased target host plus port, so databases on the same host and port
 share capacity. Each worker also holds a database/table-specific reservation,
-preventing same-table overlap. These admission and slot locks are scoped to the
+preventing same-table overlap. Database and table components are length-framed
+and hexadecimal-encoded, so delimiters inside identifiers cannot alias another
+reservation. These admission and slot locks are scoped to the
 target server host and port. Legacy run-lock accounting and same-table detection
 inspect only the configured progress table. Within that table, identity is
 derived from the immutable run specification's `scope.target_database` and
