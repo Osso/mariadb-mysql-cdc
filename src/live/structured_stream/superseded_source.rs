@@ -109,8 +109,17 @@ pub(crate) fn load_superseded_source_evidence_with_query(
     historical_primary_key: u64,
     historical_name: &str,
 ) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
+    // This coordinate is a conservative lower bound for the snapshot contents.
+    // A commit between this read and snapshot creation may be included by the
+    // snapshot, but the evidence never claims that later commit was included.
+    let snapshot_lower_bound = load_master_status(source)?;
     source.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
-    let result = load_evidence_in_transaction(source, historical_primary_key, historical_name);
+    let result = load_evidence_in_transaction(
+        source,
+        snapshot_lower_bound,
+        historical_primary_key,
+        historical_name,
+    );
     finish_transaction(source, result)
 }
 
@@ -134,10 +143,10 @@ fn finish_transaction<T>(
 
 fn load_evidence_in_transaction(
     source: &mut impl SupersededSourceQuery,
+    snapshot_lower_bound: SourceSnapshotCoordinate,
     historical_primary_key: u64,
     historical_name: &str,
 ) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
-    let snapshot = load_master_status(source)?;
     let columns = load_users_columns(source)?;
     let row_query = users_row_query(&columns)?;
     let result = source.query(
@@ -159,7 +168,7 @@ fn load_evidence_in_transaction(
         .map(|values| canonical_source_row(&columns, values))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(SupersededSourceEvidence {
-        snapshot,
+        snapshot: snapshot_lower_bound,
         columns,
         matching_rows,
     })
@@ -393,11 +402,13 @@ mod tests {
     struct FakeQuery {
         expected_queries: VecDeque<ExpectedQuery>,
         executed: Vec<String>,
+        operations: Vec<String>,
     }
 
     impl SupersededSourceQuery for FakeQuery {
         fn execute(&mut self, sql: &str) -> Result<(), SourceEvidenceError> {
             self.executed.push(sql.to_string());
+            self.operations.push(format!("EXECUTE {sql}"));
             Ok(())
         }
 
@@ -407,6 +418,7 @@ mod tests {
             params: Vec<Value>,
         ) -> Result<QueryRows, SourceEvidenceError> {
             let expected = self.expected_queries.pop_front().expect("unexpected query");
+            self.operations.push(format!("QUERY {sql}"));
             assert_eq!(sql, expected.sql);
             assert_eq!(params, expected.params);
             expected.result
@@ -535,6 +547,7 @@ mod tests {
                     },
                 ]),
                 executed: Vec::new(),
+                operations: Vec::new(),
             };
             let evidence =
                 load_superseded_source_evidence_with_query(&mut fake, 2_070_980, "-3572")
@@ -575,6 +588,7 @@ mod tests {
                 },
             ]),
             executed: Vec::new(),
+            operations: Vec::new(),
         };
 
         let evidence = load_superseded_source_evidence_with_query(&mut fake, 2_070_980, "-3572")
@@ -590,23 +604,83 @@ mod tests {
     }
 
     #[test]
-    fn query_failure_rolls_back_explicitly() {
+    fn captures_lower_bound_coordinate_before_consistent_snapshot_and_row_reads() {
+        let columns = ["id", "name"];
         let mut fake = FakeQuery {
-            expected_queries: VecDeque::from([ExpectedQuery {
-                sql: "SHOW MASTER STATUS".to_string(),
-                params: Vec::new(),
-                result: Err(SourceEvidenceError::new("status failed")),
-            }]),
+            expected_queries: VecDeque::from([
+                master_status(),
+                metadata(&columns),
+                ExpectedQuery {
+                    sql: users_row_query(
+                        &columns
+                            .iter()
+                            .map(|value| value.to_string())
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("query"),
+                    params: vec![Value::UInt(2_070_980), Value::Bytes(b"-3572".to_vec())],
+                    result: Ok(query_rows(
+                        &columns,
+                        vec![vec![Value::UInt(2_070_980), Value::Bytes(b"vngt".to_vec())]],
+                    )),
+                },
+            ]),
             executed: Vec::new(),
+            operations: Vec::new(),
+        };
+
+        let evidence = load_superseded_source_evidence_with_query(&mut fake, 2_070_980, "-3572")
+            .expect("evidence");
+
+        assert_eq!(
+            evidence.snapshot,
+            SourceSnapshotCoordinate {
+                file: "mysqld-bin.002740".to_string(),
+                position: 1_004_163_590,
+            }
+        );
+        assert_eq!(
+            fake.operations,
+            [
+                "QUERY SHOW MASTER STATUS",
+                "EXECUTE START TRANSACTION WITH CONSISTENT SNAPSHOT",
+                "QUERY SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                "QUERY SELECT `id`,`name` FROM `globalcomix`.`users` WHERE `id` = ? OR `name` = ? ORDER BY `id`",
+                "EXECUTE COMMIT",
+            ]
+        );
+    }
+
+    #[test]
+    fn query_failure_after_snapshot_creation_rolls_back_explicitly() {
+        let mut fake = FakeQuery {
+            expected_queries: VecDeque::from([
+                master_status(),
+                ExpectedQuery {
+                    sql: COLUMN_QUERY.to_string(),
+                    params: vec![
+                        Value::Bytes(b"globalcomix".to_vec()),
+                        Value::Bytes(b"users".to_vec()),
+                    ],
+                    result: Err(SourceEvidenceError::new("metadata failed")),
+                },
+            ]),
+            executed: Vec::new(),
+            operations: Vec::new(),
         };
 
         let error = load_superseded_source_evidence_with_query(&mut fake, 2_070_980, "-3572")
             .expect_err("query failure");
 
-        assert_eq!(error.to_string(), "status failed");
+        assert_eq!(error.to_string(), "metadata failed");
         assert_eq!(
-            fake.executed,
-            ["START TRANSACTION WITH CONSISTENT SNAPSHOT", "ROLLBACK"]
+            fake.operations,
+            [
+                "QUERY SHOW MASTER STATUS",
+                "EXECUTE START TRANSACTION WITH CONSISTENT SNAPSHOT",
+                "QUERY SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                "EXECUTE ROLLBACK",
+            ]
         );
     }
 }
