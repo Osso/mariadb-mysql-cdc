@@ -8,7 +8,8 @@ use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -432,17 +433,24 @@ fn write_table_catalogs(config: &TableCatalogConfig) -> Result<(), String> {
     let target = read_inventory_target(&config.connections.target)?;
     let estimated_rows = read_estimated_rows(&config.connections.source)?;
     let catalogs = build_catalogs(&source, &target, &estimated_rows);
-    write_pretty_json(
+    let syncable_bytes = encode_pretty_json(
         &config.syncable_output,
         &SyncableCatalog {
             tables: catalogs.syncable,
         },
     )?;
-    write_pretty_json(
+    let non_syncable_bytes = encode_pretty_json(
         &config.non_syncable_output,
         &NonSyncableCatalog {
             tables: catalogs.non_syncable,
         },
+    )?;
+    write_catalog_bytes_with_hook(
+        &config.syncable_output,
+        &config.non_syncable_output,
+        &syncable_bytes,
+        &non_syncable_bytes,
+        || {},
     )
 }
 
@@ -914,15 +922,20 @@ fn classify_run_statuses(
     expected_specs: &BTreeMap<String, String>,
     rows: Vec<(String, String, String, String, String, Option<u64>)>,
 ) -> Result<RunStatuses, String> {
-    let catalog_names = catalog
+    let expected_run_ids = catalog
         .tables
         .iter()
-        .map(|entry| entry.name.as_str())
-        .collect::<BTreeSet<_>>();
+        .map(|entry| {
+            (
+                deterministic_run_id(run_id_prefix, target_database, &entry.name),
+                entry.name.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut statuses = RunStatuses::default();
     for (run_id, table, run_spec_json, status, _error, lock_owner) in rows {
-        let expected_catalog_child = catalog_names.contains(table.as_str())
-            && run_id == deterministic_run_id(run_id_prefix, target_database, &table);
+        let expected_table = expected_run_ids.get(&run_id).copied();
+        let expected_catalog_child = expected_table.is_some();
         let active = lock_owner.is_some();
         let relevant = active || (status == "complete" && expected_catalog_child);
         if !relevant {
@@ -931,7 +944,7 @@ fn classify_run_statuses(
 
         let row = ActiveRunRow {
             run_id: run_id.clone(),
-            table,
+            table: table.clone(),
             run_spec_json: run_spec_json.clone(),
         };
         let (database, spec_table) = active_run_identity(&row)?;
@@ -942,8 +955,15 @@ fn classify_run_statuses(
             }
         }
         if status == "complete" && expected_catalog_child {
+            let expected_table = expected_table.expect("expected catalog child");
+            if table != expected_table {
+                return Err(format!(
+                    "run id `{run_id}` mutable table_name `{table}` disagrees with expected table `{expected_table}`"
+                ));
+            }
             if database != target_database
-                || expected_specs.get(&spec_table) != Some(&run_spec_json)
+                || spec_table != expected_table
+                || expected_specs.get(expected_table) != Some(&run_spec_json)
             {
                 return Err(format!(
                     "run id `{run_id}` already exists with a different immutable specification"
@@ -1339,11 +1359,73 @@ fn same_existing_file(first: &CatalogOutputDestination, second: &CatalogOutputDe
     }
 }
 
-fn write_pretty_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+fn encode_pretty_json(path: &Path, value: &impl Serialize) -> Result<Vec<u8>, String> {
     let mut bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("failed to encode {}: {error}", path.display()))?;
     bytes.push(b'\n');
-    fs::write(path, bytes).map_err(|error| format!("failed to write {}: {error}", path.display()))
+    Ok(bytes)
+}
+
+fn write_catalog_bytes_with_hook(
+    syncable_output: &Path,
+    non_syncable_output: &Path,
+    syncable_bytes: &[u8],
+    non_syncable_bytes: &[u8],
+    before_open: impl FnOnce(),
+) -> Result<(), String> {
+    validate_distinct_catalog_output_paths(syncable_output, non_syncable_output)?;
+    before_open();
+    let mut syncable_file = open_catalog_output(syncable_output)?;
+    let mut non_syncable_file = open_catalog_output(non_syncable_output)?;
+    if same_opened_file(&syncable_file, &non_syncable_file)? {
+        return Err(
+            "--syncable-output and --non-syncable-output resolve to the same opened filesystem file"
+                .to_string(),
+        );
+    }
+    truncate_and_write_catalog(&mut syncable_file, syncable_output, syncable_bytes)?;
+    truncate_and_write_catalog(
+        &mut non_syncable_file,
+        non_syncable_output,
+        non_syncable_bytes,
+    )
+}
+
+fn open_catalog_output(path: &Path) -> Result<File, String> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))
+}
+
+fn same_opened_file(first: &File, second: &File) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let first = first
+            .metadata()
+            .map_err(|error| format!("failed to inspect opened catalog output: {error}"))?;
+        let second = second
+            .metadata()
+            .map_err(|error| format!("failed to inspect opened catalog output: {error}"))?;
+        Ok(file_identity(&first) == file_identity(&second))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (first, second);
+        Ok(false)
+    }
+}
+
+fn truncate_and_write_catalog(file: &mut File, path: &Path, bytes: &[u8]) -> Result<(), String> {
+    file.set_len(0)
+        .map_err(|error| format!("failed to truncate {}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to seek {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 
 fn read_inventory_source(
@@ -2314,6 +2396,59 @@ mod tests {
     }
 
     #[test]
+    fn expected_complete_child_with_mutable_table_mismatch_fails_closed() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &[])],
+        };
+        let run_id = deterministic_run_id("batch", "db", "a");
+        let run_spec_json = active_run_row(&run_id, "a", "db").run_spec_json;
+        let expected_specs = BTreeMap::from([("a".to_string(), run_spec_json.clone())]);
+        let error = classify_run_statuses(
+            &catalog,
+            "batch",
+            "db",
+            &expected_specs,
+            vec![(
+                run_id,
+                "mutable-table-disagrees".into(),
+                run_spec_json,
+                "complete".into(),
+                String::new(),
+                None,
+            )],
+        )
+        .expect_err("mutable table mismatch");
+
+        assert!(error.contains("table_name"), "{error}");
+        assert!(error.contains("differs from spec table"), "{error}");
+    }
+
+    #[test]
+    fn unrelated_completed_rows_remain_ignored() {
+        let catalog = SyncableCatalog {
+            tables: vec![entry("a", 1, &[])],
+        };
+        let statuses = classify_run_statuses(
+            &catalog,
+            "batch",
+            "db",
+            &BTreeMap::new(),
+            vec![(
+                "unrelated-run".into(),
+                "a".into(),
+                "malformed".into(),
+                "complete".into(),
+                String::new(),
+                None,
+            )],
+        )
+        .expect("unrelated complete row");
+
+        assert!(statuses.completed.is_empty());
+        assert_eq!(statuses.external_active_count, 0);
+    }
+
+    #[test]
     fn complete_catalog_child_with_changed_spec_fails_closed() {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
@@ -2695,6 +2830,38 @@ mod tests {
 
         assert!(error.contains("same filesystem destination"), "{error}");
         assert_eq!(fs::read(&target).expect("read target"), b"preserve");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_alias_mutation_before_final_open_preserves_existing_content() {
+        use std::os::unix::fs::symlink;
+
+        let directory = unique_catalog_test_directory("final-open-alias");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let syncable = directory.join("syncable.json");
+        let non_syncable = directory.join("non-syncable.json");
+        fs::write(&syncable, b"preserve").expect("write existing syncable output");
+        fs::write(&non_syncable, b"other").expect("write distinct non-syncable output");
+
+        let error = write_catalog_bytes_with_hook(
+            &syncable,
+            &non_syncable,
+            b"new syncable\n",
+            b"new non-syncable\n",
+            || {
+                fs::remove_file(&non_syncable).expect("remove distinct output");
+                symlink(&syncable, &non_syncable).expect("redirect output alias");
+            },
+        )
+        .expect_err("final opened files must be distinct");
+
+        assert!(error.contains("same opened filesystem file"), "{error}");
+        assert_eq!(
+            fs::read(&syncable).expect("read preserved output"),
+            b"preserve"
+        );
         let _ = fs::remove_dir_all(directory);
     }
 

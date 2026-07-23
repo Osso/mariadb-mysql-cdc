@@ -234,10 +234,15 @@ Compatibility requires matching table default character sets (derived from table
 collations) and exact per-column `CHARACTER_SET_NAME`/`COLLATION_NAME` values for
 corresponding writable columns; a mismatch is `incompatible_schema`.
 `table-catalog` rejects output paths that resolve to the same filesystem
-destination before writing either file, including lexical aliases, existing
-symlinks, intermediate-symlink-plus-`..` aliases, and hardlinks, and fails closed
-on symlink cycles. Resolution canonicalizes the longest existing physical
-ancestor before normalizing any nonexistent suffix.
+destination, including lexical aliases, existing symlinks,
+intermediate-symlink-plus-`..` aliases, and hardlinks, and fails closed on
+symlink cycles. Resolution canonicalizes the longest existing physical ancestor
+before normalizing any nonexistent suffix. After catalog generation, it opens
+both outputs without truncation, compares the opened file identities, and only
+then truncates and writes through those handles. Path changes cannot redirect
+the second write over the first. If both destinations were nonexistent, a failed
+final identity check may leave an empty newly created file, but never overwrites
+existing content.
 
 `sync-catalog` reads only the syncable catalog and starts apply mode immediately;
 there is no dry-run/plan mode and `table-catalog` does not launch it. The command
