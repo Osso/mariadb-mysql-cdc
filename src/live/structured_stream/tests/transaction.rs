@@ -319,6 +319,7 @@ fn superseded_insert_verification_failure_rolls_back_later_rows_without_checkpoi
             404_038_011,
             "cdc.stream_checkpoint",
             "stream-binlog:production-source",
+            "cdc.row_conflicts",
         )
         .expect_err("failed proof must abort the complete source transaction");
 
@@ -351,6 +352,7 @@ fn verified_superseded_insert_commits_later_rows_resolution_and_xid_checkpoint_a
             404_038_011,
             "cdc.stream_checkpoint",
             "stream-binlog:production-source",
+            "cdc.row_conflicts",
         )
         .expect("verified candidate commits atomically");
 
@@ -455,6 +457,7 @@ fn production_404034840_superseded_users_insert_commits_all_followup_effects_at_
             404_038_011,
             "cdc.stream_checkpoint",
             "stream-binlog:production-source",
+            "cdc.row_conflicts",
         )
         .expect("exact production transaction commits atomically");
 
@@ -514,6 +517,7 @@ fn production_404034840_failed_verification_rolls_back_every_followup_effect() {
             404_038_011,
             "cdc.stream_checkpoint",
             "stream-binlog:production-source",
+            "cdc.row_conflicts",
         )
         .expect_err("failed verification rolls back complete transaction");
 
@@ -565,6 +569,7 @@ fn superseded_xid_rejects_coexisting_ordinary_conflict_and_persists_both() {
             404_038_011,
             "cdc.stream_checkpoint",
             "stream-binlog:production-source",
+            "cdc.row_conflicts",
         )
         .expect_err("ordinary conflict must block superseded commit");
 
@@ -594,6 +599,7 @@ fn superseded_xid_rejects_multiple_candidates_and_persists_all() {
             404_038_011,
             "cdc.stream_checkpoint",
             "stream-binlog:production-source",
+            "cdc.row_conflicts",
         )
         .expect_err("multiple candidates must fail closed");
 
@@ -643,6 +649,7 @@ fn superseded_xid_rejects_invalid_locked_checkpoint_predecessors() {
                 404_038_011,
                 "cdc.stream_checkpoint",
                 "stream-binlog:production-source",
+                "cdc.row_conflicts",
             )
             .expect_err("invalid predecessor must fail closed");
 
@@ -708,6 +715,197 @@ fn successful_rollback_observes_conflict_without_discarding_connection() {
 
     assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK"]);
     assert_eq!(conflicts.records().len(), 1);
+}
+
+struct ConfiguredConflictTableExecutor {
+    inner: TransactionRecordingExecutor,
+    transaction_sql: std::cell::RefCell<Vec<String>>,
+}
+
+impl TargetExecutor for ConfiguredConflictTableExecutor {
+    fn execute(
+        &self,
+        statement: &crate::target::SqlStatement,
+    ) -> Result<(), crate::target::TargetExecuteError> {
+        self.inner.execute(statement)
+    }
+}
+
+impl crate::target::TransactionalTargetExecutor for ConfiguredConflictTableExecutor {
+    fn begin_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
+        self.inner.begin_transaction()
+    }
+
+    fn load_transaction_checkpoint_for_update(
+        &self,
+        checkpoint_table: &str,
+        checkpoint_name: &str,
+    ) -> Result<Option<crate::checkpoint::Checkpoint>, crate::target::TargetExecuteError> {
+        self.inner
+            .load_transaction_checkpoint_for_update(checkpoint_table, checkpoint_name)
+    }
+
+    fn save_transaction_checkpoint(
+        &self,
+        checkpoint_table: &str,
+        checkpoint_name: &str,
+        checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> Result<(), crate::target::TargetExecuteError> {
+        self.inner
+            .save_transaction_checkpoint(checkpoint_table, checkpoint_name, checkpoint)
+    }
+
+    fn execute_transaction_sql(&self, sql: &str) -> Result<(), crate::target::TargetExecuteError> {
+        self.transaction_sql.borrow_mut().push(sql.to_string());
+        Ok(())
+    }
+
+    fn commit_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
+        self.inner.commit_transaction()
+    }
+
+    fn rollback_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
+        self.inner.rollback_transaction()
+    }
+}
+
+struct PostCommitCacheOnlyConflictStore {
+    inner: crate::conflict_repair::InMemoryConflictStore,
+}
+
+impl crate::conflict_repair::ConflictStore for PostCommitCacheOnlyConflictStore {
+    fn observe(
+        &mut self,
+        _observation: crate::conflict_repair::ConflictObservation,
+    ) -> Result<(), String> {
+        panic!("successful commit must not perform post-commit observation SQL")
+    }
+
+    fn resolve_existing(
+        &mut self,
+        _resolution: crate::conflict_repair::ConflictResolution,
+    ) -> Result<(), String> {
+        panic!("successful commit must not perform post-commit resolution SQL")
+    }
+
+    fn resolution_sql(&self, resolution: &crate::conflict_repair::ConflictResolution) -> String {
+        crate::conflict_repair::ConflictStore::resolution_sql(&self.inner, resolution)
+    }
+
+    fn mark_observation_committed(
+        &mut self,
+        observation: crate::conflict_repair::ConflictObservation,
+    ) {
+        crate::conflict_repair::ConflictStore::mark_observation_committed(
+            &mut self.inner,
+            observation,
+        );
+    }
+
+    fn mark_resolution_committed(
+        &mut self,
+        resolution: crate::conflict_repair::ConflictResolution,
+    ) {
+        crate::conflict_repair::ConflictStore::mark_resolution_committed(
+            &mut self.inner,
+            resolution,
+        );
+    }
+
+    fn has_unresolved(
+        &mut self,
+        resolution: &crate::conflict_repair::ConflictResolution,
+    ) -> Result<bool, String> {
+        crate::conflict_repair::ConflictStore::has_unresolved(&mut self.inner, resolution)
+    }
+
+    fn resolve_if_equal(
+        &mut self,
+        table: &str,
+        primary_key: &[String],
+        rows_equal: bool,
+        repair_run_id: &str,
+        evidence: &str,
+    ) -> Result<(), String> {
+        crate::conflict_repair::ConflictStore::resolve_if_equal(
+            &mut self.inner,
+            table,
+            primary_key,
+            rows_equal,
+            repair_run_id,
+            evidence,
+        )
+    }
+
+    fn unresolved_count(&self) -> usize {
+        crate::conflict_repair::ConflictStore::unresolved_count(&self.inner)
+    }
+}
+
+#[test]
+fn superseded_transaction_sql_uses_configured_conflict_table() {
+    let executor = ConfiguredConflictTableExecutor {
+        inner: exact_users_predecessor_executor(),
+        transaction_sql: std::cell::RefCell::new(Vec::new()),
+    };
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+    let mut verifier = exact_users_2070980_verifier(true);
+
+    transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            404_038_011,
+            "cdc.stream_checkpoint",
+            "stream-binlog:production-source",
+            "custom.row_conflicts",
+        )
+        .expect("configured conflict table");
+
+    let sql = executor.transaction_sql.borrow();
+    assert_eq!(sql.len(), 2);
+    assert!(
+        sql.iter()
+            .all(|statement| statement.contains("custom.row_conflicts"))
+    );
+    assert!(
+        sql.iter()
+            .all(|statement| !statement.contains("cdc.row_conflicts"))
+    );
+}
+
+#[test]
+fn successful_superseded_commit_uses_only_infallible_cache_updates_after_commit() {
+    let executor = exact_users_predecessor_executor();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = PostCommitCacheOnlyConflictStore {
+        inner: crate::conflict_repair::InMemoryConflictStore::default(),
+    };
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(users_name_superseded_candidate());
+    let mut verifier = exact_users_2070980_verifier(true);
+
+    transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            404_038_011,
+            "cdc.stream_checkpoint",
+            "stream-binlog:production-source",
+            "custom.row_conflicts",
+        )
+        .expect("atomic commit followed by cache-only finalization");
+
+    assert_eq!(conflicts.inner.records().len(), 1);
+    assert_eq!(
+        conflicts.inner.records()[0].status,
+        crate::conflict_repair::ConflictStatus::Resolved
+    );
 }
 
 #[test]

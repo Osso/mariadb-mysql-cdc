@@ -191,6 +191,31 @@ fn interrupted_phase_resumes_exact_plan_without_repeating_completed_deletes() {
 }
 
 #[test]
+fn committed_observation_updates_in_memory_cache_infallibly() {
+    let mut ledger = InMemoryConflictStore::default();
+    let mut observation = test_conflict("users", "2070980");
+    observation.source_identity = "source-a".to_string();
+    observation.schema = "globalcomix".to_string();
+
+    ledger.mark_observation_committed(observation);
+
+    let record = &ledger.records()[0];
+    assert_eq!(record.status, ConflictStatus::Unresolved);
+    assert_eq!(record.attempt_count, 1);
+}
+
+#[test]
+fn committed_observation_updates_durable_cache_without_sql() {
+    let mut store = DurableConflictStore::new(RecordingSql::default(), "custom.row_conflicts");
+    let observation = test_conflict("users", "2070980");
+
+    store.mark_observation_committed(observation);
+
+    assert_eq!(store.unresolved_count(), 1);
+    assert!(store.executor.sql.is_empty());
+}
+
+#[test]
 fn committed_resolution_updates_in_memory_cache_infallibly() {
     let mut ledger = InMemoryConflictStore::default();
     let mut observation = test_conflict("sessions", "109018328");

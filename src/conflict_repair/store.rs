@@ -15,6 +15,7 @@ pub trait ConflictStore {
     fn observe(&mut self, observation: ConflictObservation) -> Result<(), String>;
     fn resolve_existing(&mut self, resolution: ConflictResolution) -> Result<(), String>;
     fn resolution_sql(&self, resolution: &ConflictResolution) -> String;
+    fn mark_observation_committed(&mut self, observation: ConflictObservation);
     fn mark_resolution_committed(&mut self, resolution: ConflictResolution);
     fn has_unresolved(&mut self, resolution: &ConflictResolution) -> Result<bool, String>;
 
@@ -81,11 +82,7 @@ impl ConflictStore for InMemoryConflictStore {
         build_conflict_resolution_for_source_row_sql("cdc.row_conflicts", resolution)
     }
 
-    fn mark_resolution_committed(&mut self, resolution: ConflictResolution) {
-        self.mark_matching_resolution(resolution);
-    }
-
-    fn observe(&mut self, observation: ConflictObservation) -> Result<(), String> {
+    fn mark_observation_committed(&mut self, observation: ConflictObservation) {
         let key = observation.key();
         if let Some(record) = self.records.get_mut(&key) {
             record.duplicate_index = observation.duplicate_index;
@@ -94,7 +91,7 @@ impl ConflictStore for InMemoryConflictStore {
             record.error_text = observation.error_text;
             record.last_observed_at_ms = observation.observed_at_ms;
             record.attempt_count += 1;
-            return Ok(());
+            return;
         }
         self.records.insert(
             key.clone(),
@@ -112,6 +109,14 @@ impl ConflictStore for InMemoryConflictStore {
                 resolution_evidence: None,
             },
         );
+    }
+
+    fn mark_resolution_committed(&mut self, resolution: ConflictResolution) {
+        self.mark_matching_resolution(resolution);
+    }
+
+    fn observe(&mut self, observation: ConflictObservation) -> Result<(), String> {
+        self.mark_observation_committed(observation);
         Ok(())
     }
 
@@ -454,6 +459,10 @@ impl ConflictStore for MySqlConflictStore {
         build_conflict_resolution_for_source_row_sql(&self.table, resolution)
     }
 
+    fn mark_observation_committed(&mut self, observation: ConflictObservation) {
+        self.unresolved.borrow_mut().insert(observation.key());
+    }
+
     fn mark_resolution_committed(&mut self, resolution: ConflictResolution) {
         self.unresolved
             .borrow_mut()
@@ -587,6 +596,10 @@ impl<E: ConflictSqlExecutor> ConflictStore for DurableConflictStore<E> {
 
     fn resolution_sql(&self, resolution: &ConflictResolution) -> String {
         build_conflict_resolution_for_source_row_sql(&self.table, resolution)
+    }
+
+    fn mark_observation_committed(&mut self, observation: ConflictObservation) {
+        self.unresolved.insert(observation.key());
     }
 
     fn mark_resolution_committed(&mut self, resolution: ConflictResolution) {

@@ -446,6 +446,7 @@ where
             xid_end_position,
             checkpoint_table,
             checkpoint_name,
+            &config.conflict_table,
         )?;
         return Ok(StructuredEventOutcome {
             policy: EventPolicy::CommitTransaction,
