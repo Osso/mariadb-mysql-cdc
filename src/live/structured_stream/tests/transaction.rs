@@ -251,8 +251,103 @@ impl SupersededInsertVerifier for SupersededVerificationFixture {
             source_owner_hash: "source-owner-hash".to_string(),
             target_primary_hash: "source-pk-hash".to_string(),
             target_owner_hash: "source-owner-hash".to_string(),
+            current_row_install: (_candidate.observation.table == "releases").then(|| {
+                crate::target::SqlStatement {
+                    sql: "INSERT INTO `globalcomix`.`releases` (`id`,`comic_id`,`comic_category_id`) VALUES (?,?,?)".to_string(),
+                    params: vec![
+                        mysql::Value::UInt(77),
+                        mysql::Value::UInt(12),
+                        mysql::Value::UInt(9),
+                    ],
+                }
+            }),
         })
     }
+}
+
+fn releases_category_superseded_candidate() -> DeferredSupersededInsertCandidate {
+    DeferredSupersededInsertCandidate {
+        observation: crate::conflict_repair::ConflictObservation {
+            source_identity: "production-source".to_string(),
+            source_server_id: 3,
+            coordinate: crate::conflict_repair::ConflictCoordinate {
+                file: "mysqld-bin.002709".to_string(),
+                start_position: 515_816_736,
+                end_position: 0,
+            },
+            schema: "globalcomix".to_string(),
+            table: "releases".to_string(),
+            operation: crate::conflict_repair::ConflictOperation::Insert,
+            source_primary_key: vec!["77".to_string()],
+            duplicate_index: None,
+            duplicate_owner_primary_key: None,
+            error_code: 1452,
+            error_text: "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_2` FOREIGN KEY (`comic_id`, `comic_category_id`) REFERENCES `comics` (`id`, `section_id`))".to_string(),
+            observed_at_ms: 1,
+            parent_recovery: None,
+        },
+        historical_change: crate::target::TargetRowChange {
+            statement: crate::target::SqlStatement {
+                sql: "INSERT historical release".to_string(),
+                params: Vec::new(),
+            },
+            kind: crate::target::TargetRowChangeKind::Insert,
+            table: "globalcomix.releases".to_string(),
+            primary_key_columns: vec!["id".to_string()],
+            primary_key_values: vec![mysql::Value::UInt(77)],
+            writable_columns: vec![
+                "id".to_string(),
+                "comic_id".to_string(),
+                "comic_category_id".to_string(),
+            ],
+            source_values: vec![
+                mysql::Value::UInt(77),
+                mysql::Value::UInt(12),
+                mysql::Value::UInt(4),
+            ],
+            set_columns: vec![None, None, None],
+        },
+    }
+}
+
+#[test]
+fn verified_superseded_release_installs_current_row_before_evidence_checkpoint_and_commit() {
+    let executor = TransactionRecordingExecutor::with_locked_checkpoint(checkpoint_at(
+        "mysqld-bin.002709",
+        515_816_517,
+    ));
+    let mut transaction = TargetTransaction::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(releases_category_superseded_candidate());
+    let mut verifier = SupersededVerificationFixture { verified: true };
+
+    transaction
+        .verify_deferred_superseded_inserts_at_xid(
+            &executor,
+            &mut verifier,
+            SupersededXidCommitContext {
+                xid_end_position: 515_824_875,
+                checkpoint_table: "cdc.stream_checkpoint",
+                checkpoint_name: "stream-binlog:test-source",
+                conflict_table: "cdc.row_conflicts",
+                #[cfg(feature = "integration-failpoints")]
+                logical_checkpoint_predecessor: None,
+            },
+        )
+        .expect("release recovery commits atomically");
+
+    assert_eq!(
+        executor.operations(),
+        [
+            "BEGIN",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "OBSERVATION",
+            "RESOLUTION",
+            "COMMIT",
+        ]
+    );
 }
 
 fn users_name_superseded_candidate() -> DeferredSupersededInsertCandidate {
@@ -401,6 +496,8 @@ fn superseded_xid_context(conflict_table: &str) -> SupersededXidCommitContext<'_
         checkpoint_table: "cdc.stream_checkpoint",
         checkpoint_name: "stream-binlog:production-source",
         conflict_table,
+        #[cfg(feature = "integration-failpoints")]
+        logical_checkpoint_predecessor: None,
     }
 }
 

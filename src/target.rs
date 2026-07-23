@@ -95,6 +95,14 @@ pub struct UsersActiveTransactionEvidence {
     pub rows: Vec<LockedUsersRowEvidence>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReleasesActiveTransactionEvidence {
+    pub release_columns: Vec<String>,
+    pub release_rows: Vec<LockedUsersRowEvidence>,
+    pub parent_columns: Vec<String>,
+    pub parent_rows: Vec<LockedUsersRowEvidence>,
+}
+
 pub trait TransactionalTargetExecutor: TargetExecutor {
     fn acquire_stream_lease(&self, _lease_name: &str) -> Result<(), TargetExecuteError> {
         Ok(())
@@ -124,6 +132,16 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
         Err(TargetExecuteError::new(
             "active-transaction users supersession evidence is unsupported by this target executor",
+        ))
+    }
+    fn read_locked_release_supersession_evidence(
+        &self,
+        _release_id: &Value,
+        _comic_id: &Value,
+        _category_id: &Value,
+    ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
+        Err(TargetExecuteError::new(
+            "active-transaction release supersession evidence is unsupported by this target executor",
         ))
     }
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
@@ -625,6 +643,15 @@ where
         historical_name: &Value,
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
         (*self).read_locked_users_supersession_evidence(historical_primary_key, historical_name)
+    }
+
+    fn read_locked_release_supersession_evidence(
+        &self,
+        release_id: &Value,
+        comic_id: &Value,
+        category_id: &Value,
+    ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
+        (*self).read_locked_release_supersession_evidence(release_id, comic_id, category_id)
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {

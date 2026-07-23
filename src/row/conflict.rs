@@ -172,7 +172,7 @@ fn record_skipped_conflict(
     };
     let observation =
         skipped_conflict_observation(context, coordinate, table, operation, change, conflict);
-    if is_deferred_users_name_insert(table, operation, change, &observation) {
+    if is_deferred_superseded_insert(table, operation, change, &observation) {
         context
             .deferred_superseded_inserts
             .push(crate::row::DeferredSupersededInsertCandidate {
@@ -185,17 +185,31 @@ fn record_skipped_conflict(
     Ok(())
 }
 
-fn is_deferred_users_name_insert(
+fn is_deferred_superseded_insert(
     table: &RowTableMap,
     operation: RowOperation,
     change: &TargetRowChange,
     observation: &ConflictObservation,
 ) -> bool {
-    table.schema == "globalcomix"
+    if operation != RowOperation::Insert
+        || change.kind != crate::target::TargetRowChangeKind::Insert
+    {
+        return false;
+    }
+    let users_name = table.schema == "globalcomix"
         && table.table == "users"
-        && operation == RowOperation::Insert
-        && change.kind == crate::target::TargetRowChangeKind::Insert
-        && observation.duplicate_index.as_deref() == Some("users.name")
+        && observation.duplicate_index.as_deref() == Some("users.name");
+    let releases_category = table.schema == "globalcomix"
+        && table.table == "releases"
+        && observation.error_code == 1452
+        && is_exact_releases_category_constraint_error(&observation.error_text);
+    users_name || releases_category
+}
+
+fn is_exact_releases_category_constraint_error(error_text: &str) -> bool {
+    error_text.contains("`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_2`")
+        && error_text.contains("FOREIGN KEY (`comic_id`, `comic_category_id`)")
+        && error_text.contains("REFERENCES `comics` (`id`, `section_id`)")
 }
 
 fn skipped_conflict_observation(
@@ -422,7 +436,27 @@ pub(crate) fn record_duplicate_conflict<C: ConflictStore>(
 
 #[cfg(test)]
 mod tests {
-    use super::is_exact_sessions_guest_constraint_error;
+    use super::{
+        is_exact_releases_category_constraint_error, is_exact_sessions_guest_constraint_error,
+    };
+
+    #[test]
+    fn accepts_only_exact_releases_category_constraint_identity() {
+        let exact = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_2` FOREIGN KEY (`comic_id`, `comic_category_id`) REFERENCES `comics` (`id`, `section_id`))";
+        let wrong_constraint = exact.replace("releases_ibfk_2", "releases_ibfk_1");
+        let wrong_child = exact.replace("`comic_category_id`", "`category_id`");
+        let wrong_parent = exact.replace(
+            "`comics` (`id`, `section_id`)",
+            "`comics_archive` (`id`, `section_id`)",
+        );
+
+        assert!(is_exact_releases_category_constraint_error(exact));
+        assert!(!is_exact_releases_category_constraint_error(
+            &wrong_constraint
+        ));
+        assert!(!is_exact_releases_category_constraint_error(&wrong_child));
+        assert!(!is_exact_releases_category_constraint_error(&wrong_parent));
+    }
 
     #[test]
     fn accepts_only_exact_sessions_guest_constraint_identity() {

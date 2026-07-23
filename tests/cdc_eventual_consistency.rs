@@ -69,6 +69,24 @@ fn real_home_feed_card_parent_recovery_replays_child_and_checkpoints() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_superseded_release_parent_recovery_preserves_current_rows_and_commits_remaining_effects() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("superseded-release-parent-recovery")
+        .output()
+        .expect("run superseded release parent recovery harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_missing_pk_two_parent_collision_rolls_back_atomically() {
     let output = Command::new("python3")
         .arg(harness_script())
@@ -542,6 +560,7 @@ fn harness_scenario_listing_has_behavior_or_explicit_prerequisite() {
         "checkpoint-transaction",
         "source-connection-loss",
         "target-connection-loss",
+        "superseded-release-parent-recovery",
         "fk-child-first-delete",
         "fk-parent-first-insert",
         "fk-cycle-block",

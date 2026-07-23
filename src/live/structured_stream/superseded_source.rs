@@ -9,6 +9,7 @@ const USERS_SCHEMA: &str = "globalcomix";
 const USERS_TABLE: &str = "users";
 const HASH_DOMAIN: &[u8] = b"mariadb-mysql-cdc:superseded-source-row:v1\0";
 const COLUMN_QUERY: &str = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
+const WRITABLE_COLUMN_QUERY: &str = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND EXTRA NOT LIKE '%GENERATED%' ORDER BY ORDINAL_POSITION";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SourceSnapshotCoordinate {
@@ -28,6 +29,15 @@ pub(crate) struct SupersededSourceEvidence {
     pub(crate) snapshot: SourceSnapshotCoordinate,
     pub(crate) columns: Vec<String>,
     pub(crate) matching_rows: Vec<CanonicalSourceRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SupersededReleaseSourceEvidence {
+    pub(crate) snapshot: SourceSnapshotCoordinate,
+    pub(crate) release_columns: Vec<String>,
+    pub(crate) release_rows: Vec<CanonicalSourceRow>,
+    pub(crate) parent_columns: Vec<String>,
+    pub(crate) parent_rows: Vec<CanonicalSourceRow>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,6 +112,117 @@ pub(crate) fn load_superseded_source_evidence(
 ) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
     let mut source = MySqlSupersededSourceQuery::connect(config)?;
     load_superseded_source_evidence_with_query(&mut source, historical_primary_key, historical_name)
+}
+
+pub(crate) fn load_superseded_release_source_evidence(
+    config: &MySqlConnectionConfig,
+    release_id: &Value,
+) -> Result<SupersededReleaseSourceEvidence, SourceEvidenceError> {
+    let mut source = MySqlSupersededSourceQuery::connect(config)?;
+    let snapshot_lower_bound = load_master_status(&mut source)?;
+    source.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
+    let result =
+        load_release_evidence_in_transaction(&mut source, snapshot_lower_bound, release_id);
+    finish_transaction(&mut source, result)
+}
+
+fn load_release_evidence_in_transaction(
+    source: &mut impl SupersededSourceQuery,
+    snapshot: SourceSnapshotCoordinate,
+    release_id: &Value,
+) -> Result<SupersededReleaseSourceEvidence, SourceEvidenceError> {
+    let release_columns = load_writable_table_columns(source, "releases")?;
+    let release_sql = row_query(&release_columns, "releases", "`id` = ?")?;
+    let release_result = source.query(&release_sql, vec![release_id.clone()])?;
+    let release_rows = canonical_rows(&release_columns, release_result, "releases")?;
+    let release = release_rows
+        .first()
+        .ok_or_else(|| SourceEvidenceError::new("source release row is missing"))?;
+    if release_rows.len() != 1 {
+        return Err(SourceEvidenceError::new(format!(
+            "source release row count is {}, expected 1",
+            release_rows.len()
+        )));
+    }
+    let comic_id = value_for_named_column(&release_columns, &release.values, "comic_id")?.clone();
+    let category_id =
+        value_for_named_column(&release_columns, &release.values, "comic_category_id")?.clone();
+    let parent_columns = load_table_columns(source, "comics")?;
+    let parent_sql = row_query(&parent_columns, "comics", "`id` = ? AND `section_id` = ?")?;
+    let parent_result = source.query(&parent_sql, vec![comic_id, category_id])?;
+    let parent_rows = canonical_rows(&parent_columns, parent_result, "comics")?;
+    Ok(SupersededReleaseSourceEvidence {
+        snapshot,
+        release_columns,
+        release_rows,
+        parent_columns,
+        parent_rows,
+    })
+}
+
+fn canonical_rows(
+    columns: &[String],
+    result: QueryRows,
+    table: &str,
+) -> Result<Vec<CanonicalSourceRow>, SourceEvidenceError> {
+    if result.columns != columns {
+        return Err(SourceEvidenceError::new(format!(
+            "source {table} result column order mismatch: expected {:?}, got {:?}",
+            columns, result.columns
+        )));
+    }
+    result
+        .rows
+        .into_iter()
+        .map(|values| canonical_source_row(columns, values))
+        .collect()
+}
+
+fn value_for_named_column<'a>(
+    columns: &[String],
+    values: &'a [Value],
+    column: &str,
+) -> Result<&'a Value, SourceEvidenceError> {
+    let index = columns
+        .iter()
+        .position(|candidate| candidate == column)
+        .ok_or_else(|| SourceEvidenceError::new(format!("source row is missing {column}")))?;
+    values
+        .get(index)
+        .ok_or_else(|| SourceEvidenceError::new(format!("source row has no value for {column}")))
+}
+
+pub(crate) fn build_exact_row_insert_statement(
+    schema: &str,
+    table: &str,
+    row: &CanonicalSourceRow,
+) -> Result<crate::target::SqlStatement, SourceEvidenceError> {
+    if row.columns.is_empty() || row.columns.len() != row.values.len() {
+        return Err(SourceEvidenceError::new(
+            "current source row shape is invalid",
+        ));
+    }
+    if !valid_identifier(schema)
+        || !valid_identifier(table)
+        || row.columns.iter().any(|column| !valid_identifier(column))
+    {
+        return Err(SourceEvidenceError::new(
+            "current source row contains invalid identifier",
+        ));
+    }
+    let columns = row
+        .columns
+        .iter()
+        .map(|column| format!("`{column}`"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let placeholders = std::iter::repeat_n("?", row.columns.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(crate::target::SqlStatement {
+        sql: format!("INSERT INTO `{schema}`.`{table}` ({columns}) VALUES ({placeholders})"),
+        params: row.values.clone(),
+    })
 }
 
 pub(crate) fn load_superseded_source_evidence_with_query(
@@ -204,11 +325,33 @@ fn parse_master_status(
 fn load_users_columns(
     source: &mut impl SupersededSourceQuery,
 ) -> Result<Vec<String>, SourceEvidenceError> {
+    load_table_columns(source, USERS_TABLE)
+}
+
+fn load_table_columns(
+    source: &mut impl SupersededSourceQuery,
+    table: &str,
+) -> Result<Vec<String>, SourceEvidenceError> {
+    load_columns(source, table, COLUMN_QUERY)
+}
+
+fn load_writable_table_columns(
+    source: &mut impl SupersededSourceQuery,
+    table: &str,
+) -> Result<Vec<String>, SourceEvidenceError> {
+    load_columns(source, table, WRITABLE_COLUMN_QUERY)
+}
+
+fn load_columns(
+    source: &mut impl SupersededSourceQuery,
+    table: &str,
+    query: &str,
+) -> Result<Vec<String>, SourceEvidenceError> {
     let result = source.query(
-        COLUMN_QUERY,
+        query,
         vec![
             Value::Bytes(USERS_SCHEMA.as_bytes().to_vec()),
-            Value::Bytes(USERS_TABLE.as_bytes().to_vec()),
+            Value::Bytes(table.as_bytes().to_vec()),
         ],
     )?;
     let columns = result
@@ -217,23 +360,34 @@ fn load_users_columns(
         .map(|row| value_bytes(row.first(), "users column name"))
         .collect::<Result<Vec<_>, _>>()?;
     if columns.is_empty() {
-        return Err(SourceEvidenceError::new(
-            "source metadata returned no globalcomix.users columns",
-        ));
+        return Err(SourceEvidenceError::new(format!(
+            "source metadata returned no globalcomix.{table} columns"
+        )));
     }
     if columns.iter().any(|column| !valid_identifier(column)) {
-        return Err(SourceEvidenceError::new(
-            "source metadata returned an invalid users column identifier",
-        ));
+        return Err(SourceEvidenceError::new(format!(
+            "source metadata returned an invalid {table} column identifier"
+        )));
     }
     Ok(columns)
 }
 
 fn users_row_query(columns: &[String]) -> Result<String, SourceEvidenceError> {
-    if columns.is_empty() || columns.iter().any(|column| !valid_identifier(column)) {
-        return Err(SourceEvidenceError::new(
-            "cannot build users evidence query from invalid columns",
-        ));
+    row_query(columns, USERS_TABLE, "`id` = ? OR `name` = ? ORDER BY `id`")
+}
+
+fn row_query(
+    columns: &[String],
+    table: &str,
+    predicate: &str,
+) -> Result<String, SourceEvidenceError> {
+    if columns.is_empty()
+        || columns.iter().any(|column| !valid_identifier(column))
+        || !valid_identifier(table)
+    {
+        return Err(SourceEvidenceError::new(format!(
+            "cannot build {table} evidence query from invalid identifiers"
+        )));
     }
     let selected = columns
         .iter()
@@ -241,7 +395,7 @@ fn users_row_query(columns: &[String]) -> Result<String, SourceEvidenceError> {
         .collect::<Vec<_>>()
         .join(",");
     Ok(format!(
-        "SELECT {selected} FROM `globalcomix`.`users` WHERE `id` = ? OR `name` = ? ORDER BY `id`"
+        "SELECT {selected} FROM `globalcomix`.`{table}` WHERE {predicate}"
     ))
 }
 

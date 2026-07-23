@@ -32,12 +32,14 @@ pub(super) trait SupersededInsertVerifier {
     ) -> Result<super::superseded_insert::SupersededInsertProof, String>;
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct SupersededXidCommitContext<'a> {
     pub(super) xid_end_position: u64,
     pub(super) checkpoint_table: &'a str,
     pub(super) checkpoint_name: &'a str,
     pub(super) conflict_table: &'a str,
+    #[cfg(feature = "integration-failpoints")]
+    pub(super) logical_checkpoint_predecessor: Option<super::superseded_insert::BinlogCoordinate>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -303,6 +305,11 @@ impl TargetTransaction {
             .verify(&candidate, context.xid_end_position)
             .map_err(ApplyBinlogError::Target)?;
         let evidence = proof.resolution_evidence();
+        if let Some(statement) = &proof.current_row_install {
+            executor
+                .execute(statement)
+                .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        }
         let checkpoint = crate::checkpoint::Checkpoint {
             source_file: candidate.observation.coordinate.file.clone(),
             source_position: context.xid_end_position,
@@ -322,6 +329,22 @@ impl TargetTransaction {
                 context.checkpoint_name,
             )
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        #[cfg(feature = "integration-failpoints")]
+        let current = context
+            .logical_checkpoint_predecessor
+            .as_ref()
+            .map(|coordinate| crate::checkpoint::Checkpoint {
+                source_file: coordinate.file.clone(),
+                source_position: coordinate.position,
+                gtid: None,
+                event_timestamp: 0,
+                last_event: crate::checkpoint::LastEvent {
+                    event_type: "IntegrationLogicalCheckpoint".to_string(),
+                    description: "mapped disposable checkpoint to production fixture coordinate"
+                        .to_string(),
+                },
+            })
+            .or(current);
         validate_superseded_checkpoint_predecessor(
             current.as_ref(),
             &candidate,
@@ -458,6 +481,8 @@ where
     Err(ApplyBinlogError::Target(context))
 }
 
+const RELEASES_RECOVERY_CHECKPOINT_POSITION: u64 = 515_816_517;
+
 fn validate_superseded_checkpoint_predecessor(
     current: Option<&crate::checkpoint::Checkpoint>,
     candidate: &crate::row::DeferredSupersededInsertCandidate,
@@ -474,6 +499,14 @@ fn validate_superseded_checkpoint_predecessor(
         return Err(ApplyBinlogError::Checkpoint(format!(
             "superseded checkpoint predecessor file mismatch: expected {expected_file}, locked {}",
             current.source_file
+        )));
+    }
+    if candidate.observation.table == "releases"
+        && current.source_position != RELEASES_RECOVERY_CHECKPOINT_POSITION
+    {
+        return Err(ApplyBinlogError::Checkpoint(format!(
+            "superseded release recovery requires exact checkpoint predecessor {}:{RELEASES_RECOVERY_CHECKPOINT_POSITION}, locked {}:{}",
+            expected_file, current.source_file, current.source_position
         )));
     }
     if current.source_position > xid_end_position {

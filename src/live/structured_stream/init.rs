@@ -439,6 +439,16 @@ where
             &source,
             applier.executor(),
         );
+        #[cfg(feature = "integration-failpoints")]
+        if let (Some(file), Some(end_position)) = (
+            config.integration_logical_source_file.as_ref(),
+            config.integration_logical_end_position,
+        ) {
+            verifier.set_logical_snapshot(super::superseded_source::SourceSnapshotCoordinate {
+                file: file.clone(),
+                position: end_position.saturating_add(1),
+            });
+        }
         target_transaction.verify_deferred_superseded_inserts_at_xid_with_conflicts(
             applier.executor(),
             &mut verifier,
@@ -448,6 +458,17 @@ where
                 checkpoint_table,
                 checkpoint_name,
                 conflict_table: &config.conflict_table,
+                #[cfg(feature = "integration-failpoints")]
+                logical_checkpoint_predecessor: config
+                    .integration_logical_source_file
+                    .as_ref()
+                    .zip(config.integration_logical_checkpoint_position)
+                    .map(
+                        |(file, position)| super::superseded_insert::BinlogCoordinate {
+                            file: file.clone(),
+                            position,
+                        },
+                    ),
             },
         )?;
         return Ok(StructuredEventOutcome {

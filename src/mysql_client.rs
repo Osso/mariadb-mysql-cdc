@@ -12,9 +12,10 @@ use crate::table_sync::progress::{
 };
 use crate::table_sync::{SyncTableProgress, TableSyncError};
 use crate::target::{
-    DuplicateConflict, SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor,
-    TargetRowChange, TargetRowChangeKind, TransactionalTargetExecutor,
-    UsersActiveTransactionEvidence, build_primary_key_replacement_statement, locked_users_evidence,
+    DuplicateConflict, ReleasesActiveTransactionEvidence, SqlStatement, TargetExecuteError,
+    TargetExecutionOutcome, TargetExecutor, TargetRowChange, TargetRowChangeKind,
+    TransactionalTargetExecutor, UsersActiveTransactionEvidence,
+    build_primary_key_replacement_statement, locked_users_evidence,
     primary_key_replacement_outcome,
 };
 use mysql::prelude::Queryable;
@@ -450,6 +451,8 @@ fn duplicate_conflict(error: &TargetExecuteError, error_code: u16) -> DuplicateC
 }
 
 const USERS_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='users' ORDER BY ordinal_position";
+const RELEASES_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='releases' AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position";
+const COMICS_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='comics' ORDER BY ordinal_position";
 
 fn build_locked_users_evidence_sql(columns: &[String]) -> Result<String, TargetExecuteError> {
     if columns.is_empty() {
@@ -472,6 +475,30 @@ fn build_locked_users_evidence(
     rows: Result<Vec<Vec<mysql::Value>>, TargetExecuteError>,
 ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
     locked_users_evidence(columns, rows?)
+}
+
+fn build_locked_table_evidence(
+    columns: &[String],
+    rows: Vec<mysql::Row>,
+) -> Result<Vec<crate::target::LockedUsersRowEvidence>, TargetExecuteError> {
+    locked_users_evidence(
+        columns.to_vec(),
+        rows.into_iter().map(mysql::Row::unwrap).collect(),
+    )
+    .map(|evidence| evidence.rows)
+}
+
+fn quoted_columns(columns: &[String]) -> Result<String, TargetExecuteError> {
+    if columns.is_empty() {
+        return Err(TargetExecuteError::new(
+            "target metadata returned no columns",
+        ));
+    }
+    Ok(columns
+        .iter()
+        .map(|column| crate::mysql_support::quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
 impl TransactionalTargetExecutor for PersistentTargetExecutor {
@@ -551,6 +578,47 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
             .map(mysql::Row::unwrap)
             .collect();
         build_locked_users_evidence(columns, Ok(rows))
+    }
+
+    fn read_locked_release_supersession_evidence(
+        &self,
+        release_id: &mysql::Value,
+        comic_id: &mysql::Value,
+        category_id: &mysql::Value,
+    ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
+        let release_columns = self.with_connection(|conn| {
+            conn.query::<String, _>(RELEASES_COLUMNS_FOR_EVIDENCE_SQL)
+                .map_err(target_query_error)
+        })?;
+        let release_sql = format!(
+            "SELECT {} FROM `globalcomix`.`releases` WHERE `id` = ? FOR UPDATE",
+            quoted_columns(&release_columns)?
+        );
+        let release_rows = self.with_connection(|conn| {
+            conn.exec::<mysql::Row, _, _>(release_sql, Params::Positional(vec![release_id.clone()]))
+                .map_err(target_query_error)
+        })?;
+        let parent_columns = self.with_connection(|conn| {
+            conn.query::<String, _>(COMICS_COLUMNS_FOR_EVIDENCE_SQL)
+                .map_err(target_query_error)
+        })?;
+        let parent_sql = format!(
+            "SELECT {} FROM `globalcomix`.`comics` WHERE `id` = ? AND `section_id` = ? FOR UPDATE",
+            quoted_columns(&parent_columns)?
+        );
+        let parent_rows = self.with_connection(|conn| {
+            conn.exec::<mysql::Row, _, _>(
+                parent_sql,
+                Params::Positional(vec![comic_id.clone(), category_id.clone()]),
+            )
+            .map_err(target_query_error)
+        })?;
+        Ok(ReleasesActiveTransactionEvidence {
+            release_rows: build_locked_table_evidence(&release_columns, release_rows)?,
+            release_columns,
+            parent_rows: build_locked_table_evidence(&parent_columns, parent_rows)?,
+            parent_columns,
+        })
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {

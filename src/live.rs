@@ -159,6 +159,8 @@ pub struct ApplyBinlogConfig {
     #[cfg(feature = "integration-failpoints")]
     pub integration_logical_start_position: Option<u64>,
     #[cfg(feature = "integration-failpoints")]
+    pub integration_logical_checkpoint_position: Option<u64>,
+    #[cfg(feature = "integration-failpoints")]
     pub integration_logical_end_position: Option<u64>,
 }
 
@@ -180,6 +182,8 @@ impl Default for ApplyBinlogConfig {
             integration_logical_source_file: None,
             #[cfg(feature = "integration-failpoints")]
             integration_logical_start_position: None,
+            #[cfg(feature = "integration-failpoints")]
+            integration_logical_checkpoint_position: None,
             #[cfg(feature = "integration-failpoints")]
             integration_logical_end_position: None,
         }

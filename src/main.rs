@@ -581,6 +581,10 @@ fn apply_binlog_transaction_option(
             config.integration_logical_start_position = Some(parse_u64(flag, value)?);
         }
         #[cfg(feature = "integration-failpoints")]
+        "--integration-logical-checkpoint-position" => {
+            config.integration_logical_checkpoint_position = Some(parse_u64(flag, value)?);
+        }
+        #[cfg(feature = "integration-failpoints")]
         "--integration-logical-end-position" => {
             config.integration_logical_end_position = Some(parse_u64(flag, value)?);
         }

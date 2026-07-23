@@ -46,6 +46,7 @@ class ScenarioSpec:
 SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
     ScenarioSpec("home-feed-card-parent-recovery", True),
+    ScenarioSpec("superseded-release-parent-recovery", True),
     ScenarioSpec("superseded-users-recovery", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("create-table-crash-restart", True),
@@ -116,6 +117,9 @@ class Coordinate:
 
 HOME_FEED_PRODUCTION_START = Coordinate("mysqld-bin.002709", 308_259_855)
 HOME_FEED_PRODUCTION_END = Coordinate("mysqld-bin.002709", 308_261_441)
+RELEASE_PARENT_PRODUCTION_START = Coordinate("mysqld-bin.002709", 515_816_517)
+RELEASE_PARENT_PRODUCTION_EVENT = Coordinate("mysqld-bin.002709", 515_816_736)
+RELEASE_PARENT_PRODUCTION_END = Coordinate("mysqld-bin.002709", 515_824_875)
 
 
 @dataclass
@@ -553,6 +557,7 @@ class Harness:
         max_reconnects: int,
         insert_conflict_policy: str | None = None,
         logical_start: Coordinate | None = None,
+        logical_checkpoint: Coordinate | None = None,
         logical_end: Coordinate | None = None,
     ) -> list[str]:
         assert self.source and self.target
@@ -603,6 +608,8 @@ class Harness:
                     logical_start.file,
                     "--integration-logical-start-position",
                     str(logical_start.position),
+                    "--integration-logical-checkpoint-position",
+                    str((logical_checkpoint or logical_start).position),
                     "--integration-logical-end-position",
                     str(logical_end.position),
                 ]
@@ -618,6 +625,7 @@ class Harness:
         barrier_dir: Path | None = None,
         insert_conflict_policy: str | None = None,
         logical_start: Coordinate | None = None,
+        logical_checkpoint: Coordinate | None = None,
         logical_end: Coordinate | None = None,
     ) -> CommandResult:
         build_feature = integration_failpoint
@@ -636,6 +644,7 @@ class Harness:
                 max_reconnects,
                 insert_conflict_policy,
                 logical_start,
+                logical_checkpoint,
                 logical_end,
             ),
             env=env,
@@ -3032,6 +3041,206 @@ class Harness:
             "constraint_attempts=2 checkpoint_unchanged=true"
         )
 
+    def setup_superseded_release_tables(self) -> None:
+        assert self.source and self.target
+        schema_sql = (
+            "DROP TABLE IF EXISTS release_transaction_effects; "
+            "DROP TABLE IF EXISTS releases; "
+            "DROP TABLE IF EXISTS comics; "
+            "CREATE TABLE comics ("
+            "id BIGINT NOT NULL PRIMARY KEY, "
+            "section_id BIGINT NOT NULL, "
+            "title VARCHAR(64) NOT NULL, "
+            "UNIQUE KEY comics_id_section (id,section_id)"
+            ") ENGINE=InnoDB; "
+            "CREATE TABLE releases ("
+            "id BIGINT NOT NULL PRIMARY KEY, "
+            "comic_id BIGINT NOT NULL, "
+            "comic_category_id BIGINT NOT NULL, "
+            "payload VARCHAR(64) NOT NULL, "
+            "public_time BIGINT AS (1) STORED, "
+            "CONSTRAINT releases_ibfk_2 FOREIGN KEY (comic_id,comic_category_id) "
+            "REFERENCES comics (id,section_id) ON UPDATE CASCADE"
+            ") ENGINE=InnoDB; "
+            "CREATE TABLE release_transaction_effects ("
+            "id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL"
+            ") ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema_sql)
+
+    def prepare_superseded_release_case(
+        self,
+        *,
+        target_parent_section: int | None = 26,
+        source_release_mismatch: bool = False,
+        prove_later_history: bool = True,
+        target_current_release: bool = False,
+    ) -> tuple[Coordinate, Coordinate]:
+        assert self.source and self.target
+        self.setup_superseded_release_tables()
+        self.admin_sql(
+            self.source,
+            "INSERT INTO comics VALUES (18384,21,'source comic');",
+        )
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "START TRANSACTION; "
+            "INSERT INTO releases (id,comic_id,comic_category_id,payload) "
+            "VALUES (384446,18384,21,'historical release'); "
+            "INSERT INTO release_transaction_effects VALUES (900001,'same transaction effect'); "
+            "COMMIT;",
+        )
+        historical_stop = self.coordinate()
+        if prove_later_history:
+            self.admin_sql(
+                self.source,
+                "UPDATE comics SET section_id=26,title='current comic' WHERE id=18384; "
+                "UPDATE releases SET comic_category_id=26,payload='current release' WHERE id=384446;",
+            )
+        if source_release_mismatch:
+            self.admin_sql(
+                self.source,
+                "INSERT INTO comics VALUES (18385,27,'different comic'); "
+                "UPDATE releases SET comic_id=18385,comic_category_id=27,payload='mismatched current release' "
+                "WHERE id=384446;",
+            )
+        if target_parent_section is not None:
+            self.admin_sql(
+                self.target,
+                "INSERT INTO comics VALUES "
+                f"(18384,{target_parent_section},'current comic');",
+            )
+        if target_current_release:
+            self.admin_sql(
+                self.target,
+                "INSERT INTO releases (id,comic_id,comic_category_id,payload) "
+                "VALUES (384446,18384,26,'current release');",
+            )
+        return start, historical_stop
+
+    def assert_superseded_release_failure(
+        self,
+        *,
+        label: str,
+        target_parent_section: int | None = 26,
+        source_release_mismatch: bool = False,
+        prove_later_history: bool = True,
+    ) -> None:
+        assert self.target
+        start, historical_stop = self.prepare_superseded_release_case(
+            target_parent_section=target_parent_section,
+            source_release_mismatch=source_release_mismatch,
+            prove_later_history=prove_later_history,
+        )
+        result = self.run_stream(
+            start,
+            historical_stop,
+            logical_start=RELEASE_PARENT_PRODUCTION_EVENT,
+            logical_checkpoint=RELEASE_PARENT_PRODUCTION_START,
+            logical_end=RELEASE_PARENT_PRODUCTION_END,
+        )
+        if result.returncode == 0:
+            raise HarnessError(f"{label} did not fail closed")
+        release_count = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM releases WHERE id=384446;",
+        ).strip()
+        effect_count = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM release_transaction_effects WHERE id=900001;",
+        ).strip()
+        if release_count != "0" or effect_count != "0":
+            raise HarnessError(
+                f"{label} retained rolled-back effects: release={release_count} effect={effect_count}"
+            )
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint.get("source_file") != start.file
+            or int(checkpoint.get("source_position", 0)) != start.position
+        ):
+            raise HarnessError(f"{label} advanced checkpoint: {checkpoint}")
+
+    def run_superseded_release_parent_recovery(self) -> None:
+        assert self.source and self.target
+        start, historical_stop = self.prepare_superseded_release_case()
+        result = self.run_stream(
+            start,
+            historical_stop,
+            logical_start=RELEASE_PARENT_PRODUCTION_EVENT,
+            logical_checkpoint=RELEASE_PARENT_PRODUCTION_START,
+            logical_end=RELEASE_PARENT_PRODUCTION_END,
+        )
+        require_success(result, "superseded release parent recovery stream")
+        parent = self.admin_query(
+            self.target,
+            "SELECT id,section_id,title FROM comics WHERE id=18384;",
+        ).strip()
+        if parent != "18384\t26\tcurrent comic":
+            raise HarnessError(f"current target parent changed: {parent!r}")
+        release = self.admin_query(
+            self.target,
+            "SELECT id,comic_id,comic_category_id,payload FROM releases WHERE id=384446;",
+        ).strip()
+        if release != "384446\t18384\t26\tcurrent release":
+            raise HarnessError(f"current release recovery mismatch: {release!r}")
+        effect = self.admin_query(
+            self.target,
+            "SELECT id,payload FROM release_transaction_effects WHERE id=900001;",
+        ).strip()
+        if effect != "900001\tsame transaction effect":
+            raise HarnessError(f"remaining transaction effect did not commit: {effect!r}")
+
+        self.assert_superseded_release_failure(
+            label="current source release mismatch",
+            source_release_mismatch=True,
+        )
+        self.assert_superseded_release_failure(
+            label="current target parent mismatch",
+            target_parent_section=25,
+        )
+        self.assert_superseded_release_failure(
+            label="current target parent absence",
+            target_parent_section=None,
+        )
+        self.assert_superseded_release_failure(
+            label="later source history not proven",
+            prove_later_history=False,
+        )
+
+        replay_start, replay_stop = self.prepare_superseded_release_case(
+            target_current_release=True,
+        )
+        replay = self.run_stream(
+            replay_start,
+            replay_stop,
+            insert_conflict_policy="replace-divergent-pk",
+            logical_start=RELEASE_PARENT_PRODUCTION_EVENT,
+            logical_checkpoint=RELEASE_PARENT_PRODUCTION_START,
+            logical_end=RELEASE_PARENT_PRODUCTION_END,
+        )
+        require_success(replay, "current release non-regression replay")
+        current_release = self.admin_query(
+            self.target,
+            "SELECT id,comic_id,comic_category_id,payload FROM releases WHERE id=384446;",
+        ).strip()
+        if current_release != "384446\t18384\t26\tcurrent release":
+            raise HarnessError(f"historical replay regressed current release: {current_release!r}")
+        replay_effect = self.admin_query(
+            self.target,
+            "SELECT id,payload FROM release_transaction_effects WHERE id=900001;",
+        ).strip()
+        if replay_effect != "900001\tsame transaction effect":
+            raise HarnessError(f"non-regression replay missed remaining effect: {replay_effect!r}")
+        print(
+            "superseded_release_parent_recovery_ok logical_boundary="
+            "mysqld-bin.002709:515816517-515824875 current_parent_preserved=true "
+            "missing_release_recovered=true remaining_effects_committed=true "
+            "negative_proofs_fail_closed=true current_release_not_regressed=true"
+        )
+
     def setup_superseded_users_tables(self) -> None:
         assert self.source and self.target
         schema_sql = (
@@ -3981,6 +4190,8 @@ class Harness:
             self.run_strict_secondary_btree()
         elif scenario == "home-feed-card-parent-recovery":
             self.run_home_feed_card_parent_recovery()
+        elif scenario == "superseded-release-parent-recovery":
+            self.run_superseded_release_parent_recovery()
         elif scenario == "superseded-users-recovery":
             self.run_superseded_users_recovery()
         elif scenario == "production-alter-table":
