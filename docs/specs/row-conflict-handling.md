@@ -13,11 +13,15 @@ conflicting secondary key.
       NULL, foreign-key, and CHECK constraint failures are also durable debt.
 - [x] Classify an `INSERT` into `globalcomix.payments` that returns MySQL
       `1644` with the exact message `This external payment has already been
-      applied to a previous order` as durable row-conflict evidence. Roll back
-      the target transaction, preserve the unchanged checkpoint, and retry
-      through the durable conflict path rather than treating this trigger error
-      as a fatal stream exit. Other `1644` errors, other tables, and non-`INSERT`
-      changes do not receive this classification.
+      applied to a previous order` as a supported duplicate-trigger conflict.
+      After rollback, require exactly one target row matching the source on the
+      stable identity columns `id`, `order_id`, `payment_service_id`,
+      `transaction_id`, `original_transaction_id`, and `authorization_id`.
+      Treat that exact match as already applied: stage conflict resolution and
+      allow replay and checkpoint commit. A missing, ambiguous, or divergent
+      identity remains durable conflict evidence and aborts with the checkpoint
+      unchanged. Other `1644` errors, other tables, and non-`INSERT` changes do
+      not receive this classification.
 - [x] Under `ignore-duplicate`, skip a native ROW `INSERT` `1062` only when the
       target row fetched by source primary key exactly equals the source row;
       divergent `ROW INSERT` values and every non-`INSERT` `1062` unique conflict
@@ -86,8 +90,10 @@ conflicting secondary key.
 behavior: a duplicate continues without ledger evidence only when the target row
 fetched by source primary key exactly equals the source row. The narrow
 `payments` `INSERT`/MySQL `1644` duplicate-trigger classification above is
-independent of `--insert-conflict-policy` and uses durable conflict evidence.
-`replace-divergent-pk`
+independent of `--insert-conflict-policy`: one target row matching all six stable
+identity columns is already applied and may checkpoint, while missing,
+ambiguous, or divergent identity remains a durable conflict with no checkpoint
+advance. `replace-divergent-pk`
 is native ROW-only and replaces unequal rows only for a `PRIMARY` duplicate using
 a primary-key UPDATE of the source image; it records durable evidence only when
 a matching unresolved conflict already exists, then continues so the target

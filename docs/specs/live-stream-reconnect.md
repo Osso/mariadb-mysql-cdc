@@ -17,6 +17,15 @@ source connection loss without replaying from static startup coordinates.
   last durable coordinate.
 - [x] After a durably persisted row conflict, roll back, keep the checkpoint
   unchanged, and retry the same transaction in-process with bounded backoff.
+- [x] For an `INSERT` into `globalcomix.payments` that returns MySQL `1644` with
+      the exact message `This external payment has already been applied to a
+      previous order`, roll back and inspect the target row selected by source
+      primary key. Exactly one row matching `id`, `order_id`,
+      `payment_service_id`, `transaction_id`, `original_transaction_id`, and
+      `authorization_id` is treated as already applied; stage resolution and
+      allow replay/checkpoint commit. Missing, ambiguous, or divergent identity
+      remains durable conflict evidence and retries from the unchanged
+      checkpoint. Other trigger errors remain fatal.
 - [x] For the exact `globalcomix.sessions` foreign-key error `1452` naming
   `fk_sessions_guest`, persist the conflict first, then validate the source and
   target `guests` identity before retrying. Insert one complete canonical
