@@ -1269,25 +1269,30 @@ fn unresolved_catalog_output_destination(path: &Path) -> Result<CatalogOutputDes
         .components()
         .map(|component| component.as_os_str().to_os_string())
         .collect::<Vec<_>>();
+    let (mut resolved, suffix_start) = canonicalize_existing_path_prefix(path, &components)?;
+    for component in &components[suffix_start..] {
+        resolved.push(component);
+    }
+    Ok(CatalogOutputDestination {
+        path: normalize_lexical_path(&resolved),
+        #[cfg(unix)]
+        file_identity: None,
+    })
+}
+
+fn canonicalize_existing_path_prefix(
+    path: &Path,
+    components: &[std::ffi::OsString],
+) -> Result<(PathBuf, usize), String> {
     for split in (0..components.len()).rev() {
-        let existing_ancestor = components[..split].iter().collect::<PathBuf>();
-        match fs::canonicalize(&existing_ancestor) {
-            Ok(canonical_ancestor) => {
-                let mut resolved = canonical_ancestor;
-                for component in &components[split..] {
-                    resolved.push(component);
-                }
-                return Ok(CatalogOutputDestination {
-                    path: normalize_lexical_path(&resolved),
-                    #[cfg(unix)]
-                    file_identity: None,
-                });
-            }
+        let candidate = components[..split].iter().collect::<PathBuf>();
+        match fs::canonicalize(&candidate) {
+            Ok(canonical) => return Ok((canonical, split)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(format!(
                     "failed to resolve catalog output ancestor {}: {error}",
-                    existing_ancestor.display()
+                    candidate.display()
                 ));
             }
         }
