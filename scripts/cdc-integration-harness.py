@@ -3113,7 +3113,7 @@ class Harness:
         result = self.run_stream(
             start,
             historical_stop,
-            insert_conflict_policy="ignore-duplicate",
+            insert_conflict_policy="replace-divergent-pk",
         )
         require_success(result, "superseded users recovery stream")
         self.assert_superseded_users_current_rows(expected_primary_email="current@example.test")
@@ -3153,7 +3153,7 @@ class Harness:
         mismatch = self.run_stream(
             mismatch_start,
             mismatch_stop,
-            insert_conflict_policy="ignore-duplicate",
+            insert_conflict_policy="replace-divergent-pk",
         )
         mismatch_output = f"{mismatch.stdout}\n{mismatch.stderr}".lower()
         if mismatch.returncode == 0 or "targetprimaryhashmismatch" not in mismatch_output.replace("_", ""):
