@@ -229,8 +229,9 @@ where
         return Ok(FailedAttemptOutcome::Stop(stale_error));
     }
     let exact_parent_retry = error.parent_recovery().is_some();
+    let exact_parent_retry_enabled = config.reconnect_forever || config.max_reconnects > 0;
     let reconnect_eligible = if exact_parent_retry {
-        is_retryable_stream_error(&error)
+        exact_parent_retry_enabled && is_retryable_stream_error(&error)
     } else {
         should_reconnect(
             &error,
