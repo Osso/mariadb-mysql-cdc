@@ -350,6 +350,12 @@ fn propagate_non_syncable_dependencies(
     candidates: &mut BTreeMap<String, SyncableTableEntry>,
     excluded: &mut BTreeMap<String, BTreeSet<NonSyncableReason>>,
 ) {
+    let source_tables = inventory
+        .tables
+        .iter()
+        .filter(|table| table.table_type == "BASE TABLE")
+        .map(|table| table.name.as_str())
+        .collect::<BTreeSet<_>>();
     let dependencies = inventory
         .foreign_keys
         .iter()
@@ -370,7 +376,11 @@ fn propagate_non_syncable_dependencies(
     loop {
         let dependent = dependencies
             .iter()
-            .filter(|(_, parents)| parents.iter().any(|parent| excluded.contains_key(parent)))
+            .filter(|(_, parents)| {
+                parents.iter().any(|parent| {
+                    !source_tables.contains(parent.as_str()) || excluded.contains_key(parent)
+                })
+            })
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         let mut changed = false;
@@ -2121,6 +2131,29 @@ mod tests {
             .expect("target-constrained child");
 
         assert_eq!(child.parent_dependencies, vec!["parent"]);
+    }
+
+    #[test]
+    fn target_only_fk_to_parent_missing_from_source_excludes_child() {
+        let child = table("child", vec![column("id"), column("parent_id")], vec!["id"]);
+        let source = inventory(vec![child.clone()], vec![]);
+        let target = inventory(
+            vec![child, table("parent", vec![column("id")], vec!["id"])],
+            vec![foreign_key("child", "parent")],
+        );
+
+        let catalogs = build_catalogs(&source, &target, &BTreeMap::new());
+        let child = catalogs
+            .non_syncable
+            .iter()
+            .find(|entry| entry.name == "child")
+            .expect("child with target-only parent");
+
+        assert_eq!(
+            child.reasons,
+            vec![NonSyncableReason::DependencyOnNonSyncable]
+        );
+        assert!(catalogs.syncable.is_empty());
     }
 
     #[test]
