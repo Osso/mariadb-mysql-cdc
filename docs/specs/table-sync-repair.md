@@ -3,9 +3,9 @@
 `sync-table` reconciles one source table against one target table in primary-key
 chunks. It is the child operation used by the run-scoped `repair-drift`
 orchestration; live conflict observations persist in `cdc.row_conflicts` and
-are resolved only after verified equality.
+are resolved only after verified equality. The current insert and FK-parent contract is implemented by commits `986aa41` and `da60c43`.
 
-## Current behavior
+## What it must do
 
 - [x] Compare rows by configured primary-key columns.
 - [x] Report missing source rows, divergent rows, and target extras.
@@ -14,6 +14,10 @@ are resolved only after verified equality.
       prepared-statement placeholder limit; persist run progress only after the
       source chunk's update batch succeeds, leaving a failed chunk uncheckpointed
       for retry.
+- [x] Apply missing rows in strict batched `INSERT` statements. Table-sync apply
+      and missing-primary-key modes do not use `INSERT IGNORE`; `--updated-since`
+      remains the explicit upsert path. Batch success is not inferred from the
+      planned insert count.
 - [x] Require explicit `--max-deletes` for apply-mode orphan deletion and preflight
       the ceiling before mutation. Persist successful preflight completion on the
       immutable run row before repair starts, so reconnects skip the completed
@@ -47,13 +51,28 @@ are resolved only after verified equality.
       from one stable source chunk: lock both identities, restore the displaced
       owner, insert the missing owner, verify affected children unchanged, and
       commit run progress in the same transaction; roll back all state on failure.
+- [x] For production table-sync inserts, build FK edges from source and target
+      schema inventories, retain local edges for the configured schema, and
+      discover exact parent identities from each child row's FK columns.
+- [x] On a foreign-key insert failure, recursively repair each exact source
+      parent before retrying the original child batch. An absent target parent
+      is inserted; a divergent target parent is updated; an equal target parent
+      is left unchanged; repeated identities are repaired once per batch.
+- [x] Treat nullable FK values as having no parent to repair. Missing source
+      parents, malformed identities, ambiguous target identities, and dependency
+      cycles remain explicit repair errors.
+- [x] After a child insert or parent-retry batch, reread every child row by its
+      source primary key and require exactly one target row with equal values.
+      A chunk may advance durable progress only after this verification returns
+      successfully.
 - [x] Keep `--updated-since` retries restartable from the beginning under the same
       immutable run specification.
 - [x] Provide a durable conflict schema/SQL contract and resolve rows only after
       verified source/target equality.
-- [ ] Complete the remaining FK-aware phased repair work: canonical
-      child/parent columns, cross-engine rule normalization, resumable
-      per-operation state, and selected-scope cycle/schema-mismatch blocking.
+- [ ] Complete the remaining FK-aware phased repair work for `repair-drift`:
+      canonical child/parent columns, cross-engine rule normalization, and
+      resumable per-operation state remain separate from table-sync's runtime
+      parent repair.
 - [x] Build read-only and repair inputs from the full `plan.tables` union. Cumulative
       DeleteExtras preflight and child-first deletes cover every childward table;
       parentward inserts/updates retain their directional scope. Verification uses
@@ -74,6 +93,14 @@ are resolved only after verified equality.
       passes immutable child run IDs to `sync-table`.
 - [ ] No recurring conflict-to-repair scheduler exists; operators must invoke a
       fresh bounded repair run.
+- [ ] Table-sync auto-parent repair currently handles FK failures from insert
+      batches, not FK failures raised by divergent-row update batches.
+- [ ] Cross-schema FK edges are not auto-repaired. Parent repair requires the
+      parent table and exact source row to exist in the configured source
+      inventory; cycles and ambiguous identities fail closed.
+- [ ] Parent repair has no separate durable per-parent operation ledger or
+      unbounded internal retry policy; a repair error leaves the chunk
+      uncheckpointed for the surrounding run retry/orchestration.
 
 ## Required phased behavior before completion
 
@@ -81,6 +108,10 @@ are resolved only after verified equality.
    selected-table repair, derive parentward ancestor scope for inserts/updates
    and childward descendant scope for delete safety independently. Never
    alternate directions through shared nodes into siblings.
+
+For direct table-sync insert batches, runtime FK recovery uses the merged local
+source/target FK metadata to discover only the exact parent rows referenced by
+that batch. It does not resync an entire parent table.
 2. Hash the immutable run plan and filtered directional inventories; fail closed
    on drift. Disconnected FK cycles are outside the hash and do not block the run,
    while a cycle in either required phase scope blocks before mutation.
@@ -99,6 +130,53 @@ are resolved only after verified equality.
 
 Lexical order is only a tie-breaker among proven independent tables. It is not a
 replacement for FK dependency analysis.
+
+## How it works
+
+- [Target writer](../target-writer.md) — DML modes, strict table-sync inserts,
+  and target-side error boundaries.
+- [Schema inventory](../schema-inventory.md) — source/target metadata and FK
+  edge acquisition.
+- [Table catalog sync](table-catalog-sync.md) — broader phased dependency
+  scheduling for catalog and `repair-drift` workflows.
+
+## Implementation inventory
+
+- `src/table_sync/fk_parent_repair.rs` — recursive exact-parent discovery,
+  nullable-FK handling, cycle detection, and child-batch retry orchestration.
+- `src/table_sync/mysql.rs` — exact inventory-row reads for source and target
+  parent/child verification.
+- `src/table_sync/target.rs` — strict batched writes, merged local FK edges,
+  parent insert/update repair, and post-write child verification.
+- `src/table_sync/run.rs` — source/target inventory loading and repair-target
+  construction.
+- `src/table_sync/range.rs` — chunk progress persistence after repair returns.
+
+## Tests asserting this spec
+
+- `src/table_sync/tests.rs`
+  — strict batch inserts, missing-parent repair before child retry and progress
+  advance, and unresolved post-insert verification.
+- `src/table_sync/fk_parent_repair.rs`
+  — recursive ordering, equal/divergent parent handling, nullable FK skipping,
+  cycle detection, and structured source-read errors.
+- `src/table_sync/tests_support.rs` — observable batch and progress fixtures.
+
+## Known gaps (current cycle)
+
+- [ ] Update batches do not yet invoke the generic FK parent-repair path.
+- [ ] Cross-schema parents, missing source parents, ambiguous identities, and
+      dependency cycles fail closed instead of being auto-repaired.
+- [ ] Parent repairs have no separate durable per-parent operation ledger or
+      unbounded internal retry policy.
+- [ ] The generic FK runtime path still needs a real containerized MariaDB/MySQL
+      integration proof; current regression coverage is in-process.
+
+## Out of scope
+
+- Automatic repair of non-FK unique, CHECK, or arbitrary target constraints.
+- Full parent-table resynchronization when only exact referenced rows are needed.
+- Deployment or production execution; those require a separately verified image.
 
 See [Catchup Workflow](../catchup.md) and
 [Row Conflict Handling](row-conflict-handling.md).

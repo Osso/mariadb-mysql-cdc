@@ -135,8 +135,10 @@ executes staged resolution SQL, and commits once; only after COMMIT
 does it mark the in-process resolution cache committed. A rollback or commit
 failure therefore leaves target DML, checkpoint, and ledger resolution unresolved.
 Generic statement execution does not gain an unsafe replacement fallback.
-Snapshot/catchup writes and normal range repairs use explicit `INSERT IGNORE`
-independently of the flag; the `sync-table --updated-since` path uses an upsert.
+Snapshot/catchup writes may use explicit `INSERT IGNORE` independently of the
+flag. Normal `sync-table` range repairs use strict batched `INSERT` with
+inventory-driven FK parent repair and exact post-write child verification; the
+`sync-table --updated-since` path uses an upsert.
 
 ## Durable conflict control plane
 

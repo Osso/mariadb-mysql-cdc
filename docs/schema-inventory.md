@@ -10,6 +10,7 @@ Captured objects:
 - columns, ordinal positions, column types, defaults, nullability, and extras
 - generated columns with expression and virtual/stored kind
 - primary key columns in key order
+- foreign keys with child table/columns and referenced schema/table/columns
 - views and definitions
 - triggers with timing, event, table, and statement
 - routines with type and definition when available
@@ -17,12 +18,17 @@ Captured objects:
 
 The inventory module exposes:
 
-- `SchemaInventory`: normalized metadata model.
+- `SchemaInventory`: normalized metadata model, including foreign-key edges.
+- `ForeignKeyInventory`: ordered child and referenced column mappings used by
+  table-catalog scheduling and table-sync parent repair.
 - `InventoryReader`: trait for reading source metadata.
 - `MariaDbInventoryReader`: `mariadb` CLI backed reader using
   `information_schema`.
 
 The CLI reader uses read-only `SELECT` statements against `information_schema`.
+Table-sync merges local FK edges from source and target inventories; target-only
+local constraints therefore participate in exact parent discovery, while
+cross-schema edges are excluded from this runtime repair path.
 
 ## Cross-engine visibility compatibility
 
