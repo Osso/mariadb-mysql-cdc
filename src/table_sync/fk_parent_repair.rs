@@ -184,12 +184,19 @@ fn repair_parent(
     path.pop();
     parent_result?;
 
-    store
-        .repair_parent(&source)
-        .map_err(|message| ParentRepairError::Repair {
-            identity: identity.clone(),
-            message,
+    if let Err(message) = store.repair_parent(&source) {
+        let concurrent_parent = store.read_target_parent(&identity).map_err(|read_error| {
+            ParentRepairError::TargetRead {
+                identity: identity.clone(),
+                message: read_error,
+            }
         })?;
+        if concurrent_parent.as_ref() == Some(&source) {
+            repaired.insert(identity);
+            return Ok(());
+        }
+        return Err(ParentRepairError::Repair { identity, message });
+    }
     let repaired_parent =
         store
             .read_target_parent(&identity)
@@ -217,6 +224,7 @@ mod tests {
         target: BTreeMap<ParentIdentity, ParentRepairRow>,
         source_errors: BTreeMap<ParentIdentity, String>,
         drop_parent_repair: bool,
+        error_after_parent_repair: Option<String>,
         repaired: Vec<ParentIdentity>,
         retried: Vec<String>,
     }
@@ -246,7 +254,10 @@ mod tests {
             if !self.drop_parent_repair {
                 self.target.insert(identity, row.clone());
             }
-            Ok(())
+            match &self.error_after_parent_repair {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
         }
 
         fn retry_child_batch(
@@ -345,6 +356,23 @@ mod tests {
         repair_fk_parents_and_retry("guests", &[child], &edges, &mut store).unwrap();
 
         assert!(store.repaired.is_empty());
+        assert_eq!(store.retried, ["guests"]);
+    }
+
+    #[test]
+    fn accepts_concurrent_equal_parent_after_duplicate_write_error() {
+        let edges = vec![edge("guests", "utm_id", "utms", "id")];
+        let child = row("guests", &[("guest_id", Some("7")), ("utm_id", Some("41"))]);
+        let utm = row("utms", &[("id", Some("41")), ("utm_hash", Some("source"))]);
+        let mut store = RecordingStore {
+            error_after_parent_repair: Some("duplicate key".to_string()),
+            ..RecordingStore::default()
+        };
+        store.source.insert(identity("utms", "id", "41"), utm);
+
+        repair_fk_parents_and_retry("guests", &[child], &edges, &mut store)
+            .expect("concurrent equal parent");
+
         assert_eq!(store.retried, ["guests"]);
     }
 
