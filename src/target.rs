@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
-pub(crate) const MAX_UPDATE_ROWS_PER_STATEMENT: usize = 128;
+const MAX_UPDATE_ROWS_PER_STATEMENT: usize = 128;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlStatement {
@@ -746,14 +746,18 @@ where
 
     pub fn update_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TargetWriteError> {
         let changed_column_count = self.columns.len().saturating_sub(self.primary_key.len());
-        let batch_size =
-            max_update_rows_per_statement(self.primary_key.len(), changed_column_count);
+        let batch_size = update_statement_capacity(self.primary_key.len(), changed_column_count);
         for batch in rows.chunks(batch_size) {
             let statement =
                 build_update_rows_statement(&self.table, &self.primary_key, &self.columns, batch);
             self.execute_with_context("update", batch.len(), statement)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn update_batch_size(&self) -> usize {
+        let changed_column_count = self.columns.len().saturating_sub(self.primary_key.len());
+        update_statement_capacity(self.primary_key.len(), changed_column_count)
     }
 
     pub fn delete_row(&self, primary_key: &PrimaryKey) -> Result<(), TargetWriteError> {
@@ -1010,7 +1014,10 @@ fn ordered_update_params(changed_columns: &[String], rows: &[&SnapshotRow]) -> V
     params
 }
 
-fn max_update_rows_per_statement(primary_key_count: usize, changed_column_count: usize) -> usize {
+pub(crate) fn update_statement_capacity(
+    primary_key_count: usize,
+    changed_column_count: usize,
+) -> usize {
     let placeholders_per_row = changed_column_count
         .saturating_mul(primary_key_count.saturating_add(1))
         .saturating_add(primary_key_count)

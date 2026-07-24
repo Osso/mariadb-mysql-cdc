@@ -910,18 +910,18 @@ fn later_update_statement_repair_does_not_replay_committed_subbatch() {
             self.operations
                 .borrow_mut()
                 .push(format!("update:{first}-{last}"));
-            if first == "129" {
+            if first == "128" {
                 self.operations.borrow_mut().extend([
-                    "fk-1452:129".to_string(),
-                    "repair-parent:129".to_string(),
-                    "retry-update:129".to_string(),
+                    "fk-1452:128-129".to_string(),
+                    "repair-parent:128-129".to_string(),
+                    "retry-update:128-129".to_string(),
                 ]);
             }
             Ok(())
         }
 
         fn update_batch_size(&self) -> usize {
-            128
+            crate::target::update_statement_capacity(1, 256)
         }
 
         fn delete_row(&mut self, _primary_key: &[String]) -> Result<(), TableSyncError> {
@@ -941,9 +941,16 @@ fn later_update_statement_repair_does_not_replay_committed_subbatch() {
         operations: RefCell::new(Vec::new()),
     };
     let mut progress_store = RecordingProgressStore::default();
+    let wide_table = SyncTable {
+        name: "wide_accounts".to_string(),
+        primary_key: vec!["id".to_string()],
+        columns: std::iter::once("id".to_string())
+            .chain((1..=256).map(|index| format!("value_{index}")))
+            .collect(),
+    };
 
     let report = sync_table_with_progress_range(
-        &account_table(),
+        &wide_table,
         SyncRunOptions {
             run_id: "statement-sized-update-retry".to_string(),
             run_scope: "statement-sized-update-retry-scope".to_string(),
@@ -964,11 +971,11 @@ fn later_update_statement_repair_does_not_replay_committed_subbatch() {
     assert_eq!(
         repair_target.operations.borrow().as_slice(),
         &[
-            "update:001-128",
-            "update:129-129",
-            "fk-1452:129",
-            "repair-parent:129",
-            "retry-update:129",
+            "update:001-127",
+            "update:128-129",
+            "fk-1452:128-129",
+            "repair-parent:128-129",
+            "retry-update:128-129",
         ]
     );
     assert_eq!(

@@ -444,7 +444,7 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
     }
 
     fn update_batch_size(&self) -> usize {
-        crate::target::MAX_UPDATE_ROWS_PER_STATEMENT
+        self.writer.update_batch_size()
     }
 
     fn verify_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {

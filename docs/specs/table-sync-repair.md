@@ -63,8 +63,9 @@ are resolved only after verified equality. The current table-sync recovery contr
       cycles remain explicit repair errors.
 - [x] On foreign-key failures from insert or divergent-update batches, recursively
       repair each exact source parent before retrying the same child batch. Apply
-      this to the affected writer-sized subbatch (currently at most 128 rows)
-      so earlier committed subbatches are not replayed. Parent repairs require exact post-write
+      this to the affected schema-dependent writer subbatch (capped at 128
+      rows and reduced by placeholder capacity) so earlier committed subbatches
+      are not replayed. Parent repairs require exact post-write
       rereads; concurrent duplicate writes are accepted only when rereads prove
       complete source/target equality, and divergent owners fail closed.
 - [x] After a child insert, parent-retry batch, or divergent update batch, reread
