@@ -28,6 +28,9 @@ pub trait SyncRepairTarget {
     fn verify_rows(&self, _rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         Ok(())
     }
+    fn requires_terminal_verification(&self) -> bool {
+        false
+    }
     fn delete_row(&mut self, primary_key: &[String]) -> Result<(), TableSyncError>;
 
     fn restore_displaced_owner_and_insert(
@@ -460,6 +463,10 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
 
     fn verify_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         self.verify_exact_rows(rows, "update")
+    }
+
+    fn requires_terminal_verification(&self) -> bool {
+        self.fk_repair.is_some()
     }
 
     fn delete_row(&mut self, primary_key: &[String]) -> Result<(), TableSyncError> {

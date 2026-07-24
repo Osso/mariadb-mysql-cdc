@@ -1250,6 +1250,108 @@ fn target_read_allows_extra_rows_inside_source_window() {
 }
 
 #[test]
+fn apply_completes_only_after_a_subsequent_zero_drift_pass() {
+    struct VerificationTargetReader {
+        converged: Rc<Cell<bool>>,
+    }
+
+    impl SyncTableReader for VerificationTargetReader {
+        fn read_rows(
+            &self,
+            request: &SyncChunkRequest,
+        ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+            if self.converged.get() {
+                FakeReader::new(vec![row("1", "source")]).read_rows(request)
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    struct TerminalVerificationRepairTarget;
+
+    impl SyncRepairTarget for TerminalVerificationRepairTarget {
+        fn insert_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn update_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn delete_row(&mut self, _primary_key: &[String]) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn requires_terminal_verification(&self) -> bool {
+            true
+        }
+    }
+
+    let converged = Rc::new(Cell::new(false));
+    let source = FakeReader::new(vec![row("1", "source")]);
+    let target = VerificationTargetReader {
+        converged: Rc::clone(&converged),
+    };
+    let mut repair_target = TerminalVerificationRepairTarget;
+    let mut progress_store = RecordingProgressStore::default();
+    let options = || SyncRunOptions {
+        run_id: "terminal-zero-drift".to_string(),
+        run_scope: "terminal-zero-drift-scope".to_string(),
+        chunk_size: 10,
+        mode: SyncMode::Apply,
+        start_after: None,
+        end_at: None,
+        max_deletes: Some(0),
+    };
+
+    let first_error = sync_table_with_progress_range(
+        &account_table(),
+        options(),
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect_err("missing row after apply must block completion");
+
+    assert!(first_error.to_string().contains("missing_rows=1"));
+    assert!(progress_store.errors.borrow().is_empty());
+    let pending = progress_store
+        .saved
+        .borrow()
+        .last()
+        .cloned()
+        .expect("progress");
+    assert_eq!(pending.status, progress::SyncProgressStatus::Running);
+    assert_eq!(pending.last_primary_key, Some(vec!["1".to_string()]));
+    assert_eq!(pending.inserts, 1);
+
+    converged.set(true);
+    progress_store.loaded = Some(pending);
+    let report = sync_table_with_progress_range(
+        &account_table(),
+        options(),
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect("subsequent zero-drift verification completes run");
+
+    assert_eq!(report.inserts, 1);
+    assert_eq!(
+        progress_store
+            .saved
+            .borrow()
+            .last()
+            .expect("completed")
+            .status,
+        progress::SyncProgressStatus::Complete
+    );
+}
+
+#[test]
 fn verify_fails_for_missing_rows_without_mutation() {
     let source = FakeReader::new(vec![row("1", "alpha"), row("2", "bravo")]);
     let target = FakeReader::new(vec![row("1", "alpha")]);

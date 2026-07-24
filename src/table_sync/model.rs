@@ -89,6 +89,7 @@ pub enum TableSyncError {
     Read(String),
     Duplicate(String),
     Repair(String),
+    Verification(String),
     Progress(String),
 }
 
@@ -99,6 +100,7 @@ impl fmt::Display for TableSyncError {
             Self::Read(message) => write!(formatter, "sync read failed: {message}"),
             Self::Duplicate(message) => write!(formatter, "sync duplicate detected: {message}"),
             Self::Repair(message) => write!(formatter, "sync repair failed: {message}"),
+            Self::Verification(message) => write!(formatter, "sync verification failed: {message}"),
             Self::Progress(message) => write!(formatter, "sync progress failed: {message}"),
         }
     }

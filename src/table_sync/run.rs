@@ -541,7 +541,10 @@ where
 pub(crate) fn is_retryable_sync_error(error: &TableSyncError) -> bool {
     if matches!(
         error,
-        TableSyncError::Read(_) | TableSyncError::Progress(_) | TableSyncError::Duplicate(_)
+        TableSyncError::Read(_)
+            | TableSyncError::Progress(_)
+            | TableSyncError::Duplicate(_)
+            | TableSyncError::Verification(_)
     ) {
         return true;
     }

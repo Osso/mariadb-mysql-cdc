@@ -182,6 +182,12 @@ where
             if context.phase.is_verification() {
                 return verification_result(context);
             }
+            if context.options.mode == SyncMode::Apply
+                && context.phase == SyncPhase::All
+                && context.repair_target.requires_terminal_verification()
+            {
+                verify_terminal_zero_drift(context)?;
+            }
             complete_sync_progress(&mut context.progress, context.progress_store)?;
             return Ok(context.report.clone());
         };
@@ -797,6 +803,99 @@ pub(crate) fn complete_sync_progress(
 ) -> Result<(), TableSyncError> {
     progress.mark_complete();
     progress_store.save(progress)
+}
+
+fn verify_terminal_zero_drift<S, T, R, P>(
+    context: &mut RangeExecution<'_, S, T, R, P>,
+) -> Result<(), TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    let mut report = SyncTableReport {
+        table: context.table.name.clone(),
+        ..SyncTableReport::default()
+    };
+    let mut start_after = context.options.start_after.clone();
+    loop {
+        let source_rows = context.source.read_rows(&sync_chunk_request(
+            context.table,
+            start_after.clone(),
+            context.options.end_at.clone(),
+            context.options.chunk_size,
+        ))?;
+        if source_rows.is_empty() {
+            let target_rows = read_target_window(
+                context.table,
+                start_after,
+                context.options.end_at.clone(),
+                context.options.chunk_size,
+                context.target,
+            )?;
+            repair_chunk(
+                &[],
+                &target_rows,
+                SyncMode::Apply,
+                context.repair_target,
+                &mut report,
+                context.options.max_deletes,
+                SyncPhase::Verify,
+            )?;
+            break;
+        }
+
+        let end_at = last_primary_key(&source_rows)?;
+        let target_rows = read_target_window(
+            context.table,
+            start_after.clone(),
+            Some(end_at.clone()),
+            context.options.chunk_size,
+            context.target,
+        )?;
+        repair_chunk(
+            &source_rows,
+            &target_rows,
+            SyncMode::Apply,
+            context.repair_target,
+            &mut report,
+            context.options.max_deletes,
+            SyncPhase::Verify,
+        )?;
+        if source_rows.len() < context.options.chunk_size {
+            let target_tail = read_target_window(
+                context.table,
+                Some(end_at),
+                context.options.end_at.clone(),
+                context.options.chunk_size,
+                context.target,
+            )?;
+            repair_chunk(
+                &[],
+                &target_tail,
+                SyncMode::Apply,
+                context.repair_target,
+                &mut report,
+                context.options.max_deletes,
+                SyncPhase::Verify,
+            )?;
+            break;
+        }
+        start_after = Some(end_at);
+    }
+
+    if report.inserts > 0 || report.updates > 0 || report.extra_target_rows > 0 {
+        return Err(TableSyncError::Verification(format!(
+            "table={} scope={} missing_rows={} extra_rows={} divergent_rows={}",
+            context.table.name,
+            verification_scope(context.options, SyncPhase::Verify),
+            report.inserts,
+            report.extra_target_rows,
+            report.updates,
+        )));
+    }
+    Ok(())
 }
 
 fn verification_result<S, T, R, P>(
