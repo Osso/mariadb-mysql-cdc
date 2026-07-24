@@ -26,7 +26,7 @@ mod structured_stream;
 #[cfg(test)]
 use crate::target::{SqlStatement, TargetExecuteError};
 use binlog_command::read_remote_binlog;
-pub(crate) use foreign_key_error::ForeignKeyViolation;
+pub(crate) use foreign_key_error::{ForeignKeyViolation, parse_foreign_key_violation};
 pub(crate) use insert_conflict::should_replace_divergent_primary;
 pub use insert_conflict::{
     InsertConflictPolicy, should_ignore_duplicate_insert, should_ignore_duplicate_row_change,
