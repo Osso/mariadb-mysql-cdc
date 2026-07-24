@@ -26,8 +26,6 @@ pub struct RepairDriftConfig {
     pub mode: SyncMode,
     pub chunk_size: usize,
     pub progress_table: String,
-    pub max_deletes: Option<u64>,
-    pub max_deletes_explicit: bool,
     pub run_id: Option<String>,
     pub run_id_prefix: String,
     #[cfg(feature = "integration-failpoints")]
@@ -101,16 +99,8 @@ pub fn build_fk_aware_repair_plan(
     target_identity: &str,
     source: &RepairInventory,
     target: &RepairInventory,
-    max_deletes: u64,
 ) -> Result<RepairPlan, RepairPlanError> {
-    plan::build_fk_aware_repair_plan(
-        run_id,
-        source_identity,
-        target_identity,
-        source,
-        target,
-        max_deletes,
-    )
+    plan::build_fk_aware_repair_plan(run_id, source_identity, target_identity, source, target)
 }
 
 pub fn order_table_names(

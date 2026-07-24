@@ -31,8 +31,6 @@ pub(crate) fn default_repair_drift_config() -> RepairDriftConfig {
         mode: SyncMode::DryRun,
         chunk_size: 1000,
         progress_table: "cdc.table_sync_runs".to_string(),
-        max_deletes: Some(0),
-        max_deletes_explicit: false,
         run_id: None,
         run_id_prefix: "repair-drift".to_string(),
         #[cfg(feature = "integration-failpoints")]
@@ -138,16 +136,9 @@ fn apply_repair_execution_option(
         "--mode" => config.mode = parse_sync_mode(value)?,
         "--chunk-size" => config.chunk_size = crate::parse_usize(flag, value)?,
         "--progress-table" => config.progress_table = value.to_string(),
-        "--max-deletes" => set_max_deletes(config, flag, value)?,
         _ => return Ok(false),
     }
     Ok(true)
-}
-
-fn set_max_deletes(config: &mut RepairDriftConfig, flag: &str, value: &str) -> Result<(), String> {
-    config.max_deletes = Some(crate::parse_u64(flag, value)?);
-    config.max_deletes_explicit = true;
-    Ok(())
 }
 
 fn apply_repair_run_option(
@@ -262,9 +253,6 @@ fn validate_repair_options(config: &RepairDriftConfig) -> Result<(), String> {
 fn validate_apply_config(config: &RepairDriftConfig) -> Result<(), String> {
     if config.mode != SyncMode::Apply {
         return Ok(());
-    }
-    if !config.max_deletes_explicit || config.max_deletes.is_none() {
-        return Err("--max-deletes is required in apply mode".to_string());
     }
     if config.source_identity.is_empty() {
         return Err("source identity is required in apply mode".to_string());

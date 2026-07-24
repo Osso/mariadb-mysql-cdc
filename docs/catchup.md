@@ -86,9 +86,10 @@ account until that path is changed and proved.
 
 `repair-drift` creates a fresh orchestration ID, inventories both endpoints, runs
 bounded count/content checks, and invokes FK-aware phased `sync-table` repairs.
-Dry-run is default. Apply mode requires an explicit `--max-deletes` value,
-including zero when no orphan deletion is allowed. `--start-after`/`--end-at`
-select a bounded primary-key window; JSON forms support comma-containing keys.
+Dry-run is default. Apply mode reconciles target-only rows in dependency-safe
+chunks, verifies each chunk, and persists progress after verification.
+`--start-after`/`--end-at` select a bounded primary-key window; JSON forms support
+comma-containing keys.
 
 The planner deletes child rows before parents, inserts parents before children,
 blocks cycles/schema mismatch before mutation, rejects changed plan hashes on
@@ -102,7 +103,7 @@ mariadb-mysql-cdc repair-drift \
   --target-port 25060 --target-user target_user \
   --target-password-env TARGET_PASSWORD --target-database globalcomix \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
-  --mode apply --max-deletes 25 --parent-first users,applications_users
+  --mode apply --parent-first users,applications_users
 ```
 
 Use this only after reviewing the exact target extras and FK constraints. Do not
@@ -111,9 +112,8 @@ assume lexical order can satisfy parent-first inserts and child-first deletes.
 ## Table repair runs
 
 Every `sync-table` invocation requires `--run-id`. Direct reuse is limited to the
-exact interrupted immutable run; a completed ID is terminal. A changed endpoint,
-table shape, bounds, mode, delete ceiling, or `updated-since` specification needs
-a fresh ID. During apply-mode InsertMissing, `repair-drift` may reclaim exactly
+exact interrupted immutable run; a completed ID is terminal. A changed endpoint, table shape, bounds, mode, or `updated-since` specification
+needs a fresh ID. During apply-mode InsertMissing, `repair-drift` may reclaim exactly
 one failed missing-PK run only when its complete immutable specification matches.
 Reclamation is an atomic claim scoped to the table and immutable specification:
 compatibility and uniqueness are revalidated before the selected row is marked

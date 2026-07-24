@@ -19,7 +19,8 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
       node into siblings, and disconnected tables/constraints remain outside the
       repair scope.
 - [x] Skip missing/incompatible tables with explicit reasons.
-- [x] Require an explicit `--max-deletes` in apply mode.
+- [x] Reconcile target-only rows chunk by chunk in apply mode, verifying each
+      deletion before persisting progress.
 - [x] Pass child run IDs to `sync-table`.
 - [x] Atomically claim exactly one specification-identical failed
       `missing-primary-keys` run during apply-mode InsertMissing within the table
@@ -42,14 +43,13 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
 - [x] Cycles within either required directional phase scope and FK inventory/schema
       mismatch block before target mutation; disconnected cycles are ignored.
 - [x] In apply mode, DeleteExtras processes one chunk at a time across the
-      childward scope. Each chunk enforces the remaining cumulative
-      `--max-deletes` budget before mutation, applies and verifies the chunk, then
-      persists progress. Interrupted child runs resume from the next uncommitted
-      chunk; no global full-table delete preflight occurs. Read-only and repair
+      childward scope. Each chunk applies and verifies its writes and deletions,
+      then persists progress. Interrupted child runs resume from the next
+      uncommitted chunk; no global full-table delete preflight occurs. Read-only and repair
       inputs come from the full `plan.tables` union, so child-only descendants
       are deleted child-first.
-- [x] `--start-after`/`--end-at` bound the selected PK window; apply mode always
-      carries an explicit `--max-deletes` value.
+- [x] `--start-after`/`--end-at` bound the selected PK window; completed chunks
+      persist their cursor and counters only after exact verification.
 - [x] Unresolved conflicts resolve only after verified equality, with run/evidence
       fields, and the real harness proves zero unresolved debt for scope.
 - [x] Secondary-unique collisions remain primary-key scoped and do not mutate the

@@ -363,7 +363,6 @@ pub struct RepairPlan {
     pub delete_order: Vec<String>,
     pub insert_order: Vec<String>,
     pub update_order: Vec<String>,
-    pub max_deletes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

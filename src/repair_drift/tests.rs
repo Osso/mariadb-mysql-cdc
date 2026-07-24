@@ -35,7 +35,7 @@ fn fk_aware_plan_is_available_without_lexical_guessing() {
             enforced: true,
         }],
     };
-    let plan = build_fk_aware_repair_plan("run", "source", "target", &inventory, &inventory, 2)
+    let plan = build_fk_aware_repair_plan("run", "source", "target", &inventory, &inventory)
         .expect("fk-aware plan");
     assert_eq!(plan.insert_order, vec!["parents", "children"]);
     assert_eq!(plan.delete_order, vec!["children", "parents"]);
@@ -115,15 +115,6 @@ fn passes_content_check_to_drift_check_config() {
     let drift_config = build_drift_check_config(&config, vec!["accounts".to_string()]);
     assert!(!drift_config.content_check);
     assert_eq!(drift_config.tables, vec!["accounts"]);
-}
-
-#[test]
-fn apply_requires_explicit_max_deletes() {
-    let mut config = valid_config();
-    config.mode = SyncMode::Apply;
-    config.max_deletes_explicit = false;
-    let error = validate_repair_drift_config(&config).expect_err("max deletes");
-    assert_eq!(error, "--max-deletes is required in apply mode");
 }
 
 fn valid_config() -> RepairDriftConfig {
@@ -212,7 +203,7 @@ fn selected_orders_do_not_pull_sibling_cycle_into_repair_plan() {
 
     assert_eq!(reduced.tables, vec!["customers", "orders"]);
     let plan =
-        build_fk_aware_repair_plan("selected-orders", "source", "target", &reduced, &reduced, 0)
+        build_fk_aware_repair_plan("selected-orders", "source", "target", &reduced, &reduced)
             .expect("selected orders plan must not be blocked by sibling cycle");
     assert_eq!(plan.insert_order, vec!["customers", "orders"]);
     assert_eq!(plan.delete_order, vec!["orders", "customers"]);
@@ -249,7 +240,7 @@ fn dependency_closure_preserves_ancestors_children_and_selected_cycles() {
     );
     assert_eq!(reduced.foreign_keys.len(), 4);
     let error =
-        build_fk_aware_repair_plan("selected-cycle", "source", "target", &reduced, &reduced, 0)
+        build_fk_aware_repair_plan("selected-cycle", "source", "target", &reduced, &reduced)
             .expect_err("selected dependency cycle must remain blocked");
     assert!(matches!(error, RepairPlanError::Cycle(_)));
 }
@@ -366,12 +357,9 @@ fn parses_repeated_tables_parent_first_prefix_and_content_check() {
     repair_drift_option(&mut config, "--table", "accounts").expect("table");
     repair_drift_option(&mut config, "--parent-first", "accounts,authors").expect("order");
     repair_drift_option(&mut config, "--content-check", "false").expect("content check");
-    repair_drift_option(&mut config, "--max-deletes", "7").expect("deletes");
     assert_eq!(config.tables, vec!["children", "accounts"]);
     assert_eq!(config.parent_first, vec!["accounts", "authors"]);
     assert!(!config.content_check);
-    assert_eq!(config.max_deletes, Some(7));
-    assert!(config.max_deletes_explicit);
 }
 
 #[test]

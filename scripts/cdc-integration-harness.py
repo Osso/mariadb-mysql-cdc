@@ -92,8 +92,7 @@ SCENARIOS = (
     ScenarioSpec("repair-resume", True),
     ScenarioSpec("run-progress-least-privilege", True),
     ScenarioSpec("run-progress-composite-pk-rejected", True),
-    ScenarioSpec("bounded-delete", True),
-    ScenarioSpec("global-delete-limit", True),
+    ScenarioSpec("selected-window-repair", True),
     ScenarioSpec("delete-only-descendants", True),
     ScenarioSpec("conflict-resolution-zero-debt", True),
 )
@@ -765,7 +764,6 @@ class Harness:
         *,
         tables: list[str],
         mode: str,
-        max_deletes: int,
         run_id: str | None = None,
         chunk_size: int = 1000,
         start_after: list[str] | None = None,
@@ -802,8 +800,6 @@ class Harness:
             str(self.ca_file),
             "--mode",
             mode,
-            "--max-deletes",
-            str(max_deletes),
             "--chunk-size",
             str(chunk_size),
             "--progress-table",
@@ -826,7 +822,6 @@ class Harness:
         *,
         tables: list[str],
         mode: str = "apply",
-        max_deletes: int = 0,
         run_id: str | None = None,
         chunk_size: int = 1000,
         start_after: list[str] | None = None,
@@ -846,7 +841,6 @@ class Harness:
                 binary,
                 tables=tables,
                 mode=mode,
-                max_deletes=max_deletes,
                 run_id=run_id,
                 chunk_size=chunk_size,
                 start_after=start_after,
@@ -863,7 +857,6 @@ class Harness:
         self,
         *,
         tables: list[str],
-        max_deletes: int,
         run_id: str,
         chunk_size: int,
         progress_table: str = "globalcomix.table_sync_runs",
@@ -884,7 +877,6 @@ class Harness:
                 binary,
                 tables=tables,
                 mode="apply",
-                max_deletes=max_deletes,
                 run_id=run_id,
                 chunk_size=chunk_size,
                 progress_table=progress_table,
@@ -2659,7 +2651,6 @@ class Harness:
                 self._repair_binary(),
                 tables=["guests"],
                 mode="apply",
-                max_deletes=0,
                 run_id=owner_run_id,
                 chunk_size=1,
                 progress_table="globalcomix.table_sync_runs",
@@ -2813,7 +2804,6 @@ class Harness:
         try:
             owner, _log = self.start_repair(
                 tables=["guests"],
-                max_deletes=0,
                 run_id=owner_run_id,
                 chunk_size=1,
                 progress_table="globalcomix.table_sync_runs",
@@ -3543,7 +3533,6 @@ class Harness:
 
         result = self.run_repair(
             tables=["repair_accounts"],
-            max_deletes=0,
             run_id="least-privilege-progress",
             chunk_size=1,
             progress_table="cdc.table_sync_runs",
@@ -3581,7 +3570,6 @@ class Harness:
         )
         malformed = self.run_repair(
             tables=["repair_accounts"],
-            max_deletes=0,
             run_id="malformed-progress",
             chunk_size=1,
             progress_table="cdc.table_sync_runs",
@@ -3632,7 +3620,6 @@ class Harness:
 
         result = self.run_repair(
             tables=["repair_accounts"],
-            max_deletes=0,
             run_id="composite-primary-key",
             chunk_size=1,
             progress_table="cdc.table_sync_runs",
@@ -3713,8 +3700,6 @@ class Harness:
             "87308588",
             "--end-at",
             "87308589",
-            "--max-deletes",
-            "0",
         ])
         result = run(
             args,
@@ -3802,7 +3787,6 @@ class Harness:
             args.extend([
                 "--mode", "apply", "--chunk-size", "1",
                 "--start-after", "87308588", "--end-at", "87308589",
-                "--max-deletes", "0",
             ])
             result = run(
                 args,
@@ -3915,7 +3899,7 @@ class Harness:
             "globalcomix.table_sync_runs"
         )
         args.extend([
-            "--mode", "apply", "--chunk-size", "129", "--max-deletes", "0",
+            "--mode", "apply", "--chunk-size", "129",
         ])
         result = run(
             args,
@@ -4013,7 +3997,7 @@ class Harness:
                 self.admin_sql(self.target, "INSERT INTO repair_parents VALUES (1, 'keep'), (2, 'extra');")
                 self.admin_sql(self.target, "INSERT INTO repair_children VALUES (2, 2, 'extra');")
                 result = self.run_repair(
-                    tables=["repair_parents", "repair_children"], max_deletes=2, run_id="fk-delete-run"
+                    tables=["repair_parents", "repair_children"], run_id="fk-delete-run"
                 )
                 require_success(result, scenario)
                 parents = self.query(self.target, "SELECT id FROM repair_parents ORDER BY id;", user=TARGET_USER, password=TARGET_PASSWORD).strip()
@@ -4026,7 +4010,7 @@ class Harness:
             self.admin_sql(self.source, "INSERT INTO repair_parents VALUES (1, 'parent');")
             self.admin_sql(self.source, "INSERT INTO repair_children VALUES (1, 1, 'child');")
             result = self.run_repair(
-                tables=["repair_parents", "repair_children"], max_deletes=0, run_id="fk-insert-run"
+                tables=["repair_parents", "repair_children"], run_id="fk-insert-run"
             )
             require_success(result, scenario)
             rows = self.query(self.target, "SELECT p.id,c.parent_id FROM repair_parents p JOIN repair_children c ON c.parent_id=p.id;", user=TARGET_USER, password=TARGET_PASSWORD).strip()
@@ -4049,7 +4033,7 @@ class Harness:
                 )
             self.assert_foreign_keys_enabled()
             self.admin_sql(self.source, "INSERT INTO guests VALUES (1, 'source-guest');")
-            result = self.run_repair(tables=["guests"], max_deletes=0, run_id="fk-unrelated-cycle-run")
+            result = self.run_repair(tables=["guests"], run_id="fk-unrelated-cycle-run")
             require_success(result, scenario)
             guests = self.query(
                 self.target,
@@ -4083,7 +4067,7 @@ class Harness:
             self.assert_foreign_keys_enabled()
             self.admin_sql(self.source, "INSERT INTO guests VALUES (1, NULL);")
             result = self.run_repair(
-                tables=["guests"], max_deletes=0, run_id="fk-selected-dependency-cycle-run"
+                tables=["guests"], run_id="fk-selected-dependency-cycle-run"
             )
             output = f"{result.stdout}\n{result.stderr}".lower()
             if result.returncode == 0 or "cycle" not in output:
@@ -4111,7 +4095,7 @@ class Harness:
                 )
             self.assert_foreign_keys_enabled()
             result = self.run_repair(
-                tables=["repair_cycle_a", "repair_cycle_b"], max_deletes=0, run_id="fk-cycle-run"
+                tables=["repair_cycle_a", "repair_cycle_b"], run_id="fk-cycle-run"
             )
             output = f"{result.stdout}\n{result.stderr}".lower()
             if result.returncode == 0 or "cycle" not in output:
@@ -4123,7 +4107,7 @@ class Harness:
 
             self.admin_sql(self.target, "ALTER TABLE repair_cycle_b DROP FOREIGN KEY repair_cycle_b_a_fk;")
             mismatch = self.run_repair(
-                tables=["repair_cycle_a", "repair_cycle_b"], max_deletes=0, run_id="fk-schema-mismatch-run"
+                tables=["repair_cycle_a", "repair_cycle_b"], run_id="fk-schema-mismatch-run"
             )
             mismatch_output = f"{mismatch.stdout}\n{mismatch.stderr}".lower()
             if mismatch.returncode == 0 or "foreign-key inventory differs" not in mismatch_output:
@@ -4140,7 +4124,7 @@ class Harness:
             self.admin_sql(self.source, f"INSERT INTO repair_resume VALUES {values};")
             run_id = "repair-resume-run"
             process, log_path = self.start_repair(
-                tables=["repair_resume"], max_deletes=0, run_id=run_id, chunk_size=10
+                tables=["repair_resume"], run_id=run_id, chunk_size=10
             )
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
@@ -4169,13 +4153,13 @@ class Harness:
                 log.close()
 
             changed = self.run_repair(
-                tables=["repair_resume"], max_deletes=1, run_id=run_id, chunk_size=10
+                tables=["repair_resume"], run_id=run_id, chunk_size=10
             )
             changed_output = f"{changed.stdout}\n{changed.stderr}".lower()
             if changed.returncode == 0 or "immutable specification" not in changed_output:
                 raise HarnessError(f"{scenario} accepted a changed plan hash: {changed}")
             resumed = self.run_repair(
-                tables=["repair_resume"], max_deletes=0, run_id=run_id, chunk_size=10, timeout=240
+                tables=["repair_resume"], run_id=run_id, chunk_size=10, timeout=240
             )
             require_success(resumed, f"{scenario} resume")
             count = self.query(self.target, "SELECT COUNT(*) FROM repair_resume;", user=TARGET_USER, password=TARGET_PASSWORD).strip()
@@ -4222,30 +4206,8 @@ class Harness:
                 "INSERT INTO repair_delete_orders VALUES (20, 2, 'extra'); "
                 "INSERT INTO repair_delete_invoices VALUES (30, 2, 'extra');",
             )
-            limited = self.run_repair(
-                tables=["repair_delete_customers"],
-                max_deletes=2,
-                run_id="delete-only-descendants-limit",
-            )
-            limited_output = f"{limited.stdout}\n{limited.stderr}".lower()
-            if limited.returncode == 0 or "delete safety threshold exceeded" not in limited_output:
-                raise HarnessError(
-                    f"{scenario} did not preflight cumulative childward deletes: {limited}"
-                )
-            unchanged = self.query(
-                self.target,
-                "SELECT COUNT(*) FROM repair_delete_customers; "
-                "SELECT COUNT(*) FROM repair_delete_orders; "
-                "SELECT COUNT(*) FROM repair_delete_invoices;",
-                user=TARGET_USER,
-                password=TARGET_PASSWORD,
-            ).strip()
-            if unchanged != "2\n1\n1":
-                raise HarnessError(f"{scenario} mutated before cumulative preflight: {unchanged!r}")
-
             result = self.run_repair(
                 tables=["repair_delete_customers"],
-                max_deletes=3,
                 run_id="delete-only-descendants-success",
             )
             require_success(result, scenario)
@@ -4280,43 +4242,7 @@ class Harness:
             )
             return
 
-        if scenario == "global-delete-limit":
-            first_table = "repair_limit_a"
-            second_table = "repair_limit_b"
-            self.setup_repair_accounts(first_table)
-            self.setup_repair_accounts(second_table)
-            self.admin_sql(
-                self.target,
-                f"INSERT INTO {first_table} VALUES "
-                "(1, 'a-one@example.test', 'extra-one'), "
-                "(2, 'a-two@example.test', 'extra-two'), "
-                "(3, 'a-three@example.test', 'extra-three'); "
-                f"INSERT INTO {second_table} VALUES "
-                "(1, 'b-one@example.test', 'extra-one'), "
-                "(2, 'b-two@example.test', 'extra-two'), "
-                "(3, 'b-three@example.test', 'extra-three');",
-            )
-            result = self.run_repair(
-                tables=[first_table, second_table],
-                max_deletes=5,
-                run_id="global-delete-limit-run",
-            )
-            if result.returncode == 0:
-                raise HarnessError(f"{scenario} unexpectedly accepted six deletes with limit five")
-            remaining = self.query(
-                self.target,
-                f"SELECT COUNT(*) FROM {first_table}; SELECT COUNT(*) FROM {second_table};",
-                user=TARGET_USER,
-                password=TARGET_PASSWORD,
-            ).strip()
-            if remaining != "3\n3":
-                raise HarnessError(
-                    f"{scenario} mutated target before global delete preflight: {remaining!r}"
-                )
-            print(f"{scenario}_blocked total_extras=6 max_deletes=5 no_mutation=true")
-            return
-
-        if scenario == "bounded-delete":
+        if scenario == "selected-window-repair":
             self.setup_repair_accounts("repair_bounded")
             self.admin_sql(self.source, "INSERT INTO repair_bounded VALUES (1, 'one', 'source-one'), (2, 'two', 'source-two'), (3, 'three', 'source-three'), (4, 'four', 'source-four');")
             self.admin_sql(self.target, "INSERT INTO repair_bounded VALUES (1, 'one', 'target-one'), (2, 'two', 'target-two'), (3, 'three', 'target-three'), (4, 'four', 'outside-four'), (5, 'five', 'outside-extra');")
@@ -4332,7 +4258,7 @@ class Harness:
                 "'globalcomix','repair_bounded','update','[\\\"4\\\"]',NULL,NULL,1062,'outside selected window',1,1,1,'unresolved');",
             )
             result = self.run_repair(
-                tables=["repair_bounded"], max_deletes=0, run_id="bounded-repair-run", start_after=["1"], end_at=["3"]
+                tables=["repair_bounded"], run_id="bounded-repair-run", start_after=["1"], end_at=["3"]
             )
             require_success(result, scenario)
             rows = self.query(self.target, "SELECT id,payload FROM repair_bounded ORDER BY id;", user=TARGET_USER, password=TARGET_PASSWORD).strip()
@@ -4349,7 +4275,7 @@ class Harness:
             ).strip()
             if debt != "unresolved":
                 raise HarnessError(f"{scenario} resolved conflict outside selected PK window: {debt!r}")
-            print(f"{scenario}_converged window=(1,3] outside_rows_untouched=true conflict_outside_scope_unresolved=true max_deletes=0")
+            print(f"{scenario}_converged window=(1,3] outside_rows_untouched=true conflict_outside_scope_unresolved=true")
             return
 
         if scenario == "conflict-resolution-zero-debt":
@@ -4357,7 +4283,7 @@ class Harness:
             self.setup_repair_accounts(table)
             self.admin_sql(self.source, f"INSERT INTO {table} VALUES (1, 'duplicate@example.test', 'source-one'), (2, 'other@example.test', 'source-two');")
             self.admin_sql(self.target, f"INSERT INTO {table} VALUES (1, 'old@example.test', 'target-one'), (2, 'duplicate@example.test', 'target-owner');")
-            first = self.run_repair(tables=[table], max_deletes=0, run_id="conflict-secondary-run")
+            first = self.run_repair(tables=[table], run_id="conflict-secondary-run")
             first_output = f"{first.stdout}\n{first.stderr}".lower()
             if first.returncode == 0 or not any(
                 marker in first_output for marker in ("duplicate", "verification found", "mismatched rows")
@@ -4381,7 +4307,7 @@ class Harness:
                 f"'Duplicate entry duplicate@example.test for key uq_{table}_email',1,1,1,'unresolved');",
             )
             self.admin_sql(self.target, f"UPDATE {table} SET email='other@example.test',payload='source-two' WHERE id=2;")
-            second = self.run_repair(tables=[table], max_deletes=0, run_id="conflict-resolution-run")
+            second = self.run_repair(tables=[table], run_id="conflict-resolution-run")
             require_success(second, "conflict resolution")
             debt = self.query(
                 self.target,
@@ -4622,10 +4548,8 @@ class Harness:
             self.run_run_progress_least_privilege()
         elif scenario == "run-progress-composite-pk-rejected":
             self.run_run_progress_composite_pk_rejected()
-        elif scenario == "bounded-delete":
-            self.run_repair_scenario("bounded-delete")
-        elif scenario == "global-delete-limit":
-            self.run_repair_scenario("global-delete-limit")
+        elif scenario == "selected-window-repair":
+            self.run_repair_scenario("selected-window-repair")
         elif scenario == "delete-only-descendants":
             self.run_repair_scenario("delete-only-descendants")
         elif scenario == "conflict-resolution-zero-debt":

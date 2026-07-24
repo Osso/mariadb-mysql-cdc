@@ -25,16 +25,8 @@ pub(crate) fn build_fk_aware_repair_plan(
     target_identity: &str,
     source: &RepairInventory,
     target: &RepairInventory,
-    max_deletes: u64,
 ) -> Result<RepairPlan, RepairPlanError> {
-    build_repair_plan(
-        run_id,
-        source_identity,
-        target_identity,
-        source,
-        target,
-        max_deletes,
-    )
+    build_repair_plan(run_id, source_identity, target_identity, source, target)
 }
 
 pub(crate) fn order_table_names(
@@ -376,7 +368,6 @@ fn build_plan(
             source_delete: &source.delete,
             target_delete: &target.delete,
         },
-        config.max_deletes.unwrap_or(0),
     )
     .map_err(|error| RepairDriftError::Inventory(error.to_string()))
 }

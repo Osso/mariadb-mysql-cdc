@@ -155,17 +155,6 @@ fn rows_by_key(rows: &[SnapshotRow]) -> BTreeMap<Vec<String>, &SnapshotRow> {
         .collect()
 }
 
-pub(crate) fn count_extra_target_rows(
-    source_rows: &[SnapshotRow],
-    target_rows: &[SnapshotRow],
-) -> u64 {
-    let source_by_key = rows_by_key(source_rows);
-    rows_by_key(target_rows)
-        .keys()
-        .filter(|primary_key| !source_by_key.contains_key(*primary_key))
-        .count() as u64
-}
-
 fn apply_inserts(
     rows: &[&SnapshotRow],
     mode: SyncMode,

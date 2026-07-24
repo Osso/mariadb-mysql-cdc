@@ -58,7 +58,6 @@ fn execute_repair_drift(
     let drift = run_drift_check(config, tables.clone())?;
     let (repair_tables, skipped) =
         collect_repair_table_inputs(&plan.tables, &drift.comparisons, &source, &target);
-    preflight_repair_deletes(config, &run_id, &plan, &repair_tables)?;
     let repaired = run_repair_phases(config, &run_id, &plan, &repair_tables)?;
     Ok(RepairDriftReport {
         run_id,
@@ -170,38 +169,6 @@ pub(crate) fn build_drift_check_config(
     }
 }
 
-fn preflight_repair_deletes(
-    config: &RepairDriftConfig,
-    run_id: &str,
-    plan: &crate::repair_drift::RepairPlan,
-    repair_tables: &RepairTableInputs,
-) -> Result<(), RepairDriftError> {
-    if config.mode != SyncMode::Apply {
-        return Ok(());
-    }
-
-    let mut total_deletes = 0;
-    for table_name in &plan.delete_order {
-        let Some((_, _, table)) = repair_tables.get(table_name) else {
-            continue;
-        };
-        let phase_config = sync_config(
-            config,
-            table.clone(),
-            child_run_id(&format!("{run_id}-delete-preflight"), table_name),
-            &plan.plan_hash,
-        );
-        let extra_rows =
-            table_sync::read_table_extra_row_count(&phase_config).map_err(|error| {
-                RepairDriftError::Repair(format!("{table_name} DeleteExtras preflight: {error}"))
-            })?;
-        total_deletes += extra_rows;
-    }
-
-    table_sync::ensure_delete_allowed(total_deletes, config.max_deletes, config.mode)
-        .map_err(|error| RepairDriftError::Repair(format!("DeleteExtras preflight: {error}")))
-}
-
 fn run_repair_phases(
     config: &RepairDriftConfig,
     run_id: &str,
@@ -210,7 +177,6 @@ fn run_repair_phases(
 ) -> Result<Vec<RepairDriftTableReport>, RepairDriftError> {
     let mut conflict_store = initialize_conflict_store(config)?;
     let mut state = RepairState {
-        deleted_rows: 0,
         repaired_by_table: BTreeMap::new(),
         observed_verify_scopes: BTreeMap::new(),
     };
@@ -251,7 +217,6 @@ enum VerifyScope {
 }
 
 struct RepairState {
-    deleted_rows: u64,
     repaired_by_table: BTreeMap<String, RepairDriftTableReport>,
     observed_verify_scopes: BTreeMap<String, VerifyScope>,
 }
@@ -366,7 +331,6 @@ fn phase_config_for_request(
         table,
         request.run_id,
         request.table_name,
-        request.run.state.deleted_rows,
     )
 }
 
@@ -399,12 +363,9 @@ fn build_phase_config(
     table: &SyncTable,
     run_id: &str,
     table_name: &str,
-    deleted_rows: u64,
 ) -> SyncTableConfig {
     let phase_run_id = child_run_id(&format!("{}-{}", run_id, phase_name(phase)), table_name);
-    let mut phase_config = sync_config(config, table.clone(), phase_run_id, &plan.plan_hash);
-    phase_config.max_deletes = phase_max_deletes(config, phase, deleted_rows);
-    phase_config
+    sync_config(config, table.clone(), phase_run_id, &plan.plan_hash)
 }
 
 struct RecordPhaseContext<'a> {
@@ -425,7 +386,6 @@ fn record_phase(
     context: RecordPhaseContext<'_>,
     input: RecordPhaseInput,
 ) -> Result<(), RepairDriftError> {
-    context.run.state.deleted_rows += input.phase_report.extra_target_rows;
     observe_verify_scope(
         &mut context.run.state.observed_verify_scopes,
         context.phase,
@@ -494,23 +454,9 @@ pub(crate) fn sync_config(
         run_id,
         start_after: config.start_after.clone(),
         end_at: config.end_at.clone(),
-        max_deletes: config.max_deletes,
         updated_since: None,
         plan_hash: Some(plan_hash.to_string()),
     }
-}
-
-fn phase_max_deletes(
-    config: &RepairDriftConfig,
-    phase: SyncPhase,
-    deleted_rows: u64,
-) -> Option<u64> {
-    if phase == SyncPhase::DeleteExtras {
-        return config
-            .max_deletes
-            .map(|limit| limit.saturating_sub(deleted_rows));
-    }
-    Some(0)
 }
 
 fn resolve_verified_conflicts(
@@ -750,7 +696,6 @@ mod tests {
             delete_order: vec!["orders".to_string(), "customers".to_string()],
             insert_order: vec!["customers".to_string()],
             update_order: vec!["customers".to_string()],
-            max_deletes: 0,
         };
 
         let phases = repair_phases(&plan);

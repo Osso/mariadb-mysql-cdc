@@ -18,11 +18,10 @@ are resolved only after verified equality. The current table-sync recovery contr
       and missing-primary-key modes do not use `INSERT IGNORE`; `--updated-since`
       remains the explicit upsert path. Batch success is not inferred from the
       planned insert count.
-- [x] Require explicit `--max-deletes` for apply-mode orphan deletion. For each
-      repair chunk, count that chunk's target extras, enforce the cumulative delete
-      ceiling before mutation, apply the chunk, verify its writes, and persist its
-      cursor and counters. An interrupted run resumes from the next uncommitted
-      chunk; no global full-table delete preflight occurs.
+- [x] Reconcile apply-mode orphan rows chunk by chunk. Apply each repair chunk,
+      verify target writes and deletions exactly, and persist its cursor and
+      counters only after verification. An interrupted run resumes from the next
+      uncommitted chunk; no global full-table delete preflight occurs.
 - [x] Require `--run-id`; direct `sync-table` resumes only the exact interrupted
       run and rejects a completed ID. Apply-mode `repair-drift` InsertMissing may
       atomically claim one specification-identical failed missing-PK run within

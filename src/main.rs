@@ -122,7 +122,6 @@ Sync table options:
   --end-at CSV                    Primary-key upper bound for targeted sync-table repair.
   --start-after-json JSON         Primary-key lower bound as JSON string array; use for values containing commas.
   --end-at-json JSON              Primary-key upper bound as JSON string array; use for values containing commas.
-  --max-deletes COUNT             Maximum target orphan deletes allowed in sync-table apply mode. Defaults to 0.
   --updated-at-column COLUMN      Source update timestamp column for update_time accelerator.
   --updated-since VALUE           Upsert source rows where updated-at column is >= VALUE. Does not delete orphans; run checksum validation after.
 
@@ -135,7 +134,6 @@ Sync progress repair-run options:
   --throttle-ms MS                Sleep after each copied chunk. Defaults to 0.
 
 Sync catalog options:
-  --max-deletes COUNT             Required bounded target orphan deletes per table.
   --run-id-prefix PREFIX          Fresh immutable identity namespace for this catalog attempt.
 
 Drift check options:
@@ -154,7 +152,6 @@ Repair drift options:
   --end-at-json JSON               Upper primary-key bound as a JSON string array.
   --content-check BOOL             Run bounded content checks when counts match. Defaults to true.
   --mode MODE                     dry-run (default) or apply.
-  --max-deletes COUNT             Required explicitly in apply mode; bounds target orphan deletes.
   --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
   --run-id ID                     Reuse an interrupted repair run; plan hash must match.
   --run-id-prefix PREFIX          Prefix for the fresh run-scoped repair ID.

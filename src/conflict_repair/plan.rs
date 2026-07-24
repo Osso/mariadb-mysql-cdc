@@ -17,7 +17,6 @@ pub fn build_repair_plan(
     target_identity: &str,
     source: &RepairInventory,
     target: &RepairInventory,
-    max_deletes: u64,
 ) -> Result<RepairPlan, RepairPlanError> {
     build_repair_plan_with_directional_scopes(
         run_id,
@@ -29,7 +28,6 @@ pub fn build_repair_plan(
             source_delete: source,
             target_delete: target,
         },
-        max_deletes,
     )
 }
 
@@ -38,7 +36,6 @@ pub(crate) fn build_repair_plan_with_directional_scopes(
     source_identity: &str,
     target_identity: &str,
     inventories: DirectionalRepairInventories<'_>,
-    max_deletes: u64,
 ) -> Result<RepairPlan, RepairPlanError> {
     validate_inventory_match(
         inventories.source_insert_update,
@@ -56,13 +53,8 @@ pub(crate) fn build_repair_plan_with_directional_scopes(
         &inventories.source_delete.foreign_keys,
     )?);
     let tables = merged_tables(&insert_order, &delete_order);
-    let (inventory_hash, plan_hash) = build_directional_plan_hashes(
-        run_id,
-        source_identity,
-        target_identity,
-        inventories,
-        max_deletes,
-    );
+    let (inventory_hash, plan_hash) =
+        build_directional_plan_hashes(run_id, source_identity, target_identity, inventories);
     Ok(assemble_repair_plan(RepairPlanAssemblyInput {
         run_id: run_id.to_string(),
         source_identity: source_identity.to_string(),
@@ -72,7 +64,6 @@ pub(crate) fn build_repair_plan_with_directional_scopes(
         tables,
         insert_order: insert_order.clone(),
         delete_order,
-        max_deletes,
     }))
 }
 
@@ -81,7 +72,6 @@ fn build_directional_plan_hashes(
     source_identity: &str,
     target_identity: &str,
     inventories: DirectionalRepairInventories<'_>,
-    max_deletes: u64,
 ) -> (String, String) {
     let inventory_hash = stable_hash(&(
         inventories.source_insert_update,
@@ -89,13 +79,7 @@ fn build_directional_plan_hashes(
         inventories.source_delete,
         inventories.target_delete,
     ));
-    let plan_hash = stable_hash(&(
-        run_id,
-        source_identity,
-        target_identity,
-        &inventory_hash,
-        max_deletes,
-    ));
+    let plan_hash = stable_hash(&(run_id, source_identity, target_identity, &inventory_hash));
     (inventory_hash, plan_hash)
 }
 
@@ -108,7 +92,6 @@ struct RepairPlanAssemblyInput {
     tables: Vec<String>,
     insert_order: Vec<String>,
     delete_order: Vec<String>,
-    max_deletes: u64,
 }
 
 fn assemble_repair_plan(input: RepairPlanAssemblyInput) -> RepairPlan {
@@ -122,7 +105,6 @@ fn assemble_repair_plan(input: RepairPlanAssemblyInput) -> RepairPlan {
         delete_order: input.delete_order,
         insert_order: input.insert_order.clone(),
         update_order: input.insert_order,
-        max_deletes: input.max_deletes,
     }
 }
 
@@ -504,48 +486,18 @@ where
 }
 
 fn run_repair_preflight<S, E>(
-    plan: &RepairPlan,
-    input: &RepairInput,
+    _plan: &RepairPlan,
+    _input: &RepairInput,
     state: &mut RepairRunState,
     store: &mut S,
-    executor: &mut E,
+    _executor: &mut E,
 ) -> Result<(), String>
 where
     S: RepairProgressStore,
     E: RepairExecutor,
 {
-    let extra_count = count_extra_rows(plan, input, executor);
-    ensure_delete_limit(plan.max_deletes, extra_count)?;
     state.phase = RepairPhase::DeleteExtras;
     store.save(state)
-}
-
-fn count_extra_rows<E: RepairExecutor>(
-    plan: &RepairPlan,
-    input: &RepairInput,
-    executor: &E,
-) -> usize {
-    plan.tables
-        .iter()
-        .map(|table| {
-            let source = input
-                .source_rows
-                .get(table)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            extra_rows(source, &executor.target_rows(table)).len()
-        })
-        .sum()
-}
-
-fn ensure_delete_limit(max_deletes: u64, extra_count: usize) -> Result<(), String> {
-    if extra_count > max_deletes as usize {
-        Err(format!(
-            "delete safety threshold exceeded: max_deletes={max_deletes}"
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 fn build_delete_operations(

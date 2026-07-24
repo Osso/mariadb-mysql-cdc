@@ -138,7 +138,7 @@ Deployment remains blocked pending real-MySQL/live proof, exact grant/bootstrap
 review, bounded repair convergence, and ops rollout gates. Ops proof still needs
 fresh immutable image tags, suspended repair/catchup rollout review, replacement
 or justification of privileged catchup credentials, unique recurring run IDs,
-bounded delete evidence, FK-safe ordering, CA/config-map verification, journal
+exact chunk verification, FK-safe ordering, CA/config-map verification, journal
 arguments, and single-writer `GET_LOCK` proof. No ops or deployment action is
 part of this worktree. The legacy `probe` text-binlog path is not a supported
 health check.
@@ -302,13 +302,11 @@ specification before it is treated as terminal. Reservation sessions set MySQL `
 provide recovery from network disconnects. Children start only after all listed FK parents complete. Missing
 dependencies are rejected before workers start; owned failures return after owned
 work settles, and dependency cycles fail closed without waiting for unrelated
-external syncs. Catalog children apply every target orphan deletion planned by
-catalog comparison; `sync-catalog` has no `max_deletes` limit or delete-safety
-gate because the catalog-planned orphan set bounds deletion. This contract is
-specific to `sync-catalog`: direct `sync-table` apply mode and `repair-drift`
-apply mode retain explicit bounded `--max-deletes` allowances. The non-syncable
-catalog is classification/operator input only; full-dump execution is out of
-scope.
+external syncs. Catalog children reconcile every target-only row planned by
+catalog comparison in dependency-safe chunks, verify each deletion, and persist
+progress only after verification. The same unconditional chunk reconciliation
+applies to direct `sync-table` and `repair-drift`; the non-syncable catalog is
+classification/operator input only; full-dump execution is out of scope.
 
 ```bash
 cargo run -- catchup-snapshot \
@@ -388,8 +386,8 @@ full immutable specification matches the current insert phase. The claim uses a
 per-transaction `REPEATABLE READ` transaction with `FOR UPDATE` candidate
 locking; ambiguity fails closed. `repair-drift` otherwise creates a fresh
 orchestration ID, derives FK-safe phase order, and accepts bounded
-`--start-after`/`--end-at` windows. Apply mode requires an explicit
-`--max-deletes` allowance.
+`--start-after`/`--end-at` windows. Each completed chunk is verified before
+its cursor and counters are persisted.
 
 `--stop-position` is an inclusive event-end boundary: the event whose
 `end_log_pos` equals the requested position is applied and durably checkpointed,

@@ -127,7 +127,7 @@ fn duplicate_classification_distinguishes_primary_secondary_and_malformed() {
 fn planner_deletes_child_before_parent_and_inserts_parent_before_child() {
     let inventory = repair_inventory(&["parents", "children"], &[fk("children", "parents")]);
     let plan =
-        build_repair_plan("run-1", "source", "target", &inventory, &inventory, 10).expect("plan");
+        build_repair_plan("run-1", "source", "target", &inventory, &inventory).expect("plan");
     assert_eq!(plan.insert_order, vec!["parents", "children"]);
     assert_eq!(plan.delete_order, vec!["children", "parents"]);
 }
@@ -135,34 +135,16 @@ fn planner_deletes_child_before_parent_and_inserts_parent_before_child() {
 #[test]
 fn cycle_blocks_before_any_mutation() {
     let inventory = repair_inventory(&["a", "b"], &[fk("a", "b"), fk("b", "a")]);
-    let error = build_repair_plan("run-cycle", "source", "target", &inventory, &inventory, 10)
+    let error = build_repair_plan("run-cycle", "source", "target", &inventory, &inventory)
         .expect_err("cycle must block");
     assert!(matches!(error, RepairPlanError::Cycle(_)));
 }
 
 #[test]
-fn delete_ceiling_preflight_performs_zero_mutations() {
-    let inventory = repair_inventory(&["accounts"], &[]);
-    let plan = build_repair_plan("run-limit", "source", "target", &inventory, &inventory, 0)
-        .expect("plan");
-    let input = RepairInput {
-        source_rows: rows(&[("accounts", "1", "new")]),
-        target_rows: rows(&[("accounts", "1", "new"), ("accounts", "2", "extra")]),
-    };
-    let mut store = InMemoryRepairProgressStore::default();
-    let mut target = InMemoryRepairExecutor::from_rows(input.target_rows.clone());
-    let mut conflicts = InMemoryConflictStore::default();
-    let error = run_phased_repair(&plan, &input, &mut store, &mut target, &mut conflicts)
-        .expect_err("ceiling");
-    assert!(error.contains("delete safety threshold"));
-    assert!(target.operations.is_empty());
-}
-
-#[test]
 fn interrupted_phase_resumes_exact_plan_without_repeating_completed_deletes() {
     let inventory = repair_inventory(&["accounts"], &[]);
-    let plan = build_repair_plan("run-resume", "source", "target", &inventory, &inventory, 2)
-        .expect("plan");
+    let plan =
+        build_repair_plan("run-resume", "source", "target", &inventory, &inventory).expect("plan");
     let input = RepairInput {
         source_rows: rows(&[("accounts", "1", "one")]),
         target_rows: rows(&[
@@ -577,9 +559,9 @@ fn fresh_second_run_converges_and_only_then_resolves_conflict() {
 
 fn two_repair_plans() -> (RepairPlan, RepairPlan) {
     let inventory = repair_inventory(&["accounts"], &[]);
-    let first = build_repair_plan("run-first", "source", "target", &inventory, &inventory, 1)
+    let first = build_repair_plan("run-first", "source", "target", &inventory, &inventory)
         .expect("first plan");
-    let second = build_repair_plan("run-second", "source", "target", &inventory, &inventory, 1)
+    let second = build_repair_plan("run-second", "source", "target", &inventory, &inventory)
         .expect("second plan");
     (first, second)
 }

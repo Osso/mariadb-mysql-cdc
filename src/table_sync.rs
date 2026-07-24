@@ -40,14 +40,12 @@ pub(crate) use progress::{SyncRunSelectionStore, select_compatible_failed_run};
 pub(crate) use range::build_run_spec_json;
 pub(crate) use range::{
     RangeSyncRequest, complete_sync_progress, finish_sync_run, persist_sync_run_error,
-    read_table_extra_row_count, release_on_load_error,
-    sync_table_with_progress_range_phase_with_run_spec, validate_resumable_progress,
+    release_on_load_error, sync_table_with_progress_range_phase_with_run_spec,
+    validate_resumable_progress,
 };
 #[cfg(test)]
 pub(crate) use recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
-pub(crate) use repair::{
-    apply_recent_update_chunk, count_extra_target_rows, ensure_delete_allowed, repair_chunk,
-};
+pub(crate) use repair::{apply_recent_update_chunk, repair_chunk};
 #[cfg(test)]
 pub(crate) use run::{
     ExactParentReader, build_sync_run_scope, reconcile_exact_parent, retry_sync_table_operation,

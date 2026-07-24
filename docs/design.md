@@ -103,7 +103,7 @@ that path.
 Startup validates the admin-bootstrap schema, guards, constraints, and exact
 table/application grants before opening the source stream; runtime never creates
 the table. `repair-drift` now invokes FK-aware
-phases with immutable child runs, cycle/schema blocking, explicit delete ceilings,
+phases with immutable child runs, cycle/schema blocking, exact chunk verification,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
 conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 44 executable scenarios,
 including catchup, repair, conflict, DDL, and reconnect boundaries, plus a real
