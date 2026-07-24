@@ -220,7 +220,15 @@ fn reconcile_missing_parent_live(
     config: &crate::live::ApplyBinlogConfig,
     request: &crate::live::MissingParentRecovery,
 ) -> Result<(), TableSyncError> {
-    let parent = read_parent_table_inventory(config, request)?;
+    let source = crate::mysql_snapshot::MySqlConnectionConfig {
+        host: config.source.host.clone(),
+        port: config.source.port,
+        user: config.source.user.clone(),
+        password: config.source.password.clone(),
+        database: request.parent_schema.clone(),
+    };
+    let parent =
+        read_parent_table_inventory(&source, &request.parent_schema, &request.parent_table)?;
     let (source, target) = build_sessions_guest_recovery_readers(config)?;
     let sync_config = missing_parent_sync_config(config, request, &parent);
     let mut repair_target = connect_mysql_recovery_target(&sync_config)?;
@@ -229,39 +237,90 @@ fn reconcile_missing_parent_live(
 
 /// Reads the parent's columns and primary key from the source schema inventory, because a generic
 /// parent table cannot have them enumerated in code.
-fn read_parent_table_inventory(
-    config: &crate::live::ApplyBinlogConfig,
-    request: &crate::live::MissingParentRecovery,
+pub(crate) fn read_parent_table_inventory(
+    source: &crate::mysql_snapshot::MySqlConnectionConfig,
+    schema: &str,
+    table: &str,
 ) -> Result<crate::inventory::TableInventory, TableSyncError> {
     let reader = MariaDbInventoryReader::new(InventoryConfig {
-        host: config.source.host.clone(),
-        port: config.source.port,
-        user: config.source.user.clone(),
-        password: config.source.password.clone(),
+        host: source.host.clone(),
+        port: source.port,
+        user: source.user.clone(),
+        password: source.password.clone(),
         endpoint_role: InventoryEndpointRole::Source,
         use_tls: false,
         tls_ca_file: None,
         ..InventoryConfig::default()
     });
-    let inventory = build_inventory(&request.parent_schema, &reader)
+    let inventory = build_inventory(schema, &reader)
         .map_err(|error| TableSyncError::Read(error.to_string()))?;
     let parent = inventory
         .tables
         .into_iter()
-        .find(|table| table.name == request.parent_table)
+        .find(|candidate| candidate.name == table)
         .ok_or_else(|| {
             TableSyncError::Repair(format!(
-                "missing parent recovery parent table `{}`.`{}` is absent from the source inventory",
-                request.parent_schema, request.parent_table
+                "parent table `{schema}`.`{table}` is absent from the source inventory"
             ))
         })?;
     if parent.primary_key.is_empty() {
         return Err(TableSyncError::Repair(format!(
-            "missing parent recovery parent table `{}`.`{}` has no primary key",
-            request.parent_schema, request.parent_table
+            "parent table `{schema}`.`{table}` has no primary key"
         )));
     }
     Ok(parent)
+}
+
+/// Reads the one source parent row owning a referenced foreign-key identity, for in-transaction
+/// recovery of an absent parent.
+///
+/// The target side is not consulted: the caller has already proved under lock that the identity is
+/// absent there. Everything else stays the planner's decision, so an ambiguous or incomplete source
+/// parent still fails closed.
+pub(crate) fn read_exact_source_parent_row(
+    source: &crate::mysql_snapshot::MySqlConnectionConfig,
+    violation: &crate::live::ForeignKeyViolation,
+    child_foreign_key_values: &[Option<String>],
+) -> Result<
+    (
+        crate::inventory::TableInventory,
+        crate::snapshot::SnapshotRow,
+    ),
+    TableSyncError,
+> {
+    let schema = violation
+        .parent_schema
+        .clone()
+        .unwrap_or_else(|| violation.child_schema.clone());
+    let parent = read_parent_table_inventory(source, &schema, &violation.parent_table)?;
+    let reader = MySqlSyncReader::new(crate::mysql_snapshot::MySqlConnectionConfig {
+        database: schema.clone(),
+        ..source.clone()
+    })
+    .with_recovery_utc();
+    let source_rows = reader.read_parent_identity_rows(
+        &parent,
+        &violation.parent_columns,
+        child_foreign_key_values,
+    )?;
+    let plan = crate::live::plan_missing_parent_recovery(&crate::live::MissingParentInput {
+        violation,
+        child_foreign_key_values,
+        source_parent_rows: &source_rows,
+        target_parent_rows: &[],
+    })
+    .map_err(|rejection| {
+        TableSyncError::Repair(format!(
+            "missing parent recovery rejected for constraint {}: {rejection}",
+            violation.constraint
+        ))
+    })?;
+    match plan {
+        crate::live::MissingParentPlan::InsertParent(row) => Ok((parent, row)),
+        crate::live::MissingParentPlan::AlreadyReconciled => Err(TableSyncError::Repair(
+            "locked parent was absent but the planner reported it reconciled".to_string(),
+        )),
+    }
 }
 
 fn missing_parent_sync_config(

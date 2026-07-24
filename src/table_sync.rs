@@ -53,6 +53,7 @@ pub(crate) use run::{
     retry_sync_table_operation, should_record_terminal_sync_run_error,
 };
 pub(crate) use run::{
-    expected_sync_run_spec_json, find_compatible_failed_run, reconcile_exact_parent_live,
-    run_sync_table_phase_with_run_spec, should_record_sync_run_error,
+    expected_sync_run_spec_json, find_compatible_failed_run, read_exact_source_parent_row,
+    read_parent_table_inventory, reconcile_exact_parent_live, run_sync_table_phase_with_run_spec,
+    should_record_sync_run_error,
 };

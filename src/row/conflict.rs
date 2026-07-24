@@ -170,7 +170,8 @@ fn record_skipped_conflict(
     let Some(context) = context else {
         return Ok(());
     };
-    let deferred = is_deferred_superseded_insert(table, operation, change, &conflict);
+    let deferred = is_deferred_superseded_insert(table, operation, change, &conflict)
+        || is_deferred_foreign_key_conflict(table, operation, change, &conflict);
     let observation =
         skipped_conflict_observation(context, coordinate, table, operation, change, conflict);
     if deferred {
@@ -231,7 +232,6 @@ fn skipped_conflict_observation(
             timestamp: context.child_event_timestamp,
         },
         table,
-        operation,
         change,
         &conflict,
     );
@@ -274,7 +274,6 @@ const MISSING_PARENT_FK_ERROR_CODE: u16 = 1452;
 fn build_exact_parent_recovery(
     position: ChildEventPosition<'_>,
     table: &RowTableMap,
-    operation: RowOperation,
     change: &TargetRowChange,
     conflict: &crate::target::DuplicateConflict,
 ) -> Option<crate::live::ExactParentRecovery> {
@@ -316,83 +315,34 @@ fn build_exact_parent_recovery(
             },
         ));
     }
-    // A deferred conflict belongs to superseded-parent verification, which resolves it inside the
-    // transaction. Claiming it here as a missing parent would attach a recovery request to a failed
-    // verification, and that retries without consuming the transport budget instead of stalling.
-    if is_deferred_superseded_insert(table, operation, change, conflict) {
-        return None;
-    }
-    build_missing_parent_recovery(position, table, change, conflict)
-        .map(crate::live::ExactParentRecovery::MissingParent)
+    // Every other foreign-key conflict is resolved inside the applying transaction, under the
+    // parent row lock, so it must not also carry an out-of-transaction recovery request.
+    None
 }
 
-/// Builds a recovery request for any other `1452` from the identity MySQL names in the error.
+/// Whether this conflict is resolved in-transaction from the locked parent image.
 ///
-/// Every unproven case yields `None`, which keeps the ordinary durable-abort path.
-fn build_missing_parent_recovery(
-    position: ChildEventPosition<'_>,
+/// The two pinned constraints above keep their proven out-of-transaction recovery, and a deferred
+/// superseded insert keeps its own verification, so neither reaches this path.
+fn is_deferred_foreign_key_conflict(
     table: &RowTableMap,
+    operation: RowOperation,
     change: &TargetRowChange,
     conflict: &crate::target::DuplicateConflict,
-) -> Option<crate::live::MissingParentRecovery> {
+) -> bool {
     if conflict.error_code != MISSING_PARENT_FK_ERROR_CODE {
-        return None;
+        return false;
     }
-    let crate::live::ForeignKeyViolation {
-        child_schema,
-        child_table,
-        constraint,
-        child_columns,
-        parent_schema,
-        parent_table,
-        parent_columns,
-    } = crate::live::parse_foreign_key_violation(&conflict.error_text)?;
-    // The error must describe the table being applied, or the values read below are another table's.
-    if child_schema != table.schema || child_table != table.table {
-        return None;
+    if is_exact_sessions_guest_conflict(table, conflict)
+        || is_exact_home_feed_card_conflict(table, conflict)
+        || is_deferred_superseded_insert(table, operation, change, conflict)
+    {
+        return false;
     }
-    let child_foreign_key_values = child_foreign_key_values(change, &child_columns)?;
-    Some(crate::live::MissingParentRecovery {
-        source_file: position.coordinate.file.clone(),
-        source_start_position: position.coordinate.position,
-        source_end_position: position.end_position,
-        child_event_timestamp: position.timestamp,
-        schema: table.schema.clone(),
-        table: table.table.clone(),
-        constraint,
-        child_primary_key: change
-            .primary_key_values
-            .iter()
-            .map(value_to_conflict_key)
-            .collect(),
-        child_columns,
-        child_foreign_key_values,
-        parent_schema: parent_schema.unwrap_or(child_schema),
-        parent_table,
-        parent_columns,
+    // The error must name the table being applied, or the child image read later is another table's.
+    crate::live::parse_foreign_key_violation(&conflict.error_text).is_some_and(|violation| {
+        violation.child_schema == table.schema && violation.child_table == table.table
     })
-}
-
-/// Reads the child's foreign-key values from the source image, keeping SQL NULL distinct from the
-/// literal `"NULL"` that `value_to_conflict_key` produces. Yields `None` when the image does not
-/// carry a referenced column, since the parent identity is then unknown.
-fn child_foreign_key_values(
-    change: &TargetRowChange,
-    columns: &[String],
-) -> Option<Vec<Option<String>>> {
-    columns
-        .iter()
-        .map(|column| {
-            let index = change
-                .writable_columns
-                .iter()
-                .position(|candidate| candidate == column)?;
-            match change.source_values.get(index)? {
-                Value::NULL => Some(None),
-                value => Some(Some(value_to_conflict_key(value))),
-            }
-        })
-        .collect()
 }
 
 fn is_exact_sessions_guest_conflict(
@@ -539,7 +489,7 @@ pub(crate) fn record_duplicate_conflict<C: ConflictStore>(
 mod tests {
     use super::{
         ChildEventPosition, RowOperation, RowTableMap, build_exact_parent_recovery,
-        build_missing_parent_recovery, is_exact_releases_category_constraint_error,
+        is_deferred_foreign_key_conflict, is_exact_releases_category_constraint_error,
         is_exact_sessions_guest_constraint_error,
     };
     use crate::probe::BinlogCoordinate;
@@ -553,8 +503,13 @@ mod tests {
          CONSTRAINT `fk_paid_subscriptions_users_pages_session_id` FOREIGN KEY (`session_id`) \
          REFERENCES `sessions` (`session_id`)) }";
 
-    const CHILD_EVENT_TIMESTAMP: u64 = 1_753_300_000;
-    const CHILD_END_POSITION: u64 = 1_024_916_500;
+    const RELEASES_CATEGORY_ERROR: &str = "Cannot add or update a child row: a foreign key constraint fails \
+         (`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_2` FOREIGN KEY (`comic_id`, \
+         `comic_category_id`) REFERENCES `comics` (`id`, `section_id`))";
+
+    const SESSIONS_GUEST_ERROR: &str = "Cannot add or update a child row: a foreign key constraint fails \
+         (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, \
+         `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))";
 
     fn coordinate() -> BinlogCoordinate {
         BinlogCoordinate {
@@ -566,8 +521,8 @@ mod tests {
     fn child_event_position(coordinate: &BinlogCoordinate) -> ChildEventPosition<'_> {
         ChildEventPosition {
             coordinate,
-            end_position: CHILD_END_POSITION,
-            timestamp: CHILD_EVENT_TIMESTAMP,
+            end_position: 1_024_916_500,
+            timestamp: 1_753_300_000,
         }
     }
 
@@ -612,173 +567,74 @@ mod tests {
         }
     }
 
-    #[test]
-    fn builds_generic_recovery_for_the_paid_subscriptions_session_constraint() {
-        let coordinate = coordinate();
-        let table = table_map(
-            "globalcomix",
-            "paid_subscriptions_users_pages",
-            &["id", "session_id"],
-        );
-        let change = insert_change(&[
-            ("id", Value::Int(7)),
-            ("session_id", Value::Bytes(b"abc123".to_vec())),
-        ]);
-
-        let recovery = build_missing_parent_recovery(
-            child_event_position(&coordinate),
-            &table,
-            &change,
-            &foreign_key_conflict(PAID_SUBSCRIPTIONS_SESSION_ERROR),
+    fn session_child() -> (RowTableMap, TargetRowChange) {
+        (
+            table_map(
+                "globalcomix",
+                "paid_subscriptions_users_pages",
+                &["id", "session_id"],
+            ),
+            insert_change(&[
+                ("id", Value::Int(7)),
+                ("session_id", Value::Bytes(b"abc123".to_vec())),
+            ]),
         )
-        .expect("generic missing parent recovery");
+    }
 
-        assert_eq!(
-            recovery,
-            crate::live::MissingParentRecovery {
-                source_file: "mysqld-bin.002710".to_string(),
-                source_start_position: 1_024_916_259,
-                source_end_position: CHILD_END_POSITION,
-                child_event_timestamp: CHILD_EVENT_TIMESTAMP,
-                schema: "globalcomix".to_string(),
-                table: "paid_subscriptions_users_pages".to_string(),
-                constraint: "fk_paid_subscriptions_users_pages_session_id".to_string(),
-                child_primary_key: vec!["7".to_string()],
-                child_columns: vec!["session_id".to_string()],
-                child_foreign_key_values: vec![Some("abc123".to_string())],
-                parent_schema: "globalcomix".to_string(),
-                parent_table: "sessions".to_string(),
-                parent_columns: vec!["session_id".to_string()],
-            }
+    /// An unenumerated constraint is now resolved in-transaction, so it defers and carries no
+    /// out-of-transaction recovery request.
+    #[test]
+    fn defers_an_unenumerated_foreign_key_constraint() {
+        let (table, change) = session_child();
+        let conflict = foreign_key_conflict(PAID_SUBSCRIPTIONS_SESSION_ERROR);
+        let coordinate = coordinate();
+
+        assert!(is_deferred_foreign_key_conflict(
+            &table,
+            RowOperation::Insert,
+            &change,
+            &conflict
+        ));
+        assert!(
+            build_exact_parent_recovery(
+                child_event_position(&coordinate),
+                &table,
+                &change,
+                &conflict
+            )
+            .is_none(),
+            "in-transaction resolution must not also request reconnect recovery"
         );
     }
 
-    /// The image order does not have to match the order MySQL named the columns, and the planner
-    /// aligns values with `parent_columns` positionally, so the order must come from the error.
+    /// An update can violate a foreign key too, so deferral is not limited to inserts.
     #[test]
-    fn orders_multi_column_values_by_the_error_not_the_image() {
-        let coordinate = coordinate();
-        let table = table_map("globalcomix", "comics", &["id", "artist_name", "artist_id"]);
-        let change = insert_change(&[
-            ("id", Value::Int(7)),
-            ("artist_name", Value::Bytes(b"Ada".to_vec())),
-            ("artist_id", Value::Int(42)),
-        ]);
-        let error = "Cannot add or update a child row: a foreign key constraint fails \
-                     (`globalcomix`.`comics`, CONSTRAINT `comics_ibfk_5` FOREIGN KEY \
-                     (`artist_id`, `artist_name`) REFERENCES `artists` (`id`, `name`) ON DELETE \
-                     RESTRICT ON UPDATE CASCADE)";
+    fn defers_a_foreign_key_conflict_raised_by_an_update() {
+        let (table, change) = session_child();
 
-        let recovery = build_missing_parent_recovery(
-            child_event_position(&coordinate),
+        assert!(is_deferred_foreign_key_conflict(
             &table,
+            RowOperation::Update,
             &change,
-            &foreign_key_conflict(error),
-        )
-        .expect("generic missing parent recovery");
-
-        assert_eq!(
-            recovery.child_columns,
-            vec!["artist_id".to_string(), "artist_name".to_string()]
-        );
-        assert_eq!(
-            recovery.child_foreign_key_values,
-            vec![Some("42".to_string()), Some("Ada".to_string())]
-        );
-        assert_eq!(
-            recovery.parent_columns,
-            vec!["id".to_string(), "name".to_string()]
-        );
-    }
-
-    /// `value_to_conflict_key` renders NULL as the literal `"NULL"`, which would look like a real
-    /// value to the planner. Detection must keep it distinguishable so the planner can reject it.
-    #[test]
-    fn keeps_a_null_foreign_key_value_distinct_from_the_literal_null() {
-        let coordinate = coordinate();
-        let table = table_map(
-            "globalcomix",
-            "paid_subscriptions_users_pages",
-            &["id", "session_id"],
-        );
-        let change = insert_change(&[("id", Value::Int(7)), ("session_id", Value::NULL)]);
-
-        let recovery = build_missing_parent_recovery(
-            child_event_position(&coordinate),
-            &table,
-            &change,
-            &foreign_key_conflict(PAID_SUBSCRIPTIONS_SESSION_ERROR),
-        )
-        .expect("generic missing parent recovery");
-
-        assert_eq!(recovery.child_foreign_key_values, vec![None]);
+            &foreign_key_conflict(PAID_SUBSCRIPTIONS_SESSION_ERROR)
+        ));
     }
 
     #[test]
-    fn resolves_a_qualified_parent_schema_from_the_error() {
-        let coordinate = coordinate();
-        let table = table_map("globalcomix", "orders", &["id", "user_id"]);
-        let change = insert_change(&[("id", Value::Int(7)), ("user_id", Value::Int(3))]);
-        let error = "Cannot add or update a child row: a foreign key constraint fails \
-                     (`globalcomix`.`orders`, CONSTRAINT `orders_ibfk_1` FOREIGN KEY (`user_id`) \
-                     REFERENCES `other`.`users` (`id`))";
-
-        let recovery = build_missing_parent_recovery(
-            child_event_position(&coordinate),
-            &table,
-            &change,
-            &foreign_key_conflict(error),
-        )
-        .expect("generic missing parent recovery");
-
-        assert_eq!(recovery.parent_schema, "other");
-        assert_eq!(recovery.parent_table, "users");
-    }
-
-    #[test]
-    fn declines_when_the_error_names_another_table() {
-        let coordinate = coordinate();
+    fn declines_to_defer_when_the_error_names_another_table() {
         let table = table_map("globalcomix", "sessions", &["id", "session_id"]);
-        let change = insert_change(&[
-            ("id", Value::Int(7)),
-            ("session_id", Value::Bytes(b"abc123".to_vec())),
-        ]);
+        let (_, change) = session_child();
 
-        assert!(
-            build_missing_parent_recovery(
-                child_event_position(&coordinate),
-                &table,
-                &change,
-                &foreign_key_conflict(PAID_SUBSCRIPTIONS_SESSION_ERROR),
-            )
-            .is_none()
-        );
+        assert!(!is_deferred_foreign_key_conflict(
+            &table,
+            RowOperation::Insert,
+            &change,
+            &foreign_key_conflict(PAID_SUBSCRIPTIONS_SESSION_ERROR)
+        ));
     }
 
     #[test]
-    fn declines_when_the_image_omits_the_referenced_column() {
-        let coordinate = coordinate();
-        let table = table_map(
-            "globalcomix",
-            "paid_subscriptions_users_pages",
-            &["id", "session_id"],
-        );
-        let change = insert_change(&[("id", Value::Int(7))]);
-
-        assert!(
-            build_missing_parent_recovery(
-                child_event_position(&coordinate),
-                &table,
-                &change,
-                &foreign_key_conflict(PAID_SUBSCRIPTIONS_SESSION_ERROR),
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn declines_a_duplicate_key_error() {
-        let coordinate = coordinate();
+    fn declines_to_defer_a_duplicate_key_error() {
         let table = table_map("globalcomix", "guests", &["id", "guest_hash"]);
         let change = insert_change(&[
             ("id", Value::Int(7)),
@@ -790,22 +646,18 @@ mod tests {
             duplicate_index: Some("guests.idx_guest_hash".to_string()),
         };
 
-        assert!(
-            build_missing_parent_recovery(
-                child_event_position(&coordinate),
-                &table,
-                &change,
-                &conflict,
-            )
-            .is_none()
-        );
+        assert!(!is_deferred_foreign_key_conflict(
+            &table,
+            RowOperation::Insert,
+            &change,
+            &conflict
+        ));
     }
 
-    /// `releases_ibfk_2` is resolved by superseded-parent verification inside the transaction.
-    /// Attaching a missing-parent request to it would retry recovery instead of letting that run.
+    /// `releases_ibfk_2` already defers as a superseded insert, so the foreign-key path must not
+    /// claim it as well and defer it twice.
     #[test]
-    fn declines_the_deferred_releases_category_constraint() {
-        let coordinate = coordinate();
+    fn declines_to_defer_the_superseded_releases_constraint() {
         let table = table_map(
             "globalcomix",
             "releases",
@@ -816,26 +668,18 @@ mod tests {
             ("comic_id", Value::Int(4)),
             ("comic_category_id", Value::Int(9)),
         ]);
-        let error = "Cannot add or update a child row: a foreign key constraint fails \
-                     (`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_2` FOREIGN KEY \
-                     (`comic_id`, `comic_category_id`) REFERENCES `comics` (`id`, `section_id`))";
 
-        assert!(
-            build_exact_parent_recovery(
-                child_event_position(&coordinate),
-                &table,
-                RowOperation::Insert,
-                &change,
-                &foreign_key_conflict(error),
-            )
-            .is_none()
-        );
+        assert!(!is_deferred_foreign_key_conflict(
+            &table,
+            RowOperation::Insert,
+            &change,
+            &foreign_key_conflict(RELEASES_CATEGORY_ERROR)
+        ));
     }
 
-    /// The proven single-constraint path must keep winning over the generic one.
+    /// The proven out-of-transaction path keeps winning, so it must not also defer.
     #[test]
-    fn prefers_the_hardcoded_sessions_guest_recovery() {
-        let coordinate = coordinate();
+    fn keeps_the_pinned_sessions_guest_recovery_out_of_transaction() {
         let table = table_map(
             "globalcomix",
             "sessions",
@@ -846,57 +690,31 @@ mod tests {
             ("guest_id", Value::Int(5)),
             ("guest_hash", Value::Bytes(b"h1".to_vec())),
         ]);
-        let error = "Cannot add or update a child row: a foreign key constraint fails \
-                     (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY \
-                     (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))";
+        let conflict = foreign_key_conflict(SESSIONS_GUEST_ERROR);
+        let coordinate = coordinate();
 
-        let recovery = build_exact_parent_recovery(
-            child_event_position(&coordinate),
+        assert!(!is_deferred_foreign_key_conflict(
             &table,
             RowOperation::Insert,
             &change,
-            &foreign_key_conflict(error),
+            &conflict
+        ));
+        let recovery = build_exact_parent_recovery(
+            child_event_position(&coordinate),
+            &table,
+            &change,
+            &conflict,
         )
         .expect("sessions guest recovery");
-
         assert!(matches!(
             recovery,
             crate::live::ExactParentRecovery::SessionsGuest(_)
         ));
     }
 
-    /// Any other constraint now reaches the generic path instead of stalling.
-    #[test]
-    fn routes_an_unenumerated_constraint_to_generic_recovery() {
-        let coordinate = coordinate();
-        let table = table_map(
-            "globalcomix",
-            "paid_subscriptions_users_pages",
-            &["id", "session_id"],
-        );
-        let change = insert_change(&[
-            ("id", Value::Int(7)),
-            ("session_id", Value::Bytes(b"abc123".to_vec())),
-        ]);
-
-        let recovery = build_exact_parent_recovery(
-            child_event_position(&coordinate),
-            &table,
-            RowOperation::Insert,
-            &change,
-            &foreign_key_conflict(PAID_SUBSCRIPTIONS_SESSION_ERROR),
-        )
-        .expect("generic missing parent recovery");
-
-        assert!(matches!(
-            recovery,
-            crate::live::ExactParentRecovery::MissingParent(_)
-        ));
-    }
-
     #[test]
     fn accepts_only_exact_releases_category_constraint_identity() {
-        let exact = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_2` FOREIGN KEY (`comic_id`, `comic_category_id`) REFERENCES `comics` (`id`, `section_id`))";
+        let exact = RELEASES_CATEGORY_ERROR;
         let wrong_constraint = exact.replace("releases_ibfk_2", "releases_ibfk_1");
         let wrong_child = exact.replace("`comic_category_id`", "`category_id`");
         let wrong_parent = exact.replace(
@@ -914,14 +732,18 @@ mod tests {
 
     #[test]
     fn accepts_only_exact_sessions_guest_constraint_identity() {
-        let exact = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))";
-        let suffix = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `archive_fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))";
-        let archived_parent = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests_archive` (`guest_id`, `guest_hash`))";
-        let alternate_columns = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`archived_guest_id`, `guest_hash`))";
+        let suffix = SESSIONS_GUEST_ERROR.replace("fk_sessions_guest", "archive_fk_sessions_guest");
+        let archived_parent = SESSIONS_GUEST_ERROR.replace("`guests`", "`guests_archive`");
+        let alternate_columns =
+            SESSIONS_GUEST_ERROR.replace("(`guest_id`, `guest_hash`))", "(`archived_guest_id`))");
 
-        assert!(is_exact_sessions_guest_constraint_error(exact));
-        assert!(!is_exact_sessions_guest_constraint_error(suffix));
-        assert!(!is_exact_sessions_guest_constraint_error(archived_parent));
-        assert!(!is_exact_sessions_guest_constraint_error(alternate_columns));
+        assert!(is_exact_sessions_guest_constraint_error(
+            SESSIONS_GUEST_ERROR
+        ));
+        assert!(!is_exact_sessions_guest_constraint_error(&suffix));
+        assert!(!is_exact_sessions_guest_constraint_error(&archived_parent));
+        assert!(!is_exact_sessions_guest_constraint_error(
+            &alternate_columns
+        ));
     }
 }

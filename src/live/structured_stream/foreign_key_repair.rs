@@ -58,6 +58,13 @@ impl std::fmt::Display for ForeignKeyRepairRejection {
     }
 }
 
+/// A planned foreign-key repair, reduced to the statements that carry it out and durable evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ForeignKeyRepairProof {
+    pub(crate) statements: Vec<crate::target::SqlStatement>,
+    pub(crate) evidence: String,
+}
+
 pub(crate) struct ForeignKeyRepairInput<'a> {
     pub(crate) violation: &'a ForeignKeyViolation,
     /// The constraint rebuilt from the violation by `foreign_key_from_violation`.

@@ -281,11 +281,12 @@ impl SupersededInsertVerifier for SupersededVerificationFixture {
         &mut self,
         _candidate: &DeferredSupersededInsertCandidate,
         _xid_end_position: u64,
-    ) -> Result<super::super::superseded_insert::SupersededInsertProof, String> {
+    ) -> Result<super::super::transaction::DeferredRepair, String> {
         if !self.verified {
             return Err("target transactional re-read changed".to_string());
         }
-        Ok(super::super::superseded_insert::SupersededInsertProof {
+        Ok(super::super::transaction::DeferredRepair::Superseded(
+            super::super::superseded_insert::SupersededInsertProof {
             source_snapshot: super::super::superseded_insert::BinlogCoordinate {
                 file: "mysqld-bin.002740".to_string(),
                 position: 1_004_163_590,
@@ -305,7 +306,8 @@ impl SupersededInsertVerifier for SupersededVerificationFixture {
                     ],
                 }
             }),
-        })
+            },
+        ))
     }
 }
 
@@ -474,7 +476,7 @@ impl SupersededInsertVerifier for ComicsPredicateVerifier {
         &mut self,
         _candidate: &DeferredSupersededInsertCandidate,
         _xid_end_position: u64,
-    ) -> Result<super::super::superseded_insert::SupersededInsertProof, String> {
+    ) -> Result<super::super::transaction::DeferredRepair, String> {
         let input = super::super::superseded_insert::SupersededInsertVerificationInput {
             schema: "globalcomix".to_string(),
             table: "comics".to_string(),
@@ -506,6 +508,7 @@ impl SupersededInsertVerifier for ComicsPredicateVerifier {
             target_owner_hash: "lagged-mutable-owner-hash".to_string(),
         };
         super::super::superseded_insert::verify_superseded_insert(&input)
+            .map(super::super::transaction::DeferredRepair::Superseded)
             .map_err(|rejection| format!("superseded insert rejected: {rejection:?}"))
     }
 }

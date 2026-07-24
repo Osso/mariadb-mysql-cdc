@@ -60,6 +60,25 @@ where
         &mut self,
         candidate: &DeferredSupersededInsertCandidate,
         xid_end_position: u64,
+    ) -> Result<super::transaction::DeferredRepair, String> {
+        // A foreign-key conflict is resolved from the locked parent, not from supersession hashes.
+        if candidate.observation.error_code == FOREIGN_KEY_ERROR_CODE {
+            return resolve_foreign_key_conflict(&self.source, self.target, candidate)
+                .map(super::transaction::DeferredRepair::ForeignKey);
+        }
+        self.verify_superseded(candidate, xid_end_position)
+            .map(super::transaction::DeferredRepair::Superseded)
+    }
+}
+
+impl<E> ProductionSupersededInsertVerifier<'_, E>
+where
+    E: TransactionalTargetExecutor,
+{
+    fn verify_superseded(
+        &mut self,
+        candidate: &DeferredSupersededInsertCandidate,
+        xid_end_position: u64,
     ) -> Result<SupersededInsertProof, String> {
         if candidate.observation.table == RELEASES_TABLE {
             #[cfg(feature = "integration-failpoints")]
@@ -94,6 +113,182 @@ where
             .map_err(|error| error.to_string())
         };
         verify_with_source_loader(candidate, xid_end_position, &mut source, self.target)
+    }
+}
+
+const FOREIGN_KEY_ERROR_CODE: u16 = 1452;
+
+/// Resolves a deferred foreign-key conflict from the locked parent image.
+///
+/// The rejection text carries the `superseded ... insert rejected:` marker because
+/// `superseded_verification_error` classifies fatal against retryable by that prefix; without it a
+/// rejection crash-loops the stream instead of stalling it.
+fn resolve_foreign_key_conflict<E>(
+    source: &MySqlConnectionConfig,
+    target: &E,
+    candidate: &DeferredSupersededInsertCandidate,
+) -> Result<super::foreign_key_repair::ForeignKeyRepairProof, String>
+where
+    E: TransactionalTargetExecutor,
+{
+    let change = &candidate.historical_change;
+    let violation = crate::live::parse_foreign_key_violation(&candidate.observation.error_text)
+        .ok_or_else(|| {
+            "superseded foreign key insert rejected: error text did not name a foreign key"
+                .to_string()
+        })?;
+    let foreign_key = super::foreign_key_repair::foreign_key_from_violation(&violation);
+    let parent = crate::table_sync::read_parent_table_inventory(
+        source,
+        &foreign_key.referenced_schema,
+        &foreign_key.referenced_table,
+    )
+    .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?;
+    let predicate = super::foreign_key_repair::parent_primary_key_predicate(
+        &violation,
+        &parent.primary_key,
+        &change.writable_columns,
+        &change.source_values,
+    )
+    .ok_or_else(|| {
+        "superseded foreign key insert rejected: child image does not carry the referenced key"
+            .to_string()
+    })?;
+    let locked_rows = target
+        .read_locked_parent_identity(
+            &foreign_key.referenced_schema,
+            &foreign_key.referenced_table,
+            &violation.parent_columns,
+            &predicate,
+        )
+        .map_err(|error| format!("superseded foreign key target evidence failed: {error}"))?;
+    let locked_parent = super::derived_fk_fastforward::LockedParentRows {
+        columns: violation.parent_columns.clone(),
+        rows: locked_rows,
+    };
+    let plan = super::foreign_key_repair::plan_foreign_key_repair(
+        &super::foreign_key_repair::ForeignKeyRepairInput {
+            violation: &violation,
+            foreign_key: &foreign_key,
+            operation: candidate.observation.operation,
+            error_code: candidate.observation.error_code,
+            parent_primary_key: &parent.primary_key,
+            child_columns: &change.writable_columns,
+            child_values: &change.source_values,
+            locked_parent: &locked_parent,
+        },
+    )
+    .map_err(|rejection| format!("superseded foreign key insert rejected: {rejection}"))?;
+    match plan {
+        super::foreign_key_repair::ForeignKeyRepairPlan::InstallParent => {
+            install_parent_then_replay_child(source, &violation, candidate)
+        }
+        super::foreign_key_repair::ForeignKeyRepairPlan::FastForwardChild(plan) => {
+            fast_forward_child(&violation, candidate, &plan)
+        }
+    }
+}
+
+/// Installs the exact source parent, then replays the child image unchanged.
+fn install_parent_then_replay_child(
+    source: &MySqlConnectionConfig,
+    violation: &crate::live::ForeignKeyViolation,
+    candidate: &DeferredSupersededInsertCandidate,
+) -> Result<super::foreign_key_repair::ForeignKeyRepairProof, String> {
+    let child_values = candidate
+        .historical_change
+        .source_values
+        .iter()
+        .cloned()
+        .map(crate::mysql_client::value_to_string)
+        .collect::<Vec<_>>();
+    let referenced_values = violation
+        .child_columns
+        .iter()
+        .map(|column| {
+            let position = candidate
+                .historical_change
+                .writable_columns
+                .iter()
+                .position(|candidate| candidate == column)?;
+            child_values.get(position).cloned()
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            "superseded foreign key insert rejected: child image lacks a referenced column"
+                .to_string()
+        })?;
+    let (parent, parent_row) =
+        crate::table_sync::read_exact_source_parent_row(source, violation, &referenced_values)
+            .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?;
+    let parent_schema = violation
+        .parent_schema
+        .clone()
+        .unwrap_or_else(|| violation.child_schema.clone());
+    let parent_insert = build_exact_row_insert_statement(
+        &parent_schema,
+        &violation.parent_table,
+        &snapshot_row_as_source_row(&parent_row, &parent),
+    )
+    .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?;
+    Ok(super::foreign_key_repair::ForeignKeyRepairProof {
+        statements: vec![parent_insert, candidate.historical_change.statement.clone()],
+        evidence: format!(
+            "absent parent installed from the exact source row, then the historical child image \
+             replayed unchanged; constraint={} parent=`{parent_schema}`.`{}` parent_key={:?}",
+            violation.constraint, violation.parent_table, parent_row.primary_key,
+        ),
+    })
+}
+
+/// Replays the child image with only its derived referenced columns fast-forwarded.
+fn fast_forward_child(
+    violation: &crate::live::ForeignKeyViolation,
+    candidate: &DeferredSupersededInsertCandidate,
+    plan: &super::derived_fk_fastforward::DerivedFkFastForwardPlan,
+) -> Result<super::foreign_key_repair::ForeignKeyRepairProof, String> {
+    let change = &candidate.historical_change;
+    let row = super::foreign_key_repair::fast_forwarded_child_row(
+        &change.writable_columns,
+        &change.source_values,
+        plan,
+    )
+    .ok_or_else(|| {
+        "superseded foreign key insert rejected: child image could not be rebuilt".to_string()
+    })?;
+    let statement =
+        build_exact_row_insert_statement(&violation.child_schema, &violation.child_table, &row)
+            .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?;
+    Ok(super::foreign_key_repair::ForeignKeyRepairProof {
+        statements: vec![statement],
+        evidence: plan.evidence(),
+    })
+}
+
+/// Converts a source parent row into the exact-insert shape, in the parent's stored column order.
+fn snapshot_row_as_source_row(
+    row: &crate::snapshot::SnapshotRow,
+    parent: &crate::inventory::TableInventory,
+) -> super::superseded_source::CanonicalSourceRow {
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    for column in &parent.columns {
+        if column.generated.is_some() {
+            continue;
+        }
+        if let Some(value) = row.values.get(&column.name) {
+            columns.push(column.name.clone());
+            values.push(match value {
+                Some(value) => Value::Bytes(value.clone().into_bytes()),
+                None => Value::NULL,
+            });
+        }
+    }
+    super::superseded_source::CanonicalSourceRow {
+        columns,
+        values,
+        // Not a source evidence row; the insert builder reads only columns and values.
+        hash: String::new(),
     }
 }
 
