@@ -190,6 +190,19 @@ fn repair_parent(
             identity: identity.clone(),
             message,
         })?;
+    let repaired_parent =
+        store
+            .read_target_parent(&identity)
+            .map_err(|message| ParentRepairError::TargetRead {
+                identity: identity.clone(),
+                message,
+            })?;
+    if repaired_parent.as_ref() != Some(&source) {
+        return Err(ParentRepairError::Repair {
+            identity,
+            message: "target parent does not match source after repair".to_string(),
+        });
+    }
     repaired.insert(identity);
     Ok(())
 }
@@ -203,6 +216,7 @@ mod tests {
         source: BTreeMap<ParentIdentity, ParentRepairRow>,
         target: BTreeMap<ParentIdentity, ParentRepairRow>,
         source_errors: BTreeMap<ParentIdentity, String>,
+        drop_parent_repair: bool,
         repaired: Vec<ParentIdentity>,
         retried: Vec<String>,
     }
@@ -229,7 +243,9 @@ mod tests {
             let id = row.values["id"].as_deref().expect("parent id");
             let identity = identity(&row.table, "id", id);
             self.repaired.push(identity.clone());
-            self.target.insert(identity, row.clone());
+            if !self.drop_parent_repair {
+                self.target.insert(identity, row.clone());
+            }
             Ok(())
         }
 
@@ -330,6 +346,30 @@ mod tests {
 
         assert!(store.repaired.is_empty());
         assert_eq!(store.retried, ["guests"]);
+    }
+
+    #[test]
+    fn rejects_parent_repair_that_does_not_converge() {
+        let edges = vec![edge("guests", "utm_id", "utms", "id")];
+        let child = row("guests", &[("guest_id", Some("7")), ("utm_id", Some("41"))]);
+        let utm = row("utms", &[("id", Some("41")), ("utm_hash", Some("source"))]);
+        let mut store = RecordingStore {
+            drop_parent_repair: true,
+            ..RecordingStore::default()
+        };
+        store.source.insert(identity("utms", "id", "41"), utm);
+
+        let error = repair_fk_parents_and_retry("guests", &[child], &edges, &mut store)
+            .expect_err("unverified parent repair");
+
+        assert_eq!(
+            error,
+            ParentRepairError::Repair {
+                identity: identity("utms", "id", "41"),
+                message: "target parent does not match source after repair".to_string()
+            }
+        );
+        assert!(store.retried.is_empty());
     }
 
     #[test]

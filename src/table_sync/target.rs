@@ -109,6 +109,7 @@ impl MySqlSyncRepairTarget {
             .collect();
         let edges = merged_fk_edges(
             &source_inventory.schema,
+            &target_inventory.schema,
             source_inventory.foreign_keys,
             target_inventory.foreign_keys,
         );
@@ -268,14 +269,19 @@ impl MySqlParentRepairStore<'_> {
 }
 
 fn merged_fk_edges(
-    schema: &str,
+    source_schema: &str,
+    target_schema: &str,
     source: Vec<ForeignKeyInventory>,
     target: Vec<ForeignKeyInventory>,
 ) -> Vec<ForeignKeyEdge> {
     source
         .into_iter()
-        .chain(target)
-        .filter(|foreign_key| foreign_key.referenced_schema == schema)
+        .filter(|foreign_key| foreign_key.referenced_schema == source_schema)
+        .chain(
+            target
+                .into_iter()
+                .filter(|foreign_key| foreign_key.referenced_schema == target_schema),
+        )
         .map(|foreign_key| ForeignKeyEdge {
             child_table: foreign_key.table,
             parent_table: foreign_key.referenced_table,
@@ -347,14 +353,17 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
 
     fn insert_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         let rows = rows.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
-        match self.writer.insert_rows(&rows) {
-            Ok(()) => self.verify_child_rows(&rows),
-            Err(error) if error.mysql_code() == Some(1452) => {
-                self.repair_fk_parents_and_retry(&rows)?;
-                self.verify_child_rows(&rows)
+        for batch in rows.chunks(self.writer.insert_batch_size()) {
+            match self.writer.insert_rows(batch) {
+                Ok(()) => self.verify_child_rows(batch)?,
+                Err(error) if error.mysql_code() == Some(1452) => {
+                    self.repair_fk_parents_and_retry(batch)?;
+                    self.verify_child_rows(batch)?;
+                }
+                Err(error) => return Err(TableSyncError::Repair(error.to_string())),
             }
-            Err(error) => Err(TableSyncError::Repair(error.to_string())),
         }
+        Ok(())
     }
 
     fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
@@ -650,5 +659,35 @@ fn quote_literal(value: Option<&str>) -> String {
     match value {
         Some(value) => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''")),
         None => "NULL".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn foreign_key(referenced_schema: &str) -> ForeignKeyInventory {
+        ForeignKeyInventory {
+            table: "guests".to_string(),
+            name: "fk_guests_utm_id".to_string(),
+            columns: vec!["utm_id".to_string()],
+            referenced_schema: referenced_schema.to_string(),
+            referenced_table: "utms".to_string(),
+            referenced_columns: vec!["id".to_string()],
+        }
+    }
+
+    #[test]
+    fn merges_local_source_and_target_fk_schemas() {
+        let edges = merged_fk_edges(
+            "source_db",
+            "target_db",
+            Vec::new(),
+            vec![foreign_key("target_db")],
+        );
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_table, "guests");
+        assert_eq!(edges[0].parent_table, "utms");
     }
 }

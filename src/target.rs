@@ -713,6 +713,10 @@ where
         &self.table
     }
 
+    pub(crate) fn insert_batch_size(&self) -> usize {
+        max_insert_rows_per_statement(self.columns.len())
+    }
+
     pub fn insert_rows(&self, rows: &[SnapshotRow]) -> Result<(), TargetWriteError> {
         if rows.is_empty() {
             return Ok(());

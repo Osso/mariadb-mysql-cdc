@@ -851,11 +851,10 @@ fn apply_accepts_exact_total_extra_row_ceiling() {
         repair_target.operations.borrow().as_slice(),
         &[
             "update-batch:1",
-            "insert:2",
+            "insert-batch:2",
             "delete:4",
             "delete:5",
-            "insert:3",
-            "insert:6",
+            "insert-batch:3,6",
         ]
     );
 }
@@ -878,7 +877,7 @@ fn apply_releases_unique_conflicts_before_inserting_missing_rows() {
 
     assert_eq!(
         repair_target.operations.borrow().as_slice(),
-        &["update-batch:20".to_string(), "insert:10".to_string()]
+        &["update-batch:20".to_string(), "insert-batch:10".to_string(),]
     );
 }
 
@@ -1100,7 +1099,7 @@ fn ignored_insert_remains_missing_and_fails_follow_up_verification() {
     assert!(error.to_string().contains("missing_rows=1"));
     assert_eq!(
         repair_target.operations.borrow().as_slice(),
-        &["insert:1".to_string()]
+        &["insert-batch:1".to_string()]
     );
 }
 
