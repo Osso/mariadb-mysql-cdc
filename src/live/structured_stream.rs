@@ -58,6 +58,7 @@ const MYSQL_COLUMN_TYPE_STRING: u8 = 254;
 const MILLIS_PER_SECOND: u64 = 1_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 mod ddl;
+mod derived_fk_fastforward;
 mod event;
 mod init;
 mod rows;
