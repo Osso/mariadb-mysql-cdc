@@ -140,10 +140,14 @@ where
         identity_column,
     )
     .map_err(|error| format!("superseded target SQL formatting failed: {error}"))?;
+    let evidence_params = format!(
+        "{{primary_key={},identity={:?}}}",
+        historical.primary_key, historical.name
+    );
     let input = verification_input(candidate, xid_end_position, &historical, source, target)?;
     verify_superseded_insert(&input).map_err(|rejection| {
         format!(
-            "superseded insert rejected: {rejection:?}; source_sql={source_sql}; target_sql={target_sql}"
+            "superseded insert rejected: {rejection:?}; evidence_params={evidence_params}; source_sql={source_sql}; target_sql={target_sql}"
         )
     })
 }
@@ -995,8 +999,9 @@ mod tests {
 
         assert!(error.contains("source_sql=SELECT `id`,`slug` FROM `globalcomix`.`comics` WHERE `id` = ? OR `slug` = ? ORDER BY `id`"));
         assert!(error.contains("target_sql=SELECT `id`, `slug` FROM `globalcomix`.`comics` WHERE `id` = ? OR `slug` = ? ORDER BY `id` FOR UPDATE"));
-        assert!(!error.contains("48054"));
-        assert!(!error.contains("misc"));
+        assert!(error.contains("evidence_params={primary_key=48054,identity=\"misc\"}"));
+        assert!(!error.contains("password"));
+        assert!(!error.contains("host"));
     }
 
     #[test]
