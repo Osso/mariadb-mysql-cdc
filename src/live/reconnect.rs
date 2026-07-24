@@ -437,6 +437,7 @@ fn is_retryable_stream_error(error: &ApplyBinlogError) -> bool {
         error,
         ApplyBinlogError::RowConflictPersisted { .. }
             | ApplyBinlogError::ParentRecoveryFailed { .. }
+            | ApplyBinlogError::SupersededRecoveryFailed(_)
     ) {
         return true;
     }

@@ -371,6 +371,7 @@ pub enum ApplyBinlogError {
     Config(String),
     SourceCommand(String),
     Target(String),
+    SupersededRecoveryFailed(String),
     RowConflictPersisted {
         message: String,
         parent_recovery: Option<Box<ExactParentRecovery>>,
@@ -392,6 +393,9 @@ impl fmt::Display for ApplyBinlogError {
                 write!(formatter, "source binlog command failed: {message}")
             }
             Self::Target(message) => write!(formatter, "target apply failed: {message}"),
+            Self::SupersededRecoveryFailed(message) => {
+                write!(formatter, "superseded recovery failed: {message}")
+            }
             Self::RowConflictPersisted { message, .. } => {
                 write!(formatter, "row conflict persisted for repair: {message}")
             }

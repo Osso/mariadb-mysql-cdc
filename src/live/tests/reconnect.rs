@@ -148,6 +148,43 @@ fn reconnect_forever_reloads_checkpoint_after_generic_transient_error() {
 }
 
 #[test]
+fn retries_superseded_recovery_failure_from_unchanged_checkpoint() {
+    let checkpoint_store =
+        MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.002709", 515_816_517));
+    let config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            binlog_file: "mysqld-bin.002709".to_string(),
+            start_position: 515_816_517,
+            ..SourceBinlogConfig::default()
+        },
+        reconnect_forever: true,
+        ..ApplyBinlogConfig::default()
+    };
+    let starts = RefCell::new(Vec::new());
+
+    run_stream_reconnect_loop(
+        &config,
+        Some(&checkpoint_store),
+        |attempt_config| {
+            starts
+                .borrow_mut()
+                .push(attempt_config.source.start_position);
+            if starts.borrow().len() == 1 {
+                return Err(ApplyBinlogError::SupersededRecoveryFailed(
+                    "TargetParentHashMismatch".to_string(),
+                ));
+            }
+            Ok(())
+        },
+        |_delay: Duration| {},
+    )
+    .expect("superseded recovery reconnects");
+
+    assert_eq!(starts.into_inner(), vec![515_816_517, 515_816_517]);
+    assert!(checkpoint_store.saved.borrow().is_none());
+}
+
+#[test]
 fn retries_durably_persisted_row_conflict_from_unchanged_checkpoint() {
     let checkpoint_store =
         MemoryCheckpointStore::with_checkpoint(checkpoint_at("mysqld-bin.000001", 120));

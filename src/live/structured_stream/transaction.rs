@@ -303,7 +303,7 @@ impl TargetTransaction {
             })?;
         let proof = verifier
             .verify(&candidate, context.xid_end_position)
-            .map_err(ApplyBinlogError::Target)?;
+            .map_err(ApplyBinlogError::SupersededRecoveryFailed)?;
         let evidence = proof.resolution_evidence();
         if let Some(statement) = &proof.current_row_install {
             executor
