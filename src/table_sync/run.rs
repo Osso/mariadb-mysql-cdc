@@ -519,7 +519,7 @@ pub(crate) fn retry_sync_table_operation<F>(
 where
     F: FnMut() -> Result<SyncTableReport, TableSyncError>,
 {
-    let attempts = if mode == SyncMode::MissingPrimaryKeys {
+    let attempts = if matches!(mode, SyncMode::Apply | SyncMode::MissingPrimaryKeys) {
         max_attempts.max(1)
     } else {
         1
@@ -527,7 +527,7 @@ where
     for attempt in 1..=attempts {
         match operation() {
             Ok(report) => return Ok(report),
-            Err(error) if attempt < attempts && is_retryable_connection_error(&error) => {
+            Err(error) if attempt < attempts && is_retryable_sync_error(&error) => {
                 if !retry_delay.is_zero() {
                     std::thread::sleep(retry_delay);
                 }
@@ -538,8 +538,11 @@ where
     unreachable!("sync retry loop has at least one attempt")
 }
 
-fn is_retryable_connection_error(error: &TableSyncError) -> bool {
-    if matches!(error, TableSyncError::Read(_) | TableSyncError::Progress(_)) {
+pub(crate) fn is_retryable_sync_error(error: &TableSyncError) -> bool {
+    if matches!(
+        error,
+        TableSyncError::Read(_) | TableSyncError::Progress(_) | TableSyncError::Duplicate(_)
+    ) {
         return true;
     }
     let TableSyncError::Repair(message) = error else {
@@ -562,6 +565,10 @@ fn is_retryable_connection_error(error: &TableSyncError) -> bool {
         "not connected",
         "packet out of sync",
         "resource temporarily unavailable",
+        "error 1205",
+        "error 1213",
+        "deadlock",
+        "lock wait timeout",
     ]
     .iter()
     .any(|pattern| message.contains(pattern))
@@ -601,6 +608,7 @@ pub(crate) fn run_sync_table_phase_with_run_spec(
 
 pub(crate) fn should_record_sync_run_error(error: &TableSyncError) -> bool {
     matches!(error, TableSyncError::Read(_) | TableSyncError::Repair(_))
+        && !is_retryable_sync_error(error)
 }
 
 fn connect_mysql_recovery_target(

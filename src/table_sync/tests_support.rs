@@ -155,6 +155,7 @@ pub(crate) struct RecordingProgressStore {
     pub(crate) saved: RefCell<Vec<SyncTableProgress>>,
     pub(crate) acquired_run_ids: RefCell<Vec<String>>,
     pub(crate) released_run_ids: RefCell<Vec<String>>,
+    pub(crate) errors: RefCell<Vec<String>>,
     pub(crate) release_error: Option<String>,
 }
 
@@ -165,6 +166,7 @@ impl RecordingProgressStore {
             saved: RefCell::new(Vec::new()),
             acquired_run_ids: RefCell::new(Vec::new()),
             released_run_ids: RefCell::new(Vec::new()),
+            errors: RefCell::new(Vec::new()),
             release_error: None,
         }
     }
@@ -197,7 +199,8 @@ impl SyncProgressStore for RecordingProgressStore {
         Ok(())
     }
 
-    fn save_error(&mut self, _table: &str, _error: &TableSyncError) -> Result<(), TableSyncError> {
+    fn save_error(&mut self, _table: &str, error: &TableSyncError) -> Result<(), TableSyncError> {
+        self.errors.borrow_mut().push(error.to_string());
         Ok(())
     }
 }

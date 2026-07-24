@@ -47,6 +47,134 @@ fn missing_primary_key_sync_retries_transient_connection_loss_with_a_bound() {
 }
 
 #[test]
+fn apply_retries_recoverable_connection_and_constraint_failures() {
+    for first_error in [
+        TableSyncError::Read("connection reset".to_string()),
+        TableSyncError::Repair("MySqlError { ERROR 1213 (40001): deadlock }".to_string()),
+    ] {
+        let attempts = Cell::new(0);
+        let mut first_error = Some(first_error);
+        let report = retry_sync_table_operation(SyncMode::Apply, 2, Duration::ZERO, || {
+            attempts.set(attempts.get() + 1);
+            if let Some(error) = first_error.take() {
+                Err(error)
+            } else {
+                Ok(SyncTableReport::default())
+            }
+        })
+        .expect("recoverable apply failure retries");
+
+        assert_eq!(report, SyncTableReport::default());
+        assert_eq!(attempts.get(), 2);
+    }
+}
+
+#[test]
+fn recoverable_failure_preserves_running_progress_without_advancing() {
+    struct ConnectionFailureReader;
+
+    impl SyncTableReader for ConnectionFailureReader {
+        fn read_rows(
+            &self,
+            _request: &SyncChunkRequest,
+        ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+            Err(TableSyncError::Read("connection reset".to_string()))
+        }
+    }
+
+    let source = ConnectionFailureReader;
+    let target = FakeReader::new(Vec::new());
+    let mut repair_target = RecordingRepairTarget::default();
+    let mut progress_store = RecordingProgressStore::default();
+
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "recoverable-running".to_string(),
+            run_scope: "recoverable-running-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: None,
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect_err("connection failure is returned for outer retry");
+
+    assert!(progress_store.errors.borrow().is_empty());
+    assert!(progress_store.saved.borrow().iter().all(|progress| {
+        progress.status == progress::SyncProgressStatus::Running
+            && progress.last_primary_key.is_none()
+            && progress.chunks == 0
+            && progress.inserts == 0
+            && progress.updates == 0
+    }));
+}
+
+#[test]
+fn recoverable_constraint_preserves_running_progress_without_advancing() {
+    struct DeadlockingRepairTarget;
+
+    impl SyncRepairTarget for DeadlockingRepairTarget {
+        fn insert_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Err(TableSyncError::Repair(
+                "MySqlError { ERROR 1213 (40001): deadlock }".to_string(),
+            ))
+        }
+
+        fn insert_rows(&mut self, _rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+            Err(TableSyncError::Repair(
+                "MySqlError { ERROR 1213 (40001): deadlock }".to_string(),
+            ))
+        }
+
+        fn update_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn delete_row(&mut self, _primary_key: &[String]) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+    }
+
+    let source = FakeReader::new(vec![row("1", "source")]);
+    let target = FakeReader::new(Vec::new());
+    let mut repair_target = DeadlockingRepairTarget;
+    let mut progress_store = RecordingProgressStore::default();
+
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "recoverable-constraint-running".to_string(),
+            run_scope: "recoverable-constraint-running-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect_err("constraint failure is returned for outer retry");
+
+    assert!(progress_store.errors.borrow().is_empty());
+    assert!(progress_store.saved.borrow().iter().all(|progress| {
+        progress.status == progress::SyncProgressStatus::Running
+            && progress.last_primary_key.is_none()
+            && progress.chunks == 0
+            && progress.inserts == 0
+            && progress.updates == 0
+    }));
+}
+
+#[test]
 fn successful_sync_is_not_failed_by_lock_release_connection_loss() {
     let progress_store = RecordingProgressStore {
         release_error: Some("connection reset while releasing lock".to_string()),
