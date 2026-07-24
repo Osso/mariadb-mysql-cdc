@@ -709,6 +709,10 @@ where
         }
     }
 
+    pub(crate) fn table_name(&self) -> &str {
+        &self.table
+    }
+
     pub fn insert_rows(&self, rows: &[SnapshotRow]) -> Result<(), TargetWriteError> {
         if rows.is_empty() {
             return Ok(());
@@ -836,6 +840,12 @@ impl fmt::Display for TargetWriteError {
             "target {} failed for {} on {}: {}; sql: {}",
             self.operation, rows, self.table, self.source, self.sql
         )
+    }
+}
+
+impl TargetWriteError {
+    pub(crate) fn mysql_code(&self) -> Option<u16> {
+        self.source.mysql_code()
     }
 }
 

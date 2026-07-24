@@ -5,6 +5,10 @@ use super::mysql::{
 use super::range::sync_table_with_progress_range;
 use super::recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
 use super::*;
+use crate::inventory::{
+    InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
+    build_inventory,
+};
 use std::time::Duration;
 
 const SYNC_CONNECTION_ATTEMPTS: usize = 5;
@@ -613,7 +617,53 @@ fn connect_mysql_recovery_target(
 fn mysql_repair_target(config: &SyncTableConfig) -> Result<MySqlSyncRepairTarget, TableSyncError> {
     let executor = crate::mysql_client::PersistentTargetExecutor::new_for_sync(&config.target)
         .map_err(|error| TableSyncError::Repair(error.to_string()))?;
-    Ok(build_mysql_repair_target(config, executor))
+    let source_inventory = read_source_inventory(config)?;
+    let target_inventory = read_target_inventory(config)?;
+    let writer = crate::target::TargetMySqlWriter::from_snapshot_table(
+        &snapshot_table(&config.table),
+        executor,
+        sync_insert_mode(config),
+    );
+    let source = MySqlSyncReader::new(config.source.clone());
+    let target = MySqlSyncReader::new_with_target(target_connection_config(config), &config.target)
+        .map_err(TableSyncError::Read)?;
+    Ok(MySqlSyncRepairTarget::new_with_fk_repair(
+        writer,
+        source,
+        target,
+        source_inventory,
+        target_inventory,
+    ))
+}
+
+fn read_source_inventory(config: &SyncTableConfig) -> Result<SchemaInventory, TableSyncError> {
+    let reader = MariaDbInventoryReader::new(InventoryConfig {
+        host: config.source.host.clone(),
+        port: config.source.port,
+        user: config.source.user.clone(),
+        password: config.source.password.clone(),
+        endpoint_role: InventoryEndpointRole::Source,
+        use_tls: false,
+        tls_ca_file: None,
+        ..InventoryConfig::default()
+    });
+    build_inventory(&config.source.database, &reader)
+        .map_err(|error| TableSyncError::Read(error.to_string()))
+}
+
+fn read_target_inventory(config: &SyncTableConfig) -> Result<SchemaInventory, TableSyncError> {
+    let reader = MariaDbInventoryReader::new(InventoryConfig {
+        host: config.target.host.clone(),
+        port: config.target.port,
+        user: config.target.user.clone(),
+        password: config.target.password.clone(),
+        endpoint_role: InventoryEndpointRole::Target,
+        use_tls: true,
+        tls_ca_file: Some(config.target.tls_ca_file.clone()),
+        ..InventoryConfig::default()
+    });
+    build_inventory(&config.target.database, &reader)
+        .map_err(|error| TableSyncError::Read(error.to_string()))
 }
 
 fn build_mysql_repair_target(

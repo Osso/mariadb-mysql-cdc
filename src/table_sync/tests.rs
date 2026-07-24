@@ -1,6 +1,8 @@
 use super::tests_support::*;
 use super::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::time::Duration;
 
 #[test]
@@ -217,6 +219,221 @@ fn apply_batches_missing_rows_before_checkpointing_the_chunk() {
     assert_eq!(
         saved.last().expect("saved progress").last_primary_key,
         Some(vec!["2".to_string()])
+    );
+}
+
+#[test]
+fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
+    use super::fk_parent_repair::{
+        ForeignKeyColumn, ForeignKeyEdge, ParentIdentity, ParentRepairRow, ParentRepairStore,
+        repair_fk_parents_and_retry,
+    };
+
+    struct SharedReader(Rc<RefCell<Vec<crate::snapshot::SnapshotRow>>>);
+    impl SyncTableReader for SharedReader {
+        fn read_rows(
+            &self,
+            request: &SyncChunkRequest,
+        ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
+            Ok(self
+                .0
+                .borrow()
+                .iter()
+                .filter(|row| {
+                    let after_start = request
+                        .start_after
+                        .as_ref()
+                        .is_none_or(|start| row.primary_key > *start);
+                    let before_end = request
+                        .end_at
+                        .as_ref()
+                        .is_none_or(|end| row.primary_key <= *end);
+                    after_start && before_end
+                })
+                .take(request.limit)
+                .cloned()
+                .collect())
+        }
+    }
+
+    struct ParentStore<'a> {
+        source_parent: ParentRepairRow,
+        target_parents: &'a mut BTreeMap<ParentIdentity, ParentRepairRow>,
+        target_children: &'a Rc<RefCell<Vec<crate::snapshot::SnapshotRow>>>,
+        child_rows: &'a [crate::snapshot::SnapshotRow],
+        operations: &'a mut Vec<String>,
+    }
+    impl ParentRepairStore for ParentStore<'_> {
+        fn read_source_parent(
+            &mut self,
+            _identity: &ParentIdentity,
+        ) -> Result<Option<ParentRepairRow>, String> {
+            Ok(Some(self.source_parent.clone()))
+        }
+
+        fn read_target_parent(
+            &mut self,
+            identity: &ParentIdentity,
+        ) -> Result<Option<ParentRepairRow>, String> {
+            Ok(self.target_parents.get(identity).cloned())
+        }
+
+        fn repair_parent(&mut self, row: &ParentRepairRow) -> Result<(), String> {
+            self.operations
+                .push("insert-parent:utms:184041".to_string());
+            self.target_parents.insert(
+                ParentIdentity {
+                    table: "utms".to_string(),
+                    values: vec![("id".to_string(), "184041".to_string())],
+                },
+                row.clone(),
+            );
+            Ok(())
+        }
+
+        fn retry_child_batch(
+            &mut self,
+            _table: &str,
+            _rows: &[ParentRepairRow],
+        ) -> Result<(), String> {
+            self.operations.push("retry-child-batch:guests".to_string());
+            self.target_children
+                .borrow_mut()
+                .extend_from_slice(self.child_rows);
+            Ok(())
+        }
+    }
+
+    struct RepairTarget {
+        target_children: Rc<RefCell<Vec<crate::snapshot::SnapshotRow>>>,
+        target_parents: BTreeMap<ParentIdentity, ParentRepairRow>,
+        operations: Vec<String>,
+    }
+    impl SyncRepairTarget for RepairTarget {
+        fn insert_row(&mut self, row: &crate::snapshot::SnapshotRow) -> Result<(), TableSyncError> {
+            self.insert_rows(&[row])
+        }
+
+        fn insert_rows(
+            &mut self,
+            rows: &[&crate::snapshot::SnapshotRow],
+        ) -> Result<(), TableSyncError> {
+            self.operations
+                .push("insert-child-batch:guests".to_string());
+            let child_rows = rows.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
+            let repair_rows = child_rows
+                .iter()
+                .map(|row| ParentRepairRow {
+                    table: "guests".to_string(),
+                    values: row.values.clone(),
+                })
+                .collect::<Vec<_>>();
+            let source_parent = ParentRepairRow {
+                table: "utms".to_string(),
+                values: BTreeMap::from([
+                    ("id".to_string(), Some("184041".to_string())),
+                    ("utm_hash".to_string(), Some("hash".to_string())),
+                ]),
+            };
+            let mut store = ParentStore {
+                source_parent,
+                target_parents: &mut self.target_parents,
+                target_children: &self.target_children,
+                child_rows: &child_rows,
+                operations: &mut self.operations,
+            };
+            repair_fk_parents_and_retry(
+                "guests",
+                &repair_rows,
+                &[ForeignKeyEdge {
+                    child_table: "guests".to_string(),
+                    parent_table: "utms".to_string(),
+                    columns: vec![ForeignKeyColumn {
+                        child: "utm_id".to_string(),
+                        parent: "id".to_string(),
+                    }],
+                }],
+                &mut store,
+            )
+            .map_err(|error| TableSyncError::Repair(error.to_string()))
+        }
+
+        fn update_row(
+            &mut self,
+            _row: &crate::snapshot::SnapshotRow,
+        ) -> Result<(), TableSyncError> {
+            unreachable!()
+        }
+
+        fn delete_row(&mut self, _primary_key: &[String]) -> Result<(), TableSyncError> {
+            unreachable!()
+        }
+    }
+
+    let table = SyncTable {
+        name: "guests".to_string(),
+        primary_key: vec!["guest_id".to_string()],
+        columns: vec![
+            "guest_id".to_string(),
+            "guest_hash".to_string(),
+            "utm_id".to_string(),
+        ],
+    };
+    let child = crate::snapshot::SnapshotRow {
+        primary_key: vec!["87308589".to_string()],
+        values: BTreeMap::from([
+            ("guest_id".to_string(), Some("87308589".to_string())),
+            ("guest_hash".to_string(), Some("guest-hash".to_string())),
+            ("utm_id".to_string(), Some("184041".to_string())),
+        ]),
+    };
+    let source = FakeReader::new(vec![child.clone()]);
+    let target_rows = Rc::new(RefCell::new(Vec::new()));
+    let target = SharedReader(target_rows.clone());
+    let mut repair_target = RepairTarget {
+        target_children: target_rows.clone(),
+        target_parents: BTreeMap::new(),
+        operations: Vec::new(),
+    };
+    let mut progress_store = RecordingProgressStore::default();
+
+    let report = sync_table_with_progress_range(
+        &table,
+        SyncRunOptions {
+            run_id: "guest-fk-parent".to_string(),
+            run_scope: "guest-fk-parent-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect("parent-first repair");
+
+    assert_eq!(report.inserts, 1);
+    assert_eq!(target_rows.borrow().as_slice(), &[child]);
+    assert_eq!(
+        repair_target.operations,
+        [
+            "insert-child-batch:guests",
+            "insert-parent:utms:184041",
+            "retry-child-batch:guests",
+        ]
+    );
+    let progressed_keys = progress_store
+        .saved
+        .borrow()
+        .iter()
+        .filter_map(|progress| progress.last_primary_key.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        progressed_keys,
+        BTreeSet::from([vec!["87308589".to_string()]])
     );
 }
 

@@ -1,3 +1,4 @@
+mod fk_parent_repair;
 mod model;
 mod mysql;
 pub(crate) mod progress;

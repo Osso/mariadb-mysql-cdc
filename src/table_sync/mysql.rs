@@ -138,6 +138,33 @@ impl MySqlSyncReader {
         parse_home_feed_card_rows(self.query_rows(&sql)?)
     }
 
+    pub(crate) fn read_exact_inventory_rows(
+        &self,
+        table: &crate::inventory::TableInventory,
+        identity: &[(String, String)],
+    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        let columns = table
+            .columns
+            .iter()
+            .filter(|column| column.generated.is_none())
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let predicates = identity
+            .iter()
+            .map(|(column, value)| {
+                format!("{} = {}", quote_ident(column), quote_sql_literal(value))
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} LIMIT 2",
+            quote_ident_list(&columns),
+            quote_ident(&table.name),
+            predicates
+        );
+        parse_sync_rows(&columns, &table.primary_key, self.query_rows(&sql)?)
+    }
+
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
         self.connect_source_if_needed()?
             .query_rows_as_strings(sql)

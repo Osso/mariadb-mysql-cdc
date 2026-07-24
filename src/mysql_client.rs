@@ -48,6 +48,7 @@ pub struct PersistentMySqlSource {
     conn: RefCell<Conn>,
 }
 
+#[derive(Clone)]
 pub struct PersistentTargetExecutor {
     conn: SharedTargetConnection,
     connection_opts: Opts,

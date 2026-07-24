@@ -1,8 +1,14 @@
+use super::fk_parent_repair::{
+    ForeignKeyColumn, ForeignKeyEdge, ParentIdentity, ParentRepairRow, ParentRepairStore,
+    repair_fk_parents_and_retry,
+};
+use super::mysql::MySqlSyncReader;
 use super::{SyncTable, TableSyncError};
-use crate::snapshot::SnapshotRow;
-use crate::target::PrimaryKey;
+use crate::inventory::{ForeignKeyInventory, SchemaInventory, TableInventory};
+use crate::snapshot::{SnapshotRow, SnapshotTable};
+use crate::target::{PrimaryKey, SnapshotInsertMode, TargetMySqlWriter};
 use mysql::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub trait SyncRepairTarget {
     fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError>;
@@ -68,15 +74,268 @@ where
 }
 
 pub(crate) struct MySqlSyncRepairTarget {
-    writer: crate::target::TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
+    writer: TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
+    fk_repair: Option<MySqlFkRepairContext>,
+}
+
+struct MySqlFkRepairContext {
+    source: MySqlSyncReader,
+    target: MySqlSyncReader,
+    tables: BTreeMap<String, TableInventory>,
+    edges: Vec<ForeignKeyEdge>,
 }
 
 impl MySqlSyncRepairTarget {
     pub(crate) fn new(
-        writer: crate::target::TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
+        writer: TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
     ) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            fk_repair: None,
+        }
     }
+
+    pub(crate) fn new_with_fk_repair(
+        writer: TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
+        source: MySqlSyncReader,
+        target: MySqlSyncReader,
+        source_inventory: SchemaInventory,
+        target_inventory: SchemaInventory,
+    ) -> Self {
+        let tables = source_inventory
+            .tables
+            .into_iter()
+            .map(|table| (table.name.clone(), table))
+            .collect();
+        let edges = merged_fk_edges(
+            &source_inventory.schema,
+            source_inventory.foreign_keys,
+            target_inventory.foreign_keys,
+        );
+        Self {
+            writer,
+            fk_repair: Some(MySqlFkRepairContext {
+                source,
+                target,
+                tables,
+                edges,
+            }),
+        }
+    }
+
+    fn repair_fk_parents_and_retry(&mut self, rows: &[SnapshotRow]) -> Result<(), TableSyncError> {
+        let child_table = self.writer.table_name().to_string();
+        let child_rows = rows
+            .iter()
+            .map(|row| ParentRepairRow {
+                table: child_table.clone(),
+                values: row.values.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Some(mut context) = self.fk_repair.take() else {
+            return Err(TableSyncError::Repair(
+                "foreign-key parent repair context is unavailable".to_string(),
+            ));
+        };
+        let result = repair_fk_parents_and_retry(
+            &child_table,
+            &child_rows,
+            &context.edges.clone(),
+            &mut MySqlParentRepairStore {
+                writer: &self.writer,
+                context: &mut context,
+            },
+        )
+        .map_err(|error| TableSyncError::Repair(error.to_string()));
+        self.fk_repair = Some(context);
+        result
+    }
+
+    fn verify_child_rows(&self, rows: &[SnapshotRow]) -> Result<(), TableSyncError> {
+        let Some(context) = &self.fk_repair else {
+            return Ok(());
+        };
+        let table_name = self.writer.table_name();
+        let table = context.tables.get(table_name).ok_or_else(|| {
+            TableSyncError::Repair(format!("source inventory is missing table `{table_name}`"))
+        })?;
+        for source_row in rows {
+            let identity = row_identity(table, source_row)?;
+            let target_rows = context.target.read_exact_inventory_rows(table, &identity)?;
+            if target_rows.len() != 1 || target_rows.first() != Some(source_row) {
+                return Err(TableSyncError::Repair(format!(
+                    "post-insert verification failed for `{table_name}` identity {identity:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct MySqlParentRepairStore<'a> {
+    writer: &'a TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
+    context: &'a mut MySqlFkRepairContext,
+}
+
+impl ParentRepairStore for MySqlParentRepairStore<'_> {
+    fn read_source_parent(
+        &mut self,
+        identity: &ParentIdentity,
+    ) -> Result<Option<ParentRepairRow>, String> {
+        self.read_parent(&self.context.source, identity)
+    }
+
+    fn read_target_parent(
+        &mut self,
+        identity: &ParentIdentity,
+    ) -> Result<Option<ParentRepairRow>, String> {
+        self.read_parent(&self.context.target, identity)
+    }
+
+    fn repair_parent(&mut self, row: &ParentRepairRow) -> Result<(), String> {
+        let table = self.table(&row.table)?;
+        let snapshot_row = parent_snapshot_row(table, row)?;
+        let target_rows = self
+            .context
+            .target
+            .read_exact_inventory_rows(
+                table,
+                &row_identity(table, &snapshot_row).map_err(|e| e.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        let parent_writer = TargetMySqlWriter::from_snapshot_table(
+            &SnapshotTable::from(table),
+            self.writer.executor.clone(),
+            SnapshotInsertMode::Insert,
+        );
+        match target_rows.as_slice() {
+            [] => parent_writer
+                .insert_rows(std::slice::from_ref(&snapshot_row))
+                .map_err(|error| error.to_string()),
+            [_] => parent_writer
+                .update_row(&snapshot_row)
+                .map_err(|error| error.to_string()),
+            rows => Err(format!(
+                "target parent identity for `{}` is ambiguous: {} rows",
+                row.table,
+                rows.len()
+            )),
+        }
+    }
+
+    fn retry_child_batch(&mut self, table: &str, rows: &[ParentRepairRow]) -> Result<(), String> {
+        let table_inventory = self.table(table)?;
+        let snapshot_rows = rows
+            .iter()
+            .map(|row| parent_snapshot_row(table_inventory, row))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.writer
+            .insert_rows(&snapshot_rows)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl MySqlParentRepairStore<'_> {
+    fn table(&self, table: &str) -> Result<&TableInventory, String> {
+        self.context
+            .tables
+            .get(table)
+            .ok_or_else(|| format!("source inventory is missing parent table `{table}`"))
+    }
+
+    fn read_parent(
+        &self,
+        reader: &MySqlSyncReader,
+        identity: &ParentIdentity,
+    ) -> Result<Option<ParentRepairRow>, String> {
+        let table = self.table(&identity.table)?;
+        let rows = reader
+            .read_exact_inventory_rows(table, &identity.values)
+            .map_err(|error| error.to_string())?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => Ok(Some(ParentRepairRow {
+                table: identity.table.clone(),
+                values: row.values.clone(),
+            })),
+            rows => Err(format!(
+                "exact parent identity for `{}` is ambiguous: {} rows",
+                identity.table,
+                rows.len()
+            )),
+        }
+    }
+}
+
+fn merged_fk_edges(
+    schema: &str,
+    source: Vec<ForeignKeyInventory>,
+    target: Vec<ForeignKeyInventory>,
+) -> Vec<ForeignKeyEdge> {
+    source
+        .into_iter()
+        .chain(target)
+        .filter(|foreign_key| foreign_key.referenced_schema == schema)
+        .map(|foreign_key| ForeignKeyEdge {
+            child_table: foreign_key.table,
+            parent_table: foreign_key.referenced_table,
+            columns: foreign_key
+                .columns
+                .into_iter()
+                .zip(foreign_key.referenced_columns)
+                .map(|(child, parent)| ForeignKeyColumn { child, parent })
+                .collect(),
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn parent_snapshot_row(
+    table: &TableInventory,
+    row: &ParentRepairRow,
+) -> Result<SnapshotRow, String> {
+    let primary_key = table
+        .primary_key
+        .iter()
+        .map(|column| {
+            row.values
+                .get(column)
+                .and_then(Option::clone)
+                .ok_or_else(|| {
+                    format!(
+                        "parent `{}` has null or missing primary key `{column}`",
+                        table.name
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SnapshotRow {
+        primary_key,
+        values: row.values.clone(),
+    })
+}
+
+fn row_identity(
+    table: &TableInventory,
+    row: &SnapshotRow,
+) -> Result<Vec<(String, String)>, TableSyncError> {
+    table
+        .primary_key
+        .iter()
+        .map(|column| {
+            row.values
+                .get(column)
+                .and_then(Option::clone)
+                .map(|value| (column.clone(), value))
+                .ok_or_else(|| {
+                    TableSyncError::Repair(format!(
+                        "row in `{}` has null or missing primary key `{column}`",
+                        table.name
+                    ))
+                })
+        })
+        .collect()
 }
 
 impl SyncRepairTarget for MySqlSyncRepairTarget {
@@ -88,9 +347,14 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
 
     fn insert_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         let rows = rows.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
-        self.writer
-            .insert_rows(&rows)
-            .map_err(|error| TableSyncError::Repair(error.to_string()))
+        match self.writer.insert_rows(&rows) {
+            Ok(()) => self.verify_child_rows(&rows),
+            Err(error) if error.mysql_code() == Some(1452) => {
+                self.repair_fk_parents_and_retry(&rows)?;
+                self.verify_child_rows(&rows)
+            }
+            Err(error) => Err(TableSyncError::Repair(error.to_string())),
+        }
     }
 
     fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
