@@ -91,7 +91,7 @@ fn render_add_key(index: &ParsedIndexAst) -> String {
 }
 
 fn quote_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableAst, String> {
@@ -251,7 +251,828 @@ pub fn supports_fixture_create_table(source_sql: &str) -> bool {
     parse_fixture_create_table(source_sql).is_ok()
 }
 
-#[cfg(test)]
+pub fn render_modeled_index_ddl(
+    index: &super::model::ParsedIndexAst,
+    source_sql: &str,
+) -> Result<DdlTransformation, String> {
+    if !index.create {
+        return Err("modeled index renderer requires CREATE INDEX".to_string());
+    }
+    if index.index_type != "BTREE" {
+        return Err(format!(
+            "unsupported modeled index type {}",
+            index.index_type
+        ));
+    }
+    let unique = if index.unique { " UNIQUE" } else { "" };
+    let key_parts = index
+        .key_parts
+        .iter()
+        .map(render_modeled_index_key_part)
+        .collect::<Vec<_>>()
+        .join(",");
+    let tokens = super::tokenizer::tokenize_ddl(source_sql)?;
+    let visibility = if tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("INVISIBLE"))
+    {
+        " INVISIBLE"
+    } else if tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("VISIBLE"))
+    {
+        " VISIBLE"
+    } else {
+        ""
+    };
+    let comment = index
+        .comment
+        .as_ref()
+        .map(|value| format!(" COMMENT {}", quote_string_literal(value)))
+        .unwrap_or_default();
+    Ok(DdlTransformation {
+        version: DDL_TRANSFORMATION_VERSION,
+        target_sql: Some(format!(
+            "CREATE{unique} INDEX {} ON {} ({key_parts}) USING BTREE{visibility}{comment}",
+            quote_identifier(&index.name),
+            quote_identifier(&index.table),
+        )),
+    })
+}
+
+fn render_modeled_index_key_part(part: &super::model::ParsedIndexKeyPart) -> String {
+    let mut rendered = quote_identifier(&part.column);
+    if let Some(prefix_length) = part.prefix_length {
+        rendered.push_str(&format!("({prefix_length})"));
+    }
+    if part.order != "ASC" {
+        rendered.push(' ');
+        rendered.push_str(&part.order);
+    }
+    if let Some(collation) = &part.collation {
+        rendered.push_str(" COLLATE ");
+        rendered.push_str(&quote_identifier(collation));
+    }
+    rendered
+}
+
+pub fn transform_generated_schema_ddl(source_sql: &str) -> Result<DdlTransformation, String> {
+    validate_generated_schema_ddl(source_sql)?;
+    Ok(DdlTransformation {
+        version: DDL_TRANSFORMATION_VERSION,
+        target_sql: Some(source_sql.trim().trim_end_matches(';').trim().to_string()),
+    })
+}
+
+fn validate_generated_schema_ddl(source_sql: &str) -> Result<(), String> {
+    let tokens = generated_schema_tokens(source_sql).ok_or_else(|| {
+        "generated schema DDL has unsupported quoting, comments, or statement shape".to_string()
+    })?;
+    if tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("ENUM"))
+    {
+        return Err("generated schema DDL does not support ENUM".to_string());
+    }
+    if is_generated_create_table(&tokens) {
+        return validate_generated_create_table(&tokens);
+    }
+    if is_generated_alter_table(&tokens) {
+        return validate_generated_alter_table(&tokens);
+    }
+    if is_generated_unique_index(&tokens) {
+        return validate_generated_unique_index(&tokens);
+    }
+    Err("generated schema DDL family is unsupported".to_string())
+}
+
+fn validate_generated_create_table(tokens: &[String]) -> Result<(), String> {
+    let close = matching_parenthesis(tokens, 3)?;
+    validate_create_table_definitions(tokens, 4, close)?;
+    if close + 3 >= tokens.len()
+        || !tokens_match(tokens, close + 1, "ENGINE")
+        || tokens.get(close + 2).map(String::as_str) != Some("=")
+    {
+        return Err("generated CREATE TABLE requires an explicit ENGINE".to_string());
+    }
+    validate_create_table_tail(tokens, close + 3)
+}
+
+fn validate_create_table_tail(tokens: &[String], engine_value: usize) -> Result<(), String> {
+    let mut index = engine_value + 1;
+    while index < tokens.len() {
+        index = consume_create_table_option(tokens, index)?;
+    }
+    Ok(())
+}
+
+fn consume_create_table_option(tokens: &[String], mut index: usize) -> Result<usize, String> {
+    if tokens_match(tokens, index, "DEFAULT") {
+        index += 1;
+    }
+    if tokens_match(tokens, index, "CHARACTER") {
+        index += 1;
+        if tokens_match(tokens, index, "SET") {
+            index += 1;
+        }
+    } else if token_is_one_of(tokens, index, &["CHARSET", "COLLATE"]) {
+        index += 1;
+    } else {
+        return Err("generated CREATE TABLE has an unmodeled option".to_string());
+    }
+    if tokens.get(index).map(String::as_str) == Some("=") {
+        index += 1;
+    }
+    tokens
+        .get(index)
+        .map(|_| index + 1)
+        .ok_or_else(|| "generated CREATE TABLE option value is missing".to_string())
+}
+
+fn validate_generated_alter_table(tokens: &[String]) -> Result<(), String> {
+    if has_top_level_comma(tokens, 3) {
+        return Err("generated ALTER TABLE must contain exactly one action".to_string());
+    }
+    let action = tokens.get(3).map(|token| token.to_ascii_uppercase());
+    match action.as_deref() {
+        Some("ADD") => validate_generated_add(tokens),
+        Some("MODIFY") if tokens_match(tokens, 4, "COLUMN") => {
+            validate_column_definition(tokens, 5, tokens.len(), true)
+        }
+        Some("DROP") => validate_generated_drop(tokens),
+        _ => Err("generated ALTER TABLE action is unsupported".to_string()),
+    }
+}
+
+fn validate_generated_add(tokens: &[String]) -> Result<(), String> {
+    if tokens_match(tokens, 4, "COLUMN") {
+        return validate_column_definition(tokens, 5, tokens.len(), true);
+    }
+    if tokens_match(tokens, 4, "PRIMARY") {
+        return validate_key_definition(tokens, 4, tokens.len(), false);
+    }
+    if tokens_match(tokens, 4, "CONSTRAINT") {
+        return validate_constraint_definition(tokens, 4, tokens.len());
+    }
+    Err("generated ADD action is unsupported".to_string())
+}
+
+fn validate_create_table_definitions(
+    tokens: &[String],
+    start: usize,
+    end: usize,
+) -> Result<(), String> {
+    for (definition_start, definition_end) in top_level_ranges(tokens, start, end)? {
+        validate_create_table_definition(tokens, definition_start, definition_end)?;
+    }
+    Ok(())
+}
+
+fn top_level_ranges(
+    tokens: &[String],
+    start: usize,
+    end: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut ranges = Vec::new();
+    let mut definition_start = start;
+    let mut depth = 0_u32;
+    for (index, token) in tokens.iter().enumerate().take(end).skip(start) {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "generated definition parentheses are unbalanced".to_string())?;
+            }
+            "," if depth == 0 => {
+                if definition_start == index {
+                    return Err("generated CREATE TABLE contains an empty definition".to_string());
+                }
+                ranges.push((definition_start, index));
+                definition_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || definition_start >= end {
+        return Err("generated CREATE TABLE definitions are incomplete".to_string());
+    }
+    ranges.push((definition_start, end));
+    Ok(ranges)
+}
+
+fn validate_create_table_definition(
+    tokens: &[String],
+    start: usize,
+    end: usize,
+) -> Result<(), String> {
+    if tokens_match(tokens, start, "PRIMARY") {
+        return validate_key_definition(tokens, start, end, false);
+    }
+    if tokens_match(tokens, start, "UNIQUE")
+        || tokens_match(tokens, start, "KEY")
+        || tokens_match(tokens, start, "INDEX")
+    {
+        return validate_key_definition(tokens, start, end, true);
+    }
+    if tokens_match(tokens, start, "CONSTRAINT") {
+        return validate_constraint_definition(tokens, start, end);
+    }
+    validate_column_definition(tokens, start, end, false)
+}
+
+fn validate_key_definition(
+    tokens: &[String],
+    start: usize,
+    end: usize,
+    named: bool,
+) -> Result<(), String> {
+    let mut index = start;
+    if tokens_match(tokens, index, "UNIQUE") {
+        index += 1;
+    }
+    if tokens_match(tokens, index, "PRIMARY") {
+        index += 1;
+        require_generated_keyword(tokens, index, end, "KEY")?;
+        index += 1;
+    } else {
+        if !token_is_one_of(tokens, index, &["KEY", "INDEX"]) {
+            return Err("generated secondary index requires KEY or INDEX".to_string());
+        }
+        index += 1;
+        if named {
+            require_generated_identifier(tokens, index, end, "key name")?;
+            index += 1;
+        }
+    }
+    let close = validate_parenthesized_definition(tokens, index, end)?;
+    validate_generated_index_options(tokens, close + 1, end)
+}
+
+fn validate_generated_index_options(
+    tokens: &[String],
+    mut index: usize,
+    end: usize,
+) -> Result<(), String> {
+    while index < end {
+        if tokens_match(tokens, index, "USING") {
+            if !tokens_match(tokens, index + 1, "BTREE") {
+                return Err("generated index USING type is unsupported".to_string());
+            }
+            index += 2;
+        } else if token_is_one_of(tokens, index, &["VISIBLE", "INVISIBLE"]) {
+            index += 1;
+        } else if tokens_match(tokens, index, "COMMENT") {
+            require_generated_keyword(tokens, index + 1, end, "<string>")?;
+            index += 2;
+        } else {
+            return Err("generated key definition has unknown trailing option".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_constraint_definition(
+    tokens: &[String],
+    start: usize,
+    end: usize,
+) -> Result<(), String> {
+    require_generated_identifier(tokens, start + 1, end, "constraint name")?;
+    if tokens_match(tokens, start + 2, "FOREIGN") {
+        require_generated_keyword(tokens, start + 3, end, "KEY")?;
+        let child_close = validate_parenthesized_definition(tokens, start + 4, end)?;
+        require_generated_keyword(tokens, child_close + 1, end, "REFERENCES")?;
+        let parent_columns_open =
+            validate_generated_parent_reference(tokens, child_close + 2, end)?;
+        let parent_close = validate_parenthesized_definition(tokens, parent_columns_open, end)?;
+        return validate_reference_actions(tokens, parent_close + 1, end);
+    }
+    if tokens_match(tokens, start + 2, "CHECK") {
+        let close = validate_parenthesized_definition(tokens, start + 3, end)?;
+        return (close + 1 == end)
+            .then_some(())
+            .ok_or_else(|| "generated CHECK constraint has trailing tokens".to_string());
+    }
+    Err("generated constraint kind is unsupported".to_string())
+}
+
+fn validate_generated_parent_reference(
+    tokens: &[String],
+    parent_start: usize,
+    end: usize,
+) -> Result<usize, String> {
+    require_generated_identifier(tokens, parent_start, end, "parent table or schema")?;
+    if tokens.get(parent_start + 1).map(String::as_str) != Some(".") {
+        return Ok(parent_start + 1);
+    }
+    require_generated_identifier(tokens, parent_start + 2, end, "parent table")?;
+    if tokens.get(parent_start + 3).map(String::as_str) == Some(".") {
+        return Err("generated parent reference has malformed qualification".to_string());
+    }
+    Ok(parent_start + 3)
+}
+
+fn validate_reference_actions(
+    tokens: &[String],
+    mut index: usize,
+    end: usize,
+) -> Result<(), String> {
+    while index < end {
+        require_generated_keyword(tokens, index, end, "ON")?;
+        if !token_is_one_of(tokens, index + 1, &["DELETE", "UPDATE"]) {
+            return Err("generated foreign key action is unsupported".to_string());
+        }
+        index += 2;
+        if tokens_match(tokens, index, "SET") {
+            require_generated_keyword(tokens, index + 1, end, "NULL")?;
+            index += 2;
+        } else if tokens_match(tokens, index, "NO") {
+            require_generated_keyword(tokens, index + 1, end, "ACTION")?;
+            index += 2;
+        } else if token_is_one_of(tokens, index, &["CASCADE", "RESTRICT"]) {
+            index += 1;
+        } else {
+            return Err("generated foreign key action value is unsupported".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_column_definition(
+    tokens: &[String],
+    start: usize,
+    end: usize,
+    allow_position: bool,
+) -> Result<(), String> {
+    require_generated_identifier(tokens, start, end, "column name")?;
+    let mut index = validate_column_type(tokens, start + 1, end)?;
+    while index < end {
+        index = consume_column_modifier(tokens, index, end, allow_position)?.ok_or_else(|| {
+            format!(
+                "generated column definition has unsupported modifier {:?}",
+                tokens[index]
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn consume_column_modifier(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+    allow_position: bool,
+) -> Result<Option<usize>, String> {
+    if let Some(next) = consume_storage_column_modifier(tokens, index, end)? {
+        return Ok(Some(next));
+    }
+    consume_behavior_column_modifier(tokens, index, end, allow_position)
+}
+
+fn consume_storage_column_modifier(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+) -> Result<Option<usize>, String> {
+    if token_is_one_of(
+        tokens,
+        index,
+        &["UNSIGNED", "ZEROFILL", "NULL", "AUTO_INCREMENT"],
+    ) {
+        return Ok(Some(index + 1));
+    }
+    if tokens_match(tokens, index, "NOT") {
+        return require_following_keyword(tokens, index, end, "NULL");
+    }
+    if tokens_match(tokens, index, "DEFAULT") {
+        return consume_default_expression(tokens, index + 1, end).map(Some);
+    }
+    if tokens_match(tokens, index, "CHARACTER") {
+        return consume_character_set(tokens, index, end).map(Some);
+    }
+    if tokens_match(tokens, index, "COLLATE") {
+        require_generated_identifier(tokens, index + 1, end, "collation")?;
+        return Ok(Some(index + 2));
+    }
+    Ok(None)
+}
+
+fn consume_behavior_column_modifier(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+    allow_position: bool,
+) -> Result<Option<usize>, String> {
+    if tokens_match(tokens, index, "ON") {
+        require_generated_keyword(tokens, index + 1, end, "UPDATE")?;
+        return consume_current_timestamp(tokens, index + 2, end).map(Some);
+    }
+    if tokens_match(tokens, index, "COMMENT") {
+        return require_following_keyword(tokens, index, end, "<string>");
+    }
+    if tokens_match(tokens, index, "GENERATED") || tokens_match(tokens, index, "AS") {
+        return consume_generated_expression(tokens, index, end).map(Some);
+    }
+    if allow_position {
+        return consume_column_position(tokens, index, end);
+    }
+    consume_inline_key_modifier(tokens, index, end)
+}
+
+fn require_following_keyword(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+    expected: &str,
+) -> Result<Option<usize>, String> {
+    require_generated_keyword(tokens, index + 1, end, expected)?;
+    Ok(Some(index + 2))
+}
+
+fn consume_character_set(tokens: &[String], index: usize, end: usize) -> Result<usize, String> {
+    require_generated_keyword(tokens, index + 1, end, "SET")?;
+    require_generated_identifier(tokens, index + 2, end, "character set")?;
+    Ok(index + 3)
+}
+
+fn consume_column_position(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+) -> Result<Option<usize>, String> {
+    if tokens_match(tokens, index, "AFTER") {
+        require_generated_identifier(tokens, index + 1, end, "AFTER column")?;
+        return Ok(Some(index + 2));
+    }
+    if tokens_match(tokens, index, "FIRST") {
+        return Ok(Some(index + 1));
+    }
+    consume_inline_key_modifier(tokens, index, end)
+}
+
+fn consume_inline_key_modifier(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+) -> Result<Option<usize>, String> {
+    if tokens_match(tokens, index, "PRIMARY") {
+        return require_following_keyword(tokens, index, end, "KEY");
+    }
+    if tokens_match(tokens, index, "UNIQUE") {
+        let next = index + usize::from(tokens_match(tokens, index + 1, "KEY")) + 1;
+        return Ok(Some(next));
+    }
+    Ok(None)
+}
+
+const SUPPORTED_COLUMN_TYPES: &[&str] = &[
+    "BIGINT",
+    "BINARY",
+    "BIT",
+    "BLOB",
+    "BOOL",
+    "BOOLEAN",
+    "CHAR",
+    "DATE",
+    "DATETIME",
+    "DECIMAL",
+    "DOUBLE",
+    "FLOAT",
+    "GEOMETRY",
+    "GEOMETRYCOLLECTION",
+    "INT",
+    "INTEGER",
+    "JSON",
+    "LINESTRING",
+    "LONGBLOB",
+    "LONGTEXT",
+    "MEDIUMBLOB",
+    "MEDIUMINT",
+    "MEDIUMTEXT",
+    "MULTILINESTRING",
+    "MULTIPOINT",
+    "MULTIPOLYGON",
+    "NUMERIC",
+    "POINT",
+    "POLYGON",
+    "REAL",
+    "SMALLINT",
+    "TEXT",
+    "TIME",
+    "TIMESTAMP",
+    "TINYBLOB",
+    "TINYINT",
+    "TINYTEXT",
+    "VARBINARY",
+    "VARCHAR",
+    "YEAR",
+];
+
+const PARAMETERIZED_COLUMN_TYPES: &[&str] = &[
+    "BIGINT",
+    "BINARY",
+    "BIT",
+    "CHAR",
+    "DATETIME",
+    "DECIMAL",
+    "DOUBLE",
+    "FLOAT",
+    "INT",
+    "INTEGER",
+    "MEDIUMINT",
+    "NUMERIC",
+    "REAL",
+    "SMALLINT",
+    "TIME",
+    "TIMESTAMP",
+    "TINYINT",
+    "VARBINARY",
+    "VARCHAR",
+    "YEAR",
+];
+
+fn validate_column_type(tokens: &[String], index: usize, end: usize) -> Result<usize, String> {
+    let column_type = tokens
+        .get(index)
+        .filter(|_| index < end)
+        .ok_or_else(|| "generated column type is missing".to_string())?;
+    if column_type.eq_ignore_ascii_case("ENUM") || column_type.eq_ignore_ascii_case("SET") {
+        return Err(format!(
+            "generated schema DDL does not support {column_type}"
+        ));
+    }
+    if !type_is_supported(column_type, SUPPORTED_COLUMN_TYPES) {
+        return Err(format!(
+            "generated column type {column_type} is unsupported"
+        ));
+    }
+    validate_optional_type_parameters(tokens, index + 1, end, column_type)
+}
+
+fn validate_optional_type_parameters(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+    column_type: &str,
+) -> Result<usize, String> {
+    if tokens.get(index).map(String::as_str) != Some("(") {
+        return Ok(index);
+    }
+    if !type_is_supported(column_type, PARAMETERIZED_COLUMN_TYPES) {
+        return Err(format!(
+            "generated column type {column_type} does not accept parameters"
+        ));
+    }
+    let close = validate_parenthesized_definition(tokens, index, end)?;
+    validate_numeric_type_parameters(tokens, index + 1, close)?;
+    Ok(close + 1)
+}
+
+fn type_is_supported(column_type: &str, supported: &[&str]) -> bool {
+    supported
+        .iter()
+        .any(|candidate| column_type.eq_ignore_ascii_case(candidate))
+}
+
+fn validate_numeric_type_parameters(
+    tokens: &[String],
+    start: usize,
+    end: usize,
+) -> Result<(), String> {
+    if start >= end {
+        return Err("generated column type parameters are empty".to_string());
+    }
+    let mut expect_number = true;
+    for token in &tokens[start..end] {
+        if expect_number {
+            if token.parse::<u32>().is_err() {
+                return Err(format!(
+                    "generated column type parameter {token:?} is unsupported"
+                ));
+            }
+        } else if token != "," {
+            return Err("generated column type parameters require commas".to_string());
+        }
+        expect_number = !expect_number;
+    }
+    if expect_number {
+        Err("generated column type parameter list is incomplete".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn consume_default_expression(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+) -> Result<usize, String> {
+    if tokens_match(tokens, index, "CURRENT_TIMESTAMP") {
+        return consume_current_timestamp(tokens, index, end);
+    }
+    if tokens.get(index).is_some_and(|_| index < end) {
+        return Ok(index + 1);
+    }
+    Err("generated DEFAULT value is missing".to_string())
+}
+
+fn consume_current_timestamp(tokens: &[String], index: usize, end: usize) -> Result<usize, String> {
+    require_generated_keyword(tokens, index, end, "CURRENT_TIMESTAMP")?;
+    if tokens.get(index + 1).map(String::as_str) == Some("(") {
+        return Ok(validate_parenthesized_definition(tokens, index + 1, end)? + 1);
+    }
+    Ok(index + 1)
+}
+
+fn consume_generated_expression(
+    tokens: &[String],
+    mut index: usize,
+    end: usize,
+) -> Result<usize, String> {
+    if tokens_match(tokens, index, "GENERATED") {
+        require_generated_keyword(tokens, index + 1, end, "ALWAYS")?;
+        index += 2;
+    }
+    require_generated_keyword(tokens, index, end, "AS")?;
+    let close = validate_parenthesized_definition(tokens, index + 1, end)?;
+    if !token_is_one_of(tokens, close + 1, &["VIRTUAL", "STORED"]) {
+        return Err("generated column requires VIRTUAL or STORED".to_string());
+    }
+    Ok(close + 2)
+}
+
+fn validate_parenthesized_definition(
+    tokens: &[String],
+    open: usize,
+    end: usize,
+) -> Result<usize, String> {
+    if open >= end || tokens.get(open).map(String::as_str) != Some("(") {
+        return Err("generated parenthesized definition is missing".to_string());
+    }
+    let close = matching_parenthesis(tokens, open)?;
+    if close >= end {
+        return Err("generated parenthesized definition crosses its boundary".to_string());
+    }
+    Ok(close)
+}
+
+fn require_generated_keyword(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+    expected: &str,
+) -> Result<(), String> {
+    if index < end && tokens_match(tokens, index, expected) {
+        Ok(())
+    } else {
+        Err(format!("generated definition expected {expected}"))
+    }
+}
+
+fn require_generated_identifier(
+    tokens: &[String],
+    index: usize,
+    end: usize,
+    context: &str,
+) -> Result<(), String> {
+    let token = tokens
+        .get(index)
+        .filter(|_| index < end)
+        .ok_or_else(|| format!("generated {context} is missing"))?;
+    if token == "<string>" || matches!(token.as_str(), "(" | ")" | "," | "." | "=") {
+        Err(format!("generated {context} is invalid"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_generated_drop(tokens: &[String]) -> Result<(), String> {
+    if tokens_match(tokens, 4, "PRIMARY") {
+        return (tokens.len() == 6 && tokens_match(tokens, 5, "KEY"))
+            .then_some(())
+            .ok_or_else(|| "generated DROP PRIMARY KEY is ambiguous".to_string());
+    }
+    if tokens_match(tokens, 4, "FOREIGN") {
+        return (tokens.len() == 7 && tokens_match(tokens, 5, "KEY"))
+            .then_some(())
+            .ok_or_else(|| "generated DROP FOREIGN KEY is ambiguous".to_string());
+    }
+    if tokens_match(tokens, 4, "CHECK") {
+        return (tokens.len() == 6)
+            .then_some(())
+            .ok_or_else(|| "generated DROP CHECK is ambiguous".to_string());
+    }
+    if tokens_match(tokens, 4, "COLUMN") {
+        let offset = if tokens_match(tokens, 5, "IF") { 8 } else { 6 };
+        return (tokens.len() == offset)
+            .then_some(())
+            .ok_or_else(|| "generated DROP COLUMN is ambiguous".to_string());
+    }
+    Err("generated DROP action is unsupported".to_string())
+}
+
+fn is_generated_unique_index(tokens: &[String]) -> bool {
+    tokens_match(tokens, 0, "CREATE")
+        && tokens_match(tokens, 1, "UNIQUE")
+        && tokens_match(tokens, 2, "INDEX")
+}
+
+fn validate_generated_unique_index(tokens: &[String]) -> Result<(), String> {
+    if tokens.len() < 8 || !tokens_match(tokens, 4, "ON") {
+        return Err("generated CREATE UNIQUE INDEX header is invalid".to_string());
+    }
+    let open = tokens
+        .iter()
+        .position(|token| token == "(")
+        .ok_or_else(|| "generated CREATE UNIQUE INDEX columns are missing".to_string())?;
+    let close = matching_parenthesis(tokens, open)?;
+    (close + 1 == tokens.len())
+        .then_some(())
+        .ok_or_else(|| "generated CREATE UNIQUE INDEX has unmodeled options".to_string())
+}
+
+fn matching_parenthesis(tokens: &[String], open: usize) -> Result<usize, String> {
+    let mut depth = 0_u32;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "generated DDL parentheses are unbalanced".to_string())?;
+                if depth == 0 {
+                    return Ok(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err("generated DDL parentheses are unbalanced".to_string())
+}
+
+fn has_top_level_comma(tokens: &[String], start: usize) -> bool {
+    let mut depth = 0_u32;
+    for token in tokens.iter().skip(start) {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            "," if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn generated_schema_tokens(source_sql: &str) -> Option<Vec<String>> {
+    if ddl_contains_comments(source_sql) || source_sql.contains('"') {
+        return None;
+    }
+    let mut tokens = tokenize_ddl(source_sql).ok()?;
+    if tokens.last().is_some_and(|token| token == ";") {
+        tokens.pop();
+    }
+    (!tokens.iter().any(|token| token == ";") && tokens.len() >= 4).then_some(tokens)
+}
+
+fn is_generated_create_table(tokens: &[String]) -> bool {
+    tokens_match(tokens, 0, "CREATE")
+        && tokens_match(tokens, 1, "TABLE")
+        && tokens.get(3).is_some_and(|token| token == "(")
+        && tokens
+            .iter()
+            .any(|token| token.eq_ignore_ascii_case("ENGINE"))
+}
+
+fn is_generated_alter_table(tokens: &[String]) -> bool {
+    if !tokens_match(tokens, 0, "ALTER") || !tokens_match(tokens, 1, "TABLE") {
+        return false;
+    }
+    match tokens.get(3).map(|token| token.to_ascii_uppercase()) {
+        Some(action) if action == "ADD" => {
+            token_is_one_of(tokens, 4, &["COLUMN", "PRIMARY", "CONSTRAINT"])
+        }
+        Some(action) if action == "MODIFY" => tokens_match(tokens, 4, "COLUMN"),
+        Some(action) if action == "DROP" => {
+            token_is_one_of(tokens, 4, &["PRIMARY", "FOREIGN", "CHECK"])
+        }
+        _ => false,
+    }
+}
+
+fn tokens_match(tokens: &[String], index: usize, expected: &str) -> bool {
+    tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case(expected))
+}
+
+fn token_is_one_of(tokens: &[String], index: usize, expected: &[&str]) -> bool {
+    tokens.get(index).is_some_and(|token| {
+        expected
+            .iter()
+            .any(|candidate| token.eq_ignore_ascii_case(candidate))
+    })
+}
+
 pub fn transform_fixture_create_table(source_sql: &str) -> Result<DdlTransformation, String> {
     let ast = parse_fixture_create_table(source_sql)?;
     transform_fixture_create_table_ast(&ast, None)

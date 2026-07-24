@@ -294,9 +294,6 @@ fn strict_index_admission_rejects_non_simple_forms() {
         "CREATE UNIQUE INDEX idx_handle ON accounts (handle)",
         "CREATE INDEX ON accounts (handle)",
         "CREATE INDEX idx_handle ON accounts ((lower(handle)))",
-        "CREATE INDEX idx_handle ON accounts (handle) USING HASH",
-        "CREATE INDEX idx_handle ON accounts (handle) INVISIBLE",
-        "CREATE INDEX idx_handle ON accounts (handle) COMMENT 'migration'",
         "CREATE INDEX idx_handle ON accounts (handle) ALGORITHM=INPLACE",
         "CREATE INDEX idx_handle ON accounts (handle) LOCK=NONE",
         "DROP INDEX IF EXISTS idx_handle ON accounts",
@@ -315,12 +312,82 @@ fn strict_index_admission_accepts_simple_secondary_btree_forms() {
         "CREATE INDEX idx_handle ON accounts (handle) USING BTREE",
         "CREATE INDEX `idx``handle` ON `accounts` (`handle`)",
         "CREATE INDEX idx_handle ON accounts (handle(8) DESC)",
+        "CREATE INDEX idx_handle ON accounts (handle) USING BTREE INVISIBLE COMMENT 'planner'",
+        "CREATE INDEX idx_handle ON accounts (handle) VISIBLE COMMENT 'planner'",
         "DROP INDEX idx_handle ON accounts",
     ] {
         assert!(
             supports_automatic_index_ddl(sql),
             "rejected simple index DDL: {sql}"
         );
+    }
+}
+
+#[test]
+fn planner_index_options_are_preserved_in_the_parsed_ast() {
+    let operation = parse_ddl_operation(
+        "CREATE INDEX idx_handle ON accounts (handle) USING BTREE INVISIBLE COMMENT 'planner''s index'",
+    )
+    .expect("planner index DDL");
+    let index = operation.index_ast.expect("index AST");
+
+    assert_eq!(index.index_type, "BTREE");
+    assert!(!index.visible);
+    assert_eq!(index.comment.as_deref(), Some("planner's index"));
+}
+
+#[test]
+fn modeled_unique_btree_options_translate_through_shared_mapping() {
+    for (sql, visibility) in [
+        (
+            "CREATE UNIQUE INDEX `uq_handle` ON `accounts` (`handle`) USING BTREE VISIBLE COMMENT 'planner'",
+            "VISIBLE",
+        ),
+        (
+            "CREATE UNIQUE INDEX `uq_handle` ON `accounts` (`handle`) USING BTREE INVISIBLE COMMENT 'planner'",
+            "INVISIBLE",
+        ),
+    ] {
+        let translated = super::translate_modeled_ddl(sql, &[])
+            .unwrap_or_else(|error| panic!("modeled unique BTREE rejected: {sql}: {error}"));
+        assert_eq!(
+            translated.target_sql.as_deref(),
+            Some(
+                format!(
+                    "CREATE UNIQUE INDEX `uq_handle` ON `accounts` (`handle`) USING BTREE {visibility} COMMENT 'planner'"
+                )
+                .as_str()
+            )
+        );
+    }
+}
+
+#[test]
+fn unique_hash_and_unproven_generated_ddl_fail_closed_by_provenance() {
+    assert!(
+        super::translate_modeled_ddl(
+            "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING HASH",
+            &[],
+        )
+        .is_err()
+    );
+    assert!(
+        super::translate_ddl(
+            "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING BTREE",
+            &[],
+        )
+        .is_err()
+    );
+    for sql in [
+        "CREATE TABLE `items` (`id` BIGINT) ENGINE=InnoDB",
+        "ALTER TABLE `items` DROP PRIMARY KEY",
+    ] {
+        assert!(
+            super::translate_ddl(sql, &[]).is_err(),
+            "unproven streamed DDL passed through: {sql}"
+        );
+        super::translate_modeled_ddl(sql, &[])
+            .unwrap_or_else(|error| panic!("modeled planner DDL rejected: {sql}: {error}"));
     }
 }
 
@@ -349,6 +416,140 @@ fn index_tokenizer_skips_each_supported_comment_form() {
             "CREATE", "INDEX", "idx", "ON", "accounts", "(", "handle", ")"
         ]
     );
+}
+
+#[test]
+fn generated_convergence_translation_is_precise_and_temporal_mapping_is_case_insensitive() {
+    for sql in [
+        "ALTER TABLE `items` DROP PRIMARY KEY",
+        "ALTER TABLE `items` ADD PRIMARY KEY (`id`)",
+        "ALTER TABLE `items` ADD CONSTRAINT `fk_parent` FOREIGN KEY (`parent_id`) REFERENCES `parents` (`id`)",
+        "ALTER TABLE `items` DROP FOREIGN KEY `fk_parent`",
+        "ALTER TABLE `items` ADD CONSTRAINT `positive_id` CHECK (`id` > 0)",
+        "ALTER TABLE `items` DROP CHECK `positive_id`",
+        "ALTER TABLE `items` DROP COLUMN IF EXISTS `obsolete`",
+        "CREATE TABLE `items` (`id` BIGINT, KEY `idx_id` (`id`) USING BTREE INVISIBLE COMMENT 'planner') ENGINE=InnoDB",
+    ] {
+        super::translate_modeled_ddl(sql, &[])
+            .unwrap_or_else(|error| panic!("supported generated DDL rejected: {sql}: {error}"));
+    }
+
+    let mixed_case = super::translate_modeled_ddl(
+        "ALTER TABLE `items` ADD COLUMN `expires_at` TiMeStAmP(6) NULL",
+        &[],
+    )
+    .expect("mixed-case temporal mapping");
+    assert!(mixed_case.target_sql.unwrap().contains("DATETIME(6)"));
+
+    for sql in [
+        "CREATE TABLE `items` (`kind` ENUM('a','b')) ENGINE=InnoDB",
+        "ALTER TABLE `items` ADD COLUMN `a` BIGINT, ADD COLUMN `b` BIGINT",
+        "CREATE TABLE `items` (`id` BIGINT)",
+    ] {
+        assert!(
+            super::translate_ddl(sql, &[]).is_err(),
+            "unsupported or ambiguous DDL passed through: {sql}"
+        );
+    }
+}
+
+#[test]
+fn timestamp_translation_changes_only_real_sql_type_tokens() {
+    let sql = "ALTER TABLE `timestamp` ADD COLUMN `expires_at` TiMeStAmP(6) NULL COMMENT 'timestamp ''quoted''', ADD COLUMN `literal` VARCHAR(64) DEFAULT \"timestamp \\\"escaped\\\"\"; -- timestamp line\n# timestamp hash\n/* timestamp block */ /*!80000 timestamp version */";
+
+    let translated = super::translate_extended_timestamp(sql);
+
+    assert!(translated.contains("`expires_at` DATETIME(6)"));
+    assert!(translated.contains("`timestamp`"));
+    assert!(translated.contains("'timestamp ''quoted'''"));
+    assert!(translated.contains("\"timestamp \\\"escaped\\\"\""));
+    assert!(translated.contains("-- timestamp line"));
+    assert!(translated.contains("# timestamp hash"));
+    assert!(translated.contains("/* timestamp block */"));
+    assert!(translated.contains("/*!80000 timestamp version */"));
+}
+
+#[test]
+fn timestamp_translation_preserves_admitted_unquoted_identifiers() {
+    let index_sql = "CREATE INDEX timestamp ON items (created_at)";
+    let translated = super::translate_ddl(index_sql, &[]).expect("admitted streamed index DDL");
+    assert_eq!(translated.target_sql.as_deref(), Some(index_sql));
+
+    for sql in [
+        "ALTER TABLE items ADD CONSTRAINT timestamp CHECK (id > 0)",
+        "ALTER TABLE items ADD COLUMN timestamp BIGINT NULL",
+    ] {
+        let translated =
+            super::translate_modeled_ddl(sql, &[]).expect("admitted modeled identifier DDL");
+        assert_eq!(translated.target_sql.as_deref(), Some(sql));
+    }
+
+    let create = "CREATE TABLE items (id BIGINT, CONSTRAINT timestamp CHECK (id > 0), KEY timestamp (id), INDEX timestamp_2 (id), expires_at TIMESTAMP NULL)";
+    let translated_create = super::translate_extended_timestamp(create);
+    assert!(translated_create.contains("CONSTRAINT timestamp CHECK"));
+    assert!(translated_create.contains("KEY timestamp (id)"));
+    assert!(translated_create.contains("INDEX timestamp_2 (id)"));
+    assert!(translated_create.contains("expires_at DATETIME NULL"));
+
+    let temporal = super::translate_modeled_ddl(
+        "ALTER TABLE items ADD COLUMN expires_at TiMeStAmP(6) NULL",
+        &[],
+    )
+    .expect("mixed-case TIMESTAMP type");
+    assert_eq!(
+        temporal.target_sql.as_deref(),
+        Some("ALTER TABLE items ADD COLUMN expires_at DATETIME(6) NULL")
+    );
+}
+
+#[test]
+fn generated_foreign_keys_accept_exact_parent_qualification_only() {
+    for sql in [
+        "ALTER TABLE `items` ADD CONSTRAINT `fk_parent` FOREIGN KEY (`parent_id`) REFERENCES `parents` (`id`)",
+        "ALTER TABLE `items` ADD CONSTRAINT `fk_parent` FOREIGN KEY (`parent_id`) REFERENCES `globalcomix`.`parents` (`id`)",
+    ] {
+        super::translate_modeled_ddl(sql, &[])
+            .unwrap_or_else(|error| panic!("valid generated foreign key rejected: {sql}: {error}"));
+    }
+
+    for sql in [
+        "ALTER TABLE `items` ADD CONSTRAINT `fk_parent` FOREIGN KEY (`parent_id`) REFERENCES `globalcomix`. (`id`)",
+        "ALTER TABLE `items` ADD CONSTRAINT `fk_parent` FOREIGN KEY (`parent_id`) REFERENCES .`parents` (`id`)",
+        "ALTER TABLE `items` ADD CONSTRAINT `fk_parent` FOREIGN KEY (`parent_id`) REFERENCES `one`.`two`.`parents` (`id`)",
+    ] {
+        assert!(
+            super::translate_modeled_ddl(sql, &[]).is_err(),
+            "malformed generated foreign key passed: {sql}"
+        );
+    }
+}
+
+#[test]
+fn generated_schema_column_definitions_are_explicitly_modeled() {
+    for sql in [
+        "CREATE TABLE `items` (`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, `name` VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT NULL COMMENT 'label', `expires_at` TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), `slug` VARCHAR(64) GENERATED ALWAYS AS (lower(`name`)) STORED, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+        "ALTER TABLE `items` ADD COLUMN `expires_at` DATETIME(6) NULL DEFAULT NULL COMMENT 'expiry' AFTER `name`",
+        "ALTER TABLE `items` MODIFY COLUMN `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT",
+    ] {
+        super::translate_modeled_ddl(sql, &[])
+            .unwrap_or_else(|error| panic!("modeled generated DDL rejected: {sql}: {error}"));
+    }
+
+    for sql in [
+        "CREATE TABLE `items` (`kind` SET('a','b')) ENGINE=InnoDB",
+        "CREATE TABLE `items` (`kind` ENUM('a','b')) ENGINE=InnoDB",
+        "CREATE TABLE `items` (`payload` MYSTERY NULL) ENGINE=InnoDB",
+        "CREATE TABLE `items` (`id` BIGINT MAGIC) ENGINE=InnoDB",
+        "CREATE TABLE `items` (`id` BIGINT(foo)) ENGINE=InnoDB",
+        "ALTER TABLE `items` ADD COLUMN `payload` MYSTERY NULL",
+        "ALTER TABLE `items` ADD CONSTRAINT `bad` SOMETHING (`id`)",
+        "ALTER TABLE `items` MODIFY COLUMN `id` BIGINT MAGIC",
+    ] {
+        assert!(
+            super::translate_modeled_ddl(sql, &[]).is_err(),
+            "unmodeled generated column definition passed through: {sql}"
+        );
+    }
 }
 
 #[test]
@@ -393,7 +594,6 @@ fn strict_index_admission_rejects_every_non_simple_form() {
         "CREATE INDEX idx_handle ON accounts ((lower(handle)))",
         "CREATE FULLTEXT INDEX idx_handle ON accounts (handle)",
         "CREATE SPATIAL INDEX idx_handle ON accounts (handle)",
-        "CREATE INDEX idx_handle ON accounts (handle) INVISIBLE",
         "CREATE INDEX idx_handle ON accounts (handle) ALGORITHM=INPLACE",
         "CREATE INDEX idx_handle ON accounts (handle) LOCK=NONE",
         "CREATE INDEX idx_handle ON accounts (handle), idx_other ON accounts (id)",
@@ -897,25 +1097,43 @@ fn rename_column_if_exists_becomes_proven_noop_when_source_columns_are_absent() 
 }
 
 #[test]
-fn live_transform_keeps_fixture_create_table_disabled_until_evidence_gates_pass() {
+fn live_transform_uses_shared_create_table_translation() {
     let inventory = LiveDdlSemanticInventory::new(
         InventoryConfig::default(),
         InventoryConfig::default(),
         "fixture_cdc".to_string(),
         "fixture_cdc".to_string(),
     );
-    let error = inventory
-        .transform_sql(
-            "CREATE TABLE accounts (\
-                id BIGINT NOT NULL PRIMARY KEY, \
-                email VARCHAR(255) NOT NULL, \
-                payload VARCHAR(64) NOT NULL, \
-                KEY idx_accounts_payload (payload)\
-            ) ENGINE=InnoDB",
-        )
-        .expect_err("runtime CREATE TABLE admission must remain disabled");
+    let source_sql = "CREATE TABLE accounts (\
+        id BIGINT NOT NULL PRIMARY KEY, \
+        email VARCHAR(255) NOT NULL, \
+        payload VARCHAR(64) NOT NULL, \
+        KEY idx_accounts_payload (payload)\
+    ) ENGINE=InnoDB";
 
-    assert!(error.contains("does not support this statement"), "{error}");
+    let live = inventory
+        .transform_sql(source_sql)
+        .expect("live translation");
+    let pure = translate_ddl(source_sql, &[]).expect("pure translation");
+
+    assert_eq!(live, pure);
+}
+
+#[test]
+fn shared_translator_has_no_generic_create_or_alter_fallback() {
+    let unsupported = [
+        "CREATE TABLE accounts (id BIGINT)",
+        "ALTER TABLE accounts ADD PARTITION (PARTITION p0 VALUES LESS THAN (10))",
+        "ALTER TABLE accounts RENAME TO archived_accounts",
+    ];
+
+    for sql in unsupported {
+        let error = translate_ddl(sql, &[]).expect_err("unsupported DDL must fail closed");
+        assert!(
+            error.contains("unsupported") || error.contains("requires"),
+            "{sql}: {error}"
+        );
+    }
 }
 
 #[test]

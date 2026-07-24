@@ -19,6 +19,7 @@ pub mod statement;
 pub mod stream_checkpoint;
 mod sync_cli;
 mod sync_progress_cli;
+mod sync_schema;
 pub mod table_catalog;
 pub mod table_sync;
 pub mod target;
@@ -38,6 +39,7 @@ Usage:
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
+  mariadb-mysql-cdc sync-schema --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH [--table TABLE ... | --catalog FILE]
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -170,6 +172,7 @@ fn main() {
         }
         Some("table-catalog") => table_catalog::run_table_catalog_command(args.collect(), USAGE),
         Some("sync-catalog") => table_catalog::run_sync_catalog_command(args.collect(), USAGE),
+        Some("sync-schema") => sync_schema::run_sync_schema_command(args.collect(), USAGE),
         Some("drift-check") => run_drift_check_command(args.collect()),
         Some("repair-drift") => repair_drift::run_repair_drift_command(args.collect(), USAGE),
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),

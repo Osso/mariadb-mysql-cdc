@@ -304,7 +304,11 @@ impl InventoryReader for MariaDbInventoryReader {
     }
 
     fn read_indexes(&self, schema: &str) -> Result<Vec<IndexRow>, InventoryError> {
-        let rows = self.query_rows(InventoryQueryStage::Indexes, schema, &indexes_query(schema))?;
+        let rows = self.query_rows(
+            InventoryQueryStage::Indexes,
+            schema,
+            &indexes_query(schema, self.config.endpoint_role),
+        )?;
         rows.iter().map(|row| parse_index_row(row)).collect()
     }
 

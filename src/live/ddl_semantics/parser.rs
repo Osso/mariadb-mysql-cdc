@@ -4,6 +4,14 @@ use super::tokenizer::{ddl_contains_comments, tokenize_ddl};
 use super::transform::{parse_fixture_create_table, parse_production_alter_table_ast};
 
 pub fn parse_simple_index_ddl(sql: &str) -> Result<ParsedIndexAst, String> {
+    parse_index_ddl(sql, false)
+}
+
+pub fn parse_modeled_index_ddl(sql: &str) -> Result<ParsedIndexAst, String> {
+    parse_index_ddl(sql, true)
+}
+
+fn parse_index_ddl(sql: &str, allow_unique: bool) -> Result<ParsedIndexAst, String> {
     if ddl_contains_comments(sql) {
         return Err("index DDL comments are not automatic".to_string());
     }
@@ -18,37 +26,55 @@ pub fn parse_simple_index_ddl(sql: &str) -> Result<ParsedIndexAst, String> {
         .map(|token| token.to_ascii_uppercase())
         .collect::<Vec<_>>();
     match keywords.first().map(String::as_str) {
-        Some("CREATE") => parse_simple_create_index(&tokens, &keywords),
+        Some("CREATE") => parse_simple_create_index(sql, &tokens, &keywords, allow_unique),
         Some("DROP") => parse_simple_drop_index(&tokens, &keywords),
         _ => Err("only CREATE INDEX and DROP INDEX are automatic".to_string()),
     }
 }
 
 fn parse_simple_create_index(
+    sql: &str,
     tokens: &[String],
     keywords: &[String],
+    allow_unique: bool,
 ) -> Result<ParsedIndexAst, String> {
-    let (name, table, index, index_type) = parse_create_index_header(tokens, keywords)?;
+    let (name, table, index, header_index_type, unique) =
+        parse_create_index_header(tokens, keywords, allow_unique)?;
     let (key_parts, index) = parse_create_index_keys(tokens, keywords, index)?;
-    let index = parse_create_index_options(keywords, index)?;
-    ensure_create_index_complete(tokens, index)?;
-    Ok(simple_create_index_ast(name, table, index_type, key_parts))
+    let options = parse_create_index_options(tokens, keywords, index)?;
+    ensure_create_index_complete(tokens, options.end)?;
+    let comment = options
+        .comment
+        .map(|_| single_index_comment_literal(sql))
+        .transpose()?;
+    Ok(simple_create_index_ast(
+        name,
+        table,
+        unique,
+        options.index_type.unwrap_or(header_index_type),
+        options.visible,
+        comment,
+        key_parts,
+    ))
 }
 
 fn simple_create_index_ast(
     name: String,
     table: String,
+    unique: bool,
     index_type: String,
+    visible: bool,
+    comment: Option<String>,
     key_parts: Vec<ParsedIndexKeyPart>,
 ) -> ParsedIndexAst {
     ParsedIndexAst {
         create: true,
         name,
         table,
-        unique: false,
+        unique,
         index_type,
-        visible: true,
-        comment: None,
+        visible,
+        comment,
         key_parts,
     }
 }
@@ -56,26 +82,28 @@ fn simple_create_index_ast(
 fn parse_create_index_header(
     tokens: &[String],
     keywords: &[String],
-) -> Result<(String, String, usize, String), String> {
-    reject_index_variants(keywords)?;
-    require_keyword(keywords, 1, "INDEX")?;
-    let name = strict_index_identifier(tokens.get(2), "index name")?;
+    allow_unique: bool,
+) -> Result<(String, String, usize, String, bool), String> {
+    let unique = keywords.get(1).is_some_and(|token| token == "UNIQUE");
+    reject_index_variants(keywords, allow_unique)?;
+    let index_keyword = if unique { 2 } else { 1 };
+    require_keyword(keywords, index_keyword, "INDEX")?;
+    let name_index = index_keyword + 1;
+    let name = strict_index_identifier(tokens.get(name_index), "index name")?;
     if name.eq_ignore_ascii_case("ON") {
         return Err("generated index names are manual".to_string());
     }
-    require_keyword(keywords, 3, "ON")?;
-    let table = strict_index_identifier(tokens.get(4), "index table")?;
-    let (index_type, index) = parse_index_type(tokens, keywords, 5)?;
-    if index_type != "BTREE" {
-        return Err("only BTREE indexes are automatic".to_string());
-    }
-    Ok((name, table, index, index_type))
+    require_keyword(keywords, name_index + 1, "ON")?;
+    let table = strict_index_identifier(tokens.get(name_index + 2), "index table")?;
+    let (index_type, index) = parse_index_type(tokens, keywords, name_index + 3)?;
+    validate_supported_index_type(&index_type)?;
+    Ok((name, table, index, index_type, unique))
 }
 
-fn reject_index_variants(keywords: &[String]) -> Result<(), String> {
-    if keywords
-        .get(1)
-        .is_some_and(|token| matches!(token.as_str(), "UNIQUE" | "FULLTEXT" | "SPATIAL"))
+fn reject_index_variants(keywords: &[String], allow_unique: bool) -> Result<(), String> {
+    let variant = keywords.get(1).map(String::as_str);
+    if matches!(variant, Some("FULLTEXT" | "SPATIAL"))
+        || (variant == Some("UNIQUE") && !allow_unique)
     {
         return Err("unique, fulltext, and spatial indexes are manual".to_string());
     }
@@ -105,19 +133,108 @@ fn parse_create_index_keys(
     parse_index_key_parts(tokens, keywords, index + 1)
 }
 
-fn parse_create_index_options(keywords: &[String], mut index: usize) -> Result<usize, String> {
+struct ParsedIndexOptions {
+    end: usize,
+    index_type: Option<String>,
+    visible: bool,
+    comment: Option<String>,
+}
+
+fn parse_create_index_options(
+    tokens: &[String],
+    keywords: &[String],
+    mut index: usize,
+) -> Result<ParsedIndexOptions, String> {
     index += 1;
-    if keywords.get(index).map(String::as_str) == Some("USING") {
-        require_keyword(keywords, index + 1, "BTREE")?;
-        index += 2;
+    let mut index_type = None;
+    let mut visible = true;
+    let mut comment = None;
+    while index < tokens.len() {
+        match keywords[index].as_str() {
+            "USING" => {
+                let value = keywords
+                    .get(index + 1)
+                    .ok_or_else(|| "index type is missing".to_string())?
+                    .clone();
+                validate_supported_index_type(&value)?;
+                index_type = Some(value);
+                index += 2;
+            }
+            "INVISIBLE" => {
+                visible = false;
+                index += 1;
+            }
+            "VISIBLE" => {
+                visible = true;
+                index += 1;
+            }
+            "COMMENT" => {
+                require_keyword(keywords, index + 1, "<STRING>")?;
+                comment = Some("<string>".to_string());
+                index += 2;
+            }
+            _ => break,
+        }
     }
-    if keywords.get(index).map(String::as_str) == Some("INVISIBLE") {
-        return Err("invisible indexes are manual".to_string());
+    Ok(ParsedIndexOptions {
+        end: index,
+        index_type,
+        visible,
+        comment,
+    })
+}
+
+fn validate_supported_index_type(index_type: &str) -> Result<(), String> {
+    (index_type == "BTREE")
+        .then_some(())
+        .ok_or_else(|| format!("unsupported automatic index type {index_type}"))
+}
+
+fn single_index_comment_literal(sql: &str) -> Result<String, String> {
+    let characters = sql.chars().collect::<Vec<_>>();
+    let mut literals = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] != '\'' {
+            index += 1;
+            continue;
+        }
+        let (literal, next) = read_single_quoted_literal(&characters, index + 1)?;
+        literals.push(literal);
+        index = next;
     }
-    if keywords.get(index).map(String::as_str) == Some("VISIBLE") {
-        index += 1;
+    match literals.as_slice() {
+        [comment] => Ok(comment.clone()),
+        _ => Err("CREATE INDEX COMMENT requires exactly one string literal".to_string()),
     }
-    Ok(index)
+}
+
+fn read_single_quoted_literal(
+    characters: &[char],
+    mut index: usize,
+) -> Result<(String, usize), String> {
+    let mut literal = String::new();
+    while index < characters.len() {
+        match characters[index] {
+            '\\' => {
+                let escaped = characters
+                    .get(index + 1)
+                    .ok_or_else(|| "unterminated CREATE INDEX COMMENT escape".to_string())?;
+                literal.push(*escaped);
+                index += 2;
+            }
+            '\'' if characters.get(index + 1) == Some(&'\'') => {
+                literal.push('\'');
+                index += 2;
+            }
+            '\'' => return Ok((literal, index + 1)),
+            character => {
+                literal.push(character);
+                index += 1;
+            }
+        }
+    }
+    Err("unterminated CREATE INDEX COMMENT literal".to_string())
 }
 
 fn ensure_create_index_complete(tokens: &[String], index: usize) -> Result<(), String> {

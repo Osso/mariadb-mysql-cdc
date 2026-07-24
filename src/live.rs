@@ -11,7 +11,7 @@ use std::fmt;
 mod binlog_command;
 mod ddl_event;
 mod ddl_replay_journal;
-mod ddl_semantics;
+pub(crate) mod ddl_semantics;
 mod insert_conflict;
 mod mysql_cli;
 mod progress;

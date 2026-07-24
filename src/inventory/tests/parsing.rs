@@ -28,8 +28,11 @@ fn builds_information_schema_queries_with_quoted_schema() {
     assert!(tables_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
     assert!(columns_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
     assert!(primary_keys_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
-    assert!(indexes_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
-    assert!(indexes_query(schema).contains("'YES' AS IS_VISIBLE"));
+    let source_indexes = indexes_query(schema, InventoryEndpointRole::Source);
+    let target_indexes = indexes_query(schema, InventoryEndpointRole::Target);
+    assert!(source_indexes.contains(&format!("TABLE_SCHEMA = {quoted}")));
+    assert!(source_indexes.contains("IGNORED = 'YES'"));
+    assert!(target_indexes.contains("IS_VISIBLE"));
     assert!(views_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
     assert!(triggers_query(schema).contains(&format!("TRIGGER_SCHEMA = {quoted}")));
     assert!(routines_query(schema).contains(&format!("ROUTINE_SCHEMA = {quoted}")));

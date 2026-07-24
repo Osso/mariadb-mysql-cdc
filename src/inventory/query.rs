@@ -42,9 +42,18 @@ pub(crate) fn primary_keys_query(schema: &str) -> String {
     )
 }
 
-pub(crate) fn indexes_query(schema: &str) -> String {
+pub(crate) fn indexes_query(
+    schema: &str,
+    endpoint_role: crate::inventory::InventoryEndpointRole,
+) -> String {
+    let visibility = match endpoint_role {
+        crate::inventory::InventoryEndpointRole::Source => {
+            "CASE WHEN IGNORED = 'YES' THEN 'NO' ELSE 'YES' END"
+        }
+        crate::inventory::InventoryEndpointRole::Target => "IS_VISIBLE",
+    };
     format!(
-        "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, INDEX_TYPE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART, COLLATION, 'YES' AS IS_VISIBLE, INDEX_COMMENT FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = {} AND INDEX_NAME <> 'PRIMARY' ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+        "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, INDEX_TYPE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART, COLLATION, {visibility}, INDEX_COMMENT FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = {} AND INDEX_NAME <> 'PRIMARY' ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
         quote_sql_string(schema)
     )
 }

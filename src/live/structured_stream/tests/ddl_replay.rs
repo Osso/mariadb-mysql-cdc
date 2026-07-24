@@ -535,7 +535,6 @@ fn unsupported_index_ddl_is_manual_before_journal_prepare_or_execution() {
     for sql in [
         "CREATE UNIQUE INDEX idx_handle ON accounts (handle)",
         "CREATE INDEX idx_handle ON accounts (handle) USING HASH",
-        "CREATE INDEX idx_handle ON accounts (handle) INVISIBLE",
         "DROP INDEX IF EXISTS idx_handle ON accounts",
         "CREATE INDEX idx_handle ON other_db.accounts (handle)",
         "CREATE INDEX idx_handle ON other_db . accounts (handle)",
