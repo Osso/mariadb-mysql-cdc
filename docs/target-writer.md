@@ -58,21 +58,28 @@ Snapshot/catchup writes may still use `INSERT IGNORE` where their configured
 snapshot mode requests duplicate-ignore. Normal table-sync range repairs do
 not: they use strict batched `INSERT` and surface constraint failures.
 
-When table-sync insert batches receive a foreign-key error, the table-sync
-repair target uses source/target schema-inventory FK metadata to discover exact
-parent identities from the child rows. It recursively reads source parents,
-compares target parents, inserts missing parents or updates divergent parents,
-then retries the child batch. Nullable FK values are skipped. After a child
-insert or retry, every child row is reread by primary key and compared exactly;
-only then may the caller checkpoint the source chunk.
+When table-sync insert or divergent-update batches receive a foreign-key error,
+the repair target uses source/target schema-inventory FK metadata to discover
+exact parent identities from the affected child rows. It recursively reads
+source parents, compares target parents, inserts missing parents or updates
+divergent parents, verifies each parent exactly, then retries only the failed
+statement-sized child subbatch. Nullable FK values are skipped. A concurrent
+`1062` is reconciled by rereading the affected target rows: complete equality
+with the source is accepted, while a divergent owner fails closed. After a
+child insert, parent-retry, or update batch, every affected child row is
+reread by primary key and compared exactly; only then may the caller checkpoint
+the source chunk.
 
 The `sync-table --updated-since` path uses an upsert.
 
 Table-sync parent-repair errors are explicit for missing source parents,
 malformed or ambiguous identities, dependency cycles, source/target reads,
 parent writes, child-batch retry, and post-write verification. Other insert
-constraints and divergent-row update FK failures remain ordinary repair errors;
-they are not silently converted into success.
+constraints remain ordinary repair errors and are not silently converted into
+success. Apply and missing-primary-key runs retry bounded recoverable read,
+duplicate, verification, progress, network, deadlock, and lock-timeout errors
+without advancing unchanged durable progress. FK-aware apply runs require a
+final zero-drift scan before durable completion.
 
 Errors include:
 
