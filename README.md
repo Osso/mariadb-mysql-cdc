@@ -148,6 +148,25 @@ health check.
 - [Authoritative DDL transformation spec](docs/specs/ddl-transformation.md)
 - [DDL Resolution Runbook](docs/ddl-resolution.md) for journal barriers,
   translation-pending promotion, evidence inspection, and restart procedure.
+- [Schema synchronization spec](docs/specs/sync-schema.md) for selected-table
+  full convergence through the shared streamed-DDL translator.
+
+## Schema synchronization
+
+The implemented `sync-schema` command applies by default and converges only explicitly
+selected tables to the source-authoritative MySQL 8-compatible schema. It runs one
+table at a time, permits destructive changes within selected tables, and never
+drops unselected target tables. Every mapping must use the same DDL translator as
+streamed DDL replay; there is no direct-source-DDL fallback or second compatibility
+mapping.
+
+Before a potentially lossy column change, it checks actual target data. Values that
+would truncate, coerce, or fail block that table and produce representative primary
+keys; independent tables continue, while dependent operations are skipped. The
+command re-inventories every selected table and emits structured JSON for every
+statement, preflight, skip, error, and verification result. It exits nonzero if
+anything remains divergent. It has no persistent schema journal or rollback claim
+for implicitly committed MySQL DDL.
 
 ## Commands
 
