@@ -38,14 +38,17 @@ explicit; replacement evidence is durable and a successful replacement can
 checkpoint. Foreign-key, CHECK, and replacement-update conflicts persist evidence
 and abort, rolling back the target transaction/checkpoint. Secondary-unique
 conflicts follow that same path except the narrow superseded historical
-`globalcomix.users` ROW `INSERT` on exact `users.name`: exactly one candidate is
-allowed, and any ordinary conflict mixed into the source transaction fails
-closed. The live stream reads `SHOW MASTER STATUS` before one source consistent
-snapshot; that pre-snapshot coordinate is a conservative lower bound and must
-be beyond the candidate transaction. It requires complete source/target PK and
-unique-owner convergence from that snapshot plus active-transaction `SELECT ...
-FOR UPDATE` reads, then requires an existing same-file checkpoint predecessor
-before the candidate and no later than the XID. Only then does it commit
+`globalcomix.users`/`users.name` and `globalcomix.comics`/`comics.slug` ROW
+`INSERT` proofs: exactly one candidate is allowed, and any ordinary conflict
+mixed into the source transaction fails closed. The live stream reads `SHOW
+MASTER STATUS` before one source consistent snapshot; that pre-snapshot
+coordinate is a conservative lower bound and must be beyond the candidate
+transaction. The users proof requires complete source/target PK and unique-owner
+convergence from that snapshot plus active-transaction `SELECT ... FOR UPDATE`
+reads. The comics proof requires complete current primary-row equality, while
+accepting the locked unique owner by exact PK+slug identity despite unrelated
+mutable-field drift. Both paths then require an existing same-file checkpoint
+predecessor before the candidate and no later than the XID. Only then does it commit
 remaining source-transaction rows, exact observation/resolution evidence, and
 the XID checkpoint atomically. Any failed proof, predecessor, or commit rolls
 back, then persists all unresolved observations independently; rollback or

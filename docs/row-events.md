@@ -35,15 +35,18 @@ MySQL reports `PRIMARY`, using a primary-key UPDATE of the source image; it
 records durable replacement evidence and allows checkpoint advancement. The
 accepted risk is overwriting the divergent target row. Foreign-key, CHECK, and
 replacement-update conflicts persist evidence and abort. Secondary-unique
-conflicts do too, except the narrow superseded historical `globalcomix.users`
-ROW `INSERT` on the exact `users.name` index: exactly one candidate is allowed,
-and any ordinary conflict mixed into the source transaction fails closed. The
-stream reads `SHOW MASTER STATUS` before one source consistent snapshot; that
-pre-snapshot coordinate is a conservative lower bound and must be beyond the
-candidate transaction. It proves complete source/target convergence for the
-historical PK and current unique owner using active-transaction `SELECT ... FOR
-UPDATE`, then requires an existing same-file checkpoint predecessor before the
-candidate and no later than the XID. Only then does it commit the remaining
+conflicts do too, except the narrow superseded historical
+`globalcomix.users`/`users.name` and `globalcomix.comics`/`comics.slug` ROW
+`INSERT` proofs: exactly one candidate is allowed, and any ordinary conflict
+mixed into the source transaction fails closed. The stream reads `SHOW MASTER
+STATUS` before one source consistent snapshot; that pre-snapshot coordinate is a
+conservative lower bound and must be beyond the candidate transaction. The users
+proof requires complete source/target convergence for the historical PK and
+current unique owner using active-transaction `SELECT ... FOR UPDATE`. The
+comics proof requires complete current primary-row equality, while accepting the
+locked unique owner by exact PK+slug identity despite unrelated mutable-field
+drift. Both paths then require an existing same-file checkpoint predecessor
+before the candidate and no later than the XID. Only then does it commit the remaining
 source-transaction rows, exact observation/resolution evidence, and XID
 checkpoint atomically. Any proof, predecessor, or commit failure rolls back,
 then persists all unresolved observations independently; rollback or persistence

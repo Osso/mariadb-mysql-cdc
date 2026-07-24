@@ -27,7 +27,7 @@ conflicting secondary key.
       divergent `ROW INSERT` values and every non-`INSERT` `1062` unique conflict
       persist evidence and abort. Only equal `ROW INSERT` duplicates continue;
       the default `error` policy fails native row duplicates.
-- [x] The only secondary-unique exception is a superseded historical insert on
+- [x] A secondary-unique exception is a superseded historical insert on
       `globalcomix.users`: a ROW `INSERT` whose duplicate index is exactly
       `users.name` may be deferred only as exactly one row-level candidate. At
       XID, the verifier retains the complete historical image, reads
@@ -50,6 +50,17 @@ conflicting secondary key.
       independent conflict store; rollback or evidence-persistence failures are
       surfaced. Every other secondary-unique conflict keeps the ordinary abort
       path.
+- [x] The superseded historical `globalcomix.comics` `ROW INSERT` exception is
+      limited to the exact `comics.slug` index. It requires one candidate and no
+      coexisting ordinary conflict, a complete historical image, a source
+      snapshot beyond the candidate transaction, and complete current
+      source/target equality for the historical primary row. The current source
+      and locked target unique owner must have the same primary key and slug;
+      unrelated mutable owner-field drift does not reject the proof. The
+      observation/resolution evidence, remaining row effects, and XID checkpoint
+      commit atomically, while any failed predicate or commit failure rolls back
+      and leaves the conflict unresolved. The existing `globalcomix.users` /
+      `users.name` proof retains full owner-row equality and is unchanged.
 - [x] Successful equal native ROW `INSERT` no-ops and successful
       `replace-divergent-pk` replacements never create a new ledger row; they
       stage resolution of an already-recorded unresolved row only.
@@ -68,7 +79,8 @@ conflicting secondary key.
       Foreign-key, CHECK, and replacement-update conflicts never use this path
       and remain durable aborting conflicts. Secondary-unique conflicts also
       remain durable aborting conflicts except for the separately specified
-      superseded `globalcomix.users`/`users.name` insert proof above. The accepted
+      superseded `globalcomix.users`/`users.name` and
+      `globalcomix.comics`/`comics.slug` insert proofs above. The accepted
       policy risk is overwriting the divergent target row. Replacement keeps applying rows and
       may checkpoint; if its enclosing target transaction later rolls back, the
       independent ledger evidence survives while the replacement itself rolls back.
@@ -125,8 +137,9 @@ a matching unresolved conflict already exists, then continues so the target
 transaction/checkpoint can commit. Successful no-op/replacement events never
 create ledger rows. Foreign-key, CHECK, and replacement-update conflicts always
 persist evidence and abort. Secondary-unique conflicts do too, except for the
-separately specified superseded `globalcomix.users`/`users.name` insert proof,
-which can commit only after its full source/target proof. The accepted overwrite risk is
+separately specified superseded `globalcomix.users`/`users.name` and
+`globalcomix.comics`/`comics.slug` insert proofs, which can commit only after
+their specified source/target proofs. The accepted overwrite risk is
 explicit. On the live target-table checkpoint path, the stream locks and validates
 the source-scoped predecessor checkpoint in that same target transaction: it
 must exist, use the candidate's binlog file, remain before the candidate start,

@@ -18,14 +18,16 @@ The explicit `replace-divergent-pk` policy may replace an unequal row only for a
 `PRIMARY` duplicate after an exactly-one-row PK lookup and exactly-one-row
 primary-key UPDATE match; durable audit evidence records the decision. Missing or
 multiple PK rows and secondary-unique, foreign-key, CHECK, or replacement-update
-conflicts still roll back without checkpoint advancement. The live stream has one
-narrow exception for a superseded historical `globalcomix.users` ROW `INSERT` on
-exact `users.name`: it allows exactly one deferred candidate and rejects any
-mixed ordinary conflict. It reads `SHOW MASTER STATUS` before one
-`START TRANSACTION WITH CONSISTENT SNAPSHOT`; that pre-snapshot coordinate is a
-conservative lower bound and must be beyond the candidate transaction. It then
-requires consistent-source full-row proof and active-transaction target `FOR
-UPDATE` proof for both historical PK and current unique owner. Before writing the
+conflicts still roll back without checkpoint advancement. The live stream has
+superseded historical exceptions for `globalcomix.users`/`users.name` and
+`globalcomix.comics`/`comics.slug`: each allows exactly one deferred candidate
+and rejects any mixed ordinary conflict. It reads `SHOW MASTER STATUS` before
+one `START TRANSACTION WITH CONSISTENT SNAPSHOT`; that pre-snapshot coordinate
+is a conservative lower bound and must be beyond the candidate transaction. The
+users proof requires consistent-source full-row and active-transaction target
+`FOR UPDATE` proof for both historical PK and current unique owner. The comics
+proof requires full current primary-row equality, while accepting the locked
+unique owner by exact PK+slug identity despite unrelated mutable-field drift. Before writing the
 XID checkpoint, the target transaction requires an existing same-file predecessor
 before the candidate and no later than the XID. Remaining rows in that source
 transaction still apply; any proof, predecessor, or commit failure rolls back,
