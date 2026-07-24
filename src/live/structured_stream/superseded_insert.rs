@@ -25,6 +25,8 @@ pub(crate) struct SupersededInsertVerificationInput {
     pub(crate) target_primary_row_count: usize,
     pub(crate) target_primary_hash: String,
     pub(crate) target_owner_row_count: usize,
+    pub(crate) target_owner_primary_key: String,
+    pub(crate) target_owner_identity: String,
     pub(crate) target_owner_hash: String,
 }
 
@@ -222,6 +224,8 @@ pub(crate) enum SupersededInsertRejection {
     TargetPrimaryRowNotUnique,
     TargetPrimaryHashMismatch,
     TargetOwnerRowNotUnique,
+    TargetOwnerPrimaryKeyMismatch,
+    TargetOwnerIdentityMismatch,
     TargetOwnerHashMismatch,
     MissingHistoricalImageHash,
 }
@@ -278,7 +282,14 @@ pub(crate) fn verify_superseded_insert(
     if candidate.target_owner_row_count != 1 {
         return Err(SupersededInsertRejection::TargetOwnerRowNotUnique);
     }
-    if candidate.target_owner_hash != candidate.source_owner_hash {
+    if candidate.table == "comics" {
+        if candidate.target_owner_primary_key != candidate.source_owner_primary_key {
+            return Err(SupersededInsertRejection::TargetOwnerPrimaryKeyMismatch);
+        }
+        if candidate.target_owner_identity != candidate.historical_name {
+            return Err(SupersededInsertRejection::TargetOwnerIdentityMismatch);
+        }
+    } else if candidate.target_owner_hash != candidate.source_owner_hash {
         return Err(SupersededInsertRejection::TargetOwnerHashMismatch);
     }
     if candidate.historical_image_hash.is_empty() {
@@ -327,6 +338,8 @@ mod tests {
             target_primary_row_count: 1,
             target_primary_hash: "primary-hash".to_string(),
             target_owner_row_count: 1,
+            target_owner_primary_key: "2071305".to_string(),
+            target_owner_identity: "-3572".to_string(),
             target_owner_hash: "owner-hash".to_string(),
         }
     }
@@ -353,23 +366,39 @@ mod tests {
         candidate.source_primary_name =
             "DELETED_misccf7e8b9d-5851-4616-910e-5bfb755bd55e9HrF".to_string();
         candidate.source_owner_primary_key = "48058".to_string();
+        candidate.target_owner_primary_key = "48058".to_string();
+        candidate.target_owner_identity = "misc".to_string();
         candidate
     }
 
     #[test]
     fn comics_slug_supersession_accepts_renamed_primary_and_current_owner() {
-        verify_superseded_insert(&valid_comics_slug_candidate())
-            .expect("verified comics.slug supersession");
+        let mut candidate = valid_comics_slug_candidate();
+        candidate.target_owner_hash = "lagged-mutable-owner-fields".to_string();
+
+        verify_superseded_insert(&candidate)
+            .expect("verified comics.slug supersession despite mutable owner drift");
     }
 
     #[test]
-    fn comics_slug_supersession_rejects_mismatched_locked_owner() {
+    fn comics_slug_supersession_rejects_mismatched_locked_owner_primary_key() {
         let mut candidate = valid_comics_slug_candidate();
-        candidate.target_owner_hash = "different-owner".to_string();
+        candidate.target_owner_primary_key = "48059".to_string();
 
         assert_eq!(
             verify_superseded_insert(&candidate),
-            Err(SupersededInsertRejection::TargetOwnerHashMismatch)
+            Err(SupersededInsertRejection::TargetOwnerPrimaryKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn comics_slug_supersession_rejects_mismatched_locked_owner_slug() {
+        let mut candidate = valid_comics_slug_candidate();
+        candidate.target_owner_identity = "other".to_string();
+
+        assert_eq!(
+            verify_superseded_insert(&candidate),
+            Err(SupersededInsertRejection::TargetOwnerIdentityMismatch)
         );
     }
 

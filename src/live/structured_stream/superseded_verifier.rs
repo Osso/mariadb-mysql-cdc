@@ -536,6 +536,8 @@ fn verification_input(
         target_primary_row_count: target_rows.primary_count,
         target_primary_hash: target_rows.primary_hash,
         target_owner_row_count: target_rows.owner_count,
+        target_owner_primary_key: target_rows.owner_primary_key,
+        target_owner_identity: target_rows.owner_identity,
         target_owner_hash: target_rows.owner_hash,
     })
 }
@@ -547,6 +549,7 @@ struct ClassifiedRows {
     primary_hash: String,
     owner_count: usize,
     owner_primary_key: String,
+    owner_identity: String,
     owner_hash: String,
 }
 
@@ -605,6 +608,7 @@ fn classify_rows(
         if value_string(name, "users evidence owner name")? == historical.name {
             classified.owner_count += 1;
             classified.owner_primary_key = value_u64(id, "users evidence owner id")?.to_string();
+            classified.owner_identity = value_string(name, "users evidence owner name")?;
             classified.owner_hash.clone_from(hash);
         }
     }

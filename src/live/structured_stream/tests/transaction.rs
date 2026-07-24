@@ -427,6 +427,61 @@ fn comics_slug_superseded_candidate() -> DeferredSupersededInsertCandidate {
     candidate
 }
 
+struct ComicsPredicateVerifier {
+    target_owner_primary_key: String,
+    target_owner_identity: String,
+}
+
+impl ComicsPredicateVerifier {
+    fn matching_owner() -> Self {
+        Self {
+            target_owner_primary_key: "48058".to_string(),
+            target_owner_identity: "misc".to_string(),
+        }
+    }
+}
+
+impl SupersededInsertVerifier for ComicsPredicateVerifier {
+    fn verify(
+        &mut self,
+        _candidate: &DeferredSupersededInsertCandidate,
+        _xid_end_position: u64,
+    ) -> Result<super::super::superseded_insert::SupersededInsertProof, String> {
+        let input = super::super::superseded_insert::SupersededInsertVerificationInput {
+            schema: "globalcomix".to_string(),
+            table: "comics".to_string(),
+            operation: crate::conflict_repair::ConflictOperation::Insert,
+            duplicate_index: "comics.slug".to_string(),
+            candidate_xid: super::super::superseded_insert::BinlogCoordinate {
+                file: "mysqld-bin.002709".to_string(),
+                position: 531_241_781,
+            },
+            source_snapshot: super::super::superseded_insert::BinlogCoordinate {
+                file: "mysqld-bin.002743".to_string(),
+                position: 600_000_000,
+            },
+            historical_primary_key: "48054".to_string(),
+            historical_name: "misc".to_string(),
+            historical_image_hash: "historical-hash".to_string(),
+            source_primary_row_count: 1,
+            source_primary_name: "DELETED_misc".to_string(),
+            source_primary_hash: "current-primary-hash".to_string(),
+            source_owner_row_count: 1,
+            source_owner_primary_key: "48058".to_string(),
+            source_owner_hash: "current-owner-hash".to_string(),
+            target_rows_read_for_update: true,
+            target_primary_row_count: 1,
+            target_primary_hash: "current-primary-hash".to_string(),
+            target_owner_row_count: 1,
+            target_owner_primary_key: self.target_owner_primary_key.clone(),
+            target_owner_identity: self.target_owner_identity.clone(),
+            target_owner_hash: "lagged-mutable-owner-hash".to_string(),
+        };
+        super::super::superseded_insert::verify_superseded_insert(&input)
+            .map_err(|rejection| format!("superseded insert rejected: {rejection:?}"))
+    }
+}
+
 fn comics_xid_context() -> SupersededXidCommitContext<'static> {
     SupersededXidCommitContext {
         xid_end_position: 531_241_781,
@@ -447,7 +502,7 @@ fn comics_slug_supersession_commits_resolution_and_checkpoint_atomically() {
     let mut transaction = TargetTransaction::default();
     transaction.begin_if_needed(&executor).expect("begin");
     transaction.defer_superseded_insert(comics_slug_superseded_candidate());
-    let mut verifier = SupersededVerificationFixture { verified: true };
+    let mut verifier = ComicsPredicateVerifier::matching_owner();
 
     let proof = transaction
         .verify_deferred_superseded_inserts_at_xid(&executor, &mut verifier, comics_xid_context())
@@ -467,19 +522,31 @@ fn comics_slug_supersession_commits_resolution_and_checkpoint_atomically() {
     );
 }
 
-#[test]
-fn comics_slug_evidence_mismatch_rolls_back_without_resolution_or_checkpoint() {
+fn assert_comics_owner_mismatch_rolls_back(mut verifier: ComicsPredicateVerifier) {
     let executor = TransactionRecordingExecutor::default();
     let mut transaction = TargetTransaction::default();
     transaction.begin_if_needed(&executor).expect("begin");
     transaction.defer_superseded_insert(comics_slug_superseded_candidate());
-    let mut verifier = SupersededVerificationFixture { verified: false };
 
     transaction
         .verify_deferred_superseded_inserts_at_xid(&executor, &mut verifier, comics_xid_context())
-        .expect_err("mismatched evidence fails closed");
+        .expect_err("mismatched owner identity fails closed");
 
     assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK"]);
+}
+
+#[test]
+fn comics_slug_owner_primary_key_mismatch_rolls_back_without_checkpoint() {
+    let mut verifier = ComicsPredicateVerifier::matching_owner();
+    verifier.target_owner_primary_key = "48059".to_string();
+    assert_comics_owner_mismatch_rolls_back(verifier);
+}
+
+#[test]
+fn comics_slug_owner_identity_mismatch_rolls_back_without_checkpoint() {
+    let mut verifier = ComicsPredicateVerifier::matching_owner();
+    verifier.target_owner_identity = "other".to_string();
+    assert_comics_owner_mismatch_rolls_back(verifier);
 }
 
 #[test]
