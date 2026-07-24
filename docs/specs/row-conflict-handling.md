@@ -2,7 +2,8 @@
 
 The structured stream applies MariaDB ROW/FULL events by source primary key. A
 secondary-unique conflict must not mutate the target row that owns the
-conflicting secondary key.
+conflicting secondary key. Implementation detail for superseded release proofs:
+[superseded release recovery](../wiki/systems/superseded-release-recovery.md).
 
 ## Current behavior
 
@@ -61,6 +62,21 @@ conflicting secondary key.
       commit atomically, while any failed predicate or commit failure rolls back
       and leaves the conflict unresolved. The existing `globalcomix.users` /
       `users.name` proof retains full owner-row equality and is unchanged.
+- [x] The superseded historical `globalcomix.releases` `ROW INSERT` FK proof is
+      limited to the exact approved category transaction
+      `mysqld-bin.002709:515816736–515824875` (`releases_ibfk_2`) and visibility
+      transaction `mysqld-bin.002709:531921570–531929925` (`releases_ibfk_3`,
+      candidate event `531921789`). The exact FK child/parent identity is
+      required; the complete historical release image is retained; later source
+      history must show a changed parent value; and exactly one current source
+      release, matching source parent, and locked target parent identity must be
+      proven. If the target release is absent, install the complete current
+      source release row; if present, require its full hash to equal current
+      source. Preserve the current parent identity without updating or deleting
+      the parent. Remaining transaction effects, conflict observation/resolution
+      evidence, and the XID checkpoint commit atomically. Any failed proof,
+      predecessor, coordinate/FK scope, or commit check fails closed, rolls back
+      target effects and checkpoint advancement, and leaves unresolved evidence.
 - [x] Successful equal native ROW `INSERT` no-ops and successful
       `replace-divergent-pk` replacements never create a new ledger row; they
       stage resolution of an already-recorded unresolved row only.
@@ -137,9 +153,10 @@ a matching unresolved conflict already exists, then continues so the target
 transaction/checkpoint can commit. Successful no-op/replacement events never
 create ledger rows. Foreign-key, CHECK, and replacement-update conflicts always
 persist evidence and abort. Secondary-unique conflicts do too, except for the
-separately specified superseded `globalcomix.users`/`users.name` and
-`globalcomix.comics`/`comics.slug` insert proofs, which can commit only after
-their specified source/target proofs. The accepted overwrite risk is
+separately specified superseded `globalcomix.users`/`users.name`,
+`globalcomix.comics`/`comics.slug`, and `globalcomix.releases` insert proofs,
+which can commit only after their specified source/target proofs. The accepted
+overwrite risk is
 explicit. On the live target-table checkpoint path, the stream locks and validates
 the source-scoped predecessor checkpoint in that same target transaction: it
 must exist, use the candidate's binlog file, remain before the candidate start,

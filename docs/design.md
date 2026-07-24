@@ -85,9 +85,9 @@ and the live target checkpoint does not advance. For native ROW `INSERT` changes
 row fetched by source primary key exactly equals the source row. A divergent or
 otherwise non-equal `ROW INSERT` persists conflict evidence and aborts, rolling
 back the target transaction/checkpoint, except for the explicit superseded
-historical `globalcomix.users`/`users.name` and `globalcomix.comics`/`comics.slug`
-ROW `INSERT` proofs. Exactly one candidate is allowed and no ordinary conflict
-may coexist with it. Each candidate retains its complete historical image; at
+historical `globalcomix.users`/`users.name`, `globalcomix.comics`/`comics.slug`,
+and approved `globalcomix.releases` FK `ROW INSERT` proofs. Exactly one
+candidate is allowed and no ordinary conflict may coexist with it. Each candidate retains its complete historical image; at
 XID, `SHOW MASTER STATUS` is read before one source `START TRANSACTION WITH
 CONSISTENT SNAPSHOT`, and that pre-snapshot coordinate is only a conservative
 lower bound that must be beyond the candidate transaction. The users proof
@@ -95,9 +95,18 @@ requires complete source and active-target `FOR UPDATE` hashes for both the
 historical primary row and current unique owner. The comics proof requires full
 current primary-row equality, while the locked unique owner is accepted by
 exact primary-key plus slug identity despite unrelated mutable-field drift, and
-only that insert may be treated as a no-op. Before checkpointing, the target transaction
-must lock an existing same-file predecessor before the candidate and no later
-than the XID. Remaining rows still apply, and the observation/resolution evidence
+only that insert may be treated as a no-op. The releases proof is limited to
+`releases_ibfk_2` category transaction `mysqld-bin.002709:515816736–515824875`
+and `releases_ibfk_3` visibility transaction
+`mysqld-bin.002709:531921570–531929925` (candidate event
+`531921789`), with the exact child/parent FK identity required. It retains the
+complete historical release image, requires one later current source release and
+one matching source parent, locks the target release and parent identities, and
+installs the complete current release row only when the target release is absent;
+an existing target release must hash equal to current source. It preserves the
+current parent identity and never updates or deletes that parent. Before
+checkpointing, the target transaction must lock an existing same-file predecessor
+before the candidate and no later than the XID. Remaining rows still apply, and the observation/resolution evidence
 plus XID checkpoint commit atomically; any proof, predecessor, or commit failure
 rolls back, then persists all unresolved observations independently; rollback or
 persistence failures are surfaced. When superseded verification rejects a

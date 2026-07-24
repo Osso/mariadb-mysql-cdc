@@ -102,9 +102,24 @@ exact existing row, insert only on no match, and fail closed on unsupported,
 missing, colliding, divergent, unavailable, or write-failure state. Recovery never
 advances the checkpoint; normal child replay commit/checkpoint resolves ledger
 evidence. Structured logs carry source coordinates, child identity, action, and
-outcome. This is not generic FK repair, performs no historical binlog
-reconstruction, requires a durable checkpoint store, and has no real source/target
-automatic-recovery proof in this commit.
+outcome. This is not generic FK repair and performs no historical binlog
+reconstruction.
+
+A separate superseded historical `globalcomix.releases` `ROW INSERT` proof is
+approved only for the exact production category transaction
+`mysqld-bin.002709:515816736–515824875` (`releases_ibfk_2`) and visibility
+transaction `mysqld-bin.002709:531921570–531929925` (`releases_ibfk_3`, child
+`(comic_id,comic_is_visible)` to parent `(id,is_visible)`, candidate event
+`531921789`). It retains the complete historical release image, requires later
+source history showing the same release now has a different parent value, and
+requires exactly one current source release, one matching source parent, and
+locked target release/parent identities. If the target release is absent, the
+verifier installs the complete current source row; an existing target release
+must already hash equal to it. The current parent identity is preserved: recovery
+never updates or deletes the parent. Remaining transaction effects, conflict
+resolution evidence, and the XID checkpoint commit atomically; failed proof,
+coordinate/FK scope, predecessor, or commit checks roll back target effects and
+checkpoint advancement, while unresolved evidence is persisted independently.
 Guarded observation upserts
 are idempotent. The admin-bootstrapped
 `cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory

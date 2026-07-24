@@ -19,17 +19,27 @@ The explicit `replace-divergent-pk` policy may replace an unequal row only for a
 primary-key UPDATE match; durable audit evidence records the decision. Missing or
 multiple PK rows and secondary-unique, foreign-key, CHECK, or replacement-update
 conflicts still roll back without checkpoint advancement. The live stream has
-superseded historical exceptions for `globalcomix.users`/`users.name` and
-`globalcomix.comics`/`comics.slug`: each allows exactly one deferred candidate
-and rejects any mixed ordinary conflict. It reads `SHOW MASTER STATUS` before
+superseded historical exceptions for `globalcomix.users`/`users.name`,
+`globalcomix.comics`/`comics.slug`, and two exact `globalcomix.releases` FK
+transactions: category `mysqld-bin.002709:515816736–515824875`
+(`releases_ibfk_2`) and visibility `mysqld-bin.002709:531921570–531929925`
+(`releases_ibfk_3`, candidate event `531921789`). Each allows exactly one
+deferred candidate and rejects any mixed ordinary conflict. It reads `SHOW MASTER STATUS` before
 one `START TRANSACTION WITH CONSISTENT SNAPSHOT`; that pre-snapshot coordinate
 is a conservative lower bound and must be beyond the candidate transaction. The
 users proof requires consistent-source full-row and active-transaction target
 `FOR UPDATE` proof for both historical PK and current unique owner. The comics
 proof requires full current primary-row equality, while accepting the locked
-unique owner by exact PK+slug identity despite unrelated mutable-field drift. Before writing the
-XID checkpoint, the target transaction requires an existing same-file predecessor
-before the candidate and no later than the XID. Remaining rows in that source
+unique owner by exact PK+slug identity despite unrelated mutable-field drift.
+For releases, the exact FK child/parent identity must match the approved
+transaction; the complete historical release image is retained, later source
+history must show a changed parent value, and exactly one current source release,
+source parent, and locked target parent identity must match. An absent target
+release gets the complete current source row installed; an existing target
+release must hash equal to current source. The parent identity is preserved and
+never updated or deleted. Before writing the XID checkpoint, the target
+transaction requires an existing same-file predecessor before the candidate and
+no later than the XID. Remaining rows in that source
 transaction still apply; any proof, predecessor, or commit failure rolls back,
 then persists all unresolved observations independently, surfacing rollback or
 persistence failures. Success commits its exact observation/resolution evidence

@@ -36,17 +36,26 @@ records durable replacement evidence and allows checkpoint advancement. The
 accepted risk is overwriting the divergent target row. Foreign-key, CHECK, and
 replacement-update conflicts persist evidence and abort. Secondary-unique
 conflicts do too, except the narrow superseded historical
-`globalcomix.users`/`users.name` and `globalcomix.comics`/`comics.slug` ROW
-`INSERT` proofs: exactly one candidate is allowed, and any ordinary conflict
-mixed into the source transaction fails closed. The stream reads `SHOW MASTER
+`globalcomix.users`/`users.name`, `globalcomix.comics`/`comics.slug`, and
+approved `globalcomix.releases` FK `ROW INSERT` proofs: exactly one candidate is
+allowed, and any ordinary conflict mixed into the source transaction fails
+closed. The stream reads `SHOW MASTER
 STATUS` before one source consistent snapshot; that pre-snapshot coordinate is a
 conservative lower bound and must be beyond the candidate transaction. The users
 proof requires complete source/target convergence for the historical PK and
 current unique owner using active-transaction `SELECT ... FOR UPDATE`. The
 comics proof requires complete current primary-row equality, while accepting the
 locked unique owner by exact PK+slug identity despite unrelated mutable-field
-drift. Both paths then require an existing same-file checkpoint predecessor
-before the candidate and no later than the XID. Only then does it commit the remaining
+drift. The releases proof accepts only `releases_ibfk_2` at
+`mysqld-bin.002709:515816736–515824875` or `releases_ibfk_3` at
+`mysqld-bin.002709:531921570–531929925` (visibility candidate event
+`531921789`) with exact FK child/parent identity. It retains the complete
+historical release image, requires changed later source parent history plus
+exact current source/target release and parent identities, installs the complete
+current release row only when absent, and otherwise requires target equality;
+the parent is never updated or deleted. All approved paths then require an
+existing same-file checkpoint predecessor before the candidate and no later than
+the XID. Only then does it commit the remaining
 source-transaction rows, exact observation/resolution evidence, and XID
 checkpoint atomically. Any proof, predecessor, or commit failure rolls back,
 then persists all unresolved observations independently; rollback or persistence
