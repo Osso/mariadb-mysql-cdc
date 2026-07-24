@@ -57,6 +57,9 @@ struct SyncProgressRow {
     last_primary_key: String,
     elapsed_seconds: u64,
     last_error: String,
+    /// A run holds `GET_LOCK(SHA2(run_id,256))` for its lifetime, and MySQL releases it when the
+    /// connection dies. `status` alone records intent, so liveness must come from the lock.
+    live: bool,
 }
 
 fn parse_sync_progress_config(args: Vec<String>) -> Result<SyncProgressConfig, String> {
@@ -458,8 +461,19 @@ fn build_progress_query(
         "''"
     };
     let run_id_expression = if has_run_id { "run_id" } else { "''" };
+    // Without a run_id column there is no per-run lock to consult, so such rows are reported live
+    // exactly as before.
+    let live_expression = if has_run_id {
+        "IS_USED_LOCK(SHA2(run_id,256)) IS NOT NULL"
+    } else {
+        "TRUE"
+    };
+    // Measure a dead run to its last write, not to NOW(), or its runtime grows forever.
+    let elapsed_expression = format!(
+        "GREATEST(1,TIMESTAMPDIFF(SECOND,created_at,IF(status='running' AND {live_expression},NOW(),updated_at)))"
+    );
     format!(
-        "SELECT {run_id_expression}, table_name, rows_scanned, {total_rows_expression}, inserts_applied, updates_applied, extra_target_rows, status, COALESCE(last_primary_key_json,''), GREATEST(1,TIMESTAMPDIFF(SECOND,created_at,IF(status='running',NOW(),updated_at))), COALESCE(last_error,'') FROM {}{} ORDER BY FIELD(status,'running','error','complete'), updated_at DESC, table_name",
+        "SELECT {run_id_expression}, table_name, rows_scanned, {total_rows_expression}, inserts_applied, updates_applied, extra_target_rows, status, COALESCE(last_primary_key_json,''), {elapsed_expression}, COALESCE(last_error,''), {live_expression} FROM {}{} ORDER BY (status='running' AND {live_expression}) DESC, FIELD(status,'running','error','complete'), updated_at DESC, table_name",
         quote_identifier_path(progress_table),
         progress_filter
     )
@@ -508,9 +522,9 @@ fn parse_progress_rows(output: &str) -> Result<Vec<SyncProgressRow>, String> {
 #[cfg(test)]
 fn parse_progress_row(line: &str) -> Result<SyncProgressRow, String> {
     let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 11 {
+    if fields.len() != 12 {
         return Err(format!(
-            "progress row has {} fields, expected 11",
+            "progress row has {} fields, expected 12",
             fields.len()
         ));
     }
@@ -527,6 +541,7 @@ fn parse_progress_row(line: &str) -> Result<SyncProgressRow, String> {
         last_primary_key: fields[8].to_string(),
         elapsed_seconds: parse_u64_field("elapsed_seconds", fields[9])?,
         last_error: fields[10].to_string(),
+        live: parse_u64_field("live", fields[11])? != 0,
     })
 }
 
@@ -542,6 +557,7 @@ type ProgressDbRow = (
     String,
     u64,
     String,
+    u64,
 );
 
 struct TargetProgressReader {
@@ -623,6 +639,7 @@ fn sync_progress_row_from_db(row: ProgressDbRow) -> Result<SyncProgressRow, Stri
         last_primary_key: row.8,
         elapsed_seconds: row.9,
         last_error: row.10,
+        live: row.11 != 0,
     })
 }
 
