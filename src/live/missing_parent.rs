@@ -31,6 +31,27 @@ pub(crate) enum MissingParentRejection {
     TargetParentDiverges,
 }
 
+impl MissingParentRejection {
+    /// Stable snake_case reason so an operator can grep a stall back to the predicate that failed.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::NullForeignKeyValue => "null_foreign_key_value",
+            Self::MissingChildColumn => "missing_child_column",
+            Self::SourceParentAbsent => "source_parent_absent",
+            Self::SourceParentAmbiguous => "source_parent_ambiguous",
+            Self::SourceParentIdentityMismatch => "source_parent_identity_mismatch",
+            Self::TargetParentAmbiguous => "target_parent_ambiguous",
+            Self::TargetParentDiverges => "target_parent_diverges",
+        }
+    }
+}
+
+impl std::fmt::Display for MissingParentRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct MissingParentInput<'a> {
     pub(crate) violation: &'a ForeignKeyViolation,

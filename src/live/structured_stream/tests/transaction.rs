@@ -2189,6 +2189,15 @@ impl crate::table_sync::ExactParentReader for FixtureExactParentReader {
     ) -> Result<Vec<crate::snapshot::SnapshotRow>, crate::table_sync::TableSyncError> {
         Ok(self.rows.clone())
     }
+
+    fn read_parent_identity_rows(
+        &self,
+        _table: &crate::inventory::TableInventory,
+        _columns: &[String],
+        _values: &[Option<String>],
+    ) -> Result<Vec<crate::snapshot::SnapshotRow>, crate::table_sync::TableSyncError> {
+        panic!("home feed recovery must not query a generic parent")
+    }
 }
 
 impl crate::table_sync::SyncRepairTarget for RecordingExactParentTarget {

@@ -54,6 +54,8 @@ pub(super) const HOME_FEED_CARD_COLUMNS: [&str; 20] = [
 ];
 pub(super) const RECOVERY_CREATE_TIME_EPOCH_ALIAS: &str = "__recovery_create_time_epoch";
 const GUEST_IDENTITY_COLLISION_LIMIT: usize = 3;
+/// Two rows are enough to prove a referenced identity is ambiguous, which the planner rejects.
+const PARENT_IDENTITY_COLLISION_LIMIT: usize = 2;
 const HOME_FEED_CARD_IDENTITY_COLLISION_LIMIT: usize = 3;
 pub(super) const RECOVERY_UTC_SESSION_SQL: &str = "SET SESSION time_zone='+00:00'";
 
@@ -143,12 +145,7 @@ impl MySqlSyncReader {
         table: &crate::inventory::TableInventory,
         identity: &[(String, String)],
     ) -> Result<Vec<SnapshotRow>, TableSyncError> {
-        let columns = table
-            .columns
-            .iter()
-            .filter(|column| column.generated.is_none())
-            .map(|column| column.name.clone())
-            .collect::<Vec<_>>();
+        let columns = inventory_stored_columns(table);
         let predicates = identity
             .iter()
             .map(|(column, value)| {
@@ -163,6 +160,28 @@ impl MySqlSyncReader {
             predicates
         );
         parse_sync_rows(&columns, &table.primary_key, self.query_rows(&sql)?)
+    }
+
+    /// Reads the rows owning a referenced foreign-key identity in any parent table.
+    ///
+    /// Cardinality is preserved up to the collision limit so the planner can reject an ambiguous
+    /// identity instead of picking a row.
+    pub(crate) fn read_parent_identity_rows(
+        &self,
+        table: &crate::inventory::TableInventory,
+        columns: &[String],
+        values: &[Option<String>],
+    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        let query_columns = inventory_stored_columns(table);
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} ORDER BY {} LIMIT {}",
+            quote_ident_list(&query_columns),
+            quote_ident(&table.name),
+            parent_identity_predicates(columns, values),
+            quote_ident_list(&table.primary_key),
+            PARENT_IDENTITY_COLLISION_LIMIT,
+        );
+        parse_sync_rows(&query_columns, &table.primary_key, self.query_rows(&sql)?)
     }
 
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
@@ -216,6 +235,30 @@ where
         initialize()?;
     }
     Ok(())
+}
+
+/// Columns an insert can carry, which excludes generated columns the target computes itself.
+pub(super) fn inventory_stored_columns(table: &crate::inventory::TableInventory) -> Vec<String> {
+    table
+        .columns
+        .iter()
+        .filter(|column| column.generated.is_none())
+        .map(|column| column.name.clone())
+        .collect()
+}
+
+/// A NULL foreign-key value never violates the constraint, so it cannot select a parent by
+/// equality. `IS NULL` keeps the read honest and the planner rejects the case outright.
+fn parent_identity_predicates(columns: &[String], values: &[Option<String>]) -> String {
+    columns
+        .iter()
+        .zip(values)
+        .map(|(column, value)| match value {
+            Some(value) => format!("{} = {}", quote_ident(column), quote_sql_literal(value)),
+            None => format!("{} IS NULL", quote_ident(column)),
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn build_guest_identity_sql(guest_id: &str, guest_hash: &str) -> String {
