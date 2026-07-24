@@ -193,6 +193,62 @@ impl MySqlSyncRepairTarget {
     fn verify_child_rows(&self, rows: &[SnapshotRow]) -> Result<(), TableSyncError> {
         self.verify_exact_rows(&rows.iter().collect::<Vec<_>>(), "insert")
     }
+
+    fn rows_missing_after_duplicate(
+        &self,
+        rows: &[SnapshotRow],
+    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        let Some(context) = &self.fk_repair else {
+            return Err(TableSyncError::Repair(
+                "duplicate reconciliation context is unavailable".to_string(),
+            ));
+        };
+        let table_name = self.writer.table_name();
+        let table = context.tables.get(table_name).ok_or_else(|| {
+            TableSyncError::Repair(format!("source inventory is missing table `{table_name}`"))
+        })?;
+        let mut missing = Vec::new();
+        for source_row in rows {
+            let identity = row_identity(table, source_row)?;
+            let target_rows = context.target.read_exact_inventory_rows(table, &identity)?;
+            match target_rows.as_slice() {
+                [] => missing.push(source_row.clone()),
+                [target_row] if target_row == source_row => {}
+                _ => {
+                    return Err(TableSyncError::Repair(format!(
+                        "concurrent duplicate owner diverges from source for `{table_name}` identity {identity:?}"
+                    )));
+                }
+            }
+        }
+        if missing.len() == rows.len() {
+            return Err(TableSyncError::Repair(format!(
+                "duplicate key for `{table_name}` is owned by a different target identity"
+            )));
+        }
+        Ok(missing)
+    }
+
+    fn insert_child_batch(&mut self, batch: &[SnapshotRow]) -> Result<(), TableSyncError> {
+        let mut remaining = batch.to_vec();
+        loop {
+            match self.writer.insert_rows(&remaining) {
+                Ok(()) => break,
+                Err(error) if error.mysql_code() == Some(1452) => {
+                    self.repair_fk_parents_and_retry(&remaining, ChildBatchOperation::Insert)?;
+                    break;
+                }
+                Err(error) if error.mysql_code() == Some(1062) => {
+                    remaining = self.rows_missing_after_duplicate(&remaining)?;
+                    if remaining.is_empty() {
+                        break;
+                    }
+                }
+                Err(error) => return Err(TableSyncError::Repair(error.to_string())),
+            }
+        }
+        self.verify_child_rows(batch)
+    }
 }
 
 struct MySqlParentRepairStore<'a> {
@@ -381,14 +437,7 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
     fn insert_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         let rows = rows.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
         for batch in rows.chunks(self.writer.insert_batch_size()) {
-            match self.writer.insert_rows(batch) {
-                Ok(()) => self.verify_child_rows(batch)?,
-                Err(error) if error.mysql_code() == Some(1452) => {
-                    self.repair_fk_parents_and_retry(batch, ChildBatchOperation::Insert)?;
-                    self.verify_child_rows(batch)?;
-                }
-                Err(error) => return Err(TableSyncError::Repair(error.to_string())),
-            }
+            self.insert_child_batch(batch)?;
         }
         Ok(())
     }

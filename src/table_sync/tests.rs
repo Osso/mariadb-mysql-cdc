@@ -186,6 +186,136 @@ fn apply_repairs_missing_different_and_extra_target_rows() {
     );
 }
 
+struct ConcurrentDuplicateRepairTarget {
+    target_rows: RefCell<Vec<SnapshotRow>>,
+    divergent: bool,
+}
+
+impl ConcurrentDuplicateRepairTarget {
+    fn exact() -> Self {
+        Self {
+            target_rows: RefCell::new(Vec::new()),
+            divergent: false,
+        }
+    }
+
+    fn divergent() -> Self {
+        Self {
+            target_rows: RefCell::new(Vec::new()),
+            divergent: true,
+        }
+    }
+}
+
+impl SyncRepairTarget for ConcurrentDuplicateRepairTarget {
+    fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
+        self.insert_rows(&[row])
+    }
+
+    fn insert_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        let concurrent_rows = rows
+            .iter()
+            .map(|row| {
+                if self.divergent {
+                    super::tests_support::row(&row.primary_key[0], "divergent-owner")
+                } else {
+                    (*row).clone()
+                }
+            })
+            .collect();
+        self.target_rows.replace(concurrent_rows);
+        Err(TableSyncError::Duplicate(
+            "mysql error 1062 from concurrent insert".to_string(),
+        ))
+    }
+
+    fn update_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+
+    fn verify_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        let target_rows = self.target_rows.borrow();
+        let exact = rows.len() == target_rows.len()
+            && rows
+                .iter()
+                .zip(target_rows.iter())
+                .all(|(source, target)| **source == *target);
+        if exact {
+            Ok(())
+        } else {
+            Err(TableSyncError::Repair(
+                "concurrent duplicate owner diverges from source".to_string(),
+            ))
+        }
+    }
+
+    fn delete_row(&mut self, _primary_key: &[String]) -> Result<(), TableSyncError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn concurrent_exact_child_duplicate_advances_only_after_verification() {
+    let source = FakeReader::new(vec![row("1", "source")]);
+    let target = FakeReader::new(Vec::new());
+    let mut repair_target = ConcurrentDuplicateRepairTarget::exact();
+    let mut progress_store = RecordingProgressStore::default();
+
+    let report = sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "concurrent-exact-child".to_string(),
+            run_scope: "concurrent-exact-child-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect("identical concurrent child is benign");
+
+    assert_eq!(report.inserts, 1);
+    assert!(progress_store.saved.borrow().iter().any(|progress| {
+        progress.last_primary_key == Some(vec!["1".to_string()]) && progress.inserts == 1
+    }));
+}
+
+#[test]
+fn concurrent_divergent_child_duplicate_rejects_progress() {
+    let source = FakeReader::new(vec![row("1", "source")]);
+    let target = FakeReader::new(Vec::new());
+    let mut repair_target = ConcurrentDuplicateRepairTarget::divergent();
+    let mut progress_store = RecordingProgressStore::default();
+
+    let error = sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "concurrent-divergent-child".to_string(),
+            run_scope: "concurrent-divergent-child-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect_err("divergent concurrent owner must fail");
+
+    assert!(error.to_string().contains("diverges from source"));
+    assert!(progress_store.saved.borrow().iter().all(|progress| {
+        progress.last_primary_key.is_none() && progress.inserts == 0 && progress.chunks == 0
+    }));
+}
+
 #[test]
 fn apply_batches_missing_rows_before_checkpointing_the_chunk() {
     let source = FakeReader::new(vec![row("1", "alpha"), row("2", "bravo")]);

@@ -87,6 +87,7 @@ pub trait SyncTableReader {
 pub enum TableSyncError {
     InvalidTable(String),
     Read(String),
+    Duplicate(String),
     Repair(String),
     Progress(String),
 }
@@ -96,6 +97,7 @@ impl fmt::Display for TableSyncError {
         match self {
             Self::InvalidTable(message) => write!(formatter, "invalid sync table: {message}"),
             Self::Read(message) => write!(formatter, "sync read failed: {message}"),
+            Self::Duplicate(message) => write!(formatter, "sync duplicate detected: {message}"),
             Self::Repair(message) => write!(formatter, "sync repair failed: {message}"),
             Self::Progress(message) => write!(formatter, "sync progress failed: {message}"),
         }

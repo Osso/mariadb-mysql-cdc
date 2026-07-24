@@ -195,7 +195,11 @@ fn apply_inserts(
     repair_target: &mut impl SyncRepairTarget,
 ) -> Result<(), TableSyncError> {
     if mode != SyncMode::DryRun && !rows.is_empty() {
-        repair_target.insert_rows(rows)?;
+        match repair_target.insert_rows(rows) {
+            Ok(()) => {}
+            Err(TableSyncError::Duplicate(_)) => repair_target.verify_rows(rows)?,
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
