@@ -3728,11 +3728,11 @@ class Harness:
             "SELECT status,last_primary_key_json FROM globalcomix.table_sync_runs "
             "WHERE run_id='sync-table-fk-parent-repair';",
         ).strip()
-        if not parent.startswith("184041\\t42f66c"):
+        if not parent.startswith("184041\t42f66c"):
             raise HarnessError(f"FK parent did not converge: {parent!r}")
-        if child != "87308589\\t6ee3278e-f4e0-4242-bd66-1342633d84f1G4Cd\\t184041":
+        if child != "87308589\t6ee3278e-f4e0-4242-bd66-1342633d84f1G4Cd\t184041":
             raise HarnessError(f"FK child did not converge: {child!r}")
-        if progress != 'complete\\t["87308589"]':
+        if progress != 'complete\t["87308589"]':
             raise HarnessError(f"progress advanced without terminal convergence: {progress!r}")
         print("sync_table_fk_parent_repair_ok mysql_error=1452 parent_first=true child_retried=true")
 
