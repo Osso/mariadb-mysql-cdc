@@ -75,6 +75,7 @@ fn grants() -> Vec<String> {
         "GRANT SELECT, INSERT, UPDATE ON `cdc`.`stream_checkpoint` TO `cdc_stream`@`%`".to_string(),
         "GRANT SELECT, INSERT, UPDATE ON `cdc`.`row_conflicts` TO `cdc_stream`@`%`".to_string(),
         "GRANT SELECT, INSERT, UPDATE ON `cdc`.`ddl_replay_journal` TO `cdc_stream`@`%`".to_string(),
+        "GRANT SELECT, INSERT, UPDATE ON `cdc`.`table_sync_runs` TO `cdc_stream`@`%`".to_string(),
         "GRANT EXECUTE ON PROCEDURE `cdc`.`ddl_replay_journal_trigger_inventory` TO `cdc_stream`@`%`".to_string(),
     ]
 }

@@ -173,6 +173,7 @@ impl RuntimeGrantPolicy {
             scope if scope == self.journal_scope => JOURNAL_PRIVILEGES,
             scope if scope == self.conflict_scope => JOURNAL_PRIVILEGES,
             scope if scope == self.inventory_scope => EXECUTE_PRIVILEGES,
+            "CDC.TABLE_SYNC_RUNS" => CHECKPOINT_PRIVILEGES,
             "PROCEDURE CDC.ROW_CONFLICTS_TRIGGER_INVENTORY" => EXECUTE_PRIVILEGES,
             _ => return None,
         };
