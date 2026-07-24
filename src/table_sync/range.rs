@@ -143,27 +143,6 @@ where
     R: SyncRepairTarget,
     P: SyncProgressStore,
 {
-    if matches!(context.phase, SyncPhase::All | SyncPhase::DeleteExtras)
-        && context.options.mode == SyncMode::Apply
-        && context.options.max_deletes.is_some()
-        && !context.progress.delete_preflight_complete
-    {
-        preflight_delete_budget(
-            DeletePreflightOptions {
-                table: context.table,
-                chunk_size: context.options.chunk_size,
-                mode: context.options.mode,
-                start_after: context.start_after.clone(),
-                range_end_at: context.options.end_at.clone(),
-                existing_deletes: context.report.extra_target_rows,
-                max_deletes: context.options.max_deletes,
-            },
-            context.source,
-            context.target,
-        )?;
-        context.progress.delete_preflight_complete = true;
-        context.progress_store.save(&context.progress)?;
-    }
     run_range_chunks(&mut context)
 }
 
@@ -289,46 +268,6 @@ where
     } else {
         Ok(Some(end_at))
     }
-}
-
-struct DeletePreflightOptions<'a> {
-    table: &'a SyncTable,
-    chunk_size: usize,
-    mode: SyncMode,
-    start_after: Option<Vec<String>>,
-    range_end_at: Option<Vec<String>>,
-    existing_deletes: u64,
-    max_deletes: Option<u64>,
-}
-
-fn preflight_delete_budget<S, T>(
-    options: DeletePreflightOptions<'_>,
-    source: &S,
-    target: &T,
-) -> Result<(), TableSyncError>
-where
-    S: SyncTableReader,
-    T: SyncTableReader,
-{
-    if options.mode != SyncMode::Apply || options.max_deletes.is_none() {
-        return Ok(());
-    }
-
-    let extra_target_rows = count_total_extra_rows(
-        ExtraRowCount {
-            table: options.table,
-            chunk_size: options.chunk_size,
-            range_end_at: options.range_end_at,
-            source,
-            target,
-        },
-        options.start_after,
-    )?;
-    ensure_delete_allowed(
-        options.existing_deletes + extra_target_rows,
-        options.max_deletes,
-        options.mode,
-    )
 }
 
 struct ExtraRowCount<'a, S, T>

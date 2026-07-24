@@ -567,227 +567,85 @@ fn resumes_from_saved_table_progress_and_saves_each_chunk() {
 }
 
 #[test]
-fn mysql_progress_reconnect_persists_preflight_marker_and_skips_repeat_scan() {
-    let database = Rc::new(progress::TestProgressSqlDatabase::default());
-    let source_rows = vec![row("1", "alpha")];
-    let first_source = FailOnReadReader::new(source_rows.clone(), 2);
-    let target = FakeReader::new(vec![row("1", "alpha")]);
-    let mut first_repair_target = RecordingRepairTarget::default();
-    let mut first_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
-        Rc::clone(&database),
-        "cdc.table_sync_runs".to_string(),
-    );
+fn first_chunk_mutation_immediately_persists_progress() {
+    let source = FailOnReadReader::new(vec![row("1", "alpha"), row("2", "beta")], 2);
+    let target = FakeReader::new(Vec::new());
+    let mut repair_target = RecordingRepairTarget::default();
+    let mut progress_store = RecordingProgressStore::default();
 
     sync_table_with_progress_range(
         &account_table(),
         SyncRunOptions {
-            run_id: "mysql-preflight-resume".to_string(),
-            run_scope: "mysql-preflight-resume-scope".to_string(),
-            chunk_size: 10,
+            run_id: "immediate-first-chunk".to_string(),
+            run_scope: "immediate-first-chunk-scope".to_string(),
+            chunk_size: 1,
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
             max_deletes: Some(0),
         },
-        &first_source,
+        &source,
         &target,
-        &mut first_repair_target,
-        &mut first_store,
+        &mut repair_target,
+        &mut progress_store,
     )
-    .expect_err("repair read fails after successful preflight");
+    .expect_err("second source read fails after first chunk commits");
 
-    let resumed_source = FakeReader::new(source_rows);
-    let resumed_target = FakeReader::new(vec![row("1", "alpha")]);
-    let mut resumed_repair_target = RecordingRepairTarget::default();
-    let mut resumed_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
-        database,
-        "cdc.table_sync_runs".to_string(),
-    );
-    sync_table_with_progress_range(
-        &account_table(),
-        SyncRunOptions {
-            run_id: "mysql-preflight-resume".to_string(),
-            run_scope: "mysql-preflight-resume-scope".to_string(),
-            chunk_size: 10,
-            mode: SyncMode::Apply,
-            start_after: None,
-            end_at: None,
-            max_deletes: Some(0),
-        },
-        &resumed_source,
-        &resumed_target,
-        &mut resumed_repair_target,
-        &mut resumed_store,
-    )
-    .expect("fresh MySQL progress store resumes after reconnect");
-
-    assert_eq!(resumed_source.requests.borrow().len(), 1);
-}
-
-#[test]
-fn mysql_progress_reconnect_retries_incomplete_preflight() {
-    let database = Rc::new(progress::TestProgressSqlDatabase::default());
-    let source_rows = vec![row("1", "alpha")];
-    let first_source = FailOnReadReader::new(source_rows.clone(), 1);
-    let target = FakeReader::new(vec![row("1", "alpha")]);
-    let mut first_repair_target = RecordingRepairTarget::default();
-    let mut first_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
-        Rc::clone(&database),
-        "cdc.table_sync_runs".to_string(),
-    );
-    sync_table_with_progress_range(
-        &account_table(),
-        SyncRunOptions {
-            run_id: "mysql-incomplete-preflight".to_string(),
-            run_scope: "mysql-incomplete-preflight-scope".to_string(),
-            chunk_size: 10,
-            mode: SyncMode::Apply,
-            start_after: None,
-            end_at: None,
-            max_deletes: Some(0),
-        },
-        &first_source,
-        &target,
-        &mut first_repair_target,
-        &mut first_store,
-    )
-    .expect_err("preflight read fails before marker persistence");
     assert_eq!(
-        database.stored_preflight_marker("mysql-incomplete-preflight"),
-        Some(false)
+        repair_target
+            .inserts
+            .borrow()
+            .iter()
+            .map(|row| row.primary_key.clone())
+            .collect::<Vec<_>>(),
+        vec![vec!["1".to_string()]]
     );
-
-    let resumed_source = FakeReader::new(source_rows);
-    let resumed_target = FakeReader::new(vec![row("1", "alpha")]);
-    let mut resumed_repair_target = RecordingRepairTarget::default();
-    let mut resumed_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
-        database,
-        "cdc.table_sync_runs".to_string(),
-    );
-    sync_table_with_progress_range(
-        &account_table(),
-        SyncRunOptions {
-            run_id: "mysql-incomplete-preflight".to_string(),
-            run_scope: "mysql-incomplete-preflight-scope".to_string(),
-            chunk_size: 10,
-            mode: SyncMode::Apply,
-            start_after: None,
-            end_at: None,
-            max_deletes: Some(0),
-        },
-        &resumed_source,
-        &resumed_target,
-        &mut resumed_repair_target,
-        &mut resumed_store,
-    )
-    .expect("incomplete preflight is retried");
-
-    assert_eq!(resumed_source.requests.borrow().len(), 2);
+    let saved = progress_store.saved.borrow();
+    let first_chunk = saved
+        .iter()
+        .find(|progress| progress.last_primary_key == Some(vec!["1".to_string()]))
+        .expect("first chunk progress persisted");
+    assert_eq!(first_chunk.chunks, 1);
+    assert_eq!(first_chunk.rows_scanned, 1);
+    assert_eq!(first_chunk.inserts, 1);
 }
 
 #[test]
-fn mysql_progress_reconnect_retries_preflight_when_marker_save_fails() {
-    let database = Rc::new(progress::TestProgressSqlDatabase::default());
-    database.fail_next_completed_preflight_save();
-    let source_rows = vec![row("1", "alpha")];
-    let first_source = FakeReader::new(source_rows.clone());
-    let target = FakeReader::new(vec![row("1", "alpha")]);
-    let mut first_repair_target = RecordingRepairTarget::default();
-    let mut first_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
-        Rc::clone(&database),
-        "cdc.table_sync_runs".to_string(),
-    );
-    sync_table_with_progress_range(
-        &account_table(),
-        SyncRunOptions {
-            run_id: "mysql-marker-save-failure".to_string(),
-            run_scope: "mysql-marker-save-failure-scope".to_string(),
-            chunk_size: 10,
-            mode: SyncMode::Apply,
-            start_after: None,
-            end_at: None,
-            max_deletes: Some(0),
-        },
-        &first_source,
-        &target,
-        &mut first_repair_target,
-        &mut first_store,
-    )
-    .expect_err("completed-preflight marker save fails");
-    assert_eq!(
-        database.stored_preflight_marker("mysql-marker-save-failure"),
-        Some(false)
-    );
-
-    let resumed_source = FakeReader::new(source_rows);
-    let resumed_target = FakeReader::new(vec![row("1", "alpha")]);
-    let mut resumed_repair_target = RecordingRepairTarget::default();
-    let mut resumed_store = progress::MySqlSyncRunProgressStore::new_with_test_database(
-        database,
-        "cdc.table_sync_runs".to_string(),
-    );
-    sync_table_with_progress_range(
-        &account_table(),
-        SyncRunOptions {
-            run_id: "mysql-marker-save-failure".to_string(),
-            run_scope: "mysql-marker-save-failure-scope".to_string(),
-            chunk_size: 10,
-            mode: SyncMode::Apply,
-            start_after: None,
-            end_at: None,
-            max_deletes: Some(0),
-        },
-        &resumed_source,
-        &resumed_target,
-        &mut resumed_repair_target,
-        &mut resumed_store,
-    )
-    .expect("failed marker save leaves preflight retryable");
-
-    assert_eq!(resumed_source.requests.borrow().len(), 2);
-}
-
-#[test]
-fn reconnect_skips_successful_delete_preflight_before_repair_resumes() {
+fn interruption_resumes_after_persisted_chunk_without_replay() {
     let durable_progress = Rc::new(RefCell::new(None));
-    let source_rows = vec![row("1", "alpha")];
-    let first_source = FailOnReadReader::new(source_rows.clone(), 2);
-    let target = FakeReader::new(vec![row("1", "alpha")]);
+    let first_source = FailOnReadReader::new(vec![row("1", "alpha"), row("2", "beta")], 2);
+    let first_target = FakeReader::new(Vec::new());
     let mut first_repair_target = RecordingRepairTarget::default();
     let mut first_store = SharedProgressStore::new(Rc::clone(&durable_progress));
-    let first_error = sync_table_with_progress_range(
+
+    sync_table_with_progress_range(
         &account_table(),
         SyncRunOptions {
-            run_id: "preflight-resume".to_string(),
-            run_scope: "preflight-resume-scope".to_string(),
-            chunk_size: 10,
+            run_id: "chunk-resume".to_string(),
+            run_scope: "chunk-resume-scope".to_string(),
+            chunk_size: 1,
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
             max_deletes: Some(0),
         },
         &first_source,
-        &target,
+        &first_target,
         &mut first_repair_target,
         &mut first_store,
     )
-    .expect_err("repair read fails after successful preflight");
-    assert_eq!(
-        first_error.to_string(),
-        "sync read failed: repair connection lost"
-    );
+    .expect_err("interruption after first committed chunk");
 
-    let resumed_source = FakeReader::new(source_rows);
+    let resumed_source = FakeReader::new(vec![row("1", "alpha"), row("2", "beta")]);
     let resumed_target = FakeReader::new(vec![row("1", "alpha")]);
     let mut resumed_repair_target = RecordingRepairTarget::default();
     let mut resumed_store = SharedProgressStore::new(durable_progress);
-
     sync_table_with_progress_range(
         &account_table(),
         SyncRunOptions {
-            run_id: "preflight-resume".to_string(),
-            run_scope: "preflight-resume-scope".to_string(),
-            chunk_size: 10,
+            run_id: "chunk-resume".to_string(),
+            run_scope: "chunk-resume-scope".to_string(),
+            chunk_size: 1,
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
@@ -798,9 +656,72 @@ fn reconnect_skips_successful_delete_preflight_before_repair_resumes() {
         &mut resumed_repair_target,
         &mut resumed_store,
     )
-    .expect("repair resumes after reconnect");
+    .expect("resume completes from next chunk");
 
-    assert_eq!(resumed_source.requests.borrow().len(), 1);
+    assert_eq!(
+        resumed_source.requests.borrow()[0].start_after,
+        Some(vec!["1".to_string()])
+    );
+    assert_eq!(
+        resumed_repair_target
+            .inserts
+            .borrow()
+            .iter()
+            .map(|row| row.primary_key.clone())
+            .collect::<Vec<_>>(),
+        vec![vec!["2".to_string()]]
+    );
+}
+
+#[test]
+fn cumulative_delete_budget_fails_before_violating_chunk_mutates() {
+    let source = FakeReader::new(vec![row("10", "ten"), row("20", "twenty")]);
+    let target = FakeReader::new(vec![
+        row("05", "extra-first"),
+        row("10", "ten"),
+        row("15", "extra-second"),
+        row("20", "twenty"),
+    ]);
+    let mut repair_target = RecordingRepairTarget::default();
+    let mut progress_store = RecordingProgressStore::default();
+
+    let error = sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "cumulative-delete-budget".to_string(),
+            run_scope: "cumulative-delete-budget-scope".to_string(),
+            chunk_size: 1,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(1),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect_err("second chunk exceeds cumulative delete budget");
+
+    assert_eq!(
+        error.to_string(),
+        "sync repair failed: delete safety threshold exceeded: max_deletes=1"
+    );
+    assert_eq!(
+        repair_target.deletes.borrow().as_slice(),
+        &[vec!["05".to_string()]]
+    );
+    let saved = progress_store.saved.borrow();
+    let first_chunk = saved
+        .iter()
+        .find(|progress| progress.last_primary_key == Some(vec!["10".to_string()]))
+        .expect("first chunk progress persisted");
+    assert_eq!(first_chunk.extra_target_rows, 1);
+    assert!(
+        saved
+            .iter()
+            .all(|progress| progress.last_primary_key != Some(vec!["20".to_string()]))
+    );
 }
 
 #[test]
