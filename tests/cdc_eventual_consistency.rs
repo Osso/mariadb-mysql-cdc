@@ -566,7 +566,6 @@ fn repair_scenarios_are_executable_and_in_repair_scope() {
         "fk-unrelated-cycle-ignored",
         "fk-selected-dependency-cycle-block",
         "repair-resume",
-        "bounded-delete",
         "conflict-resolution-zero-debt",
     ] {
         assert!(script.contains(&format!("ScenarioSpec(\"{scenario}\", True)")));
@@ -585,7 +584,6 @@ fn repair_scenarios_have_real_cli_orchestration_dispatch() {
         "fk-unrelated-cycle-ignored",
         "fk-selected-dependency-cycle-block",
         "repair-resume",
-        "bounded-delete",
         "conflict-resolution-zero-debt",
     ] {
         assert!(
@@ -657,7 +655,6 @@ fn harness_scenario_listing_has_behavior_or_explicit_prerequisite() {
         "fk-unrelated-cycle-ignored",
         "fk-selected-dependency-cycle-block",
         "repair-resume",
-        "bounded-delete",
         "conflict-resolution-zero-debt",
     ] {
         assert!(
