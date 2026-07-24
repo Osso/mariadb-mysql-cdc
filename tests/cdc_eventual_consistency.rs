@@ -87,6 +87,24 @@ fn real_fk_parent_repair_reconciles_concurrent_child_duplicate() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_wide_update_retries_only_failed_fk_statement() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("sync-table-wide-update-fk-retry")
+        .output()
+        .expect("run wide update FK retry harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_superseded_users_recovery_commits_remaining_effects_and_rejects_mismatch() {
     let output = Command::new("python3")
         .arg(harness_script())

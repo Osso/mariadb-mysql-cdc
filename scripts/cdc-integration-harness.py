@@ -48,6 +48,7 @@ SCENARIOS = (
     ScenarioSpec("sync-table-fk-parent-repair", True),
     ScenarioSpec("sync-table-update-fk-parent-repair", True),
     ScenarioSpec("sync-table-fk-parent-concurrent-duplicate", True),
+    ScenarioSpec("sync-table-wide-update-fk-retry", True),
     ScenarioSpec("home-feed-card-parent-recovery", True),
     ScenarioSpec("superseded-release-parent-recovery", True),
     ScenarioSpec("superseded-users-recovery", True),
@@ -3850,6 +3851,110 @@ class Harness:
             "mysql_errors=1452,1062 exact_progress=true divergent_progress=false"
         )
 
+    def run_sync_table_wide_update_fk_retry(self) -> None:
+        assert self.source and self.target
+        payload_columns = [f"value_{index}" for index in range(1, 256)]
+        column_definitions = ", ".join(
+            f"{column} CHAR(1) NOT NULL" for column in payload_columns
+        )
+        columns = ["id", "parent_id", *payload_columns]
+        quoted_columns = ",".join(f"`{column}`" for column in columns)
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "DROP TABLE IF EXISTS wide_update_audit; "
+                "DROP TABLE IF EXISTS wide_children; DROP TABLE IF EXISTS wide_parents; "
+                "CREATE TABLE wide_parents (id INT UNSIGNED NOT NULL PRIMARY KEY, "
+                "parent_hash VARCHAR(64) NOT NULL UNIQUE) ENGINE=InnoDB; "
+                "CREATE TABLE wide_children (id INT UNSIGNED NOT NULL PRIMARY KEY, "
+                "parent_id INT UNSIGNED NOT NULL, "
+                f"{column_definitions}, "
+                "CONSTRAINT fk_wide_children_parent FOREIGN KEY (parent_id) "
+                "REFERENCES wide_parents(id)) ENGINE=InnoDB;",
+            )
+        self.admin_sql(
+            self.target,
+            "CREATE TABLE wide_update_audit (id INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "update_count INT UNSIGNED NOT NULL) ENGINE=InnoDB; "
+            "CREATE TRIGGER audit_wide_child_update BEFORE UPDATE ON wide_children "
+            "FOR EACH ROW INSERT INTO wide_update_audit VALUES (OLD.id, 1) "
+            "ON DUPLICATE KEY UPDATE update_count=update_count+1;",
+        )
+        self.admin_sql(
+            self.source,
+            "INSERT INTO wide_parents VALUES (1, 'existing'), (184041, 'repaired');",
+        )
+        self.admin_sql(self.target, "INSERT INTO wide_parents VALUES (1, 'existing');")
+
+        def values(row_id: int, parent_id: int, payload: str) -> str:
+            fields = [str(row_id), str(parent_id), *([f"'{payload}'"] * 255)]
+            return f"({','.join(fields)})"
+
+        source_rows = ",".join(
+            values(row_id, 1 if row_id <= 127 else 184041, "s")
+            for row_id in range(1, 130)
+        )
+        target_rows = ",".join(values(row_id, 1, "t") for row_id in range(1, 130))
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO wide_children ({quoted_columns}) VALUES {source_rows};",
+        )
+        self.admin_sql(
+            self.target,
+            f"INSERT INTO wide_children ({quoted_columns}) VALUES {target_rows};",
+        )
+
+        binary = self._repair_binary()
+        args = self._sync_table_args(binary)
+        args[args.index("accounts")] = "wide_children"
+        args[args.index("id,email,payload")] = ",".join(columns)
+        args[args.index("sync-table-source-ca-proof")] = "sync-table-wide-update-fk-retry"
+        args[args.index("globalcomix.sync_table_tls_progress")] = (
+            "globalcomix.table_sync_runs"
+        )
+        args.extend([
+            "--mode", "apply", "--chunk-size", "129", "--max-deletes", "0",
+        ])
+        result = run(
+            args,
+            cwd=self.repo,
+            env={
+                **os.environ,
+                "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            },
+            timeout=240,
+            check=False,
+        )
+        require_success(result, "wide update FK retry")
+        audit = self.admin_query(
+            self.target,
+            "SELECT COUNT(*),MIN(update_count),MAX(update_count),SUM(update_count) "
+            "FROM wide_update_audit;",
+        ).strip()
+        drift = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM wide_children WHERE "
+            "value_1 <> 's' OR (id <= 127 AND parent_id <> 1) OR "
+            "(id >= 128 AND parent_id <> 184041);",
+        ).strip()
+        progress = self.admin_query(
+            self.target,
+            "SELECT status,last_primary_key_json,updates_applied,chunks "
+            "FROM globalcomix.table_sync_runs "
+            "WHERE run_id='sync-table-wide-update-fk-retry';",
+        ).strip()
+        if audit != "129\t1\t1\t129":
+            raise HarnessError(f"committed update prefix was replayed: audit={audit!r}")
+        if drift != "0":
+            raise HarnessError(f"wide update exact readback diverged: count={drift!r}")
+        if progress != 'complete\t["129"]\t129\t1':
+            raise HarnessError(f"wide update progress was not gated: {progress!r}")
+        print(
+            "sync_table_wide_update_fk_retry_ok capacity=127 mysql_error=1452 "
+            "committed_prefix_replayed=false exact_readback=true progress_afterward=true"
+        )
+
     def run_repair_scenario(self, scenario: str) -> None:
         assert self.source and self.target
         if scenario in {"fk-child-first-delete", "fk-parent-first-insert"}:
@@ -4389,6 +4494,8 @@ class Harness:
             self.run_sync_table_fk_parent_repair(update_existing_child=True)
         elif scenario == "sync-table-fk-parent-concurrent-duplicate":
             self.run_sync_table_fk_parent_concurrent_duplicate()
+        elif scenario == "sync-table-wide-update-fk-retry":
+            self.run_sync_table_wide_update_fk_retry()
         elif scenario == "home-feed-card-parent-recovery":
             self.run_home_feed_card_parent_recovery()
         elif scenario == "superseded-release-parent-recovery":
