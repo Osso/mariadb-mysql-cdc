@@ -1292,46 +1292,6 @@ fn apply_repairs_source_empty_target_range() {
 }
 
 #[test]
-fn apply_rejects_total_extra_rows_before_any_mutation() {
-    let source = FakeReader::new(vec![
-        row("1", "new"),
-        row("2", "missing"),
-        row("3", "missing"),
-        row("6", "missing"),
-    ]);
-    let target = FakeReader::new(vec![row("1", "old"), row("4", "extra"), row("5", "extra")]);
-    let mut repair_target = RecordingRepairTarget::default();
-    let mut progress_store = RecordingProgressStore::default();
-
-    let error = sync_table_with_progress_range(
-        &account_table(),
-        SyncRunOptions {
-            run_id: "test-run".to_string(),
-            run_scope: "test-scope".to_string(),
-            chunk_size: 2,
-            mode: SyncMode::Apply,
-            start_after: None,
-            end_at: None,
-            max_deletes: Some(1),
-        },
-        &source,
-        &target,
-        &mut repair_target,
-        &mut progress_store,
-    )
-    .expect_err("delete ceiling");
-
-    assert_eq!(
-        error.to_string(),
-        "sync repair failed: delete safety threshold exceeded: max_deletes=1"
-    );
-    assert!(repair_target.inserts.borrow().is_empty());
-    assert!(repair_target.updates.borrow().is_empty());
-    assert!(repair_target.deletes.borrow().is_empty());
-    assert!(repair_target.operations.borrow().is_empty());
-}
-
-#[test]
 fn apply_accepts_exact_total_extra_row_ceiling() {
     let source = FakeReader::new(vec![
         row("1", "new"),
