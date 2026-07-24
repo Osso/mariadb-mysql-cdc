@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
-const MAX_UPDATE_ROWS_PER_STATEMENT: usize = 128;
+pub(crate) const MAX_UPDATE_ROWS_PER_STATEMENT: usize = 128;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlStatement {

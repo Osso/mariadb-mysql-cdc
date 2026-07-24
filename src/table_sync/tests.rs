@@ -885,6 +885,104 @@ fn apply_batches_divergent_rows_before_checkpointing_the_chunk() {
 }
 
 #[test]
+fn later_update_statement_repair_does_not_replay_committed_subbatch() {
+    struct StatementSizedUpdateTarget {
+        operations: RefCell<Vec<String>>,
+    }
+
+    impl SyncRepairTarget for StatementSizedUpdateTarget {
+        fn insert_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn update_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn update_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+            if rows.len() > 128 {
+                return Err(TableSyncError::Repair(
+                    "table sync replayed more than one writer statement".to_string(),
+                ));
+            }
+            let first = rows.first().expect("update rows").primary_key[0].clone();
+            let last = rows.last().expect("update rows").primary_key[0].clone();
+            self.operations
+                .borrow_mut()
+                .push(format!("update:{first}-{last}"));
+            if first == "129" {
+                self.operations.borrow_mut().extend([
+                    "fk-1452:129".to_string(),
+                    "repair-parent:129".to_string(),
+                    "retry-update:129".to_string(),
+                ]);
+            }
+            Ok(())
+        }
+
+        fn update_batch_size(&self) -> usize {
+            128
+        }
+
+        fn delete_row(&mut self, _primary_key: &[String]) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+    }
+
+    let source_rows = (1..=129)
+        .map(|id| row(&format!("{id:03}"), "source"))
+        .collect::<Vec<_>>();
+    let target_rows = (1..=129)
+        .map(|id| row(&format!("{id:03}"), "target"))
+        .collect::<Vec<_>>();
+    let source = FakeReader::new(source_rows);
+    let target = FakeReader::new(target_rows);
+    let mut repair_target = StatementSizedUpdateTarget {
+        operations: RefCell::new(Vec::new()),
+    };
+    let mut progress_store = RecordingProgressStore::default();
+
+    let report = sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "statement-sized-update-retry".to_string(),
+            run_scope: "statement-sized-update-retry-scope".to_string(),
+            chunk_size: 129,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect("later statement repairs without replaying first statement");
+
+    assert_eq!(report.updates, 129);
+    assert_eq!(
+        repair_target.operations.borrow().as_slice(),
+        &[
+            "update:001-128",
+            "update:129-129",
+            "fk-1452:129",
+            "repair-parent:129",
+            "retry-update:129",
+        ]
+    );
+    assert_eq!(
+        progress_store
+            .saved
+            .borrow()
+            .last()
+            .expect("progress")
+            .last_primary_key,
+        Some(vec!["129".to_string()])
+    );
+}
+
+#[test]
 fn apply_batches_divergent_rows_in_source_primary_key_order() {
     let source = FakeReader::new(vec![row("99", "ninety-nine"), row("100", "one-hundred")]);
     let target = FakeReader::new(vec![row("99", "old-99"), row("100", "old-100")]);

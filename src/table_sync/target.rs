@@ -25,6 +25,9 @@ pub trait SyncRepairTarget {
         }
         Ok(())
     }
+    fn update_batch_size(&self) -> usize {
+        usize::MAX
+    }
     fn verify_rows(&self, _rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         Ok(())
     }
@@ -438,6 +441,10 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
             }
             Err(error) => Err(TableSyncError::Repair(error.to_string())),
         }
+    }
+
+    fn update_batch_size(&self) -> usize {
+        crate::target::MAX_UPDATE_ROWS_PER_STATEMENT
     }
 
     fn verify_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {

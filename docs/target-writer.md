@@ -63,7 +63,7 @@ the repair target uses source/target schema-inventory FK metadata to discover
 exact parent identities from the affected child rows. It recursively reads
 source parents, compares target parents, inserts missing parents or updates
 divergent parents, verifies each parent exactly, then retries only the failed
-statement-sized child subbatch. Nullable FK values are skipped. A concurrent
+writer-sized child subbatch (currently at most 128 rows). Nullable FK values are skipped. A concurrent
 `1062` is reconciled by rereading the affected target rows: complete equality
 with the source is accepted, while a divergent owner fails closed. After a
 child insert, parent-retry, or update batch, every affected child row is

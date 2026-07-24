@@ -117,8 +117,10 @@ fn repair_changed_rows(
         })
         .collect::<Vec<_>>();
     if mode == SyncMode::Apply && !changed_rows.is_empty() {
-        repair_target.update_rows(&changed_rows)?;
-        repair_target.verify_rows(&changed_rows)?;
+        for batch in changed_rows.chunks(repair_target.update_batch_size()) {
+            repair_target.update_rows(batch)?;
+            repair_target.verify_rows(batch)?;
+        }
     }
     report.updates += changed_rows.len() as u64;
     Ok(())
