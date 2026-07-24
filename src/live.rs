@@ -43,7 +43,8 @@ use reconnect::{StreamCheckpointStore, run_stream_reconnect_loop, save_stream_ch
 #[cfg(test)]
 use reconnect::{is_stale_or_missing_binlog_error, resume_from_checkpoint, should_reconnect};
 pub use recovery::{
-    ExactParentRecovery, HomeFeedCardRecovery, RecoveryAttemptError, SessionsGuestRecovery,
+    ExactParentRecovery, HomeFeedCardRecovery, MissingParentRecovery, RecoveryAttemptError,
+    SessionsGuestRecovery,
 };
 pub(crate) use recovery::{
     HOME_FEED_CARD_PARENT_PRIMARY_KEY, HOME_FEED_CARD_PARENT_TABLE, HOME_FEED_SLIDE_CHILD_SCHEMA,

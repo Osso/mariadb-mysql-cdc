@@ -350,7 +350,7 @@ fn format_recovery_log(
         shell_word(request.source_file()),
         request.source_start_position(),
         request.source_end_position(),
-        shell_word(request.child_primary_key()),
+        shell_word(&request.child_primary_key()),
         shell_word(&request.parent_identity()),
         outcome,
     )

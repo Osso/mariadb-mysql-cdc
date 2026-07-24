@@ -138,8 +138,18 @@ pub(crate) fn reconcile_exact_parent(
             )?;
             (source_rows, target_rows)
         }
+        crate::live::ExactParentRecovery::MissingParent(_) => {
+            return Err(generic_missing_parent_unwired());
+        }
     };
     reconcile_loaded_exact_parent(request, &source_rows, &target_rows, repair_target)
+}
+
+/// The generic planner is not reachable from reconciliation yet, and detection does not build the
+/// variant, so this arm is unreachable in practice. It fails closed rather than falling through to
+/// another constraint's plan.
+fn generic_missing_parent_unwired() -> TableSyncError {
+    TableSyncError::InvalidTable("generic missing parent recovery is not wired".to_string())
 }
 
 pub(crate) fn reconcile_exact_parent_live(
@@ -152,6 +162,9 @@ pub(crate) fn reconcile_exact_parent_live(
         }
         crate::live::ExactParentRecovery::HomeFeedCard(request) => {
             exact_home_feed_card_sync_config(config, request)
+        }
+        crate::live::ExactParentRecovery::MissingParent(_) => {
+            return Err(generic_missing_parent_unwired());
         }
     };
     let (source, target) = build_sessions_guest_recovery_readers(config)?;
@@ -176,6 +189,9 @@ pub(crate) fn reconcile_loaded_exact_parent(
                 request.child_event_timestamp,
             )?;
             plan_loaded_home_feed_card(source_row, target_rows, request)?
+        }
+        crate::live::ExactParentRecovery::MissingParent(_) => {
+            return Err(generic_missing_parent_unwired());
         }
     };
     let GuestReconciliation::Insert(source_row) = reconciliation else {
