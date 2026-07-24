@@ -766,6 +766,36 @@ fn progress_validation_errors_do_not_replace_saved_run_status() {
     )));
 }
 
+/// A terminal verification failure must land in the durable run row. Leaving it unrecorded keeps
+/// the run at `status='running'` with no live worker, which reads as an in-flight sync. Retries are
+/// already exhausted at that point, so retryability must not suppress the record.
+#[test]
+fn terminal_verification_failures_are_recorded_on_the_run() {
+    let verification = TableSyncError::Verification(
+        "table=devices_properties scope=full-table missing_rows=537 extra_rows=0 \
+         divergent_rows=134077"
+            .to_string(),
+    );
+
+    assert!(is_retryable_sync_error(&verification));
+    assert!(!should_record_sync_run_error(&verification));
+    assert!(should_record_terminal_sync_run_error(&verification));
+}
+
+/// A verification failure that never reaches the durable row is what made dead runs look live.
+#[test]
+fn terminal_recording_still_protects_saved_run_status() {
+    assert!(!should_record_terminal_sync_run_error(
+        &TableSyncError::Progress("run id is already complete".to_string())
+    ));
+    assert!(!should_record_terminal_sync_run_error(
+        &TableSyncError::InvalidTable("invalid bounds".to_string())
+    ));
+    assert!(should_record_terminal_sync_run_error(
+        &TableSyncError::Repair("target write failed".to_string())
+    ));
+}
+
 #[test]
 fn run_id_rejects_changed_immutable_specification() {
     let source = FakeReader::new(vec![]);

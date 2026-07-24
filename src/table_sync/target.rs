@@ -228,25 +228,41 @@ impl MySqlSyncRepairTarget {
     }
 
     fn insert_child_batch(&mut self, batch: &[SnapshotRow]) -> Result<(), TableSyncError> {
-        let mut remaining = batch.to_vec();
-        let mut repaired_parents = false;
-        loop {
-            match self.writer.insert_rows(&remaining) {
-                Ok(()) => break,
-                Err(error) if error.mysql_code() == Some(1452) && !repaired_parents => {
-                    self.repair_fk_parents_and_retry(&remaining)?;
-                    repaired_parents = true;
-                }
-                Err(error) if error.mysql_code() == Some(1062) => {
-                    remaining = self.rows_missing_after_duplicate(&remaining)?;
-                    if remaining.is_empty() {
-                        break;
-                    }
-                }
-                Err(error) => return Err(TableSyncError::Repair(error.to_string())),
-            }
-        }
+        super::child_batch::insert_child_batch_with_reconciliation(self, batch)?;
         self.verify_child_rows(batch)
+    }
+}
+
+impl super::child_batch::ChildBatchInserter for MySqlSyncRepairTarget {
+    fn table_name(&self) -> &str {
+        self.writer.table_name()
+    }
+
+    fn insert(
+        &mut self,
+        rows: &[SnapshotRow],
+    ) -> Result<super::child_batch::ChildInsertOutcome, TableSyncError> {
+        match self.writer.insert_rows(rows) {
+            Ok(()) => Ok(super::child_batch::ChildInsertOutcome::Applied),
+            Err(error) if error.mysql_code() == Some(1452) => {
+                Ok(super::child_batch::ChildInsertOutcome::MissingParent)
+            }
+            Err(error) if error.mysql_code() == Some(1062) => {
+                Ok(super::child_batch::ChildInsertOutcome::DuplicateKey)
+            }
+            Err(error) => Err(TableSyncError::Repair(error.to_string())),
+        }
+    }
+
+    fn repair_parents(&mut self, rows: &[SnapshotRow]) -> Result<(), TableSyncError> {
+        self.repair_fk_parents_and_retry(rows)
+    }
+
+    fn reconcile_duplicates(
+        &mut self,
+        rows: &[SnapshotRow],
+    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        self.rows_missing_after_duplicate(rows)
     }
 }
 
