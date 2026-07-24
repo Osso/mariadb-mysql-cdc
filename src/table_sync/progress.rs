@@ -246,126 +246,6 @@ pub struct MySqlSyncProgressStore {
     target: TargetMySqlConfig,
     table: String,
     writer: RefCell<Option<PersistentProgressWriter>>,
-    #[cfg(test)]
-    test_database: Option<std::rc::Rc<TestProgressSqlDatabase>>,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct TestProgressSqlDatabase {
-    rows: RefCell<std::collections::BTreeMap<String, String>>,
-    fail_completed_preflight_save: std::cell::Cell<bool>,
-}
-
-#[cfg(test)]
-impl TestProgressSqlDatabase {
-    pub(crate) fn fail_next_completed_preflight_save(&self) {
-        self.fail_completed_preflight_save.set(true);
-    }
-
-    pub(crate) fn stored_preflight_marker(&self, run_id: &str) -> Option<bool> {
-        self.rows.borrow().get(run_id).and_then(|row| {
-            row.split('\t').nth(2).and_then(|value| match value {
-                "0" => Some(false),
-                "1" => Some(true),
-                _ => None,
-            })
-        })
-    }
-
-    fn execute(&self, sql: String) -> Result<(), TableSyncError> {
-        if sql.starts_with("INSERT INTO") && sql.contains("run_spec_json,delete_preflight_complete")
-        {
-            let values = sync_run_upsert_values(&sql)?;
-            if values[3] == "1" && self.fail_completed_preflight_save.replace(false) {
-                return Err(TableSyncError::Progress(
-                    "injected completed-preflight marker save failure".to_string(),
-                ));
-            }
-            let run_id = values[0].clone();
-            let row = [
-                values[1].as_str(),
-                values[2].as_str(),
-                values[3].as_str(),
-                values[4].as_str(),
-                values[5].as_str(),
-                values[6].as_str(),
-                values[7].as_str(),
-                values[8].as_str(),
-                values[9].as_str(),
-                values[10].as_str(),
-                values[11].as_str(),
-                values[12].as_str(),
-                "",
-            ]
-            .join("\t");
-            self.rows.borrow_mut().insert(run_id, row);
-        }
-        Ok(())
-    }
-
-    fn query(&self, sql: String) -> Result<String, TableSyncError> {
-        if sql.contains("information_schema.tables") {
-            return Ok("1\t16\t16\t1\t1".to_string());
-        }
-        if sql.starts_with("SELECT GET_LOCK") || sql.starts_with("SELECT RELEASE_LOCK") {
-            return Ok("1".to_string());
-        }
-        if sql.starts_with("SELECT table_name, run_spec_json") {
-            let run_id = sql
-                .split(" WHERE run_id = '")
-                .nth(1)
-                .and_then(|value| value.split('\'').next())
-                .ok_or_else(|| {
-                    TableSyncError::Progress("missing run id in test SQL".to_string())
-                })?;
-            return Ok(self.rows.borrow().get(run_id).cloned().unwrap_or_default());
-        }
-        Ok(String::new())
-    }
-}
-
-#[cfg(test)]
-fn sync_run_upsert_values(sql: &str) -> Result<Vec<String>, TableSyncError> {
-    let values = sql
-        .split(" VALUES (")
-        .nth(1)
-        .and_then(|value| value.split(") ON DUPLICATE KEY UPDATE").next())
-        .ok_or_else(|| TableSyncError::Progress("invalid test progress upsert".to_string()))?;
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut quoted = false;
-    let mut chars = values.chars().peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            '\'' if quoted && chars.peek() == Some(&'\'') => {
-                field.push('\'');
-                chars.next();
-            }
-            '\'' => quoted = !quoted,
-            ',' if !quoted => {
-                fields.push(normalize_test_sql_value(&field));
-                field.clear();
-            }
-            _ => field.push(character),
-        }
-    }
-    fields.push(normalize_test_sql_value(&field));
-    if fields.len() != 14 {
-        return Err(TableSyncError::Progress(format!(
-            "test progress upsert has {} values, expected 14",
-            fields.len()
-        )));
-    }
-    Ok(fields)
-}
-
-#[cfg(test)]
-fn normalize_test_sql_value(value: &str) -> String {
-    match value.trim() {
-        "NULL" => String::new(),
-        value => value.to_string(),
-    }
 }
 
 impl MySqlSyncProgressStore {
@@ -374,8 +254,6 @@ impl MySqlSyncProgressStore {
             target,
             table,
             writer: RefCell::new(None),
-            #[cfg(test)]
-            test_database: None,
         }
     }
 }
@@ -408,18 +286,10 @@ impl SyncProgressStore for MySqlSyncProgressStore {
 
 impl MySqlSyncProgressStore {
     fn execute(&self, statement: String) -> Result<(), TableSyncError> {
-        #[cfg(test)]
-        if let Some(database) = &self.test_database {
-            return database.execute(statement);
-        }
         self.writer()?.execute_table_sync_progress_sql(statement)
     }
 
     fn query(&self, sql: String) -> Result<String, TableSyncError> {
-        #[cfg(test)]
-        if let Some(database) = &self.test_database {
-            return database.query(sql);
-        }
         self.writer()?.query_table_sync_progress_tsv(sql)
     }
 
@@ -443,16 +313,6 @@ impl MySqlSyncRunProgressStore {
         Self {
             inner: MySqlSyncProgressStore::new(target, table),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_test_database(
-        database: std::rc::Rc<TestProgressSqlDatabase>,
-        table: String,
-    ) -> Self {
-        let mut inner = MySqlSyncProgressStore::new(TargetMySqlConfig::default(), table);
-        inner.test_database = Some(database);
-        Self { inner }
     }
 
     pub(crate) fn find_failed_run_candidates(
