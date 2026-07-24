@@ -383,6 +383,108 @@ impl SyncRepairTarget for ConcurrentDuplicateRepairTarget {
 }
 
 #[test]
+fn fk_parent_repair_then_exact_child_duplicate_advances_after_verification() {
+    struct FkThenDuplicateTarget {
+        target_rows: RefCell<Vec<SnapshotRow>>,
+        divergent: bool,
+        operations: RefCell<Vec<&'static str>>,
+    }
+
+    impl SyncRepairTarget for FkThenDuplicateTarget {
+        fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
+            self.insert_rows(&[row])
+        }
+
+        fn insert_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+            self.operations
+                .borrow_mut()
+                .extend(["child-1452", "parent-repaired", "child-1062"]);
+            self.target_rows.replace(
+                rows.iter()
+                    .map(|row| {
+                        if self.divergent {
+                            super::tests_support::row(&row.primary_key[0], "divergent-owner")
+                        } else {
+                            (*row).clone()
+                        }
+                    })
+                    .collect(),
+            );
+            Err(TableSyncError::Duplicate("mysql error 1062".to_string()))
+        }
+
+        fn update_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn verify_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+            let target_rows = self.target_rows.borrow();
+            if rows.len() == target_rows.len()
+                && rows
+                    .iter()
+                    .zip(target_rows.iter())
+                    .all(|(source, target)| **source == *target)
+            {
+                Ok(())
+            } else {
+                Err(TableSyncError::Repair(
+                    "concurrent duplicate owner diverges from source".to_string(),
+                ))
+            }
+        }
+
+        fn delete_row(&mut self, _primary_key: &[String]) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+    }
+
+    for divergent in [false, true] {
+        let source = FakeReader::new(vec![row("1", "source")]);
+        let target = FakeReader::new(Vec::new());
+        let mut repair_target = FkThenDuplicateTarget {
+            target_rows: RefCell::new(Vec::new()),
+            divergent,
+            operations: RefCell::new(Vec::new()),
+        };
+        let mut progress_store = RecordingProgressStore::default();
+        let result = sync_table_with_progress_range(
+            &account_table(),
+            SyncRunOptions {
+                run_id: format!("fk-then-duplicate-{divergent}"),
+                run_scope: "fk-then-duplicate-scope".to_string(),
+                chunk_size: 10,
+                mode: SyncMode::Apply,
+                start_after: None,
+                end_at: None,
+                max_deletes: Some(0),
+            },
+            &source,
+            &target,
+            &mut repair_target,
+            &mut progress_store,
+        );
+
+        assert_eq!(
+            repair_target.operations.borrow().as_slice(),
+            &["child-1452", "parent-repaired", "child-1062"]
+        );
+        if divergent {
+            assert!(result.unwrap_err().to_string().contains("diverges"));
+            assert!(
+                progress_store.saved.borrow().iter().all(|progress| {
+                    progress.last_primary_key.is_none() && progress.inserts == 0
+                })
+            );
+        } else {
+            assert_eq!(result.unwrap().inserts, 1);
+            assert!(progress_store.saved.borrow().iter().any(|progress| {
+                progress.last_primary_key == Some(vec!["1".to_string()]) && progress.inserts == 1
+            }));
+        }
+    }
+}
+
+#[test]
 fn concurrent_exact_child_duplicate_advances_only_after_verification() {
     let source = FakeReader::new(vec![row("1", "source")]);
     let target = FakeReader::new(Vec::new());
