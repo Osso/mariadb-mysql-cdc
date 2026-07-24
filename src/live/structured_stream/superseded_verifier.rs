@@ -218,16 +218,18 @@ fn validate_exact_release_scope(
             .error_text
             .contains("REFERENCES `comics` (`id`, `section_id`)");
     if !exact_constraint {
-        return Err("superseded release verifier requires exact globalcomix.releases releases_ibfk_2 INSERT FK 1452".to_string());
+        return Err("superseded release insert rejected: requires exact globalcomix.releases releases_ibfk_2 INSERT FK 1452".to_string());
     }
     if observation.coordinate.file != RELEASES_RECOVERY_FILE
         || observation.coordinate.start_position != RELEASES_RECOVERY_EVENT_POSITION
         || xid_end_position != RELEASES_RECOVERY_XID_POSITION
     {
-        return Err("superseded release verifier requires exact production transaction mysqld-bin.002709:515816736-515824875".to_string());
+        return Err("superseded release insert rejected: requires exact production transaction mysqld-bin.002709:515816736-515824875".to_string());
     }
     if candidate.historical_change.kind != crate::target::TargetRowChangeKind::Insert {
-        return Err("superseded release historical change must be INSERT".to_string());
+        return Err(
+            "superseded release insert rejected: historical change must be INSERT".to_string(),
+        );
     }
     Ok(())
 }
@@ -419,13 +421,13 @@ fn validate_exact_scope(candidate: &DeferredSupersededInsertCandidate) -> Result
             || (observation.table == COMICS_TABLE
                 && observation.duplicate_index.as_deref() == Some(COMICS_SLUG_INDEX)));
     if !supported_scope {
-        return Err("superseded insert verifier requires globalcomix.users/users.name or globalcomix.comics/comics.slug".to_string());
+        return Err("superseded insert rejected: requires globalcomix.users/users.name or globalcomix.comics/comics.slug".to_string());
     }
     if observation.operation != crate::conflict_repair::ConflictOperation::Insert {
-        return Err("superseded insert verifier requires INSERT".to_string());
+        return Err("superseded insert rejected: requires INSERT".to_string());
     }
     if candidate.historical_change.kind != crate::target::TargetRowChangeKind::Insert {
-        return Err("superseded insert historical change must be INSERT".to_string());
+        return Err("superseded insert rejected: historical change must be INSERT".to_string());
     }
     Ok(())
 }

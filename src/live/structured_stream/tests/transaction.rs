@@ -17,6 +17,34 @@ fn superseded_verification_classifies_only_semantic_rejections_as_retryable() {
     ));
 }
 
+/// A candidate outside the verifier's supported scope is a semantic rejection, not an
+/// infrastructure failure. Classifying it as fatal crash-looped the production stream: `releases`
+/// 384461 at `mysqld-bin.002710:656283581` hit `releases_ibfk_2` but not the pinned recovery
+/// coordinate, and the stream restarted 7 times with `ready=false` instead of persisting a conflict
+/// and reconnecting.
+#[test]
+fn superseded_scope_rejections_are_retryable_not_fatal() {
+    for message in [
+        "superseded release insert rejected: requires exact production transaction \
+         mysqld-bin.002709:515816736-515824875",
+        "superseded release insert rejected: requires exact globalcomix.releases releases_ibfk_2 \
+         INSERT FK 1452",
+        "superseded release insert rejected: historical change must be INSERT",
+        "superseded insert rejected: requires globalcomix.users/users.name or \
+         globalcomix.comics/comics.slug",
+        "superseded insert rejected: requires INSERT",
+        "superseded insert rejected: historical change must be INSERT",
+    ] {
+        assert!(
+            matches!(
+                superseded_verification_error(message.to_string()),
+                ApplyBinlogError::SupersededRecoveryFailed(_)
+            ),
+            "expected a retryable rejection for {message}"
+        );
+    }
+}
+
 #[test]
 fn table_map_and_row_events_do_not_checkpoint_without_transaction_boundary() {
     let table_map = BinlogEvent::TableMapEvent(accounts_table_map_event(5));
