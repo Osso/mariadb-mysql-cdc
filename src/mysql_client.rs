@@ -452,6 +452,7 @@ fn duplicate_conflict(error: &TargetExecuteError, error_code: u16) -> DuplicateC
 }
 
 const USERS_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='users' ORDER BY ordinal_position";
+const COMICS_COLUMNS_FOR_SUPERSESSION_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='comics' ORDER BY ordinal_position";
 fn releases_columns_for_evidence_sql() -> String {
     format!(
         "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='releases' AND {} ORDER BY ordinal_position",
@@ -473,6 +474,22 @@ fn build_locked_users_evidence_sql(columns: &[String]) -> Result<String, TargetE
         .join(", ");
     Ok(format!(
         "SELECT {columns} FROM `globalcomix`.`users` WHERE `id` = ? OR `name` = ? ORDER BY `id` FOR UPDATE"
+    ))
+}
+
+fn build_locked_comics_evidence_sql(columns: &[String]) -> Result<String, TargetExecuteError> {
+    if columns.is_empty() {
+        return Err(TargetExecuteError::new(
+            "globalcomix.comics metadata returned no columns",
+        ));
+    }
+    let columns = columns
+        .iter()
+        .map(|column| crate::mysql_support::quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "SELECT {columns} FROM `globalcomix`.`comics` WHERE `id` = ? OR `slug` = ? ORDER BY `id` FOR UPDATE"
     ))
 }
 
@@ -576,6 +593,33 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
                     Params::Positional(vec![
                         historical_primary_key.clone(),
                         historical_name.clone(),
+                    ]),
+                )
+                .map_err(target_query_error)
+            })?
+            .into_iter()
+            .map(mysql::Row::unwrap)
+            .collect();
+        build_locked_users_evidence(columns, Ok(rows))
+    }
+
+    fn read_locked_comics_supersession_evidence(
+        &self,
+        historical_primary_key: &mysql::Value,
+        historical_slug: &mysql::Value,
+    ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+        let columns = self.with_connection(|conn| {
+            conn.query::<String, _>(COMICS_COLUMNS_FOR_SUPERSESSION_SQL)
+                .map_err(target_query_error)
+        })?;
+        let sql = build_locked_comics_evidence_sql(&columns)?;
+        let rows = self
+            .with_connection(|conn| {
+                conn.exec::<mysql::Row, _, _>(
+                    sql,
+                    Params::Positional(vec![
+                        historical_primary_key.clone(),
+                        historical_slug.clone(),
                     ]),
                 )
                 .map_err(target_query_error)

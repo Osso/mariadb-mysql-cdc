@@ -134,6 +134,15 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
             "active-transaction users supersession evidence is unsupported by this target executor",
         ))
     }
+    fn read_locked_comics_supersession_evidence(
+        &self,
+        _historical_primary_key: &Value,
+        _historical_slug: &Value,
+    ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+        Err(TargetExecuteError::new(
+            "active-transaction comics supersession evidence is unsupported by this target executor",
+        ))
+    }
     fn read_locked_release_supersession_evidence(
         &self,
         _release_id: &Value,
@@ -643,6 +652,14 @@ where
         historical_name: &Value,
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
         (*self).read_locked_users_supersession_evidence(historical_primary_key, historical_name)
+    }
+
+    fn read_locked_comics_supersession_evidence(
+        &self,
+        historical_primary_key: &Value,
+        historical_slug: &Value,
+    ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+        (*self).read_locked_comics_supersession_evidence(historical_primary_key, historical_slug)
     }
 
     fn read_locked_release_supersession_evidence(

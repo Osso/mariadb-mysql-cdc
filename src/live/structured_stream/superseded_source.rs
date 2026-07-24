@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 const USERS_SCHEMA: &str = "globalcomix";
+#[cfg(test)]
 const USERS_TABLE: &str = "users";
 const HASH_DOMAIN: &[u8] = b"mariadb-mysql-cdc:superseded-source-row:v1\0";
 const COLUMN_QUERY: &str = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
@@ -115,8 +116,44 @@ pub(crate) fn load_superseded_source_evidence(
     historical_primary_key: u64,
     historical_name: &str,
 ) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
+    load_identity_source_evidence(
+        config,
+        "users",
+        "name",
+        historical_primary_key,
+        historical_name,
+    )
+}
+
+pub(crate) fn load_superseded_comics_source_evidence(
+    config: &MySqlConnectionConfig,
+    historical_primary_key: u64,
+    historical_slug: &str,
+) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
+    load_identity_source_evidence(
+        config,
+        "comics",
+        "slug",
+        historical_primary_key,
+        historical_slug,
+    )
+}
+
+fn load_identity_source_evidence(
+    config: &MySqlConnectionConfig,
+    table: &str,
+    identity_column: &str,
+    historical_primary_key: u64,
+    historical_identity: &str,
+) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
     let mut source = MySqlSupersededSourceQuery::connect(config)?;
-    load_superseded_source_evidence_with_query(&mut source, historical_primary_key, historical_name)
+    load_identity_source_evidence_with_query(
+        &mut source,
+        table,
+        identity_column,
+        historical_primary_key,
+        historical_identity,
+    )
 }
 
 pub(crate) fn load_superseded_release_source_evidence(
@@ -230,6 +267,7 @@ pub(crate) fn build_exact_row_insert_statement(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn load_superseded_source_evidence_with_query(
     source: &mut impl SupersededSourceQuery,
     historical_primary_key: u64,
@@ -240,9 +278,11 @@ pub(crate) fn load_superseded_source_evidence_with_query(
     // snapshot, but the evidence never claims that later commit was included.
     let snapshot_lower_bound = load_master_status(source)?;
     source.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
-    let result = load_evidence_in_transaction(
+    let result = load_identity_evidence_in_transaction(
         source,
         snapshot_lower_bound,
+        "users",
+        "name",
         historical_primary_key,
         historical_name,
     );
@@ -267,14 +307,40 @@ fn finish_transaction<T>(
     }
 }
 
-fn load_evidence_in_transaction(
+fn load_identity_source_evidence_with_query(
+    source: &mut impl SupersededSourceQuery,
+    table: &str,
+    identity_column: &str,
+    historical_primary_key: u64,
+    historical_identity: &str,
+) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
+    let snapshot_lower_bound = load_master_status(source)?;
+    source.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
+    let result = load_identity_evidence_in_transaction(
+        source,
+        snapshot_lower_bound,
+        table,
+        identity_column,
+        historical_primary_key,
+        historical_identity,
+    );
+    finish_transaction(source, result)
+}
+
+fn load_identity_evidence_in_transaction(
     source: &mut impl SupersededSourceQuery,
     snapshot_lower_bound: SourceSnapshotCoordinate,
+    table: &str,
+    identity_column: &str,
     historical_primary_key: u64,
     historical_name: &str,
 ) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
-    let columns = load_users_columns(source)?;
-    let row_query = users_row_query(&columns)?;
+    let columns = load_table_columns(source, table)?;
+    let row_query = row_query(
+        &columns,
+        table,
+        &format!("`id` = ? OR `{identity_column}` = ? ORDER BY `id`"),
+    )?;
     let result = source.query(
         &row_query,
         vec![
@@ -284,7 +350,7 @@ fn load_evidence_in_transaction(
     )?;
     if result.columns != columns {
         return Err(SourceEvidenceError::new(format!(
-            "source users result column order mismatch: expected {:?}, got {:?}",
+            "source {table} result column order mismatch: expected {:?}, got {:?}",
             columns, result.columns
         )));
     }
@@ -325,12 +391,6 @@ fn parse_master_status(
         ));
     }
     Ok(SourceSnapshotCoordinate { file, position })
-}
-
-fn load_users_columns(
-    source: &mut impl SupersededSourceQuery,
-) -> Result<Vec<String>, SourceEvidenceError> {
-    load_table_columns(source, USERS_TABLE)
 }
 
 fn load_table_columns(
@@ -377,6 +437,7 @@ fn load_columns(
     Ok(columns)
 }
 
+#[cfg(test)]
 fn users_row_query(columns: &[String]) -> Result<String, SourceEvidenceError> {
     row_query(columns, USERS_TABLE, "`id` = ? OR `name` = ? ORDER BY `id`")
 }

@@ -199,11 +199,14 @@ fn is_deferred_superseded_insert(
     let users_name = table.schema == "globalcomix"
         && table.table == "users"
         && observation.duplicate_index.as_deref() == Some("users.name");
+    let comics_slug = table.schema == "globalcomix"
+        && table.table == "comics"
+        && observation.duplicate_index.as_deref() == Some("comics.slug");
     let releases_category = table.schema == "globalcomix"
         && table.table == "releases"
         && observation.error_code == 1452
         && is_exact_releases_category_constraint_error(&observation.error_text);
-    users_name || releases_category
+    users_name || comics_slug || releases_category
 }
 
 fn is_exact_releases_category_constraint_error(error_text: &str) -> bool {

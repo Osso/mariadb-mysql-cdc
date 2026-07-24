@@ -409,6 +409,79 @@ fn users_name_superseded_candidate() -> DeferredSupersededInsertCandidate {
     }
 }
 
+fn comics_slug_superseded_candidate() -> DeferredSupersededInsertCandidate {
+    let mut candidate = users_name_superseded_candidate();
+    candidate.observation.coordinate.start_position = 531_241_142;
+    candidate.observation.table = "comics".to_string();
+    candidate.observation.source_primary_key = vec!["48054".to_string()];
+    candidate.observation.duplicate_index = Some("comics.slug".to_string());
+    candidate.observation.duplicate_owner_primary_key = Some(vec!["48058".to_string()]);
+    candidate.observation.error_text = "Duplicate entry 'misc' for key 'comics.slug'".to_string();
+    candidate.historical_change.table = "globalcomix.comics".to_string();
+    candidate.historical_change.writable_columns = vec!["id".to_string(), "slug".to_string()];
+    candidate.historical_change.primary_key_values = vec![mysql::Value::Int(48_054)];
+    candidate.historical_change.source_values = vec![
+        mysql::Value::Int(48_054),
+        mysql::Value::Bytes(b"misc".to_vec()),
+    ];
+    candidate
+}
+
+fn comics_xid_context() -> SupersededXidCommitContext<'static> {
+    SupersededXidCommitContext {
+        xid_end_position: 531_241_781,
+        checkpoint_table: "cdc.stream_checkpoint",
+        checkpoint_name: "stream-binlog:production-source",
+        conflict_table: "cdc.row_conflicts",
+        #[cfg(feature = "integration-failpoints")]
+        logical_checkpoint_predecessor: None,
+    }
+}
+
+#[test]
+fn comics_slug_supersession_commits_resolution_and_checkpoint_atomically() {
+    let executor = TransactionRecordingExecutor::with_locked_checkpoint(checkpoint_at(
+        "mysqld-bin.002709",
+        531_240_959,
+    ));
+    let mut transaction = TargetTransaction::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(comics_slug_superseded_candidate());
+    let mut verifier = SupersededVerificationFixture { verified: true };
+
+    let proof = transaction
+        .verify_deferred_superseded_inserts_at_xid(&executor, &mut verifier, comics_xid_context())
+        .expect("verified comics transaction commits atomically");
+
+    assert_eq!(proof.checkpoint.source_position, 531_241_781);
+    assert_eq!(
+        executor.operations(),
+        [
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "OBSERVATION",
+            "RESOLUTION",
+            "COMMIT"
+        ]
+    );
+}
+
+#[test]
+fn comics_slug_evidence_mismatch_rolls_back_without_resolution_or_checkpoint() {
+    let executor = TransactionRecordingExecutor::default();
+    let mut transaction = TargetTransaction::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(comics_slug_superseded_candidate());
+    let mut verifier = SupersededVerificationFixture { verified: false };
+
+    transaction
+        .verify_deferred_superseded_inserts_at_xid(&executor, &mut verifier, comics_xid_context())
+        .expect_err("mismatched evidence fails closed");
+
+    assert_eq!(executor.operations(), ["BEGIN", "ROLLBACK"]);
+}
+
 #[test]
 fn superseded_insert_verification_failure_rolls_back_later_rows_without_checkpoint() {
     let executor = TransactionRecordingExecutor::default();

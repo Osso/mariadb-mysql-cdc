@@ -229,13 +229,21 @@ pub(crate) enum SupersededInsertRejection {
 pub(crate) fn verify_superseded_insert(
     candidate: &SupersededInsertVerificationInput,
 ) -> Result<SupersededInsertProof, SupersededInsertRejection> {
-    if candidate.schema != "globalcomix" || candidate.table != "users" {
+    let supported_scope = candidate.schema == "globalcomix"
+        && ((candidate.table == "users" && candidate.duplicate_index == "users.name")
+            || (candidate.table == "comics" && candidate.duplicate_index == "comics.slug"));
+    if !supported_scope {
         return Err(SupersededInsertRejection::WrongScope);
     }
     if candidate.operation != crate::conflict_repair::ConflictOperation::Insert {
         return Err(SupersededInsertRejection::WrongOperation);
     }
-    if candidate.duplicate_index != "users.name" {
+    let expected_index = if candidate.table == "comics" {
+        "comics.slug"
+    } else {
+        "users.name"
+    };
+    if candidate.duplicate_index != expected_index {
         return Err(SupersededInsertRejection::WrongDuplicateIndex);
     }
     if candidate.source_snapshot <= candidate.candidate_xid {
@@ -334,6 +342,36 @@ mod tests {
         assert_eq!(proof.historical_image_hash, "historical-hash");
         assert_eq!(proof.source_primary_hash, "primary-hash");
         assert_eq!(proof.source_owner_hash, "owner-hash");
+    }
+
+    fn valid_comics_slug_candidate() -> SupersededInsertVerificationInput {
+        let mut candidate = valid_candidate();
+        candidate.table = "comics".to_string();
+        candidate.duplicate_index = "comics.slug".to_string();
+        candidate.candidate_xid.position = 531_241_781;
+        candidate.historical_primary_key = "48054".to_string();
+        candidate.historical_name = "misc".to_string();
+        candidate.source_primary_name =
+            "DELETED_misccf7e8b9d-5851-4616-910e-5bfb755bd55e9HrF".to_string();
+        candidate.source_owner_primary_key = "48058".to_string();
+        candidate
+    }
+
+    #[test]
+    fn comics_slug_supersession_accepts_renamed_primary_and_current_owner() {
+        verify_superseded_insert(&valid_comics_slug_candidate())
+            .expect("verified comics.slug supersession");
+    }
+
+    #[test]
+    fn comics_slug_supersession_rejects_mismatched_locked_owner() {
+        let mut candidate = valid_comics_slug_candidate();
+        candidate.target_owner_hash = "different-owner".to_string();
+
+        assert_eq!(
+            verify_superseded_insert(&candidate),
+            Err(SupersededInsertRejection::TargetOwnerHashMismatch)
+        );
     }
 
     fn valid_release_candidate() -> SupersededReleaseVerificationInput {

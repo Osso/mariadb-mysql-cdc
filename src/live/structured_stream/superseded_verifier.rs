@@ -4,7 +4,8 @@ use super::superseded_insert::{
 };
 use super::superseded_source::{
     SupersededReleaseSourceEvidence, SupersededSourceEvidence, build_exact_row_insert_statement,
-    load_superseded_release_source_evidence, load_superseded_source_evidence,
+    load_superseded_comics_source_evidence, load_superseded_release_source_evidence,
+    load_superseded_source_evidence,
 };
 use super::transaction::SupersededInsertVerifier;
 use crate::mysql_snapshot::MySqlConnectionConfig;
@@ -17,6 +18,8 @@ use mysql::Value;
 const USERS_SCHEMA: &str = "globalcomix";
 const USERS_TABLE: &str = "users";
 const USERS_NAME_INDEX: &str = "users.name";
+const COMICS_TABLE: &str = "comics";
+const COMICS_SLUG_INDEX: &str = "comics.slug";
 const RELEASES_TABLE: &str = "releases";
 const RELEASES_CONSTRAINT: &str = "releases_ibfk_2";
 const RELEASES_RECOVERY_FILE: &str = "mysqld-bin.002709";
@@ -81,9 +84,14 @@ where
                 self.target,
             );
         }
-        let mut source = |primary_key: u64, name: &str| {
-            load_superseded_source_evidence(&self.source, primary_key, name)
-                .map_err(|error| error.to_string())
+        let is_comics = candidate.observation.table == COMICS_TABLE;
+        let mut source = |primary_key: u64, identity: &str| {
+            if is_comics {
+                load_superseded_comics_source_evidence(&self.source, primary_key, identity)
+            } else {
+                load_superseded_source_evidence(&self.source, primary_key, identity)
+            }
+            .map_err(|error| error.to_string())
         };
         verify_with_source_loader(candidate, xid_end_position, &mut source, self.target)
     }
@@ -103,12 +111,18 @@ where
     let historical = historical_identity(candidate)?;
     let source = source_loader(historical.primary_key, &historical.name)
         .map_err(|error| format!("superseded source evidence failed: {error}"))?;
-    let target = target
-        .read_locked_users_supersession_evidence(
+    let target = if candidate.observation.table == COMICS_TABLE {
+        target.read_locked_comics_supersession_evidence(
             &historical.primary_key_value,
             &historical.name_value,
         )
-        .map_err(|error| format!("superseded target evidence failed: {error}"))?;
+    } else {
+        target.read_locked_users_supersession_evidence(
+            &historical.primary_key_value,
+            &historical.name_value,
+        )
+    }
+    .map_err(|error| format!("superseded target evidence failed: {error}"))?;
     let input = verification_input(candidate, xid_end_position, &historical, source, target)?;
     verify_superseded_insert(&input)
         .map_err(|rejection| format!("superseded insert rejected: {rejection:?}"))
@@ -375,14 +389,16 @@ fn only_locked_hash(rows: &[crate::target::LockedUsersRowEvidence]) -> String {
 
 fn validate_exact_scope(candidate: &DeferredSupersededInsertCandidate) -> Result<(), String> {
     let observation = &candidate.observation;
-    if observation.schema != USERS_SCHEMA || observation.table != USERS_TABLE {
-        return Err("superseded insert verifier requires globalcomix.users".to_string());
+    let supported_scope = observation.schema == USERS_SCHEMA
+        && ((observation.table == USERS_TABLE
+            && observation.duplicate_index.as_deref() == Some(USERS_NAME_INDEX))
+            || (observation.table == COMICS_TABLE
+                && observation.duplicate_index.as_deref() == Some(COMICS_SLUG_INDEX)));
+    if !supported_scope {
+        return Err("superseded insert verifier requires globalcomix.users/users.name or globalcomix.comics/comics.slug".to_string());
     }
     if observation.operation != crate::conflict_repair::ConflictOperation::Insert {
         return Err("superseded insert verifier requires INSERT".to_string());
-    }
-    if observation.duplicate_index.as_deref() != Some(USERS_NAME_INDEX) {
-        return Err("superseded insert verifier requires duplicate index users.name".to_string());
     }
     if candidate.historical_change.kind != crate::target::TargetRowChangeKind::Insert {
         return Err("superseded insert historical change must be INSERT".to_string());
@@ -406,9 +422,14 @@ fn historical_identity(
         return Err("historical users change column/value count mismatch".to_string());
     }
     let primary_key_value = value_for_column(change, "id")?.clone();
-    let name_value = value_for_column(change, "name")?.clone();
-    let primary_key = value_u64(&primary_key_value, "historical users.id")?;
-    let name = value_string(&name_value, "historical users.name")?;
+    let identity_column = if candidate.observation.table == COMICS_TABLE {
+        "slug"
+    } else {
+        "name"
+    };
+    let name_value = value_for_column(change, identity_column)?.clone();
+    let primary_key = value_u64(&primary_key_value, "historical id")?;
+    let name = value_string(&name_value, "historical unique identity")?;
     let image_hash = super::superseded_source::hash_canonical_row(
         &change.writable_columns,
         &change.source_values,
@@ -452,7 +473,12 @@ fn verification_input(
         ));
     }
     let id_index = column_index(&source.columns, "id")?;
-    let name_index = column_index(&source.columns, "name")?;
+    let identity_column = if candidate.observation.table == COMICS_TABLE {
+        "slug"
+    } else {
+        "name"
+    };
+    let name_index = column_index(&source.columns, identity_column)?;
     let source_rows = classify_source_rows(&source, id_index, name_index, historical)?;
     let target_rows = classify_target_rows(&target, id_index, name_index, historical)?;
 
