@@ -229,9 +229,8 @@ pub(crate) enum SupersededInsertRejection {
 pub(crate) fn verify_superseded_insert(
     candidate: &SupersededInsertVerificationInput,
 ) -> Result<SupersededInsertProof, SupersededInsertRejection> {
-    let supported_scope = candidate.schema == "globalcomix"
-        && ((candidate.table == "users" && candidate.duplicate_index == "users.name")
-            || (candidate.table == "comics" && candidate.duplicate_index == "comics.slug"));
+    let supported_scope =
+        candidate.schema == "globalcomix" && matches!(candidate.table.as_str(), "users" | "comics");
     if !supported_scope {
         return Err(SupersededInsertRejection::WrongScope);
     }
