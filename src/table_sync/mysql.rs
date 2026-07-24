@@ -399,12 +399,23 @@ fn primary_key_at_or_before_predicate(columns: &[String], values: &[String]) -> 
 }
 
 fn primary_key_bound_predicate(columns: &[String], values: &[String], operator: &str) -> String {
-    columns
-        .iter()
-        .enumerate()
-        .map(|(index, _column)| primary_key_bound_branch(columns, values, index, operator))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+    group_primary_key_bound_branches(
+        columns
+            .iter()
+            .enumerate()
+            .map(|(index, _column)| primary_key_bound_branch(columns, values, index, operator))
+            .collect(),
+    )
+}
+
+/// A multi-column bound is a disjunction, and `AND` binds tighter than `OR`. Without grouping, a
+/// second bound combined with `AND` would only constrain the last branch, leaving the window
+/// effectively unbounded.
+fn group_primary_key_bound_branches(branches: Vec<String>) -> String {
+    if branches.len() < 2 {
+        return branches.join(" OR ");
+    }
+    format!("({})", branches.join(" OR "))
 }
 
 fn primary_key_bound_branch(

@@ -34,7 +34,7 @@ fn builds_resume_select_for_composite_primary_key() {
 
     assert_eq!(
         sql,
-        "SELECT `left_id`, `right_id` FROM `edges` WHERE (`left_id` > '10') OR (`left_id` = '10' AND `right_id` > '20') ORDER BY `left_id`, `right_id` LIMIT 50"
+        "SELECT `left_id`, `right_id` FROM `edges` WHERE ((`left_id` > '10') OR (`left_id` = '10' AND `right_id` > '20')) ORDER BY `left_id`, `right_id` LIMIT 50"
     );
 }
 

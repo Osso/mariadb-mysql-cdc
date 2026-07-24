@@ -41,13 +41,12 @@ pub(crate) fn insert_child_batch_with_reconciliation<I>(
 where
     I: ChildBatchInserter + ?Sized,
 {
-    let mut remaining = batch.to_vec();
     let mut repaired_parents = false;
     loop {
-        match inserter.insert(&remaining)? {
+        match inserter.insert(batch)? {
             ChildInsertOutcome::Applied => return Ok(()),
             ChildInsertOutcome::MissingParent if !repaired_parents => {
-                inserter.repair_parents(&remaining)?;
+                inserter.repair_parents(batch)?;
                 repaired_parents = true;
             }
             ChildInsertOutcome::MissingParent => {
@@ -57,7 +56,7 @@ where
                 )));
             }
             ChildInsertOutcome::DuplicateKey => {
-                let absent = inserter.reconcile_duplicates(&remaining)?;
+                let absent = inserter.reconcile_duplicates(batch)?;
                 if absent.is_empty() {
                     return Ok(());
                 }

@@ -928,6 +928,33 @@ fn builds_sync_select_with_start_and_end_bounds() {
     );
 }
 
+/// `comics_releases_fragments_stats` has the composite primary key `(datehour, fragment_id)`. The
+/// multi-column lower bound is a disjunction, so it must be grouped: `AND` binds tighter than `OR`,
+/// and an ungrouped bound let `datehour > <start>` match every later row regardless of the upper
+/// bound. `read_target_window` then paged the whole remaining table into memory and was OOM killed.
+#[test]
+fn bounds_a_composite_primary_key_window_on_both_ends() {
+    let sql = build_sync_select_sql(&SyncChunkRequest {
+        table: "comics_releases_fragments_stats".to_string(),
+        primary_key: vec!["datehour".to_string(), "fragment_id".to_string()],
+        columns: vec!["datehour".to_string(), "fragment_id".to_string()],
+        start_after: Some(vec!["2023-05-29 08:00:00".to_string(), "71169".to_string()]),
+        end_at: Some(vec!["2018-01-07 16:00:00".to_string(), "4619".to_string()]),
+        updated_since: None,
+        limit: 10000,
+    });
+
+    assert_eq!(
+        sql,
+        "SELECT `datehour`, `fragment_id` FROM `comics_releases_fragments_stats` \
+         WHERE ((`datehour` > '2023-05-29 08:00:00') \
+         OR (`datehour` = '2023-05-29 08:00:00' AND `fragment_id` > '71169')) \
+         AND NOT (((`datehour` > '2018-01-07 16:00:00') \
+         OR (`datehour` = '2018-01-07 16:00:00' AND `fragment_id` > '4619'))) \
+         ORDER BY `datehour`, `fragment_id` LIMIT 10000"
+    );
+}
+
 #[test]
 fn builds_sync_select_with_updated_since_filter() {
     let sql = build_sync_select_sql(&SyncChunkRequest {
