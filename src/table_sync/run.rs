@@ -558,13 +558,14 @@ where
     unreachable!("sync retry loop has at least one attempt")
 }
 
+/// `Verification` is deliberately absent. The terminal parity pass is read-only: `repair_chunk`
+/// returns after counting for `SyncPhase::Verify`. A retry resumes the chunk phase at the saved
+/// tail primary key, so it cannot repair drift the pass found earlier in the table, then re-runs the
+/// same read-only pass and reaches the same conclusion. Retrying only multiplies a full-table scan.
 pub(crate) fn is_retryable_sync_error(error: &TableSyncError) -> bool {
     if matches!(
         error,
-        TableSyncError::Read(_)
-            | TableSyncError::Progress(_)
-            | TableSyncError::Duplicate(_)
-            | TableSyncError::Verification(_)
+        TableSyncError::Read(_) | TableSyncError::Progress(_) | TableSyncError::Duplicate(_)
     ) {
         return true;
     }

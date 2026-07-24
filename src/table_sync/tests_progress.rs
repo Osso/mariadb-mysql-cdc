@@ -777,7 +777,7 @@ fn terminal_verification_failures_are_recorded_on_the_run() {
             .to_string(),
     );
 
-    assert!(is_retryable_sync_error(&verification));
+    assert!(!is_retryable_sync_error(&verification));
     assert!(!should_record_sync_run_error(&verification));
     assert!(should_record_terminal_sync_run_error(&verification));
 }
