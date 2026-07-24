@@ -11,10 +11,11 @@
 use super::model::TableSyncError;
 use crate::snapshot::SnapshotRow;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ChildInsertOutcome {
     Applied,
-    DuplicateKey,
+    /// Carries the MySQL `1062` text so reconciliation can name the colliding index as evidence.
+    DuplicateKey(String),
     MissingParent,
 }
 
@@ -27,10 +28,12 @@ pub(crate) trait ChildBatchInserter {
     fn repair_parents(&mut self, rows: &[SnapshotRow]) -> Result<(), TableSyncError>;
 
     /// Rows of `rows` that are still absent from the target. Diverging or foreign-owned
-    /// duplicates fail closed instead of being reported as absent.
+    /// duplicates fail closed instead of being reported as absent. `duplicate_error` is the MySQL
+    /// text that triggered reconciliation and is recorded as evidence on failure.
     fn reconcile_duplicates(
         &mut self,
         rows: &[SnapshotRow],
+        duplicate_error: &str,
     ) -> Result<Vec<SnapshotRow>, TableSyncError>;
 }
 
@@ -55,8 +58,8 @@ where
                     inserter.table_name()
                 )));
             }
-            ChildInsertOutcome::DuplicateKey => {
-                let absent = inserter.reconcile_duplicates(batch)?;
+            ChildInsertOutcome::DuplicateKey(duplicate_error) => {
+                let absent = inserter.reconcile_duplicates(batch, &duplicate_error)?;
                 if absent.is_empty() {
                     return Ok(());
                 }
@@ -79,8 +82,8 @@ where
         let single = std::slice::from_ref(row);
         match inserter.insert(single)? {
             ChildInsertOutcome::Applied => {}
-            ChildInsertOutcome::DuplicateKey => {
-                inserter.reconcile_duplicates(single)?;
+            ChildInsertOutcome::DuplicateKey(duplicate_error) => {
+                inserter.reconcile_duplicates(single, &duplicate_error)?;
             }
             ChildInsertOutcome::MissingParent => {
                 return Err(TableSyncError::Repair(format!(

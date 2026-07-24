@@ -25,6 +25,8 @@ struct RecordedInserter {
     repair_parent_calls: usize,
     /// Primary keys the target already holds. Reconciliation reports the rest as absent.
     present: Vec<String>,
+    /// MySQL text passed to each reconciliation call, in order.
+    reconcile_errors: Vec<String>,
     /// Primary keys that collide on a secondary unique key owned by another identity.
     foreign_owned: Vec<String>,
     /// Insert calls that report a missing parent before any parent repair runs.
@@ -51,7 +53,9 @@ impl ChildBatchInserter for RecordedInserter {
             return Ok(ChildInsertOutcome::MissingParent);
         }
         if self.collides(rows) {
-            return Ok(ChildInsertOutcome::DuplicateKey);
+            return Ok(ChildInsertOutcome::DuplicateKey(
+                "Duplicate entry 'x' for key 'guests.idx_guest_hash'".to_string(),
+            ));
         }
         Ok(ChildInsertOutcome::Applied)
     }
@@ -64,8 +68,10 @@ impl ChildBatchInserter for RecordedInserter {
     fn reconcile_duplicates(
         &mut self,
         rows: &[SnapshotRow],
+        duplicate_error: &str,
     ) -> Result<Vec<SnapshotRow>, TableSyncError> {
         self.reconcile_sizes.push(rows.len());
+        self.reconcile_errors.push(duplicate_error.to_string());
         let absent = rows
             .iter()
             .filter(|row| !self.present.contains(&row.primary_key[0]))
