@@ -24,6 +24,16 @@ impl Default for TargetTransactionGroupConfig {
     }
 }
 
+pub(super) fn superseded_verification_error(message: String) -> ApplyBinlogError {
+    if message.starts_with("superseded release insert rejected:")
+        || message.starts_with("superseded insert rejected:")
+    {
+        ApplyBinlogError::SupersededRecoveryFailed(message)
+    } else {
+        ApplyBinlogError::Target(message)
+    }
+}
+
 pub(super) trait SupersededInsertVerifier {
     fn verify(
         &mut self,
@@ -303,7 +313,7 @@ impl TargetTransaction {
             })?;
         let proof = verifier
             .verify(&candidate, context.xid_end_position)
-            .map_err(ApplyBinlogError::SupersededRecoveryFailed)?;
+            .map_err(superseded_verification_error)?;
         let evidence = proof.resolution_evidence();
         if let Some(statement) = &proof.current_row_install {
             executor

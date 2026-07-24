@@ -2,6 +2,22 @@ use super::*;
 use crate::row::DeferredSupersededInsertCandidate;
 
 #[test]
+fn superseded_verification_classifies_only_semantic_rejections_as_retryable() {
+    assert!(matches!(
+        superseded_verification_error(
+            "superseded release insert rejected: TargetParentMismatch".to_string()
+        ),
+        ApplyBinlogError::SupersededRecoveryFailed(_)
+    ));
+    assert!(matches!(
+        superseded_verification_error(
+            "superseded release target evidence failed: permission denied".to_string()
+        ),
+        ApplyBinlogError::Target(_)
+    ));
+}
+
+#[test]
 fn table_map_and_row_events_do_not_checkpoint_without_transaction_boundary() {
     let table_map = BinlogEvent::TableMapEvent(accounts_table_map_event(5));
     let write = BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
