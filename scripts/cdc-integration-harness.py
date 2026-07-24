@@ -3081,6 +3081,7 @@ class Harness:
         source_release_mismatch: bool = False,
         prove_later_history: bool = True,
         target_current_release: bool = False,
+        target_parent_title: str = "lagged target comic",
     ) -> tuple[Coordinate, Coordinate]:
         assert self.source and self.target
         self.setup_superseded_release_tables()
@@ -3116,7 +3117,7 @@ class Harness:
             self.admin_sql(
                 self.target,
                 "INSERT INTO comics VALUES "
-                f"(18384,{target_parent_section},'current comic');",
+                f"(18384,{target_parent_section},'{target_parent_title}');",
             )
         if target_current_release:
             self.admin_sql(
@@ -3183,7 +3184,7 @@ class Harness:
             self.target,
             "SELECT id,section_id,title FROM comics WHERE id=18384;",
         ).strip()
-        if parent != "18384\t26\tcurrent comic":
+        if parent != "18384\t26\tlagged target comic":
             raise HarnessError(f"current target parent changed: {parent!r}")
         release = self.admin_query(
             self.target,

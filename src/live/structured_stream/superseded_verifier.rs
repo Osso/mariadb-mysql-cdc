@@ -268,6 +268,15 @@ fn release_verification_proof(
         crate::target::hash_ordered_mysql_row(&row.values)
     });
     let target_release_hash = only_locked_hash(&target.release_rows);
+    let target_parent = target.parent_rows.first();
+    let target_parent_comic_id = target_parent
+        .map(|row| named_value_key(&target.parent_columns, &row.values, "id"))
+        .transpose()?
+        .unwrap_or_default();
+    let target_parent_category_id = target_parent
+        .map(|row| named_value_key(&target.parent_columns, &row.values, "section_id"))
+        .transpose()?
+        .unwrap_or_default();
     let target_parent_hash = only_locked_hash(&target.parent_rows);
     let input = SupersededReleaseVerificationInput {
         schema: candidate.observation.schema.clone(),
@@ -300,6 +309,8 @@ fn release_verification_proof(
         target_release_hash,
         target_parent_read_for_update: true,
         target_parent_row_count: target.parent_rows.len(),
+        target_parent_comic_id,
+        target_parent_category_id,
         target_parent_hash,
         historical_image_hash: historical.image_hash.clone(),
     };

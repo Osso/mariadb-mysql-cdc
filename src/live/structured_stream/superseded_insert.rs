@@ -86,6 +86,8 @@ pub(crate) struct SupersededReleaseVerificationInput {
     pub(crate) target_release_hash: String,
     pub(crate) target_parent_read_for_update: bool,
     pub(crate) target_parent_row_count: usize,
+    pub(crate) target_parent_comic_id: String,
+    pub(crate) target_parent_category_id: String,
     pub(crate) target_parent_hash: String,
     pub(crate) historical_image_hash: String,
 }
@@ -120,7 +122,7 @@ pub(crate) enum SupersededReleaseRejection {
     TargetReleaseHashMismatch,
     TargetParentNotReadForUpdate,
     TargetParentRowNotUnique,
-    TargetParentHashMismatch,
+    TargetParentMismatch,
     MissingHistoricalImageHash,
 }
 
@@ -185,8 +187,10 @@ pub(crate) fn verify_superseded_release_insert(
     if candidate.target_parent_row_count != 1 {
         return Err(SupersededReleaseRejection::TargetParentRowNotUnique);
     }
-    if candidate.target_parent_hash != candidate.source_parent_hash {
-        return Err(SupersededReleaseRejection::TargetParentHashMismatch);
+    if candidate.target_parent_comic_id != candidate.current_release_comic_id
+        || candidate.target_parent_category_id != candidate.current_release_category_id
+    {
+        return Err(SupersededReleaseRejection::TargetParentMismatch);
     }
     if candidate.historical_image_hash.is_empty() {
         return Err(SupersededReleaseRejection::MissingHistoricalImageHash);
@@ -364,6 +368,8 @@ mod tests {
             target_release_hash: String::new(),
             target_parent_read_for_update: true,
             target_parent_row_count: 1,
+            target_parent_comic_id: "12".to_string(),
+            target_parent_category_id: "9".to_string(),
             target_parent_hash: "source-parent-hash".to_string(),
             historical_image_hash: "historical-release-hash".to_string(),
         }
@@ -379,6 +385,30 @@ mod tests {
         assert!(proof.install_current_release);
         assert_eq!(proof.current_release_hash, "release-hash");
         assert_eq!(proof.source_parent_hash, proof.target_parent_hash);
+    }
+
+    #[test]
+    fn release_fk_recovery_accepts_lagged_mutable_parent_fields() {
+        let mut candidate = valid_release_candidate();
+        candidate.target_parent_hash = "lagged-mutable-fields".to_string();
+
+        let proof = verify_superseded_release_insert(&candidate)
+            .expect("exact target FK identity permits lagged mutable fields");
+
+        assert!(proof.install_current_release);
+        assert_ne!(proof.source_parent_hash, proof.target_parent_hash);
+    }
+
+    #[test]
+    fn identical_ordered_rows_use_one_canonical_hash() {
+        let values = vec![
+            mysql::Value::UInt(12),
+            mysql::Value::Bytes(b"same".to_vec()),
+        ];
+        assert_eq!(
+            crate::target::hash_ordered_mysql_row(&values),
+            crate::target::hash_ordered_mysql_row(&values)
+        );
     }
 
     #[test]
@@ -441,8 +471,8 @@ mod tests {
             },
             Case {
                 name: "target parent mismatch",
-                alter: |value| value.target_parent_hash = "different".to_string(),
-                expected: SupersededReleaseRejection::TargetParentHashMismatch,
+                alter: |value| value.target_parent_category_id = "8".to_string(),
+                expected: SupersededReleaseRejection::TargetParentMismatch,
             },
             Case {
                 name: "target release divergent",
