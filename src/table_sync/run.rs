@@ -1,6 +1,6 @@
 use super::mysql::{
     GUEST_COLUMNS, HOME_FEED_CARD_COLUMNS, MySqlSyncReader, RECOVERY_CREATE_TIME_EPOCH_ALIAS,
-    RECOVERY_UTC_SESSION_SQL, guest_columns, home_feed_card_columns, inventory_stored_columns,
+    RECOVERY_UTC_SESSION_SQL, guest_columns, home_feed_card_columns,
 };
 use super::range::sync_table_with_progress_range;
 use super::recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
@@ -78,13 +78,6 @@ pub(crate) trait ExactParentReader {
         card_type_id: &str,
         source_id: Option<&str>,
     ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError>;
-
-    fn read_parent_identity_rows(
-        &self,
-        table: &crate::inventory::TableInventory,
-        columns: &[String],
-        values: &[Option<String>],
-    ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError>;
 }
 
 impl ExactParentReader for MySqlSyncReader {
@@ -110,15 +103,6 @@ impl ExactParentReader for MySqlSyncReader {
         source_id: Option<&str>,
     ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
         self.read_home_feed_card_identity_rows(card_id, card_type_id, source_id)
-    }
-
-    fn read_parent_identity_rows(
-        &self,
-        table: &crate::inventory::TableInventory,
-        columns: &[String],
-        values: &[Option<String>],
-    ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
-        self.read_parent_identity_rows(table, columns, values)
     }
 }
 
@@ -154,48 +138,9 @@ pub(crate) fn reconcile_exact_parent(
             )?;
             (source_rows, target_rows)
         }
-        crate::live::ExactParentRecovery::MissingParent(_) => {
-            return Err(missing_parent_needs_inventory());
-        }
     };
     reconcile_loaded_exact_parent(request, &source_rows, &target_rows, repair_target)
 }
-
-/// Generic recovery reads an arbitrary parent table, so it needs that table's inventory to know its
-/// columns and primary key. `reconcile_exact_parent_live` routes it to `reconcile_missing_parent`
-/// instead, which holds the inventory.
-fn missing_parent_needs_inventory() -> TableSyncError {
-    TableSyncError::InvalidTable(
-        "missing parent recovery requires the parent table inventory".to_string(),
-    )
-}
-
-/// Reads the referenced parent identity on both endpoints and applies the generic plan.
-pub(crate) fn reconcile_missing_parent(
-    request: &crate::live::MissingParentRecovery,
-    parent: &crate::inventory::TableInventory,
-    source: &impl ExactParentReader,
-    target: &impl ExactParentReader,
-    repair_target: &mut impl SyncRepairTarget,
-) -> Result<(), TableSyncError> {
-    let source_rows = source.read_parent_identity_rows(
-        parent,
-        &request.parent_columns,
-        &request.child_foreign_key_values,
-    )?;
-    let target_rows = target.read_parent_identity_rows(
-        parent,
-        &request.parent_columns,
-        &request.child_foreign_key_values,
-    )?;
-    reconcile_loaded_exact_parent(
-        &crate::live::ExactParentRecovery::MissingParent(request.clone()),
-        &source_rows,
-        &target_rows,
-        repair_target,
-    )
-}
-
 pub(crate) fn reconcile_exact_parent_live(
     config: &crate::live::ApplyBinlogConfig,
     request: &crate::live::ExactParentRecovery,
@@ -207,34 +152,11 @@ pub(crate) fn reconcile_exact_parent_live(
         crate::live::ExactParentRecovery::HomeFeedCard(request) => {
             exact_home_feed_card_sync_config(config, request)
         }
-        crate::live::ExactParentRecovery::MissingParent(request) => {
-            return reconcile_missing_parent_live(config, request);
-        }
     };
     let (source, target) = build_sessions_guest_recovery_readers(config)?;
     let mut repair_target = connect_mysql_recovery_target(&sync_config)?;
     reconcile_exact_parent(request, &source, &target, &mut repair_target)
 }
-
-fn reconcile_missing_parent_live(
-    config: &crate::live::ApplyBinlogConfig,
-    request: &crate::live::MissingParentRecovery,
-) -> Result<(), TableSyncError> {
-    let source = crate::mysql_snapshot::MySqlConnectionConfig {
-        host: config.source.host.clone(),
-        port: config.source.port,
-        user: config.source.user.clone(),
-        password: config.source.password.clone(),
-        database: request.parent_schema.clone(),
-    };
-    let parent =
-        read_parent_table_inventory(&source, &request.parent_schema, &request.parent_table)?;
-    let (source, target) = build_sessions_guest_recovery_readers(config)?;
-    let sync_config = missing_parent_sync_config(config, request, &parent);
-    let mut repair_target = connect_mysql_recovery_target(&sync_config)?;
-    reconcile_missing_parent(request, &parent, &source, &target, &mut repair_target)
-}
-
 /// Reads the parent's columns and primary key from the source schema inventory, because a generic
 /// parent table cannot have them enumerated in code.
 pub(crate) fn read_parent_table_inventory(
@@ -322,41 +244,6 @@ pub(crate) fn read_exact_source_parent_row(
         )),
     }
 }
-
-fn missing_parent_sync_config(
-    config: &crate::live::ApplyBinlogConfig,
-    request: &crate::live::MissingParentRecovery,
-    parent: &crate::inventory::TableInventory,
-) -> SyncTableConfig {
-    SyncTableConfig {
-        source: crate::mysql_snapshot::MySqlConnectionConfig {
-            host: config.source.host.clone(),
-            port: config.source.port,
-            user: config.source.user.clone(),
-            password: config.source.password.clone(),
-            database: request.parent_schema.clone(),
-        },
-        target: config.target.clone(),
-        table: SyncTable {
-            name: parent.name.clone(),
-            primary_key: parent.primary_key.clone(),
-            columns: inventory_stored_columns(parent),
-        },
-        chunk_size: 1,
-        mode: SyncMode::MissingPrimaryKeys,
-        progress_table: "cdc.sync_table_progress".to_string(),
-        run_id: format!(
-            "stream-missing-parent-{}-{}",
-            request.constraint,
-            request.child_primary_key.join("-")
-        ),
-        start_after: None,
-        end_at: None,
-        updated_since: None,
-        plan_hash: None,
-    }
-}
-
 pub(crate) fn reconcile_loaded_exact_parent(
     request: &crate::live::ExactParentRecovery,
     source_rows: &[crate::snapshot::SnapshotRow],
@@ -374,9 +261,6 @@ pub(crate) fn reconcile_loaded_exact_parent(
                 request.child_event_timestamp,
             )?;
             plan_loaded_home_feed_card(source_row, target_rows, request)?
-        }
-        crate::live::ExactParentRecovery::MissingParent(request) => {
-            plan_loaded_missing_parent(source_rows, target_rows, request)?
         }
     };
     let GuestReconciliation::Insert(source_row) = reconciliation else {
@@ -482,48 +366,6 @@ fn plan_loaded_sessions_guest(
     }
     Ok(GuestReconciliation::Existing)
 }
-
-/// Applies the generic plan, translating a rejection into a durable stall that names its predicate.
-fn plan_loaded_missing_parent(
-    source_rows: &[crate::snapshot::SnapshotRow],
-    target_rows: &[crate::snapshot::SnapshotRow],
-    request: &crate::live::MissingParentRecovery,
-) -> Result<GuestReconciliation, TableSyncError> {
-    let violation = requested_foreign_key_violation(request);
-    let plan = crate::live::plan_missing_parent_recovery(&crate::live::MissingParentInput {
-        violation: &violation,
-        child_foreign_key_values: &request.child_foreign_key_values,
-        source_parent_rows: source_rows,
-        target_parent_rows: target_rows,
-    })
-    .map_err(|rejection| {
-        TableSyncError::Repair(format!(
-            "missing parent recovery rejected for constraint {} on `{}`.`{}`: {rejection}",
-            request.constraint, request.schema, request.table
-        ))
-    })?;
-    Ok(match plan {
-        crate::live::MissingParentPlan::InsertParent(row) => GuestReconciliation::Insert(row),
-        crate::live::MissingParentPlan::AlreadyReconciled => GuestReconciliation::Existing,
-    })
-}
-
-/// Rebuilds the identity the planner reads. The planner uses only the two column lists, which the
-/// request carries verbatim from the parsed error.
-fn requested_foreign_key_violation(
-    request: &crate::live::MissingParentRecovery,
-) -> crate::live::ForeignKeyViolation {
-    crate::live::ForeignKeyViolation {
-        child_schema: request.schema.clone(),
-        child_table: request.table.clone(),
-        constraint: request.constraint.clone(),
-        child_columns: request.child_columns.clone(),
-        parent_schema: Some(request.parent_schema.clone()),
-        parent_table: request.parent_table.clone(),
-        parent_columns: request.parent_columns.clone(),
-    }
-}
-
 fn plan_loaded_home_feed_card(
     source_row: &crate::snapshot::SnapshotRow,
     target_rows: &[crate::snapshot::SnapshotRow],
@@ -1422,317 +1264,6 @@ mod home_feed_card_recovery_tests {
         let collision = card_row("9999999");
         assert!(
             plan_loaded_home_feed_card(&source, &[source.clone(), collision], &request).is_err()
-        );
-    }
-}
-
-#[cfg(test)]
-mod missing_parent_recovery_tests {
-    use super::*;
-
-    /// The constraint that stalled the production stream twice on 2026-07-24, which no hardcoded
-    /// recovery path covered.
-    fn request() -> crate::live::MissingParentRecovery {
-        crate::live::MissingParentRecovery {
-            source_file: "mysqld-bin.002709".to_string(),
-            source_start_position: 753_030_230,
-            source_end_position: 753_031_004,
-            child_event_timestamp: 1_784_588_463,
-            schema: "globalcomix".to_string(),
-            table: "paid_subscriptions_users_pages".to_string(),
-            constraint: "fk_paid_subscriptions_users_pages_session_id".to_string(),
-            child_primary_key: vec!["8812".to_string()],
-            child_columns: vec!["session_id".to_string()],
-            child_foreign_key_values: vec![Some("sess-abc".to_string())],
-            parent_schema: "globalcomix".to_string(),
-            parent_table: "sessions".to_string(),
-            parent_columns: vec!["session_id".to_string()],
-        }
-    }
-
-    fn column(name: &str, generated: bool) -> crate::inventory::ColumnInventory {
-        crate::inventory::ColumnInventory {
-            name: name.to_string(),
-            ordinal_position: 1,
-            column_type: "varchar(64)".to_string(),
-            data_type: "varchar".to_string(),
-            is_nullable: false,
-            character_set: None,
-            collation: None,
-            default_value: None,
-            extra: String::new(),
-            comment: String::new(),
-            generated: generated.then(|| crate::inventory::GeneratedColumn {
-                expression: "1".to_string(),
-                generation_kind: "VIRTUAL".to_string(),
-            }),
-        }
-    }
-
-    fn parent_inventory() -> crate::inventory::TableInventory {
-        crate::inventory::TableInventory {
-            name: "sessions".to_string(),
-            table_type: "BASE TABLE".to_string(),
-            engine: Some("InnoDB".to_string()),
-            collation: None,
-            primary_key: vec!["session_id".to_string()],
-            columns: vec![
-                column("session_id", false),
-                column("user_id", false),
-                column("payload", false),
-                column("derived_label", true),
-            ],
-        }
-    }
-
-    fn parent_row(session_id: &str, user_id: &str) -> crate::snapshot::SnapshotRow {
-        crate::snapshot::SnapshotRow {
-            primary_key: vec![session_id.to_string()],
-            values: [
-                ("session_id", Some(session_id)),
-                ("user_id", Some(user_id)),
-                ("payload", Some("blob")),
-            ]
-            .into_iter()
-            .map(|(column, value)| (column.to_string(), value.map(ToString::to_string)))
-            .collect(),
-        }
-    }
-
-    /// The columns and values one parent identity read was issued with.
-    type RecordedRead = (Vec<String>, Vec<Option<String>>);
-
-    #[derive(Clone, Default)]
-    struct FakeParentReader {
-        rows: Vec<crate::snapshot::SnapshotRow>,
-        reads: std::cell::RefCell<Vec<RecordedRead>>,
-    }
-
-    impl ExactParentReader for FakeParentReader {
-        fn read_guest_identity_rows(
-            &self,
-            _guest_id: &str,
-            _guest_hash: &str,
-        ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
-            panic!("generic recovery must not query guests")
-        }
-
-        fn read_home_feed_card_rows_by_id(
-            &self,
-            _card_id: &str,
-        ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
-            panic!("generic recovery must not query home feed cards")
-        }
-
-        fn read_home_feed_card_identity_rows(
-            &self,
-            _card_id: &str,
-            _card_type_id: &str,
-            _source_id: Option<&str>,
-        ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
-            panic!("generic recovery must not query home feed cards")
-        }
-
-        fn read_parent_identity_rows(
-            &self,
-            _table: &crate::inventory::TableInventory,
-            columns: &[String],
-            values: &[Option<String>],
-        ) -> Result<Vec<crate::snapshot::SnapshotRow>, TableSyncError> {
-            self.reads
-                .borrow_mut()
-                .push((columns.to_vec(), values.to_vec()));
-            Ok(self.rows.clone())
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingTarget {
-        inserted: Vec<crate::snapshot::SnapshotRow>,
-        updated: Vec<crate::snapshot::SnapshotRow>,
-    }
-
-    impl SyncRepairTarget for RecordingTarget {
-        fn insert_row(&mut self, row: &crate::snapshot::SnapshotRow) -> Result<(), TableSyncError> {
-            self.inserted.push(row.clone());
-            Ok(())
-        }
-
-        fn update_row(&mut self, row: &crate::snapshot::SnapshotRow) -> Result<(), TableSyncError> {
-            self.updated.push(row.clone());
-            Ok(())
-        }
-
-        /// Recovery never deletes a parent, so any call is a contract breach.
-        fn delete_row(&mut self, primary_key: &[String]) -> Result<(), TableSyncError> {
-            panic!("recovery must never delete a parent row: {primary_key:?}")
-        }
-    }
-
-    fn reconcile(
-        source_rows: Vec<crate::snapshot::SnapshotRow>,
-        target_rows: Vec<crate::snapshot::SnapshotRow>,
-    ) -> (
-        Result<(), TableSyncError>,
-        RecordingTarget,
-        FakeParentReader,
-    ) {
-        let source = FakeParentReader {
-            rows: source_rows,
-            ..FakeParentReader::default()
-        };
-        let target = FakeParentReader {
-            rows: target_rows,
-            ..FakeParentReader::default()
-        };
-        let mut recording = RecordingTarget::default();
-        let result = reconcile_missing_parent(
-            &request(),
-            &parent_inventory(),
-            &source,
-            &target,
-            &mut recording,
-        );
-        (result, recording, source)
-    }
-
-    #[test]
-    fn inserts_the_exact_source_parent_when_the_target_lacks_it() {
-        let (result, recording, source) = reconcile(vec![parent_row("sess-abc", "77")], Vec::new());
-
-        result.expect("missing parent recovery");
-        assert_eq!(recording.inserted, vec![parent_row("sess-abc", "77")]);
-        assert!(recording.updated.is_empty(), "recovery must not update");
-        assert_eq!(
-            source.reads.borrow().as_slice(),
-            [(
-                vec!["session_id".to_string()],
-                vec![Some("sess-abc".to_string())]
-            )]
-        );
-    }
-
-    #[test]
-    fn writes_nothing_when_the_target_already_holds_an_equal_parent() {
-        let (result, recording, _) = reconcile(
-            vec![parent_row("sess-abc", "77")],
-            vec![parent_row("sess-abc", "77")],
-        );
-
-        result.expect("missing parent recovery");
-        assert!(recording.inserted.is_empty());
-        assert!(recording.updated.is_empty());
-    }
-
-    /// A superseded parent attribute is a different class: the historical child value no longer
-    /// selects any source parent, so this class must decline rather than invent one.
-    #[test]
-    fn fails_closed_when_the_source_parent_is_absent() {
-        let (result, recording, _) = reconcile(Vec::new(), Vec::new());
-
-        let error = result.expect_err("absent source parent must fail closed");
-        assert!(
-            error.to_string().contains("source_parent_absent"),
-            "unexpected error: {error}"
-        );
-        assert!(recording.inserted.is_empty());
-    }
-
-    #[test]
-    fn fails_closed_when_the_target_parent_diverges() {
-        let (result, recording, _) = reconcile(
-            vec![parent_row("sess-abc", "77")],
-            vec![parent_row("sess-abc", "88")],
-        );
-
-        let error = result.expect_err("divergent target parent must fail closed");
-        assert!(
-            error.to_string().contains("target_parent_diverges"),
-            "unexpected error: {error}"
-        );
-        assert!(recording.inserted.is_empty());
-    }
-
-    #[test]
-    fn fails_closed_when_the_referenced_identity_is_ambiguous() {
-        let (result, recording, _) = reconcile(
-            vec![parent_row("sess-abc", "77"), parent_row("sess-abc", "78")],
-            Vec::new(),
-        );
-
-        let error = result.expect_err("ambiguous source parent must fail closed");
-        assert!(
-            error.to_string().contains("source_parent_ambiguous"),
-            "unexpected error: {error}"
-        );
-        assert!(recording.inserted.is_empty());
-    }
-
-    #[test]
-    fn fails_closed_on_a_null_foreign_key_value() {
-        let mut null_request = request();
-        null_request.child_foreign_key_values = vec![None];
-        let source = FakeParentReader {
-            rows: vec![parent_row("sess-abc", "77")],
-            ..FakeParentReader::default()
-        };
-        let target = FakeParentReader::default();
-        let mut recording = RecordingTarget::default();
-
-        let error = reconcile_missing_parent(
-            &null_request,
-            &parent_inventory(),
-            &source,
-            &target,
-            &mut recording,
-        )
-        .expect_err("null foreign key value must fail closed");
-
-        assert!(
-            error.to_string().contains("null_foreign_key_value"),
-            "unexpected error: {error}"
-        );
-        assert!(recording.inserted.is_empty());
-    }
-
-    /// The parent table shape must come from the inventory, and generated columns are excluded
-    /// because the target computes them.
-    #[test]
-    fn takes_the_parent_table_shape_from_the_inventory() {
-        let config = missing_parent_sync_config(
-            &crate::live::ApplyBinlogConfig::default(),
-            &request(),
-            &parent_inventory(),
-        );
-
-        assert_eq!(config.table.name, "sessions");
-        assert_eq!(config.table.primary_key, vec!["session_id".to_string()]);
-        assert_eq!(
-            config.table.columns,
-            vec![
-                "session_id".to_string(),
-                "user_id".to_string(),
-                "payload".to_string()
-            ]
-        );
-        assert_ne!(config.table.columns, guest_columns());
-    }
-
-    /// The error names the constraint, so a stall points at the exact foreign key.
-    #[test]
-    fn names_the_constraint_and_child_table_in_a_rejection() {
-        let (result, _, _) = reconcile(Vec::new(), Vec::new());
-
-        let error = result
-            .expect_err("absent source parent must fail closed")
-            .to_string();
-        assert!(
-            error.contains("fk_paid_subscriptions_users_pages_session_id"),
-            "{error}"
-        );
-        assert!(
-            error.contains("`globalcomix`.`paid_subscriptions_users_pages`"),
-            "{error}"
         );
     }
 }
