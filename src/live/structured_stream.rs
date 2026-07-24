@@ -60,6 +60,7 @@ const SECONDS_PER_DAY: i64 = 86_400;
 mod ddl;
 mod derived_fk_fastforward;
 mod event;
+mod foreign_key_repair;
 mod init;
 mod rows;
 mod schema;
