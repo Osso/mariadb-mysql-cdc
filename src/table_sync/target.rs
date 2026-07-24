@@ -234,12 +234,13 @@ impl MySqlSyncRepairTarget {
 
     fn insert_child_batch(&mut self, batch: &[SnapshotRow]) -> Result<(), TableSyncError> {
         let mut remaining = batch.to_vec();
+        let mut repaired_parents = false;
         loop {
             match self.writer.insert_rows(&remaining) {
                 Ok(()) => break,
-                Err(error) if error.mysql_code() == Some(1452) => {
+                Err(error) if error.mysql_code() == Some(1452) && !repaired_parents => {
                     self.repair_fk_parents_and_retry(&remaining, ChildBatchOperation::Insert)?;
-                    break;
+                    repaired_parents = true;
                 }
                 Err(error) if error.mysql_code() == Some(1062) => {
                     remaining = self.rows_missing_after_duplicate(&remaining)?;

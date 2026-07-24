@@ -91,12 +91,7 @@ pub(crate) fn repair_fk_parents_and_retry(
         repair_row_parents(child_row, ordered_edges, store, &mut repaired, &mut path)?;
     }
 
-    store
-        .retry_child_batch(child_table, child_rows)
-        .map_err(|message| ParentRepairError::RetryChildBatch {
-            table: child_table.to_string(),
-            message,
-        })
+    Ok(())
 }
 
 fn repair_row_parents(
@@ -327,7 +322,21 @@ mod tests {
                 identity("utms", "id", "41")
             ]
         );
-        assert_eq!(store.retried, ["guests"]);
+        assert!(store.retried.is_empty());
+    }
+
+    #[test]
+    fn returns_after_parent_repair_without_retrying_child_batch() {
+        let edges = vec![edge("guests", "utm_id", "utms", "id")];
+        let child = row("guests", &[("guest_id", Some("7")), ("utm_id", Some("41"))]);
+        let utm = row("utms", &[("id", Some("41")), ("utm_hash", Some("source"))]);
+        let mut store = RecordingStore::default();
+        store.source.insert(identity("utms", "id", "41"), utm);
+
+        repair_fk_parents_and_retry("guests", &[child], &edges, &mut store).unwrap();
+
+        assert_eq!(store.repaired, [identity("utms", "id", "41")]);
+        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -344,7 +353,7 @@ mod tests {
         repair_fk_parents_and_retry("guests", &[child], &edges, &mut store).unwrap();
 
         assert!(store.repaired.is_empty());
-        assert_eq!(store.retried, ["guests"]);
+        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -356,7 +365,7 @@ mod tests {
         repair_fk_parents_and_retry("guests", &[child], &edges, &mut store).unwrap();
 
         assert!(store.repaired.is_empty());
-        assert_eq!(store.retried, ["guests"]);
+        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -373,7 +382,7 @@ mod tests {
         repair_fk_parents_and_retry("guests", &[child], &edges, &mut store)
             .expect("concurrent equal parent");
 
-        assert_eq!(store.retried, ["guests"]);
+        assert!(store.retried.is_empty());
     }
 
     #[test]
