@@ -25,6 +25,9 @@ pub trait SyncRepairTarget {
         }
         Ok(())
     }
+    fn verify_rows(&self, _rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        Ok(())
+    }
     fn delete_row(&mut self, primary_key: &[String]) -> Result<(), TableSyncError>;
 
     fn restore_displaced_owner_and_insert(
@@ -152,7 +155,11 @@ impl MySqlSyncRepairTarget {
         result
     }
 
-    fn verify_child_rows(&self, rows: &[SnapshotRow]) -> Result<(), TableSyncError> {
+    fn verify_exact_rows(
+        &self,
+        rows: &[&SnapshotRow],
+        operation: &str,
+    ) -> Result<(), TableSyncError> {
         let Some(context) = &self.fk_repair else {
             return Ok(());
         };
@@ -163,13 +170,17 @@ impl MySqlSyncRepairTarget {
         for source_row in rows {
             let identity = row_identity(table, source_row)?;
             let target_rows = context.target.read_exact_inventory_rows(table, &identity)?;
-            if target_rows.len() != 1 || target_rows.first() != Some(source_row) {
+            if target_rows.len() != 1 || target_rows.first() != Some(*source_row) {
                 return Err(TableSyncError::Repair(format!(
-                    "post-insert verification failed for `{table_name}` identity {identity:?}"
+                    "post-{operation} verification failed for `{table_name}` identity {identity:?}"
                 )));
             }
         }
         Ok(())
+    }
+
+    fn verify_child_rows(&self, rows: &[SnapshotRow]) -> Result<(), TableSyncError> {
+        self.verify_exact_rows(&rows.iter().collect::<Vec<_>>(), "insert")
     }
 }
 
@@ -374,6 +385,10 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
     fn update_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         crate::target::TargetMySqlWriter::update_rows(&self.writer, rows)
             .map_err(|error| TableSyncError::Repair(error.to_string()))
+    }
+
+    fn verify_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        self.verify_exact_rows(rows, "update")
     }
 
     fn delete_row(&mut self, primary_key: &[String]) -> Result<(), TableSyncError> {

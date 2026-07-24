@@ -1,5 +1,6 @@
 use super::tests_support::*;
 use super::*;
+use crate::snapshot::SnapshotRow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -435,6 +436,68 @@ fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
         progressed_keys,
         BTreeSet::from([vec!["87308589".to_string()]])
     );
+}
+
+#[test]
+fn failed_post_update_verification_does_not_advance_counters_or_cursor() {
+    struct UpdateSucceedsWithoutConvergence;
+
+    impl SyncRepairTarget for UpdateSucceedsWithoutConvergence {
+        fn insert_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn update_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn update_rows(&mut self, _rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+
+        fn verify_rows(&self, _rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+            Err(TableSyncError::Repair(
+                "post-update verification failed for `accounts` identity [(\"id\", \"1\")]"
+                    .to_string(),
+            ))
+        }
+
+        fn delete_row(&mut self, _primary_key: &[String]) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+    }
+
+    let source = FakeReader::new(vec![row("1", "source")]);
+    let target = FakeReader::new(vec![row("1", "target")]);
+    let mut repair_target = UpdateSucceedsWithoutConvergence;
+    let mut progress_store = RecordingProgressStore::default();
+
+    let error = sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "failed-update-verification".to_string(),
+            run_scope: "failed-update-verification-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect_err("divergent post-update row must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("post-update verification failed")
+    );
+    assert!(progress_store.saved.borrow().iter().all(|progress| {
+        progress.last_primary_key.is_none() && progress.updates == 0 && progress.chunks == 0
+    }));
 }
 
 #[test]
