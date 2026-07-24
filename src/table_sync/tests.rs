@@ -518,8 +518,6 @@ fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
     struct ParentStore<'a> {
         source_parent: ParentRepairRow,
         target_parents: &'a mut BTreeMap<ParentIdentity, ParentRepairRow>,
-        target_children: &'a Rc<RefCell<Vec<crate::snapshot::SnapshotRow>>>,
-        child_rows: &'a [crate::snapshot::SnapshotRow],
         operations: &'a mut Vec<String>,
     }
     impl ParentRepairStore for ParentStore<'_> {
@@ -547,18 +545,6 @@ fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
                 },
                 row.clone(),
             );
-            Ok(())
-        }
-
-        fn retry_child_batch(
-            &mut self,
-            _table: &str,
-            _rows: &[ParentRepairRow],
-        ) -> Result<(), String> {
-            self.operations.push("retry-child-batch:guests".to_string());
-            self.target_children
-                .borrow_mut()
-                .extend_from_slice(self.child_rows);
             Ok(())
         }
     }
@@ -597,8 +583,6 @@ fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
             let mut store = ParentStore {
                 source_parent,
                 target_parents: &mut self.target_parents,
-                target_children: &self.target_children,
-                child_rows: &child_rows,
                 operations: &mut self.operations,
             };
             repair_fk_parents_and_retry(
@@ -614,7 +598,10 @@ fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
                 }],
                 &mut store,
             )
-            .map_err(|error| TableSyncError::Repair(error.to_string()))
+            .map_err(|error| TableSyncError::Repair(error.to_string()))?;
+            self.operations.push("retry-child-batch:guests".to_string());
+            self.target_children.borrow_mut().extend(child_rows);
+            Ok(())
         }
 
         fn update_row(

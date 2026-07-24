@@ -38,8 +38,6 @@ pub(crate) trait ParentRepairStore {
     ) -> Result<Option<ParentRepairRow>, String>;
 
     fn repair_parent(&mut self, row: &ParentRepairRow) -> Result<(), String>;
-
-    fn retry_child_batch(&mut self, table: &str, rows: &[ParentRepairRow]) -> Result<(), String>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,10 +64,6 @@ pub(crate) enum ParentRepairError {
         identity: ParentIdentity,
         message: String,
     },
-    RetryChildBatch {
-        table: String,
-        message: String,
-    },
 }
 
 impl fmt::Display for ParentRepairError {
@@ -79,7 +73,7 @@ impl fmt::Display for ParentRepairError {
 }
 
 pub(crate) fn repair_fk_parents_and_retry(
-    child_table: &str,
+    _child_table: &str,
     child_rows: &[ParentRepairRow],
     ordered_edges: &[ForeignKeyEdge],
     store: &mut impl ParentRepairStore,
@@ -221,7 +215,6 @@ mod tests {
         drop_parent_repair: bool,
         error_after_parent_repair: Option<String>,
         repaired: Vec<ParentIdentity>,
-        retried: Vec<String>,
     }
 
     impl ParentRepairStore for RecordingStore {
@@ -253,15 +246,6 @@ mod tests {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
             }
-        }
-
-        fn retry_child_batch(
-            &mut self,
-            table: &str,
-            _rows: &[ParentRepairRow],
-        ) -> Result<(), String> {
-            self.retried.push(table.to_string());
-            Ok(())
         }
     }
 
@@ -322,7 +306,6 @@ mod tests {
                 identity("utms", "id", "41")
             ]
         );
-        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -336,7 +319,6 @@ mod tests {
         repair_fk_parents_and_retry("guests", &[child], &edges, &mut store).unwrap();
 
         assert_eq!(store.repaired, [identity("utms", "id", "41")]);
-        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -353,7 +335,6 @@ mod tests {
         repair_fk_parents_and_retry("guests", &[child], &edges, &mut store).unwrap();
 
         assert!(store.repaired.is_empty());
-        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -365,7 +346,6 @@ mod tests {
         repair_fk_parents_and_retry("guests", &[child], &edges, &mut store).unwrap();
 
         assert!(store.repaired.is_empty());
-        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -381,8 +361,6 @@ mod tests {
 
         repair_fk_parents_and_retry("guests", &[child], &edges, &mut store)
             .expect("concurrent equal parent");
-
-        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -406,7 +384,6 @@ mod tests {
                 message: "target parent does not match source after repair".to_string()
             }
         );
-        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -424,7 +401,6 @@ mod tests {
                 identity: identity("utms", "id", "41")
             }
         );
-        assert!(store.retried.is_empty());
     }
 
     #[test]
@@ -448,7 +424,6 @@ mod tests {
                 message: "exact source parent is ambiguous: 2 rows".to_string()
             }
         );
-        assert!(store.retried.is_empty());
     }
 
     #[test]

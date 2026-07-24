@@ -91,12 +91,6 @@ struct MySqlFkRepairContext {
     edges: Vec<ForeignKeyEdge>,
 }
 
-#[derive(Clone, Copy)]
-enum ChildBatchOperation {
-    Insert,
-    Update,
-}
-
 impl MySqlSyncRepairTarget {
     pub(crate) fn new(
         writer: TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
@@ -136,11 +130,7 @@ impl MySqlSyncRepairTarget {
         }
     }
 
-    fn repair_fk_parents_and_retry(
-        &mut self,
-        rows: &[SnapshotRow],
-        operation: ChildBatchOperation,
-    ) -> Result<(), TableSyncError> {
+    fn repair_fk_parents_and_retry(&mut self, rows: &[SnapshotRow]) -> Result<(), TableSyncError> {
         let child_table = self.writer.table_name().to_string();
         let child_rows = rows
             .iter()
@@ -161,7 +151,6 @@ impl MySqlSyncRepairTarget {
             &mut MySqlParentRepairStore {
                 writer: &self.writer,
                 context: &mut context,
-                child_operation: operation,
             },
         )
         .map_err(|error| TableSyncError::Repair(error.to_string()));
@@ -239,7 +228,7 @@ impl MySqlSyncRepairTarget {
             match self.writer.insert_rows(&remaining) {
                 Ok(()) => break,
                 Err(error) if error.mysql_code() == Some(1452) && !repaired_parents => {
-                    self.repair_fk_parents_and_retry(&remaining, ChildBatchOperation::Insert)?;
+                    self.repair_fk_parents_and_retry(&remaining)?;
                     repaired_parents = true;
                 }
                 Err(error) if error.mysql_code() == Some(1062) => {
@@ -258,7 +247,6 @@ impl MySqlSyncRepairTarget {
 struct MySqlParentRepairStore<'a> {
     writer: &'a TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
     context: &'a mut MySqlFkRepairContext,
-    child_operation: ChildBatchOperation,
 }
 
 impl ParentRepairStore for MySqlParentRepairStore<'_> {
@@ -305,21 +293,6 @@ impl ParentRepairStore for MySqlParentRepairStore<'_> {
                 rows.len()
             )),
         }
-    }
-
-    fn retry_child_batch(&mut self, table: &str, rows: &[ParentRepairRow]) -> Result<(), String> {
-        let table_inventory = self.table(table)?;
-        let snapshot_rows = rows
-            .iter()
-            .map(|row| parent_snapshot_row(table_inventory, row))
-            .collect::<Result<Vec<_>, _>>()?;
-        match self.child_operation {
-            ChildBatchOperation::Insert => self.writer.insert_rows(&snapshot_rows),
-            ChildBatchOperation::Update => self
-                .writer
-                .update_rows(&snapshot_rows.iter().collect::<Vec<_>>()),
-        }
-        .map_err(|error| error.to_string())
     }
 }
 
@@ -456,7 +429,12 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
             Ok(()) => Ok(()),
             Err(error) if error.mysql_code() == Some(1452) => {
                 let rows = rows.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
-                self.repair_fk_parents_and_retry(&rows, ChildBatchOperation::Update)
+                self.repair_fk_parents_and_retry(&rows)?;
+                crate::target::TargetMySqlWriter::update_rows(
+                    &self.writer,
+                    &rows.iter().collect::<Vec<_>>(),
+                )
+                .map_err(|retry_error| TableSyncError::Repair(retry_error.to_string()))
             }
             Err(error) => Err(TableSyncError::Repair(error.to_string())),
         }
