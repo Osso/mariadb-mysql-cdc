@@ -521,7 +521,6 @@ fn resumes_from_saved_table_progress_and_saves_each_chunk() {
                 SyncMode::Apply,
                 &None,
                 &None,
-                Some(0),
             )
             .expect("run spec"),
         ),
@@ -582,7 +581,6 @@ fn first_chunk_mutation_immediately_persists_progress() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -627,7 +625,6 @@ fn interruption_resumes_after_persisted_chunk_without_replay() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &first_source,
         &first_target,
@@ -649,7 +646,6 @@ fn interruption_resumes_after_persisted_chunk_without_replay() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &resumed_source,
         &resumed_target,
@@ -674,7 +670,7 @@ fn interruption_resumes_after_persisted_chunk_without_replay() {
 }
 
 #[test]
-fn cumulative_delete_budget_fails_before_violating_chunk_mutates() {
+fn target_extras_delete_chunk_by_chunk_and_persist_progress() {
     let source = FakeReader::new(vec![row("10", "ten"), row("20", "twenty")]);
     let target = FakeReader::new(vec![
         row("05", "extra-first"),
@@ -685,43 +681,35 @@ fn cumulative_delete_budget_fails_before_violating_chunk_mutates() {
     let mut repair_target = RecordingRepairTarget::default();
     let mut progress_store = RecordingProgressStore::default();
 
-    let error = sync_table_with_progress_range(
+    sync_table_with_progress_range(
         &account_table(),
         SyncRunOptions {
-            run_id: "cumulative-delete-budget".to_string(),
-            run_scope: "cumulative-delete-budget-scope".to_string(),
+            run_id: "chunk-deletes".to_string(),
+            run_scope: "chunk-deletes-scope".to_string(),
             chunk_size: 1,
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(1),
         },
         &source,
         &target,
         &mut repair_target,
         &mut progress_store,
     )
-    .expect_err("second chunk exceeds cumulative delete budget");
+    .expect("all target extras reconcile");
 
     assert_eq!(
-        error.to_string(),
-        "sync repair failed: delete safety threshold exceeded: max_deletes=1"
-    );
-    assert_eq!(
         repair_target.deletes.borrow().as_slice(),
-        &[vec!["05".to_string()]]
+        &[vec!["05".to_string()], vec!["15".to_string()]]
     );
     let saved = progress_store.saved.borrow();
-    let first_chunk = saved
-        .iter()
-        .find(|progress| progress.last_primary_key == Some(vec!["10".to_string()]))
-        .expect("first chunk progress persisted");
-    assert_eq!(first_chunk.extra_target_rows, 1);
-    assert!(
-        saved
-            .iter()
-            .all(|progress| progress.last_primary_key != Some(vec!["20".to_string()]))
-    );
+    assert!(saved.iter().any(|progress| {
+        progress.last_primary_key == Some(vec!["10".to_string()]) && progress.extra_target_rows == 1
+    }));
+    let completed = saved.last().expect("completed progress");
+    assert_eq!(completed.last_primary_key, Some(vec!["20".to_string()]));
+    assert_eq!(completed.extra_target_rows, 2);
+    assert_eq!(completed.status, progress::SyncProgressStatus::Complete);
 }
 
 #[test]
@@ -750,7 +738,6 @@ fn run_scope_changes_with_endpoints_and_write_policy() {
         run_id: "repair-01".to_string(),
         start_after: None,
         end_at: None,
-        max_deletes: Some(0),
         updated_since: None,
         plan_hash: None,
     };
@@ -794,7 +781,6 @@ fn run_id_rejects_changed_immutable_specification() {
                 SyncMode::Apply,
                 &Some(vec!["10".to_string()]),
                 &Some(vec!["20".to_string()]),
-                Some(1),
             )
             .expect("saved run spec"),
         ),
@@ -821,7 +807,6 @@ fn run_id_rejects_changed_immutable_specification() {
             mode: SyncMode::Apply,
             start_after: Some(vec!["100".to_string()]),
             end_at: Some(vec!["200".to_string()]),
-            max_deletes: Some(1),
         },
         &source,
         &target,
@@ -852,7 +837,6 @@ fn completed_run_id_is_terminal() {
                 SyncMode::Apply,
                 &None,
                 &None,
-                Some(0),
             )
             .expect("run spec"),
         ),

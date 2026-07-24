@@ -52,7 +52,6 @@ pub fn sync_table_with_progress(
             mode,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         source,
         target,
@@ -445,7 +444,6 @@ fn exact_home_feed_card_sync_config(
         run_id: format!("stream-home-feed-slide-{}", request.slide_id),
         start_after: None,
         end_at: Some(vec![request.card_id.clone()]),
-        max_deletes: Some(0),
         updated_since: None,
         plan_hash: None,
     }
@@ -475,7 +473,6 @@ fn exact_guest_sync_config(
         run_id: format!("stream-sessions-{}", request.session_id),
         start_after: None,
         end_at: Some(vec![request.guest_id.clone()]),
-        max_deletes: Some(0),
         updated_since: None,
         plan_hash: None,
     }
@@ -698,7 +695,6 @@ pub(crate) fn expected_sync_run_spec_json(
         config.mode,
         &config.start_after,
         &config.end_at,
-        config.max_deletes,
     )
 }
 
@@ -796,7 +792,6 @@ fn run_range_sync(
                 mode: config.mode,
                 start_after: config.start_after.clone(),
                 end_at: config.end_at.clone(),
-                max_deletes: config.max_deletes,
             },
             source,
             target,
@@ -831,7 +826,6 @@ pub(crate) fn find_compatible_failed_run(
         resumed_config.mode,
         &resumed_config.start_after,
         &resumed_config.end_at,
-        resumed_config.max_deletes,
     )?;
     claim_compatible_failed_run(&mut progress_store, table, phase, &expected_run_spec_json)
 }

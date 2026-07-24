@@ -8,7 +8,6 @@ pub(crate) fn repair_chunk(
     mode: SyncMode,
     repair_target: &mut impl SyncRepairTarget,
     report: &mut SyncTableReport,
-    max_deletes: Option<u64>,
     phase: SyncPhase,
 ) -> Result<(), TableSyncError> {
     let source_by_key = rows_by_key(source_rows);
@@ -26,14 +25,7 @@ pub(crate) fn repair_chunk(
         return Ok(());
     }
     if matches!(phase, SyncPhase::All | SyncPhase::DeleteExtras) {
-        repair_extra_rows(
-            &source_by_key,
-            &target_by_key,
-            mode,
-            repair_target,
-            report,
-            max_deletes,
-        )?;
+        repair_extra_rows(&source_by_key, &target_by_key, mode, repair_target, report)?;
     }
     if matches!(phase, SyncPhase::All | SyncPhase::UpdateDivergent) {
         repair_changed_rows(source_rows, &target_by_key, mode, repair_target, report)?;
@@ -82,19 +74,12 @@ fn repair_extra_rows(
     mode: SyncMode,
     repair_target: &mut impl SyncRepairTarget,
     report: &mut SyncTableReport,
-    max_deletes: Option<u64>,
 ) -> Result<(), TableSyncError> {
     let extra_primary_keys = target_by_key
         .keys()
         .filter(|primary_key| !source_by_key.contains_key(*primary_key))
         .cloned()
         .collect::<Vec<_>>();
-    ensure_delete_allowed(
-        report.extra_target_rows + extra_primary_keys.len() as u64,
-        max_deletes,
-        mode,
-    )?;
-
     for primary_key in &extra_primary_keys {
         apply_delete(primary_key, mode, repair_target)?;
     }
@@ -179,20 +164,6 @@ pub(crate) fn count_extra_target_rows(
         .keys()
         .filter(|primary_key| !source_by_key.contains_key(*primary_key))
         .count() as u64
-}
-
-pub(crate) fn ensure_delete_allowed(
-    total_deletes: u64,
-    max_deletes: Option<u64>,
-    mode: SyncMode,
-) -> Result<(), TableSyncError> {
-    if mode == SyncMode::Apply && max_deletes.is_some_and(|limit| total_deletes > limit) {
-        return Err(TableSyncError::Repair(format!(
-            "delete safety threshold exceeded: max_deletes={}",
-            max_deletes.expect("checked max deletes")
-        )));
-    }
-    Ok(())
 }
 
 fn apply_inserts(

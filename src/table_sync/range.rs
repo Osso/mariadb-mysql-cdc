@@ -195,7 +195,6 @@ where
         progress: &mut context.progress,
         report: &mut context.report,
         range_end_at: context.options.end_at.clone(),
-        max_deletes: context.options.max_deletes,
         phase: context.phase,
     })
 }
@@ -216,7 +215,6 @@ fn load_range_sync_progress(
             options.mode,
             &options.start_after,
             &options.end_at,
-            options.max_deletes,
         )?,
     };
     load_sync_progress(run_id, &run_spec_json, table, options.mode, progress_store)
@@ -240,7 +238,6 @@ where
     progress: &'a mut SyncTableProgress,
     report: &'a mut SyncTableReport,
     range_end_at: Option<Vec<String>>,
-    max_deletes: Option<u64>,
     phase: SyncPhase,
 }
 
@@ -410,7 +407,6 @@ where
         context.mode,
         context.repair_target,
         context.report,
-        context.max_deletes,
         context.phase,
     )?;
     record_repaired_source_chunk(context, source_rows.len(), end_at.clone())?;
@@ -590,7 +586,6 @@ where
         context.mode,
         context.repair_target,
         context.report,
-        context.max_deletes,
         context.phase,
     )?;
     context.progress.record_report(context.report);
@@ -635,7 +630,6 @@ pub(crate) fn build_run_spec_json(
     mode: SyncMode,
     start_after: &Option<Vec<String>>,
     end_at: &Option<Vec<String>>,
-    max_deletes: Option<u64>,
 ) -> Result<String, TableSyncError> {
     serde_json::to_string(&SyncRunSpec {
         scope: run_scope,
@@ -644,7 +638,6 @@ pub(crate) fn build_run_spec_json(
         mode,
         start_after,
         end_at,
-        max_deletes,
         updated_since: None,
     })
     .map_err(|error| TableSyncError::Progress(format!("serialize run specification: {error}")))
@@ -781,7 +774,6 @@ where
                 SyncMode::Apply,
                 context.repair_target,
                 &mut report,
-                context.options.max_deletes,
                 SyncPhase::Verify,
             )?;
             break;
@@ -801,7 +793,6 @@ where
             SyncMode::Apply,
             context.repair_target,
             &mut report,
-            context.options.max_deletes,
             SyncPhase::Verify,
         )?;
         if source_rows.len() < context.options.chunk_size {
@@ -818,7 +809,6 @@ where
                 SyncMode::Apply,
                 context.repair_target,
                 &mut report,
-                context.options.max_deletes,
                 SyncPhase::Verify,
             )?;
             break;

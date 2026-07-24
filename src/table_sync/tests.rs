@@ -96,7 +96,6 @@ fn recoverable_failure_preserves_running_progress_without_advancing() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: None,
         },
         &source,
         &target,
@@ -155,7 +154,6 @@ fn recoverable_constraint_preserves_running_progress_without_advancing() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -206,7 +204,6 @@ fn target_connection_config_preserves_target_endpoint() {
         run_id: "test-run".to_string(),
         start_after: None,
         end_at: None,
-        max_deletes: Some(0),
         updated_since: None,
         plan_hash: None,
     };
@@ -238,7 +235,6 @@ fn apply_uses_strict_inserts_so_constraint_failures_are_observable() {
         run_id: "strict-insert".to_string(),
         start_after: None,
         end_at: None,
-        max_deletes: Some(0),
         updated_since: None,
         plan_hash: None,
     };
@@ -288,7 +284,6 @@ fn apply_repairs_missing_different_and_extra_target_rows() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(1),
         },
         &source,
         &target,
@@ -456,7 +451,6 @@ fn fk_parent_repair_then_exact_child_duplicate_advances_after_verification() {
                 mode: SyncMode::Apply,
                 start_after: None,
                 end_at: None,
-                max_deletes: Some(0),
             },
             &source,
             &target,
@@ -500,7 +494,6 @@ fn concurrent_exact_child_duplicate_advances_only_after_verification() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -531,7 +524,6 @@ fn concurrent_divergent_child_duplicate_rejects_progress() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -562,7 +554,6 @@ fn apply_batches_missing_rows_before_checkpointing_the_chunk() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -754,7 +745,6 @@ fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -828,7 +818,6 @@ fn failed_post_update_verification_does_not_advance_counters_or_cursor() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -863,7 +852,6 @@ fn apply_batches_divergent_rows_before_checkpointing_the_chunk() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -958,7 +946,6 @@ fn later_update_statement_repair_does_not_replay_committed_subbatch() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -1002,7 +989,6 @@ fn apply_batches_divergent_rows_in_source_primary_key_order() {
         SyncMode::Apply,
         &mut repair_target,
         &mut report,
-        Some(0),
         SyncPhase::All,
     )
     .expect("repair chunk");
@@ -1011,38 +997,6 @@ fn apply_batches_divergent_rows_in_source_primary_key_order() {
         repair_target.operations.borrow().as_slice(),
         &["update-batch:99,100"]
     );
-}
-
-#[test]
-fn apply_stops_before_deleting_above_safety_threshold() {
-    let source = FakeReader::new(vec![row("1", "alpha")]);
-    let target = FakeReader::new(vec![row("0", "extra"), row("1", "alpha")]);
-    let mut repair_target = RecordingRepairTarget::default();
-    let mut progress_store = RecordingProgressStore::default();
-
-    let error = sync_table_with_progress_range(
-        &account_table(),
-        SyncRunOptions {
-            run_id: "test-run".to_string(),
-            run_scope: "test-scope".to_string(),
-            chunk_size: 10,
-            mode: SyncMode::Apply,
-            start_after: None,
-            end_at: None,
-            max_deletes: Some(0),
-        },
-        &source,
-        &target,
-        &mut repair_target,
-        &mut progress_store,
-    )
-    .expect_err("delete threshold");
-
-    assert_eq!(
-        error.to_string(),
-        "sync repair failed: delete safety threshold exceeded: max_deletes=0"
-    );
-    assert!(repair_target.deletes.borrow().is_empty());
 }
 
 #[test]
@@ -1089,7 +1043,6 @@ fn recent_update_retry_restarts_from_beginning_to_catch_newly_eligible_rows() {
         mode: SyncMode::Apply,
         start_after: &None,
         end_at: &None,
-        max_deletes: None,
         updated_since: Some(&updated_since),
     })
     .expect("run spec");
@@ -1154,7 +1107,6 @@ fn core_config_accepts_plaintext_source_without_tls_ca() {
         run_id: "test-run".to_string(),
         start_after: None,
         end_at: None,
-        max_deletes: Some(0),
         updated_since: None,
         plan_hash: None,
     };
@@ -1175,7 +1127,6 @@ fn core_config_rejects_updated_since_with_primary_key_bounds() {
         run_id: "test-run".to_string(),
         start_after: Some(vec!["10".to_string()]),
         end_at: None,
-        max_deletes: Some(0),
         updated_since: Some(UpdatedSince {
             column: "updated_at".to_string(),
             value: "2026-06-01 00:00:00".to_string(),
@@ -1212,7 +1163,6 @@ fn rejects_range_bounds_with_wrong_composite_primary_key_arity() {
             mode: SyncMode::DryRun,
             start_after: Some(vec!["1".to_string()]),
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -1243,7 +1193,6 @@ fn apply_repairs_target_tail_after_last_source_row() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(1),
         },
         &source,
         &target,
@@ -1275,7 +1224,6 @@ fn apply_repairs_source_empty_target_range() {
             mode: SyncMode::Apply,
             start_after: Some(vec!["1".to_string()]),
             end_at: Some(vec!["3".to_string()]),
-            max_deletes: Some(1),
         },
         &source,
         &target,
@@ -1326,7 +1274,6 @@ fn delete_verification_failure_does_not_persist_chunk_progress() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(1),
         },
         &source,
         &target,
@@ -1364,7 +1311,6 @@ fn target_tail_delete_counters_are_persisted_before_completion() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(1),
         },
         &source,
         &target,
@@ -1404,7 +1350,6 @@ fn apply_accepts_exact_total_extra_row_ceiling() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(2),
         },
         &source,
         &target,
@@ -1548,7 +1493,6 @@ fn apply_completes_only_after_a_subsequent_zero_drift_pass() {
         mode: SyncMode::Apply,
         start_after: None,
         end_at: None,
-        max_deletes: Some(0),
     };
 
     let first_error = sync_table_with_progress_range(
@@ -1613,7 +1557,6 @@ fn verify_fails_for_missing_rows_without_mutation() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -1643,7 +1586,6 @@ fn verify_no_target_extras_allows_source_missing_rows_without_mutation() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -1675,7 +1617,6 @@ fn verify_fails_for_extra_rows_without_mutation() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -1705,7 +1646,6 @@ fn verify_fails_for_divergent_rows_without_mutation() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -1735,7 +1675,6 @@ fn ignored_insert_remains_missing_and_fails_follow_up_verification() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -1755,7 +1694,6 @@ fn ignored_insert_remains_missing_and_fails_follow_up_verification() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -1792,7 +1730,6 @@ fn verify_only_reports_differences_inside_bounded_primary_key_window() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: Some(vec!["2".to_string()]),
-            max_deletes: Some(0),
         },
         &source,
         &target,
@@ -1858,7 +1795,6 @@ fn phase_sync_applies_only_requested_mutation_kind() {
             mode: SyncMode::Apply,
             start_after: None,
             end_at: None,
-            max_deletes: Some(1),
         },
         &source,
         &target,

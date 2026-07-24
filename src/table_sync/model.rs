@@ -13,7 +13,6 @@ pub struct SyncTableConfig {
     pub run_id: String,
     pub start_after: Option<Vec<String>>,
     pub end_at: Option<Vec<String>>,
-    pub max_deletes: Option<u64>,
     pub updated_since: Option<UpdatedSince>,
     pub plan_hash: Option<String>,
 }
@@ -128,7 +127,6 @@ pub(crate) struct SyncRunSpec<'a> {
     pub(crate) mode: SyncMode,
     pub(crate) start_after: &'a Option<Vec<String>>,
     pub(crate) end_at: &'a Option<Vec<String>>,
-    pub(crate) max_deletes: Option<u64>,
     pub(crate) updated_since: Option<&'a UpdatedSince>,
 }
 
@@ -139,7 +137,6 @@ pub struct SyncRunOptions {
     pub mode: SyncMode,
     pub start_after: Option<Vec<String>>,
     pub end_at: Option<Vec<String>>,
-    pub max_deletes: Option<u64>,
 }
 
 pub(crate) fn validate_sync_table_config(config: &SyncTableConfig) -> Result<(), TableSyncError> {

@@ -63,7 +63,6 @@ fn default_sync_table_config() -> table_sync::SyncTableConfig {
         run_id: String::new(),
         start_after: None,
         end_at: None,
-        max_deletes: Some(0),
         updated_since: None,
         plan_hash: None,
     }
@@ -117,7 +116,6 @@ fn apply_sync_table_window_option(
         "--end-at" => config.end_at = Some(parse_csv_columns(value)),
         "--start-after-json" => config.start_after = Some(parse_json_columns(flag, value)?),
         "--end-at-json" => config.end_at = Some(parse_json_columns(flag, value)?),
-        "--max-deletes" => config.max_deletes = Some(crate::parse_u64(flag, value)?),
         "--updated-at-column" => set_updated_since_column(config, value),
         "--updated-since" => set_updated_since_value(config, value),
         _ => return Ok(false),
@@ -367,7 +365,6 @@ mod tests {
         assert_eq!(config.mode, table_sync::SyncMode::DryRun);
         assert_eq!(config.progress_table, "cdc.table_sync_runs");
         assert_eq!(config.run_id, "repair-20260710-01");
-        assert_eq!(config.max_deletes, Some(0));
     }
 
     #[test]
@@ -418,7 +415,6 @@ mod tests {
             ("--run-id", "repair-20260716-01"),
             ("--start-after-json", "[\"tenant,1\",\"10\"]"),
             ("--end-at-json", "[\"tenant,1\",\"20\"]"),
-            ("--max-deletes", "5"),
             ("--updated-at-column", "updated_at"),
             ("--updated-since", "2026-07-16 00:00:00"),
         ] {
@@ -440,7 +436,6 @@ mod tests {
             config.end_at,
             Some(vec!["tenant,1".to_string(), "20".to_string()])
         );
-        assert_eq!(config.max_deletes, Some(5));
         assert_eq!(
             config.updated_since,
             Some(table_sync::UpdatedSince {
@@ -582,19 +577,12 @@ mod tests {
         set_env("CDC_SYNC_SOURCE_PASSWORD", "source-pass");
         set_env("CDC_SYNC_TARGET_PASSWORD", "target-pass");
 
-        let config = parse_sync_table_config(required_args([
-            "--start-after",
-            "10",
-            "--end-at",
-            "20",
-            "--max-deletes",
-            "5",
-        ]))
-        .expect("sync-table config");
+        let config =
+            parse_sync_table_config(required_args(["--start-after", "10", "--end-at", "20"]))
+                .expect("sync-table config");
 
         assert_eq!(config.start_after, Some(vec!["10".to_string()]));
         assert_eq!(config.end_at, Some(vec!["20".to_string()]));
-        assert_eq!(config.max_deletes, Some(5));
     }
 
     #[test]

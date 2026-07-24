@@ -195,7 +195,6 @@ fn recent_update_run_spec_json(
         mode,
         start_after: &None,
         end_at: &None,
-        max_deletes: None,
         updated_since: Some(updated_since),
     })
     .map_err(|error| TableSyncError::Progress(format!("serialize run specification: {error}")))
