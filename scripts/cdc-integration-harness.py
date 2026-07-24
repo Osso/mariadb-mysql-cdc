@@ -46,6 +46,7 @@ class ScenarioSpec:
 SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
     ScenarioSpec("sync-table-fk-parent-repair", True),
+    ScenarioSpec("sync-table-update-fk-parent-repair", True),
     ScenarioSpec("home-feed-card-parent-recovery", True),
     ScenarioSpec("superseded-release-parent-recovery", True),
     ScenarioSpec("superseded-users-recovery", True),
@@ -3656,8 +3657,13 @@ class Harness:
             "progress_rows=0 target_rows=0"
         )
 
-    def run_sync_table_fk_parent_repair(self) -> None:
+    def run_sync_table_fk_parent_repair(self, update_existing_child: bool = False) -> None:
         assert self.source and self.target
+        run_id = (
+            "sync-table-update-fk-parent-repair"
+            if update_existing_child
+            else "sync-table-fk-parent-repair"
+        )
         for endpoint in (self.source, self.target):
             self.admin_sql(
                 endpoint,
@@ -3680,12 +3686,19 @@ class Harness:
             "INSERT INTO guests VALUES (87308589, "
             "'6ee3278e-f4e0-4242-bd66-1342633d84f1G4Cd', 184041);",
         )
+        if update_existing_child:
+            self.admin_sql(
+                self.target,
+                "INSERT INTO utms VALUES (1, 'existing-target-parent'); "
+                "INSERT INTO guests VALUES (87308589, "
+                "'6ee3278e-f4e0-4242-bd66-1342633d84f1G4Cd', 1);",
+            )
         binary = self._repair_binary()
         args = self._sync_table_args(binary)
         args[args.index("accounts")] = "guests"
         args[args.index("id,email,payload")] = "guest_id,guest_hash,utm_id"
         args[args.index("id")] = "guest_id"
-        args[args.index("sync-table-source-ca-proof")] = "sync-table-fk-parent-repair"
+        args[args.index("sync-table-source-ca-proof")] = run_id
         args[args.index("globalcomix.sync_table_tls_progress")] = "globalcomix.table_sync_runs"
         args.extend([
             "--mode",
@@ -3726,7 +3739,7 @@ class Harness:
         progress = self.admin_query(
             self.target,
             "SELECT status,last_primary_key_json FROM globalcomix.table_sync_runs "
-            "WHERE run_id='sync-table-fk-parent-repair';",
+            f"WHERE run_id='{run_id}';",
         ).strip()
         if not parent.startswith("184041\t42f66c"):
             raise HarnessError(f"FK parent did not converge: {parent!r}")
@@ -3734,7 +3747,11 @@ class Harness:
             raise HarnessError(f"FK child did not converge: {child!r}")
         if progress != 'complete\t["87308589"]':
             raise HarnessError(f"progress advanced without terminal convergence: {progress!r}")
-        print("sync_table_fk_parent_repair_ok mysql_error=1452 parent_first=true child_retried=true")
+        operation = "update" if update_existing_child else "insert"
+        print(
+            "sync_table_fk_parent_repair_ok mysql_error=1452 "
+            f"operation={operation} parent_first=true child_retried=true"
+        )
 
     def run_repair_scenario(self, scenario: str) -> None:
         assert self.source and self.target
@@ -4271,6 +4288,8 @@ class Harness:
             self.run_strict_secondary_btree()
         elif scenario == "sync-table-fk-parent-repair":
             self.run_sync_table_fk_parent_repair()
+        elif scenario == "sync-table-update-fk-parent-repair":
+            self.run_sync_table_fk_parent_repair(update_existing_child=True)
         elif scenario == "home-feed-card-parent-recovery":
             self.run_home_feed_card_parent_recovery()
         elif scenario == "superseded-release-parent-recovery":
