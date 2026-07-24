@@ -41,6 +41,7 @@ pub struct SyncCatalogConfig {
     pub progress_table: String,
     pub run_id_prefix: String,
     pub chunk_size: usize,
+    pub max_deletes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1038,7 +1039,7 @@ fn catalog_table_sync_config(
         ),
         start_after: None,
         end_at: None,
-        max_deletes: None,
+        max_deletes: config.max_deletes,
         updated_since: None,
         plan_hash: None,
     }
@@ -1582,6 +1583,7 @@ fn parse_sync_catalog_config(args: Vec<String>) -> Result<SyncCatalogConfig, Str
             "--progress-table",
             "--run-id-prefix",
             "--chunk-size",
+            "--max-deletes",
         ],
     )?;
     let run_id_prefix = required_value(&values, "--run-id-prefix")?;
@@ -1597,6 +1599,9 @@ fn parse_sync_catalog_config(args: Vec<String>) -> Result<SyncCatalogConfig, Str
     if chunk_size == 0 {
         return Err("--chunk-size must be greater than zero".to_string());
     }
+    let max_deletes = required_value(&values, "--max-deletes")?
+        .parse::<u64>()
+        .map_err(|_| "--max-deletes must be a non-negative integer".to_string())?;
     Ok(SyncCatalogConfig {
         connections,
         catalog: required_path(&values, "--catalog")?,
@@ -1606,6 +1611,7 @@ fn parse_sync_catalog_config(args: Vec<String>) -> Result<SyncCatalogConfig, Str
             .unwrap_or_else(|| "cdc.table_sync_runs".to_string()),
         run_id_prefix,
         chunk_size,
+        max_deletes: Some(max_deletes),
     })
 }
 
@@ -3012,8 +3018,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_sync_removes_delete_limit() {
-        let config = catalog_sync_test_config();
+    fn catalog_retry_propagates_bounded_deletes_into_fresh_run_identity_and_spec() {
+        let mut original = catalog_sync_test_config();
+        original.run_id_prefix = "catalog-original".to_string();
+        original.max_deletes = Some(0);
+        let mut retry = original.clone();
+        retry.run_id_prefix = "catalog-retry-20260724".to_string();
+        retry.max_deletes = Some(37);
         let entry = SyncableTableEntry {
             name: "orphaned_rows".to_string(),
             primary_key: vec!["id".to_string()],
@@ -3022,33 +3033,16 @@ mod tests {
             parent_dependencies: vec![],
         };
 
-        let sync_config = catalog_table_sync_config(&config, &entry);
+        let original_sync = catalog_table_sync_config(&original, &entry);
+        let retry_sync = catalog_table_sync_config(&retry, &entry);
 
-        assert_eq!(sync_config.mode, table_sync::SyncMode::Apply);
-        assert_eq!(sync_config.max_deletes, None);
-        table_sync::ensure_delete_allowed(u64::MAX, sync_config.max_deletes, sync_config.mode)
-            .expect("catalog deletes are unbounded");
-    }
-
-    #[test]
-    fn catalog_run_spec_records_no_delete_limit() {
-        let config = catalog_sync_test_config();
-        let catalog = SyncableCatalog {
-            tables: vec![SyncableTableEntry {
-                name: "orphaned_rows".to_string(),
-                primary_key: vec!["id".to_string()],
-                columns: vec!["id".to_string()],
-                estimated_source_rows: 1,
-                parent_dependencies: vec![],
-            }],
-        };
-
-        let specs = expected_catalog_run_specs(&config, &catalog).expect("catalog run specs");
-        let spec: serde_json::Value =
-            serde_json::from_str(specs.get("orphaned_rows").expect("orphaned rows run spec"))
-                .expect("valid run spec JSON");
-
-        assert_eq!(spec["max_deletes"], serde_json::Value::Null);
+        assert_ne!(original_sync.run_id, retry_sync.run_id);
+        assert_eq!(retry_sync.max_deletes, Some(37));
+        let spec: serde_json::Value = serde_json::from_str(
+            &table_sync::expected_sync_run_spec_json(&retry_sync).expect("retry run spec"),
+        )
+        .expect("valid retry run spec JSON");
+        assert_eq!(spec["max_deletes"], 37);
     }
 
     fn catalog_sync_test_config() -> SyncCatalogConfig {
@@ -3075,6 +3069,7 @@ mod tests {
             progress_table: "cdc.table_sync_runs".to_string(),
             run_id_prefix: "catalog".to_string(),
             chunk_size: 10_000,
+            max_deletes: Some(0),
         }
     }
 

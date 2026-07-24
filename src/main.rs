@@ -134,6 +134,10 @@ Sync progress repair-run options:
   --chunk-size ROWS               Rows per chunk. Defaults to 10000.
   --throttle-ms MS                Sleep after each copied chunk. Defaults to 0.
 
+Sync catalog options:
+  --max-deletes COUNT             Required bounded target orphan deletes per table.
+  --run-id-prefix PREFIX          Fresh immutable identity namespace for this catalog attempt.
+
 Drift check options:
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
   --table TABLE                   Limit drift check to a source table; repeat for multiple tables.
