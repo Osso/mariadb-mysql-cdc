@@ -84,20 +84,24 @@ fn repair_extra_rows(
     report: &mut SyncTableReport,
     max_deletes: Option<u64>,
 ) -> Result<(), TableSyncError> {
-    let extra_primary_keys: Vec<_> = target_by_key
+    let extra_primary_keys = target_by_key
         .keys()
         .filter(|primary_key| !source_by_key.contains_key(*primary_key))
-        .collect();
+        .cloned()
+        .collect::<Vec<_>>();
     ensure_delete_allowed(
         report.extra_target_rows + extra_primary_keys.len() as u64,
         max_deletes,
         mode,
     )?;
 
-    for primary_key in extra_primary_keys {
+    for primary_key in &extra_primary_keys {
         apply_delete(primary_key, mode, repair_target)?;
-        report.extra_target_rows += 1;
     }
+    if mode == SyncMode::Apply && !extra_primary_keys.is_empty() {
+        repair_target.verify_deleted_rows(&extra_primary_keys)?;
+    }
+    report.extra_target_rows += extra_primary_keys.len() as u64;
     Ok(())
 }
 

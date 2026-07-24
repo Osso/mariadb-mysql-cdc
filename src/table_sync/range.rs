@@ -592,7 +592,9 @@ where
         context.report,
         context.max_deletes,
         context.phase,
-    )
+    )?;
+    context.progress.record_report(context.report);
+    context.progress_store.save(context.progress)
 }
 
 fn read_source_chunk<S, T, R, P>(

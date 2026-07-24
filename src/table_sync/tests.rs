@@ -1292,6 +1292,98 @@ fn apply_repairs_source_empty_target_range() {
 }
 
 #[test]
+fn delete_verification_failure_does_not_persist_chunk_progress() {
+    struct FailedDeleteVerificationTarget;
+
+    impl SyncRepairTarget for FailedDeleteVerificationTarget {
+        fn insert_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+        fn update_row(&mut self, _row: &SnapshotRow) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+        fn delete_row(&mut self, _primary_key: &[String]) -> Result<(), TableSyncError> {
+            Ok(())
+        }
+        fn verify_deleted_rows(&self, _primary_keys: &[Vec<String>]) -> Result<(), TableSyncError> {
+            Err(TableSyncError::Repair(
+                "post-delete verification failed".to_string(),
+            ))
+        }
+    }
+
+    let source = FakeReader::new(vec![row("10", "ten")]);
+    let target = FakeReader::new(vec![row("05", "extra"), row("10", "ten")]);
+    let mut repair_target = FailedDeleteVerificationTarget;
+    let mut progress_store = RecordingProgressStore::default();
+
+    let error = sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "delete-verification".to_string(),
+            run_scope: "delete-verification-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(1),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect_err("delete verification failure");
+
+    assert_eq!(
+        error.to_string(),
+        "sync repair failed: post-delete verification failed"
+    );
+    assert!(
+        progress_store
+            .saved
+            .borrow()
+            .iter()
+            .all(|progress| progress.last_primary_key.is_none())
+    );
+}
+
+#[test]
+fn target_tail_delete_counters_are_persisted_before_completion() {
+    let source = FakeReader::new(vec![row("10", "ten")]);
+    let target = FakeReader::new(vec![row("10", "ten"), row("20", "extra")]);
+    let mut repair_target = RecordingRepairTarget::default();
+    let mut progress_store = RecordingProgressStore::default();
+
+    sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "tail-delete-progress".to_string(),
+            run_scope: "tail-delete-progress-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(1),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect("tail delete sync");
+
+    let completed = progress_store
+        .saved
+        .borrow()
+        .last()
+        .cloned()
+        .expect("completed progress");
+    assert_eq!(completed.extra_target_rows, 1);
+    assert_eq!(completed.last_primary_key, Some(vec!["10".to_string()]));
+}
+
+#[test]
 fn apply_accepts_exact_total_extra_row_ceiling() {
     let source = FakeReader::new(vec![
         row("1", "new"),

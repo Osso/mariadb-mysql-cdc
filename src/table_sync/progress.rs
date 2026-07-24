@@ -461,6 +461,10 @@ impl SyncTableProgress {
 
     pub fn record_chunk(&mut self, report: &SyncTableReport, last_primary_key: Vec<String>) {
         self.last_primary_key = Some(last_primary_key);
+        self.record_report(report);
+    }
+
+    pub fn record_report(&mut self, report: &SyncTableReport) {
         self.chunks = report.chunks;
         self.rows_scanned = report.rows_scanned;
         self.inserts = report.inserts;

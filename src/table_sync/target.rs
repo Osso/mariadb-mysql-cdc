@@ -31,6 +31,9 @@ pub trait SyncRepairTarget {
     fn verify_rows(&self, _rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         Ok(())
     }
+    fn verify_deleted_rows(&self, _primary_keys: &[Vec<String>]) -> Result<(), TableSyncError> {
+        Ok(())
+    }
     fn requires_terminal_verification(&self) -> bool {
         false
     }
@@ -449,6 +452,39 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
 
     fn verify_rows(&self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         self.verify_exact_rows(rows, "update")
+    }
+
+    fn verify_deleted_rows(&self, primary_keys: &[Vec<String>]) -> Result<(), TableSyncError> {
+        let Some(context) = &self.fk_repair else {
+            return Ok(());
+        };
+        let table_name = self.writer.table_name();
+        let table = context.tables.get(table_name).ok_or_else(|| {
+            TableSyncError::Repair(format!("source inventory is missing table `{table_name}`"))
+        })?;
+        for primary_key in primary_keys {
+            if primary_key.len() != table.primary_key.len() {
+                return Err(TableSyncError::Repair(format!(
+                    "post-delete verification primary key width mismatch for `{table_name}`"
+                )));
+            }
+            let identity = table
+                .primary_key
+                .iter()
+                .cloned()
+                .zip(primary_key.iter().cloned())
+                .collect::<Vec<_>>();
+            if !context
+                .target
+                .read_exact_inventory_rows(table, &identity)?
+                .is_empty()
+            {
+                return Err(TableSyncError::Repair(format!(
+                    "post-delete verification failed for `{table_name}` identity {identity:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn requires_terminal_verification(&self) -> bool {
