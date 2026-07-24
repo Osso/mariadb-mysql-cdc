@@ -97,9 +97,11 @@ must lock an existing same-file predecessor before the candidate and no later
 than the XID. Remaining rows still apply, and the observation/resolution evidence
 plus XID checkpoint commit atomically; any proof, predecessor, or commit failure
 rolls back, then persists all unresolved observations independently; rollback or
-persistence failures are surfaced. Every non-`INSERT` `1062` unique conflict also
-persists evidence and aborts; all other secondary-unique conflicts remain on
-that path.
+persistence failures are surfaced. When superseded verification rejects a
+candidate, the structured error includes the exact parameterized source and
+locked-target evidence `SELECT` statements; bound identity values and credentials
+are never logged. Every non-`INSERT` `1062` unique conflict also persists evidence
+and aborts; all other secondary-unique conflicts remain on that path.
 Startup validates the admin-bootstrap schema, guards, constraints, and exact
 table/application grants before opening the source stream; runtime never creates
 the table. `repair-drift` now invokes FK-aware
