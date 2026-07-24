@@ -18,10 +18,11 @@ are resolved only after verified equality. The current table-sync recovery contr
       and missing-primary-key modes do not use `INSERT IGNORE`; `--updated-since`
       remains the explicit upsert path. Batch success is not inferred from the
       planned insert count.
-- [x] Require explicit `--max-deletes` for apply-mode orphan deletion and preflight
-      the ceiling before mutation. Persist successful preflight completion on the
-      immutable run row before repair starts, so reconnects skip the completed
-      scan; failed or incomplete preflights remain unmarked and rerun.
+- [x] Require explicit `--max-deletes` for apply-mode orphan deletion. For each
+      repair chunk, count that chunk's target extras, enforce the cumulative delete
+      ceiling before mutation, apply the chunk, verify its writes, and persist its
+      cursor and counters. An interrupted run resumes from the next uncommitted
+      chunk; no global full-table delete preflight occurs.
 - [x] Require `--run-id`; direct `sync-table` resumes only the exact interrupted
       run and rejects a completed ID. Apply-mode `repair-drift` InsertMissing may
       atomically claim one specification-identical failed missing-PK run within
@@ -33,11 +34,12 @@ are resolved only after verified equality. The current table-sync recovery contr
       concurrent use of the same run ID with a target named lock.
 - [x] For an existing run-progress table, validate the full 16-column contract
       and `run_id` primary key through `information_schema`. Migrate only the
-      exact legacy 15-column contract by adding `delete_preflight_complete`
-      with default false, preserving existing runs as requiring preflight;
-      reject malformed tables without modifying them. After migration,
-      least-privilege runtime use requires only `SELECT, INSERT, UPDATE` on the
-      prebootstrapped table; absent or legacy tables require DDL grants.
+      exact legacy 15-column contract by adding the retained
+      `delete_preflight_complete` compatibility column with default false; it is
+      not a full-table scan marker. Reject malformed tables without modifying
+      them. After migration, least-privilege runtime use requires only `SELECT,
+      INSERT, UPDATE` on the prebootstrapped table; absent or legacy tables
+      require DDL grants.
 - [x] Keep `cdc.table_sync_progress` as catchup-only legacy state.
 - [x] Keep shared MySQL TCP liveness bounds on persistent source, target, and
       progress connections: 10-second TCP connect timeout and TCP keepalive
@@ -88,11 +90,12 @@ are resolved only after verified equality. The current table-sync recovery contr
       canonical child/parent columns, cross-engine rule normalization, and
       resumable per-operation state remain separate from table-sync's runtime
       parent repair.
-- [x] Build read-only and repair inputs from the full `plan.tables` union. Cumulative
-      DeleteExtras preflight and child-first deletes cover every childward table;
-      parentward inserts/updates retain their directional scope. Verification uses
-      observed phase outcomes: insert/update scope receives full equality, while
-      delete-only descendants verify only that target extras are gone.
+- [x] Build read-only and repair inputs from the full `plan.tables` union. Per-chunk
+      DeleteExtras budget checks and child-first deletes cover every childward
+      table; parentward inserts/updates retain their directional scope.
+      Verification uses observed phase outcomes: insert/update scope receives full
+      equality, while delete-only descendants verify only that target extras are
+      gone.
 
 ## Remaining boundaries
 
@@ -128,9 +131,10 @@ that batch. It does not resync an entire parent table.
 2. Hash the immutable run plan and filtered directional inventories; fail closed
    on drift. Disconnected FK cycles are outside the hash and do not block the run,
    while a cycle in either required phase scope blocks before mutation.
-3. Preflight the cumulative delete ceiling across every table in the childward
-   scope, and preflight cycles, before any mutation.
-4. Delete reviewed extras child-first.
+3. Preflight cycles and schema blockers before mutation. For each DeleteExtras
+   chunk, enforce the remaining cumulative delete budget before mutation, then
+   apply and verify that chunk before persisting its progress.
+4. Delete reviewed extras child-first, one durable chunk at a time.
 5. Insert missing rows parent-first.
 6. Update divergent rows after blockers are removed; handle FK/unique key changes
    explicitly.
@@ -163,7 +167,8 @@ replacement for FK dependency analysis.
   parent insert/update repair, and post-write child verification.
 - `src/table_sync/run.rs` — source/target inventory loading and repair-target
   construction.
-- `src/table_sync/range.rs` — chunk progress persistence after repair returns.
+- `src/table_sync/range.rs` — per-chunk delete-budget enforcement and progress
+  persistence after verified repair returns.
 
 ## Tests asserting this spec
 

@@ -41,8 +41,11 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
       and reject changed plans when reusing an interrupted run.
 - [x] Cycles within either required directional phase scope and FK inventory/schema
       mismatch block before target mutation; disconnected cycles are ignored.
-- [x] In apply mode, cumulative DeleteExtras preflight sums extras across every
-      table in the childward scope before target mutation. Read-only and repair
+- [x] In apply mode, DeleteExtras processes one chunk at a time across the
+      childward scope. Each chunk enforces the remaining cumulative
+      `--max-deletes` budget before mutation, applies and verifies the chunk, then
+      persists progress. Interrupted child runs resume from the next uncommitted
+      chunk; no global full-table delete preflight occurs. Read-only and repair
       inputs come from the full `plan.tables` union, so child-only descendants
       are deleted child-first.
 - [x] `--start-after`/`--end-at` bound the selected PK window; apply mode always
