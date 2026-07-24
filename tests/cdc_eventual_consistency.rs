@@ -177,6 +177,24 @@ fn real_superseded_release_parent_recovery_preserves_current_rows_and_commits_re
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_superseded_release_visibility_recovery_installs_current_row_atomically() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("superseded-release-visibility-recovery")
+        .output()
+        .expect("run superseded release visibility recovery harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_missing_pk_two_parent_collision_rolls_back_atomically() {
     let output = Command::new("python3")
         .arg(harness_script())

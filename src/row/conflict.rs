@@ -202,17 +202,24 @@ fn is_deferred_superseded_insert(
     let comics_slug = table.schema == "globalcomix"
         && table.table == "comics"
         && observation.duplicate_index.as_deref() == Some("comics.slug");
-    let releases_category = table.schema == "globalcomix"
+    let releases_superseded_parent = table.schema == "globalcomix"
         && table.table == "releases"
         && observation.error_code == 1452
-        && is_exact_releases_category_constraint_error(&observation.error_text);
-    users_name || comics_slug || releases_category
+        && (is_exact_releases_category_constraint_error(&observation.error_text)
+            || is_exact_releases_visibility_constraint_error(&observation.error_text));
+    users_name || comics_slug || releases_superseded_parent
 }
 
 fn is_exact_releases_category_constraint_error(error_text: &str) -> bool {
     error_text.contains("`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_2`")
         && error_text.contains("FOREIGN KEY (`comic_id`, `comic_category_id`)")
         && error_text.contains("REFERENCES `comics` (`id`, `section_id`)")
+}
+
+fn is_exact_releases_visibility_constraint_error(error_text: &str) -> bool {
+    error_text.contains("`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_3`")
+        && error_text.contains("FOREIGN KEY (`comic_id`, `comic_is_visible`)")
+        && error_text.contains("REFERENCES `comics` (`id`, `is_visible`)")
 }
 
 fn skipped_conflict_observation(
@@ -440,7 +447,8 @@ pub(crate) fn record_duplicate_conflict<C: ConflictStore>(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_exact_releases_category_constraint_error, is_exact_sessions_guest_constraint_error,
+        is_exact_releases_category_constraint_error, is_exact_releases_visibility_constraint_error,
+        is_exact_sessions_guest_constraint_error,
     };
 
     #[test]
@@ -459,6 +467,26 @@ mod tests {
         ));
         assert!(!is_exact_releases_category_constraint_error(&wrong_child));
         assert!(!is_exact_releases_category_constraint_error(&wrong_parent));
+    }
+
+    #[test]
+    fn accepts_only_exact_releases_visibility_constraint_identity() {
+        let exact = "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_3` FOREIGN KEY (`comic_id`, `comic_is_visible`) REFERENCES `comics` (`id`, `is_visible`))";
+        let wrong_constraint = exact.replace("releases_ibfk_3", "releases_ibfk_2");
+        let wrong_child = exact.replace("`comic_is_visible`", "`is_visible`");
+        let wrong_parent = exact.replace(
+            "`comics` (`id`, `is_visible`)",
+            "`comics` (`id`, `section_id`)",
+        );
+
+        assert!(is_exact_releases_visibility_constraint_error(exact));
+        assert!(!is_exact_releases_visibility_constraint_error(
+            &wrong_constraint
+        ));
+        assert!(!is_exact_releases_visibility_constraint_error(&wrong_child));
+        assert!(!is_exact_releases_visibility_constraint_error(
+            &wrong_parent
+        ));
     }
 
     #[test]

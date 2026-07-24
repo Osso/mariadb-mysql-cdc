@@ -641,7 +641,8 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         &self,
         release_id: &mysql::Value,
         comic_id: &mysql::Value,
-        category_id: &mysql::Value,
+        parent_value: &mysql::Value,
+        parent_key: crate::target::ReleaseParentKey,
     ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
         let release_columns = self.with_connection(|conn| {
             conn.query::<String, _>(releases_columns_for_evidence_sql())
@@ -660,13 +661,14 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
                 .map_err(target_query_error)
         })?;
         let parent_sql = format!(
-            "SELECT {} FROM `globalcomix`.`comics` WHERE `id` = ? AND `section_id` = ? FOR UPDATE",
-            quoted_columns(&parent_columns)?
+            "SELECT {} FROM `globalcomix`.`comics` WHERE `id` = ? AND `{}` = ? FOR UPDATE",
+            quoted_columns(&parent_columns)?,
+            parent_key.parent_column()
         );
         let parent_rows = self.with_connection(|conn| {
             conn.exec::<mysql::Row, _, _>(
                 parent_sql,
-                Params::Positional(vec![comic_id.clone(), category_id.clone()]),
+                Params::Positional(vec![comic_id.clone(), parent_value.clone()]),
             )
             .map_err(target_query_error)
         })?;

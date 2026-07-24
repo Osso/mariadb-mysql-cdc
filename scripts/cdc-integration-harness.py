@@ -52,6 +52,7 @@ SCENARIOS = (
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("home-feed-card-parent-recovery", True),
     ScenarioSpec("superseded-release-parent-recovery", True),
+    ScenarioSpec("superseded-release-visibility-recovery", True),
     ScenarioSpec("superseded-users-recovery", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("create-table-crash-restart", True),
@@ -124,6 +125,9 @@ HOME_FEED_PRODUCTION_END = Coordinate("mysqld-bin.002709", 308_261_441)
 RELEASE_PARENT_PRODUCTION_START = Coordinate("mysqld-bin.002709", 515_816_517)
 RELEASE_PARENT_PRODUCTION_EVENT = Coordinate("mysqld-bin.002709", 515_816_736)
 RELEASE_PARENT_PRODUCTION_END = Coordinate("mysqld-bin.002709", 515_824_875)
+RELEASE_VISIBILITY_PRODUCTION_START = Coordinate("mysqld-bin.002709", 531_921_570)
+RELEASE_VISIBILITY_PRODUCTION_EVENT = Coordinate("mysqld-bin.002709", 531_921_789)
+RELEASE_VISIBILITY_PRODUCTION_END = Coordinate("mysqld-bin.002709", 531_929_925)
 
 
 @dataclass
@@ -3237,6 +3241,107 @@ class Harness:
             "negative_proofs_fail_closed=true current_release_not_regressed=true"
         )
 
+    def setup_superseded_release_visibility_tables(self) -> None:
+        assert self.source and self.target
+        schema_sql = (
+            "DROP TABLE IF EXISTS release_transaction_effects; "
+            "DROP TABLE IF EXISTS releases; "
+            "DROP TABLE IF EXISTS comics; "
+            "CREATE TABLE comics ("
+            "id BIGINT NOT NULL PRIMARY KEY, "
+            "is_visible TINYINT NOT NULL, "
+            "title VARCHAR(64) NOT NULL, "
+            "update_time DATETIME NULL, "
+            "UNIQUE KEY comics_id_visible (id,is_visible)"
+            ") ENGINE=InnoDB; "
+            "CREATE TABLE releases ("
+            "id BIGINT NOT NULL PRIMARY KEY, "
+            "comic_id BIGINT NOT NULL, "
+            "comic_is_visible TINYINT NOT NULL, "
+            "slug VARCHAR(64) NOT NULL, "
+            "payload VARCHAR(64) NOT NULL, "
+            "is_visible TINYINT NOT NULL, "
+            "is_deleted TINYINT NOT NULL, "
+            "page_count INT NOT NULL, "
+            "update_time DATETIME NULL, "
+            "CONSTRAINT releases_ibfk_3 FOREIGN KEY (comic_id,comic_is_visible) "
+            "REFERENCES comics (id,is_visible) ON UPDATE CASCADE"
+            ") ENGINE=InnoDB; "
+            "CREATE TABLE release_transaction_effects ("
+            "id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL"
+            ") ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema_sql)
+
+    def run_superseded_release_visibility_recovery(self) -> None:
+        assert self.source and self.target
+        self.setup_superseded_release_visibility_tables()
+        self.admin_sql(
+            self.source,
+            "INSERT INTO comics VALUES (48054,1,'historical comic','2026-07-18 05:26:16');",
+        )
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "START TRANSACTION; "
+            "INSERT INTO releases VALUES "
+            "(384447,48054,1,'four-essentials','historical release',1,0,0,NULL); "
+            "INSERT INTO release_transaction_effects VALUES (900002,'same transaction effect'); "
+            "COMMIT;",
+        )
+        historical_stop = self.coordinate()
+        self.admin_sql(
+            self.source,
+            "UPDATE comics SET is_visible=0,title='current comic',"
+            "update_time='2026-07-18 06:00:26' WHERE id=48054; "
+            "UPDATE releases SET comic_is_visible=0,slug='DELETED_misc',"
+            "payload='current release',is_visible=0,is_deleted=1,page_count=13,"
+            "update_time='2026-07-18 05:41:17' WHERE id=384447;",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO comics VALUES "
+            "(48054,0,'lagged target comic','2026-07-18 05:41:46');",
+        )
+        result = self.run_stream(
+            start,
+            historical_stop,
+            logical_start=RELEASE_VISIBILITY_PRODUCTION_EVENT,
+            logical_checkpoint=RELEASE_VISIBILITY_PRODUCTION_START,
+            logical_end=RELEASE_VISIBILITY_PRODUCTION_END,
+        )
+        require_success(result, "superseded release visibility recovery stream")
+        parent = self.admin_query(
+            self.target,
+            "SELECT id,is_visible,title,update_time FROM comics WHERE id=48054;",
+        ).strip()
+        if parent != "48054\t0\tlagged target comic\t2026-07-18 05:41:46":
+            raise HarnessError(f"current target visibility parent changed: {parent!r}")
+        release = self.admin_query(
+            self.target,
+            "SELECT id,comic_id,comic_is_visible,slug,payload,is_visible,is_deleted,page_count,update_time "
+            "FROM releases WHERE id=384447;",
+        ).strip()
+        expected_release = (
+            "384447\t48054\t0\tDELETED_misc\tcurrent release\t0\t1\t13\t"
+            "2026-07-18 05:41:17"
+        )
+        if release != expected_release:
+            raise HarnessError(f"current visibility release recovery mismatch: {release!r}")
+        effect = self.admin_query(
+            self.target,
+            "SELECT id,payload FROM release_transaction_effects WHERE id=900002;",
+        ).strip()
+        if effect != "900002\tsame transaction effect":
+            raise HarnessError(f"visibility recovery missed remaining effect: {effect!r}")
+        print(
+            "superseded_release_visibility_recovery_ok logical_boundary="
+            "mysqld-bin.002709:531921570-531929925 current_parent_preserved=true "
+            "current_release_installed=true remaining_effects_committed=true"
+        )
+
     def setup_superseded_users_tables(self) -> None:
         assert self.source and self.target
         schema_sql = (
@@ -4477,6 +4582,8 @@ class Harness:
             self.run_home_feed_card_parent_recovery()
         elif scenario == "superseded-release-parent-recovery":
             self.run_superseded_release_parent_recovery()
+        elif scenario == "superseded-release-visibility-recovery":
+            self.run_superseded_release_visibility_recovery()
         elif scenario == "superseded-users-recovery":
             self.run_superseded_users_recovery()
         elif scenario == "production-alter-table":

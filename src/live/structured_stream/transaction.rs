@@ -491,7 +491,20 @@ where
     Err(ApplyBinlogError::Target(context))
 }
 
-const RELEASES_RECOVERY_CHECKPOINT_POSITION: u64 = 515_816_517;
+const RELEASES_CATEGORY_EVENT_POSITION: u64 = 515_816_736;
+const RELEASES_CATEGORY_CHECKPOINT_POSITION: u64 = 515_816_517;
+const RELEASES_VISIBILITY_EVENT_POSITION: u64 = 531_921_789;
+const RELEASES_VISIBILITY_CHECKPOINT_POSITION: u64 = 531_921_570;
+
+fn expected_release_checkpoint_predecessor(
+    candidate: &crate::row::DeferredSupersededInsertCandidate,
+) -> Option<u64> {
+    match candidate.observation.coordinate.start_position {
+        RELEASES_CATEGORY_EVENT_POSITION => Some(RELEASES_CATEGORY_CHECKPOINT_POSITION),
+        RELEASES_VISIBILITY_EVENT_POSITION => Some(RELEASES_VISIBILITY_CHECKPOINT_POSITION),
+        _ => None,
+    }
+}
 
 fn validate_superseded_checkpoint_predecessor(
     current: Option<&crate::checkpoint::Checkpoint>,
@@ -511,13 +524,20 @@ fn validate_superseded_checkpoint_predecessor(
             current.source_file
         )));
     }
-    if candidate.observation.table == "releases"
-        && current.source_position != RELEASES_RECOVERY_CHECKPOINT_POSITION
-    {
-        return Err(ApplyBinlogError::Checkpoint(format!(
-            "superseded release recovery requires exact checkpoint predecessor {}:{RELEASES_RECOVERY_CHECKPOINT_POSITION}, locked {}:{}",
-            expected_file, current.source_file, current.source_position
-        )));
+    if candidate.observation.table == "releases" {
+        let expected_position =
+            expected_release_checkpoint_predecessor(candidate).ok_or_else(|| {
+                ApplyBinlogError::Checkpoint(format!(
+                    "superseded release recovery has no approved checkpoint predecessor for {}:{}",
+                    expected_file, candidate.observation.coordinate.start_position
+                ))
+            })?;
+        if current.source_position != expected_position {
+            return Err(ApplyBinlogError::Checkpoint(format!(
+                "superseded release recovery requires exact checkpoint predecessor {expected_file}:{expected_position}, locked {}:{}",
+                current.source_file, current.source_position
+            )));
+        }
     }
     if current.source_position > xid_end_position {
         return Err(ApplyBinlogError::Checkpoint(format!(

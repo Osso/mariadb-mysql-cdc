@@ -95,6 +95,35 @@ pub struct UsersActiveTransactionEvidence {
     pub rows: Vec<LockedUsersRowEvidence>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseParentKey {
+    Category,
+    Visibility,
+}
+
+impl ReleaseParentKey {
+    pub fn constraint(self) -> &'static str {
+        match self {
+            Self::Category => "releases_ibfk_2",
+            Self::Visibility => "releases_ibfk_3",
+        }
+    }
+
+    pub fn child_column(self) -> &'static str {
+        match self {
+            Self::Category => "comic_category_id",
+            Self::Visibility => "comic_is_visible",
+        }
+    }
+
+    pub fn parent_column(self) -> &'static str {
+        match self {
+            Self::Category => "section_id",
+            Self::Visibility => "is_visible",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReleasesActiveTransactionEvidence {
     pub release_columns: Vec<String>,
@@ -147,7 +176,8 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
         &self,
         _release_id: &Value,
         _comic_id: &Value,
-        _category_id: &Value,
+        _parent_value: &Value,
+        _parent_key: ReleaseParentKey,
     ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
         Err(TargetExecuteError::new(
             "active-transaction release supersession evidence is unsupported by this target executor",
@@ -666,9 +696,15 @@ where
         &self,
         release_id: &Value,
         comic_id: &Value,
-        category_id: &Value,
+        parent_value: &Value,
+        parent_key: ReleaseParentKey,
     ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
-        (*self).read_locked_release_supersession_evidence(release_id, comic_id, category_id)
+        (*self).read_locked_release_supersession_evidence(
+            release_id,
+            comic_id,
+            parent_value,
+            parent_key,
+        )
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {

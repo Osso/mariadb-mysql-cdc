@@ -69,19 +69,20 @@ pub(crate) struct SupersededReleaseVerificationInput {
     pub(crate) operation: crate::conflict_repair::ConflictOperation,
     pub(crate) error_code: u16,
     pub(crate) constraint: String,
+    pub(crate) parent_key: crate::target::ReleaseParentKey,
     pub(crate) candidate_xid: BinlogCoordinate,
     pub(crate) source_snapshot: BinlogCoordinate,
     pub(crate) historical_release_id: String,
     pub(crate) historical_comic_id: String,
-    pub(crate) historical_category_id: String,
+    pub(crate) historical_parent_value: String,
     pub(crate) current_release_row_count: usize,
     pub(crate) current_release_id: String,
     pub(crate) current_release_comic_id: String,
-    pub(crate) current_release_category_id: String,
+    pub(crate) current_release_parent_value: String,
     pub(crate) current_release_hash: String,
     pub(crate) source_parent_row_count: usize,
     pub(crate) source_parent_comic_id: String,
-    pub(crate) source_parent_category_id: String,
+    pub(crate) source_parent_value: String,
     pub(crate) source_parent_hash: String,
     pub(crate) target_release_rows_read_for_update: bool,
     pub(crate) target_release_row_count: usize,
@@ -89,7 +90,7 @@ pub(crate) struct SupersededReleaseVerificationInput {
     pub(crate) target_parent_read_for_update: bool,
     pub(crate) target_parent_row_count: usize,
     pub(crate) target_parent_comic_id: String,
-    pub(crate) target_parent_category_id: String,
+    pub(crate) target_parent_value: String,
     pub(crate) target_parent_hash: String,
     pub(crate) historical_image_hash: String,
 }
@@ -140,7 +141,7 @@ pub(crate) fn verify_superseded_release_insert(
     if candidate.error_code != 1452 {
         return Err(SupersededReleaseRejection::WrongErrorCode);
     }
-    if candidate.constraint != "releases_ibfk_2" {
+    if candidate.constraint != candidate.parent_key.constraint() {
         return Err(SupersededReleaseRejection::WrongConstraint);
     }
     if candidate.source_snapshot <= candidate.candidate_xid {
@@ -149,7 +150,7 @@ pub(crate) fn verify_superseded_release_insert(
     if candidate.current_release_row_count != 1 {
         return Err(SupersededReleaseRejection::CurrentReleaseRowNotUnique);
     }
-    if candidate.current_release_category_id == candidate.historical_category_id {
+    if candidate.current_release_parent_value == candidate.historical_parent_value {
         return Err(SupersededReleaseRejection::MissingLaterSourceHistory);
     }
     if candidate.current_release_id != candidate.historical_release_id {
@@ -165,7 +166,7 @@ pub(crate) fn verify_superseded_release_insert(
         return Err(SupersededReleaseRejection::SourceParentRowNotUnique);
     }
     if candidate.source_parent_comic_id != candidate.current_release_comic_id
-        || candidate.source_parent_category_id != candidate.current_release_category_id
+        || candidate.source_parent_value != candidate.current_release_parent_value
     {
         return Err(SupersededReleaseRejection::SourceParentMismatch);
     }
@@ -190,7 +191,7 @@ pub(crate) fn verify_superseded_release_insert(
         return Err(SupersededReleaseRejection::TargetParentRowNotUnique);
     }
     if candidate.target_parent_comic_id != candidate.current_release_comic_id
-        || candidate.target_parent_category_id != candidate.current_release_category_id
+        || candidate.target_parent_value != candidate.current_release_parent_value
     {
         return Err(SupersededReleaseRejection::TargetParentMismatch);
     }
@@ -409,6 +410,7 @@ mod tests {
             operation: crate::conflict_repair::ConflictOperation::Insert,
             error_code: 1452,
             constraint: "releases_ibfk_2".to_string(),
+            parent_key: crate::target::ReleaseParentKey::Category,
             candidate_xid: BinlogCoordinate {
                 file: "mysqld-bin.002709".to_string(),
                 position: 404_038_011,
@@ -419,15 +421,15 @@ mod tests {
             },
             historical_release_id: "77".to_string(),
             historical_comic_id: "12".to_string(),
-            historical_category_id: "4".to_string(),
+            historical_parent_value: "4".to_string(),
             current_release_row_count: 1,
             current_release_id: "77".to_string(),
             current_release_comic_id: "12".to_string(),
-            current_release_category_id: "9".to_string(),
+            current_release_parent_value: "9".to_string(),
             current_release_hash: "release-hash".to_string(),
             source_parent_row_count: 1,
             source_parent_comic_id: "12".to_string(),
-            source_parent_category_id: "9".to_string(),
+            source_parent_value: "9".to_string(),
             source_parent_hash: "source-parent-hash".to_string(),
             target_release_rows_read_for_update: true,
             target_release_row_count: 0,
@@ -435,7 +437,7 @@ mod tests {
             target_parent_read_for_update: true,
             target_parent_row_count: 1,
             target_parent_comic_id: "12".to_string(),
-            target_parent_category_id: "9".to_string(),
+            target_parent_value: "9".to_string(),
             target_parent_hash: "source-parent-hash".to_string(),
             historical_image_hash: "historical-release-hash".to_string(),
         }
@@ -511,7 +513,7 @@ mod tests {
             Case {
                 name: "no later category",
                 alter: |value| {
-                    value.current_release_category_id = value.historical_category_id.clone()
+                    value.current_release_parent_value = value.historical_parent_value.clone()
                 },
                 expected: SupersededReleaseRejection::MissingLaterSourceHistory,
             },
@@ -527,7 +529,7 @@ mod tests {
             },
             Case {
                 name: "source parent mismatch",
-                alter: |value| value.source_parent_category_id = "10".to_string(),
+                alter: |value| value.source_parent_value = "10".to_string(),
                 expected: SupersededReleaseRejection::SourceParentMismatch,
             },
             Case {
@@ -537,7 +539,7 @@ mod tests {
             },
             Case {
                 name: "target parent mismatch",
-                alter: |value| value.target_parent_category_id = "8".to_string(),
+                alter: |value| value.target_parent_value = "8".to_string(),
                 expected: SupersededReleaseRejection::TargetParentMismatch,
             },
             Case {

@@ -11,7 +11,8 @@ use super::transaction::SupersededInsertVerifier;
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::row::DeferredSupersededInsertCandidate;
 use crate::target::{
-    ReleasesActiveTransactionEvidence, TransactionalTargetExecutor, UsersActiveTransactionEvidence,
+    ReleaseParentKey, ReleasesActiveTransactionEvidence, TransactionalTargetExecutor,
+    UsersActiveTransactionEvidence,
 };
 use mysql::Value;
 
@@ -21,10 +22,11 @@ const USERS_NAME_INDEX: &str = "users.name";
 const COMICS_TABLE: &str = "comics";
 const COMICS_SLUG_INDEX: &str = "comics.slug";
 const RELEASES_TABLE: &str = "releases";
-const RELEASES_CONSTRAINT: &str = "releases_ibfk_2";
 const RELEASES_RECOVERY_FILE: &str = "mysqld-bin.002709";
-const RELEASES_RECOVERY_EVENT_POSITION: u64 = 515_816_736;
-const RELEASES_RECOVERY_XID_POSITION: u64 = 515_824_875;
+const RELEASES_CATEGORY_EVENT_POSITION: u64 = 515_816_736;
+const RELEASES_CATEGORY_XID_POSITION: u64 = 515_824_875;
+const RELEASES_VISIBILITY_EVENT_POSITION: u64 = 531_921_789;
+const RELEASES_VISIBILITY_XID_POSITION: u64 = 531_929_925;
 
 pub(crate) struct ProductionSupersededInsertVerifier<'a, E> {
     source: MySqlConnectionConfig,
@@ -64,9 +66,10 @@ where
         if candidate.observation.table == RELEASES_TABLE {
             #[cfg(feature = "integration-failpoints")]
             let logical_snapshot = self.logical_snapshot.clone();
-            let mut source = |release_id: &Value| {
-                let evidence = load_superseded_release_source_evidence(&self.source, release_id)
-                    .map_err(|error| error.to_string())?;
+            let mut source = |release_id: &Value, parent_key: ReleaseParentKey| {
+                let evidence =
+                    load_superseded_release_source_evidence(&self.source, release_id, parent_key)
+                        .map_err(|error| error.to_string())?;
                 #[cfg(feature = "integration-failpoints")]
                 let evidence = {
                     let mut evidence = evidence;
@@ -160,32 +163,34 @@ fn verify_release_with_source_loader<E, L>(
 ) -> Result<SupersededInsertProof, String>
 where
     E: TransactionalTargetExecutor,
-    L: FnMut(&Value) -> Result<SupersededReleaseSourceEvidence, String>,
+    L: FnMut(&Value, ReleaseParentKey) -> Result<SupersededReleaseSourceEvidence, String>,
 {
-    validate_exact_release_scope(candidate, xid_end_position)?;
-    let historical = historical_release_identity(candidate)?;
-    let source = source_loader(&historical.release_id)
+    let parent_key = validate_exact_release_scope(candidate, xid_end_position)?;
+    let historical = historical_release_identity(candidate, parent_key)?;
+    let source = source_loader(&historical.release_id, parent_key)
         .map_err(|error| format!("superseded release source evidence failed: {error}"))?;
     let current = source
         .release_rows
         .first()
         .ok_or_else(|| "superseded release source evidence has no current row".to_string())?;
     let current_comic_id = named_value(&source.release_columns, &current.values, "comic_id")?;
-    let current_category_id = named_value(
+    let current_parent_value = named_value(
         &source.release_columns,
         &current.values,
-        "comic_category_id",
+        parent_key.child_column(),
     )?;
     let target_evidence = target
         .read_locked_release_supersession_evidence(
             &historical.release_id,
             current_comic_id,
-            current_category_id,
+            current_parent_value,
+            parent_key,
         )
         .map_err(|error| format!("superseded release target evidence failed: {error}"))?;
     release_verification_proof(
         candidate,
         xid_end_position,
+        parent_key,
         &historical,
         source,
         target_evidence,
@@ -195,45 +200,75 @@ where
 struct HistoricalReleaseIdentity {
     release_id: Value,
     comic_id: String,
-    category_id: String,
+    parent_value: String,
     image_hash: String,
 }
 
 fn validate_exact_release_scope(
     candidate: &DeferredSupersededInsertCandidate,
     xid_end_position: u64,
-) -> Result<(), String> {
+) -> Result<ReleaseParentKey, String> {
     let observation = &candidate.observation;
-    let exact_constraint = observation.schema == USERS_SCHEMA
+    let exact_release_insert = observation.schema == USERS_SCHEMA
         && observation.table == RELEASES_TABLE
         && observation.operation == crate::conflict_repair::ConflictOperation::Insert
-        && observation.error_code == 1452
-        && observation
-            .error_text
-            .contains("CONSTRAINT `releases_ibfk_2`")
-        && observation
-            .error_text
-            .contains("FOREIGN KEY (`comic_id`, `comic_category_id`)")
-        && observation
-            .error_text
-            .contains("REFERENCES `comics` (`id`, `section_id`)");
-    if !exact_constraint {
-        return Err("superseded release verifier requires exact globalcomix.releases releases_ibfk_2 INSERT FK 1452".to_string());
+        && observation.error_code == 1452;
+    if !exact_release_insert {
+        return Err(
+            "superseded release verifier requires exact globalcomix.releases INSERT FK 1452"
+                .to_string(),
+        );
     }
-    if observation.coordinate.file != RELEASES_RECOVERY_FILE
-        || observation.coordinate.start_position != RELEASES_RECOVERY_EVENT_POSITION
-        || xid_end_position != RELEASES_RECOVERY_XID_POSITION
-    {
-        return Err("superseded release verifier requires exact production transaction mysqld-bin.002709:515816736-515824875".to_string());
-    }
+    let parent_key = [ReleaseParentKey::Category, ReleaseParentKey::Visibility]
+        .into_iter()
+        .find(|parent_key| release_recovery_boundary_matches(observation, xid_end_position, *parent_key))
+        .ok_or_else(|| {
+            "superseded release verifier requires an approved exact production transaction and FK identity"
+                .to_string()
+        })?;
     if candidate.historical_change.kind != crate::target::TargetRowChangeKind::Insert {
         return Err("superseded release historical change must be INSERT".to_string());
     }
-    Ok(())
+    Ok(parent_key)
+}
+
+fn release_recovery_boundary_matches(
+    observation: &crate::conflict_repair::ConflictObservation,
+    xid_end_position: u64,
+    parent_key: ReleaseParentKey,
+) -> bool {
+    let (child_identity, parent_identity, event_position, xid_position) = match parent_key {
+        ReleaseParentKey::Category => (
+            "FOREIGN KEY (`comic_id`, `comic_category_id`)",
+            "REFERENCES `comics` (`id`, `section_id`)",
+            RELEASES_CATEGORY_EVENT_POSITION,
+            RELEASES_CATEGORY_XID_POSITION,
+        ),
+        ReleaseParentKey::Visibility => (
+            "FOREIGN KEY (`comic_id`, `comic_is_visible`)",
+            "REFERENCES `comics` (`id`, `is_visible`)",
+            RELEASES_VISIBILITY_EVENT_POSITION,
+            RELEASES_VISIBILITY_XID_POSITION,
+        ),
+    };
+    let exact_constraint = observation
+        .error_text
+        .contains(&format!("CONSTRAINT `{}`", parent_key.constraint()));
+    let exact_child_identity = observation.error_text.contains(child_identity);
+    let exact_parent_identity = observation.error_text.contains(parent_identity);
+    let exact_file = observation.coordinate.file == RELEASES_RECOVERY_FILE;
+    let exact_coordinates =
+        observation.coordinate.start_position == event_position && xid_end_position == xid_position;
+    exact_constraint
+        && exact_child_identity
+        && exact_parent_identity
+        && exact_file
+        && exact_coordinates
 }
 
 fn historical_release_identity(
     candidate: &DeferredSupersededInsertCandidate,
+    parent_key: ReleaseParentKey,
 ) -> Result<HistoricalReleaseIdentity, String> {
     let change = &candidate.historical_change;
     if change.writable_columns.len() != change.source_values.len() {
@@ -241,9 +276,9 @@ fn historical_release_identity(
     }
     let release_id = value_for_column(change, "id")?.clone();
     let comic_id = value_key(value_for_column(change, "comic_id")?, "historical comic_id")?;
-    let category_id = value_key(
-        value_for_column(change, "comic_category_id")?,
-        "historical comic_category_id",
+    let parent_value = value_key(
+        value_for_column(change, parent_key.child_column())?,
+        "historical release parent value",
     )?;
     let image_hash = super::superseded_source::hash_canonical_row(
         &change.writable_columns,
@@ -253,7 +288,7 @@ fn historical_release_identity(
     Ok(HistoricalReleaseIdentity {
         release_id,
         comic_id,
-        category_id,
+        parent_value,
         image_hash,
     })
 }
@@ -261,6 +296,7 @@ fn historical_release_identity(
 fn release_verification_proof(
     candidate: &DeferredSupersededInsertCandidate,
     xid_end_position: u64,
+    parent_key: ReleaseParentKey,
     historical: &HistoricalReleaseIdentity,
     source: SupersededReleaseSourceEvidence,
     target: ReleasesActiveTransactionEvidence,
@@ -287,16 +323,28 @@ fn release_verification_proof(
         .map(|row| named_value_key(&source.release_columns, &row.values, "comic_id"))
         .transpose()?
         .unwrap_or_default();
-    let current_category_id = current
-        .map(|row| named_value_key(&source.release_columns, &row.values, "comic_category_id"))
+    let current_parent_value = current
+        .map(|row| {
+            named_value_key(
+                &source.release_columns,
+                &row.values,
+                parent_key.child_column(),
+            )
+        })
         .transpose()?
         .unwrap_or_default();
     let source_parent_comic_id = source_parent
         .map(|row| named_value_key(&source.parent_columns, &row.values, "id"))
         .transpose()?
         .unwrap_or_default();
-    let source_parent_category_id = source_parent
-        .map(|row| named_value_key(&source.parent_columns, &row.values, "section_id"))
+    let source_parent_value = source_parent
+        .map(|row| {
+            named_value_key(
+                &source.parent_columns,
+                &row.values,
+                parent_key.parent_column(),
+            )
+        })
         .transpose()?
         .unwrap_or_default();
     let current_hash = current.map_or_else(String::new, |row| {
@@ -311,8 +359,14 @@ fn release_verification_proof(
         .map(|row| named_value_key(&target.parent_columns, &row.values, "id"))
         .transpose()?
         .unwrap_or_default();
-    let target_parent_category_id = target_parent
-        .map(|row| named_value_key(&target.parent_columns, &row.values, "section_id"))
+    let target_parent_value = target_parent
+        .map(|row| {
+            named_value_key(
+                &target.parent_columns,
+                &row.values,
+                parent_key.parent_column(),
+            )
+        })
         .transpose()?
         .unwrap_or_default();
     let target_parent_hash = only_locked_hash(&target.parent_rows);
@@ -321,7 +375,8 @@ fn release_verification_proof(
         table: candidate.observation.table.clone(),
         operation: candidate.observation.operation,
         error_code: candidate.observation.error_code,
-        constraint: RELEASES_CONSTRAINT.to_string(),
+        constraint: parent_key.constraint().to_string(),
+        parent_key,
         candidate_xid: BinlogCoordinate {
             file: candidate.observation.coordinate.file.clone(),
             position: xid_end_position,
@@ -332,15 +387,15 @@ fn release_verification_proof(
         },
         historical_release_id: value_key(&historical.release_id, "historical release id")?,
         historical_comic_id: historical.comic_id.clone(),
-        historical_category_id: historical.category_id.clone(),
+        historical_parent_value: historical.parent_value.clone(),
         current_release_row_count: source.release_rows.len(),
         current_release_id,
         current_release_comic_id: current_comic_id,
-        current_release_category_id: current_category_id,
+        current_release_parent_value: current_parent_value,
         current_release_hash: current_hash,
         source_parent_row_count: source.parent_rows.len(),
         source_parent_comic_id,
-        source_parent_category_id,
+        source_parent_value,
         source_parent_hash,
         target_release_rows_read_for_update: true,
         target_release_row_count: target.release_rows.len(),
@@ -348,7 +403,7 @@ fn release_verification_proof(
         target_parent_read_for_update: true,
         target_parent_row_count: target.parent_rows.len(),
         target_parent_comic_id,
-        target_parent_category_id,
+        target_parent_value,
         target_parent_hash,
         historical_image_hash: historical.image_hash.clone(),
     };
@@ -719,7 +774,8 @@ mod tests {
             &self,
             _release_id: &Value,
             _comic_id: &Value,
-            _category_id: &Value,
+            _parent_value: &Value,
+            _parent_key: ReleaseParentKey,
         ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
             self.release_evidence
                 .borrow_mut()
@@ -879,7 +935,7 @@ mod tests {
                 source_server_id: 3,
                 coordinate: crate::conflict_repair::ConflictCoordinate {
                     file: "mysqld-bin.002709".to_string(),
-                    start_position: RELEASES_RECOVERY_EVENT_POSITION,
+                    start_position: RELEASES_CATEGORY_EVENT_POSITION,
                     end_position: 0,
                 },
                 schema: USERS_SCHEMA.to_string(),
@@ -919,11 +975,11 @@ mod tests {
             evidence: RefCell::new(None),
             release_evidence: RefCell::new(Some(Ok(release_target_evidence()))),
         };
-        let mut source = |_: &Value| Ok(release_source_evidence());
+        let mut source = |_: &Value, _: ReleaseParentKey| Ok(release_source_evidence());
 
         let proof = verify_release_with_source_loader(
             &release_candidate(),
-            RELEASES_RECOVERY_XID_POSITION,
+            RELEASES_CATEGORY_XID_POSITION,
             &mut source,
             &target,
         )

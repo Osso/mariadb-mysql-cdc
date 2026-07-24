@@ -159,12 +159,17 @@ fn load_identity_source_evidence(
 pub(crate) fn load_superseded_release_source_evidence(
     config: &MySqlConnectionConfig,
     release_id: &Value,
+    parent_key: crate::target::ReleaseParentKey,
 ) -> Result<SupersededReleaseSourceEvidence, SourceEvidenceError> {
     let mut source = MySqlSupersededSourceQuery::connect(config)?;
     let snapshot_lower_bound = load_master_status(&mut source)?;
     source.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
-    let result =
-        load_release_evidence_in_transaction(&mut source, snapshot_lower_bound, release_id);
+    let result = load_release_evidence_in_transaction(
+        &mut source,
+        snapshot_lower_bound,
+        release_id,
+        parent_key,
+    );
     finish_transaction(&mut source, result)
 }
 
@@ -172,6 +177,7 @@ fn load_release_evidence_in_transaction(
     source: &mut impl SupersededSourceQuery,
     snapshot: SourceSnapshotCoordinate,
     release_id: &Value,
+    parent_key: crate::target::ReleaseParentKey,
 ) -> Result<SupersededReleaseSourceEvidence, SourceEvidenceError> {
     let release_columns = load_writable_table_columns(source, "releases")?;
     let release_sql = row_query(&release_columns, "releases", "`id` = ?")?;
@@ -187,11 +193,13 @@ fn load_release_evidence_in_transaction(
         )));
     }
     let comic_id = value_for_named_column(&release_columns, &release.values, "comic_id")?.clone();
-    let category_id =
-        value_for_named_column(&release_columns, &release.values, "comic_category_id")?.clone();
+    let parent_value =
+        value_for_named_column(&release_columns, &release.values, parent_key.child_column())?
+            .clone();
     let parent_columns = load_table_columns(source, "comics")?;
-    let parent_sql = row_query(&parent_columns, "comics", "`id` = ? AND `section_id` = ?")?;
-    let parent_result = source.query(&parent_sql, vec![comic_id, category_id])?;
+    let parent_predicate = format!("`id` = ? AND `{}` = ?", parent_key.parent_column());
+    let parent_sql = row_query(&parent_columns, "comics", &parent_predicate)?;
+    let parent_result = source.query(&parent_sql, vec![comic_id, parent_value])?;
     let parent_rows = canonical_rows(&parent_columns, parent_result, "comics")?;
     Ok(SupersededReleaseSourceEvidence {
         snapshot,
