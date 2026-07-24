@@ -4,6 +4,14 @@ use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 #[test]
+fn target_writable_columns_keep_default_generated_only() {
+    let query = releases_columns_for_evidence_sql();
+    assert!(query.contains("VIRTUAL GENERATED"));
+    assert!(query.contains("STORED GENERATED"));
+    assert!(!query.contains("extra NOT LIKE '%GENERATED%'"));
+}
+
+#[test]
 fn formats_mysql_values_like_snapshot_text_rows() {
     assert_eq!(value_to_string(Value::NULL), None);
     assert_eq!(

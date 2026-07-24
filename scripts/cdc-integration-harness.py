@@ -49,6 +49,7 @@ SCENARIOS = (
     ScenarioSpec("sync-table-update-fk-parent-repair", True),
     ScenarioSpec("sync-table-fk-parent-concurrent-duplicate", True),
     ScenarioSpec("sync-table-wide-update-fk-retry", True),
+    ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("home-feed-card-parent-recovery", True),
     ScenarioSpec("superseded-release-parent-recovery", True),
     ScenarioSpec("superseded-users-recovery", True),
@@ -3955,6 +3956,53 @@ class Harness:
             "committed_prefix_replayed=false exact_readback=true progress_afterward=true"
         )
 
+    def run_writable_column_generated_metadata(self) -> None:
+        assert self.source and self.target
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "DROP TABLE IF EXISTS writable_column_metadata; "
+                "CREATE TABLE writable_column_metadata ("
+                "id INT NOT NULL PRIMARY KEY, "
+                "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                "payload INT NOT NULL, "
+                "virtual_value INT GENERATED ALWAYS AS (payload + 1) VIRTUAL, "
+                "stored_value INT GENERATED ALWAYS AS (payload + 2) STORED"
+                ") ENGINE=InnoDB;",
+            )
+        legacy_query = (
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='globalcomix' "
+            "AND table_name='writable_column_metadata' "
+            "AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position;"
+        )
+        writable_query = (
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='globalcomix' "
+            "AND table_name='writable_column_metadata' "
+            "AND UPPER(extra) NOT LIKE '%VIRTUAL GENERATED%' "
+            "AND UPPER(extra) NOT LIKE '%STORED GENERATED%' "
+            "ORDER BY ordinal_position;"
+        )
+        source_columns = self.admin_query(self.source, writable_query).splitlines()
+        target_columns = self.admin_query(self.target, writable_query).splitlines()
+        legacy_target = self.admin_query(self.target, legacy_query).splitlines()
+        expected = ["id", "created_at", "payload"]
+        if source_columns != expected or target_columns != expected:
+            raise HarnessError(
+                "writable metadata classification mismatch: "
+                f"source={source_columns!r} target={target_columns!r}"
+            )
+        if "created_at" in legacy_target:
+            raise HarnessError(
+                "MySQL DEFAULT_GENERATED did not reproduce legacy exclusion"
+            )
+        print(
+            "writable_column_generated_metadata_ok default_generated=writable "
+            "virtual_generated=excluded stored_generated=excluded "
+            "source_target_equal=true legacy_target_excludes_default=true"
+        )
+
     def run_repair_scenario(self, scenario: str) -> None:
         assert self.source and self.target
         if scenario in {"fk-child-first-delete", "fk-parent-first-insert"}:
@@ -4496,6 +4544,8 @@ class Harness:
             self.run_sync_table_fk_parent_concurrent_duplicate()
         elif scenario == "sync-table-wide-update-fk-retry":
             self.run_sync_table_wide_update_fk_retry()
+        elif scenario == "writable-column-generated-metadata":
+            self.run_writable_column_generated_metadata()
         elif scenario == "home-feed-card-parent-recovery":
             self.run_home_feed_card_parent_recovery()
         elif scenario == "superseded-release-parent-recovery":

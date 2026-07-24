@@ -9,7 +9,12 @@ const USERS_SCHEMA: &str = "globalcomix";
 const USERS_TABLE: &str = "users";
 const HASH_DOMAIN: &[u8] = b"mariadb-mysql-cdc:superseded-source-row:v1\0";
 const COLUMN_QUERY: &str = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
-const WRITABLE_COLUMN_QUERY: &str = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND EXTRA NOT LIKE '%GENERATED%' ORDER BY ORDINAL_POSITION";
+fn writable_column_query() -> String {
+    format!(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND {} ORDER BY ORDINAL_POSITION",
+        crate::mysql_support::writable_column_predicate("EXTRA")
+    )
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SourceSnapshotCoordinate {
@@ -339,7 +344,7 @@ fn load_writable_table_columns(
     source: &mut impl SupersededSourceQuery,
     table: &str,
 ) -> Result<Vec<String>, SourceEvidenceError> {
-    load_columns(source, table, WRITABLE_COLUMN_QUERY)
+    load_columns(source, table, &writable_column_query())
 }
 
 fn load_columns(
@@ -543,6 +548,14 @@ fn source_options(config: &MySqlConnectionConfig) -> Result<Opts, SourceEvidence
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_writable_columns_keep_default_generated_only() {
+        let query = writable_column_query();
+        assert!(query.contains("VIRTUAL GENERATED"));
+        assert!(query.contains("STORED GENERATED"));
+        assert!(!query.contains("EXTRA NOT LIKE '%GENERATED%'"));
+    }
     use std::collections::VecDeque;
 
     #[derive(Clone, Debug, PartialEq)]

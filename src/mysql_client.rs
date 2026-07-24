@@ -452,7 +452,12 @@ fn duplicate_conflict(error: &TargetExecuteError, error_code: u16) -> DuplicateC
 }
 
 const USERS_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='users' ORDER BY ordinal_position";
-const RELEASES_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='releases' AND extra NOT LIKE '%GENERATED%' ORDER BY ordinal_position";
+fn releases_columns_for_evidence_sql() -> String {
+    format!(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='releases' AND {} ORDER BY ordinal_position",
+        crate::mysql_support::writable_column_predicate("extra")
+    )
+}
 const COMICS_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='comics' ORDER BY ordinal_position";
 
 fn build_locked_users_evidence_sql(columns: &[String]) -> Result<String, TargetExecuteError> {
@@ -588,7 +593,7 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         category_id: &mysql::Value,
     ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
         let release_columns = self.with_connection(|conn| {
-            conn.query::<String, _>(RELEASES_COLUMNS_FOR_EVIDENCE_SQL)
+            conn.query::<String, _>(releases_columns_for_evidence_sql())
                 .map_err(target_query_error)
         })?;
         let release_sql = format!(

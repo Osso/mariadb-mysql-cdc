@@ -17,6 +17,12 @@ const MYSQL_TCP_KEEPALIVE_PROBE_COUNT: u32 = 3;
 #[cfg(target_os = "linux")]
 const MYSQL_TCP_USER_TIMEOUT_MS: u32 = 30_000;
 
+pub(crate) fn writable_column_predicate(extra_column: &str) -> String {
+    format!(
+        "UPPER({extra_column}) NOT LIKE '%VIRTUAL GENERATED%' AND UPPER({extra_column}) NOT LIKE '%STORED GENERATED%'"
+    )
+}
+
 pub fn target_mysql_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
     let builder = OptsBuilder::default()
         .ip_or_hostname(Some(target.host.clone()))
