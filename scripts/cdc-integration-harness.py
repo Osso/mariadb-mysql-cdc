@@ -45,6 +45,7 @@ class ScenarioSpec:
 
 SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
+    ScenarioSpec("sync-table-fk-parent-repair", True),
     ScenarioSpec("home-feed-card-parent-recovery", True),
     ScenarioSpec("superseded-release-parent-recovery", True),
     ScenarioSpec("superseded-users-recovery", True),
@@ -3655,6 +3656,86 @@ class Harness:
             "progress_rows=0 target_rows=0"
         )
 
+    def run_sync_table_fk_parent_repair(self) -> None:
+        assert self.source and self.target
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "DROP TABLE IF EXISTS guests; DROP TABLE IF EXISTS utms; "
+                "CREATE TABLE utms ("
+                "id INT UNSIGNED NOT NULL PRIMARY KEY, "
+                "utm_hash VARCHAR(64) NOT NULL UNIQUE"
+                ") ENGINE=InnoDB; "
+                "CREATE TABLE guests ("
+                "guest_id BIGINT UNSIGNED NOT NULL PRIMARY KEY, "
+                "guest_hash CHAR(40) NOT NULL UNIQUE, "
+                "utm_id INT UNSIGNED NULL, "
+                "CONSTRAINT fk_guests_utm_id FOREIGN KEY (utm_id) REFERENCES utms(id)"
+                ") ENGINE=InnoDB;",
+            )
+        self.admin_sql(
+            self.source,
+            "INSERT INTO utms VALUES (184041, "
+            "'42f66cafa34b0fb11f329298c627bc1b9fa233d772b5bb5cd621f1bbe8dced6d'); "
+            "INSERT INTO guests VALUES (87308589, "
+            "'6ee3278e-f4e0-4242-bd66-1342633d84f1G4Cd', 184041);",
+        )
+        binary = self._repair_binary()
+        args = self._sync_table_args(binary)
+        args[args.index("accounts")] = "guests"
+        args[args.index("id,email,payload")] = "guest_id,guest_hash,utm_id"
+        args[args.index("id")] = "guest_id"
+        args[args.index("sync-table-source-ca-proof")] = "sync-table-fk-parent-repair"
+        args[args.index("globalcomix.sync_table_tls_progress")] = "globalcomix.table_sync_runs"
+        args.extend([
+            "--mode",
+            "apply",
+            "--chunk-size",
+            "1",
+            "--start-after",
+            "87308588",
+            "--end-at",
+            "87308589",
+            "--max-deletes",
+            "0",
+        ])
+        result = run(
+            args,
+            cwd=self.repo,
+            env={
+                **os.environ,
+                "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            },
+            timeout=180,
+            check=False,
+        )
+        require_success(result, "sync-table FK parent repair")
+        parent = self.query(
+            self.target,
+            "SELECT id,utm_hash FROM utms WHERE id=184041;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        child = self.query(
+            self.target,
+            "SELECT guest_id,guest_hash,utm_id FROM guests WHERE guest_id=87308589;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        progress = self.admin_query(
+            self.target,
+            "SELECT status,last_primary_key_json FROM globalcomix.table_sync_runs "
+            "WHERE run_id='sync-table-fk-parent-repair';",
+        ).strip()
+        if not parent.startswith("184041\\t42f66c"):
+            raise HarnessError(f"FK parent did not converge: {parent!r}")
+        if child != "87308589\\t6ee3278e-f4e0-4242-bd66-1342633d84f1G4Cd\\t184041":
+            raise HarnessError(f"FK child did not converge: {child!r}")
+        if progress != 'complete\\t["87308589"]':
+            raise HarnessError(f"progress advanced without terminal convergence: {progress!r}")
+        print("sync_table_fk_parent_repair_ok mysql_error=1452 parent_first=true child_retried=true")
+
     def run_repair_scenario(self, scenario: str) -> None:
         assert self.source and self.target
         if scenario in {"fk-child-first-delete", "fk-parent-first-insert"}:
@@ -4188,6 +4269,8 @@ class Harness:
         self.prepare()
         if scenario == "strict-secondary-btree":
             self.run_strict_secondary_btree()
+        elif scenario == "sync-table-fk-parent-repair":
+            self.run_sync_table_fk_parent_repair()
         elif scenario == "home-feed-card-parent-recovery":
             self.run_home_feed_card_parent_recovery()
         elif scenario == "superseded-release-parent-recovery":
