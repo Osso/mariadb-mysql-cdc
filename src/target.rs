@@ -153,6 +153,23 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
             "active-transaction release supersession evidence is unsupported by this target executor",
         ))
     }
+    /// Reads a parent's referenced columns under the active transaction, locked, selecting by the
+    /// parent's primary key values. Rows come back in the requested `referenced_columns` order and
+    /// cardinality is preserved so the caller can reject an ambiguous parent.
+    ///
+    /// An empty result means the parent identity is absent, which is the missing-parent class; one
+    /// row whose non-key referenced values differ is the superseded-attribute class.
+    fn read_locked_parent_identity(
+        &self,
+        _schema: &str,
+        _parent_table: &str,
+        _referenced_columns: &[String],
+        _parent_primary_key: &[(String, Value)],
+    ) -> Result<Vec<Vec<Value>>, TargetExecuteError> {
+        Err(TargetExecuteError::new(
+            "active-transaction locked parent identity read is unsupported by this target executor",
+        ))
+    }
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
     fn discard_failed_transaction_connection(&self) -> Result<(), TargetExecuteError> {
@@ -669,6 +686,21 @@ where
         category_id: &Value,
     ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
         (*self).read_locked_release_supersession_evidence(release_id, comic_id, category_id)
+    }
+
+    fn read_locked_parent_identity(
+        &self,
+        schema: &str,
+        parent_table: &str,
+        referenced_columns: &[String],
+        parent_primary_key: &[(String, Value)],
+    ) -> Result<Vec<Vec<Value>>, TargetExecuteError> {
+        (*self).read_locked_parent_identity(
+            schema,
+            parent_table,
+            referenced_columns,
+            parent_primary_key,
+        )
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
