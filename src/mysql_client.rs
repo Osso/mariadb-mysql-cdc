@@ -462,25 +462,32 @@ fn releases_columns_for_evidence_sql() -> String {
 const COMICS_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='comics' ORDER BY ordinal_position";
 
 fn build_locked_users_evidence_sql(columns: &[String]) -> Result<String, TargetExecuteError> {
-    if columns.is_empty() {
-        return Err(TargetExecuteError::new(
-            "globalcomix.users metadata returned no columns",
-        ));
-    }
-    let columns = columns
-        .iter()
-        .map(|column| crate::mysql_support::quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!(
-        "SELECT {columns} FROM `globalcomix`.`users` WHERE `id` = ? OR `name` = ? ORDER BY `id` FOR UPDATE"
-    ))
+    build_locked_identity_evidence_sql(columns, "users", "name")
 }
 
 fn build_locked_comics_evidence_sql(columns: &[String]) -> Result<String, TargetExecuteError> {
+    build_locked_identity_evidence_sql(columns, "comics", "slug")
+}
+
+pub(crate) fn build_locked_identity_evidence_sql(
+    columns: &[String],
+    table: &str,
+    identity_column: &str,
+) -> Result<String, TargetExecuteError> {
     if columns.is_empty() {
+        return Err(TargetExecuteError::new(format!(
+            "globalcomix.{table} metadata returned no columns"
+        )));
+    }
+    if !table
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || !identity_column
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
         return Err(TargetExecuteError::new(
-            "globalcomix.comics metadata returned no columns",
+            "invalid supersession evidence identifier",
         ));
     }
     let columns = columns
@@ -489,7 +496,7 @@ fn build_locked_comics_evidence_sql(columns: &[String]) -> Result<String, Target
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!(
-        "SELECT {columns} FROM `globalcomix`.`comics` WHERE `id` = ? OR `slug` = ? ORDER BY `id` FOR UPDATE"
+        "SELECT {columns} FROM `globalcomix`.`{table}` WHERE `id` = ? OR `{identity_column}` = ? ORDER BY `id` FOR UPDATE"
     ))
 }
 

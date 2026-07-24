@@ -123,9 +123,29 @@ where
         )
     }
     .map_err(|error| format!("superseded target evidence failed: {error}"))?;
+    let identity_column = if candidate.observation.table == COMICS_TABLE {
+        "slug"
+    } else {
+        "name"
+    };
+    let source_sql = super::superseded_source::identity_row_query(
+        &source.columns,
+        &candidate.observation.table,
+        identity_column,
+    )
+    .map_err(|error| format!("superseded source SQL formatting failed: {error}"))?;
+    let target_sql = crate::mysql_client::build_locked_identity_evidence_sql(
+        &target.columns,
+        &candidate.observation.table,
+        identity_column,
+    )
+    .map_err(|error| format!("superseded target SQL formatting failed: {error}"))?;
     let input = verification_input(candidate, xid_end_position, &historical, source, target)?;
-    verify_superseded_insert(&input)
-        .map_err(|rejection| format!("superseded insert rejected: {rejection:?}"))
+    verify_superseded_insert(&input).map_err(|rejection| {
+        format!(
+            "superseded insert rejected: {rejection:?}; source_sql={source_sql}; target_sql={target_sql}"
+        )
+    })
 }
 
 fn verify_release_with_source_loader<E, L>(
@@ -676,6 +696,17 @@ mod tests {
                 .expect("one target evidence read")
         }
 
+        fn read_locked_comics_supersession_evidence(
+            &self,
+            _historical_primary_key: &Value,
+            _historical_slug: &Value,
+        ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+            self.evidence
+                .borrow_mut()
+                .take()
+                .expect("one target evidence read")
+        }
+
         fn read_locked_release_supersession_evidence(
             &self,
             _release_id: &Value,
@@ -932,6 +963,40 @@ mod tests {
             error,
             "superseded source evidence failed: source unavailable"
         );
+    }
+
+    #[test]
+    fn owner_hash_mismatch_reports_parameterized_source_and_target_sql() {
+        let mut candidate = candidate();
+        candidate.observation.table = COMICS_TABLE.to_string();
+        candidate.observation.duplicate_index = Some(COMICS_SLUG_INDEX.to_string());
+        candidate.observation.source_primary_key = vec!["48054".to_string()];
+        candidate.historical_change.table = "globalcomix.comics".to_string();
+        candidate.historical_change.writable_columns = vec!["id".to_string(), "slug".to_string()];
+        candidate.historical_change.primary_key_values = vec![Value::UInt(48_054)];
+        candidate.historical_change.source_values = values(48_054, "misc");
+
+        let mut source_evidence = source_evidence();
+        source_evidence.columns[1] = "slug".to_string();
+        for row in &mut source_evidence.matching_rows {
+            row.columns[1] = "slug".to_string();
+        }
+        let mut target_evidence = target_evidence();
+        target_evidence.columns[1] = "slug".to_string();
+        target_evidence.rows[1].row_hash = "different-owner-hash".to_string();
+        let target = FakeTarget {
+            evidence: RefCell::new(Some(Ok(target_evidence))),
+            release_evidence: RefCell::new(None),
+        };
+        let mut source = |_primary_key: u64, _slug: &str| Ok(source_evidence.clone());
+
+        let error = verify_with_source_loader(&candidate, 531_241_781, &mut source, &target)
+            .expect_err("owner mismatch must include evidence queries");
+
+        assert!(error.contains("source_sql=SELECT `id`,`slug` FROM `globalcomix`.`comics` WHERE `id` = ? OR `slug` = ? ORDER BY `id`"));
+        assert!(error.contains("target_sql=SELECT `id`, `slug` FROM `globalcomix`.`comics` WHERE `id` = ? OR `slug` = ? ORDER BY `id` FOR UPDATE"));
+        assert!(!error.contains("48054"));
+        assert!(!error.contains("misc"));
     }
 
     #[test]

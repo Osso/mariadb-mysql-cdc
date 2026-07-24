@@ -336,11 +336,7 @@ fn load_identity_evidence_in_transaction(
     historical_name: &str,
 ) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
     let columns = load_table_columns(source, table)?;
-    let row_query = row_query(
-        &columns,
-        table,
-        &format!("`id` = ? OR `{identity_column}` = ? ORDER BY `id`"),
-    )?;
+    let row_query = identity_row_query(&columns, table, identity_column)?;
     let result = source.query(
         &row_query,
         vec![
@@ -439,7 +435,24 @@ fn load_columns(
 
 #[cfg(test)]
 fn users_row_query(columns: &[String]) -> Result<String, SourceEvidenceError> {
-    row_query(columns, USERS_TABLE, "`id` = ? OR `name` = ? ORDER BY `id`")
+    identity_row_query(columns, USERS_TABLE, "name")
+}
+
+pub(crate) fn identity_row_query(
+    columns: &[String],
+    table: &str,
+    identity_column: &str,
+) -> Result<String, SourceEvidenceError> {
+    if !valid_identifier(identity_column) {
+        return Err(SourceEvidenceError::new(
+            "cannot build evidence query from invalid identity column",
+        ));
+    }
+    row_query(
+        columns,
+        table,
+        &format!("`id` = ? OR `{identity_column}` = ? ORDER BY `id`"),
+    )
 }
 
 fn row_query(
