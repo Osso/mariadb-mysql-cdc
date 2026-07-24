@@ -255,7 +255,9 @@ impl ParentRepairStore for MySqlParentRepairStore<'_> {
             .collect::<Result<Vec<_>, _>>()?;
         match self.child_operation {
             ChildBatchOperation::Insert => self.writer.insert_rows(&snapshot_rows),
-            ChildBatchOperation::Update => self.writer.update_rows(&snapshot_rows),
+            ChildBatchOperation::Update => self
+                .writer
+                .update_rows(&snapshot_rows.iter().collect::<Vec<_>>()),
         }
         .map_err(|error| error.to_string())
     }
@@ -397,10 +399,10 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
     }
 
     fn update_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
-        let rows = rows.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
-        match crate::target::TargetMySqlWriter::update_rows(&self.writer, &rows) {
+        match crate::target::TargetMySqlWriter::update_rows(&self.writer, rows) {
             Ok(()) => Ok(()),
             Err(error) if error.mysql_code() == Some(1452) => {
+                let rows = rows.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
                 self.repair_fk_parents_and_retry(&rows, ChildBatchOperation::Update)
             }
             Err(error) => Err(TableSyncError::Repair(error.to_string())),
