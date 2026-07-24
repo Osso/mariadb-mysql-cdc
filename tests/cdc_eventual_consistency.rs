@@ -69,6 +69,24 @@ fn real_sync_table_update_repairs_fk_parent_after_1452() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_fk_parent_repair_reconciles_concurrent_child_duplicate() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("sync-table-fk-parent-concurrent-duplicate")
+        .output()
+        .expect("run FK parent concurrent duplicate harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_superseded_users_recovery_commits_remaining_effects_and_rejects_mismatch() {
     let output = Command::new("python3")
         .arg(harness_script())

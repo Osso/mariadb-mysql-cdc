@@ -47,6 +47,7 @@ SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
     ScenarioSpec("sync-table-fk-parent-repair", True),
     ScenarioSpec("sync-table-update-fk-parent-repair", True),
+    ScenarioSpec("sync-table-fk-parent-concurrent-duplicate", True),
     ScenarioSpec("home-feed-card-parent-recovery", True),
     ScenarioSpec("superseded-release-parent-recovery", True),
     ScenarioSpec("superseded-users-recovery", True),
@@ -3753,6 +3754,102 @@ class Harness:
             f"operation={operation} parent_first=true child_retried=true"
         )
 
+    def run_sync_table_fk_parent_concurrent_duplicate(self) -> None:
+        assert self.source and self.target
+        for divergent in (False, True):
+            for endpoint in (self.source, self.target):
+                self.admin_sql(
+                    endpoint,
+                    "DROP TABLE IF EXISTS guests; DROP TABLE IF EXISTS utms; "
+                    "CREATE TABLE utms (id INT UNSIGNED NOT NULL PRIMARY KEY, "
+                    "utm_hash VARCHAR(64) NOT NULL UNIQUE) ENGINE=InnoDB; "
+                    "CREATE TABLE guests (guest_id BIGINT UNSIGNED NOT NULL PRIMARY KEY, "
+                    "guest_hash CHAR(40) NOT NULL UNIQUE, utm_id INT UNSIGNED NULL, "
+                    "CONSTRAINT fk_guests_utm_id FOREIGN KEY (utm_id) REFERENCES utms(id)) "
+                    "ENGINE=InnoDB;",
+                )
+            source_hash = "6ee3278e-f4e0-4242-bd66-1342633d84f1G4Cd"
+            concurrent_hash = (
+                "divergent-concurrent-owner-000000000000"
+                if divergent
+                else source_hash
+            )
+            self.admin_sql(
+                self.source,
+                "INSERT INTO utms VALUES (184041, "
+                "'42f66cafa34b0fb11f329298c627bc1b9fa233d772b5bb5cd621f1bbe8dced6d'); "
+                f"INSERT INTO guests VALUES (87308589, '{source_hash}', 184041);",
+            )
+            self.admin_sql(
+                self.target,
+                "CREATE TRIGGER concurrent_guest_after_utm_insert AFTER INSERT ON utms "
+                "FOR EACH ROW INSERT INTO guests VALUES "
+                f"(87308589, '{concurrent_hash}', NEW.id);",
+            )
+            run_id = f"sync-table-fk-concurrent-duplicate-{str(divergent).lower()}"
+            binary = self._repair_binary()
+            args = self._sync_table_args(binary)
+            args[args.index("accounts")] = "guests"
+            args[args.index("id,email,payload")] = "guest_id,guest_hash,utm_id"
+            args[args.index("id")] = "guest_id"
+            args[args.index("sync-table-source-ca-proof")] = run_id
+            args[args.index("globalcomix.sync_table_tls_progress")] = (
+                "globalcomix.table_sync_runs"
+            )
+            args.extend([
+                "--mode", "apply", "--chunk-size", "1",
+                "--start-after", "87308588", "--end-at", "87308589",
+                "--max-deletes", "0",
+            ])
+            result = run(
+                args,
+                cwd=self.repo,
+                env={
+                    **os.environ,
+                    "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                    "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+                },
+                timeout=180,
+                check=False,
+            )
+            progress = self.admin_query(
+                self.target,
+                "SELECT status,COALESCE(last_primary_key_json,''),inserts_applied,chunks "
+                "FROM globalcomix.table_sync_runs "
+                f"WHERE run_id='{run_id}';",
+            ).strip()
+            child = self.query(
+                self.target,
+                "SELECT guest_id,guest_hash,utm_id FROM guests WHERE guest_id=87308589;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            if divergent:
+                if result.returncode == 0 or "diverges from source" not in (
+                    result.stdout + result.stderr
+                ):
+                    raise HarnessError(
+                        "divergent concurrent child did not fail closed: "
+                        f"result={result}"
+                    )
+                fields = progress.split("\t")
+                if len(fields) != 4 or fields[1:] != ["", "0", "0"]:
+                    raise HarnessError(
+                        f"divergent concurrent child advanced progress: {progress!r}"
+                    )
+            else:
+                require_success(result, "exact concurrent child after FK parent repair")
+                if child != f"87308589\t{source_hash}\t184041":
+                    raise HarnessError(f"exact concurrent child did not converge: {child!r}")
+                if progress != 'complete\t["87308589"]\t1\t1':
+                    raise HarnessError(
+                        f"exact concurrent child did not checkpoint: {progress!r}"
+                    )
+        print(
+            "sync_table_fk_parent_concurrent_duplicate_ok "
+            "mysql_errors=1452,1062 exact_progress=true divergent_progress=false"
+        )
+
     def run_repair_scenario(self, scenario: str) -> None:
         assert self.source and self.target
         if scenario in {"fk-child-first-delete", "fk-parent-first-insert"}:
@@ -4290,6 +4387,8 @@ class Harness:
             self.run_sync_table_fk_parent_repair()
         elif scenario == "sync-table-update-fk-parent-repair":
             self.run_sync_table_fk_parent_repair(update_existing_child=True)
+        elif scenario == "sync-table-fk-parent-concurrent-duplicate":
+            self.run_sync_table_fk_parent_concurrent_duplicate()
         elif scenario == "home-feed-card-parent-recovery":
             self.run_home_feed_card_parent_recovery()
         elif scenario == "superseded-release-parent-recovery":
