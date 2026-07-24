@@ -6,6 +6,12 @@ use std::collections::BTreeMap;
 
 pub trait SyncRepairTarget {
     fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError>;
+    fn insert_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        for row in rows {
+            self.insert_row(row)?;
+        }
+        Ok(())
+    }
     fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError>;
     fn update_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
         for row in rows {
@@ -34,7 +40,13 @@ where
     E: crate::target::TargetExecutor,
 {
     fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
-        self.insert_rows(std::slice::from_ref(row))
+        crate::target::TargetMySqlWriter::insert_rows(self, std::slice::from_ref(row))
+            .map_err(|error| TableSyncError::Repair(error.to_string()))
+    }
+
+    fn insert_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        let rows = rows.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
+        crate::target::TargetMySqlWriter::insert_rows(self, &rows)
             .map_err(|error| TableSyncError::Repair(error.to_string()))
     }
 
@@ -71,6 +83,13 @@ impl SyncRepairTarget for MySqlSyncRepairTarget {
     fn insert_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
         self.writer
             .insert_rows(std::slice::from_ref(row))
+            .map_err(|error| TableSyncError::Repair(error.to_string()))
+    }
+
+    fn insert_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        let rows = rows.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
+        self.writer
+            .insert_rows(&rows)
             .map_err(|error| TableSyncError::Repair(error.to_string()))
     }
 
@@ -131,8 +150,11 @@ impl crate::target::TargetMySqlWriter<crate::mysql_client::PersistentTargetExecu
             )?;
             crate::target::TargetMySqlWriter::update_row(self, displaced_source)
                 .map_err(|error| TableSyncError::Repair(error.to_string()))?;
-            self.insert_rows(std::slice::from_ref(missing_source))
-                .map_err(|error| TableSyncError::Repair(error.to_string()))?;
+            crate::target::TargetMySqlWriter::insert_rows(
+                self,
+                std::slice::from_ref(missing_source),
+            )
+            .map_err(|error| TableSyncError::Repair(error.to_string()))?;
             verify_parent_rows(executor, table, displaced_source, missing_source)?;
             let dependencies_after = dependency_fingerprint(
                 executor,

@@ -88,6 +88,37 @@ fn target_connection_config_preserves_target_endpoint() {
 }
 
 #[test]
+fn apply_uses_strict_inserts_so_constraint_failures_are_observable() {
+    let config = SyncTableConfig {
+        source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
+        target: crate::live::TargetMySqlConfig {
+            host: "target".to_string(),
+            port: 25060,
+            user: "target_user".to_string(),
+            password: "secret".to_string(),
+            database: "globalcomix".to_string(),
+            tls_ca_file: "/tmp/custom-target-ca.pem".to_string(),
+            insert_conflict_policy: crate::live::InsertConflictPolicy::IgnoreDuplicate,
+        },
+        table: account_table(),
+        chunk_size: 10,
+        mode: SyncMode::Apply,
+        progress_table: "cdc.table_sync_runs".to_string(),
+        run_id: "strict-insert".to_string(),
+        start_after: None,
+        end_at: None,
+        max_deletes: Some(0),
+        updated_since: None,
+        plan_hash: None,
+    };
+
+    assert_eq!(
+        sync_insert_mode(&config),
+        crate::target::SnapshotInsertMode::Insert
+    );
+}
+
+#[test]
 fn dry_run_reports_repairs_without_applying_them() {
     let source = FakeReader::new(vec![row("1", "alpha"), row("2", "bravo")]);
     let target = FakeReader::new(vec![row("0", "extra"), row("1", "old")]);
@@ -149,6 +180,43 @@ fn apply_repairs_missing_different_and_extra_target_rows() {
     assert_eq!(
         repair_target.deletes.borrow().as_slice(),
         &[vec!["0".to_string()]]
+    );
+}
+
+#[test]
+fn apply_batches_missing_rows_before_checkpointing_the_chunk() {
+    let source = FakeReader::new(vec![row("1", "alpha"), row("2", "bravo")]);
+    let target = FakeReader::new(Vec::new());
+    let mut repair_target = RecordingRepairTarget::default();
+    let mut progress_store = RecordingProgressStore::default();
+
+    let report = sync_table_with_progress_range(
+        &account_table(),
+        SyncRunOptions {
+            run_id: "batched-inserts".to_string(),
+            run_scope: "batched-inserts-scope".to_string(),
+            chunk_size: 10,
+            mode: SyncMode::Apply,
+            start_after: None,
+            end_at: None,
+            max_deletes: Some(0),
+        },
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+    )
+    .expect("sync report");
+
+    assert_eq!(report.inserts, 2);
+    assert_eq!(
+        repair_target.operations.borrow().as_slice(),
+        &["insert-batch:1,2"]
+    );
+    let saved = progress_store.saved.borrow();
+    assert_eq!(
+        saved.last().expect("saved progress").last_primary_key,
+        Some(vec!["2".to_string()])
     );
 }
 

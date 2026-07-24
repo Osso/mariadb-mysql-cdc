@@ -104,6 +104,20 @@ impl SyncRepairTarget for RecordingRepairTarget {
         Ok(())
     }
 
+    fn insert_rows(&mut self, rows: &[&SnapshotRow]) -> Result<(), TableSyncError> {
+        self.inserts
+            .borrow_mut()
+            .extend(rows.iter().map(|row| (*row).clone()));
+        self.operations.borrow_mut().push(format!(
+            "insert-batch:{}",
+            rows.iter()
+                .map(|row| row.primary_key.join(","))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        Ok(())
+    }
+
     fn update_row(&mut self, row: &SnapshotRow) -> Result<(), TableSyncError> {
         self.updates.borrow_mut().push(row.clone());
         self.operations

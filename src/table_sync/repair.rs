@@ -130,12 +130,13 @@ fn repair_missing_rows(
     repair_target: &mut impl SyncRepairTarget,
     report: &mut SyncTableReport,
 ) -> Result<(), TableSyncError> {
-    for (primary_key, source) in source_by_key {
-        if !target_by_key.contains_key(primary_key) {
-            apply_insert(source, mode, repair_target)?;
-            report.inserts += 1;
-        }
-    }
+    let missing_rows = source_by_key
+        .iter()
+        .filter(|(primary_key, _)| !target_by_key.contains_key(*primary_key))
+        .map(|(_, source)| *source)
+        .collect::<Vec<_>>();
+    apply_inserts(&missing_rows, mode, repair_target)?;
+    report.inserts += missing_rows.len() as u64;
     Ok(())
 }
 
@@ -187,13 +188,13 @@ pub(crate) fn ensure_delete_allowed(
     Ok(())
 }
 
-fn apply_insert(
-    row: &SnapshotRow,
+fn apply_inserts(
+    rows: &[&SnapshotRow],
     mode: SyncMode,
     repair_target: &mut impl SyncRepairTarget,
 ) -> Result<(), TableSyncError> {
-    if mode != SyncMode::DryRun {
-        repair_target.insert_row(row)?;
+    if mode != SyncMode::DryRun && !rows.is_empty() {
+        repair_target.insert_rows(rows)?;
     }
     Ok(())
 }

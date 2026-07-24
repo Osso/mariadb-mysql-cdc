@@ -153,12 +153,10 @@ pub(crate) fn validate_sync_table_config(config: &SyncTableConfig) -> Result<(),
 }
 
 pub(crate) fn sync_insert_mode(config: &SyncTableConfig) -> crate::target::SnapshotInsertMode {
-    if config.mode == SyncMode::MissingPrimaryKeys {
-        crate::target::SnapshotInsertMode::Insert
-    } else if config.updated_since.is_some() {
+    if config.updated_since.is_some() {
         crate::target::SnapshotInsertMode::Upsert
     } else {
-        crate::target::SnapshotInsertMode::IgnoreDuplicate
+        crate::target::SnapshotInsertMode::Insert
     }
 }
 
