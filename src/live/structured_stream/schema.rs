@@ -52,7 +52,7 @@ impl TableSchemaResolver for TargetInventorySchemaResolver {
         &self,
         schema: &str,
         table: &str,
-        column_count: usize,
+        _column_count: usize,
     ) -> Result<ResolvedTableSchema, ApplyBinlogError> {
         self.ensure_schema_inventory(schema)?;
         let inventories = self.inventories.borrow();
@@ -64,7 +64,7 @@ impl TableSchemaResolver for TargetInventorySchemaResolver {
             .iter()
             .find(|candidate| candidate.name == table)
             .ok_or_else(|| mapping_error(format!("source table {schema}.{table} was not found")))?;
-        build_inventory_table_schema(schema, table, column_count)
+        build_inventory_table_schema(table)
     }
 
     fn invalidate_schema(&self, schema: &str) {
@@ -163,26 +163,21 @@ fn resolved_table_schema(
 }
 
 fn build_inventory_table_schema(
-    schema: &str,
     table: &TableInventory,
-    column_count: usize,
 ) -> Result<ResolvedTableSchema, ApplyBinlogError> {
     let columns: Vec<String> = table
         .columns
         .iter()
         .map(|column| column.name.clone())
         .collect();
-    // Deliberately NOT tolerant of a count mismatch. Taking the leading `column_count` target
-    // columns only aligns when the missing columns were appended. This source inserts columns
-    // mid-table - home_feed_rss_articles gained image_width/image_height at positions 7 and 8 -
-    // so the leading slice shifts every later value into the wrong column. MySQL caught one such
-    // write only because an excerpt landed in an integer column; where the types line up it would
-    // corrupt silently. Fail closed and let the count check below reject the event.
+    // Never map by position across a count mismatch: this source adds columns mid-table
+    // (home_feed_rss_articles gained image_width/image_height at 7 and 8), so a leading slice
+    // shifts every later value into the wrong column. MySQL caught one such write only because an
+    // excerpt landed in an integer column; where the types agree it would corrupt silently.
     let generated_columns = generated_column_names(table);
     let signed_columns = signed_column_names(table);
     let enum_columns = enum_column_values(table);
     let set_columns = set_column_values(table);
-    validate_column_count(schema, &table.name, column_count, &columns)?;
     Ok(ResolvedTableSchema {
         columns,
         primary_key: table.primary_key.clone(),
@@ -307,12 +302,24 @@ pub(super) fn map_table_map_event<R>(
     coordinate: &BinlogCoordinate,
     table_map: &MysqlCdcTableMapEvent,
     schema_resolver: &R,
-) -> Result<TableMapEvent, ApplyBinlogError>
+) -> Result<Option<TableMapEvent>, ApplyBinlogError>
 where
     R: TableSchemaResolver,
 {
     let schema = resolve_table_schema(table_map, schema_resolver)?;
-    Ok(TableMapEvent {
+    if !column_count_matches(table_map.column_types.len(), &schema.columns) {
+        eprintln!(
+            "cdc_row_event_schema_skipped schema={} table={} target_columns={} event_columns={} coordinate={}:{} reason=column_count_mismatch",
+            table_map.database_name,
+            table_map.table_name,
+            schema.columns.len(),
+            table_map.column_types.len(),
+            coordinate.file,
+            coordinate.position
+        );
+        return Ok(None);
+    }
+    Ok(Some(TableMapEvent {
         coordinate: coordinate.clone(),
         table: RowTableMap {
             table_id: table_map.table_id,
@@ -325,7 +332,7 @@ where
             enum_columns: schema.enum_columns,
             set_columns: schema.set_columns,
         },
-    })
+    }))
 }
 
 pub(super) fn enum_columns_from_metadata(
@@ -486,6 +493,16 @@ pub(super) fn primary_key_column(
         .ok_or_else(|| mapping_error(format!("primary key column index {index} is out of range")))
 }
 
+/// Reports whether the resolved column list can carry the row event's values.
+///
+/// A mismatch is not an error: the event describes the table as it was when written, and this
+/// source adds columns mid-table, so there is no position-based mapping and the binlog carries no
+/// column names (`binlog_row_metadata=NO_LOG`). The caller skips the table instead, and a later
+/// full data sync supplies the rows.
+pub(super) fn column_count_matches(expected: usize, columns: &[String]) -> bool {
+    columns.len() == expected
+}
+
 pub(super) fn validate_column_count(
     schema: &str,
     table: &str,
@@ -505,71 +522,26 @@ pub(super) fn validate_column_count(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inventory::{ColumnInventory, TableInventory};
 
-    fn column(name: &str) -> ColumnInventory {
-        ColumnInventory {
-            name: name.to_string(),
-            ordinal_position: 0,
-            column_type: "bigint".to_string(),
-            data_type: "bigint".to_string(),
-            is_nullable: true,
-            character_set: None,
-            collation: None,
-            default_value: None,
-            extra: String::new(),
-            comment: String::new(),
-            generated: None,
-        }
-    }
-
-    fn table(names: &[&str]) -> TableInventory {
-        TableInventory {
-            name: "users_profiles".to_string(),
-            table_type: "BASE TABLE".to_string(),
-            engine: Some("InnoDB".to_string()),
-            collation: Some("utf8mb4_0900_ai_ci".to_string()),
-            primary_key: vec!["user_id".to_string()],
-            columns: names.iter().map(|name| column(name)).collect(),
-        }
-    }
-
-    /// A count mismatch must fail closed in BOTH directions. Mapping the event onto the leading
-    /// target columns silently shifts every value when the absent columns were inserted mid-table,
-    /// which this source does.
+    /// The count decision is the only thing standing between a historical event and a misaligned
+    /// write, because the binlog carries no column names to map by. It must reject in BOTH
+    /// directions rather than mapping by position.
     #[test]
-    fn a_target_with_extra_columns_fails_rather_than_shifting_values() {
-        let converged = table(&[
+    fn a_column_count_mismatch_is_never_mapped_by_position() {
+        let converged = [
             "user_id",
             "bio",
             "app_next_eligible",
             "app_next_opted_out_at",
-        ]);
+        ]
+        .map(str::to_string)
+        .to_vec();
 
-        let error = build_inventory_table_schema("globalcomix", &converged, 2)
-            .expect_err("a count mismatch cannot be resolved by position");
-
-        assert!(
-            error
-                .to_string()
-                .contains("has 4 columns but row event table map has 2"),
-            "{error}"
-        );
-    }
-
-    /// The opposite direction has nowhere to put the event's values and must still fail.
-    #[test]
-    fn a_target_missing_columns_the_event_carries_still_fails() {
-        let behind = table(&["user_id", "bio"]);
-
-        let error = build_inventory_table_schema("globalcomix", &behind, 4)
-            .expect_err("a target with fewer columns cannot map the event");
-
-        assert!(
-            error
-                .to_string()
-                .contains("has 2 columns but row event table map has 4"),
-            "{error}"
-        );
+        // Target gained columns since the event was written.
+        assert!(!column_count_matches(2, &converged));
+        // Event carries more than the target knows.
+        assert!(!column_count_matches(6, &converged));
+        // Only an exact agreement maps.
+        assert!(column_count_matches(4, &converged));
     }
 }

@@ -39,7 +39,8 @@ fn metadata_table_map_supplies_column_names_and_primary_keys() {
     };
 
     let mapped = map_table_map_event(&stream_coordinate(100), &table_map, &resolver)
-        .expect("map table metadata");
+        .expect("map table metadata")
+        .expect("column counts agree, so the table map is mapped rather than skipped");
 
     assert_eq!(mapped.table.table_id, 77);
     assert_eq!(mapped.table.columns, vec!["id", "name"]);
@@ -73,7 +74,8 @@ fn metadata_table_map_uses_inventory_enum_values_when_metadata_omits_them() {
     };
 
     let mapped = map_table_map_event(&stream_coordinate(100), &table_map, &resolver)
-        .expect("map table metadata");
+        .expect("map table metadata")
+        .expect("column counts agree, so the table map is mapped rather than skipped");
 
     assert_eq!(
         mapped.table.enum_columns.get("public_time_delta"),
@@ -112,7 +114,8 @@ fn production_string_set_metadata_drives_equality_and_preserves_divergence() {
     };
 
     let mapped = map_table_map_event(&stream_coordinate(100), &table_map, &resolver)
-        .expect("map production-shaped SET metadata");
+        .expect("map production-shaped SET metadata")
+        .expect("column counts agree, so the table map is mapped rather than skipped");
     let set_columns = mapped
         .table
         .columns
@@ -179,7 +182,8 @@ fn metadata_table_map_supplies_set_member_names_for_duplicate_comparison() {
     };
 
     let mapped = map_table_map_event(&stream_coordinate(100), &table_map, &resolver)
-        .expect("map SET metadata");
+        .expect("map SET metadata")
+        .expect("column counts agree, so the table map is mapped rather than skipped");
 
     assert_eq!(
         mapped.table.set_columns.get("labels"),

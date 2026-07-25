@@ -17,7 +17,13 @@ where
     }
 
     state.apply_table_id(table_map.table_id);
-    let event = map_table_map_event(coordinate, table_map, schema_resolver)?;
+    // A table whose event shape cannot be mapped is ignored for as long as this table map stands,
+    // so its row events are skipped instead of stopping the stream. A later full data sync supplies
+    // those rows; the skip is logged per table map with both column counts.
+    let Some(event) = map_table_map_event(coordinate, table_map, schema_resolver)? else {
+        state.ignore_table_id(table_map.table_id);
+        return Ok(EventPolicy::Ignore);
+    };
     applier.apply_table_map(event);
     Ok(EventPolicy::ApplyTableMap)
 }

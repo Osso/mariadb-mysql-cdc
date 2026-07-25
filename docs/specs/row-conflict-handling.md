@@ -7,6 +7,13 @@ conflicting secondary key. Implementation detail for superseded release proofs:
 
 ## Current behavior
 
+- [x] Skip a row event whose table map column count does not match the resolved schema, recording
+      the table, both counts, and the coordinate as `cdc_row_event_schema_skipped`. The event
+      describes the table as it was when written, this source adds columns mid-table, and
+      `binlog_row_metadata` is `NO_LOG`, so no column names exist to map by; mapping the values onto
+      the leading columns shifts every later value into the wrong column. The table map is ignored
+      for as long as it stands, so its row events are skipped rather than stopping the stream, and a
+      later full data sync supplies those rows.
 - [x] Build plain `INSERT` statements with the explicit source primary key.
 - [x] Never use `ON DUPLICATE KEY UPDATE` for source inserts.
 - [x] Classify native ROW `1062` as durable repair debt unless
