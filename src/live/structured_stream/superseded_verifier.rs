@@ -416,7 +416,9 @@ fn validate_exact_release_scope(
     }
     let parent_key = [ReleaseParentKey::Category, ReleaseParentKey::Visibility]
         .into_iter()
-        .find(|parent_key| release_recovery_boundary_matches(observation, xid_end_position, *parent_key))
+        .find(|parent_key| {
+            release_recovery_boundary_matches(observation, xid_end_position, *parent_key)
+        })
         .ok_or_else(|| {
             "superseded release insert rejected: requires an approved exact production transaction \
              and FK identity"
