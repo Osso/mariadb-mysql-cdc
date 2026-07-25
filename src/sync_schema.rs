@@ -484,7 +484,8 @@ fn plan_table(
     };
 
     if source_table.engine != target_table.engine
-        || source_table.collation != target_table.collation
+        || source_table.collation.as_deref().map(canonical_collation)
+            != target_table.collation.as_deref().map(canonical_collation)
     {
         plan.statements
             .push(modeled_table_options_statement(source_table)?);
@@ -3557,6 +3558,35 @@ mod tests {
 
         assert!(columns_equal(&source, &converged));
         assert!(!columns_equal(&source, &unconverged));
+    }
+
+    /// A converged run must plan nothing on the next run.
+    #[test]
+    fn a_uca1400_table_collation_plans_no_repeated_table_options() {
+        let mut source_table = table("items", vec![column("id", "bigint", false)], vec!["id"]);
+        source_table.collation = Some("utf8mb4_uca1400_ai_ci".to_string());
+        let source = inventory(vec![source_table.clone()], vec![]);
+        let mut target_table = source_table;
+        target_table.collation = Some("utf8mb4_0900_ai_ci".to_string());
+        let target = inventory(vec![target_table], vec![]);
+
+        let plan = plan_schema_convergence(
+            &source,
+            &target,
+            &["items".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("schema plan");
+
+        assert!(
+            plan.tables[0].statements.is_empty(),
+            "{:?}",
+            plan.tables[0]
+                .statements
+                .iter()
+                .map(|statement| statement.sql.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// A qualified name sorts elsewhere than the source name it replaced, so the grouped lists
