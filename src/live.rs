@@ -12,7 +12,9 @@ mod binlog_command;
 mod ddl_event;
 mod ddl_replay_journal;
 pub(crate) mod ddl_semantics;
+mod foreign_key_error;
 mod insert_conflict;
+mod missing_parent;
 mod mysql_cli;
 mod progress;
 mod reconnect;
@@ -24,9 +26,13 @@ mod structured_stream;
 #[cfg(test)]
 use crate::target::{SqlStatement, TargetExecuteError};
 use binlog_command::read_remote_binlog;
+pub(crate) use foreign_key_error::{ForeignKeyViolation, parse_foreign_key_violation};
 pub(crate) use insert_conflict::should_replace_divergent_primary;
 pub use insert_conflict::{
     InsertConflictPolicy, should_ignore_duplicate_insert, should_ignore_duplicate_row_change,
+};
+pub(crate) use missing_parent::{
+    MissingParentInput, MissingParentPlan, plan_missing_parent_recovery,
 };
 pub use mysql_cli::MysqlCliExecutor;
 #[cfg(test)]

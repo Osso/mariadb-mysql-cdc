@@ -43,7 +43,33 @@ pub(super) trait SupersededInsertVerifier {
         &mut self,
         candidate: &crate::row::DeferredSupersededInsertCandidate,
         xid_end_position: u64,
-    ) -> Result<super::superseded_insert::SupersededInsertProof, String>;
+    ) -> Result<DeferredRepair, String>;
+}
+
+/// What a deferred conflict resolved to, and the statements that carry it out inside the applying
+/// transaction.
+pub(super) enum DeferredRepair {
+    /// A duplicate-key conflict whose historical row was superseded on the source.
+    Superseded(super::superseded_insert::SupersededInsertProof),
+    /// A foreign-key conflict resolved from the locked parent image.
+    ForeignKey(super::foreign_key_repair::ForeignKeyRepairProof),
+}
+
+impl DeferredRepair {
+    pub(super) fn resolution_evidence(&self) -> String {
+        match self {
+            Self::Superseded(proof) => proof.resolution_evidence(),
+            Self::ForeignKey(proof) => proof.evidence.clone(),
+        }
+    }
+
+    /// Statements to apply before the transaction commits, in order.
+    pub(super) fn statements(&self) -> Vec<crate::target::SqlStatement> {
+        match self {
+            Self::Superseded(proof) => proof.current_row_install.clone().into_iter().collect(),
+            Self::ForeignKey(proof) => proof.statements.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -319,9 +345,9 @@ impl TargetTransaction {
             .verify(&candidate, context.xid_end_position)
             .map_err(superseded_verification_error)?;
         let evidence = proof.resolution_evidence();
-        if let Some(statement) = &proof.current_row_install {
+        for statement in proof.statements() {
             executor
-                .execute(statement)
+                .execute(&statement)
                 .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         }
         let checkpoint = crate::checkpoint::Checkpoint {
@@ -495,21 +521,6 @@ where
     Err(ApplyBinlogError::Target(context))
 }
 
-const RELEASES_CATEGORY_EVENT_POSITION: u64 = 515_816_736;
-const RELEASES_CATEGORY_CHECKPOINT_POSITION: u64 = 515_816_517;
-const RELEASES_VISIBILITY_EVENT_POSITION: u64 = 531_921_789;
-const RELEASES_VISIBILITY_CHECKPOINT_POSITION: u64 = 531_921_570;
-
-fn expected_release_checkpoint_predecessor(
-    candidate: &crate::row::DeferredSupersededInsertCandidate,
-) -> Option<u64> {
-    match candidate.observation.coordinate.start_position {
-        RELEASES_CATEGORY_EVENT_POSITION => Some(RELEASES_CATEGORY_CHECKPOINT_POSITION),
-        RELEASES_VISIBILITY_EVENT_POSITION => Some(RELEASES_VISIBILITY_CHECKPOINT_POSITION),
-        _ => None,
-    }
-}
-
 fn validate_superseded_checkpoint_predecessor(
     current: Option<&crate::checkpoint::Checkpoint>,
     candidate: &crate::row::DeferredSupersededInsertCandidate,
@@ -527,21 +538,6 @@ fn validate_superseded_checkpoint_predecessor(
             "superseded checkpoint predecessor file mismatch: expected {expected_file}, locked {}",
             current.source_file
         )));
-    }
-    if candidate.observation.table == "releases" {
-        let expected_position =
-            expected_release_checkpoint_predecessor(candidate).ok_or_else(|| {
-                ApplyBinlogError::Checkpoint(format!(
-                    "superseded release recovery has no approved checkpoint predecessor for {}:{}",
-                    expected_file, candidate.observation.coordinate.start_position
-                ))
-            })?;
-        if current.source_position != expected_position {
-            return Err(ApplyBinlogError::Checkpoint(format!(
-                "superseded release recovery requires exact checkpoint predecessor {expected_file}:{expected_position}, locked {}:{}",
-                current.source_file, current.source_position
-            )));
-        }
     }
     if current.source_position > xid_end_position {
         return Err(ApplyBinlogError::Checkpoint(format!(

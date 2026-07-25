@@ -500,6 +500,69 @@ pub(crate) fn build_locked_identity_evidence_sql(
     ))
 }
 
+/// Builds the locked read that both foreign-key recovery classes decide on.
+///
+/// The predicate uses only the parent's primary key columns, never the full referenced tuple: a
+/// superseded parent attribute means the historical tuple matches nothing, and selecting by it could
+/// not tell that case apart from a parent that is genuinely absent. `FOR UPDATE` holds the parent
+/// still so the decision and the write that follows see one image.
+pub(crate) fn build_locked_parent_identity_sql(
+    schema: &str,
+    parent_table: &str,
+    referenced_columns: &[String],
+    predicate_columns: &[String],
+) -> Result<String, TargetExecuteError> {
+    if referenced_columns.is_empty() {
+        return Err(TargetExecuteError::new(format!(
+            "{schema}.{parent_table} foreign key names no referenced columns"
+        )));
+    }
+    if predicate_columns.is_empty() {
+        return Err(TargetExecuteError::new(format!(
+            "{schema}.{parent_table} has no primary key to lock a parent by"
+        )));
+    }
+    for identifier in [schema, parent_table] {
+        validate_locked_parent_identifier(identifier)?;
+    }
+    for identifier in referenced_columns.iter().chain(predicate_columns) {
+        validate_locked_parent_identifier(identifier)?;
+    }
+    let selected = referenced_columns
+        .iter()
+        .map(|column| crate::mysql_support::quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let predicates = predicate_columns
+        .iter()
+        .map(|column| format!("{} = ?", crate::mysql_support::quote_ident(column)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let order_by = predicate_columns
+        .iter()
+        .map(|column| crate::mysql_support::quote_ident(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "SELECT {selected} FROM {}.{} WHERE {predicates} ORDER BY {order_by} LIMIT 2 FOR UPDATE",
+        crate::mysql_support::quote_ident(schema),
+        crate::mysql_support::quote_ident(parent_table),
+    ))
+}
+
+fn validate_locked_parent_identifier(identifier: &str) -> Result<(), TargetExecuteError> {
+    let valid = !identifier.is_empty()
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if valid {
+        return Ok(());
+    }
+    Err(TargetExecuteError::new(format!(
+        "invalid locked parent identifier: {identifier}"
+    )))
+}
+
 fn build_locked_users_evidence(
     columns: Vec<String>,
     rows: Result<Vec<Vec<mysql::Value>>, TargetExecuteError>,
@@ -635,6 +698,34 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
             .map(mysql::Row::unwrap)
             .collect();
         build_locked_users_evidence(columns, Ok(rows))
+    }
+
+    fn read_locked_parent_identity(
+        &self,
+        schema: &str,
+        parent_table: &str,
+        referenced_columns: &[String],
+        parent_primary_key: &[(String, mysql::Value)],
+    ) -> Result<Vec<Vec<mysql::Value>>, TargetExecuteError> {
+        let predicate_columns = parent_primary_key
+            .iter()
+            .map(|(column, _)| column.clone())
+            .collect::<Vec<_>>();
+        let sql = build_locked_parent_identity_sql(
+            schema,
+            parent_table,
+            referenced_columns,
+            &predicate_columns,
+        )?;
+        let params = parent_primary_key
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let rows = self.with_connection(|conn| {
+            conn.exec::<mysql::Row, _, _>(&sql, Params::Positional(params.clone()))
+                .map_err(target_query_error)
+        })?;
+        Ok(rows.into_iter().map(mysql::Row::unwrap).collect())
     }
 
     fn read_locked_release_supersession_evidence(

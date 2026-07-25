@@ -112,7 +112,7 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       transport budget, so
       repeated parent-recovery failures can exceed `max-reconnects`. Successful
       replay resolves the matching evidence row.
-- [x] For the exact automatic parent-recovery cases, a persisted `1452` on
+- [x] For the two out-of-transaction parent-recovery cases, a persisted `1452` on
       `globalcomix.sessions` naming `fk_sessions_guest` must carry non-empty
       `session_id`, `guest_id`, and `guest_hash`; source `guests` must contain
       exactly one matching row. A persisted `1452` on
@@ -123,6 +123,33 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       while divergent, colliding, or ambiguous state fails closed. Recovery
       never updates or deletes a parent and never advances the stream checkpoint;
       only the subsequent successful replay can do that.
+- [x] Every other `1452` is resolved inside the applying transaction, from one
+      locked read of the parent taken under `FOR UPDATE`. The constraint identity
+      comes from the error text, which names the child table, the constraint, the
+      child columns, the parent table, and the referenced columns; only the
+      parent's primary key is read from the schema inventory, because the error
+      never states it. The locked read selects by that primary key alone, never by
+      the full referenced tuple, so an absent parent is distinguishable from a
+      parent whose referenced attribute has moved on.
+- [x] An empty locked read is the missing-parent class: install the exact current
+      source parent row, then replay the child image unchanged. Source state must
+      hold exactly one complete parent owning the referenced identity; absent,
+      ambiguous, or mismatched source state fails closed. This class is not gated
+      on parent `create_time`, because a generic parent table is not guaranteed to
+      have that column.
+- [x] A single locked row whose referenced non-key columns differ is the
+      superseded-attribute class: replay the child image with only those derived
+      columns fast-forwarded to the locked parent's values, keeping every other
+      child column historical. Those columns are maintained by
+      `ON UPDATE CASCADE`, so the next replayed parent update writes the same
+      values. The referenced primary key columns must match exactly; more than one
+      locked row, a shape that disagrees with the error, or no drift at all fails
+      closed.
+- [x] Neither in-transaction class updates or deletes a parent row, and a rejected
+      resolution is an ordinary durable conflict: roll back, persist evidence, and
+      retry from the unchanged checkpoint. Rejection messages carry the
+      `superseded ... insert rejected:` marker, because the stream classifies
+      fatal against retryable by that prefix.
 - [x] Emit parseable `cdc_row_conflict_skipped` output with operation, table,
       source coordinate, and source primary key.
 - [x] Replay the same source event into the same identity and increment its
@@ -209,6 +236,11 @@ source-transaction end coordinates, rolls back the target transaction, then
 persists the unresolved observations through the independent durable ledger
 before returning the row failure. The failed transaction and later coordinates
 are not checkpointed, while the independently persisted evidence survives.
+The reconnect loop below covers only the two pinned constraints. Any other
+foreign-key conflict never reaches it: it is deferred and resolved inside the
+applying transaction under the parent lock, so it carries no reconnect recovery
+request and cannot retry outside the transport budget.
+
 For each exact parent-recovery identity, the reconnect loop first verifies that
 exact-parent retry is enabled and the error is retryable, then performs strict
 source/target parent validation after rollback and durable ledger persistence. A

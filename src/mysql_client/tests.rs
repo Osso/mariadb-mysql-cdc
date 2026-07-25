@@ -275,6 +275,71 @@ fn locked_users_evidence_sql_uses_complete_ordered_columns_parameters_and_row_lo
     assert_eq!(sql.matches('?').count(), 2);
 }
 
+/// A multi-column foreign key on `comics -> artists(id, name)`: the lock must select by `id` alone,
+/// because the superseded `name` is exactly what no longer matches.
+#[test]
+fn locked_parent_identity_sql_selects_referenced_columns_by_primary_key_only() {
+    let sql = build_locked_parent_identity_sql(
+        "globalcomix",
+        "artists",
+        &["id".to_string(), "name".to_string()],
+        &["id".to_string()],
+    )
+    .expect("locked parent identity SQL");
+
+    assert_eq!(
+        sql,
+        "SELECT `id`, `name` FROM `globalcomix`.`artists` WHERE `id` = ? ORDER BY `id` LIMIT 2 FOR UPDATE"
+    );
+    assert_eq!(sql.matches('?').count(), 1);
+}
+
+#[test]
+fn locked_parent_identity_sql_supports_a_composite_primary_key() {
+    let sql = build_locked_parent_identity_sql(
+        "globalcomix",
+        "guests",
+        &["guest_id".to_string(), "guest_hash".to_string()],
+        &["guest_id".to_string(), "guest_hash".to_string()],
+    )
+    .expect("locked parent identity SQL");
+
+    assert!(
+        sql.contains("WHERE `guest_id` = ? AND `guest_hash` = ?"),
+        "{sql}"
+    );
+    assert!(sql.ends_with("FOR UPDATE"), "{sql}");
+}
+
+#[test]
+fn locked_parent_identity_sql_rejects_an_unsafe_identifier() {
+    let error = build_locked_parent_identity_sql(
+        "globalcomix",
+        "artists`; DROP TABLE users; --",
+        &["id".to_string()],
+        &["id".to_string()],
+    )
+    .expect_err("unsafe identifier must fail");
+
+    assert!(
+        error.to_string().contains("invalid locked parent"),
+        "{error}"
+    );
+}
+
+#[test]
+fn locked_parent_identity_sql_rejects_missing_columns_or_primary_key() {
+    let no_columns =
+        build_locked_parent_identity_sql("globalcomix", "artists", &[], &["id".to_string()])
+            .expect_err("no referenced columns must fail");
+    assert!(no_columns.to_string().contains("no referenced columns"));
+
+    let no_primary_key =
+        build_locked_parent_identity_sql("globalcomix", "artists", &["id".to_string()], &[])
+            .expect_err("no primary key must fail");
+    assert!(no_primary_key.to_string().contains("no primary key"));
+}
+
 #[test]
 fn locked_users_evidence_query_failure_is_explicit() {
     let error = build_locked_users_evidence(

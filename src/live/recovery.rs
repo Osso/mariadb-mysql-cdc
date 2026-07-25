@@ -82,10 +82,10 @@ impl ExactParentRecovery {
         }
     }
 
-    pub(crate) fn child_primary_key(&self) -> &str {
+    pub(crate) fn child_primary_key(&self) -> String {
         match self {
-            Self::SessionsGuest(request) => &request.session_id,
-            Self::HomeFeedCard(request) => &request.slide_id,
+            Self::SessionsGuest(request) => request.session_id.clone(),
+            Self::HomeFeedCard(request) => request.slide_id.clone(),
         }
     }
 

@@ -141,7 +141,6 @@ pub(crate) fn reconcile_exact_parent(
     };
     reconcile_loaded_exact_parent(request, &source_rows, &target_rows, repair_target)
 }
-
 pub(crate) fn reconcile_exact_parent_live(
     config: &crate::live::ApplyBinlogConfig,
     request: &crate::live::ExactParentRecovery,
@@ -158,7 +157,93 @@ pub(crate) fn reconcile_exact_parent_live(
     let mut repair_target = connect_mysql_recovery_target(&sync_config)?;
     reconcile_exact_parent(request, &source, &target, &mut repair_target)
 }
+/// Reads the parent's columns and primary key from the source schema inventory, because a generic
+/// parent table cannot have them enumerated in code.
+pub(crate) fn read_parent_table_inventory(
+    source: &crate::mysql_snapshot::MySqlConnectionConfig,
+    schema: &str,
+    table: &str,
+) -> Result<crate::inventory::TableInventory, TableSyncError> {
+    let reader = MariaDbInventoryReader::new(InventoryConfig {
+        host: source.host.clone(),
+        port: source.port,
+        user: source.user.clone(),
+        password: source.password.clone(),
+        endpoint_role: InventoryEndpointRole::Source,
+        use_tls: false,
+        tls_ca_file: None,
+        ..InventoryConfig::default()
+    });
+    let inventory = build_inventory(schema, &reader)
+        .map_err(|error| TableSyncError::Read(error.to_string()))?;
+    let parent = inventory
+        .tables
+        .into_iter()
+        .find(|candidate| candidate.name == table)
+        .ok_or_else(|| {
+            TableSyncError::Repair(format!(
+                "parent table `{schema}`.`{table}` is absent from the source inventory"
+            ))
+        })?;
+    if parent.primary_key.is_empty() {
+        return Err(TableSyncError::Repair(format!(
+            "parent table `{schema}`.`{table}` has no primary key"
+        )));
+    }
+    Ok(parent)
+}
 
+/// Reads the one source parent row owning a referenced foreign-key identity, for in-transaction
+/// recovery of an absent parent.
+///
+/// The target side is not consulted: the caller has already proved under lock that the identity is
+/// absent there. Everything else stays the planner's decision, so an ambiguous or incomplete source
+/// parent still fails closed.
+pub(crate) fn read_exact_source_parent_row(
+    source: &crate::mysql_snapshot::MySqlConnectionConfig,
+    violation: &crate::live::ForeignKeyViolation,
+    child_foreign_key_values: &[Option<String>],
+) -> Result<
+    (
+        crate::inventory::TableInventory,
+        crate::snapshot::SnapshotRow,
+    ),
+    TableSyncError,
+> {
+    let schema = violation
+        .parent_schema
+        .clone()
+        .unwrap_or_else(|| violation.child_schema.clone());
+    let parent = read_parent_table_inventory(source, &schema, &violation.parent_table)?;
+    let reader = MySqlSyncReader::new(crate::mysql_snapshot::MySqlConnectionConfig {
+        database: schema.clone(),
+        ..source.clone()
+    })
+    .with_recovery_utc();
+    let source_rows = reader.read_parent_identity_rows(
+        &parent,
+        &violation.parent_columns,
+        child_foreign_key_values,
+    )?;
+    let plan = crate::live::plan_missing_parent_recovery(&crate::live::MissingParentInput {
+        violation,
+        child_foreign_key_values,
+        source_parent_rows: &source_rows,
+        target_parent_rows: &[],
+    })
+    .map_err(|rejection| {
+        TableSyncError::Repair(format!(
+            "missing parent recovery rejected for constraint {}: {rejection}",
+            violation.constraint
+        ))
+    })?;
+    match plan {
+        crate::live::MissingParentPlan::InsertParent(row) => Ok((parent, row)),
+        crate::live::MissingParentPlan::AlreadyReconciled => Err(TableSyncError::Repair(
+            "locked parent was absent but the planner reported it reconciled".to_string(),
+        )),
+    }
+}
 pub(crate) fn reconcile_loaded_exact_parent(
     request: &crate::live::ExactParentRecovery,
     source_rows: &[crate::snapshot::SnapshotRow],
@@ -281,7 +366,6 @@ fn plan_loaded_sessions_guest(
     }
     Ok(GuestReconciliation::Existing)
 }
-
 fn plan_loaded_home_feed_card(
     source_row: &crate::snapshot::SnapshotRow,
     target_rows: &[crate::snapshot::SnapshotRow],
