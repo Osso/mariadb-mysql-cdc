@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-const MAX_CATALOG_CONCURRENCY: usize = 4;
+const MAX_CATALOG_CONCURRENCY: usize = 8;
 const DEFAULT_CHUNK_SIZE: usize = 10_000;
 const DB_TIMEOUT: Duration = Duration::from_secs(30);
 const RESERVATION_SESSION_WAIT_TIMEOUT_SECONDS: u64 = 86_400;
@@ -2641,10 +2641,16 @@ mod tests {
     }
 
     #[test]
+    /// Expressed against the configured cap so raising it does not silently invalidate the test.
     fn admission_counts_legacy_run_locks_and_new_slot_reservations() {
-        assert!(!admission_has_capacity(1, 3, 0));
-        assert!(!admission_has_capacity(0, 3, 4));
-        assert!(admission_has_capacity(1, 2, 3));
+        let cap = MAX_CATALOG_CONCURRENCY;
+        // Legacy run locks and slot reservations share one budget.
+        assert!(!admission_has_capacity(1, cap - 1, 0));
+        assert!(!admission_has_capacity(cap, 0, 0));
+        // An externally observed active run consumes capacity on its own.
+        assert!(!admission_has_capacity(0, 0, cap));
+        // One below the cap on every counter still admits.
+        assert!(admission_has_capacity(1, cap - 2, cap - 1));
     }
 
     #[test]
