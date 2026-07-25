@@ -1428,6 +1428,8 @@ fn check_constraint_query(
     format!("{columns_and_from} {predicate}{scope} {order}")
 }
 
+/// Groups by table in a stable order. Qualifying a reused name moves it in the endpoint's own
+/// ordering, so comparison must not depend on the order the endpoint reported.
 fn checks_by_table(checks: &[CheckConstraint]) -> BTreeMap<String, Vec<CheckConstraint>> {
     let mut grouped = BTreeMap::<String, Vec<CheckConstraint>>::new();
     for check in checks {
@@ -1435,6 +1437,9 @@ fn checks_by_table(checks: &[CheckConstraint]) -> BTreeMap<String, Vec<CheckCons
             .entry(check.table.clone())
             .or_default()
             .push(check.clone());
+    }
+    for table_checks in grouped.values_mut() {
+        table_checks.sort();
     }
     grouped
 }
@@ -3552,6 +3557,36 @@ mod tests {
 
         assert!(columns_equal(&source, &converged));
         assert!(!columns_equal(&source, &unconverged));
+    }
+
+    /// A qualified name sorts elsewhere than the source name it replaced, so the grouped lists
+    /// must compare equal regardless of the order each endpoint reported.
+    #[test]
+    fn grouped_check_constraints_compare_independently_of_report_order() {
+        let check = |table: &str, name: &str, column: &str| CheckConstraint {
+            table: table.to_string(),
+            name: name.to_string(),
+            clause: format!("json_valid(`{column}`)"),
+        };
+        let source = vec![
+            check("home_feed_bakes", "config", "config"),
+            check("home_feed_bakes", "editorial_chat", "editorial_chat"),
+            check("home_feed_bakes", "slot_list", "slot_list"),
+            check("home_feed_variants", "config", "config"),
+        ];
+        let target = vec![
+            check("home_feed_bakes", "editorial_chat", "editorial_chat"),
+            check("home_feed_bakes", "home_feed_bakes_config", "config"),
+            check("home_feed_bakes", "slot_list", "slot_list"),
+        ];
+
+        let expected = checks_by_table(&target_check_constraints(&source));
+        let observed = checks_by_table(&target);
+
+        assert_eq!(
+            expected.get("home_feed_bakes"),
+            observed.get("home_feed_bakes")
+        );
     }
 
     #[test]
