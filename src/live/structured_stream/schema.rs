@@ -167,11 +167,19 @@ fn build_inventory_table_schema(
     table: &TableInventory,
     column_count: usize,
 ) -> Result<ResolvedTableSchema, ApplyBinlogError> {
-    let columns: Vec<String> = table
+    let mut columns: Vec<String> = table
         .columns
         .iter()
         .map(|column| column.name.clone())
         .collect();
+    // A row event carries the columns the source had when it was written. The target may already
+    // carry extra columns after those, because schema convergence runs ahead of a lagging stream.
+    // Map the event's values onto the leading columns and leave the rest to their defaults, which
+    // is what MySQL replication itself permits. A target with FEWER columns than the event still
+    // fails the count check below, because those values would have nowhere to go.
+    if columns.len() > column_count {
+        columns.truncate(column_count);
+    }
     let generated_columns = generated_column_names(table);
     let signed_columns = signed_column_names(table);
     let enum_columns = enum_column_values(table);
@@ -494,4 +502,71 @@ pub(super) fn validate_column_count(
         "schema for {schema}.{table} has {} columns but row event table map has {expected}",
         columns.len()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::{ColumnInventory, TableInventory};
+
+    fn column(name: &str) -> ColumnInventory {
+        ColumnInventory {
+            name: name.to_string(),
+            ordinal_position: 0,
+            column_type: "bigint".to_string(),
+            data_type: "bigint".to_string(),
+            is_nullable: true,
+            character_set: None,
+            collation: None,
+            default_value: None,
+            extra: String::new(),
+            comment: String::new(),
+            generated: None,
+        }
+    }
+
+    fn table(names: &[&str]) -> TableInventory {
+        TableInventory {
+            name: "users_profiles".to_string(),
+            table_type: "BASE TABLE".to_string(),
+            engine: Some("InnoDB".to_string()),
+            collation: Some("utf8mb4_0900_ai_ci".to_string()),
+            primary_key: vec!["user_id".to_string()],
+            columns: names.iter().map(|name| column(name)).collect(),
+        }
+    }
+
+    /// Schema convergence runs ahead of a lagging stream, so a historical row event carries fewer
+    /// columns than the target now has. The event's values map to the leading columns.
+    #[test]
+    fn extra_trailing_target_columns_map_the_events_leading_columns() {
+        let converged = table(&[
+            "user_id",
+            "bio",
+            "app_next_eligible",
+            "app_next_opted_out_at",
+        ]);
+
+        let resolved = build_inventory_table_schema("globalcomix", &converged, 2)
+            .expect("a target with extra trailing columns still resolves");
+
+        assert_eq!(resolved.columns, ["user_id", "bio"]);
+        assert_eq!(resolved.primary_key, ["user_id"]);
+    }
+
+    /// The opposite direction has nowhere to put the event's values and must still fail.
+    #[test]
+    fn a_target_missing_columns_the_event_carries_still_fails() {
+        let behind = table(&["user_id", "bio"]);
+
+        let error = build_inventory_table_schema("globalcomix", &behind, 4)
+            .expect_err("a target with fewer columns cannot map the event");
+
+        assert!(
+            error
+                .to_string()
+                .contains("has 2 columns but row event table map has 4"),
+            "{error}"
+        );
+    }
 }
