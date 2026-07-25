@@ -499,12 +499,35 @@ pub fn run_sync_table(config: &SyncTableConfig) -> Result<SyncTableReport, Table
 pub(crate) fn run_sync_table_reserved(
     config: &SyncTableConfig,
 ) -> Result<SyncTableReport, TableSyncError> {
-    retry_sync_table_operation(
+    let result = retry_sync_table_operation(
         config.mode,
         SYNC_CONNECTION_ATTEMPTS,
         SYNC_CONNECTION_RETRY_DELAY,
         || run_sync_table_phase(config, SyncPhase::All),
-    )
+    );
+    record_terminal_sync_run_error(config, result)
+}
+
+fn record_terminal_sync_run_error(
+    config: &SyncTableConfig,
+    result: Result<SyncTableReport, TableSyncError>,
+) -> Result<SyncTableReport, TableSyncError> {
+    let Err(error) = result else {
+        return result;
+    };
+    if !should_record_terminal_sync_run_error(&error) {
+        return Err(error);
+    }
+    let mut progress_store = progress::MySqlSyncRunProgressStore::new(
+        config.target.clone(),
+        config.progress_table.clone(),
+    );
+    if let Err(save_error) = progress_store.save_error(&config.run_id, &error) {
+        return Err(TableSyncError::Progress(format!(
+            "{error}; also failed to persist run error: {save_error}"
+        )));
+    }
+    Err(error)
 }
 
 pub(crate) fn retry_sync_table_operation<F>(
@@ -535,13 +558,14 @@ where
     unreachable!("sync retry loop has at least one attempt")
 }
 
+/// `Verification` is deliberately absent. The terminal parity pass is read-only: `repair_chunk`
+/// returns after counting for `SyncPhase::Verify`. A retry resumes the chunk phase at the saved
+/// tail primary key, so it cannot repair drift the pass found earlier in the table, then re-runs the
+/// same read-only pass and reaches the same conclusion. Retrying only multiplies a full-table scan.
 pub(crate) fn is_retryable_sync_error(error: &TableSyncError) -> bool {
     if matches!(
         error,
-        TableSyncError::Read(_)
-            | TableSyncError::Progress(_)
-            | TableSyncError::Duplicate(_)
-            | TableSyncError::Verification(_)
+        TableSyncError::Read(_) | TableSyncError::Progress(_) | TableSyncError::Duplicate(_)
     ) {
         return true;
     }
@@ -609,6 +633,17 @@ pub(crate) fn run_sync_table_phase_with_run_spec(
 pub(crate) fn should_record_sync_run_error(error: &TableSyncError) -> bool {
     matches!(error, TableSyncError::Read(_) | TableSyncError::Repair(_))
         && !is_retryable_sync_error(error)
+}
+
+/// Retries are exhausted by the time a run returns, so any surviving error ends the run. Recording
+/// it keeps the durable row from staying `running` with no live worker, which otherwise reads as an
+/// in-flight sync. Progress and table-validation errors are excluded because they must not replace
+/// an already saved run status.
+pub(crate) fn should_record_terminal_sync_run_error(error: &TableSyncError) -> bool {
+    !matches!(
+        error,
+        TableSyncError::Progress(_) | TableSyncError::InvalidTable(_)
+    )
 }
 
 fn connect_mysql_recovery_target(

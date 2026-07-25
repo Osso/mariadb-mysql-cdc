@@ -150,12 +150,17 @@ fn checksum_bound_predicates(request: &ChecksumRequest) -> Vec<String> {
 }
 
 fn primary_key_bound_predicate(columns: &[String], values: &[String], operator: &str) -> String {
-    columns
+    let branches = columns
         .iter()
         .enumerate()
         .map(|(index, _column)| primary_key_bound_branch(columns, values, index, operator))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+        .collect::<Vec<_>>();
+    if branches.len() < 2 {
+        return branches.join(" OR ");
+    }
+    // `AND` binds tighter than `OR`, so an ungrouped multi-column bound leaves the window
+    // unbounded once a second bound is combined with `AND`.
+    format!("({})", branches.join(" OR "))
 }
 
 fn primary_key_bound_branch(

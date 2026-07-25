@@ -691,7 +691,12 @@ fn primary_key_after_predicate(columns: &[String], values: &[String]) -> String 
     for index in 0..columns.len() {
         predicates.push(primary_key_after_branch(columns, values, index));
     }
-    predicates.join(" OR ")
+    if predicates.len() < 2 {
+        return predicates.join(" OR ");
+    }
+    // `AND` binds tighter than `OR`, so an ungrouped multi-column bound leaves the window
+    // unbounded once a second bound is combined with `AND`.
+    format!("({})", predicates.join(" OR "))
 }
 
 fn primary_key_at_or_before_predicate(columns: &[String], values: &[String]) -> String {

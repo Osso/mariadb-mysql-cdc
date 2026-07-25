@@ -5,9 +5,11 @@ pub(super) fn format_progress_rows(
     config: &SyncProgressConfig,
     rows: &[SyncProgressRow],
 ) -> Vec<String> {
+    // A `running` row whose advisory lock is gone is a dead run. Reporting it as in progress is what
+    // made abandoned runs read as the longest-running work in the system.
     let (running_rows, other_rows): (Vec<_>, Vec<_>) = rows
         .iter()
-        .partition(|row| row.status.eq_ignore_ascii_case("running"));
+        .partition(|row| row.status.eq_ignore_ascii_case("running") && row.live);
     let mut lines = other_rows
         .iter()
         .map(|row| format_progress_row(config, row))
@@ -76,6 +78,8 @@ fn aggregate_range_rows(
         last_primary_key: "-".to_string(),
         elapsed_seconds,
         last_error: aggregate_error(ranges),
+        // Summaries are built only from rows already partitioned as live.
+        live: true,
     }
 }
 
@@ -117,9 +121,10 @@ pub(super) fn format_progress_row(config: &SyncProgressConfig, row: &SyncProgres
     let eta_seconds = remaining.and_then(|remaining| eta(remaining, rows_per_second));
 
     format!(
-        "table={} status={} run_id={} rows_scanned={} total_rows={} progress={} rows_per_second={:.2} inserts_per_second={:.2} eta={} last_pk={} inserts={} updates={} extras={} error={}",
+        "table={} status={} live={} run_id={} rows_scanned={} total_rows={} progress={} rows_per_second={:.2} inserts_per_second={:.2} eta={} last_pk={} inserts={} updates={} extras={} error={}",
         row.table,
-        row.status,
+        display_status(row),
+        row.live,
         display_run_id(&row.run_id),
         row.rows_scanned,
         display_optional_u64(total_rows),
@@ -137,6 +142,15 @@ pub(super) fn format_progress_row(config: &SyncProgressConfig, row: &SyncProgres
 
 fn display_run_id(run_id: &str) -> &str {
     if run_id.is_empty() { "-" } else { run_id }
+}
+
+/// `running` with no lock holder means the process died without recording an outcome, which a crash
+/// can never do from inside. Name that state instead of repeating the stale intent.
+fn display_status(row: &SyncProgressRow) -> String {
+    if row.status.eq_ignore_ascii_case("running") && !row.live {
+        return "abandoned".to_string();
+    }
+    row.status.clone()
 }
 
 pub(super) fn rate(count: u64, seconds: u64) -> f64 {

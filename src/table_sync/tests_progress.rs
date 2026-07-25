@@ -766,6 +766,36 @@ fn progress_validation_errors_do_not_replace_saved_run_status() {
     )));
 }
 
+/// A terminal verification failure must land in the durable run row. Leaving it unrecorded keeps
+/// the run at `status='running'` with no live worker, which reads as an in-flight sync. Retries are
+/// already exhausted at that point, so retryability must not suppress the record.
+#[test]
+fn terminal_verification_failures_are_recorded_on_the_run() {
+    let verification = TableSyncError::Verification(
+        "table=devices_properties scope=full-table missing_rows=537 extra_rows=0 \
+         divergent_rows=134077"
+            .to_string(),
+    );
+
+    assert!(!is_retryable_sync_error(&verification));
+    assert!(!should_record_sync_run_error(&verification));
+    assert!(should_record_terminal_sync_run_error(&verification));
+}
+
+/// A verification failure that never reaches the durable row is what made dead runs look live.
+#[test]
+fn terminal_recording_still_protects_saved_run_status() {
+    assert!(!should_record_terminal_sync_run_error(
+        &TableSyncError::Progress("run id is already complete".to_string())
+    ));
+    assert!(!should_record_terminal_sync_run_error(
+        &TableSyncError::InvalidTable("invalid bounds".to_string())
+    ));
+    assert!(should_record_terminal_sync_run_error(
+        &TableSyncError::Repair("target write failed".to_string())
+    ));
+}
+
 #[test]
 fn run_id_rejects_changed_immutable_specification() {
     let source = FakeReader::new(vec![]);
@@ -895,6 +925,33 @@ fn builds_sync_select_with_start_and_end_bounds() {
     assert_eq!(
         sql,
         "SELECT `id`, `name` FROM `accounts` WHERE (`id` > '10') AND NOT ((`id` > '20')) ORDER BY `id` LIMIT 100"
+    );
+}
+
+/// `comics_releases_fragments_stats` has the composite primary key `(datehour, fragment_id)`. The
+/// multi-column lower bound is a disjunction, so it must be grouped: `AND` binds tighter than `OR`,
+/// and an ungrouped bound let `datehour > <start>` match every later row regardless of the upper
+/// bound. `read_target_window` then paged the whole remaining table into memory and was OOM killed.
+#[test]
+fn bounds_a_composite_primary_key_window_on_both_ends() {
+    let sql = build_sync_select_sql(&SyncChunkRequest {
+        table: "comics_releases_fragments_stats".to_string(),
+        primary_key: vec!["datehour".to_string(), "fragment_id".to_string()],
+        columns: vec!["datehour".to_string(), "fragment_id".to_string()],
+        start_after: Some(vec!["2023-05-29 08:00:00".to_string(), "71169".to_string()]),
+        end_at: Some(vec!["2018-01-07 16:00:00".to_string(), "4619".to_string()]),
+        updated_since: None,
+        limit: 10000,
+    });
+
+    assert_eq!(
+        sql,
+        "SELECT `datehour`, `fragment_id` FROM `comics_releases_fragments_stats` \
+         WHERE ((`datehour` > '2023-05-29 08:00:00') \
+         OR (`datehour` = '2023-05-29 08:00:00' AND `fragment_id` > '71169')) \
+         AND NOT (((`datehour` > '2018-01-07 16:00:00') \
+         OR (`datehour` = '2018-01-07 16:00:00' AND `fragment_id` > '4619'))) \
+         ORDER BY `datehour`, `fragment_id` LIMIT 10000"
     );
 }
 

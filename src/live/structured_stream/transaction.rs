@@ -24,6 +24,10 @@ impl Default for TargetTransactionGroupConfig {
     }
 }
 
+/// A verifier rejection means the no-op could not be proven, which is the ordinary durable-conflict
+/// path: roll back, persist evidence, retry from the unchanged checkpoint. Only an infrastructure
+/// failure inside the verifier is fatal. Every scope and predicate rejection must therefore carry
+/// the `rejected:` marker, or it is misclassified as fatal and crash-loops the stream.
 pub(super) fn superseded_verification_error(message: String) -> ApplyBinlogError {
     if message.starts_with("superseded release insert rejected:")
         || message.starts_with("superseded insert rejected:")

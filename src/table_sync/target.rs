@@ -195,6 +195,7 @@ impl MySqlSyncRepairTarget {
     fn rows_missing_after_duplicate(
         &self,
         rows: &[SnapshotRow],
+        duplicate_error: &str,
     ) -> Result<Vec<SnapshotRow>, TableSyncError> {
         let Some(context) = &self.fk_repair else {
             return Err(TableSyncError::Repair(
@@ -221,32 +222,50 @@ impl MySqlSyncRepairTarget {
         }
         if missing.len() == rows.len() {
             return Err(TableSyncError::Repair(format!(
-                "duplicate key for `{table_name}` is owned by a different target identity"
+                "duplicate key for `{table_name}` is owned by a different target identity; {}",
+                foreign_owned_duplicate_evidence(rows, duplicate_error)
             )));
         }
         Ok(missing)
     }
 
     fn insert_child_batch(&mut self, batch: &[SnapshotRow]) -> Result<(), TableSyncError> {
-        let mut remaining = batch.to_vec();
-        let mut repaired_parents = false;
-        loop {
-            match self.writer.insert_rows(&remaining) {
-                Ok(()) => break,
-                Err(error) if error.mysql_code() == Some(1452) && !repaired_parents => {
-                    self.repair_fk_parents_and_retry(&remaining)?;
-                    repaired_parents = true;
-                }
-                Err(error) if error.mysql_code() == Some(1062) => {
-                    remaining = self.rows_missing_after_duplicate(&remaining)?;
-                    if remaining.is_empty() {
-                        break;
-                    }
-                }
-                Err(error) => return Err(TableSyncError::Repair(error.to_string())),
-            }
-        }
+        super::child_batch::insert_child_batch_with_reconciliation(self, batch)?;
         self.verify_child_rows(batch)
+    }
+}
+
+impl super::child_batch::ChildBatchInserter for MySqlSyncRepairTarget {
+    fn table_name(&self) -> &str {
+        self.writer.table_name()
+    }
+
+    fn insert(
+        &mut self,
+        rows: &[SnapshotRow],
+    ) -> Result<super::child_batch::ChildInsertOutcome, TableSyncError> {
+        match self.writer.insert_rows(rows) {
+            Ok(()) => Ok(super::child_batch::ChildInsertOutcome::Applied),
+            Err(error) if error.mysql_code() == Some(1452) => {
+                Ok(super::child_batch::ChildInsertOutcome::MissingParent)
+            }
+            Err(error) if error.mysql_code() == Some(1062) => Ok(
+                super::child_batch::ChildInsertOutcome::DuplicateKey(error.to_string()),
+            ),
+            Err(error) => Err(TableSyncError::Repair(error.to_string())),
+        }
+    }
+
+    fn repair_parents(&mut self, rows: &[SnapshotRow]) -> Result<(), TableSyncError> {
+        self.repair_fk_parents_and_retry(rows)
+    }
+
+    fn reconcile_duplicates(
+        &mut self,
+        rows: &[SnapshotRow],
+        duplicate_error: &str,
+    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        self.rows_missing_after_duplicate(rows, duplicate_error)
     }
 }
 
@@ -777,9 +796,92 @@ fn quote_literal(value: Option<&str>) -> String {
     }
 }
 
+/// Rows named in a foreign-owned duplicate failure. Enough to reproduce it after the run exits, and
+/// bounded so one wide batch cannot produce an unbounded error string.
+const FOREIGN_OWNED_DUPLICATE_EVIDENCE_KEYS: usize = 10;
+
+/// Every row of the batch is absent by its own identity yet the insert reported a duplicate, so some
+/// other unique index owns the key. Without the index name and the source keys, the failure cannot be
+/// reproduced once the live stream has moved the target on.
+fn foreign_owned_duplicate_evidence(rows: &[SnapshotRow], duplicate_error: &str) -> String {
+    let index = crate::conflict_repair::duplicate_key_name(duplicate_error)
+        .unwrap_or_else(|| "<unparsed>".to_string());
+    let shown = rows
+        .iter()
+        .take(FOREIGN_OWNED_DUPLICATE_EVIDENCE_KEYS)
+        .map(|row| format!("{:?}", row.primary_key))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted = rows
+        .len()
+        .saturating_sub(FOREIGN_OWNED_DUPLICATE_EVIDENCE_KEYS);
+    let suffix = if omitted == 0 {
+        String::new()
+    } else {
+        format!(" (+{omitted} more)")
+    };
+    format!(
+        "duplicate_index={index}; batch_rows={}; source_primary_keys=[{shown}]{suffix}; \
+         mysql_error={duplicate_error}",
+        rows.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn evidence_row(primary_key: &str) -> SnapshotRow {
+        SnapshotRow {
+            primary_key: vec![primary_key.to_string()],
+            values: BTreeMap::from([("id".to_string(), Some(primary_key.to_string()))]),
+        }
+    }
+
+    /// `users_actions_timestamps` aborted with only the table name, so the collision could not be
+    /// reproduced once the live stream had moved the target on.
+    #[test]
+    fn foreign_owned_duplicate_evidence_names_the_index_and_source_keys() {
+        let rows = vec![evidence_row("155476744"), evidence_row("155476745")];
+
+        let evidence = foreign_owned_duplicate_evidence(
+            &rows,
+            "Duplicate entry '1916023-first_page_read' for key \
+             'users_actions_timestamps.uidx_owner_key'",
+        );
+
+        assert!(evidence.contains("duplicate_index=users_actions_timestamps.uidx_owner_key"));
+        assert!(evidence.contains("batch_rows=2"));
+        assert!(evidence.contains("\"155476744\""));
+        assert!(evidence.contains("\"155476745\""));
+        assert!(!evidence.contains("more)"));
+    }
+
+    /// A wide batch must not produce an unbounded error string.
+    #[test]
+    fn foreign_owned_duplicate_evidence_bounds_the_key_list() {
+        let rows = (0..25)
+            .map(|index| evidence_row(&index.to_string()))
+            .collect::<Vec<_>>();
+
+        let evidence = foreign_owned_duplicate_evidence(&rows, "Duplicate entry 'x' for key 't.u'");
+
+        assert!(evidence.contains("batch_rows=25"));
+        assert!(evidence.contains("(+15 more)"));
+        assert!(evidence.contains("\"9\""));
+        assert!(!evidence.contains("\"10\""));
+    }
+
+    /// An unparseable duplicate message must still yield the source keys rather than nothing.
+    #[test]
+    fn foreign_owned_duplicate_evidence_survives_an_unparseable_error() {
+        let evidence =
+            foreign_owned_duplicate_evidence(&[evidence_row("7")], "some other target failure");
+
+        assert!(evidence.contains("duplicate_index=<unparsed>"));
+        assert!(evidence.contains("\"7\""));
+        assert!(evidence.contains("mysql_error=some other target failure"));
+    }
 
     fn foreign_key(referenced_schema: &str) -> ForeignKeyInventory {
         ForeignKeyInventory {

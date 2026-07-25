@@ -1,3 +1,4 @@
+mod child_batch;
 mod fk_parent_repair;
 mod model;
 mod mysql;
@@ -48,7 +49,8 @@ pub(crate) use recent::{RecentUpdateSyncContext, sync_recent_updates_with_progre
 pub(crate) use repair::{apply_recent_update_chunk, repair_chunk};
 #[cfg(test)]
 pub(crate) use run::{
-    ExactParentReader, build_sync_run_scope, reconcile_exact_parent, retry_sync_table_operation,
+    ExactParentReader, build_sync_run_scope, is_retryable_sync_error, reconcile_exact_parent,
+    retry_sync_table_operation, should_record_terminal_sync_run_error,
 };
 pub(crate) use run::{
     expected_sync_run_spec_json, find_compatible_failed_run, reconcile_exact_parent_live,

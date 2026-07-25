@@ -6,6 +6,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::time::Duration;
 
+/// The terminal parity pass is read-only and a retry resumes at the saved tail primary key, so it
+/// cannot repair drift found earlier in the table. Retrying only re-scans. `guests` burned 3h20m on
+/// repeated full-table passes that all reached the same conclusion.
+#[test]
+fn terminal_verification_failure_runs_the_sync_once() {
+    let attempts = Cell::new(0);
+
+    let error = retry_sync_table_operation(SyncMode::Apply, 5, Duration::ZERO, || {
+        attempts.set(attempts.get() + 1);
+        Err(TableSyncError::Verification(
+            "table=guests scope=full-table missing_rows=4125 extra_rows=0 divergent_rows=468"
+                .to_string(),
+        ))
+    })
+    .expect_err("verification is terminal");
+
+    assert_eq!(attempts.get(), 1);
+    assert!(error.to_string().contains("missing_rows=4125"));
+}
+
 #[test]
 fn missing_primary_key_sync_retries_transient_connection_loss_with_a_bound() {
     let attempts = Cell::new(0);
