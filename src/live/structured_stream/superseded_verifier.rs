@@ -3,8 +3,7 @@ use super::superseded_insert::{
     verify_superseded_insert,
 };
 use super::superseded_source::{
-    SupersededSourceEvidence, build_exact_row_insert_statement,
-    load_superseded_comics_source_evidence, load_superseded_source_evidence,
+    SupersededSourceEvidence, build_exact_row_insert_statement, load_identity_source_evidence,
 };
 use super::transaction::SupersededInsertVerifier;
 use crate::mysql_snapshot::MySqlConnectionConfig;
@@ -22,6 +21,18 @@ const SUPERSEDED_IDENTITY_SCOPES: &[(&str, &str, &str)] = &[
     ("comics", "comics.slug", "slug"),
     ("artists", "artists.idx_slug", "name"),
 ];
+
+/// The table and identity column whose columns the source evidence must be read from. Reading a
+/// different table's columns produces a source/target column mismatch rather than a proof result.
+fn superseded_source_identity(
+    table: &str,
+    duplicate_index: Option<&str>,
+) -> Option<(&'static str, &'static str)> {
+    SUPERSEDED_IDENTITY_SCOPES
+        .iter()
+        .find(|(scope_table, index, _)| *scope_table == table && Some(*index) == duplicate_index)
+        .map(|(scope_table, _, identity_column)| (*scope_table, *identity_column))
+}
 
 /// Whether a table and duplicate index are a supported superseded-identity scope. The deferral gate
 /// in `row::conflict` uses this so a candidate cannot be filtered out before reaching the proof.
@@ -91,13 +102,19 @@ where
         candidate: &DeferredSupersededInsertCandidate,
         xid_end_position: u64,
     ) -> Result<SupersededInsertProof, String> {
-        let is_comics = candidate.observation.table == "comics";
+        let (source_table, source_identity_column) = superseded_source_identity(
+            &candidate.observation.table,
+            candidate.observation.duplicate_index.as_deref(),
+        )
+        .ok_or_else(|| "superseded insert rejected: table is out of scope".to_string())?;
         let mut source = |primary_key: u64, identity: &str| {
-            if is_comics {
-                load_superseded_comics_source_evidence(&self.source, primary_key, identity)
-            } else {
-                load_superseded_source_evidence(&self.source, primary_key, identity)
-            }
+            load_identity_source_evidence(
+                &self.source,
+                source_table,
+                source_identity_column,
+                primary_key,
+                identity,
+            )
             .map_err(|error| error.to_string())
         };
         verify_with_source_loader(candidate, xid_end_position, &mut source, self.target)
@@ -412,7 +429,7 @@ fn verification_input(
 ) -> Result<SupersededInsertVerificationInput, String> {
     if source.columns != target.columns {
         return Err(format!(
-            "source/target users evidence column mismatch: source {:?}, target {:?}",
+            "superseded insert rejected: source/target evidence column mismatch: source {:?}, target {:?}",
             source.columns, target.columns
         ));
     }
@@ -780,6 +797,41 @@ mod tests {
         candidate.observation.duplicate_index = Some("artists.idx_slug".to_string());
 
         assert!(validate_exact_scope(&candidate).is_ok());
+    }
+
+    /// A source/target column mismatch is a data or scope problem, not an infrastructure failure, so
+    /// it must stall rather than kill the process.
+    #[test]
+    fn evidence_column_mismatch_is_a_retryable_rejection() {
+        let mismatch = format!(
+            "superseded insert rejected: source/target evidence column mismatch: source {:?}, target {:?}",
+            ["id", "name"],
+            ["id", "slug"]
+        );
+
+        assert!(matches!(
+            super::super::transaction::superseded_verification_error(mismatch),
+            crate::live::ApplyBinlogError::SupersededRecoveryFailed(_)
+        ));
+    }
+
+    /// Source evidence must be loaded from the scoped table, not always from `users`. Deferring
+    /// `artists` while the loader still read users columns produced
+    /// "source/target users evidence column mismatch", which carries no `rejected:` marker and so
+    /// crash-looped the stream instead of stalling it.
+    #[test]
+    fn source_evidence_loads_each_scope_table_rather_than_users() {
+        for (table, index, identity_column) in SUPERSEDED_IDENTITY_SCOPES {
+            assert_eq!(
+                superseded_source_identity(table, Some(index)),
+                Some((*table, *identity_column)),
+                "{table}/{index} must load its own columns"
+            );
+        }
+        assert_eq!(
+            superseded_source_identity("releases", Some("releases.slug")),
+            None
+        );
     }
 
     /// The deferral gate and the proof scope must agree, or a candidate is filtered out before the

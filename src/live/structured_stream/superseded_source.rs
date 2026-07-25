@@ -96,35 +96,7 @@ impl SupersededSourceQuery for MySqlSupersededSourceQuery {
     }
 }
 
-pub(crate) fn load_superseded_source_evidence(
-    config: &MySqlConnectionConfig,
-    historical_primary_key: u64,
-    historical_name: &str,
-) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
-    load_identity_source_evidence(
-        config,
-        "users",
-        "name",
-        historical_primary_key,
-        historical_name,
-    )
-}
-
-pub(crate) fn load_superseded_comics_source_evidence(
-    config: &MySqlConnectionConfig,
-    historical_primary_key: u64,
-    historical_slug: &str,
-) -> Result<SupersededSourceEvidence, SourceEvidenceError> {
-    load_identity_source_evidence(
-        config,
-        "comics",
-        "slug",
-        historical_primary_key,
-        historical_slug,
-    )
-}
-
-fn load_identity_source_evidence(
+pub(crate) fn load_identity_source_evidence(
     config: &MySqlConnectionConfig,
     table: &str,
     identity_column: &str,
