@@ -55,6 +55,8 @@ pub(super) const HOME_FEED_CARD_COLUMNS: [&str; 20] = [
 pub(super) const RECOVERY_CREATE_TIME_EPOCH_ALIAS: &str = "__recovery_create_time_epoch";
 const GUEST_IDENTITY_COLLISION_LIMIT: usize = 3;
 /// Two rows are enough to prove a referenced identity is ambiguous, which the planner rejects.
+// Unwired with generic missing-parent deferral (see live::missing_parent); kept for re-enable.
+#[allow(dead_code)]
 const PARENT_IDENTITY_COLLISION_LIMIT: usize = 2;
 const HOME_FEED_CARD_IDENTITY_COLLISION_LIMIT: usize = 3;
 pub(super) const RECOVERY_UTC_SESSION_SQL: &str = "SET SESSION time_zone='+00:00'";
@@ -166,6 +168,8 @@ impl MySqlSyncReader {
     ///
     /// Cardinality is preserved up to the collision limit so the planner can reject an ambiguous
     /// identity instead of picking a row.
+    // Unwired with generic missing-parent deferral (see live::missing_parent); kept for re-enable.
+    #[allow(dead_code)]
     pub(crate) fn read_parent_identity_rows(
         &self,
         table: &crate::inventory::TableInventory,
@@ -249,6 +253,8 @@ pub(super) fn inventory_stored_columns(table: &crate::inventory::TableInventory)
 
 /// A NULL foreign-key value never violates the constraint, so it cannot select a parent by
 /// equality. `IS NULL` keeps the read honest and the planner rejects the case outright.
+// Unwired with generic missing-parent deferral (see live::missing_parent); kept for re-enable.
+#[allow(dead_code)]
 fn parent_identity_predicates(columns: &[String], values: &[Option<String>]) -> String {
     columns
         .iter()

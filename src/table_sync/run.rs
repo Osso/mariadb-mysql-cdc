@@ -199,6 +199,8 @@ pub(crate) fn read_parent_table_inventory(
 /// The target side is not consulted: the caller has already proved under lock that the identity is
 /// absent there. Everything else stays the planner's decision, so an ambiguous or incomplete source
 /// parent still fails closed.
+// Unwired with generic missing-parent deferral (see live::missing_parent); kept for re-enable.
+#[allow(dead_code)]
 pub(crate) fn read_exact_source_parent_row(
     source: &crate::mysql_snapshot::MySqlConnectionConfig,
     violation: &crate::live::ForeignKeyViolation,

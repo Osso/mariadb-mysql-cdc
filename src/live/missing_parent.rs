@@ -5,6 +5,13 @@
 //! unchanged checkpoint. A parent is never updated or deleted, and the checkpoint never advances
 //! during recovery.
 //!
+//! UNWIRED as of 2026-07-25: generic deferral is disabled in `row::conflict` while the backfill is
+//! incomplete, because recovery cannot succeed when the parent is absent from source and target
+//! alike, and a failed recovery aborted the stream instead of skipping the row. Re-enable
+//! `is_deferred_foreign_key_conflict` once the parent tables are fully loaded; this planner is kept
+//! intact for that.
+#![allow(dead_code)]
+
 //! This generalises the two previously hardcoded constraints to any foreign key, using the identity
 //! parsed from the error text. Every predicate fails closed so an unproven case keeps the ordinary
 //! durable-abort path.

@@ -136,7 +136,18 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       while divergent, colliding, or ambiguous state fails closed. Recovery
       never updates or deletes a parent and never advances the stream checkpoint;
       only the subsequent successful replay can do that.
-- [x] Every other `1452` is resolved inside the applying transaction, from one
+- [ ] Every other `1452` is recorded and skipped like any other conflict: the row
+      is dropped, the evidence is persisted, and the stream advances. A missing
+      parent must never hold the stream: an unresolvable row is a skipped row, not
+      a stop. The generic in-transaction resolver below is implemented but
+      unwired, because it can only succeed when the parent exists in the source
+      and is absent from the target, while during backfill the parent is missing
+      from both, recovery fails, and a failed recovery aborted the stream instead
+      of skipping - `webhooks_requests` -> `sessions` held it down for 45 minutes
+      that way. Re-enable it once the referenced parent tables are fully loaded;
+      the planned full data resync supplies every row skipped in the meantime.
+      The remaining boxes in this section describe that unwired resolver.
+- [ ] Every other `1452` is resolved inside the applying transaction, from one
       locked read of the parent taken under `FOR UPDATE`. The constraint identity
       comes from the error text, which names the child table, the constraint, the
       child columns, the parent table, and the referenced columns; only the
@@ -144,13 +155,13 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       never states it. The locked read selects by that primary key alone, never by
       the full referenced tuple, so an absent parent is distinguishable from a
       parent whose referenced attribute has moved on.
-- [x] An empty locked read is the missing-parent class: install the exact current
+- [ ] An empty locked read is the missing-parent class: install the exact current
       source parent row, then replay the child image unchanged. Source state must
       hold exactly one complete parent owning the referenced identity; absent,
       ambiguous, or mismatched source state fails closed. This class is not gated
       on parent `create_time`, because a generic parent table is not guaranteed to
       have that column.
-- [x] A single locked row whose referenced non-key columns differ is the
+- [ ] A single locked row whose referenced non-key columns differ is the
       superseded-attribute class: replay the child image with only those derived
       columns fast-forwarded to the locked parent's values, keeping every other
       child column historical. Those columns are maintained by
@@ -158,7 +169,7 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       values. The referenced primary key columns must match exactly; more than one
       locked row, a shape that disagrees with the error, or no drift at all fails
       closed.
-- [x] Neither in-transaction class updates or deletes a parent row, and a rejected
+- [ ] Neither in-transaction class updates or deletes a parent row, and a rejected
       resolution is an ordinary durable conflict: roll back, persist evidence, and
       retry from the unchanged checkpoint. Rejection messages carry the
       `superseded ... insert rejected:` marker, because the stream classifies

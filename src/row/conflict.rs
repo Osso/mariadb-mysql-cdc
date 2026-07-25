@@ -347,10 +347,14 @@ fn is_deferred_foreign_key_conflict(
     {
         return false;
     }
-    // The error must name the table being applied, or the child image read later is another table's.
-    crate::live::parse_foreign_key_violation(&conflict.error_text).is_some_and(|violation| {
-        violation.child_schema == table.schema && violation.child_table == table.table
-    })
+    // Generic missing-parent recovery is deliberately NOT attempted. It can only succeed when the
+    // parent exists in the source and is absent from the target; while the backfill is incomplete
+    // the parent is missing from both, recovery fails, and a failed recovery aborts the stream
+    // instead of skipping - webhooks_requests -> sessions held the stream down for 45 minutes that
+    // way. Treating these as ordinary conflicts records them and skips the row, and the planned
+    // full data resync supplies it. The two exact recovery cases above still recover.
+    let _ = crate::live::parse_foreign_key_violation(&conflict.error_text);
+    false
 }
 
 fn is_exact_sessions_guest_conflict(
@@ -592,12 +596,14 @@ mod tests {
     /// An unenumerated constraint is now resolved in-transaction, so it defers and carries no
     /// out-of-transaction recovery request.
     #[test]
-    fn defers_an_unenumerated_foreign_key_constraint() {
+    fn records_and_skips_an_unenumerated_foreign_key_constraint() {
         let (table, change) = session_child();
         let conflict = foreign_key_conflict(PAID_SUBSCRIPTIONS_SESSION_ERROR);
         let coordinate = coordinate();
 
-        assert!(is_deferred_foreign_key_conflict(
+        // Generic missing-parent recovery is disabled while the backfill is incomplete: these
+        // conflicts are recorded and skipped instead of deferred to a recovery that cannot succeed.
+        assert!(!is_deferred_foreign_key_conflict(
             &table,
             RowOperation::Insert,
             &change,
@@ -615,12 +621,12 @@ mod tests {
         );
     }
 
-    /// An update can violate a foreign key too, so deferral is not limited to inserts.
+    /// An update can violate a foreign key too, and it is recorded and skipped like an insert.
     #[test]
-    fn defers_a_foreign_key_conflict_raised_by_an_update() {
+    fn records_and_skips_a_foreign_key_conflict_raised_by_an_update() {
         let (table, change) = session_child();
 
-        assert!(is_deferred_foreign_key_conflict(
+        assert!(!is_deferred_foreign_key_conflict(
             &table,
             RowOperation::Update,
             &change,
