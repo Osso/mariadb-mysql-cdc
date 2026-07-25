@@ -10,6 +10,7 @@ use mysql::prelude::Queryable;
 use mysql::{Conn, Params, Value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
@@ -1058,16 +1059,10 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
         schema: config.target.database.clone(),
     };
     let mut plan = plan_schema_convergence(&source, &target, &selected, &preflight)?;
-    let source_checks = read_check_constraints(
-        &inventory_config_source(&config.source),
-        &config.source.database,
-        None,
-    )?;
-    let target_checks = read_check_constraints(
-        &inventory_config_target(&config.target),
-        &config.target.database,
-        None,
-    )?;
+    let source_checks = CheckConstraintReader::new(inventory_config_source(&config.source))
+        .read(&config.source.database, None)?;
+    let target_checks = CheckConstraintReader::new(inventory_config_target(&config.target))
+        .read(&config.target.database, None)?;
     append_check_constraint_plan(&mut plan, &source, &source_checks, &target_checks);
     let source_canonical_foreign_keys =
         build_canonical_foreign_key_inventory(&config.source.database, &source_reader)
@@ -1089,10 +1084,15 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
     let source_checks_by_table = checks_by_table(&target_check_constraints(&source_checks));
     let source_table_map = table_map(&source);
     let expected = expected_target_inventory(&source);
+    // One reader and one check-constraint connection serve every table, because a fresh TLS
+    // handshake per table costs more than the metadata reads themselves.
+    let verification_reader = MariaDbInventoryReader::new(target_config.clone());
+    let check_reader = RefCell::new(CheckConstraintReader::new(target_config.clone()));
     Ok(execute_schema_plan(plan, &mut executor, &|table| {
         // Verification describes one table, so it must not re-read the whole schema per table.
-        let reader = MariaDbInventoryReader::for_table(target_config.clone(), table);
-        let target_inventory = match build_inventory(&config.target.database, &reader) {
+        verification_reader.scope_to_table(table);
+        let target_inventory = match build_inventory(&config.target.database, &verification_reader)
+        {
             Ok(inventory) => inventory,
             Err(error) => return vec![format!("target re-inventory failed: {error}")],
         };
@@ -1100,15 +1100,15 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
             return vec!["source table disappeared during verification".to_string()];
         }
         let mut differences = schema_table_differences(&expected, &target_inventory, table);
-        let target_checks =
-            read_check_constraints(&target_config, &config.target.database, Some(table)).map(
-                |checks| {
-                    checks_by_table(&checks)
-                        .get(table)
-                        .cloned()
-                        .unwrap_or_default()
-                },
-            );
+        let target_checks = check_reader
+            .borrow_mut()
+            .read(&config.target.database, Some(table))
+            .map(|checks| {
+                checks_by_table(&checks)
+                    .get(table)
+                    .cloned()
+                    .unwrap_or_default()
+            });
         match target_checks {
             Ok(target_checks)
                 if target_checks
@@ -1120,7 +1120,7 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
             Err(error) => differences.push(format!("check verification failed: {error}")),
         }
         let target_canonical =
-            build_canonical_foreign_key_inventory(&config.target.database, &reader);
+            build_canonical_foreign_key_inventory(&config.target.database, &verification_reader);
         let source_table_foreign_keys = relative_canonical_foreign_keys(
             &canonical_foreign_keys_for(&source_canonical_foreign_keys, table),
             &config.source.database,
@@ -1300,15 +1300,53 @@ fn parse_sync_schema_config(args: Vec<String>) -> Result<SyncSchemaConfig, Strin
     })
 }
 
-fn read_check_constraints(
-    config: &InventoryConfig,
+/// Holds one connection for repeated check-constraint reads, because a fresh TLS handshake per
+/// table costs more than the read.
+struct CheckConstraintReader {
+    config: InventoryConfig,
+    connection: Option<Conn>,
+}
+
+impl CheckConstraintReader {
+    fn new(config: InventoryConfig) -> Self {
+        Self {
+            config,
+            connection: None,
+        }
+    }
+
+    fn read(
+        &mut self,
+        schema: &str,
+        table_scope: Option<&str>,
+    ) -> Result<Vec<CheckConstraint>, String> {
+        if self.connection.is_none() {
+            let opts = crate::inventory::reader::inventory_opts(&self.config)?;
+            self.connection = Some(
+                Conn::new(opts)
+                    .map_err(|error| format!("check inventory connection failed: {error}"))?,
+            );
+        }
+        let connection = self
+            .connection
+            .as_mut()
+            .expect("check inventory connection");
+        let result =
+            query_check_constraints(connection, self.config.endpoint_role, schema, table_scope);
+        if result.is_err() {
+            self.connection = None;
+        }
+        result
+    }
+}
+
+fn query_check_constraints(
+    connection: &mut Conn,
+    endpoint_role: InventoryEndpointRole,
     schema: &str,
     table_scope: Option<&str>,
 ) -> Result<Vec<CheckConstraint>, String> {
-    let opts = crate::inventory::reader::inventory_opts(config)?;
-    let mut connection =
-        Conn::new(opts).map_err(|error| format!("check inventory connection failed: {error}"))?;
-    let sql = check_constraint_query(config.endpoint_role, table_scope);
+    let sql = check_constraint_query(endpoint_role, table_scope);
     let mut parameters = vec![Value::Bytes(schema.as_bytes().to_vec())];
     if let Some(table_scope) = table_scope {
         parameters.push(Value::Bytes(table_scope.as_bytes().to_vec()));
@@ -2509,13 +2547,14 @@ fn render_inline_foreign_key(foreign_key: &ForeignKeyInventory, schema: &str) ->
 }
 
 /// A foreign key inside the converged schema must resolve in the target database, so only a
-/// genuinely cross-schema parent keeps its schema qualifier.
+/// genuinely cross-schema parent keeps its schema qualifier. A parent already expressed
+/// relative to its endpoint carries the sentinel and is equally unqualified.
 fn referenced_table_reference(
     schema: &str,
     referenced_schema: &str,
     referenced_table: &str,
 ) -> String {
-    if referenced_schema == schema {
+    if referenced_schema == schema || referenced_schema == OWN_SCHEMA {
         format!("`{referenced_table}`")
     } else {
         format!("`{referenced_schema}`.`{referenced_table}`")
@@ -3508,6 +3547,30 @@ mod tests {
             ..target
         };
         assert_ne!(source, other_column);
+    }
+
+    /// The relative form is a comparison device; it must never reach the target as SQL.
+    #[test]
+    fn a_relative_parent_schema_renders_unqualified() {
+        let key = CanonicalForeignKey {
+            constraint_schema: OWN_SCHEMA.to_string(),
+            constraint_name: "fk_child_parent".to_string(),
+            child_schema: OWN_SCHEMA.to_string(),
+            child_table: "children".to_string(),
+            child_columns: vec!["parent_id".to_string()],
+            parent_schema: OWN_SCHEMA.to_string(),
+            parent_table: "parents".to_string(),
+            parent_columns: vec!["id".to_string()],
+            update_rule: "RESTRICT".to_string(),
+            delete_rule: "CASCADE".to_string(),
+            match_option: "NONE".to_string(),
+            enforced: true,
+        };
+
+        let sql = render_canonical_foreign_key(&key, "globalcomix");
+
+        assert!(sql.contains("REFERENCES `parents` (`id`)"), "{sql}");
+        assert!(!sql.contains(OWN_SCHEMA), "{sql}");
     }
 
     #[test]

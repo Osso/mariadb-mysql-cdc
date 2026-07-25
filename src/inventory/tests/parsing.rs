@@ -210,11 +210,40 @@ fn decodes_null_inventory_values_as_empty_optional_fields() {
     assert_eq!(table.table_collation, None);
 }
 
+/// MySQL reports an empty-string default as an empty string and no default as SQL NULL, so the
+/// two must not collapse into one.
+#[test]
+fn distinguishes_an_empty_string_default_from_no_default() {
+    let column = |default: &str, is_null: &str| {
+        parse_column_row(&[
+            "access_tokens".to_string(),
+            "token".to_string(),
+            "2".to_string(),
+            "varchar(32)".to_string(),
+            "varchar".to_string(),
+            "NO".to_string(),
+            "utf8mb3".to_string(),
+            "utf8mb3_general_ci".to_string(),
+            default.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            is_null.to_string(),
+        ])
+        .expect("column row")
+        .column_default
+    };
+
+    assert_eq!(column("", "0"), Some(String::new()));
+    assert_eq!(column("", "1"), None);
+    assert_eq!(column("POST", "0"), Some("POST".to_string()));
+}
+
 #[test]
 fn reports_malformed_inventory_rows_with_row_type() {
     let error = parse_column_row(&["accounts".to_string()]).expect_err("short column row");
 
-    assert_eq!(error.to_string(), "column row has 1 fields, expected 12");
+    assert_eq!(error.to_string(), "column row has 1 fields, expected 13");
 }
 
 #[test]

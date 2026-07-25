@@ -128,7 +128,7 @@ pub struct MariaDbInventoryReader {
     conn: RefCell<Option<InventoryConnectionState>>,
     factory: Rc<dyn InventoryConnectionFactory>,
     /// Restricts every table-scoped query to one table. `None` reads the whole schema.
-    table: Option<String>,
+    table: RefCell<Option<String>>,
 }
 
 impl MariaDbInventoryReader {
@@ -136,13 +136,10 @@ impl MariaDbInventoryReader {
         Self::with_factory(config, Rc::new(MySqlInventoryConnectionFactory))
     }
 
-    /// A reader that describes one table, for verifying a single table without reading the
-    /// metadata of every other table in the schema.
-    pub fn for_table(config: InventoryConfig, table: &str) -> Self {
-        Self {
-            table: Some(table.to_string()),
-            ..Self::new(config)
-        }
+    /// Restrict later reads to one table, so verifying a table does not read the metadata of
+    /// every other table in the schema. Reusing one reader keeps one connection across tables.
+    pub fn scope_to_table(&self, table: &str) {
+        self.table.replace(Some(table.to_string()));
     }
 
     pub(crate) fn with_factory(
@@ -153,12 +150,8 @@ impl MariaDbInventoryReader {
             config,
             conn: RefCell::new(None),
             factory,
-            table: None,
+            table: RefCell::new(None),
         }
-    }
-
-    fn table_scope(&self) -> Option<&str> {
-        self.table.as_deref()
     }
 
     fn query_rows(
@@ -304,7 +297,7 @@ impl InventoryReader for MariaDbInventoryReader {
         let rows = self.query_rows(
             InventoryQueryStage::Tables,
             schema,
-            &tables_query(schema, self.table_scope()),
+            &tables_query(schema, self.table.borrow().as_deref()),
         )?;
         rows.iter().map(|row| parse_table_row(row)).collect()
     }
@@ -313,7 +306,7 @@ impl InventoryReader for MariaDbInventoryReader {
         let rows = self.query_rows(
             InventoryQueryStage::Columns,
             schema,
-            &columns_query(schema, self.table_scope()),
+            &columns_query(schema, self.table.borrow().as_deref()),
         )?;
         rows.iter().map(|row| parse_column_row(row)).collect()
     }
@@ -322,7 +315,7 @@ impl InventoryReader for MariaDbInventoryReader {
         let rows = self.query_rows(
             InventoryQueryStage::PrimaryKeys,
             schema,
-            &primary_keys_query(schema, self.table_scope()),
+            &primary_keys_query(schema, self.table.borrow().as_deref()),
         )?;
         rows.iter().map(|row| parse_primary_key_row(row)).collect()
     }
@@ -331,7 +324,11 @@ impl InventoryReader for MariaDbInventoryReader {
         let rows = self.query_rows(
             InventoryQueryStage::Indexes,
             schema,
-            &indexes_query(schema, self.config.endpoint_role, self.table_scope()),
+            &indexes_query(
+                schema,
+                self.config.endpoint_role,
+                self.table.borrow().as_deref(),
+            ),
         )?;
         rows.iter().map(|row| parse_index_row(row)).collect()
     }
@@ -340,7 +337,7 @@ impl InventoryReader for MariaDbInventoryReader {
         let rows = self.query_rows(
             InventoryQueryStage::ForeignKeys,
             schema,
-            &foreign_keys_query(schema, self.table_scope()),
+            &foreign_keys_query(schema, self.table.borrow().as_deref()),
         )?;
         rows.iter().map(|row| parse_foreign_key_row(row)).collect()
     }
@@ -352,7 +349,7 @@ impl InventoryReader for MariaDbInventoryReader {
         let rows = self.query_rows(
             InventoryQueryStage::CanonicalForeignKeys,
             schema,
-            &canonical_foreign_keys_query(schema, self.table_scope()),
+            &canonical_foreign_keys_query(schema, self.table.borrow().as_deref()),
         )?;
         rows.iter()
             .map(|row| parse_canonical_foreign_key_row(row))

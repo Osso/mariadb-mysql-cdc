@@ -72,7 +72,7 @@ pub(crate) fn parse_table_row(fields: &[String]) -> Result<TableRow, InventoryEr
 }
 
 pub(crate) fn parse_column_row(fields: &[String]) -> Result<ColumnRow, InventoryError> {
-    require_len(fields, 12, "column")?;
+    require_len(fields, 13, "column")?;
 
     Ok(ColumnRow {
         table_name: fields[0].clone(),
@@ -83,7 +83,8 @@ pub(crate) fn parse_column_row(fields: &[String]) -> Result<ColumnRow, Inventory
         is_nullable: fields[5] == "YES",
         character_set: optional_string(&fields[6]),
         collation: optional_string(&fields[7]),
-        column_default: optional_string(&fields[8]),
+        // An empty string is a real default, so only a SQL NULL means the column has none.
+        column_default: (fields[12] != "1").then(|| fields[8].clone()),
         extra: fields[9].clone(),
         column_comment: fields[10].clone(),
         generation_expression: optional_string(&fields[11]),
