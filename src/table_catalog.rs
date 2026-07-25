@@ -1210,7 +1210,9 @@ fn column_type_is_compatible(
     if source.is_nullable && !target.is_nullable {
         return false;
     }
-    if source.character_set != target.character_set || source.collation != target.collation {
+    if source.character_set != target.character_set
+        || !collations_are_equivalent(source.collation.as_deref(), target.collation.as_deref())
+    {
         return false;
     }
     if source.data_type == target.data_type {
@@ -1231,6 +1233,22 @@ fn column_type_is_compatible(
     integer_rank(&target.data_type) >= integer_rank(&source.data_type)
         && integer_rank(&source.data_type) > 0
         && source.column_type.contains("unsigned") == target.column_type.contains("unsigned")
+}
+
+/// Whether two column collations name the same converged collation.
+///
+/// MariaDB 11.8 defaults new tables to the UCA-1400 collations, which MySQL 8 does not have, and
+/// `sync-schema` converges each to its MySQL equivalent rather than rewriting the column. Comparing
+/// the raw names here classified every recently created table as `incompatible_schema` even though
+/// its schema had already converged, which silently excluded 40 tables from every catalog sync.
+fn collations_are_equivalent(source: Option<&str>, target: Option<&str>) -> bool {
+    match (source, target) {
+        (Some(source), Some(target)) => {
+            crate::sync_schema::canonical_collation(source)
+                == crate::sync_schema::canonical_collation(target)
+        }
+        (source, target) => source == target,
+    }
 }
 
 fn variable_length_capacity(column_type: &str) -> usize {
@@ -1976,6 +1994,34 @@ mod tests {
             catalogs.non_syncable[0].reasons,
             vec![NonSyncableReason::IncompatibleSchema]
         );
+    }
+
+    /// MariaDB 11.8 defaults new tables to UCA-1400, which `sync-schema` converges to the MySQL
+    /// spelling. Such a table is fully synced and must stay syncable.
+    #[test]
+    fn converged_uca1400_column_collations_stay_syncable() {
+        let mut source_name = typed_column("name", "varchar(32)", false);
+        source_name.character_set = Some("utf8mb4".into());
+        source_name.collation = Some("utf8mb4_uca1400_ai_ci".into());
+        let mut target_name = source_name.clone();
+        target_name.collation = Some("utf8mb4_0900_ai_ci".into());
+        let mut source_table = table("items", vec![column("id"), source_name], vec!["id"]);
+        source_table.collation = Some("utf8mb4_uca1400_ai_ci".into());
+        let mut target_table = table("items", vec![column("id"), target_name], vec!["id"]);
+        target_table.collation = Some("utf8mb4_0900_ai_ci".into());
+
+        let catalogs = build_catalogs(
+            &inventory(vec![source_table], vec![]),
+            &inventory(vec![target_table], vec![]),
+            &BTreeMap::new(),
+        );
+
+        assert!(
+            catalogs.non_syncable.is_empty(),
+            "converged collations must not exclude the table: {:?}",
+            catalogs.non_syncable
+        );
+        assert_eq!(catalogs.syncable[0].name, "items");
     }
 
     #[test]

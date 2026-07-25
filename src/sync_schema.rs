@@ -2452,7 +2452,7 @@ fn canonical_extra(extra: &str) -> String {
 
 /// MariaDB 11 names its Unicode collations `*_uca1400_*`; MySQL spells the same ordering
 /// `utf8mb4_0900_*`, and has no UCA-1400 utf8mb3 collation beyond its general one.
-fn canonical_collation(collation: &str) -> String {
+pub(crate) fn canonical_collation(collation: &str) -> String {
     let lowered = collation.to_ascii_lowercase();
     match lowered.as_str() {
         "utf8mb4_uca1400_ai_ci" => "utf8mb4_0900_ai_ci".to_string(),
