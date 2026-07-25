@@ -67,6 +67,7 @@ mod schema;
 mod superseded_insert;
 mod superseded_source;
 mod superseded_verifier;
+pub(crate) use superseded_verifier::is_superseded_identity_scope;
 mod token;
 mod transaction;
 mod value;

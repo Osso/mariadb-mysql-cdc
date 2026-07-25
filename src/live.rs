@@ -61,6 +61,7 @@ pub(crate) use recovery::{
 use repair::{FailedStatementRepairer, repair_failed_statement};
 pub(crate) use schema_recovery::mysql_compatible_create_table;
 use schema_recovery::mysql_executor_with_recovery;
+pub(crate) use structured_stream::is_superseded_identity_scope;
 
 #[cfg(feature = "integration-failpoints")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

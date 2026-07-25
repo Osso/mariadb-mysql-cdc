@@ -198,18 +198,19 @@ fn is_deferred_superseded_insert(
     {
         return false;
     }
-    let users_name = table.schema == "globalcomix"
-        && table.table == "users"
-        && conflict.duplicate_index.as_deref() == Some("users.name");
-    let comics_slug = table.schema == "globalcomix"
-        && table.table == "comics"
-        && conflict.duplicate_index.as_deref() == Some("comics.slug");
+    // Must stay in step with SUPERSEDED_IDENTITY_SCOPES in superseded_verifier: a candidate that is
+    // not deferred here never reaches the proof, whatever that scope allows.
+    let superseded_identity = table.schema == "globalcomix"
+        && crate::live::is_superseded_identity_scope(
+            &table.table,
+            conflict.duplicate_index.as_deref(),
+        );
     let releases_superseded_parent = table.schema == "globalcomix"
         && table.table == "releases"
         && conflict.error_code == MISSING_PARENT_FK_ERROR_CODE
         && (is_exact_releases_category_constraint_error(&conflict.error_text)
             || is_exact_releases_visibility_constraint_error(&conflict.error_text));
-    users_name || comics_slug || releases_superseded_parent
+    superseded_identity || releases_superseded_parent
 }
 
 fn is_exact_releases_category_constraint_error(error_text: &str) -> bool {

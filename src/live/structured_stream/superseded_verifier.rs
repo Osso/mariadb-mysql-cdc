@@ -23,6 +23,12 @@ const SUPERSEDED_IDENTITY_SCOPES: &[(&str, &str, &str)] = &[
     ("artists", "artists.idx_slug", "name"),
 ];
 
+/// Whether a table and duplicate index are a supported superseded-identity scope. The deferral gate
+/// in `row::conflict` uses this so a candidate cannot be filtered out before reaching the proof.
+pub(crate) fn is_superseded_identity_scope(table: &str, duplicate_index: Option<&str>) -> bool {
+    superseded_identity_column(table, duplicate_index).is_some()
+}
+
 /// The identity column for a supported table, or `None` when the table is out of scope.
 fn superseded_identity_column(table: &str, duplicate_index: Option<&str>) -> Option<&'static str> {
     SUPERSEDED_IDENTITY_SCOPES
@@ -774,6 +780,26 @@ mod tests {
         candidate.observation.duplicate_index = Some("artists.idx_slug".to_string());
 
         assert!(validate_exact_scope(&candidate).is_ok());
+    }
+
+    /// The deferral gate and the proof scope must agree, or a candidate is filtered out before the
+    /// proof ever runs. Extending only the proof left artists 32268 stalled with no rejection logged.
+    #[test]
+    fn deferral_scope_matches_the_proof_scope() {
+        for (table, index, _) in SUPERSEDED_IDENTITY_SCOPES {
+            assert!(
+                is_superseded_identity_scope(table, Some(index)),
+                "{table}/{index} must be deferrable"
+            );
+        }
+        assert!(!is_superseded_identity_scope(
+            "artists",
+            Some("artists.name")
+        ));
+        assert!(!is_superseded_identity_scope(
+            "releases",
+            Some("releases.slug")
+        ));
     }
 
     /// A table outside the list, or the right table with the wrong index, must stay rejected.
