@@ -87,18 +87,18 @@ pub(crate) enum SupersededInsertRejection {
 pub(crate) fn verify_superseded_insert(
     candidate: &SupersededInsertVerificationInput,
 ) -> Result<SupersededInsertProof, SupersededInsertRejection> {
-    let supported_scope =
-        candidate.schema == "globalcomix" && matches!(candidate.table.as_str(), "users" | "comics");
+    let supported_scope = candidate.schema == "globalcomix"
+        && matches!(candidate.table.as_str(), "users" | "comics" | "artists");
     if !supported_scope {
         return Err(SupersededInsertRejection::WrongScope);
     }
     if candidate.operation != crate::conflict_repair::ConflictOperation::Insert {
         return Err(SupersededInsertRejection::WrongOperation);
     }
-    let expected_index = if candidate.table == "comics" {
-        "comics.slug"
-    } else {
-        "users.name"
+    let expected_index = match candidate.table.as_str() {
+        "comics" => "comics.slug",
+        "artists" => "artists.idx_slug",
+        _ => "users.name",
     };
     if candidate.duplicate_index != expected_index {
         return Err(SupersededInsertRejection::WrongDuplicateIndex);
@@ -223,6 +223,39 @@ mod tests {
         candidate.target_owner_primary_key = "48058".to_string();
         candidate.target_owner_identity = "misc".to_string();
         candidate
+    }
+
+    fn valid_artists_slug_candidate() -> SupersededInsertVerificationInput {
+        let mut candidate = valid_candidate();
+        candidate.table = "artists".to_string();
+        candidate.duplicate_index = "artists.idx_slug".to_string();
+        candidate.historical_primary_key = "32168".to_string();
+        candidate.historical_name = "kalyancomics".to_string();
+        candidate.source_primary_name = "renamed-kalyancomics".to_string();
+        candidate.source_owner_primary_key = "32210".to_string();
+        candidate.target_owner_primary_key = "32210".to_string();
+        candidate.target_owner_identity = "kalyancomics".to_string();
+        candidate
+    }
+
+    #[test]
+    fn artists_slug_supersession_requires_exact_table_and_index_identity() {
+        let candidate = valid_artists_slug_candidate();
+        verify_superseded_insert(&candidate).expect("complete artists.idx_slug proof");
+
+        let mut wrong_index = candidate.clone();
+        wrong_index.duplicate_index = "artists.name".to_string();
+        assert_eq!(
+            verify_superseded_insert(&wrong_index),
+            Err(SupersededInsertRejection::WrongDuplicateIndex)
+        );
+
+        let mut wrong_table = candidate;
+        wrong_table.table = "artists_history".to_string();
+        assert_eq!(
+            verify_superseded_insert(&wrong_table),
+            Err(SupersededInsertRejection::WrongScope)
+        );
     }
 
     #[test]
