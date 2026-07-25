@@ -727,6 +727,7 @@ fn reserve_under_admission_lock(
     table: &str,
     active_count: usize,
 ) -> Result<bool, String> {
+    reap_abandoned_runs(connection, progress_table)?;
     let occupied_slots = count_occupied_slots(connection, server_namespace)?;
     let active_runs = inspect_active_runs(
         connection,
@@ -756,6 +757,35 @@ fn reserve_under_admission_lock(
     }
     release_named_lock(connection, &table_lock)?;
     Ok(false)
+}
+
+/// The `last_error` recorded on a `running` row whose worker died without releasing its run lock.
+pub(crate) const ABANDONED_RUN_ERROR: &str =
+    "run abandoned: worker exited without releasing its run lock";
+
+/// Marks `running` rows whose worker is gone as `error` so the table stops claiming to be live.
+///
+/// A run acquires `GET_LOCK(SHA2(run_id,256))` before it writes its row and holds it for the
+/// process lifetime, so a `running` row without that lock cannot be a starting worker - it is a
+/// dead one. Admission already ignored these for capacity, which left them `running` forever and
+/// made the table unreadable as status. Recording them as errors keeps the resume path intact: a
+/// later run with the same identity claims the failed row and continues from its stored key.
+///
+/// Runs under the admission lock, so two workers cannot reap concurrently.
+fn reap_abandoned_runs(connection: &mut Conn, progress_table: &str) -> Result<usize, String> {
+    let table_path = quote_identifier_path(progress_table);
+    let sql = format!(
+        "UPDATE {table_path} SET status = 'error', last_error = ? \
+         WHERE status = 'running' AND IS_USED_LOCK(SHA2(run_id, 256)) IS NULL"
+    );
+    connection
+        .exec_drop(&sql, (ABANDONED_RUN_ERROR,))
+        .map_err(|error| format!("failed to reap abandoned table sync runs: {error}"))?;
+    let reaped = usize::try_from(connection.affected_rows()).unwrap_or(usize::MAX);
+    if reaped > 0 {
+        println!("cdc_table_sync_runs_reaped abandoned_runs={reaped}");
+    }
+    Ok(reaped)
 }
 
 fn count_occupied_slots(connection: &mut Conn, server_namespace: &str) -> Result<usize, String> {
