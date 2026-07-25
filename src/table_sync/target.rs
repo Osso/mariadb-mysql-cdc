@@ -85,6 +85,87 @@ where
     }
 }
 
+/// At most this many misfiled owners may be deleted for one duplicate batch.
+///
+/// The fault seen in production arrives in small contiguous blocks. A larger batch means the
+/// premise is wrong, so the repair stops instead of deleting at scale.
+const MISFILED_OWNER_RECLAIM_LIMIT: usize = 64;
+
+/// The single target row that holds `source_row`'s unique key under a different primary key.
+///
+/// Returns `None` when nothing may be deleted: no owner, an ambiguous owner, the owner is the
+/// rightful row, or the source agrees the owner's primary key owns this unique value.
+fn misfiled_duplicate_owner(
+    context: &MySqlFkRepairContext,
+    table: &TableInventory,
+    key_columns: &[String],
+    source_row: &SnapshotRow,
+) -> Result<Option<SnapshotRow>, TableSyncError> {
+    let key_identity = column_identity(table, source_row, key_columns)?;
+    let owners = context
+        .target
+        .read_exact_inventory_rows(table, &key_identity)?;
+    let [owner] = owners.as_slice() else {
+        return Ok(None);
+    };
+    if owner.primary_key == source_row.primary_key {
+        return Ok(None);
+    }
+    let owner_identity = table
+        .primary_key
+        .iter()
+        .cloned()
+        .zip(owner.primary_key.iter().cloned())
+        .collect::<Vec<_>>();
+    let source_at_owner_key = context
+        .source
+        .read_exact_inventory_rows(table, &owner_identity)?;
+    let source_key_at_owner = match source_at_owner_key.as_slice() {
+        [] => None,
+        [source_owner] => Some(column_identity(table, source_owner, key_columns)?),
+        // An ambiguous source read proves nothing.
+        _ => return Ok(None),
+    };
+    Ok(owner_is_misfiled(&key_identity, source_key_at_owner.as_deref()).then(|| owner.clone()))
+}
+
+/// Whether the target owner of `key_identity` may be deleted.
+///
+/// `source_key_at_owner` is the unique value the source stores at the owner's primary key, or `None`
+/// when the source has no row there. The owner is misfiled only when the source does not agree that
+/// its primary key owns this unique value: an absent source row, or a source row holding a different
+/// value. Agreement means the owner is the rightful row and must survive.
+fn owner_is_misfiled(
+    key_identity: &[(String, String)],
+    source_key_at_owner: Option<&[(String, String)]>,
+) -> bool {
+    match source_key_at_owner {
+        None => true,
+        Some(source_key) => source_key != key_identity,
+    }
+}
+
+/// The named columns of a row as (column, value) pairs, in the order given.
+fn column_identity(
+    table: &TableInventory,
+    row: &SnapshotRow,
+    columns: &[String],
+) -> Result<Vec<(String, String)>, TableSyncError> {
+    columns
+        .iter()
+        .map(|column| {
+            let value = row.values.get(column).cloned().flatten().ok_or_else(|| {
+                TableSyncError::Repair(format!(
+                    "unique key column `{column}` is NULL or missing on `{}`; a NULL key cannot \
+                     collide",
+                    table.name
+                ))
+            })?;
+            Ok((column.clone(), value))
+        })
+        .collect()
+}
+
 pub(crate) struct MySqlSyncRepairTarget {
     writer: TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
     fk_repair: Option<MySqlFkRepairContext>,
@@ -95,6 +176,8 @@ struct MySqlFkRepairContext {
     target: MySqlSyncReader,
     tables: BTreeMap<String, TableInventory>,
     edges: Vec<ForeignKeyEdge>,
+    /// Source secondary unique indexes by table, as (index name, key columns).
+    unique_indexes: BTreeMap<String, Vec<(String, Vec<String>)>>,
 }
 
 impl MySqlSyncRepairTarget {
@@ -119,6 +202,19 @@ impl MySqlSyncRepairTarget {
             .into_iter()
             .map(|table| (table.name.clone(), table))
             .collect();
+        let mut unique_indexes: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
+        for index in &source_inventory.indexes {
+            if !index.unique || index.name.eq_ignore_ascii_case("PRIMARY") {
+                continue;
+            }
+            unique_indexes
+                .entry(index.table.clone())
+                .or_default()
+                .push((
+                    index.name.clone(),
+                    index.columns.iter().map(|part| part.name.clone()).collect(),
+                ));
+        }
         let edges = merged_fk_edges(
             &source_inventory.schema,
             &target_inventory.schema,
@@ -132,6 +228,7 @@ impl MySqlSyncRepairTarget {
                 target,
                 tables,
                 edges,
+                unique_indexes,
             }),
         }
     }
@@ -193,7 +290,7 @@ impl MySqlSyncRepairTarget {
     }
 
     fn rows_missing_after_duplicate(
-        &self,
+        &mut self,
         rows: &[SnapshotRow],
         duplicate_error: &str,
     ) -> Result<Vec<SnapshotRow>, TableSyncError> {
@@ -202,8 +299,8 @@ impl MySqlSyncRepairTarget {
                 "duplicate reconciliation context is unavailable".to_string(),
             ));
         };
-        let table_name = self.writer.table_name();
-        let table = context.tables.get(table_name).ok_or_else(|| {
+        let table_name = self.writer.table_name().to_string();
+        let table = context.tables.get(&table_name).ok_or_else(|| {
             TableSyncError::Repair(format!("source inventory is missing table `{table_name}`"))
         })?;
         let mut missing = Vec::new();
@@ -221,12 +318,90 @@ impl MySqlSyncRepairTarget {
             }
         }
         if missing.len() == rows.len() {
-            return Err(TableSyncError::Repair(format!(
-                "duplicate key for `{table_name}` is owned by a different target identity; {}",
-                foreign_owned_duplicate_evidence(rows, duplicate_error)
-            )));
+            let reclaimed = self.reclaim_misfiled_duplicate_owners(rows, duplicate_error)?;
+            if reclaimed == 0 {
+                return Err(TableSyncError::Repair(format!(
+                    "duplicate key for `{table_name}` is owned by a different target identity; {}",
+                    foreign_owned_duplicate_evidence(rows, duplicate_error)
+                )));
+            }
         }
         Ok(missing)
+    }
+
+    /// Deletes target rows that hold a source row's unique key under the wrong primary key.
+    ///
+    /// A row copied without preserving the source primary key lands on a fresh auto_increment value.
+    /// Its unique key then belongs to the wrong primary key, so the rightful row can never be
+    /// inserted, and every update addressed by primary key silently finds nothing. The only way to
+    /// converge is to remove the misfiled row, which is destructive, so each deletion must be proven:
+    ///
+    ///   - the source row being inserted is absent from the target by primary key, already
+    ///     established by the caller;
+    ///   - exactly one target row owns the conflicting unique value;
+    ///   - that owner's primary key differs from the source row's;
+    ///   - the source row at the owner's primary key is absent, or present with a different unique
+    ///     value. This is the decisive check: if the source agrees that the owner's primary key owns
+    ///     this unique value, the owner is legitimate and nothing may be deleted.
+    ///
+    /// Anything else fails closed and leaves the conflict for an operator.
+    fn reclaim_misfiled_duplicate_owners(
+        &mut self,
+        rows: &[SnapshotRow],
+        duplicate_error: &str,
+    ) -> Result<usize, TableSyncError> {
+        let Some(index) = crate::target::duplicate_index_from_error(duplicate_error) else {
+            return Ok(0);
+        };
+        let index = index.rsplit('.').next().unwrap_or(&index).to_string();
+        if index.eq_ignore_ascii_case("PRIMARY") {
+            return Ok(0);
+        }
+        let table_name = self.writer.table_name().to_string();
+        let mut owners = Vec::new();
+        {
+            let Some(context) = &self.fk_repair else {
+                return Ok(0);
+            };
+            let table = context.tables.get(&table_name).ok_or_else(|| {
+                TableSyncError::Repair(format!("source inventory is missing table `{table_name}`"))
+            })?;
+            let Some(key_columns) = context
+                .unique_indexes
+                .get(&table_name)
+                .and_then(|indexes| {
+                    indexes
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&index))
+                })
+                .map(|(_, columns)| columns.clone())
+            else {
+                return Ok(0);
+            };
+            for source_row in rows {
+                let Some(owner) =
+                    misfiled_duplicate_owner(context, table, &key_columns, source_row)?
+                else {
+                    continue;
+                };
+                owners.push((owner, source_row.primary_key.clone()));
+            }
+        }
+        if owners.len() > MISFILED_OWNER_RECLAIM_LIMIT {
+            return Err(TableSyncError::Repair(format!(
+                "refusing to reclaim {} misfiled duplicate owners on `{table_name}`; the limit is {MISFILED_OWNER_RECLAIM_LIMIT}",
+                owners.len()
+            )));
+        }
+        for (owner, rightful_primary_key) in &owners {
+            println!(
+                "cdc_misfiled_duplicate_owner_reclaimed table={table_name} index={index} \
+                 deleted_primary_key={:?} rightful_primary_key={:?}",
+                owner.primary_key, rightful_primary_key
+            );
+            self.delete_row(&owner.primary_key)?;
+        }
+        Ok(owners.len())
     }
 
     fn insert_child_batch(&mut self, batch: &[SnapshotRow]) -> Result<(), TableSyncError> {
@@ -830,6 +1005,61 @@ fn foreign_owned_duplicate_evidence(rows: &[SnapshotRow], duplicate_error: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(column, value)| (column.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// The observed production fault: the source has no row at the owner's primary key, because the
+    /// owner was inserted on a fresh auto_increment value.
+    #[test]
+    fn an_owner_absent_from_the_source_is_misfiled() {
+        let key = identity(&[("token", "62935919")]);
+
+        assert!(owner_is_misfiled(&key, None));
+    }
+
+    /// The source stores a different value at that primary key, so the owner cannot belong there.
+    #[test]
+    fn an_owner_whose_source_row_holds_another_value_is_misfiled() {
+        let key = identity(&[("user_id", "1916267"), ("entity_id", "3")]);
+        let at_owner = identity(&[("user_id", "1917680"), ("entity_id", "3")]);
+
+        assert!(owner_is_misfiled(&key, Some(&at_owner)));
+    }
+
+    /// The decisive negative: the source agrees this primary key owns the value, so the target row is
+    /// the rightful one and deleting it would destroy live data.
+    #[test]
+    fn an_owner_the_source_agrees_with_is_never_misfiled() {
+        let key = identity(&[("token", "62935919")]);
+
+        assert!(!owner_is_misfiled(&key, Some(&key)));
+    }
+
+    #[test]
+    fn a_null_unique_key_column_cannot_be_reclaimed() {
+        let table = TableInventory {
+            name: "users_offers".to_string(),
+            table_type: "BASE TABLE".to_string(),
+            engine: None,
+            collation: None,
+            primary_key: vec!["id".to_string()],
+            columns: Vec::new(),
+        };
+        let row = SnapshotRow {
+            primary_key: vec!["7".to_string()],
+            values: [("uuid".to_string(), None)].into_iter().collect(),
+        };
+
+        let error = column_identity(&table, &row, &["uuid".to_string()])
+            .expect_err("a NULL unique key cannot collide");
+
+        assert!(error.to_string().contains("NULL"), "{error}");
+    }
 
     fn evidence_row(primary_key: &str) -> SnapshotRow {
         SnapshotRow {

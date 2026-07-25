@@ -7,6 +7,18 @@ are resolved only after verified equality. The current table-sync recovery contr
 
 ## What it must do
 
+- [x] Reclaim a target row that holds a source row's secondary unique key under the
+      wrong primary key. A row copied without preserving the primary key lands on a
+      fresh auto_increment value, so the rightful row can never be inserted and every
+      update addressed by primary key silently finds nothing; the only convergence is
+      to delete the misfiled row. Each deletion is proven: the source row is absent
+      from the target by primary key, exactly one target row owns the conflicting
+      unique value, its primary key differs, and the source either has no row at that
+      primary key or holds a different unique value there. A source that agrees the
+      owner's primary key owns the value proves the owner is rightful and nothing is
+      deleted. Ambiguous reads, a NULL key column, a `PRIMARY` duplicate, an unknown
+      index, and more than 64 owners in one batch all fail closed. Each deletion emits
+      `cdc_misfiled_duplicate_owner_reclaimed` with both primary keys.
 - [x] Compare rows by configured primary-key columns.
 - [x] Report missing source rows, divergent rows, and target extras.
 - [x] Apply divergent rows in bounded primary-key update batches, with at most
