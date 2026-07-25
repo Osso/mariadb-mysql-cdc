@@ -2283,13 +2283,16 @@ fn canonical_default(default: Option<&str>) -> Option<String> {
 }
 
 /// `current_timestamp()` and `CURRENT_TIMESTAMP` are the same default; only an explicit
-/// fractional-second precision distinguishes them.
+/// fractional-second precision distinguishes them. Any other value is data, so its case stands.
 fn canonical_current_timestamp(value: &str) -> String {
     let lowered = value.to_ascii_lowercase();
-    if lowered == "current_timestamp" || lowered == "current_timestamp()" {
-        return "current_timestamp".to_string();
+    if lowered.starts_with("current_timestamp") {
+        if lowered == "current_timestamp()" {
+            return "current_timestamp".to_string();
+        }
+        return lowered;
     }
-    lowered
+    value.to_string()
 }
 
 /// MySQL adds a `DEFAULT_GENERATED` marker for expression defaults that MariaDB never reports.
@@ -3394,6 +3397,11 @@ mod tests {
                 "bit literal default",
                 defaulted_column("bit(1)", Some("b'0'"), ""),
                 defaulted_column("bit(1)", Some("b'0'"), ""),
+            ),
+            (
+                "upper-case string default",
+                defaulted_column("varchar(10)", Some("'POST'"), ""),
+                defaulted_column("varchar(10)", Some("POST"), ""),
             ),
         ];
         for (label, source, target) in cases {
