@@ -52,6 +52,8 @@ SCENARIOS = (
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("home-feed-card-parent-recovery", True),
     ScenarioSpec("superseded-release-parent-recovery", True),
+    ScenarioSpec("generic-fk-missing-parent", True),
+    ScenarioSpec("generic-fk-superseded-attribute", True),
     ScenarioSpec("superseded-users-recovery", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("create-table-crash-restart", True),
@@ -969,6 +971,129 @@ class Harness:
         """
         self.admin_sql(self.source, schema)
         self.admin_sql(self.target, schema)
+
+    GENERIC_FK_SCHEMA = """
+            CREATE TABLE artists (
+                id BIGINT NOT NULL PRIMARY KEY,
+                name VARCHAR(190) NOT NULL,
+                UNIQUE KEY uq_artist_identity (id, name)
+            ) ENGINE=InnoDB;
+            CREATE TABLE artist_comics (
+                id BIGINT NOT NULL PRIMARY KEY,
+                title VARCHAR(190) NOT NULL,
+                artist_id BIGINT NOT NULL,
+                artist_name VARCHAR(190) NOT NULL,
+                CONSTRAINT fk_artist_comics_artist FOREIGN KEY (artist_id, artist_name)
+                    REFERENCES artists(id, name) ON DELETE RESTRICT ON UPDATE CASCADE
+            ) ENGINE=InnoDB;
+        """
+
+    def run_generic_fk_missing_parent(self) -> None:
+        """An unenumerated constraint whose parent the target does not hold yet.
+
+        No coordinate is pinned anywhere: the constraint identity comes from the 1452 text and the
+        parent's primary key from the schema inventory.
+        """
+        assert self.source and self.target
+        self.admin_sql(self.source, self.GENERIC_FK_SCHEMA)
+        self.admin_sql(self.target, self.GENERIC_FK_SCHEMA)
+        self.admin_sql(self.source, "INSERT INTO artists VALUES (1,'Ada');")
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO artist_comics VALUES (10,'Comic A',1,'Ada');",
+        )
+        stop = self.coordinate()
+
+        result = self.run_stream(start, stop, max_reconnects=1)
+        require_success(result, "generic missing parent recovery")
+
+        parent = self.query(
+            self.target,
+            "SELECT id,name FROM artists WHERE id=1;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if parent != "1\tAda":
+            raise HarnessError(f"installed parent mismatch: {parent!r}")
+        child = self.query(
+            self.target,
+            "SELECT id,title,artist_id,artist_name FROM artist_comics WHERE id=10;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if child != "10\tComic A\t1\tAda":
+            raise HarnessError(f"replayed child mismatch: {child!r}")
+        if int(self.query(
+            self.target,
+            "SELECT COUNT(*) FROM artists;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()) != 1:
+            raise HarnessError("recovery must install exactly one parent")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(
+            checkpoint.get("source_position", 0)
+        ) != stop.position:
+            raise HarnessError(f"checkpoint did not advance to the child XID: {checkpoint}")
+        print(
+            "generic_fk_missing_parent_ok constraint=fk_artist_comics_artist "
+            f"boundary={start.file}:{start.position}-{stop.position} parent_id=1 child_id=10"
+        )
+
+    def run_generic_fk_superseded_attribute(self) -> None:
+        """The production race: the target parent already moved on while the stream replays.
+
+        The child event carries the historical `artist_name`, so only that derived column may be
+        fast-forwarded; the title must stay historical and the parent must not be touched.
+        """
+        assert self.source and self.target
+        self.admin_sql(self.source, self.GENERIC_FK_SCHEMA)
+        self.admin_sql(self.target, self.GENERIC_FK_SCHEMA)
+        self.admin_sql(self.source, "INSERT INTO artists VALUES (2,'Bob');")
+        self.admin_sql(self.target, "INSERT INTO artists VALUES (2,'Bob');")
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO artist_comics VALUES (20,'Historical Title',2,'Bob');",
+        )
+        stop = self.coordinate()
+        # Catch-up copied the current parent while the stream still replays the older child event.
+        self.admin_sql(self.target, "UPDATE artists SET name='Robert' WHERE id=2;")
+
+        result = self.run_stream(start, stop, max_reconnects=1)
+        require_success(result, "generic superseded attribute recovery")
+
+        child = self.query(
+            self.target,
+            "SELECT id,title,artist_id,artist_name FROM artist_comics WHERE id=20;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if child != "20\tHistorical Title\t2\tRobert":
+            raise HarnessError(
+                f"only the derived column may be fast-forwarded: {child!r}"
+            )
+        parent = self.query(
+            self.target,
+            "SELECT id,name FROM artists WHERE id=2;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if parent != "2\tRobert":
+            raise HarnessError(f"recovery must not mutate the parent: {parent!r}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(
+            checkpoint.get("source_position", 0)
+        ) != stop.position:
+            raise HarnessError(f"checkpoint did not advance to the child XID: {checkpoint}")
+        print(
+            "generic_fk_superseded_attribute_ok constraint=fk_artist_comics_artist "
+            f"boundary={start.file}:{start.position}-{stop.position} "
+            "substituted=artist_name:Bob->Robert title_preserved=1 parent_unchanged=1"
+        )
 
     def run_home_feed_card_parent_recovery(self) -> None:
         assert self.source and self.target
@@ -3180,8 +3305,10 @@ class Harness:
             self.target,
             "SELECT id,comic_id,comic_category_id,payload FROM releases WHERE id=384446;",
         ).strip()
-        if release != "384446\t18384\t26\tcurrent release":
-            raise HarnessError(f"current release recovery mismatch: {release!r}")
+        # Column substitution replaced the whole-current-row install: only the derived referenced
+        # column moves to the locked parent's section_id, so the payload stays historical.
+        if release != "384446\t18384\t26\thistorical release":
+            raise HarnessError(f"derived column fast-forward mismatch: {release!r}")
         effect = self.admin_query(
             self.target,
             "SELECT id,payload FROM release_transaction_effects WHERE id=900001;",
@@ -3189,22 +3316,16 @@ class Harness:
         if effect != "900001\tsame transaction effect":
             raise HarnessError(f"remaining transaction effect did not commit: {effect!r}")
 
-        self.assert_superseded_release_failure(
-            label="current source release mismatch",
-            source_release_mismatch=True,
-        )
-        self.assert_superseded_release_failure(
-            label="current target parent mismatch",
-            target_parent_section=25,
-        )
-        self.assert_superseded_release_failure(
-            label="current target parent absence",
-            target_parent_section=None,
-        )
-        self.assert_superseded_release_failure(
-            label="later source history not proven",
-            prove_later_history=False,
-        )
+        # The four fail-closed cases that used to live here guarded evidence the whole-current-row
+        # install consumed: the current source release row, and proof that source history moved
+        # later. Column substitution reads neither. It takes the locked parent's current value for
+        # the derived column only, on the approved reasoning that the next replayed parent update
+        # writes the same value and, if the parent never changes again, the target value is already
+        # final. A differing or absent target parent is now a resolved outcome rather than a stall:
+        # differing fast-forwards to it, absent installs the exact source parent. The fail-closed
+        # boundaries of the unified path are ambiguity, a locked shape disagreeing with the error,
+        # and a NULL referenced key, covered by foreign_key_repair unit tests and by the
+        # generic-fk-* scenarios.
 
         replay_start, replay_stop = self.prepare_superseded_release_case(
             target_current_release=True,
@@ -4477,6 +4598,10 @@ class Harness:
             self.run_home_feed_card_parent_recovery()
         elif scenario == "superseded-release-parent-recovery":
             self.run_superseded_release_parent_recovery()
+        elif scenario == "generic-fk-missing-parent":
+            self.run_generic_fk_missing_parent()
+        elif scenario == "generic-fk-superseded-attribute":
+            self.run_generic_fk_superseded_attribute()
         elif scenario == "superseded-users-recovery":
             self.run_superseded_users_recovery()
         elif scenario == "production-alter-table":

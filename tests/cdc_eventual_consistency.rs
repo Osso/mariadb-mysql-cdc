@@ -175,6 +175,44 @@ fn real_superseded_release_parent_recovery_preserves_current_rows_and_commits_re
     );
 }
 
+/// An unenumerated constraint recovers with no coordinate pinned anywhere.
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_generic_fk_missing_parent_installs_parent_and_replays_child() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("generic-fk-missing-parent")
+        .output()
+        .expect("run generic fk missing parent harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The target parent moved on while the stream replays, so only the child's derived column moves.
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_generic_fk_superseded_attribute_fast_forwards_only_derived_columns() {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("generic-fk-superseded-attribute")
+        .output()
+        .expect("run generic fk superseded attribute harness");
+
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_missing_pk_two_parent_collision_rolls_back_atomically() {
