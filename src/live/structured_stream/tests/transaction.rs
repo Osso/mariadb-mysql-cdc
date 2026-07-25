@@ -34,6 +34,7 @@ fn superseded_scope_rejections_are_retryable_not_fatal() {
          globalcomix.comics/comics.slug",
         "superseded insert rejected: requires INSERT",
         "superseded insert rejected: historical change must be INSERT",
+        "superseded foreign key insert rejected: NoDerivedDrift",
     ] {
         assert!(
             matches!(

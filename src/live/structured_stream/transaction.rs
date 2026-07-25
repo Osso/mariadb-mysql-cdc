@@ -31,6 +31,7 @@ impl Default for TargetTransactionGroupConfig {
 pub(super) fn superseded_verification_error(message: String) -> ApplyBinlogError {
     if message.starts_with("superseded release insert rejected:")
         || message.starts_with("superseded insert rejected:")
+        || message.starts_with("superseded foreign key insert rejected:")
     {
         ApplyBinlogError::SupersededRecoveryFailed(message)
     } else {
