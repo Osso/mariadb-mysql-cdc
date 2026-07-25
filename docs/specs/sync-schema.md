@@ -44,6 +44,11 @@ Both engines describe an identical converged column differently, so comparison u
 - [x] Apply by default; there is no implicit dry-run mode.
 - [x] Allow destructive convergence, including dropping target-only selected-table objects, changing column definitions, and narrowing types when the actual-data preflight proves the conversion safe.
 - [x] Preflight existing target data before every potentially lossy column conversion.
+- [x] Skip the preflight for a conversion no target row can violate, rather than counting every row
+      as a blocker because no predicate is expressible. MariaDB spells a JSON column `LONGTEXT` with
+      a `json_valid()` CHECK while MySQL has a native type, and every stored JSON document
+      serialises into `LONGTEXT`, so replacing the native type with that spelling can neither reject
+      nor truncate a row. The reverse direction is not safe and still preflights.
 - [x] Never truncate, coerce, discard, clamp, or silently rewrite existing target values to make an ALTER succeed.
 - [x] If data would be rejected, truncated, or coerced, fail that table's operation, report the blocking condition and representative primary-key sample values, and continue independent tables.
 - [x] Apply foreign keys and other dependency-sensitive objects only after their prerequisites converge; skip dependent operations when a prerequisite failed.

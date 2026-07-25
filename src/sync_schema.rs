@@ -1266,6 +1266,14 @@ impl SchemaCoercionPreflight for MySqlCoercionPreflight {
         source: &ColumnInventory,
         target: &ColumnInventory,
     ) -> Result<CoercionBlockers, String> {
+        if conversion_is_provably_safe(source, target) {
+            return Ok(CoercionBlockers {
+                predicate: None,
+                count: 0,
+                sample_primary_keys: Vec::new(),
+                sample_error: None,
+            });
+        }
         let predicate = coercion_blocker_predicate(source, target).ok();
         let query_predicate = predicate.as_deref().unwrap_or("TRUE");
         let mut connection = self.connect()?;
@@ -2056,6 +2064,19 @@ fn schema_table_differences(
         differences.push("foreign keys differ".to_string());
     }
     differences
+}
+
+/// Conversions no target row can violate, so no target-data check is required.
+///
+/// Without this, a conversion that has no expressible predicate falls back to counting every row as
+/// a blocker, which blocks the table outright. MySQL stores `json` as a validated document and every
+/// such document serialises into `LONGTEXT`, so replacing the native type with MariaDB's
+/// `LONGTEXT` + `json_valid()` spelling can neither reject nor truncate a row.
+fn conversion_is_provably_safe(source: &ColumnInventory, target: &ColumnInventory) -> bool {
+    target.data_type.eq_ignore_ascii_case("json")
+        && source.data_type.eq_ignore_ascii_case("longtext")
+        && source.generated == target.generated
+        && (source.is_nullable || !target.is_nullable)
 }
 
 fn coercion_blocker_predicate(
@@ -3592,6 +3613,31 @@ mod tests {
     /// A converged run must plan nothing on the next run.
     /// A column whose only difference is collation spelling needs no conversion, so demanding a
     /// preflight for it blocked the table on a predicate that does not exist.
+    /// MariaDB spells a JSON column `LONGTEXT` plus a `json_valid()` CHECK; MySQL has a native
+    /// type. Replacing the native type with that spelling cannot reject or truncate a row, and
+    /// without recognising that, the preflight counts every row as a blocker and blocks the table.
+    #[test]
+    fn a_native_json_target_converts_to_longtext_without_a_data_check() {
+        let mut source = column("config", "longtext", false);
+        source.data_type = "longtext".to_string();
+        source.character_set = Some("utf8mb4".to_string());
+        source.collation = Some("utf8mb4_bin".to_string());
+        let mut target = column("config", "json", false);
+        target.data_type = "json".to_string();
+        target.character_set = None;
+        target.collation = None;
+
+        assert!(conversion_is_provably_safe(&source, &target));
+        assert!(column_change_requires_data_preflight(&source, &target));
+
+        // Not safe in the other direction: arbitrary text is not necessarily valid JSON.
+        assert!(!conversion_is_provably_safe(&target, &source));
+        // Nor when the source would newly forbid NULL.
+        let mut nullable_target = target.clone();
+        nullable_target.is_nullable = true;
+        assert!(!conversion_is_provably_safe(&source, &nullable_target));
+    }
+
     #[test]
     fn an_equivalent_collation_needs_no_data_preflight() {
         let mut source = column("alignment", "varchar(16)", true);
