@@ -117,11 +117,43 @@ pub(crate) struct SchemaConvergenceReport {
     pub(crate) tables: Vec<TableSchemaReport>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+/// `clause` keeps the endpoint's own text so an addition renders the source expression, while
+/// identity ignores the parentheses and charset introducers MySQL adds when it re-renders one.
+#[derive(Clone, Debug, Serialize)]
 struct CheckConstraint {
     table: String,
     name: String,
     clause: String,
+}
+
+impl CheckConstraint {
+    fn identity(&self) -> (&str, &str, String) {
+        (
+            &self.table,
+            &self.name,
+            canonical_sql_expression(&self.clause),
+        )
+    }
+}
+
+impl PartialEq for CheckConstraint {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for CheckConstraint {}
+
+impl PartialOrd for CheckConstraint {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CheckConstraint {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity().cmp(&other.identity())
+    }
 }
 
 pub(crate) trait SchemaStatementExecutor {
@@ -365,11 +397,11 @@ fn failed_table_plan(
     Ok(TableSchemaPlan {
         table: table.to_string(),
         source_fingerprint: source
-            .map(semantic_table_fingerprint)
+            .map(expected_target_table_fingerprint)
             .transpose()?
             .unwrap_or_default(),
         target_fingerprint: target
-            .map(semantic_table_fingerprint)
+            .map(observed_target_table_fingerprint)
             .transpose()?
             .unwrap_or_default(),
         dependencies: Vec::new(),
@@ -416,9 +448,9 @@ fn plan_table(
         .collect::<Vec<_>>();
     let mut plan = TableSchemaPlan {
         table: source_table.name.clone(),
-        source_fingerprint: semantic_table_fingerprint(source_table)?,
+        source_fingerprint: expected_target_table_fingerprint(source_table)?,
         target_fingerprint: target_table
-            .map(semantic_table_fingerprint)
+            .map(observed_target_table_fingerprint)
             .transpose()?
             .unwrap_or_default(),
         dependencies,
@@ -1266,13 +1298,7 @@ fn read_check_constraints(
     let opts = crate::inventory::reader::inventory_opts(config)?;
     let mut connection =
         Conn::new(opts).map_err(|error| format!("check inventory connection failed: {error}"))?;
-    let sql = "SELECT tc.TABLE_NAME,tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE \
-               FROM information_schema.TABLE_CONSTRAINTS tc \
-               JOIN information_schema.CHECK_CONSTRAINTS cc \
-                 ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA \
-                AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME \
-              WHERE tc.CONSTRAINT_SCHEMA=? AND tc.CONSTRAINT_TYPE='CHECK' \
-              ORDER BY tc.TABLE_NAME,tc.CONSTRAINT_NAME";
+    let sql = check_constraint_query(config.endpoint_role);
     connection
         .exec_map(
             sql,
@@ -1284,6 +1310,29 @@ fn read_check_constraints(
             },
         )
         .map_err(|error| format!("check constraint inventory failed: {error}"))
+}
+
+/// MariaDB reports the owning table in `CHECK_CONSTRAINTS` and allows one check name on
+/// several tables. MySQL's view has no table column, but its check names are unique per
+/// schema, so only there is the `TABLE_CONSTRAINTS` join both needed and unambiguous.
+fn check_constraint_query(endpoint_role: InventoryEndpointRole) -> &'static str {
+    match endpoint_role {
+        InventoryEndpointRole::Source => {
+            "SELECT TABLE_NAME,CONSTRAINT_NAME,CHECK_CLAUSE \
+               FROM information_schema.CHECK_CONSTRAINTS \
+              WHERE CONSTRAINT_SCHEMA=? \
+              ORDER BY TABLE_NAME,CONSTRAINT_NAME"
+        }
+        InventoryEndpointRole::Target => {
+            "SELECT tc.TABLE_NAME,tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE \
+               FROM information_schema.TABLE_CONSTRAINTS tc \
+               JOIN information_schema.CHECK_CONSTRAINTS cc \
+                 ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA \
+                AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME \
+              WHERE tc.CONSTRAINT_SCHEMA=? AND tc.CONSTRAINT_TYPE='CHECK' \
+              ORDER BY tc.TABLE_NAME,tc.CONSTRAINT_NAME"
+        }
+    }
 }
 
 fn checks_by_table(checks: &[CheckConstraint]) -> BTreeMap<String, Vec<CheckConstraint>> {
@@ -1537,7 +1586,8 @@ fn modeled_table_options_statement(
 fn render_table_options(table: &TableInventory) -> String {
     let engine = table.engine.as_deref().unwrap_or("InnoDB");
     let collation = table.collation.as_deref().map(|collation| {
-        let character_set = collation.split('_').next().unwrap_or(collation);
+        let collation = canonical_collation(collation);
+        let character_set = collation.split('_').next().unwrap_or(&collation);
         format!(" DEFAULT CHARACTER SET={character_set} COLLATE={collation}")
     });
     format!(
@@ -1570,7 +1620,8 @@ fn render_create_table(
         );
     }
     let collation = table.collation.as_deref().map(|collation| {
-        let character_set = collation.split('_').next().unwrap_or(collation);
+        let collation = canonical_collation(collation);
+        let character_set = collation.split('_').next().unwrap_or(&collation);
         format!(" DEFAULT CHARACTER SET={character_set} COLLATE={collation}")
     });
     format!(
@@ -1586,7 +1637,7 @@ fn render_column(column: &ColumnInventory) -> String {
     let mut rendered = format!(
         "`{}` {}",
         column.name,
-        column.column_type.to_ascii_uppercase()
+        uppercase_type_name(&column.column_type)
     );
     // `CHARACTER SET` and `COLLATE` belong to the data type, so MySQL rejects them after
     // nullability, a default, or a generated expression.
@@ -1594,7 +1645,7 @@ fn render_column(column: &ColumnInventory) -> String {
         rendered.push_str(&format!(" CHARACTER SET {character_set}"));
     }
     if let Some(collation) = &column.collation {
-        rendered.push_str(&format!(" COLLATE {collation}"));
+        rendered.push_str(&format!(" COLLATE {}", canonical_collation(collation)));
     }
     if let Some(generated) = &column.generated {
         rendered.push_str(&format!(
@@ -1632,6 +1683,8 @@ fn render_column(column: &ColumnInventory) -> String {
     rendered
 }
 
+/// MariaDB's `information_schema` reports a literal default already written as SQL: strings
+/// carry their quotes and bit literals their `b'..'` form. Only a bare value needs quoting.
 fn render_default(default: &str) -> String {
     if default.eq_ignore_ascii_case("current_timestamp")
         || default
@@ -1640,9 +1693,48 @@ fn render_default(default: &str) -> String {
         || default.eq_ignore_ascii_case("null")
     {
         default.to_ascii_uppercase()
+    } else if is_sql_literal(default) {
+        default.to_string()
     } else {
         format!("'{}'", default.replace('\'', "''"))
     }
+}
+
+fn is_sql_literal(default: &str) -> bool {
+    let bit_literal = default.len() > 3
+        && default.starts_with("b'")
+        && default.ends_with('\'')
+        && default[2..default.len() - 1]
+            .bytes()
+            .all(|byte| byte == b'0' || byte == b'1');
+    bit_literal || quoted_literal_body(default).is_some()
+}
+
+/// The body of a single-quoted SQL literal, with doubled quotes collapsed. `None` when the
+/// value is not one quoted literal.
+fn quoted_literal_body(value: &str) -> Option<String> {
+    let inner = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))?;
+    let mut body = String::with_capacity(inner.len());
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\'' => {
+                if characters.next() != Some('\'') {
+                    // An unescaped quote means the value is not one quoted literal.
+                    return None;
+                }
+                body.push('\'');
+            }
+            '\\' => {
+                body.push('\\');
+                body.push(characters.next()?);
+            }
+            other => body.push(other),
+        }
+    }
+    Some(body)
 }
 
 fn column_position(table: &TableInventory, index: usize) -> String {
@@ -1768,8 +1860,8 @@ fn schema_table_differences(
         return vec!["target table missing".to_string()];
     };
     let mut differences = Vec::new();
-    if semantic_table_fingerprint(source_table).ok()
-        != semantic_table_fingerprint(target_table).ok()
+    if expected_target_table_fingerprint(source_table).ok()
+        != observed_target_table_fingerprint(target_table).ok()
     {
         differences.push(
             "columns, generated expressions, primary key, engine, or collation differ".to_string(),
@@ -2044,16 +2136,168 @@ fn integer_rank(data_type: &str) -> Option<u8> {
     }
 }
 
-fn columns_equal(left: &ColumnInventory, right: &ColumnInventory) -> bool {
-    left.ordinal_position == right.ordinal_position
-        && left.comment == right.comment
-        && left.column_type.eq_ignore_ascii_case(&right.column_type)
-        && left.is_nullable == right.is_nullable
-        && left.default_value == right.default_value
-        && left.extra.eq_ignore_ascii_case(&right.extra)
-        && left.generated == right.generated
-        && left.character_set == right.character_set
-        && left.collation == right.collation
+/// Compare a source column against a target column through the MySQL form the translated DDL
+/// produces, so an already-converged column is not modified again.
+fn columns_equal(source: &ColumnInventory, target: &ColumnInventory) -> bool {
+    expected_target_column(source) == observed_target_column(target)
+}
+
+/// The MySQL column the translated source definition produces.
+fn expected_target_column(source: &ColumnInventory) -> ColumnInventory {
+    let mut expected = observed_target_column(source);
+    if expected.data_type.eq_ignore_ascii_case("timestamp") {
+        expected.data_type = "datetime".to_string();
+        expected.column_type = expected.column_type.replacen("timestamp", "datetime", 1);
+    }
+    expected
+}
+
+/// The same column described the way MySQL's `information_schema` reports it.
+///
+/// MariaDB and MySQL describe an identical column differently: MariaDB keeps the integer
+/// display widths MySQL 8 dropped, quotes literal defaults MySQL reports bare, spells a NULL
+/// default as the literal `NULL`, writes `current_timestamp()` where MySQL writes
+/// `CURRENT_TIMESTAMP`, omits MySQL's `DEFAULT_GENERATED` marker, names its UCA-1400
+/// collations differently, and prints generated expressions without MySQL's added
+/// parentheses and charset introducers.
+fn observed_target_column(column: &ColumnInventory) -> ColumnInventory {
+    let mut canonical = column.clone();
+    canonical.column_type = canonical_column_type(&column.column_type);
+    canonical.data_type = column.data_type.to_ascii_lowercase();
+    canonical.default_value = canonical_default(column.default_value.as_deref());
+    canonical.extra = canonical_extra(&column.extra);
+    canonical.collation = column.collation.as_deref().map(canonical_collation);
+    canonical.generated =
+        column
+            .generated
+            .as_ref()
+            .map(|generated| crate::inventory::GeneratedColumn {
+                expression: canonical_sql_expression(&generated.expression),
+                generation_kind: generated.generation_kind.to_ascii_lowercase(),
+            });
+    canonical
+}
+
+const INTEGER_TYPES: [&str; 6] = [
+    "tinyint",
+    "smallint",
+    "mediumint",
+    "int",
+    "integer",
+    "bigint",
+];
+
+/// Change the case of the type name and its trailing attributes only, because `ENUM` values
+/// are data and their case is significant.
+fn recase_type_name(column_type: &str, recase: fn(&str) -> String) -> String {
+    match type_parameter_span(column_type) {
+        Some((open, close)) => format!(
+            "{}{}{}",
+            recase(&column_type[..open]),
+            &column_type[open..=close],
+            recase(&column_type[close + 1..])
+        ),
+        None => recase(column_type),
+    }
+}
+
+fn uppercase_type_name(column_type: &str) -> String {
+    recase_type_name(column_type, str::to_ascii_uppercase)
+}
+
+/// Byte offsets of the type's opening and closing parenthesis, when it has parameters.
+fn type_parameter_span(column_type: &str) -> Option<(usize, usize)> {
+    let open = column_type.find('(')?;
+    let close = column_type.rfind(')')?;
+    (close > open).then_some((open, close))
+}
+
+/// MySQL 8 dropped integer display widths, so `int(11) unsigned` and `int unsigned` describe
+/// the same column and only the attributes after the width carry meaning.
+fn canonical_column_type(column_type: &str) -> String {
+    let lowered = recase_type_name(column_type, str::to_ascii_lowercase);
+    let Some((open, close)) = type_parameter_span(&lowered) else {
+        return lowered;
+    };
+    let base = lowered[..open].trim_end();
+    if !INTEGER_TYPES.contains(&base) {
+        return lowered;
+    }
+    let suffix = lowered[close + 1..].trim_start();
+    if suffix.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} {suffix}")
+    }
+}
+
+fn canonical_default(default: Option<&str>) -> Option<String> {
+    let default = default?;
+    if default.eq_ignore_ascii_case("null") {
+        return None;
+    }
+    if let Some(body) = quoted_literal_body(default) {
+        return Some(body);
+    }
+    Some(canonical_current_timestamp(default))
+}
+
+/// `current_timestamp()` and `CURRENT_TIMESTAMP` are the same default; only an explicit
+/// fractional-second precision distinguishes them.
+fn canonical_current_timestamp(value: &str) -> String {
+    let lowered = value.to_ascii_lowercase();
+    if lowered == "current_timestamp" || lowered == "current_timestamp()" {
+        return "current_timestamp".to_string();
+    }
+    lowered
+}
+
+/// MySQL adds a `DEFAULT_GENERATED` marker for expression defaults that MariaDB never reports.
+fn canonical_extra(extra: &str) -> String {
+    let lowered = extra.to_ascii_lowercase();
+    lowered
+        .replace("default_generated", "")
+        .replace("current_timestamp()", "current_timestamp")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// MariaDB 11 names its Unicode collations `*_uca1400_*`; MySQL spells the same ordering
+/// `utf8mb4_0900_*`, and has no UCA-1400 utf8mb3 collation beyond its general one.
+fn canonical_collation(collation: &str) -> String {
+    let lowered = collation.to_ascii_lowercase();
+    match lowered.as_str() {
+        "utf8mb4_uca1400_ai_ci" => "utf8mb4_0900_ai_ci".to_string(),
+        "utf8mb4_uca1400_as_cs" => "utf8mb4_0900_as_cs".to_string(),
+        "utf8mb3_uca1400_ai_ci" => "utf8mb3_general_ci".to_string(),
+        _ => lowered,
+    }
+}
+
+/// MySQL re-renders a stored expression - a generated column or a check clause - with its own
+/// parentheses, charset introducers, and spacing. Comparison therefore ignores the formatting
+/// MySQL controls, not the operands or operators.
+fn canonical_sql_expression(expression: &str) -> String {
+    let mut canonical = String::with_capacity(expression.len());
+    let lowered = expression.to_ascii_lowercase();
+    let mut rest = lowered.as_str();
+    while !rest.is_empty() {
+        if let Some(remainder) = rest
+            .strip_prefix("_utf8mb4")
+            .or_else(|| rest.strip_prefix("_utf8mb3"))
+        {
+            rest = remainder;
+            continue;
+        }
+        let mut characters = rest.chars();
+        let character = characters.next().expect("non-empty remainder");
+        if !matches!(character, '(' | ')' | ' ' | '\t' | '\n' | '\\') {
+            canonical.push(character);
+        }
+        rest = characters.as_str();
+    }
+    canonical
 }
 
 fn indexes_equal(left: &IndexInventory, right: &IndexInventory) -> bool {
@@ -2196,18 +2440,23 @@ fn fingerprint(value: &impl Serialize) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn semantic_table_fingerprint(table: &TableInventory) -> Result<String, String> {
+/// Fingerprint of the MySQL table the translated source schema produces.
+fn expected_target_table_fingerprint(table: &TableInventory) -> Result<String, String> {
+    semantic_table_fingerprint(table, expected_target_column)
+}
+
+/// Fingerprint of the MySQL table as the target reports it.
+fn observed_target_table_fingerprint(table: &TableInventory) -> Result<String, String> {
+    semantic_table_fingerprint(table, observed_target_column)
+}
+
+fn semantic_table_fingerprint(
+    table: &TableInventory,
+    canonical: fn(&ColumnInventory) -> ColumnInventory,
+) -> Result<String, String> {
     let mut table = table.clone();
-    for column in &mut table.columns {
-        if column.data_type.eq_ignore_ascii_case("timestamp") {
-            column.data_type = "datetime".to_string();
-            column.column_type = column
-                .column_type
-                .replacen("timestamp", "datetime", 1)
-                .replacen("TIMESTAMP", "DATETIME", 1);
-        }
-        column.extra = column.extra.to_ascii_lowercase();
-    }
+    table.columns = table.columns.iter().map(canonical).collect();
+    table.collation = table.collation.as_deref().map(canonical_collation);
     fingerprint(&table)
 }
 
@@ -2351,7 +2600,7 @@ mod tests {
         assert_eq!(missing_target.tables[0].status, TableSchemaStatus::Failed);
         assert_eq!(
             missing_target.tables[0].source_fingerprint,
-            semantic_table_fingerprint(&source_table).expect("source fingerprint")
+            expected_target_table_fingerprint(&source_table).expect("source fingerprint")
         );
         assert!(missing_target.tables[0].target_fingerprint.is_empty());
 
@@ -2370,11 +2619,11 @@ mod tests {
         assert_eq!(existing_target.tables[0].status, TableSchemaStatus::Failed);
         assert_eq!(
             existing_target.tables[0].source_fingerprint,
-            semantic_table_fingerprint(&source_table).expect("source fingerprint")
+            expected_target_table_fingerprint(&source_table).expect("source fingerprint")
         );
         assert_eq!(
             existing_target.tables[0].target_fingerprint,
-            semantic_table_fingerprint(&target_table).expect("target fingerprint")
+            observed_target_table_fingerprint(&target_table).expect("target fingerprint")
         );
     }
 
@@ -2785,8 +3034,8 @@ mod tests {
         );
         assert!(label.sql.contains("AFTER `id`"), "{}", label.sql);
         assert_ne!(
-            semantic_table_fingerprint(&source.tables[0]).unwrap(),
-            semantic_table_fingerprint(&target.tables[0]).unwrap()
+            expected_target_table_fingerprint(&source.tables[0]).unwrap(),
+            observed_target_table_fingerprint(&target.tables[0]).unwrap()
         );
     }
 
@@ -2973,6 +3222,219 @@ mod tests {
 
         assert!(sql.contains("DEFAULT CHARACTER SET=utf8mb4"), "{sql}");
         assert!(sql.contains("COLLATE=utf8mb4_unicode_ci"), "{sql}");
+    }
+
+    /// Each case is a real `information_schema` disagreement measured between the prod MariaDB
+    /// source and the do-managed MySQL target for a column that is already converged.
+    #[test]
+    fn already_converged_columns_compare_equal_across_both_engines() {
+        let cases: &[(&str, ColumnInventory, ColumnInventory)] = &[
+            (
+                "integer display width",
+                int_column("int(11) unsigned"),
+                int_column("int unsigned"),
+            ),
+            (
+                "tinyint display width",
+                int_column("tinyint(1) unsigned"),
+                int_column("tinyint unsigned"),
+            ),
+            (
+                "mediumint display width",
+                int_column("mediumint(8)"),
+                int_column("mediumint"),
+            ),
+            (
+                "literal NULL default",
+                defaulted_column("int(11) unsigned", Some("NULL"), ""),
+                defaulted_column("int unsigned", None, ""),
+            ),
+            (
+                "quoted string default",
+                defaulted_column("char(2)", Some("'en'"), ""),
+                defaulted_column("char(2)", Some("en"), ""),
+            ),
+            (
+                "quoted empty-string default",
+                defaulted_column("varchar(32)", Some("''"), ""),
+                defaulted_column("varchar(32)", Some(""), ""),
+            ),
+            (
+                "current_timestamp default and DEFAULT_GENERATED marker",
+                defaulted_column("datetime", Some("current_timestamp()"), ""),
+                defaulted_column("datetime", Some("CURRENT_TIMESTAMP"), "DEFAULT_GENERATED"),
+            ),
+            (
+                "on update current_timestamp extra",
+                defaulted_column("datetime", None, "on update current_timestamp()"),
+                defaulted_column(
+                    "datetime",
+                    None,
+                    "DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+                ),
+            ),
+            (
+                "fractional current_timestamp",
+                defaulted_column(
+                    "datetime(6)",
+                    Some("current_timestamp(6)"),
+                    "on update current_timestamp(6)",
+                ),
+                defaulted_column(
+                    "datetime(6)",
+                    Some("CURRENT_TIMESTAMP(6)"),
+                    "DEFAULT_GENERATED on update CURRENT_TIMESTAMP(6)",
+                ),
+            ),
+            (
+                "bit literal default",
+                defaulted_column("bit(1)", Some("b'0'"), ""),
+                defaulted_column("bit(1)", Some("b'0'"), ""),
+            ),
+        ];
+        for (label, source, target) in cases {
+            assert!(columns_equal(source, target), "{label}");
+        }
+
+        let mut uca = defaulted_column("varchar(32)", None, "");
+        uca.collation = Some("utf8mb4_uca1400_ai_ci".to_string());
+        let mut mysql_collation = defaulted_column("varchar(32)", None, "");
+        mysql_collation.collation = Some("utf8mb4_0900_ai_ci".to_string());
+        assert!(columns_equal(&uca, &mysql_collation), "UCA-1400 collation");
+
+        let mut source_generated = defaulted_column("tinyint(1)", None, "VIRTUAL GENERATED");
+        source_generated.generated = Some(crate::inventory::GeneratedColumn {
+            expression: "json_valid(`adaptations`) and json_length(`adaptations`) > 0".to_string(),
+            generation_kind: "virtual".to_string(),
+        });
+        let mut target_generated = defaulted_column("tinyint", None, "VIRTUAL GENERATED");
+        target_generated.generated = Some(crate::inventory::GeneratedColumn {
+            expression: "(json_valid(`adaptations`) and (json_length(`adaptations`) > 0))"
+                .to_string(),
+            generation_kind: "VIRTUAL".to_string(),
+        });
+        assert!(
+            columns_equal(&source_generated, &target_generated),
+            "generated expression parentheses"
+        );
+
+        // A genuine difference still compares unequal.
+        assert!(
+            !columns_equal(
+                &defaulted_column("char(2)", Some("'en'"), ""),
+                &defaulted_column("char(2)", Some("us"), "")
+            ),
+            "different string defaults"
+        );
+        assert!(
+            !columns_equal(
+                &int_column("int(11) unsigned"),
+                &int_column("bigint unsigned")
+            ),
+            "different integer widths"
+        );
+        assert!(
+            !columns_equal(&int_column("int(11)"), &int_column("int unsigned")),
+            "signedness"
+        );
+    }
+
+    #[test]
+    fn source_timestamp_converges_to_datetime_but_a_timestamp_target_does_not() {
+        let mut source = defaulted_column("timestamp", None, "");
+        source.data_type = "timestamp".to_string();
+        let mut converged = defaulted_column("datetime", None, "");
+        converged.data_type = "datetime".to_string();
+        let mut unconverged = source.clone();
+        unconverged.column_type = "timestamp".to_string();
+
+        assert!(columns_equal(&source, &converged));
+        assert!(!columns_equal(&source, &unconverged));
+    }
+
+    #[test]
+    fn check_constraints_compare_through_the_clause_mysql_renders() {
+        let source = CheckConstraint {
+            table: "comics_enrichments".to_string(),
+            name: "ck_comic_identity".to_string(),
+            clause: "`comic_id` is not null or `comic_slug` is not null".to_string(),
+        };
+        let target = CheckConstraint {
+            table: "comics_enrichments".to_string(),
+            name: "ck_comic_identity".to_string(),
+            clause: "((`comic_id` is not null) or (`comic_slug` is not null))".to_string(),
+        };
+        assert_eq!(source, target);
+
+        let renamed = CheckConstraint {
+            name: "comics_enrichments_chk_1".to_string(),
+            ..target.clone()
+        };
+        assert_ne!(source, renamed);
+
+        let other_column = CheckConstraint {
+            clause: "((`comic_id` is not null) or (`comic_name` is not null))".to_string(),
+            ..target
+        };
+        assert_ne!(source, other_column);
+    }
+
+    /// MariaDB permits one check name on several tables, so the source inventory must report the
+    /// owning table rather than joining every same-named constraint to every table.
+    #[test]
+    fn check_constraint_inventory_is_scoped_per_endpoint() {
+        assert!(
+            check_constraint_query(InventoryEndpointRole::Source)
+                .contains("FROM information_schema.CHECK_CONSTRAINTS")
+        );
+        assert!(!check_constraint_query(InventoryEndpointRole::Source).contains("JOIN"));
+        assert!(check_constraint_query(InventoryEndpointRole::Target).contains("JOIN"));
+    }
+
+    #[test]
+    fn enum_values_keep_their_case_while_the_type_name_is_recased() {
+        let mut channel = defaulted_column("enum('dev','Prod')", Some("'dev'"), "");
+        channel.is_nullable = false;
+
+        assert_eq!(
+            render_column(&channel),
+            "`value` ENUM('dev','Prod') NOT NULL DEFAULT 'dev'"
+        );
+        assert_eq!(
+            canonical_column_type("ENUM('dev','Prod')"),
+            "enum('dev','Prod')"
+        );
+        assert!(!columns_equal(
+            &defaulted_column("enum('dev','Prod')", None, ""),
+            &defaulted_column("enum('dev','prod')", None, "")
+        ));
+    }
+
+    #[test]
+    fn literal_defaults_render_without_double_quoting() {
+        assert_eq!(render_default("'en'"), "'en'");
+        assert_eq!(render_default("''"), "''");
+        assert_eq!(render_default("b'0'"), "b'0'");
+        assert_eq!(render_default("0"), "'0'");
+        assert_eq!(render_default("current_timestamp()"), "CURRENT_TIMESTAMP()");
+        assert_eq!(render_default("it's"), "'it''s'");
+    }
+
+    fn int_column(column_type: &str) -> ColumnInventory {
+        defaulted_column(column_type, None, "")
+    }
+
+    fn defaulted_column(column_type: &str, default: Option<&str>, extra: &str) -> ColumnInventory {
+        let mut column = column("value", column_type, true);
+        // Both engines report DATA_TYPE without the display width or the attributes.
+        column.data_type = column_type
+            .split(['(', ' '])
+            .next()
+            .expect("column type")
+            .to_string();
+        column.default_value = default.map(str::to_string);
+        column.extra = extra.to_string();
+        column
     }
 
     #[test]
@@ -3362,8 +3824,8 @@ mod tests {
         );
 
         assert_eq!(
-            semantic_table_fingerprint(&source).unwrap(),
-            semantic_table_fingerprint(&target).unwrap()
+            expected_target_table_fingerprint(&source).unwrap(),
+            observed_target_table_fingerprint(&target).unwrap()
         );
     }
 
@@ -3771,7 +4233,7 @@ mod tests {
             vec![
                 table(
                     "unsupported",
-                    vec![column("kind", "enum('a','b')", false)],
+                    vec![column("kind", "set('a','b')", false)],
                     vec!["kind"],
                 ),
                 table(

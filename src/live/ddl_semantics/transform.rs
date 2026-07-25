@@ -328,12 +328,6 @@ fn validate_generated_schema_ddl(source_sql: &str) -> Result<(), String> {
     let tokens = generated_schema_tokens(source_sql).ok_or_else(|| {
         "generated schema DDL has unsupported quoting, comments, or statement shape".to_string()
     })?;
-    if tokens
-        .iter()
-        .any(|token| token.eq_ignore_ascii_case("ENUM"))
-    {
-        return Err("generated schema DDL does not support ENUM".to_string());
-    }
     if is_generated_create_table(&tokens) {
         return validate_generated_create_table(&tokens);
     }
@@ -737,6 +731,7 @@ const SUPPORTED_COLUMN_TYPES: &[&str] = &[
     "DATETIME",
     "DECIMAL",
     "DOUBLE",
+    "ENUM",
     "FLOAT",
     "GEOMETRY",
     "GEOMETRYCOLLECTION",
@@ -776,6 +771,7 @@ const PARAMETERIZED_COLUMN_TYPES: &[&str] = &[
     "DATETIME",
     "DECIMAL",
     "DOUBLE",
+    "ENUM",
     "FLOAT",
     "INT",
     "INTEGER",
@@ -796,7 +792,7 @@ fn validate_column_type(tokens: &[String], index: usize, end: usize) -> Result<u
         .get(index)
         .filter(|_| index < end)
         .ok_or_else(|| "generated column type is missing".to_string())?;
-    if column_type.eq_ignore_ascii_case("ENUM") || column_type.eq_ignore_ascii_case("SET") {
+    if column_type.eq_ignore_ascii_case("SET") {
         return Err(format!(
             "generated schema DDL does not support {column_type}"
         ));
@@ -824,8 +820,40 @@ fn validate_optional_type_parameters(
         ));
     }
     let close = validate_parenthesized_definition(tokens, index, end)?;
-    validate_numeric_type_parameters(tokens, index + 1, close)?;
+    if column_type.eq_ignore_ascii_case("ENUM") {
+        validate_enum_type_parameters(tokens, index + 1, close)?;
+    } else {
+        validate_numeric_type_parameters(tokens, index + 1, close)?;
+    }
     Ok(close + 1)
+}
+
+/// MariaDB and MySQL agree on `ENUM` semantics, so the value list only has to be a
+/// comma-separated list of string literals.
+fn validate_enum_type_parameters(
+    tokens: &[String],
+    start: usize,
+    end: usize,
+) -> Result<(), String> {
+    if start >= end {
+        return Err("generated ENUM value list is empty".to_string());
+    }
+    let mut expect_value = true;
+    for token in &tokens[start..end] {
+        if expect_value {
+            if token != "<string>" {
+                return Err(format!("generated ENUM value {token:?} is unsupported"));
+            }
+        } else if token != "," {
+            return Err("generated ENUM values require commas".to_string());
+        }
+        expect_value = !expect_value;
+    }
+    if expect_value {
+        Err("generated ENUM value list is incomplete".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn type_is_supported(column_type: &str, supported: &[&str]) -> bool {

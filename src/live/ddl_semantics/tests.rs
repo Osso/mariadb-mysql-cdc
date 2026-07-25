@@ -442,7 +442,7 @@ fn generated_convergence_translation_is_precise_and_temporal_mapping_is_case_ins
     assert!(mixed_case.target_sql.unwrap().contains("DATETIME(6)"));
 
     for sql in [
-        "CREATE TABLE `items` (`kind` ENUM('a','b')) ENGINE=InnoDB",
+        "CREATE TABLE `items` (`kind` SET('a','b')) ENGINE=InnoDB",
         "ALTER TABLE `items` ADD COLUMN `a` BIGINT, ADD COLUMN `b` BIGINT",
         "CREATE TABLE `items` (`id` BIGINT)",
     ] {
@@ -537,7 +537,6 @@ fn generated_schema_column_definitions_are_explicitly_modeled() {
 
     for sql in [
         "CREATE TABLE `items` (`kind` SET('a','b')) ENGINE=InnoDB",
-        "CREATE TABLE `items` (`kind` ENUM('a','b')) ENGINE=InnoDB",
         "CREATE TABLE `items` (`payload` MYSTERY NULL) ENGINE=InnoDB",
         "CREATE TABLE `items` (`id` BIGINT MAGIC) ENGINE=InnoDB",
         "CREATE TABLE `items` (`id` BIGINT(foo)) ENGINE=InnoDB",
@@ -1604,4 +1603,27 @@ fn rename_column_if_exists_fails_closed_when_old_and_new_columns_both_exist() {
     .expect_err("target drift must block transformation");
 
     assert!(error.contains("both exist"), "{error}");
+}
+
+#[test]
+fn enum_columns_translate_and_set_columns_are_rejected() {
+    for sql in [
+        "CREATE TABLE `items` (`id` BIGINT UNSIGNED NOT NULL, `channel` ENUM('dev','prod') NOT NULL DEFAULT 'dev', PRIMARY KEY (`id`)) ENGINE=InnoDB",
+        "ALTER TABLE `items` MODIFY COLUMN `channel` ENUM('dev','prod') CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL DEFAULT 'dev'",
+        "ALTER TABLE `items` ADD COLUMN `channel` ENUM('dev') NULL DEFAULT NULL",
+    ] {
+        super::translate_modeled_ddl(sql, &[])
+            .unwrap_or_else(|error| panic!("ENUM column rejected: {sql}: {error}"));
+    }
+    for sql in [
+        "ALTER TABLE `items` MODIFY COLUMN `flags` SET('a','b') NULL DEFAULT NULL",
+        "ALTER TABLE `items` MODIFY COLUMN `channel` ENUM() NULL DEFAULT NULL",
+        "ALTER TABLE `items` MODIFY COLUMN `channel` ENUM(1,2) NULL DEFAULT NULL",
+        "ALTER TABLE `items` MODIFY COLUMN `channel` ENUM('a' 'b') NULL DEFAULT NULL",
+    ] {
+        assert!(
+            super::translate_modeled_ddl(sql, &[]).is_err(),
+            "unsupported enumerated column passed through: {sql}"
+        );
+    }
 }
