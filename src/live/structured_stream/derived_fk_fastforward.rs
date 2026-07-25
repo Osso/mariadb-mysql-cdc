@@ -208,7 +208,7 @@ fn child_value<'a>(
 }
 
 /// Foreign keys compare by stored value, so a bare integer and its text form are the same key.
-fn values_equal(left: &Value, right: &Value) -> bool {
+pub(super) fn values_equal(left: &Value, right: &Value) -> bool {
     if left == right {
         return true;
     }

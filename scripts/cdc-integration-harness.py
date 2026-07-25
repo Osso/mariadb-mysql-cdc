@@ -3445,12 +3445,13 @@ class Harness:
             "SELECT id,comic_id,comic_is_visible,slug,payload,is_visible,is_deleted,page_count,update_time "
             "FROM releases WHERE id=384447;",
         ).strip()
-        expected_release = (
-            "384447\t48054\t0\tDELETED_misc\tcurrent release\t0\t1\t13\t"
-            "2026-07-18 05:41:17"
-        )
+        # Column substitution replaced the whole-current-row install. Only the derived
+        # comic_is_visible moves to the locked parent's value; every other column stays historical,
+        # and the later replayed child updates converge it. Installing the current row here jumped
+        # the child ahead of the replay, which the stream is not supposed to do.
+        expected_release = "384447\t48054\t0\tfour-essentials\thistorical release\t1\t0\t0\tNULL"
         if release != expected_release:
-            raise HarnessError(f"current visibility release recovery mismatch: {release!r}")
+            raise HarnessError(f"visibility derived column fast-forward mismatch: {release!r}")
         effect = self.admin_query(
             self.target,
             "SELECT id,payload FROM release_transaction_effects WHERE id=900002;",
