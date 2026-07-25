@@ -25,11 +25,11 @@ fn builds_information_schema_queries_with_quoted_schema() {
     let schema = "app's\\schema";
     let quoted = "'app''s\\\\schema'";
 
-    assert!(tables_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
-    assert!(columns_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
-    assert!(primary_keys_query(schema).contains(&format!("TABLE_SCHEMA = {quoted}")));
-    let source_indexes = indexes_query(schema, InventoryEndpointRole::Source);
-    let target_indexes = indexes_query(schema, InventoryEndpointRole::Target);
+    assert!(tables_query(schema, None).contains(&format!("TABLE_SCHEMA = {quoted}")));
+    assert!(columns_query(schema, None).contains(&format!("TABLE_SCHEMA = {quoted}")));
+    assert!(primary_keys_query(schema, None).contains(&format!("TABLE_SCHEMA = {quoted}")));
+    let source_indexes = indexes_query(schema, InventoryEndpointRole::Source, None);
+    let target_indexes = indexes_query(schema, InventoryEndpointRole::Target, None);
     assert!(source_indexes.contains(&format!("TABLE_SCHEMA = {quoted}")));
     assert!(source_indexes.contains("IGNORED = 'YES'"));
     assert!(target_indexes.contains("IS_VISIBLE"));
@@ -37,12 +37,32 @@ fn builds_information_schema_queries_with_quoted_schema() {
     assert!(triggers_query(schema).contains(&format!("TRIGGER_SCHEMA = {quoted}")));
     assert!(routines_query(schema).contains(&format!("ROUTINE_SCHEMA = {quoted}")));
     assert!(events_query(schema).contains(&format!("EVENT_SCHEMA = {quoted}")));
-    assert!(foreign_keys_query(schema).contains("REFERENCED_TABLE_SCHEMA"));
-    let foreign_keys = canonical_foreign_keys_query(schema);
+    assert!(foreign_keys_query(schema, None).contains("REFERENCED_TABLE_SCHEMA"));
+    let foreign_keys = canonical_foreign_keys_query(schema, None);
     assert!(foreign_keys.contains("REFERENTIAL_CONSTRAINTS"));
     assert!(foreign_keys.contains("UPDATE_RULE"));
     assert!(foreign_keys.contains("DELETE_RULE"));
     assert!(foreign_keys.contains("ORDINAL_POSITION"));
+
+    // Verifying one table must not read every table's metadata.
+    let table = "orders'items";
+    let quoted_table = "'orders''items'";
+    assert!(tables_query(schema, Some(table)).contains(&format!("TABLE_NAME = {quoted_table}")));
+    assert!(columns_query(schema, Some(table)).contains(&format!("TABLE_NAME = {quoted_table}")));
+    assert!(
+        primary_keys_query(schema, Some(table)).contains(&format!("TABLE_NAME = {quoted_table}"))
+    );
+    assert!(
+        indexes_query(schema, InventoryEndpointRole::Target, Some(table))
+            .contains(&format!("TABLE_NAME = {quoted_table}"))
+    );
+    assert!(
+        foreign_keys_query(schema, Some(table)).contains(&format!("TABLE_NAME = {quoted_table}"))
+    );
+    assert!(
+        canonical_foreign_keys_query(schema, Some(table))
+            .contains(&format!("k.TABLE_NAME = {quoted_table}"))
+    );
 }
 
 #[test]

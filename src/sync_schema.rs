@@ -1061,10 +1061,12 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
     let source_checks = read_check_constraints(
         &inventory_config_source(&config.source),
         &config.source.database,
+        None,
     )?;
     let target_checks = read_check_constraints(
         &inventory_config_target(&config.target),
         &config.target.database,
+        None,
     )?;
     append_check_constraint_plan(&mut plan, &source, &source_checks, &target_checks);
     let source_canonical_foreign_keys =
@@ -1088,7 +1090,8 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
     let source_table_map = table_map(&source);
     let expected = expected_target_inventory(&source);
     Ok(execute_schema_plan(plan, &mut executor, &|table| {
-        let reader = MariaDbInventoryReader::new(target_config.clone());
+        // Verification describes one table, so it must not re-read the whole schema per table.
+        let reader = MariaDbInventoryReader::for_table(target_config.clone(), table);
         let target_inventory = match build_inventory(&config.target.database, &reader) {
             Ok(inventory) => inventory,
             Err(error) => return vec![format!("target re-inventory failed: {error}")],
@@ -1098,12 +1101,14 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
         }
         let mut differences = schema_table_differences(&expected, &target_inventory, table);
         let target_checks =
-            read_check_constraints(&target_config, &config.target.database).map(|checks| {
-                checks_by_table(&checks)
-                    .get(table)
-                    .cloned()
-                    .unwrap_or_default()
-            });
+            read_check_constraints(&target_config, &config.target.database, Some(table)).map(
+                |checks| {
+                    checks_by_table(&checks)
+                        .get(table)
+                        .cloned()
+                        .unwrap_or_default()
+                },
+            );
         match target_checks {
             Ok(target_checks)
                 if target_checks
@@ -1298,15 +1303,20 @@ fn parse_sync_schema_config(args: Vec<String>) -> Result<SyncSchemaConfig, Strin
 fn read_check_constraints(
     config: &InventoryConfig,
     schema: &str,
+    table_scope: Option<&str>,
 ) -> Result<Vec<CheckConstraint>, String> {
     let opts = crate::inventory::reader::inventory_opts(config)?;
     let mut connection =
         Conn::new(opts).map_err(|error| format!("check inventory connection failed: {error}"))?;
-    let sql = check_constraint_query(config.endpoint_role);
+    let sql = check_constraint_query(config.endpoint_role, table_scope);
+    let mut parameters = vec![Value::Bytes(schema.as_bytes().to_vec())];
+    if let Some(table_scope) = table_scope {
+        parameters.push(Value::Bytes(table_scope.as_bytes().to_vec()));
+    }
     connection
         .exec_map(
             sql,
-            Params::Positional(vec![Value::Bytes(schema.as_bytes().to_vec())]),
+            Params::Positional(parameters),
             |(table, name, clause): (String, String, String)| CheckConstraint {
                 table,
                 name,
@@ -1319,24 +1329,33 @@ fn read_check_constraints(
 /// MariaDB reports the owning table in `CHECK_CONSTRAINTS` and allows one check name on
 /// several tables. MySQL's view has no table column, but its check names are unique per
 /// schema, so only there is the `TABLE_CONSTRAINTS` join both needed and unambiguous.
-fn check_constraint_query(endpoint_role: InventoryEndpointRole) -> &'static str {
-    match endpoint_role {
-        InventoryEndpointRole::Source => {
+fn check_constraint_query(
+    endpoint_role: InventoryEndpointRole,
+    table_scope: Option<&str>,
+) -> String {
+    let (columns_and_from, predicate, order) = match endpoint_role {
+        InventoryEndpointRole::Source => (
             "SELECT TABLE_NAME,CONSTRAINT_NAME,CHECK_CLAUSE \
-               FROM information_schema.CHECK_CONSTRAINTS \
-              WHERE CONSTRAINT_SCHEMA=? \
-              ORDER BY TABLE_NAME,CONSTRAINT_NAME"
-        }
-        InventoryEndpointRole::Target => {
+               FROM information_schema.CHECK_CONSTRAINTS",
+            "WHERE CONSTRAINT_SCHEMA=?",
+            "ORDER BY TABLE_NAME,CONSTRAINT_NAME",
+        ),
+        InventoryEndpointRole::Target => (
             "SELECT tc.TABLE_NAME,tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE \
                FROM information_schema.TABLE_CONSTRAINTS tc \
                JOIN information_schema.CHECK_CONSTRAINTS cc \
                  ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA \
-                AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME \
-              WHERE tc.CONSTRAINT_SCHEMA=? AND tc.CONSTRAINT_TYPE='CHECK' \
-              ORDER BY tc.TABLE_NAME,tc.CONSTRAINT_NAME"
-        }
-    }
+                AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME",
+            "WHERE tc.CONSTRAINT_SCHEMA=? AND tc.CONSTRAINT_TYPE='CHECK'",
+            "ORDER BY tc.TABLE_NAME,tc.CONSTRAINT_NAME",
+        ),
+    };
+    let scope = match (endpoint_role, table_scope) {
+        (_, None) => "",
+        (InventoryEndpointRole::Source, Some(_)) => " AND TABLE_NAME=?",
+        (InventoryEndpointRole::Target, Some(_)) => " AND tc.TABLE_NAME=?",
+    };
+    format!("{columns_and_from} {predicate}{scope} {order}")
 }
 
 fn checks_by_table(checks: &[CheckConstraint]) -> BTreeMap<String, Vec<CheckConstraint>> {
@@ -3579,11 +3598,11 @@ mod tests {
     #[test]
     fn check_constraint_inventory_is_scoped_per_endpoint() {
         assert!(
-            check_constraint_query(InventoryEndpointRole::Source)
+            check_constraint_query(InventoryEndpointRole::Source, None)
                 .contains("FROM information_schema.CHECK_CONSTRAINTS")
         );
-        assert!(!check_constraint_query(InventoryEndpointRole::Source).contains("JOIN"));
-        assert!(check_constraint_query(InventoryEndpointRole::Target).contains("JOIN"));
+        assert!(!check_constraint_query(InventoryEndpointRole::Source, None).contains("JOIN"));
+        assert!(check_constraint_query(InventoryEndpointRole::Target, None).contains("JOIN"));
     }
 
     #[test]

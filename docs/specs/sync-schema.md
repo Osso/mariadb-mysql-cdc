@@ -17,9 +17,27 @@
 - [x] Generate schema operations through that translator and apply the same semantic mappings, including temporal types, defaults, `ON UPDATE`, generated expressions, character sets, collations, indexes, checks, and foreign keys.
 - [x] Emit column `CHARACTER SET` and `COLLATE` as part of the data type, before nullability, defaults, and generated expressions.
 - [x] Converge the target to the source schema plus the unique parent indexes MySQL requires and MariaDB does not: when a source foreign key's referenced columns are not the leftmost prefix of a source primary key or unique index, expect a synthesized `uq_cdc_<parent>_<columns>` unique index on the parent. Create it when absent, keep it when present, and require it before adding the dependent foreign key.
+- [x] Translate `ENUM` columns, preserving the case of their values; `SET` columns are still rejected explicitly.
+- [x] Render a literal default as the source already spells it, quoting only a bare value, so a MariaDB string or bit literal is never quoted twice.
+- [x] Name check constraints so they are unique per schema as MySQL requires: a source name used by more than one table is qualified with its table, and a name already unique keeps its source spelling.
+- [x] Reference a foreign-key parent in the converged schema without a database qualifier so it resolves in the target database; only a genuinely cross-schema parent keeps its qualifier.
 - [x] Maintain actual streamed-DDL parity: a mapping accepted by `sync-schema` must produce the same translated MySQL semantics as the corresponding streamed DDL operation.
 - [x] Have no alternate mapping, compatibility fallback, direct source-DDL execution path, or silent approximation.
 - [x] Fail explicitly on unsupported or ambiguous source constructs.
+
+### Comparing MariaDB metadata with MySQL metadata
+
+Both engines describe an identical converged column differently, so comparison uses one canonical form. Without it every column reads as divergent, every run re-issues the same `ALTER`, and no table can verify as converged.
+
+- [x] Treat an integer display width as absent, because MySQL 8 does not store one.
+- [x] Read a MariaDB literal default as its value: quotes removed, and the literal `NULL` treated as no default.
+- [x] Treat `current_timestamp()` and `CURRENT_TIMESTAMP` as one default, and preserve the case of every other default value because it is data.
+- [x] Ignore MySQL's `DEFAULT_GENERATED` extra marker.
+- [x] Map MariaDB's UCA-1400 collations to their MySQL equivalents in both comparison and generated DDL.
+- [x] Compare a stored expression - a generated column or a check clause - ignoring the parentheses, charset introducers, and spacing MySQL adds when it re-renders one.
+- [x] Compare a source `TIMESTAMP` column against a target `DATETIME` column as converged, while a target still holding `TIMESTAMP` remains divergent.
+- [x] Express a foreign key's parent schema relative to the endpoint reporting it, so a target database whose name differs from the source still compares equal for a same-schema parent.
+- [x] Read the source check-constraint inventory from the table-scoped MariaDB view rather than joining every same-named constraint to every table.
 
 ### Convergence and destructive changes
 
