@@ -985,18 +985,41 @@ fn execute_planned_statement(
     table: &str,
     statement: &PlannedSchemaStatement,
 ) -> StatementExecution {
+    // Logged before execution as well as after, so a statement that hangs or kills the process
+    // is still attributable to the exact SQL that was sent.
+    log_statement(table, statement, "applying", None);
     let error = executor.execute(table, &statement.sql).err();
+    let status = if error.is_none() {
+        "executed"
+    } else {
+        "failed"
+    };
+    log_statement(table, statement, status, error.as_deref());
     StatementExecution {
         phase: statement.phase,
         sql: statement.sql.clone(),
-        status: if error.is_none() {
-            "executed"
-        } else {
-            "failed"
-        }
-        .to_string(),
+        status: status.to_string(),
         error,
     }
+}
+
+fn log_statement(
+    table: &str,
+    statement: &PlannedSchemaStatement,
+    status: &str,
+    error: Option<&str>,
+) {
+    let phase = serde_json::to_value(statement.phase)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    eprintln!(
+        "cdc_sync_schema_statement table={table} phase={phase} status={status} sql={:?}{}",
+        statement.sql,
+        error
+            .map(|error| format!(" error={error:?}"))
+            .unwrap_or_default()
+    );
 }
 
 fn skipped_statement_execution(
@@ -2279,12 +2302,7 @@ fn columns_equal(source: &ColumnInventory, target: &ColumnInventory) -> bool {
 
 /// The MySQL column the translated source definition produces.
 fn expected_target_column(source: &ColumnInventory) -> ColumnInventory {
-    let mut expected = observed_target_column(source);
-    if expected.data_type.eq_ignore_ascii_case("timestamp") {
-        expected.data_type = "datetime".to_string();
-        expected.column_type = expected.column_type.replacen("timestamp", "datetime", 1);
-    }
-    expected
+    observed_target_column(source)
 }
 
 /// The same column described the way MySQL's `information_schema` reports it.
@@ -3548,16 +3566,17 @@ mod tests {
     }
 
     #[test]
-    fn source_timestamp_converges_to_datetime_but_a_timestamp_target_does_not() {
+    /// The temporal types are no longer mapped, so a source TIMESTAMP column converges only
+    /// against a target TIMESTAMP column. DATETIME is a different type, not a wider spelling.
+    fn a_source_timestamp_converges_only_against_a_target_timestamp() {
         let mut source = defaulted_column("timestamp", None, "");
         source.data_type = "timestamp".to_string();
-        let mut converged = defaulted_column("datetime", None, "");
-        converged.data_type = "datetime".to_string();
-        let mut unconverged = source.clone();
-        unconverged.column_type = "timestamp".to_string();
+        let same = source.clone();
+        let mut datetime = defaulted_column("datetime", None, "");
+        datetime.data_type = "datetime".to_string();
 
-        assert!(columns_equal(&source, &converged));
-        assert!(!columns_equal(&source, &unconverged));
+        assert!(columns_equal(&source, &same));
+        assert!(!columns_equal(&source, &datetime));
     }
 
     /// A converged run must plan nothing on the next run.
@@ -4026,7 +4045,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_translation_maps_extended_timestamp_and_is_used_by_schema_plan() {
+    fn shared_translation_carries_timestamp_through_and_is_used_by_schema_plan() {
         let source = inventory(
             vec![table(
                 "tokens",
@@ -4050,8 +4069,8 @@ mod tests {
         )
         .expect("schema plan");
 
-        assert!(translated.target_sql.unwrap().contains("DATETIME"));
-        assert!(plan.tables[0].statements[0].sql.contains("DATETIME"));
+        assert!(translated.target_sql.unwrap().contains("TIMESTAMP"));
+        assert!(plan.tables[0].statements[0].sql.contains("TIMESTAMP"));
     }
 
     #[test]
@@ -4185,13 +4204,18 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fingerprint_treats_source_timestamp_as_target_datetime() {
+    fn semantic_fingerprint_keeps_timestamp_and_datetime_distinct() {
         let source = table(
             "tokens",
             vec![column("end_time", "timestamp", true)],
             vec!["end_time"],
         );
-        let target = table(
+        let same = table(
+            "tokens",
+            vec![column("end_time", "timestamp", true)],
+            vec!["end_time"],
+        );
+        let datetime = table(
             "tokens",
             vec![column("end_time", "datetime", true)],
             vec!["end_time"],
@@ -4199,7 +4223,11 @@ mod tests {
 
         assert_eq!(
             expected_target_table_fingerprint(&source).unwrap(),
-            observed_target_table_fingerprint(&target).unwrap()
+            observed_target_table_fingerprint(&same).unwrap()
+        );
+        assert_ne!(
+            expected_target_table_fingerprint(&source).unwrap(),
+            observed_target_table_fingerprint(&datetime).unwrap()
         );
     }
 

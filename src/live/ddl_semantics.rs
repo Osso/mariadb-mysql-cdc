@@ -137,215 +137,37 @@ fn translate_ddl_with_provenance(
     target_columns: &[String],
     provenance: DdlTranslationProvenance,
 ) -> Result<DdlTransformation, String> {
-    let normalized = translate_extended_timestamp(sql);
     let parsed_index = match provenance {
-        DdlTranslationProvenance::Streamed => parser::parse_simple_index_ddl(&normalized),
-        DdlTranslationProvenance::ModeledPlanner => parse_modeled_index_ddl(&normalized),
+        DdlTranslationProvenance::Streamed => parser::parse_simple_index_ddl(sql),
+        DdlTranslationProvenance::ModeledPlanner => parse_modeled_index_ddl(sql),
     };
     if let Ok(index) = parsed_index {
         if provenance == DdlTranslationProvenance::ModeledPlanner && index.unique {
-            return render_modeled_index_ddl(&index, &normalized);
+            return render_modeled_index_ddl(&index, sql);
         }
         return Ok(DdlTransformation {
             version: transform::DDL_TRANSFORMATION_VERSION,
-            target_sql: Some(normalized.trim().trim_end_matches(';').trim().to_string()),
+            target_sql: Some(sql.trim().trim_end_matches(';').trim().to_string()),
         });
     }
-    if supports_fixture_create_table(&normalized) {
-        return transform::transform_fixture_create_table(&normalized);
+    if supports_fixture_create_table(sql) {
+        return transform::transform_fixture_create_table(sql);
     }
-    if supports_production_alter_table(&normalized) {
-        return transform_production_alter_table(&normalized);
+    if supports_production_alter_table(sql) {
+        return transform_production_alter_table(sql);
     }
-    if supports_drop_columns_if_exists(&normalized) {
-        return transform_drop_columns_if_exists(
-            &normalized,
-            &target_columns.iter().cloned().collect(),
-        );
+    if supports_drop_columns_if_exists(sql) {
+        return transform_drop_columns_if_exists(sql, &target_columns.iter().cloned().collect());
     }
-    if supports_rename_columns_if_exists(&normalized) {
-        return transform_rename_columns_if_exists(
-            &normalized,
-            &target_columns.iter().cloned().collect(),
-        );
+    if supports_rename_columns_if_exists(sql) {
+        return transform_rename_columns_if_exists(sql, &target_columns.iter().cloned().collect());
     }
     match provenance {
-        DdlTranslationProvenance::ModeledPlanner => transform_generated_schema_ddl(&normalized),
+        DdlTranslationProvenance::ModeledPlanner => transform_generated_schema_ddl(sql),
         DdlTranslationProvenance::Streamed => {
             Err("streamed DDL family is unsupported without an existing parsed model".to_string())
         }
     }
-}
-
-fn translate_extended_timestamp(sql: &str) -> String {
-    let characters = sql.chars().collect::<Vec<_>>();
-    let mut translated = String::with_capacity(sql.len());
-    let mut index = 0;
-    while index < characters.len() {
-        if let Some(next) = copy_quoted_or_commented_sql(&characters, index, &mut translated) {
-            index = next;
-            continue;
-        }
-        if is_timestamp_token_at(&characters, index) && timestamp_is_column_type(&characters, index)
-        {
-            translated.push_str("DATETIME");
-            index += "timestamp".len();
-            continue;
-        }
-        translated.push(characters[index]);
-        index += 1;
-    }
-    translated
-}
-
-fn copy_quoted_or_commented_sql(
-    characters: &[char],
-    index: usize,
-    translated: &mut String,
-) -> Option<usize> {
-    let character = characters[index];
-    if matches!(character, '\'' | '"' | '`') {
-        return Some(copy_quoted_sql(characters, index, character, translated));
-    }
-    if character == '#' {
-        return Some(copy_line_comment(characters, index, translated));
-    }
-    if is_mysql_line_comment_start(characters, index) {
-        return Some(copy_line_comment(characters, index, translated));
-    }
-    if character == '/' && characters.get(index + 1) == Some(&'*') {
-        return Some(copy_block_comment(characters, index, translated));
-    }
-    None
-}
-
-fn copy_quoted_sql(
-    characters: &[char],
-    start: usize,
-    quote: char,
-    translated: &mut String,
-) -> usize {
-    let mut index = start;
-    while index < characters.len() {
-        let character = characters[index];
-        translated.push(character);
-        index += 1;
-        if character == '\\' && quote != '`' {
-            if let Some(escaped) = characters.get(index) {
-                translated.push(*escaped);
-                index += 1;
-            }
-            continue;
-        }
-        if character == quote && index > start + 1 {
-            if characters.get(index) == Some(&quote) {
-                translated.push(quote);
-                index += 1;
-                continue;
-            }
-            return index;
-        }
-    }
-    index
-}
-
-fn copy_line_comment(characters: &[char], start: usize, translated: &mut String) -> usize {
-    let mut index = start;
-    while let Some(character) = characters.get(index) {
-        translated.push(*character);
-        index += 1;
-        if *character == '\n' {
-            break;
-        }
-    }
-    index
-}
-
-fn copy_block_comment(characters: &[char], start: usize, translated: &mut String) -> usize {
-    let mut index = start;
-    while index < characters.len() {
-        let character = characters[index];
-        translated.push(character);
-        index += 1;
-        if character == '*' && characters.get(index) == Some(&'/') {
-            translated.push('/');
-            return index + 1;
-        }
-    }
-    index
-}
-
-fn is_mysql_line_comment_start(characters: &[char], index: usize) -> bool {
-    characters.get(index) == Some(&'-')
-        && characters.get(index + 1) == Some(&'-')
-        && match characters.get(index + 2) {
-            None => true,
-            Some(character) => character.is_whitespace() || character.is_control(),
-        }
-}
-
-fn is_timestamp_token_at(characters: &[char], index: usize) -> bool {
-    let end = index + "timestamp".len();
-    let candidate = characters.get(index..end);
-    candidate.is_some_and(|candidate| {
-        candidate
-            .iter()
-            .copied()
-            .zip("timestamp".chars())
-            .all(|(actual, expected)| actual.eq_ignore_ascii_case(&expected))
-    }) && identifier_boundary(
-        index
-            .checked_sub(1)
-            .and_then(|before| characters.get(before)),
-    ) && identifier_boundary(characters.get(end))
-}
-
-fn identifier_boundary(character: Option<&char>) -> bool {
-    character.is_none_or(|character| !(character.is_ascii_alphanumeric() || *character == '_'))
-}
-
-fn timestamp_is_column_type(characters: &[char], index: usize) -> bool {
-    let prefix = characters[..index].iter().collect::<String>();
-    let Ok(tokens) = tokenizer::tokenize_ddl(&prefix) else {
-        return false;
-    };
-    let Some(column_name) = tokens.last() else {
-        return false;
-    };
-    if !is_identifier_token(column_name) || is_create_definition_keyword(column_name) {
-        return false;
-    }
-    let before_name = tokens
-        .len()
-        .checked_sub(2)
-        .and_then(|position| tokens.get(position))
-        .map(String::as_str);
-    if matches!(before_name, Some("(") | Some(",")) {
-        return true;
-    }
-    let before_before_name = tokens
-        .len()
-        .checked_sub(3)
-        .and_then(|position| tokens.get(position))
-        .map(String::as_str);
-    matches!(before_name, Some(keyword) if keyword.eq_ignore_ascii_case("COLUMN"))
-        && matches!(
-            before_before_name,
-            Some(keyword)
-                if keyword.eq_ignore_ascii_case("ADD")
-                    || keyword.eq_ignore_ascii_case("MODIFY")
-        )
-}
-
-fn is_identifier_token(token: &str) -> bool {
-    !matches!(token, "(" | ")" | "," | "." | "=" | "<string>")
-}
-
-fn is_create_definition_keyword(token: &str) -> bool {
-    matches!(
-        token.to_ascii_uppercase().as_str(),
-        "CONSTRAINT" | "KEY" | "INDEX" | "PRIMARY" | "UNIQUE" | "FOREIGN" | "CHECK"
-    )
 }
 
 impl DdlSemanticInventory for LiveDdlSemanticInventory {

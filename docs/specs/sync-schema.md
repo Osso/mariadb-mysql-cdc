@@ -35,7 +35,7 @@ Both engines describe an identical converged column differently, so comparison u
 - [x] Ignore MySQL's `DEFAULT_GENERATED` extra marker.
 - [x] Map MariaDB's UCA-1400 collations to their MySQL equivalents in both comparison and generated DDL.
 - [x] Compare a stored expression - a generated column or a check clause - ignoring the parentheses, charset introducers, and spacing MySQL adds when it re-renders one.
-- [x] Compare a source `TIMESTAMP` column against a target `DATETIME` column as converged, while a target still holding `TIMESTAMP` remains divergent.
+- [x] Carry `TIMESTAMP` across unchanged. It is not mapped to `DATETIME`: MySQL stores every value this source holds, so a source `TIMESTAMP` column converges only against a target `TIMESTAMP` column.
 - [x] Express a foreign key's parent schema relative to the endpoint reporting it, so a target database whose name differs from the source still compares equal for a same-schema parent.
 - [x] Read the source check-constraint inventory from the table-scoped MariaDB view rather than joining every same-named constraint to every table.
 
@@ -53,7 +53,7 @@ Both engines describe an identical converged column differently, so comparison u
 - [x] Continue independent table operations after a statement or table failure; dependency-blocked operations are reported as skipped rather than attempted.
 - [x] Re-inventory every selected table after its operations finish, reading only that table's metadata and fetching it in one round-trip.
 - [x] Plan nothing on a second run against a converged target.
-- [x] Log each table's position, status, and statement counts to stderr as it completes, so a long run is distinguishable from a hang. The JSON report stays the sole stdout output.
+- [x] Log each table's position, status, and statement counts to stderr as it completes, and log every applied statement to stderr both before and after execution with its table, phase, SQL, outcome, and error, so a statement that hangs or kills the process is still attributable. The JSON report stays the sole stdout output.
 - [x] Report remaining semantic differences after re-inventory.
 - [x] Emit structured JSON for every table, statement, preflight, skip, error, and final verification outcome, including source/target fingerprints and representative blocker keys.
 - [x] Exit nonzero when any selected table is divergent, blocked, skipped due to a failed prerequisite, or otherwise not converged.

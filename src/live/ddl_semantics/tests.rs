@@ -438,8 +438,8 @@ fn generated_convergence_translation_is_precise_and_temporal_mapping_is_case_ins
         "ALTER TABLE `items` ADD COLUMN `expires_at` TiMeStAmP(6) NULL",
         &[],
     )
-    .expect("mixed-case temporal mapping");
-    assert!(mixed_case.target_sql.unwrap().contains("DATETIME(6)"));
+    .expect("mixed-case temporal type");
+    assert!(mixed_case.target_sql.unwrap().contains("TiMeStAmP(6)"));
 
     for sql in [
         "CREATE TABLE `items` (`kind` SET('a','b')) ENGINE=InnoDB",
@@ -453,20 +453,20 @@ fn generated_convergence_translation_is_precise_and_temporal_mapping_is_case_ins
     }
 }
 
+/// MySQL stores TIMESTAMP with the same meaning MariaDB gives it for every value this source
+/// holds, so the type is carried across unchanged rather than widened to DATETIME.
 #[test]
-fn timestamp_translation_changes_only_real_sql_type_tokens() {
-    let sql = "ALTER TABLE `timestamp` ADD COLUMN `expires_at` TiMeStAmP(6) NULL COMMENT 'timestamp ''quoted''', ADD COLUMN `literal` VARCHAR(64) DEFAULT \"timestamp \\\"escaped\\\"\"; -- timestamp line\n# timestamp hash\n/* timestamp block */ /*!80000 timestamp version */";
+fn a_timestamp_column_type_is_carried_across_unchanged() {
+    let translated = super::translate_modeled_ddl(
+        "ALTER TABLE `items` ADD COLUMN `expires_at` TIMESTAMP NULL DEFAULT NULL",
+        &[],
+    )
+    .expect("timestamp column translation");
 
-    let translated = super::translate_extended_timestamp(sql);
-
-    assert!(translated.contains("`expires_at` DATETIME(6)"));
-    assert!(translated.contains("`timestamp`"));
-    assert!(translated.contains("'timestamp ''quoted'''"));
-    assert!(translated.contains("\"timestamp \\\"escaped\\\"\""));
-    assert!(translated.contains("-- timestamp line"));
-    assert!(translated.contains("# timestamp hash"));
-    assert!(translated.contains("/* timestamp block */"));
-    assert!(translated.contains("/*!80000 timestamp version */"));
+    assert_eq!(
+        translated.target_sql.as_deref(),
+        Some("ALTER TABLE `items` ADD COLUMN `expires_at` TIMESTAMP NULL DEFAULT NULL")
+    );
 }
 
 #[test]
@@ -484,13 +484,6 @@ fn timestamp_translation_preserves_admitted_unquoted_identifiers() {
         assert_eq!(translated.target_sql.as_deref(), Some(sql));
     }
 
-    let create = "CREATE TABLE items (id BIGINT, CONSTRAINT timestamp CHECK (id > 0), KEY timestamp (id), INDEX timestamp_2 (id), expires_at TIMESTAMP NULL)";
-    let translated_create = super::translate_extended_timestamp(create);
-    assert!(translated_create.contains("CONSTRAINT timestamp CHECK"));
-    assert!(translated_create.contains("KEY timestamp (id)"));
-    assert!(translated_create.contains("INDEX timestamp_2 (id)"));
-    assert!(translated_create.contains("expires_at DATETIME NULL"));
-
     let temporal = super::translate_modeled_ddl(
         "ALTER TABLE items ADD COLUMN expires_at TiMeStAmP(6) NULL",
         &[],
@@ -498,7 +491,7 @@ fn timestamp_translation_preserves_admitted_unquoted_identifiers() {
     .expect("mixed-case TIMESTAMP type");
     assert_eq!(
         temporal.target_sql.as_deref(),
-        Some("ALTER TABLE items ADD COLUMN expires_at DATETIME(6) NULL")
+        Some("ALTER TABLE items ADD COLUMN expires_at TiMeStAmP(6) NULL")
     );
 }
 

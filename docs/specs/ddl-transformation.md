@@ -37,6 +37,7 @@ allowlist.
 - [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
 - [x] Record expected target object state for crash/replay verification without treating that evidence as source/target reconciliation.
 - [x] Fail closed as `translation_pending` before target execution when syntax, context, dependencies, or semantics fall outside that explicit slice; the stream checkpoint and later-event barrier must remain unchanged.
+- [x] Carry `TIMESTAMP` column types across unchanged. The former unconditional `TIMESTAMP` to `DATETIME` rewrite is removed: MySQL rejects values past 2038-01-19 that MariaDB 11 accepts, but no source column holds one, so the rewrite bought nothing and would have required rebuilding 384 tables and about 864 GB with `ALGORITHM=COPY`.
 - [x] Emit deterministic MySQL 8 SQL and record transformation version `mariadb-mysql8-v1`.
 - [x] Set journal `transformation_version` and nullable `generated_sql` from the actual transformation before `prepared`; proven no-ops persist `generated_sql = NULL`.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
