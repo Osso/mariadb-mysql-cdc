@@ -1,19 +1,15 @@
 use super::superseded_insert::{
     BinlogCoordinate, SupersededInsertProof, SupersededInsertVerificationInput,
-    SupersededReleaseVerificationInput, verify_superseded_insert, verify_superseded_release_insert,
+    verify_superseded_insert,
 };
 use super::superseded_source::{
-    SupersededReleaseSourceEvidence, SupersededSourceEvidence, build_exact_row_insert_statement,
-    load_superseded_comics_source_evidence, load_superseded_release_source_evidence,
-    load_superseded_source_evidence,
+    SupersededSourceEvidence, build_exact_row_insert_statement,
+    load_superseded_comics_source_evidence, load_superseded_source_evidence,
 };
 use super::transaction::SupersededInsertVerifier;
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::row::DeferredSupersededInsertCandidate;
-use crate::target::{
-    ReleaseParentKey, ReleasesActiveTransactionEvidence, TransactionalTargetExecutor,
-    UsersActiveTransactionEvidence,
-};
+use crate::target::{TransactionalTargetExecutor, UsersActiveTransactionEvidence};
 use mysql::Value;
 
 const USERS_SCHEMA: &str = "globalcomix";
@@ -21,12 +17,6 @@ const USERS_TABLE: &str = "users";
 const USERS_NAME_INDEX: &str = "users.name";
 const COMICS_TABLE: &str = "comics";
 const COMICS_SLUG_INDEX: &str = "comics.slug";
-const RELEASES_TABLE: &str = "releases";
-const RELEASES_RECOVERY_FILE: &str = "mysqld-bin.002709";
-const RELEASES_CATEGORY_EVENT_POSITION: u64 = 515_816_736;
-const RELEASES_CATEGORY_XID_POSITION: u64 = 515_824_875;
-const RELEASES_VISIBILITY_EVENT_POSITION: u64 = 531_921_789;
-const RELEASES_VISIBILITY_XID_POSITION: u64 = 531_929_925;
 
 pub(crate) struct ProductionSupersededInsertVerifier<'a, E> {
     source: MySqlConnectionConfig,
@@ -82,30 +72,6 @@ where
         candidate: &DeferredSupersededInsertCandidate,
         xid_end_position: u64,
     ) -> Result<SupersededInsertProof, String> {
-        if candidate.observation.table == RELEASES_TABLE {
-            #[cfg(feature = "integration-failpoints")]
-            let logical_snapshot = self.logical_snapshot.clone();
-            let mut source = |release_id: &Value, parent_key: ReleaseParentKey| {
-                let evidence =
-                    load_superseded_release_source_evidence(&self.source, release_id, parent_key)
-                        .map_err(|error| error.to_string())?;
-                #[cfg(feature = "integration-failpoints")]
-                let evidence = {
-                    let mut evidence = evidence;
-                    if let Some(snapshot) = &logical_snapshot {
-                        evidence.snapshot = snapshot.clone();
-                    }
-                    evidence
-                };
-                Ok(evidence)
-            };
-            return verify_release_with_source_loader(
-                candidate,
-                xid_end_position,
-                &mut source,
-                self.target,
-            );
-        }
         let is_comics = candidate.observation.table == COMICS_TABLE;
         let mut source = |primary_key: u64, identity: &str| {
             if is_comics {
@@ -348,322 +314,6 @@ where
             "superseded insert rejected: {rejection:?}; evidence_params={evidence_params}; source_sql={source_sql}; target_sql={target_sql}"
         )
     })
-}
-
-fn verify_release_with_source_loader<E, L>(
-    candidate: &DeferredSupersededInsertCandidate,
-    xid_end_position: u64,
-    source_loader: &mut L,
-    target: &E,
-) -> Result<SupersededInsertProof, String>
-where
-    E: TransactionalTargetExecutor,
-    L: FnMut(&Value, ReleaseParentKey) -> Result<SupersededReleaseSourceEvidence, String>,
-{
-    let parent_key = validate_exact_release_scope(candidate, xid_end_position)?;
-    let historical = historical_release_identity(candidate, parent_key)?;
-    let source = source_loader(&historical.release_id, parent_key)
-        .map_err(|error| format!("superseded release source evidence failed: {error}"))?;
-    let current = source
-        .release_rows
-        .first()
-        .ok_or_else(|| "superseded release source evidence has no current row".to_string())?;
-    let current_comic_id = named_value(&source.release_columns, &current.values, "comic_id")?;
-    let current_parent_value = named_value(
-        &source.release_columns,
-        &current.values,
-        parent_key.child_column(),
-    )?;
-    let target_evidence = target
-        .read_locked_release_supersession_evidence(
-            &historical.release_id,
-            current_comic_id,
-            current_parent_value,
-            parent_key,
-        )
-        .map_err(|error| format!("superseded release target evidence failed: {error}"))?;
-    release_verification_proof(
-        candidate,
-        xid_end_position,
-        parent_key,
-        &historical,
-        source,
-        target_evidence,
-    )
-}
-
-struct HistoricalReleaseIdentity {
-    release_id: Value,
-    comic_id: String,
-    parent_value: String,
-    image_hash: String,
-}
-
-fn validate_exact_release_scope(
-    candidate: &DeferredSupersededInsertCandidate,
-    xid_end_position: u64,
-) -> Result<ReleaseParentKey, String> {
-    let observation = &candidate.observation;
-    let exact_release_insert = observation.schema == USERS_SCHEMA
-        && observation.table == RELEASES_TABLE
-        && observation.operation == crate::conflict_repair::ConflictOperation::Insert
-        && observation.error_code == 1452;
-    if !exact_release_insert {
-        return Err(
-            "superseded release insert rejected: requires exact globalcomix.releases INSERT FK 1452"
-                .to_string(),
-        );
-    }
-    let parent_key = [ReleaseParentKey::Category, ReleaseParentKey::Visibility]
-        .into_iter()
-        .find(|parent_key| {
-            release_recovery_boundary_matches(observation, xid_end_position, *parent_key)
-        })
-        .ok_or_else(|| {
-            "superseded release insert rejected: requires an approved exact production transaction \
-             and FK identity"
-                .to_string()
-        })?;
-    if candidate.historical_change.kind != crate::target::TargetRowChangeKind::Insert {
-        return Err(
-            "superseded release insert rejected: historical change must be INSERT".to_string(),
-        );
-    }
-    Ok(parent_key)
-}
-
-fn release_recovery_boundary_matches(
-    observation: &crate::conflict_repair::ConflictObservation,
-    xid_end_position: u64,
-    parent_key: ReleaseParentKey,
-) -> bool {
-    let (child_identity, parent_identity, event_position, xid_position) = match parent_key {
-        ReleaseParentKey::Category => (
-            "FOREIGN KEY (`comic_id`, `comic_category_id`)",
-            "REFERENCES `comics` (`id`, `section_id`)",
-            RELEASES_CATEGORY_EVENT_POSITION,
-            RELEASES_CATEGORY_XID_POSITION,
-        ),
-        ReleaseParentKey::Visibility => (
-            "FOREIGN KEY (`comic_id`, `comic_is_visible`)",
-            "REFERENCES `comics` (`id`, `is_visible`)",
-            RELEASES_VISIBILITY_EVENT_POSITION,
-            RELEASES_VISIBILITY_XID_POSITION,
-        ),
-    };
-    let exact_constraint = observation
-        .error_text
-        .contains(&format!("CONSTRAINT `{}`", parent_key.constraint()));
-    let exact_child_identity = observation.error_text.contains(child_identity);
-    let exact_parent_identity = observation.error_text.contains(parent_identity);
-    let exact_file = observation.coordinate.file == RELEASES_RECOVERY_FILE;
-    let exact_coordinates =
-        observation.coordinate.start_position == event_position && xid_end_position == xid_position;
-    exact_constraint
-        && exact_child_identity
-        && exact_parent_identity
-        && exact_file
-        && exact_coordinates
-}
-
-fn historical_release_identity(
-    candidate: &DeferredSupersededInsertCandidate,
-    parent_key: ReleaseParentKey,
-) -> Result<HistoricalReleaseIdentity, String> {
-    let change = &candidate.historical_change;
-    if change.writable_columns.len() != change.source_values.len() {
-        return Err("historical releases change column/value count mismatch".to_string());
-    }
-    let release_id = value_for_column(change, "id")?.clone();
-    let comic_id = value_key(value_for_column(change, "comic_id")?, "historical comic_id")?;
-    let parent_value = value_key(
-        value_for_column(change, parent_key.child_column())?,
-        "historical release parent value",
-    )?;
-    let image_hash = super::superseded_source::hash_canonical_row(
-        &change.writable_columns,
-        &change.source_values,
-    )
-    .map_err(|error| format!("historical releases image hash failed: {error}"))?;
-    Ok(HistoricalReleaseIdentity {
-        release_id,
-        comic_id,
-        parent_value,
-        image_hash,
-    })
-}
-
-fn release_verification_proof(
-    candidate: &DeferredSupersededInsertCandidate,
-    xid_end_position: u64,
-    parent_key: ReleaseParentKey,
-    historical: &HistoricalReleaseIdentity,
-    source: SupersededReleaseSourceEvidence,
-    target: ReleasesActiveTransactionEvidence,
-) -> Result<SupersededInsertProof, String> {
-    if source.release_columns != target.release_columns {
-        return Err(format!(
-            "source/target releases evidence column mismatch: source {:?}, target {:?}",
-            source.release_columns, target.release_columns
-        ));
-    }
-    if source.parent_columns != target.parent_columns {
-        return Err(format!(
-            "source/target comics evidence column mismatch: source {:?}, target {:?}",
-            source.parent_columns, target.parent_columns
-        ));
-    }
-    let current = source.release_rows.first();
-    let source_parent = source.parent_rows.first();
-    let current_release_id = current
-        .map(|row| named_value_key(&source.release_columns, &row.values, "id"))
-        .transpose()?
-        .unwrap_or_default();
-    let current_comic_id = current
-        .map(|row| named_value_key(&source.release_columns, &row.values, "comic_id"))
-        .transpose()?
-        .unwrap_or_default();
-    let current_parent_value = current
-        .map(|row| {
-            named_value_key(
-                &source.release_columns,
-                &row.values,
-                parent_key.child_column(),
-            )
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let source_parent_comic_id = source_parent
-        .map(|row| named_value_key(&source.parent_columns, &row.values, "id"))
-        .transpose()?
-        .unwrap_or_default();
-    let source_parent_value = source_parent
-        .map(|row| {
-            named_value_key(
-                &source.parent_columns,
-                &row.values,
-                parent_key.parent_column(),
-            )
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let current_hash = current.map_or_else(String::new, |row| {
-        crate::target::hash_ordered_mysql_row(&row.values)
-    });
-    let source_parent_hash = source_parent.map_or_else(String::new, |row| {
-        crate::target::hash_ordered_mysql_row(&row.values)
-    });
-    let target_release_hash = only_locked_hash(&target.release_rows);
-    let target_parent = target.parent_rows.first();
-    let target_parent_comic_id = target_parent
-        .map(|row| named_value_key(&target.parent_columns, &row.values, "id"))
-        .transpose()?
-        .unwrap_or_default();
-    let target_parent_value = target_parent
-        .map(|row| {
-            named_value_key(
-                &target.parent_columns,
-                &row.values,
-                parent_key.parent_column(),
-            )
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let target_parent_hash = only_locked_hash(&target.parent_rows);
-    let input = SupersededReleaseVerificationInput {
-        schema: candidate.observation.schema.clone(),
-        table: candidate.observation.table.clone(),
-        operation: candidate.observation.operation,
-        error_code: candidate.observation.error_code,
-        constraint: parent_key.constraint().to_string(),
-        parent_key,
-        candidate_xid: BinlogCoordinate {
-            file: candidate.observation.coordinate.file.clone(),
-            position: xid_end_position,
-        },
-        source_snapshot: BinlogCoordinate {
-            file: source.snapshot.file.clone(),
-            position: source.snapshot.position,
-        },
-        historical_release_id: value_key(&historical.release_id, "historical release id")?,
-        historical_comic_id: historical.comic_id.clone(),
-        historical_parent_value: historical.parent_value.clone(),
-        current_release_row_count: source.release_rows.len(),
-        current_release_id,
-        current_release_comic_id: current_comic_id,
-        current_release_parent_value: current_parent_value,
-        current_release_hash: current_hash,
-        source_parent_row_count: source.parent_rows.len(),
-        source_parent_comic_id,
-        source_parent_value,
-        source_parent_hash,
-        target_release_rows_read_for_update: true,
-        target_release_row_count: target.release_rows.len(),
-        target_release_hash,
-        target_parent_read_for_update: true,
-        target_parent_row_count: target.parent_rows.len(),
-        target_parent_comic_id,
-        target_parent_value,
-        target_parent_hash,
-        historical_image_hash: historical.image_hash.clone(),
-    };
-    let release_proof = verify_superseded_release_insert(&input)
-        .map_err(|rejection| format!("superseded release insert rejected: {rejection:?}"))?;
-    let current_row_install = if release_proof.install_current_release {
-        Some(
-            build_exact_row_insert_statement(
-                USERS_SCHEMA,
-                RELEASES_TABLE,
-                current.expect("verified current release row"),
-            )
-            .map_err(|error| error.to_string())?,
-        )
-    } else {
-        None
-    };
-    Ok(SupersededInsertProof {
-        source_snapshot: release_proof.source_snapshot,
-        historical_image_hash: release_proof.historical_image_hash,
-        source_primary_hash: release_proof.current_release_hash.clone(),
-        source_owner_hash: release_proof.source_parent_hash.clone(),
-        target_primary_hash: release_proof.current_release_hash,
-        target_owner_hash: release_proof.target_parent_hash,
-        current_row_install,
-    })
-}
-
-fn named_value<'a>(
-    columns: &[String],
-    values: &'a [Value],
-    column: &str,
-) -> Result<&'a Value, String> {
-    let index = column_index(columns, column)?;
-    values
-        .get(index)
-        .ok_or_else(|| format!("evidence row has no value for {column}"))
-}
-
-fn named_value_key(columns: &[String], values: &[Value], column: &str) -> Result<String, String> {
-    value_key(named_value(columns, values, column)?, column)
-}
-
-fn value_key(value: &Value, label: &str) -> Result<String, String> {
-    match value {
-        Value::Bytes(bytes) => {
-            String::from_utf8(bytes.clone()).map_err(|_| format!("{label} is not valid UTF-8"))
-        }
-        Value::Int(number) => Ok(number.to_string()),
-        Value::UInt(number) => Ok(number.to_string()),
-        _ => Err(format!("{label} is not an integer or text key")),
-    }
-}
-
-fn only_locked_hash(rows: &[crate::target::LockedUsersRowEvidence]) -> String {
-    if rows.len() == 1 {
-        rows[0].row_hash.clone()
-    } else {
-        String::new()
-    }
 }
 
 fn validate_exact_scope(candidate: &DeferredSupersededInsertCandidate) -> Result<(), String> {
@@ -909,8 +559,6 @@ mod tests {
 
     struct FakeTarget {
         evidence: RefCell<Option<Result<UsersActiveTransactionEvidence, TargetExecuteError>>>,
-        release_evidence:
-            RefCell<Option<Result<ReleasesActiveTransactionEvidence, TargetExecuteError>>>,
     }
 
     impl TargetExecutor for FakeTarget {
@@ -968,19 +616,6 @@ mod tests {
                 .borrow_mut()
                 .take()
                 .expect("one target evidence read")
-        }
-
-        fn read_locked_release_supersession_evidence(
-            &self,
-            _release_id: &Value,
-            _comic_id: &Value,
-            _parent_value: &Value,
-            _parent_key: ReleaseParentKey,
-        ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
-            self.release_evidence
-                .borrow_mut()
-                .take()
-                .expect("one release target evidence read")
         }
 
         fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
@@ -1074,133 +709,10 @@ mod tests {
         }
     }
 
-    fn release_source_evidence() -> SupersededReleaseSourceEvidence {
-        let release_columns = vec![
-            "id".to_string(),
-            "comic_id".to_string(),
-            "comic_category_id".to_string(),
-        ];
-        let release_values = vec![Value::UInt(77), Value::UInt(12), Value::UInt(9)];
-        let parent_columns = vec!["id".to_string(), "section_id".to_string()];
-        let parent_values = vec![Value::UInt(12), Value::UInt(9)];
-        SupersededReleaseSourceEvidence {
-            snapshot: super::super::superseded_source::SourceSnapshotCoordinate {
-                file: "mysqld-bin.002740".to_string(),
-                position: 1_004_163_590,
-            },
-            release_columns: release_columns.clone(),
-            release_rows: vec![super::super::superseded_source::CanonicalSourceRow {
-                hash: super::super::superseded_source::hash_canonical_row(
-                    &release_columns,
-                    &release_values,
-                )
-                .expect("release hash"),
-                columns: release_columns,
-                values: release_values,
-            }],
-            parent_columns: parent_columns.clone(),
-            parent_rows: vec![super::super::superseded_source::CanonicalSourceRow {
-                hash: super::super::superseded_source::hash_canonical_row(
-                    &parent_columns,
-                    &parent_values,
-                )
-                .expect("parent hash"),
-                columns: parent_columns,
-                values: parent_values,
-            }],
-        }
-    }
-
-    fn release_target_evidence() -> ReleasesActiveTransactionEvidence {
-        let parent_values = vec![Value::UInt(12), Value::UInt(9)];
-        ReleasesActiveTransactionEvidence {
-            release_columns: vec![
-                "id".to_string(),
-                "comic_id".to_string(),
-                "comic_category_id".to_string(),
-            ],
-            release_rows: Vec::new(),
-            parent_columns: vec!["id".to_string(), "section_id".to_string()],
-            parent_rows: vec![LockedUsersRowEvidence {
-                row_hash: crate::target::hash_ordered_mysql_row(&parent_values),
-                values: parent_values,
-            }],
-        }
-    }
-
-    fn release_candidate() -> DeferredSupersededInsertCandidate {
-        DeferredSupersededInsertCandidate {
-            observation: crate::conflict_repair::ConflictObservation {
-                source_identity: "source".to_string(),
-                source_server_id: 3,
-                coordinate: crate::conflict_repair::ConflictCoordinate {
-                    file: "mysqld-bin.002709".to_string(),
-                    start_position: RELEASES_CATEGORY_EVENT_POSITION,
-                    end_position: 0,
-                },
-                schema: USERS_SCHEMA.to_string(),
-                table: RELEASES_TABLE.to_string(),
-                operation: crate::conflict_repair::ConflictOperation::Insert,
-                source_primary_key: vec!["77".to_string()],
-                duplicate_index: None,
-                duplicate_owner_primary_key: None,
-                error_code: 1452,
-                error_text: "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`releases`, CONSTRAINT `releases_ibfk_2` FOREIGN KEY (`comic_id`, `comic_category_id`) REFERENCES `comics` (`id`, `section_id`))".to_string(),
-                observed_at_ms: 1,
-                parent_recovery: None,
-            },
-            historical_change: TargetRowChange {
-                statement: SqlStatement {
-                    sql: "historical insert".to_string(),
-                    params: Vec::new(),
-                },
-                kind: crate::target::TargetRowChangeKind::Insert,
-                table: "globalcomix.releases".to_string(),
-                primary_key_columns: vec!["id".to_string()],
-                primary_key_values: vec![Value::UInt(77)],
-                writable_columns: vec![
-                    "id".to_string(),
-                    "comic_id".to_string(),
-                    "comic_category_id".to_string(),
-                ],
-                source_values: vec![Value::UInt(77), Value::UInt(12), Value::UInt(4)],
-                set_columns: vec![None, None, None],
-            },
-        }
-    }
-
-    #[test]
-    fn release_verifier_locks_current_release_and_parent_and_builds_exact_install() {
-        let target = FakeTarget {
-            evidence: RefCell::new(None),
-            release_evidence: RefCell::new(Some(Ok(release_target_evidence()))),
-        };
-        let mut source = |_: &Value, _: ReleaseParentKey| Ok(release_source_evidence());
-
-        let proof = verify_release_with_source_loader(
-            &release_candidate(),
-            RELEASES_CATEGORY_XID_POSITION,
-            &mut source,
-            &target,
-        )
-        .expect("superseded release proof");
-
-        let install = proof.current_row_install.expect("current release install");
-        assert_eq!(
-            install.sql,
-            "INSERT INTO `globalcomix`.`releases` (`id`,`comic_id`,`comic_category_id`) VALUES (?,?,?)"
-        );
-        assert_eq!(
-            install.params,
-            [Value::UInt(77), Value::UInt(12), Value::UInt(9)]
-        );
-    }
-
     #[test]
     fn combines_source_snapshot_and_active_target_transaction_into_shared_proof() {
         let target = FakeTarget {
             evidence: RefCell::new(Some(Ok(target_evidence()))),
-            release_evidence: RefCell::new(None),
         };
         let mut source = |_: u64, _: &str| Ok(source_evidence());
 
@@ -1216,7 +728,6 @@ mod tests {
     fn maps_source_adapter_failure_precisely() {
         let target = FakeTarget {
             evidence: RefCell::new(Some(Ok(target_evidence()))),
-            release_evidence: RefCell::new(None),
         };
         let mut source = |_: u64, _: &str| Err("source unavailable".to_string());
 
@@ -1250,7 +761,6 @@ mod tests {
         target_evidence.rows[1].row_hash = "different-owner-hash".to_string();
         let target = FakeTarget {
             evidence: RefCell::new(Some(Ok(target_evidence))),
-            release_evidence: RefCell::new(None),
         };
         let mut source = |_primary_key: u64, _slug: &str| Ok(source_evidence.clone());
 
@@ -1268,7 +778,6 @@ mod tests {
     fn maps_active_target_adapter_failure_precisely() {
         let target = FakeTarget {
             evidence: RefCell::new(Some(Err(TargetExecuteError::new("lock read failed")))),
-            release_evidence: RefCell::new(None),
         };
         let mut source = |_: u64, _: &str| Ok(source_evidence());
 

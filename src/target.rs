@@ -95,43 +95,6 @@ pub struct UsersActiveTransactionEvidence {
     pub rows: Vec<LockedUsersRowEvidence>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReleaseParentKey {
-    Category,
-    Visibility,
-}
-
-impl ReleaseParentKey {
-    pub fn constraint(self) -> &'static str {
-        match self {
-            Self::Category => "releases_ibfk_2",
-            Self::Visibility => "releases_ibfk_3",
-        }
-    }
-
-    pub fn child_column(self) -> &'static str {
-        match self {
-            Self::Category => "comic_category_id",
-            Self::Visibility => "comic_is_visible",
-        }
-    }
-
-    pub fn parent_column(self) -> &'static str {
-        match self {
-            Self::Category => "section_id",
-            Self::Visibility => "is_visible",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReleasesActiveTransactionEvidence {
-    pub release_columns: Vec<String>,
-    pub release_rows: Vec<LockedUsersRowEvidence>,
-    pub parent_columns: Vec<String>,
-    pub parent_rows: Vec<LockedUsersRowEvidence>,
-}
-
 pub trait TransactionalTargetExecutor: TargetExecutor {
     fn acquire_stream_lease(&self, _lease_name: &str) -> Result<(), TargetExecuteError> {
         Ok(())
@@ -170,17 +133,6 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
         Err(TargetExecuteError::new(
             "active-transaction comics supersession evidence is unsupported by this target executor",
-        ))
-    }
-    fn read_locked_release_supersession_evidence(
-        &self,
-        _release_id: &Value,
-        _comic_id: &Value,
-        _parent_value: &Value,
-        _parent_key: ReleaseParentKey,
-    ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
-        Err(TargetExecuteError::new(
-            "active-transaction release supersession evidence is unsupported by this target executor",
         ))
     }
     /// Reads a parent's referenced columns under the active transaction, locked, selecting by the
@@ -707,21 +659,6 @@ where
         historical_slug: &Value,
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
         (*self).read_locked_comics_supersession_evidence(historical_primary_key, historical_slug)
-    }
-
-    fn read_locked_release_supersession_evidence(
-        &self,
-        release_id: &Value,
-        comic_id: &Value,
-        parent_value: &Value,
-        parent_key: ReleaseParentKey,
-    ) -> Result<ReleasesActiveTransactionEvidence, TargetExecuteError> {
-        (*self).read_locked_release_supersession_evidence(
-            release_id,
-            comic_id,
-            parent_value,
-            parent_key,
-        )
     }
 
     fn read_locked_parent_identity(

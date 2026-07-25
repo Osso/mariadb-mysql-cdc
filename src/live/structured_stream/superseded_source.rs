@@ -10,12 +10,6 @@ const USERS_SCHEMA: &str = "globalcomix";
 const USERS_TABLE: &str = "users";
 const HASH_DOMAIN: &[u8] = b"mariadb-mysql-cdc:superseded-source-row:v1\0";
 const COLUMN_QUERY: &str = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
-fn writable_column_query() -> String {
-    format!(
-        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND {} ORDER BY ORDINAL_POSITION",
-        crate::mysql_support::writable_column_predicate("EXTRA")
-    )
-}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SourceSnapshotCoordinate {
@@ -35,15 +29,6 @@ pub(crate) struct SupersededSourceEvidence {
     pub(crate) snapshot: SourceSnapshotCoordinate,
     pub(crate) columns: Vec<String>,
     pub(crate) matching_rows: Vec<CanonicalSourceRow>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SupersededReleaseSourceEvidence {
-    pub(crate) snapshot: SourceSnapshotCoordinate,
-    pub(crate) release_columns: Vec<String>,
-    pub(crate) release_rows: Vec<CanonicalSourceRow>,
-    pub(crate) parent_columns: Vec<String>,
-    pub(crate) parent_rows: Vec<CanonicalSourceRow>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,92 +139,6 @@ fn load_identity_source_evidence(
         historical_primary_key,
         historical_identity,
     )
-}
-
-pub(crate) fn load_superseded_release_source_evidence(
-    config: &MySqlConnectionConfig,
-    release_id: &Value,
-    parent_key: crate::target::ReleaseParentKey,
-) -> Result<SupersededReleaseSourceEvidence, SourceEvidenceError> {
-    let mut source = MySqlSupersededSourceQuery::connect(config)?;
-    let snapshot_lower_bound = load_master_status(&mut source)?;
-    source.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
-    let result = load_release_evidence_in_transaction(
-        &mut source,
-        snapshot_lower_bound,
-        release_id,
-        parent_key,
-    );
-    finish_transaction(&mut source, result)
-}
-
-fn load_release_evidence_in_transaction(
-    source: &mut impl SupersededSourceQuery,
-    snapshot: SourceSnapshotCoordinate,
-    release_id: &Value,
-    parent_key: crate::target::ReleaseParentKey,
-) -> Result<SupersededReleaseSourceEvidence, SourceEvidenceError> {
-    let release_columns = load_writable_table_columns(source, "releases")?;
-    let release_sql = row_query(&release_columns, "releases", "`id` = ?")?;
-    let release_result = source.query(&release_sql, vec![release_id.clone()])?;
-    let release_rows = canonical_rows(&release_columns, release_result, "releases")?;
-    let release = release_rows
-        .first()
-        .ok_or_else(|| SourceEvidenceError::new("source release row is missing"))?;
-    if release_rows.len() != 1 {
-        return Err(SourceEvidenceError::new(format!(
-            "source release row count is {}, expected 1",
-            release_rows.len()
-        )));
-    }
-    let comic_id = value_for_named_column(&release_columns, &release.values, "comic_id")?.clone();
-    let parent_value =
-        value_for_named_column(&release_columns, &release.values, parent_key.child_column())?
-            .clone();
-    let parent_columns = load_table_columns(source, "comics")?;
-    let parent_predicate = format!("`id` = ? AND `{}` = ?", parent_key.parent_column());
-    let parent_sql = row_query(&parent_columns, "comics", &parent_predicate)?;
-    let parent_result = source.query(&parent_sql, vec![comic_id, parent_value])?;
-    let parent_rows = canonical_rows(&parent_columns, parent_result, "comics")?;
-    Ok(SupersededReleaseSourceEvidence {
-        snapshot,
-        release_columns,
-        release_rows,
-        parent_columns,
-        parent_rows,
-    })
-}
-
-fn canonical_rows(
-    columns: &[String],
-    result: QueryRows,
-    table: &str,
-) -> Result<Vec<CanonicalSourceRow>, SourceEvidenceError> {
-    if result.columns != columns {
-        return Err(SourceEvidenceError::new(format!(
-            "source {table} result column order mismatch: expected {:?}, got {:?}",
-            columns, result.columns
-        )));
-    }
-    result
-        .rows
-        .into_iter()
-        .map(|values| canonical_source_row(columns, values))
-        .collect()
-}
-
-fn value_for_named_column<'a>(
-    columns: &[String],
-    values: &'a [Value],
-    column: &str,
-) -> Result<&'a Value, SourceEvidenceError> {
-    let index = columns
-        .iter()
-        .position(|candidate| candidate == column)
-        .ok_or_else(|| SourceEvidenceError::new(format!("source row is missing {column}")))?;
-    values
-        .get(index)
-        .ok_or_else(|| SourceEvidenceError::new(format!("source row has no value for {column}")))
 }
 
 pub(crate) fn build_exact_row_insert_statement(
@@ -402,13 +301,6 @@ fn load_table_columns(
     table: &str,
 ) -> Result<Vec<String>, SourceEvidenceError> {
     load_columns(source, table, COLUMN_QUERY)
-}
-
-fn load_writable_table_columns(
-    source: &mut impl SupersededSourceQuery,
-    table: &str,
-) -> Result<Vec<String>, SourceEvidenceError> {
-    load_columns(source, table, &writable_column_query())
 }
 
 fn load_columns(
@@ -630,14 +522,6 @@ fn source_options(config: &MySqlConnectionConfig) -> Result<Opts, SourceEvidence
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn source_writable_columns_keep_default_generated_only() {
-        let query = writable_column_query();
-        assert!(query.contains("VIRTUAL GENERATED"));
-        assert!(query.contains("STORED GENERATED"));
-        assert!(!query.contains("EXTRA NOT LIKE '%GENERATED%'"));
-    }
     use std::collections::VecDeque;
 
     #[derive(Clone, Debug, PartialEq)]
