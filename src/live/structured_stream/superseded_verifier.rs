@@ -13,10 +13,23 @@ use crate::target::{TransactionalTargetExecutor, UsersActiveTransactionEvidence}
 use mysql::Value;
 
 const USERS_SCHEMA: &str = "globalcomix";
-const USERS_TABLE: &str = "users";
-const USERS_NAME_INDEX: &str = "users.name";
-const COMICS_TABLE: &str = "comics";
-const COMICS_SLUG_INDEX: &str = "comics.slug";
+
+/// Tables whose superseded-insert proof is supported, as
+/// `(table, duplicate index, identity column)`. The identity column must be the single unique column
+/// behind that index, because the proof compares exactly one historical identity owner.
+const SUPERSEDED_IDENTITY_SCOPES: &[(&str, &str, &str)] = &[
+    ("users", "users.name", "name"),
+    ("comics", "comics.slug", "slug"),
+    ("artists", "artists.idx_slug", "name"),
+];
+
+/// The identity column for a supported table, or `None` when the table is out of scope.
+fn superseded_identity_column(table: &str, duplicate_index: Option<&str>) -> Option<&'static str> {
+    SUPERSEDED_IDENTITY_SCOPES
+        .iter()
+        .find(|(scope_table, index, _)| *scope_table == table && Some(*index) == duplicate_index)
+        .map(|(_, _, identity_column)| *identity_column)
+}
 
 pub(crate) struct ProductionSupersededInsertVerifier<'a, E> {
     source: MySqlConnectionConfig,
@@ -72,7 +85,7 @@ where
         candidate: &DeferredSupersededInsertCandidate,
         xid_end_position: u64,
     ) -> Result<SupersededInsertProof, String> {
-        let is_comics = candidate.observation.table == COMICS_TABLE;
+        let is_comics = candidate.observation.table == "comics";
         let mut source = |primary_key: u64, identity: &str| {
             if is_comics {
                 load_superseded_comics_source_evidence(&self.source, primary_key, identity)
@@ -275,23 +288,19 @@ where
     let historical = historical_identity(candidate)?;
     let source = source_loader(historical.primary_key, &historical.name)
         .map_err(|error| format!("superseded source evidence failed: {error}"))?;
-    let target = if candidate.observation.table == COMICS_TABLE {
-        target.read_locked_comics_supersession_evidence(
+    let identity_column = superseded_identity_column(
+        &candidate.observation.table,
+        candidate.observation.duplicate_index.as_deref(),
+    )
+    .ok_or_else(|| "superseded insert rejected: table is out of scope".to_string())?;
+    let target = target
+        .read_locked_supersession_evidence(
+            &candidate.observation.table,
+            identity_column,
             &historical.primary_key_value,
             &historical.name_value,
         )
-    } else {
-        target.read_locked_users_supersession_evidence(
-            &historical.primary_key_value,
-            &historical.name_value,
-        )
-    }
-    .map_err(|error| format!("superseded target evidence failed: {error}"))?;
-    let identity_column = if candidate.observation.table == COMICS_TABLE {
-        "slug"
-    } else {
-        "name"
-    };
+        .map_err(|error| format!("superseded target evidence failed: {error}"))?;
     let source_sql = super::superseded_source::identity_row_query(
         &source.columns,
         &candidate.observation.table,
@@ -319,12 +328,12 @@ where
 fn validate_exact_scope(candidate: &DeferredSupersededInsertCandidate) -> Result<(), String> {
     let observation = &candidate.observation;
     let supported_scope = observation.schema == USERS_SCHEMA
-        && ((observation.table == USERS_TABLE
-            && observation.duplicate_index.as_deref() == Some(USERS_NAME_INDEX))
-            || (observation.table == COMICS_TABLE
-                && observation.duplicate_index.as_deref() == Some(COMICS_SLUG_INDEX)));
+        && superseded_identity_column(&observation.table, observation.duplicate_index.as_deref())
+            .is_some();
     if !supported_scope {
-        return Err("superseded insert rejected: requires globalcomix.users/users.name or globalcomix.comics/comics.slug".to_string());
+        return Err(format!(
+            "superseded insert rejected: requires one of {SUPERSEDED_IDENTITY_SCOPES:?}"
+        ));
     }
     if observation.operation != crate::conflict_repair::ConflictOperation::Insert {
         return Err("superseded insert rejected: requires INSERT".to_string());
@@ -351,11 +360,11 @@ fn historical_identity(
         return Err("historical users change column/value count mismatch".to_string());
     }
     let primary_key_value = value_for_column(change, "id")?.clone();
-    let identity_column = if candidate.observation.table == COMICS_TABLE {
-        "slug"
-    } else {
-        "name"
-    };
+    let identity_column = superseded_identity_column(
+        &candidate.observation.table,
+        candidate.observation.duplicate_index.as_deref(),
+    )
+    .ok_or_else(|| "historical identity column is out of scope".to_string())?;
     let name_value = value_for_column(change, identity_column)?.clone();
     let primary_key = value_u64(&primary_key_value, "historical id")?;
     let name = value_string(&name_value, "historical unique identity")?;
@@ -402,11 +411,11 @@ fn verification_input(
         ));
     }
     let id_index = column_index(&source.columns, "id")?;
-    let identity_column = if candidate.observation.table == COMICS_TABLE {
-        "slug"
-    } else {
-        "name"
-    };
+    let identity_column = superseded_identity_column(
+        &candidate.observation.table,
+        candidate.observation.duplicate_index.as_deref(),
+    )
+    .ok_or_else(|| "verification identity column is out of scope".to_string())?;
     let name_index = column_index(&source.columns, identity_column)?;
     let source_rows = classify_source_rows(&source, id_index, name_index, historical)?;
     let target_rows = classify_target_rows(&target, id_index, name_index, historical)?;
@@ -596,10 +605,12 @@ mod tests {
             Ok(())
         }
 
-        fn read_locked_users_supersession_evidence(
+        fn read_locked_supersession_evidence(
             &self,
+            _table: &str,
+            _identity_column: &str,
             _historical_primary_key: &Value,
-            _historical_name: &Value,
+            _historical_identity: &Value,
         ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
             self.evidence
                 .borrow_mut()
@@ -683,10 +694,10 @@ mod tests {
                     end_position: 0,
                 },
                 schema: USERS_SCHEMA.to_string(),
-                table: USERS_TABLE.to_string(),
+                table: "users".to_string(),
                 operation: crate::conflict_repair::ConflictOperation::Insert,
                 source_primary_key: vec!["2070980".to_string()],
-                duplicate_index: Some(USERS_NAME_INDEX.to_string()),
+                duplicate_index: Some("users.name".to_string()),
                 duplicate_owner_primary_key: None,
                 error_code: 1062,
                 error_text: "duplicate".to_string(),
@@ -699,7 +710,7 @@ mod tests {
                     params: Vec::new(),
                 },
                 kind: crate::target::TargetRowChangeKind::Insert,
-                table: USERS_TABLE.to_string(),
+                table: "users".to_string(),
                 primary_key_columns: vec!["id".to_string()],
                 primary_key_values: vec![Value::UInt(2_070_980)],
                 writable_columns: vec!["id".to_string(), "name".to_string()],
@@ -740,11 +751,57 @@ mod tests {
         );
     }
 
+    /// `artists` 32268 stalled the stream for 92 minutes at `mysqld-bin.002712:138433767` with
+    /// `Duplicate entry 'ascendancy-studio' for key 'artists.idx_slug'`. The index is on `name`, so
+    /// the proof is the same shape as `users.name`, but `artists` was out of scope.
+    #[test]
+    fn artists_idx_slug_is_a_supported_supersession_scope() {
+        assert_eq!(
+            superseded_identity_column("artists", Some("artists.idx_slug")),
+            Some("name")
+        );
+        assert_eq!(
+            superseded_identity_column("users", Some("users.name")),
+            Some("name")
+        );
+        assert_eq!(
+            superseded_identity_column("comics", Some("comics.slug")),
+            Some("slug")
+        );
+
+        let mut candidate = candidate();
+        candidate.observation.table = "artists".to_string();
+        candidate.observation.duplicate_index = Some("artists.idx_slug".to_string());
+
+        assert!(validate_exact_scope(&candidate).is_ok());
+    }
+
+    /// A table outside the list, or the right table with the wrong index, must stay rejected.
+    #[test]
+    fn unlisted_table_or_index_is_out_of_supersession_scope() {
+        assert_eq!(
+            superseded_identity_column("artists", Some("artists.name")),
+            None
+        );
+        assert_eq!(
+            superseded_identity_column("releases", Some("releases.slug")),
+            None
+        );
+        assert_eq!(superseded_identity_column("users", None), None);
+
+        let mut candidate = candidate();
+        candidate.observation.table = "releases".to_string();
+        candidate.observation.duplicate_index = Some("releases.slug".to_string());
+
+        let error = validate_exact_scope(&candidate).expect_err("out of scope");
+        assert!(error.starts_with("superseded insert rejected:"), "{error}");
+    }
+
     #[test]
     fn owner_hash_mismatch_reports_parameterized_source_and_target_sql() {
         let mut candidate = candidate();
-        candidate.observation.table = COMICS_TABLE.to_string();
-        candidate.observation.duplicate_index = Some(COMICS_SLUG_INDEX.to_string());
+        candidate.observation.table = "comics".to_string();
+        candidate.observation.duplicate_index = Some("comics.slug".to_string());
         candidate.observation.source_primary_key = vec!["48054".to_string()];
         candidate.historical_change.table = "globalcomix.comics".to_string();
         candidate.historical_change.writable_columns = vec!["id".to_string(), "slug".to_string()];

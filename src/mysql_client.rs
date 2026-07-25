@@ -450,12 +450,15 @@ fn duplicate_conflict(error: &TargetExecuteError, error_code: u16) -> DuplicateC
     }
 }
 
-const USERS_COLUMNS_FOR_EVIDENCE_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='users' ORDER BY ordinal_position";
-const COMICS_COLUMNS_FOR_SUPERSESSION_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='comics' ORDER BY ordinal_position";
-
-fn build_locked_users_evidence_sql(columns: &[String]) -> Result<String, TargetExecuteError> {
-    build_locked_identity_evidence_sql(columns, "users", "name")
+/// Column list for any table whose supersession identity is a single unique column.
+fn supersession_columns_sql(table: &str) -> String {
+    format!(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='{}' ORDER BY ordinal_position",
+        table.replace('\'', "''")
+    )
 }
+
+const COMICS_COLUMNS_FOR_SUPERSESSION_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='comics' ORDER BY ordinal_position";
 
 fn build_locked_comics_evidence_sql(columns: &[String]) -> Result<String, TargetExecuteError> {
     build_locked_identity_evidence_sql(columns, "comics", "slug")
@@ -614,31 +617,33 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
     }
 
-    fn read_locked_users_supersession_evidence(
+    fn read_locked_supersession_evidence(
         &self,
+        table: &str,
+        identity_column: &str,
         historical_primary_key: &mysql::Value,
-        historical_name: &mysql::Value,
+        historical_identity: &mysql::Value,
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
+        let columns_sql = supersession_columns_sql(table);
         let columns = self.with_connection(|conn| {
-            conn.query::<String, _>(USERS_COLUMNS_FOR_EVIDENCE_SQL)
+            conn.query::<String, _>(&columns_sql)
                 .map_err(target_query_error)
         })?;
-        let sql = build_locked_users_evidence_sql(&columns)?;
-        let rows = self
-            .with_connection(|conn| {
-                conn.exec::<mysql::Row, _, _>(
-                    sql,
-                    Params::Positional(vec![
-                        historical_primary_key.clone(),
-                        historical_name.clone(),
-                    ]),
-                )
-                .map_err(target_query_error)
-            })?
-            .into_iter()
-            .map(mysql::Row::unwrap)
-            .collect();
-        build_locked_users_evidence(columns, Ok(rows))
+        let sql = build_locked_identity_evidence_sql(&columns, table, identity_column)?;
+        let rows = self.with_connection(|conn| {
+            conn.exec::<mysql::Row, _, _>(
+                sql,
+                Params::Positional(vec![
+                    historical_primary_key.clone(),
+                    historical_identity.clone(),
+                ]),
+            )
+            .map_err(target_query_error)
+        })?;
+        build_locked_users_evidence(
+            columns,
+            Ok(rows.into_iter().map(mysql::Row::unwrap).collect()),
+        )
     }
 
     fn read_locked_comics_supersession_evidence(

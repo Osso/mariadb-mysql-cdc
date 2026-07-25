@@ -117,13 +117,17 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
             params: Vec::new(),
         })
     }
-    fn read_locked_users_supersession_evidence(
+    /// Reads the locked rows matching either the historical primary key or the historical identity
+    /// value, for any table whose supersession identity is a single unique column.
+    fn read_locked_supersession_evidence(
         &self,
+        _table: &str,
+        _identity_column: &str,
         _historical_primary_key: &Value,
-        _historical_name: &Value,
+        _historical_identity: &Value,
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
         Err(TargetExecuteError::new(
-            "active-transaction users supersession evidence is unsupported by this target executor",
+            "active-transaction supersession evidence is unsupported by this target executor",
         ))
     }
     fn read_locked_comics_supersession_evidence(
@@ -645,12 +649,19 @@ where
         (*self).save_transaction_checkpoint(checkpoint_table, checkpoint_name, checkpoint)
     }
 
-    fn read_locked_users_supersession_evidence(
+    fn read_locked_supersession_evidence(
         &self,
+        table: &str,
+        identity_column: &str,
         historical_primary_key: &Value,
-        historical_name: &Value,
+        historical_identity: &Value,
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
-        (*self).read_locked_users_supersession_evidence(historical_primary_key, historical_name)
+        (*self).read_locked_supersession_evidence(
+            table,
+            identity_column,
+            historical_primary_key,
+            historical_identity,
+        )
     }
 
     fn read_locked_comics_supersession_evidence(
@@ -1347,10 +1358,12 @@ mod tests {
     }
 
     #[test]
-    fn default_active_transaction_users_evidence_fails_explicitly() {
+    fn default_active_transaction_supersession_evidence_fails_explicitly() {
         let executor = RecordingExecutor::default();
         let error = TransactionalRecordingExecutor(executor)
-            .read_locked_users_supersession_evidence(
+            .read_locked_supersession_evidence(
+                "users",
+                "name",
                 &Value::Int(2_070_980),
                 &Value::Bytes(b"-3572".to_vec()),
             )

@@ -247,13 +247,19 @@ fn connection_opts_use_explicit_ca_for_tls() {
     std::fs::remove_file(ca_path).expect("remove CA fixture");
 }
 
+fn build_locked_identity_evidence_sql_for_users(
+    columns: &[String],
+) -> Result<String, crate::target::TargetExecuteError> {
+    build_locked_identity_evidence_sql(columns, "users", "name")
+}
+
 #[test]
 fn locked_users_evidence_sql_uses_complete_ordered_columns_parameters_and_row_locks() {
     assert_eq!(
-        USERS_COLUMNS_FOR_EVIDENCE_SQL,
+        supersession_columns_sql("users"),
         "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='users' ORDER BY ordinal_position"
     );
-    let sql = build_locked_users_evidence_sql(&[
+    let sql = build_locked_identity_evidence_sql_for_users(&[
         "id".to_string(),
         "email".to_string(),
         "name".to_string(),
@@ -345,7 +351,8 @@ fn locked_users_evidence_query_failure_is_explicit() {
 
 #[test]
 fn locked_users_evidence_rejects_missing_metadata() {
-    let error = build_locked_users_evidence_sql(&[]).expect_err("empty metadata must fail");
+    let error =
+        build_locked_identity_evidence_sql_for_users(&[]).expect_err("empty metadata must fail");
     assert!(error.to_string().contains("no columns"));
 }
 
