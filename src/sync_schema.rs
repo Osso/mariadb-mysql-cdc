@@ -829,8 +829,10 @@ pub(crate) fn execute_schema_plan(
 ) -> SchemaConvergenceReport {
     let mut table_status = BTreeMap::new();
     let mut reports = Vec::new();
-    for table in plan.tables {
+    let total = plan.tables.len();
+    for (position, table) in plan.tables.into_iter().enumerate() {
         let report = execute_table_plan(table, &table_status, executor, final_differences);
+        log_table_progress(position + 1, total, &report);
         table_status.insert(report.table.clone(), report.status);
         reports.push(report);
     }
@@ -844,6 +846,36 @@ pub(crate) fn execute_schema_plan(
             .then(|| "one or more selected tables remain divergent".to_string()),
         tables: reports,
     }
+}
+
+/// A table-by-table trace on stderr, because the JSON report only appears once the whole run
+/// finishes and a long run is otherwise indistinguishable from a hang.
+fn log_table_progress(position: usize, total: usize, report: &TableSchemaReport) {
+    let executed = report
+        .executions
+        .iter()
+        .filter(|execution| execution.status == "executed")
+        .count();
+    let failed = report
+        .executions
+        .iter()
+        .filter(|execution| execution.status == "failed")
+        .count();
+    let skipped = report
+        .executions
+        .iter()
+        .filter(|execution| execution.status == "skipped")
+        .count();
+    eprintln!(
+        "cdc_sync_schema_table table={} progress={position}/{total} status={} executed={executed} failed={failed} skipped={skipped} differences={} blockers={}",
+        report.table,
+        serde_json::to_value(report.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string()),
+        report.final_differences.len(),
+        report.blockers.len(),
+    );
 }
 
 fn execute_table_plan(

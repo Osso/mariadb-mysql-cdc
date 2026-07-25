@@ -160,6 +160,11 @@ impl InventoryQueryConnection for ScriptedInventoryConnection {
             .pop_front()
             .expect("scripted inventory query result")
     }
+
+    fn query_result_sets(&mut self, query: &str) -> Result<Vec<Vec<Vec<String>>>, mysql::Error> {
+        let statements = query.matches(';').count() + 1;
+        (0..statements).map(|_| self.query_rows(query)).collect()
+    }
 }
 
 struct FailFirstConnectionFactory {
