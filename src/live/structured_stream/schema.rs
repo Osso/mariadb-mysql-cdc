@@ -167,19 +167,17 @@ fn build_inventory_table_schema(
     table: &TableInventory,
     column_count: usize,
 ) -> Result<ResolvedTableSchema, ApplyBinlogError> {
-    let mut columns: Vec<String> = table
+    let columns: Vec<String> = table
         .columns
         .iter()
         .map(|column| column.name.clone())
         .collect();
-    // A row event carries the columns the source had when it was written. The target may already
-    // carry extra columns after those, because schema convergence runs ahead of a lagging stream.
-    // Map the event's values onto the leading columns and leave the rest to their defaults, which
-    // is what MySQL replication itself permits. A target with FEWER columns than the event still
-    // fails the count check below, because those values would have nowhere to go.
-    if columns.len() > column_count {
-        columns.truncate(column_count);
-    }
+    // Deliberately NOT tolerant of a count mismatch. Taking the leading `column_count` target
+    // columns only aligns when the missing columns were appended. This source inserts columns
+    // mid-table - home_feed_rss_articles gained image_width/image_height at positions 7 and 8 -
+    // so the leading slice shifts every later value into the wrong column. MySQL caught one such
+    // write only because an excerpt landed in an integer column; where the types line up it would
+    // corrupt silently. Fail closed and let the count check below reject the event.
     let generated_columns = generated_column_names(table);
     let signed_columns = signed_column_names(table);
     let enum_columns = enum_column_values(table);
@@ -536,10 +534,11 @@ mod tests {
         }
     }
 
-    /// Schema convergence runs ahead of a lagging stream, so a historical row event carries fewer
-    /// columns than the target now has. The event's values map to the leading columns.
+    /// A count mismatch must fail closed in BOTH directions. Mapping the event onto the leading
+    /// target columns silently shifts every value when the absent columns were inserted mid-table,
+    /// which this source does.
     #[test]
-    fn extra_trailing_target_columns_map_the_events_leading_columns() {
+    fn a_target_with_extra_columns_fails_rather_than_shifting_values() {
         let converged = table(&[
             "user_id",
             "bio",
@@ -547,11 +546,15 @@ mod tests {
             "app_next_opted_out_at",
         ]);
 
-        let resolved = build_inventory_table_schema("globalcomix", &converged, 2)
-            .expect("a target with extra trailing columns still resolves");
+        let error = build_inventory_table_schema("globalcomix", &converged, 2)
+            .expect_err("a count mismatch cannot be resolved by position");
 
-        assert_eq!(resolved.columns, ["user_id", "bio"]);
-        assert_eq!(resolved.primary_key, ["user_id"]);
+        assert!(
+            error
+                .to_string()
+                .contains("has 4 columns but row event table map has 2"),
+            "{error}"
+        );
     }
 
     /// The opposite direction has nowhere to put the event's values and must still fail.
