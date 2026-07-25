@@ -125,7 +125,17 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       transport budget, so
       repeated parent-recovery failures can exceed `max-reconnects`. Successful
       replay resolves the matching evidence row.
-- [x] For the two out-of-transaction parent-recovery cases, a persisted `1452` on
+- [ ] Requesting out-of-transaction parent recovery is suspended for the same
+      reason: installing the parent from the source can fail on the parent's own
+      foreign keys while the backfill is incomplete - installing `guests` for
+      `fk_sessions_guest` failed `fk_guests_utm_id` because `utms` was not loaded -
+      and a failed recovery is never marked attempted, so the reconnect loop
+      re-attempts it at the same coordinate indefinitely and the stream never
+      advances. With no recovery request the conflict is an ordinary recorded
+      skip. `EXACT_PARENT_RECOVERY_ENABLED` in `row::conflict` gates it and the
+      proofs below are `#[ignore]`d together with it; restore both once the
+      referenced parent tables are fully loaded.
+- [ ] For the two out-of-transaction parent-recovery cases, a persisted `1452` on
       `globalcomix.sessions` naming `fk_sessions_guest` must carry non-empty
       `session_id`, `guest_id`, and `guest_hash`; source `guests` must contain
       exactly one matching row. A persisted `1452` on

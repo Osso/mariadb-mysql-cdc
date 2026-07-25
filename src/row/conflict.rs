@@ -279,12 +279,25 @@ struct ChildEventPosition<'a> {
 /// MySQL's "cannot add or update a child row: a foreign key constraint fails".
 const MISSING_PARENT_FK_ERROR_CODE: u16 = 1452;
 
+/// Whether a missing parent may be installed from the source. Off until the backfill completes.
+const EXACT_PARENT_RECOVERY_ENABLED: bool = false;
+
 fn build_exact_parent_recovery(
     position: ChildEventPosition<'_>,
     table: &RowTableMap,
     change: &TargetRowChange,
     conflict: &crate::target::DuplicateConflict,
 ) -> Option<crate::live::ExactParentRecovery> {
+    // Requesting recovery is suspended for the same reason the generic resolver is unwired: these
+    // install the parent from the source, and while the backfill is incomplete that insert can fail
+    // on the parent's own foreign keys - installing `guests` for `fk_sessions_guest` failed
+    // `fk_guests_utm_id` because `utms` was not loaded. A failed recovery is never marked attempted,
+    // so the reconnect loop re-attempts it at the same coordinate forever and the stream never
+    // advances. Without a request the conflict is an ordinary recorded skip. Restore this once the
+    // referenced parent tables are fully loaded.
+    if !EXACT_PARENT_RECOVERY_ENABLED {
+        return None;
+    }
     let coordinate = position.coordinate;
     let values = change
         .writable_columns
@@ -693,6 +706,7 @@ mod tests {
 
     /// The proven out-of-transaction path keeps winning, so it must not also defer.
     #[test]
+    #[ignore = "exact parent recovery is suspended until the backfill completes; see EXACT_PARENT_RECOVERY_ENABLED"]
     fn keeps_the_pinned_sessions_guest_recovery_out_of_transaction() {
         let table = table_map(
             "globalcomix",

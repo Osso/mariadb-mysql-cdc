@@ -2031,6 +2031,7 @@ fn duplicate_insert_under_default_error_policy_rolls_back_without_ledger_entry()
 }
 
 #[test]
+#[ignore = "exact parent recovery is suspended until the backfill completes; see EXACT_PARENT_RECOVERY_ENABLED"]
 fn sessions_109018328_fk_conflict_carries_exact_guest_recovery_after_rollback_and_persistence() {
     let executor = TransactionRecordingExecutor::with_foreign_key_conflict_second_row_change();
     let mut applier = crate::row::RowApplier::new(executor);
@@ -2100,6 +2101,7 @@ fn sessions_109018328_fk_conflict_carries_exact_guest_recovery_after_rollback_an
 }
 
 #[test]
+#[ignore = "exact parent recovery is suspended until the backfill completes; see EXACT_PARENT_RECOVERY_ENABLED"]
 fn home_feed_slide_4508905_fk_conflict_carries_exact_card_recovery_boundary() {
     let executor = TransactionRecordingExecutor::with_home_feed_card_foreign_key_conflict();
     let mut applier = crate::row::RowApplier::new(executor);
@@ -2269,6 +2271,7 @@ fn exact_home_feed_card_parent_row() -> crate::snapshot::SnapshotRow {
 }
 
 #[test]
+#[ignore = "exact parent recovery is suspended until the backfill completes; see EXACT_PARENT_RECOVERY_ENABLED"]
 fn exact_home_feed_event_recovers_parent_then_replays_child_and_xid_checkpoint() {
     let resolver = FixtureSchemaResolver;
     let event = BinlogEvent::WriteRowsEvent(MysqlCdcWriteRowsEvent {
