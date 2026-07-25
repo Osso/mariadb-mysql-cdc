@@ -31,6 +31,14 @@ pub(crate) struct SupersededSourceEvidence {
     pub(crate) matching_rows: Vec<CanonicalSourceRow>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ForeignKeySourceEvidence {
+    pub(crate) update_rule: String,
+    pub(crate) referenced_columns: Vec<String>,
+    pub(crate) current_parent_rows: Vec<Vec<Value>>,
+    pub(crate) parent_rows_by_historical_identity: Vec<CanonicalSourceRow>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceEvidenceError {
     message: String,
@@ -111,6 +119,149 @@ pub(crate) fn load_identity_source_evidence(
         historical_primary_key,
         historical_identity,
     )
+}
+
+pub(crate) fn load_foreign_key_source_evidence(
+    config: &MySqlConnectionConfig,
+    violation: &crate::live::ForeignKeyViolation,
+    parent_primary_key: &[(String, Value)],
+    historical_referenced_values: &[Value],
+) -> Result<ForeignKeySourceEvidence, SourceEvidenceError> {
+    let mut source = MySqlSupersededSourceQuery::connect(config)?;
+    source.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
+    let result = load_foreign_key_evidence_in_transaction(
+        &mut source,
+        violation,
+        parent_primary_key,
+        historical_referenced_values,
+    );
+    finish_transaction(&mut source, result)
+}
+
+fn load_foreign_key_evidence_in_transaction(
+    source: &mut impl SupersededSourceQuery,
+    violation: &crate::live::ForeignKeyViolation,
+    parent_primary_key: &[(String, Value)],
+    historical_referenced_values: &[Value],
+) -> Result<ForeignKeySourceEvidence, SourceEvidenceError> {
+    let parent_schema = violation
+        .parent_schema
+        .as_deref()
+        .unwrap_or(&violation.child_schema);
+    let metadata = source.query(
+        "SELECT k.COLUMN_NAME,k.REFERENCED_COLUMN_NAME,COALESCE(r.UPDATE_RULE,'RESTRICT') FROM information_schema.KEY_COLUMN_USAGE k LEFT JOIN information_schema.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME=k.CONSTRAINT_NAME WHERE k.CONSTRAINT_SCHEMA=? AND k.TABLE_NAME=? AND k.CONSTRAINT_NAME=? ORDER BY k.ORDINAL_POSITION",
+        vec![
+            Value::Bytes(violation.child_schema.as_bytes().to_vec()),
+            Value::Bytes(violation.child_table.as_bytes().to_vec()),
+            Value::Bytes(violation.constraint.as_bytes().to_vec()),
+        ],
+    )?;
+    let mut referenced_columns = Vec::new();
+    let mut update_rule = None;
+    for row in &metadata.rows {
+        if row.len() != 3 {
+            return Err(SourceEvidenceError::new(
+                "foreign-key metadata row shape mismatch",
+            ));
+        }
+        referenced_columns.push(value_bytes(row.get(1), "referenced column")?);
+        let row_rule = value_bytes(row.get(2), "update rule")?.to_ascii_uppercase();
+        if update_rule.as_ref().is_some_and(|rule| rule != &row_rule) {
+            return Err(SourceEvidenceError::new(
+                "foreign-key metadata update rule mismatch",
+            ));
+        }
+        update_rule = Some(row_rule);
+    }
+    if referenced_columns != violation.parent_columns {
+        return Err(SourceEvidenceError::new(
+            "foreign-key metadata referenced columns mismatch",
+        ));
+    }
+    let update_rule =
+        update_rule.ok_or_else(|| SourceEvidenceError::new("foreign-key metadata is missing"))?;
+    let current_parent_rows = query_values_by_identity(
+        source,
+        parent_schema,
+        &violation.parent_table,
+        &referenced_columns,
+        parent_primary_key,
+    )?;
+    let stored_columns = load_columns(source, &violation.parent_table, &writable_column_query())?;
+    let historical_identity = violation
+        .parent_columns
+        .iter()
+        .cloned()
+        .zip(historical_referenced_values.iter().cloned())
+        .collect::<Vec<_>>();
+    let full_rows = query_values_by_identity(
+        source,
+        parent_schema,
+        &violation.parent_table,
+        &stored_columns,
+        &historical_identity,
+    )?;
+    let parent_rows_by_historical_identity = full_rows
+        .into_iter()
+        .map(|values| canonical_source_row(&stored_columns, values))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ForeignKeySourceEvidence {
+        update_rule,
+        referenced_columns,
+        current_parent_rows,
+        parent_rows_by_historical_identity,
+    })
+}
+
+fn query_values_by_identity(
+    source: &mut impl SupersededSourceQuery,
+    schema: &str,
+    table: &str,
+    selected_columns: &[String],
+    identity: &[(String, Value)],
+) -> Result<Vec<Vec<Value>>, SourceEvidenceError> {
+    if selected_columns.is_empty() || identity.is_empty() || !valid_identifier(schema) {
+        return Err(SourceEvidenceError::new(
+            "foreign-key source query shape is invalid",
+        ));
+    }
+    let predicate = identity
+        .iter()
+        .map(|(column, _)| {
+            valid_identifier(column)
+                .then(|| format!("`{column}` = ?"))
+                .ok_or_else(|| SourceEvidenceError::new("invalid foreign-key identity column"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join(" AND ");
+    let columns = selected_columns
+        .iter()
+        .map(|column| format!("`{column}`"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT {columns} FROM `{schema}`.`{table}` WHERE {predicate} ORDER BY {} LIMIT 2",
+        identity
+            .iter()
+            .map(|(column, _)| format!("`{column}`"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let result = source.query(
+        &sql,
+        identity.iter().map(|(_, value)| value.clone()).collect(),
+    )?;
+    if result.columns != selected_columns {
+        return Err(SourceEvidenceError::new(format!(
+            "foreign-key source result column mismatch: expected {:?}, got {:?}",
+            selected_columns, result.columns
+        )));
+    }
+    Ok(result.rows)
+}
+
+fn writable_column_query() -> String {
+    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COALESCE(GENERATION_EXPRESSION, '') = '' ORDER BY ORDINAL_POSITION".to_string()
 }
 
 pub(crate) fn build_exact_row_insert_statement(

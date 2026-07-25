@@ -701,6 +701,34 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         Ok(rows.into_iter().map(mysql::Row::unwrap).collect())
     }
 
+    fn read_locked_child_identity(
+        &self,
+        schema: &str,
+        child_table: &str,
+        selected_columns: &[String],
+        primary_key: &[(String, mysql::Value)],
+    ) -> Result<Vec<Vec<mysql::Value>>, TargetExecuteError> {
+        let predicate_columns = primary_key
+            .iter()
+            .map(|(column, _)| column.clone())
+            .collect::<Vec<_>>();
+        let sql = build_locked_parent_identity_sql(
+            schema,
+            child_table,
+            selected_columns,
+            &predicate_columns,
+        )?;
+        let params = primary_key
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let rows = self.with_connection(|conn| {
+            conn.exec::<mysql::Row, _, _>(&sql, Params::Positional(params))
+                .map_err(target_query_error)
+        })?;
+        Ok(rows.into_iter().map(mysql::Row::unwrap).collect())
+    }
+
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
         self.execute_transaction_control("COMMIT")
     }

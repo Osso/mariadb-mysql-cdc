@@ -3,7 +3,8 @@ use super::superseded_insert::{
     verify_superseded_insert,
 };
 use super::superseded_source::{
-    SupersededSourceEvidence, build_exact_row_insert_statement, load_identity_source_evidence,
+    ForeignKeySourceEvidence, SupersededSourceEvidence, build_exact_row_insert_statement,
+    load_foreign_key_source_evidence, load_identity_source_evidence,
 };
 use super::transaction::SupersededInsertVerifier;
 use crate::mysql_snapshot::MySqlConnectionConfig;
@@ -159,6 +160,28 @@ where
         "superseded foreign key insert rejected: child image does not carry the referenced key"
             .to_string()
     })?;
+    let historical_referenced_values = violation
+        .child_columns
+        .iter()
+        .map(|column| {
+            let position = change
+                .writable_columns
+                .iter()
+                .position(|candidate| candidate == column)?;
+            change.source_values.get(position).cloned()
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            "superseded foreign key insert rejected: child image lacks a referenced column"
+                .to_string()
+        })?;
+    let source_evidence = load_foreign_key_source_evidence(
+        source,
+        &violation,
+        &predicate,
+        &historical_referenced_values,
+    )
+    .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?;
     let locked_rows = target
         .read_locked_parent_identity(
             &foreign_key.referenced_schema,
@@ -186,72 +209,55 @@ where
     .map_err(|rejection| format!("superseded foreign key insert rejected: {rejection}"))?;
     match plan {
         super::foreign_key_repair::ForeignKeyRepairPlan::InstallParent => {
-            install_parent_then_replay_child(source, &violation, candidate)
+            install_parent_then_replay_child(&violation, candidate, source_evidence)
         }
         super::foreign_key_repair::ForeignKeyRepairPlan::FastForwardChild(plan) => {
-            fast_forward_child(&violation, candidate, &plan)
+            validate_class_two_source_evidence(&source_evidence, &locked_parent)?;
+            fast_forward_child(target, &violation, candidate, &plan)
         }
     }
 }
 
 /// Installs the exact source parent, then replays the child image unchanged.
 fn install_parent_then_replay_child(
-    source: &MySqlConnectionConfig,
     violation: &crate::live::ForeignKeyViolation,
     candidate: &DeferredSupersededInsertCandidate,
+    source: ForeignKeySourceEvidence,
 ) -> Result<super::foreign_key_repair::ForeignKeyRepairProof, String> {
-    let child_values = candidate
-        .historical_change
-        .source_values
-        .iter()
-        .cloned()
-        .map(crate::mysql_client::value_to_string)
-        .collect::<Vec<_>>();
-    let referenced_values = violation
-        .child_columns
-        .iter()
-        .map(|column| {
-            let position = candidate
-                .historical_change
-                .writable_columns
-                .iter()
-                .position(|candidate| candidate == column)?;
-            child_values.get(position).cloned()
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            "superseded foreign key insert rejected: child image lacks a referenced column"
-                .to_string()
-        })?;
-    let (parent, parent_row) =
-        crate::table_sync::read_exact_source_parent_row(source, violation, &referenced_values)
-            .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?;
+    if source.parent_rows_by_historical_identity.len() != 1 {
+        return Err(format!(
+            "superseded foreign key insert rejected: source parent row count is {}, expected 1",
+            source.parent_rows_by_historical_identity.len()
+        ));
+    }
+    let parent_row = &source.parent_rows_by_historical_identity[0];
     let parent_schema = violation
         .parent_schema
         .clone()
         .unwrap_or_else(|| violation.child_schema.clone());
-    let parent_insert = build_exact_row_insert_statement(
-        &parent_schema,
-        &violation.parent_table,
-        &snapshot_row_as_source_row(&parent_row, &parent),
-    )
-    .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?;
+    let parent_insert =
+        build_exact_row_insert_statement(&parent_schema, &violation.parent_table, parent_row)
+            .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?;
     Ok(super::foreign_key_repair::ForeignKeyRepairProof {
         statements: vec![parent_insert, candidate.historical_change.statement.clone()],
         evidence: format!(
             "absent parent installed from the exact source row, then the historical child image \
              replayed unchanged; constraint={} parent=`{parent_schema}`.`{}` parent_key={:?}",
-            violation.constraint, violation.parent_table, parent_row.primary_key,
+            violation.constraint, violation.parent_table, violation.parent_columns,
         ),
     })
 }
 
 /// Replays the child image with only its derived referenced columns fast-forwarded.
-fn fast_forward_child(
+fn fast_forward_child<E>(
+    target: &E,
     violation: &crate::live::ForeignKeyViolation,
     candidate: &DeferredSupersededInsertCandidate,
     plan: &super::derived_fk_fastforward::DerivedFkFastForwardPlan,
-) -> Result<super::foreign_key_repair::ForeignKeyRepairProof, String> {
+) -> Result<super::foreign_key_repair::ForeignKeyRepairProof, String>
+where
+    E: TransactionalTargetExecutor,
+{
     let change = &candidate.historical_change;
     let row = super::foreign_key_repair::fast_forwarded_child_row(
         &change.writable_columns,
@@ -261,40 +267,139 @@ fn fast_forward_child(
     .ok_or_else(|| {
         "superseded foreign key insert rejected: child image could not be rebuilt".to_string()
     })?;
-    let statement =
-        build_exact_row_insert_statement(&violation.child_schema, &violation.child_table, &row)
-            .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?;
+    let primary_key = change
+        .primary_key_columns
+        .iter()
+        .cloned()
+        .zip(change.primary_key_values.iter().cloned())
+        .collect::<Vec<_>>();
+    if primary_key.is_empty() {
+        return Err(
+            "superseded foreign key insert rejected: child primary key is missing".to_string(),
+        );
+    }
+    let selected_columns = plan
+        .substitutions
+        .iter()
+        .map(|substitution| substitution.child_column.clone())
+        .collect::<Vec<_>>();
+    let target_rows = target
+        .read_locked_child_identity(
+            &violation.child_schema,
+            &violation.child_table,
+            &selected_columns,
+            &primary_key,
+        )
+        .map_err(|error| format!("superseded foreign key target child evidence failed: {error}"))?;
+    let statement = match target_rows.len() {
+        0 if candidate.observation.operation
+            == crate::conflict_repair::ConflictOperation::Insert =>
+        {
+            build_exact_row_insert_statement(&violation.child_schema, &violation.child_table, &row)
+                .map_err(|error| format!("superseded foreign key insert rejected: {error}"))?
+        }
+        0 => {
+            return Err(
+                "superseded foreign key insert rejected: UPDATE child is absent".to_string(),
+            );
+        }
+        1 => build_derived_child_update_statement(
+            &violation.child_schema,
+            &violation.child_table,
+            &primary_key,
+            plan,
+        )?,
+        count => {
+            return Err(format!(
+                "superseded foreign key insert rejected: target child row count is {count}, expected at most 1"
+            ));
+        }
+    };
     Ok(super::foreign_key_repair::ForeignKeyRepairProof {
         statements: vec![statement],
         evidence: plan.evidence(),
     })
 }
 
-/// Converts a source parent row into the exact-insert shape, in the parent's stored column order.
-fn snapshot_row_as_source_row(
-    row: &crate::snapshot::SnapshotRow,
-    parent: &crate::inventory::TableInventory,
-) -> super::superseded_source::CanonicalSourceRow {
-    let mut columns = Vec::new();
-    let mut values = Vec::new();
-    for column in &parent.columns {
-        if column.generated.is_some() {
-            continue;
-        }
-        if let Some(value) = row.values.get(&column.name) {
-            columns.push(column.name.clone());
-            values.push(match value {
-                Some(value) => Value::Bytes(value.clone().into_bytes()),
-                None => Value::NULL,
-            });
-        }
+fn validate_class_two_source_evidence(
+    source: &ForeignKeySourceEvidence,
+    target: &super::derived_fk_fastforward::LockedParentRows,
+) -> Result<(), String> {
+    if source.update_rule != "CASCADE" {
+        return Err(format!(
+            "superseded foreign key insert rejected: source UPDATE_RULE is {}",
+            source.update_rule
+        ));
     }
-    super::superseded_source::CanonicalSourceRow {
-        columns,
-        values,
-        // Not a source evidence row; the insert builder reads only columns and values.
-        hash: String::new(),
+    if source.referenced_columns != target.columns {
+        return Err(
+            "superseded foreign key insert rejected: source/target parent shape mismatch"
+                .to_string(),
+        );
     }
+    if source.current_parent_rows.len() != 1 {
+        return Err(format!(
+            "superseded foreign key insert rejected: source current parent row count is {}, expected 1",
+            source.current_parent_rows.len()
+        ));
+    }
+    if source.current_parent_rows != target.rows {
+        return Err(
+            "superseded foreign key insert rejected: source/target current parent mismatch"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn build_derived_child_update_statement(
+    schema: &str,
+    table: &str,
+    primary_key: &[(String, Value)],
+    plan: &super::derived_fk_fastforward::DerivedFkFastForwardPlan,
+) -> Result<crate::target::SqlStatement, String> {
+    if !valid_recovery_identifier(schema)
+        || !valid_recovery_identifier(table)
+        || primary_key
+            .iter()
+            .any(|(column, _)| !valid_recovery_identifier(column))
+        || plan
+            .substitutions
+            .iter()
+            .any(|substitution| !valid_recovery_identifier(&substitution.child_column))
+    {
+        return Err(
+            "superseded foreign key insert rejected: invalid child update identifier".to_string(),
+        );
+    }
+    let assignments = plan
+        .substitutions
+        .iter()
+        .map(|substitution| format!("`{}` = ?", substitution.child_column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let predicates = primary_key
+        .iter()
+        .map(|(column, _)| format!("`{column}` = ?"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut params = plan
+        .substitutions
+        .iter()
+        .map(|substitution| substitution.parent_value.clone())
+        .collect::<Vec<_>>();
+    params.extend(primary_key.iter().map(|(_, value)| value.clone()));
+    Ok(crate::target::SqlStatement {
+        sql: format!("UPDATE `{schema}`.`{table}` SET {assignments} WHERE {predicates}"),
+        params,
+    })
+}
+
+fn valid_recovery_identifier(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn verify_with_source_loader<E, L>(
@@ -907,6 +1012,193 @@ mod tests {
         assert!(error.contains("evidence_params={primary_key=48054,identity=\"misc\"}"));
         assert!(!error.contains("password"));
         assert!(!error.contains("host"));
+    }
+
+    struct ExistingChildTarget;
+
+    impl TargetExecutor for ExistingChildTarget {
+        fn execute(&self, _statement: &SqlStatement) -> Result<(), TargetExecuteError> {
+            Ok(())
+        }
+    }
+
+    impl TransactionalTargetExecutor for ExistingChildTarget {
+        fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
+            Ok(())
+        }
+        fn load_transaction_checkpoint_for_update(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<crate::checkpoint::Checkpoint>, TargetExecuteError> {
+            Ok(None)
+        }
+        fn save_transaction_checkpoint(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::checkpoint::Checkpoint,
+        ) -> Result<(), TargetExecuteError> {
+            Ok(())
+        }
+        fn read_locked_child_identity(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: &[(String, Value)],
+        ) -> Result<Vec<Vec<Value>>, TargetExecuteError> {
+            Ok(vec![vec![Value::Bytes(b"Robert".to_vec())]])
+        }
+        fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
+            Ok(())
+        }
+        fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
+            Ok(())
+        }
+    }
+
+    fn foreign_key_candidate(
+        operation: crate::conflict_repair::ConflictOperation,
+    ) -> DeferredSupersededInsertCandidate {
+        DeferredSupersededInsertCandidate {
+            observation: crate::conflict_repair::ConflictObservation {
+                source_identity: "source".to_string(),
+                source_server_id: 3,
+                coordinate: crate::conflict_repair::ConflictCoordinate {
+                    file: "mysql-bin.1".to_string(),
+                    start_position: 10,
+                    end_position: 20,
+                },
+                schema: "globalcomix".to_string(),
+                table: "artist_comics".to_string(),
+                operation,
+                source_primary_key: vec!["20".to_string()],
+                duplicate_index: None,
+                duplicate_owner_primary_key: None,
+                error_code: 1452,
+                error_text: "fk".to_string(),
+                observed_at_ms: 1,
+                parent_recovery: None,
+            },
+            historical_change: TargetRowChange {
+                statement: SqlStatement {
+                    sql: "INSERT historical".to_string(),
+                    params: vec![],
+                },
+                kind: if operation == crate::conflict_repair::ConflictOperation::Update {
+                    crate::target::TargetRowChangeKind::Update
+                } else {
+                    crate::target::TargetRowChangeKind::Insert
+                },
+                table: "globalcomix.artist_comics".to_string(),
+                primary_key_columns: vec!["id".to_string()],
+                primary_key_values: vec![Value::UInt(20)],
+                writable_columns: vec![
+                    "id".to_string(),
+                    "title".to_string(),
+                    "artist_id".to_string(),
+                    "artist_name".to_string(),
+                ],
+                source_values: vec![
+                    Value::UInt(20),
+                    Value::Bytes(b"Historical".to_vec()),
+                    Value::UInt(2),
+                    Value::Bytes(b"Bob".to_vec()),
+                ],
+                set_columns: vec![None; 4],
+            },
+        }
+    }
+
+    fn derived_plan() -> super::super::derived_fk_fastforward::DerivedFkFastForwardPlan {
+        super::super::derived_fk_fastforward::DerivedFkFastForwardPlan {
+            constraint: "fk_artist_comics_artist".to_string(),
+            parent_table: "artists".to_string(),
+            substitutions: vec![
+                super::super::derived_fk_fastforward::DerivedFkSubstitution {
+                    child_column: "artist_name".to_string(),
+                    referenced_column: "name".to_string(),
+                    historical_value: Value::Bytes(b"Bob".to_vec()),
+                    parent_value: Value::Bytes(b"Robert".to_vec()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn existing_child_fast_forward_updates_only_derived_columns_by_primary_key() {
+        let proof = fast_forward_child(
+            &ExistingChildTarget,
+            &crate::live::ForeignKeyViolation {
+                child_schema: "globalcomix".to_string(),
+                child_table: "artist_comics".to_string(),
+                constraint: "fk_artist_comics_artist".to_string(),
+                child_columns: vec!["artist_id".to_string(), "artist_name".to_string()],
+                parent_schema: None,
+                parent_table: "artists".to_string(),
+                parent_columns: vec!["id".to_string(), "name".to_string()],
+            },
+            &foreign_key_candidate(crate::conflict_repair::ConflictOperation::Insert),
+            &derived_plan(),
+        )
+        .expect("existing child update proof");
+        assert_eq!(
+            proof.statements[0].sql,
+            "UPDATE `globalcomix`.`artist_comics` SET `artist_name` = ? WHERE `id` = ?"
+        );
+        assert_eq!(
+            proof.statements[0].params,
+            vec![Value::Bytes(b"Robert".to_vec()), Value::UInt(20)]
+        );
+        assert!(!proof.statements[0].sql.contains("title"));
+        assert!(!proof.statements[0].sql.starts_with("INSERT"));
+    }
+
+    #[test]
+    fn update_operation_never_becomes_insert() {
+        let proof = fast_forward_child(
+            &ExistingChildTarget,
+            &crate::live::ForeignKeyViolation {
+                child_schema: "globalcomix".to_string(),
+                child_table: "artist_comics".to_string(),
+                constraint: "fk".to_string(),
+                child_columns: vec!["artist_id".to_string(), "artist_name".to_string()],
+                parent_schema: None,
+                parent_table: "artists".to_string(),
+                parent_columns: vec!["id".to_string(), "name".to_string()],
+            },
+            &foreign_key_candidate(crate::conflict_repair::ConflictOperation::Update),
+            &derived_plan(),
+        )
+        .expect("update proof");
+        assert!(proof.statements[0].sql.starts_with("UPDATE"));
+    }
+
+    #[test]
+    fn class_two_requires_cascade_and_equal_source_target_parent() {
+        let target = super::super::derived_fk_fastforward::LockedParentRows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::UInt(2), Value::Bytes(b"Robert".to_vec())]],
+        };
+        let mut source = ForeignKeySourceEvidence {
+            update_rule: "RESTRICT".to_string(),
+            referenced_columns: target.columns.clone(),
+            current_parent_rows: target.rows.clone(),
+            parent_rows_by_historical_identity: vec![],
+        };
+        assert!(
+            validate_class_two_source_evidence(&source, &target)
+                .unwrap_err()
+                .contains("UPDATE_RULE")
+        );
+        source.update_rule = "CASCADE".to_string();
+        source.current_parent_rows[0][1] = Value::Bytes(b"Source".to_vec());
+        assert!(
+            validate_class_two_source_evidence(&source, &target)
+                .unwrap_err()
+                .contains("source/target current parent mismatch")
+        );
     }
 
     #[test]

@@ -156,6 +156,17 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
             "active-transaction locked parent identity read is unsupported by this target executor",
         ))
     }
+    fn read_locked_child_identity(
+        &self,
+        _schema: &str,
+        _child_table: &str,
+        _selected_columns: &[String],
+        _primary_key: &[(String, Value)],
+    ) -> Result<Vec<Vec<Value>>, TargetExecuteError> {
+        Err(TargetExecuteError::new(
+            "active-transaction locked child identity read is unsupported by this target executor",
+        ))
+    }
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
     fn discard_failed_transaction_connection(&self) -> Result<(), TargetExecuteError> {
@@ -685,6 +696,16 @@ where
             referenced_columns,
             parent_primary_key,
         )
+    }
+
+    fn read_locked_child_identity(
+        &self,
+        schema: &str,
+        child_table: &str,
+        selected_columns: &[String],
+        primary_key: &[(String, Value)],
+    ) -> Result<Vec<Vec<Value>>, TargetExecuteError> {
+        (*self).read_locked_child_identity(schema, child_table, selected_columns, primary_key)
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {

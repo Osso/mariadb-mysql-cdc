@@ -6,6 +6,21 @@ fn harness_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/cdc-integration-harness.py")
 }
 
+fn run_harness_scenario(scenario: &str) {
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg(scenario)
+        .output()
+        .expect("run CDC integration harness");
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn fixture_paths() -> [PathBuf; 2] {
     [
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cdc-harness-source-bootstrap.sql"),
@@ -211,6 +226,24 @@ fn real_generic_fk_superseded_attribute_fast_forwards_only_derived_columns() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_generic_fk_source_parent_mismatch_fails_closed() {
+    run_harness_scenario("generic-fk-source-parent-mismatch");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_generic_fk_restrict_rule_fails_closed() {
+    run_harness_scenario("generic-fk-restrict-rejected");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_generic_fk_missing_parent_preserves_binary_bytes() {
+    run_harness_scenario("generic-fk-missing-parent-binary");
 }
 
 #[test]

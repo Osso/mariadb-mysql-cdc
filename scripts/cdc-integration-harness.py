@@ -54,7 +54,10 @@ SCENARIOS = (
     ScenarioSpec("superseded-release-parent-recovery", True),
     ScenarioSpec("superseded-release-visibility-recovery", True),
     ScenarioSpec("generic-fk-missing-parent", True),
+    ScenarioSpec("generic-fk-missing-parent-binary", True),
     ScenarioSpec("generic-fk-superseded-attribute", True),
+    ScenarioSpec("generic-fk-source-parent-mismatch", True),
+    ScenarioSpec("generic-fk-restrict-rejected", True),
     ScenarioSpec("superseded-users-recovery", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("create-table-crash-restart", True),
@@ -1064,7 +1067,9 @@ class Harness:
             "INSERT INTO artist_comics VALUES (20,'Historical Title',2,'Bob');",
         )
         stop = self.coordinate()
-        # Catch-up copied the current parent while the stream still replays the older child event.
+        # Current source and catch-up target agree on the moved parent identity while the child is
+        # still absent from the target.
+        self.admin_sql(self.source, "UPDATE artists SET name='Robert' WHERE id=2;")
         self.admin_sql(self.target, "UPDATE artists SET name='Robert' WHERE id=2;")
 
         result = self.run_stream(start, stop, max_reconnects=1)
@@ -1096,8 +1101,75 @@ class Harness:
         print(
             "generic_fk_superseded_attribute_ok constraint=fk_artist_comics_artist "
             f"boundary={start.file}:{start.position}-{stop.position} "
-            "substituted=artist_name:Bob->Robert title_preserved=1 parent_unchanged=1"
+            "substituted=artist_name:Bob->Robert historical_title_preserved=1 parent_unchanged=1"
         )
+
+    def run_generic_fk_source_parent_mismatch(self) -> None:
+        assert self.source and self.target
+        self.admin_sql(self.source, self.GENERIC_FK_SCHEMA)
+        self.admin_sql(self.target, self.GENERIC_FK_SCHEMA)
+        self.admin_sql(self.source, "INSERT INTO artists VALUES (3,'Old');")
+        self.admin_sql(self.target, "INSERT INTO artists VALUES (3,'Target');")
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(self.source, "INSERT INTO artist_comics VALUES (30,'Historical',3,'Old');")
+        stop = self.coordinate()
+        self.admin_sql(self.source, "UPDATE artists SET name='Source' WHERE id=3;")
+        result = self.run_stream(start, stop, max_reconnects=0)
+        if result.returncode == 0:
+            raise HarnessError("source/target parent mismatch did not fail closed")
+        if self.checkpoint().get("source_position") != start.position:
+            raise HarnessError("source/target parent mismatch advanced checkpoint")
+        print("generic_fk_source_parent_mismatch_ok checkpoint_unchanged=true")
+
+    def run_generic_fk_restrict_rejected(self) -> None:
+        assert self.source and self.target
+        schema = self.GENERIC_FK_SCHEMA.replace("ON UPDATE CASCADE", "ON UPDATE RESTRICT")
+        self.admin_sql(self.source, schema)
+        self.admin_sql(self.target, schema)
+        self.admin_sql(self.source, "INSERT INTO artists VALUES (4,'Old');")
+        self.admin_sql(self.target, "INSERT INTO artists VALUES (4,'Current');")
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(self.source, "INSERT INTO artist_comics VALUES (40,'Historical',4,'Old');")
+        stop = self.coordinate()
+        result = self.run_stream(start, stop, max_reconnects=0)
+        if result.returncode == 0:
+            raise HarnessError("ON UPDATE RESTRICT conflict did not fail closed")
+        if self.checkpoint().get("source_position") != start.position:
+            raise HarnessError("ON UPDATE RESTRICT conflict advanced checkpoint")
+        print("generic_fk_restrict_rejected_ok checkpoint_unchanged=true")
+
+    def run_generic_fk_missing_parent_binary(self) -> None:
+        assert self.source and self.target
+        schema = """
+            CREATE TABLE binary_parents (
+                id BIGINT NOT NULL PRIMARY KEY,
+                identity VARBINARY(8) NOT NULL,
+                payload BLOB NOT NULL,
+                UNIQUE KEY uq_binary_identity (id, identity)
+            ) ENGINE=InnoDB;
+            CREATE TABLE binary_children (
+                id BIGINT NOT NULL PRIMARY KEY,
+                parent_id BIGINT NOT NULL,
+                parent_identity VARBINARY(8) NOT NULL,
+                CONSTRAINT fk_binary_parent FOREIGN KEY (parent_id,parent_identity)
+                    REFERENCES binary_parents(id,identity) ON UPDATE CASCADE
+            ) ENGINE=InnoDB;
+        """
+        self.admin_sql(self.source, schema)
+        self.admin_sql(self.target, schema)
+        self.admin_sql(self.source, "INSERT INTO binary_parents VALUES (5,X'FF00',X'80FF00');")
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(self.source, "INSERT INTO binary_children VALUES (50,5,X'FF00');")
+        stop = self.coordinate()
+        result = self.run_stream(start, stop, max_reconnects=1)
+        require_success(result, "generic binary missing parent recovery")
+        parent = self.query(self.target, "SELECT id,HEX(identity),HEX(payload) FROM binary_parents WHERE id=5;", user=TARGET_USER, password=TARGET_PASSWORD).strip()
+        if parent != "5\tFF00\t80FF00":
+            raise HarnessError(f"binary parent changed bytes: {parent!r}")
+        print("generic_fk_missing_parent_binary_ok bytes_preserved=true")
 
     def run_home_feed_card_parent_recovery(self) -> None:
         assert self.source and self.target
@@ -4708,8 +4780,14 @@ class Harness:
             self.run_superseded_release_visibility_recovery()
         elif scenario == "generic-fk-missing-parent":
             self.run_generic_fk_missing_parent()
+        elif scenario == "generic-fk-missing-parent-binary":
+            self.run_generic_fk_missing_parent_binary()
         elif scenario == "generic-fk-superseded-attribute":
             self.run_generic_fk_superseded_attribute()
+        elif scenario == "generic-fk-source-parent-mismatch":
+            self.run_generic_fk_source_parent_mismatch()
+        elif scenario == "generic-fk-restrict-rejected":
+            self.run_generic_fk_restrict_rejected()
         elif scenario == "superseded-users-recovery":
             self.run_superseded_users_recovery()
         elif scenario == "production-alter-table":
