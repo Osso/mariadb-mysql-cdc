@@ -1414,7 +1414,7 @@ fn child_replay_resolves_ledger_before_single_commit_at_crash_boundary() {
         event_header(16, 215_331_160),
         BinlogEvent::XidEvent(XidEvent { xid: 101 })
     )
-    .expect_err("XID persists the divergent sessions conflict");
+    .expect("XID persists the divergent sessions conflict and advances past it");
 
     let record = &conflicts.records()[0];
     assert_eq!(record.key.table, "sessions");
@@ -1677,7 +1677,7 @@ fn process_stream_core_defers_and_finalizes_real_row_boundary_at_xid() {
         },
         &mut dispatch_xid,
     )
-    .expect_err("XID persists the finalized conflict and stops replay");
+    .expect("XID persists the finalized conflict and advances past it");
     assert_eq!(
         conflicts.records()[0].key.coordinate.start_position,
         215_330_725
@@ -1805,7 +1805,7 @@ fn apply_deferred_conflict_at_xid(
     fixture: DeferredConflictFixture<'_>,
     header: &EventHeader,
     event: &BinlogEvent,
-) -> ApplyBinlogError {
+) -> Result<StructuredEventOutcome, ApplyBinlogError> {
     apply_deferred_conflict_at_xid_position(applier, fixture, header, event, 260)
 }
 
@@ -1815,7 +1815,7 @@ fn apply_deferred_conflict_at_xid_position(
     header: &EventHeader,
     event: &BinlogEvent,
     xid_end_position: u32,
-) -> ApplyBinlogError {
+) -> Result<StructuredEventOutcome, ApplyBinlogError> {
     let DeferredConflictFixture {
         resolver,
         state,
@@ -1865,7 +1865,6 @@ fn apply_deferred_conflict_at_xid_position(
         "test-source",
         conflicts,
     )
-    .expect_err("XID persists the deferred conflict and aborts replay")
 }
 
 #[test]
@@ -1880,7 +1879,7 @@ fn divergent_duplicate_rolls_back_and_persists_conflict_evidence() {
     let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
     let header = event_header(30, 240);
     let event = write_rows_event(18, 2, "beta");
-    let error = apply_deferred_conflict_at_xid(
+    let outcome = apply_deferred_conflict_at_xid(
         &mut applier,
         DeferredConflictFixture {
             resolver: &resolver,
@@ -1891,16 +1890,14 @@ fn divergent_duplicate_rolls_back_and_persists_conflict_evidence() {
         },
         &header,
         &event,
-    );
+    )
+    .expect("a conflict with no recovery plan is recorded and skipped");
 
-    assert!(
-        error
-            .to_string()
-            .contains("row conflict persisted for repair")
-    );
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
+    assert!(!conflicts.records().is_empty());
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "ROLLBACK"]
+        ["BEGIN", "EXEC", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
     );
     assert_eq!(conflicts.records().len(), 1);
     assert_eq!(conflicts.records()[0].error_code, 1062);
@@ -1960,7 +1957,7 @@ fn update_unique_conflict_under_ignore_duplicate_rolls_back_and_records_ledger()
         )],
     });
     let header = event_header(30, 240);
-    let error = apply_deferred_conflict_at_xid(
+    let outcome = apply_deferred_conflict_at_xid(
         &mut applier,
         DeferredConflictFixture {
             resolver: &resolver,
@@ -1971,16 +1968,14 @@ fn update_unique_conflict_under_ignore_duplicate_rolls_back_and_records_ledger()
         },
         &header,
         &event,
-    );
+    )
+    .expect("a conflict with no recovery plan is recorded and skipped");
 
-    assert!(
-        error
-            .to_string()
-            .contains("row conflict persisted for repair")
-    );
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
+    assert!(!conflicts.records().is_empty());
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "ROLLBACK"]
+        ["BEGIN", "EXEC", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
     );
     assert_eq!(conflicts.records().len(), 1);
     assert_eq!(
@@ -2071,7 +2066,8 @@ fn sessions_109018328_fk_conflict_carries_exact_guest_recovery_after_rollback_an
         &event_header_at(30, 224_141_058, 1_784_246_400),
         &event,
         224_142_261,
-    );
+    )
+    .expect_err("a recovery-carrying conflict still aborts so recovery can run");
 
     assert_eq!(
         applier.executor().operations().as_slice(),
@@ -2136,7 +2132,8 @@ fn home_feed_slide_4508905_fk_conflict_carries_exact_card_recovery_boundary() {
         &event_header_at(30, 308_259_874, 1_784_588_463),
         &event,
         308_261_441,
-    );
+    )
+    .expect_err("a recovery-carrying conflict still aborts so recovery can run");
 
     assert_eq!(
         applier.executor().operations().as_slice(),
@@ -2306,7 +2303,8 @@ fn exact_home_feed_event_recovers_parent_then_replays_child_and_xid_checkpoint()
         &header,
         &event,
         308_261_441,
-    );
+    )
+    .expect_err("a recovery-carrying conflict still aborts so recovery can run");
     let recovery = error
         .parent_recovery()
         .expect("exact event must dispatch parent recovery");
@@ -2379,7 +2377,7 @@ fn foreign_key_conflict_rolls_back_and_preserves_constraint_evidence() {
     let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
     let header = event_header(30, 240);
     let event = write_rows_event(18, 2, "beta");
-    let error = apply_deferred_conflict_at_xid(
+    let outcome = apply_deferred_conflict_at_xid(
         &mut applier,
         DeferredConflictFixture {
             resolver: &resolver,
@@ -2390,16 +2388,14 @@ fn foreign_key_conflict_rolls_back_and_preserves_constraint_evidence() {
         },
         &header,
         &event,
-    );
+    )
+    .expect("a conflict with no recovery plan is recorded and skipped");
 
-    assert!(
-        error
-            .to_string()
-            .contains("row conflict persisted for repair")
-    );
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
+    assert!(!conflicts.records().is_empty());
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "ROLLBACK"]
+        ["BEGIN", "EXEC", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
     );
     assert_eq!(conflicts.records().len(), 1);
     assert_eq!(conflicts.records()[0].error_code, 1452);
@@ -2418,7 +2414,7 @@ fn check_conflict_rolls_back_and_preserves_constraint_evidence() {
     let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
     let header = event_header(30, 240);
     let event = write_rows_event(18, 2, "beta");
-    let error = apply_deferred_conflict_at_xid(
+    let outcome = apply_deferred_conflict_at_xid(
         &mut applier,
         DeferredConflictFixture {
             resolver: &resolver,
@@ -2429,16 +2425,14 @@ fn check_conflict_rolls_back_and_preserves_constraint_evidence() {
         },
         &header,
         &event,
-    );
+    )
+    .expect("a conflict with no recovery plan is recorded and skipped");
 
-    assert!(
-        error
-            .to_string()
-            .contains("row conflict persisted for repair")
-    );
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
+    assert!(!conflicts.records().is_empty());
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "ROLLBACK"]
+        ["BEGIN", "EXEC", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
     );
     assert_eq!(conflicts.records().len(), 1);
     assert_eq!(conflicts.records()[0].error_code, 3819);

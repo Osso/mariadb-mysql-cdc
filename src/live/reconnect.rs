@@ -433,6 +433,9 @@ pub(super) fn reconnect_delay(attempt: u32) -> Duration {
 }
 
 fn is_retryable_stream_error(error: &ApplyBinlogError) -> bool {
+    // A persisted conflict is only retried when it carries a recovery plan: recovery changes the
+    // target, so the same position can then succeed. A conflict with no plan is skipped at the
+    // XID instead of reaching here.
     if matches!(
         error,
         ApplyBinlogError::RowConflictPersisted { .. }

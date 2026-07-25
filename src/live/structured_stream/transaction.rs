@@ -682,10 +682,16 @@ where
             let observations = context
                 .target_transaction
                 .take_finalized_conflict_observations(end_position);
-            context
-                .target_transaction
-                .rollback_if_open(applier.executor())?;
-            return persist_deferred_conflicts(conflict_store, observations);
+            // Record the divergence before advancing past it. A retry from the unchanged
+            // checkpoint cannot succeed for a conflict with no recovery plan, because replaying
+            // the same rows cannot change the target; the ledger owns that divergence. A
+            // recovery-carrying conflict still aborts so recovery can run and replay can succeed.
+            if let Err(error) = persist_deferred_conflicts(conflict_store, observations) {
+                context
+                    .target_transaction
+                    .rollback_if_open(applier.executor())?;
+                return Err(error);
+            }
         }
         let force_flush = matches!(event, BinlogEvent::QueryEvent(_) | BinlogEvent::XidEvent(_));
         finish_source_transaction(
@@ -806,10 +812,17 @@ where
     Ok(())
 }
 
+/// Persists the transaction's unresolved conflict evidence.
+///
+/// A conflict carrying a recovery plan still aborts: recovery changes the target, so replaying the
+/// same position can then succeed. A conflict without one is skipped, because replay cannot change
+/// anything and the stream would never leave the position. Persistence failure always aborts,
+/// because advancing past a divergence that was not recorded would lose it silently.
 fn persist_deferred_conflicts(
     conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
     observations: Vec<crate::conflict_repair::ConflictObservation>,
-) -> Result<StructuredEventOutcome, ApplyBinlogError> {
+) -> Result<(), ApplyBinlogError> {
+    let skipped = observations.len();
     let error_text = observations
         .first()
         .map(|observation| observation.error_text.clone())
@@ -826,11 +839,16 @@ fn persist_deferred_conflicts(
     let unresolved_count = conflict_store
         .unresolved_count_result()
         .map_err(ApplyBinlogError::Target)?;
-    println!("cdc_row_conflict_progress unresolved_count={unresolved_count}");
-    Err(ApplyBinlogError::RowConflictPersisted {
-        message: error_text,
-        parent_recovery,
-    })
+    if parent_recovery.is_some() {
+        return Err(ApplyBinlogError::RowConflictPersisted {
+            message: error_text,
+            parent_recovery,
+        });
+    }
+    println!(
+        "cdc_row_conflict_progress unresolved_count={unresolved_count} skipped_rows={skipped}"
+    );
+    Ok(())
 }
 
 fn execute_conflict_resolutions_in_target_transaction<E, R, C>(

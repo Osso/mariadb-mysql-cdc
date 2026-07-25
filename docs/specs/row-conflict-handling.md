@@ -93,8 +93,8 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       matched target row. Missing/multiple PK rows or any other update count persist
       conflict evidence and abort without checkpoint advancement.
       Foreign-key, CHECK, and replacement-update conflicts never use this path
-      and remain durable aborting conflicts. Secondary-unique conflicts also
-      remain durable aborting conflicts except for the separately specified
+      and remain durable skipped conflicts. Secondary-unique conflicts are also
+      recorded and skipped, except for the separately specified
       superseded `globalcomix.users`/`users.name` and
       `globalcomix.comics`/`comics.slug` insert proofs above. The accepted
       policy risk is overwriting the divergent target row. Replacement keeps applying rows and
@@ -102,9 +102,15 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       independent ledger evidence survives while the replacement itself rolls back.
 - [x] Stage supported constraint-conflict observations within the source
       transaction; at its XID, finalize their source-transaction end
-      coordinates, roll back the target transaction, persist the unresolved
-      observations through the independent control-plane connection, and retry
-      from the unchanged checkpoint with bounded in-process backoff. Ordinary
+      coordinates, persist the unresolved observations through the independent
+      control-plane connection, then commit the transaction's remaining row
+      effects and advance the XID checkpoint past the conflicting rows. The
+      skipped rows are divergence the ledger owns; repair happens out of band.
+      Retrying from the unchanged checkpoint is forbidden here because replaying
+      the same rows cannot change the target, so the stream would never leave
+      the position - unbounded under `--reconnect-forever`. Failure to persist
+      the evidence aborts with the checkpoint unchanged, because advancing past a
+      divergence that was not recorded would lose it silently. Ordinary
       transport reconnects default to 12 after the initial attempt (13 attempts
       total); `--max-reconnects 0` disables them unless
       `--reconnect-forever true` is set. Exact-parent retries require a positive
