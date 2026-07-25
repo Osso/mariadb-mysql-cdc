@@ -145,6 +145,59 @@ pub(crate) trait SchemaCoercionPreflight {
     ) -> Result<CoercionBlockers, String>;
 }
 
+/// How the selected-table set is determined before the source inventory is read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SchemaSelection {
+    /// Exactly the named tables, from `--table` and `--catalog`.
+    Named(Vec<String>),
+    /// Every source base table, resolved from the source inventory.
+    AllSourceTables,
+}
+
+pub(crate) fn schema_selection(
+    repeated: &[String],
+    catalog: Option<&[u8]>,
+    all_tables: bool,
+) -> Result<SchemaSelection, String> {
+    if all_tables {
+        if !repeated.is_empty() || catalog.is_some() {
+            return Err(
+                "sync-schema --all-tables cannot be combined with --table or --catalog".to_string(),
+            );
+        }
+        return Ok(SchemaSelection::AllSourceTables);
+    }
+    Ok(SchemaSelection::Named(selected_tables(repeated, catalog)?))
+}
+
+pub(crate) fn resolve_schema_selection(
+    selection: &SchemaSelection,
+    source: &SchemaInventory,
+) -> Result<Vec<String>, String> {
+    match selection {
+        SchemaSelection::Named(tables) => Ok(tables.clone()),
+        SchemaSelection::AllSourceTables => all_source_tables(source),
+    }
+}
+
+/// The schema inventory holds base tables only, so every inventoried table is selectable.
+fn all_source_tables(source: &SchemaInventory) -> Result<Vec<String>, String> {
+    let selected = source
+        .tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect::<BTreeSet<_>>();
+    if selected.is_empty() {
+        return Err("sync-schema --all-tables found no source base tables".to_string());
+    }
+    if let Some(invalid) = selected.iter().find(|table| !valid_identifier(table)) {
+        return Err(format!(
+            "sync-schema --all-tables found invalid source table identifier `{invalid}`"
+        ));
+    }
+    Ok(selected.into_iter().collect())
+}
+
 pub(crate) fn selected_tables(
     repeated: &[String],
     catalog: Option<&[u8]>,
@@ -165,7 +218,10 @@ pub(crate) fn selected_tables(
         selected.extend(catalog.tables.into_iter().map(|table| table.name));
     }
     if selected.is_empty() {
-        return Err("sync-schema requires at least one --table or --catalog".to_string());
+        return Err(
+            "sync-schema requires at least one --table, --catalog, or --all-tables true"
+                .to_string(),
+        );
     }
     if selected.iter().any(|table| !valid_identifier(table)) {
         return Err("sync-schema selection contains invalid table identifier".to_string());
@@ -828,6 +884,7 @@ struct SyncSchemaConfig {
     target: crate::live::TargetMySqlConfig,
     tables: Vec<String>,
     catalog: Option<PathBuf>,
+    all_tables: bool,
 }
 
 pub(crate) fn run_sync_schema_command(args: Vec<String>, _usage: &str) {
@@ -872,13 +929,14 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
         .map(fs::read)
         .transpose()
         .map_err(|error| format!("failed to read sync-schema catalog: {error}"))?;
-    let selected = selected_tables(&config.tables, catalog.as_deref())?;
+    let selection = schema_selection(&config.tables, catalog.as_deref(), config.all_tables)?;
     let source_reader = MariaDbInventoryReader::new(inventory_config_source(&config.source));
     let target_reader = MariaDbInventoryReader::new(inventory_config_target(&config.target));
     let source = build_inventory(&config.source.database, &source_reader)
         .map_err(|error| format!("source schema inventory failed: {error}"))?;
     let target = build_inventory(&config.target.database, &target_reader)
         .map_err(|error| format!("target schema inventory failed: {error}"))?;
+    let selected = resolve_schema_selection(&selection, &source)?;
     let preflight = MySqlCoercionPreflight {
         config: inventory_config_target(&config.target),
         schema: config.target.database.clone(),
@@ -1108,6 +1166,10 @@ fn parse_sync_schema_config(args: Vec<String>) -> Result<SyncSchemaConfig, Strin
         },
         tables,
         catalog: values.get("--catalog").map(PathBuf::from),
+        all_tables: match values.get("--all-tables") {
+            Some(value) => crate::parse_bool("--all-tables", value)?,
+            None => false,
+        },
     })
 }
 
@@ -3126,6 +3188,110 @@ mod tests {
         .expect("selected tables");
 
         assert_eq!(selected, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn all_tables_selection_resolves_every_source_table_from_the_inventory() {
+        let selection = schema_selection(&[], None, true).expect("all-tables selection");
+        assert_eq!(selection, SchemaSelection::AllSourceTables);
+
+        let source = inventory(
+            vec![
+                table("zeta", vec![column("id", "int", false)], vec!["id"]),
+                table("alpha", vec![column("id", "int", false)], vec!["id"]),
+            ],
+            vec![],
+        );
+        let selected =
+            resolve_schema_selection(&selection, &source).expect("resolved all-tables selection");
+
+        assert_eq!(selected, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn all_tables_selection_rejects_named_tables_and_an_empty_source() {
+        let combined_table = schema_selection(&["alpha".to_string()], None, true)
+            .expect_err("--table with --all-tables");
+        assert_eq!(
+            combined_table,
+            "sync-schema --all-tables cannot be combined with --table or --catalog"
+        );
+
+        let combined_catalog =
+            schema_selection(&[], Some(br#"{"tables":[{"name":"alpha"}]}"#), true)
+                .expect_err("--catalog with --all-tables");
+        assert_eq!(
+            combined_catalog,
+            "sync-schema --all-tables cannot be combined with --table or --catalog"
+        );
+
+        let empty = resolve_schema_selection(
+            &SchemaSelection::AllSourceTables,
+            &inventory(vec![], vec![]),
+        )
+        .expect_err("empty source inventory");
+        assert_eq!(
+            empty,
+            "sync-schema --all-tables found no source base tables"
+        );
+    }
+
+    #[test]
+    fn named_selection_requires_a_table_catalog_or_all_tables() {
+        let error = schema_selection(&[], None, false).expect_err("empty selection");
+        assert_eq!(
+            error,
+            "sync-schema requires at least one --table, --catalog, or --all-tables true"
+        );
+    }
+
+    #[test]
+    fn parses_all_tables_selection_from_the_command_line() {
+        let config = parse_sync_schema_config(sync_schema_args(&["--all-tables", "true"]))
+            .expect("all-tables config");
+        assert!(config.all_tables);
+        assert!(config.tables.is_empty());
+        assert!(config.catalog.is_none());
+
+        let default = parse_sync_schema_config(sync_schema_args(&["--table", "alpha"]))
+            .expect("named config");
+        assert!(!default.all_tables);
+
+        let invalid = parse_sync_schema_config(sync_schema_args(&["--all-tables", "yes"]))
+            .expect_err("invalid boolean");
+        assert_eq!(invalid, "--all-tables must be true or false");
+    }
+
+    fn sync_schema_args(extra: &[&str]) -> Vec<String> {
+        // SAFETY: single-threaded test setup for the password environment lookup.
+        unsafe {
+            std::env::set_var("SYNC_SCHEMA_TEST_PASSWORD", "secret");
+        }
+        let mut args = [
+            "--source-host",
+            "source.example",
+            "--source-user",
+            "reader",
+            "--source-password-env",
+            "SYNC_SCHEMA_TEST_PASSWORD",
+            "--source-database",
+            "globalcomix",
+            "--target-host",
+            "target.example",
+            "--target-user",
+            "writer",
+            "--target-password-env",
+            "SYNC_SCHEMA_TEST_PASSWORD",
+            "--target-database",
+            "globalcomix",
+            "--target-tls-ca-file",
+            "/etc/ca.pem",
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+        args.extend(extra.iter().map(|value| value.to_string()));
+        args
     }
 
     fn inventory(

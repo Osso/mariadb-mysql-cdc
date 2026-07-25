@@ -6,7 +6,7 @@
 
 ### Selection and authority
 
-- [x] Accept repeated `--table TABLE` arguments or a catalog input defining the selected tables.
+- [x] Accept repeated `--table TABLE` arguments, a catalog input, or `--all-tables true` defining the selected tables. `--all-tables true` selects every source base table read from the source inventory, and is rejected when combined with `--table` or `--catalog`.
 - [x] Treat the source schema as authoritative only within the selected-table set.
 - [x] Converge each selected table exactly: target-only columns, indexes, foreign keys, checks, and generated expressions are removed; unselected target tables are never dropped.
 - [x] Apply selected tables sequentially, one table at a time.

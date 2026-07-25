@@ -39,7 +39,7 @@ Usage:
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
-  mariadb-mysql-cdc sync-schema --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH [--table TABLE ... | --catalog FILE]
+  mariadb-mysql-cdc sync-schema --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH [--table TABLE ... | --catalog FILE | --all-tables true]
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -60,6 +60,8 @@ Commands:
           Write deterministic syncable and non-syncable table catalogs ordered by estimated source rows.
   sync-catalog
           Apply a syncable table catalog with dependency ordering and four total sync slots.
+  sync-schema
+          Converge selected target tables to the translated source schema; --all-tables true selects every source base table.
   drift-check
           Read-only source/target COUNT(*) drift check for selected tables, or all source base tables when no --table is supplied.
   repair-drift
