@@ -2213,6 +2213,13 @@ fn column_change_requires_data_preflight(
     source: &ColumnInventory,
     target: &ColumnInventory,
 ) -> bool {
+    // A column the target already satisfies is not converted, so there is nothing to preflight.
+    // Comparing raw metadata here instead of the canonical form demanded a preflight for
+    // differences that are only spelling - a UCA-1400 collation against its MySQL equivalent -
+    // and that preflight has no predicate to test, so it counted every row as a blocker.
+    if columns_equal(source, target) {
+        return false;
+    }
     if source.generated != target.generated {
         return true;
     }
@@ -2222,7 +2229,10 @@ fn column_change_requires_data_preflight(
     let source_type = normalized_data_type(source);
     let target_type = normalized_data_type(target);
     if source_type == target_type {
-        if source.character_set != target.character_set || source.collation != target.collation {
+        if source.character_set != target.character_set
+            || source.collation.as_deref().map(canonical_collation)
+                != target.collation.as_deref().map(canonical_collation)
+        {
             return true;
         }
         if let Some((source_length, target_length)) =
@@ -3580,6 +3590,24 @@ mod tests {
     }
 
     /// A converged run must plan nothing on the next run.
+    /// A column whose only difference is collation spelling needs no conversion, so demanding a
+    /// preflight for it blocked the table on a predicate that does not exist.
+    #[test]
+    fn an_equivalent_collation_needs_no_data_preflight() {
+        let mut source = column("alignment", "varchar(16)", true);
+        source.character_set = Some("utf8mb4".to_string());
+        source.collation = Some("utf8mb4_uca1400_ai_ci".to_string());
+        let mut target = source.clone();
+        target.collation = Some("utf8mb4_0900_ai_ci".to_string());
+
+        assert!(!column_change_requires_data_preflight(&source, &target));
+
+        // A genuinely different collation still needs one.
+        let mut different = source.clone();
+        different.collation = Some("utf8mb4_bin".to_string());
+        assert!(column_change_requires_data_preflight(&source, &different));
+    }
+
     #[test]
     fn a_uca1400_table_collation_plans_no_repeated_table_options() {
         let mut source_table = table("items", vec![column("id", "bigint", false)], vec!["id"]);
