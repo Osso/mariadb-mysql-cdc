@@ -303,12 +303,13 @@ fn synthesized_parent_indexes(source: &SchemaInventory) -> Vec<IndexInventory> {
                     .referenced_columns
                     .iter()
                     .enumerate()
+                    // Ascending, as the inventory reader describes an ascending B-tree column.
                     .map(|(position, column)| IndexColumnInventory {
                         name: column.clone(),
                         sequence: position as u32 + 1,
                         prefix_length: None,
                         collation: Some("A".to_string()),
-                        order: String::new(),
+                        order: "ASC".to_string(),
                     })
                     .collect(),
             });
@@ -702,7 +703,7 @@ fn render_foreign_keys(
         .map(|foreign_key| {
             let statement = translate_statement(
                 SchemaPhase::Constraints,
-                render_foreign_key(foreign_key),
+                render_foreign_key(foreign_key, &source.schema),
                 vec![format!("foreign_key:{}.{}", table.name, foreign_key.name)],
                 &[],
             )?;
@@ -731,10 +732,9 @@ fn plan_foreign_keys(
         .collect::<Vec<_>>();
     let mut statements = Vec::new();
     for target_key in &target_keys {
-        if !source_keys
-            .iter()
-            .any(|source_key| foreign_keys_equal(source_key, target_key))
-        {
+        if !source_keys.iter().any(|source_key| {
+            foreign_keys_equal(source_key, &source.schema, target_key, &target.schema)
+        }) {
             statements.push(translate_statement(
                 SchemaPhase::Constraints,
                 format!(
@@ -747,13 +747,12 @@ fn plan_foreign_keys(
         }
     }
     for source_key in source_keys {
-        if !target_keys
-            .iter()
-            .any(|target_key| foreign_keys_equal(source_key, target_key))
-        {
+        if !target_keys.iter().any(|target_key| {
+            foreign_keys_equal(source_key, &source.schema, target_key, &target.schema)
+        }) {
             let statement = translate_statement(
                 SchemaPhase::Constraints,
-                render_foreign_key(source_key),
+                render_foreign_key(source_key, &source.schema),
                 vec![format!("foreign_key:{}.{}", table.name, source_key.name)],
                 &[],
             )?;
@@ -1079,12 +1078,13 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
         &source,
         &source_canonical_foreign_keys,
         &target_canonical_foreign_keys,
+        &config.target.database,
     );
     let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
         .map_err(|error| error.to_string())?;
     let mut executor = MySqlSchemaExecutor { executor };
     let target_config = inventory_config_target(&config.target);
-    let source_checks_by_table = checks_by_table(&source_checks);
+    let source_checks_by_table = checks_by_table(&target_check_constraints(&source_checks));
     let source_table_map = table_map(&source);
     let expected = expected_target_inventory(&source);
     Ok(execute_schema_plan(plan, &mut executor, &|table| {
@@ -1116,12 +1116,16 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
         }
         let target_canonical =
             build_canonical_foreign_key_inventory(&config.target.database, &reader);
-        let source_table_foreign_keys =
-            canonical_foreign_keys_for(&source_canonical_foreign_keys, table);
+        let source_table_foreign_keys = relative_canonical_foreign_keys(
+            &canonical_foreign_keys_for(&source_canonical_foreign_keys, table),
+            &config.source.database,
+        );
         match target_canonical {
             Ok(target_keys)
-                if canonical_foreign_keys_for(&target_keys, table) == source_table_foreign_keys => {
-            }
+                if relative_canonical_foreign_keys(
+                    &canonical_foreign_keys_for(&target_keys, table),
+                    &config.target.database,
+                ) == source_table_foreign_keys => {}
             Ok(_) => differences.push("foreign key rules differ".to_string()),
             Err(error) => differences.push(format!("foreign key verification failed: {error}")),
         }
@@ -1352,7 +1356,7 @@ fn append_check_constraint_plan(
     source: &[CheckConstraint],
     target: &[CheckConstraint],
 ) {
-    let source = checks_by_table(source);
+    let source = checks_by_table(&target_check_constraints(source));
     let target = checks_by_table(target);
     for table in &mut plan.tables {
         let source_checks = source.get(&table.table).cloned().unwrap_or_default();
@@ -1391,6 +1395,36 @@ fn append_check_constraint_plan(
         table.statements.splice(0..0, drops);
         table.statements.extend(additions);
     }
+}
+
+/// The check constraints the target must hold.
+///
+/// MariaDB only requires a check name to be unique within its table, and this source reuses
+/// several across tables. MySQL requires schema-wide uniqueness, so a reused name is qualified
+/// with its table. Names already unique keep their source spelling.
+fn target_check_constraints(source: &[CheckConstraint]) -> Vec<CheckConstraint> {
+    let mut tables_per_name = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for check in source {
+        tables_per_name
+            .entry(check.name.as_str())
+            .or_default()
+            .insert(check.table.as_str());
+    }
+    source
+        .iter()
+        .map(|check| {
+            let reused = tables_per_name
+                .get(check.name.as_str())
+                .is_some_and(|tables| tables.len() > 1);
+            if !reused {
+                return check.clone();
+            }
+            CheckConstraint {
+                name: format!("{}_{}", check.table, check.name),
+                ..check.clone()
+            }
+        })
+        .collect()
 }
 
 fn check_constraint_prerequisites(
@@ -1436,6 +1470,7 @@ fn append_canonical_foreign_key_plan(
     source_inventory: &SchemaInventory,
     source: &[CanonicalForeignKey],
     target: &[CanonicalForeignKey],
+    target_schema: &str,
 ) {
     for table in &mut plan.tables {
         let foreign_key_prerequisites = table
@@ -1455,8 +1490,14 @@ fn append_canonical_foreign_key_plan(
                 .iter()
                 .any(|object| object.starts_with("foreign_key:"))
         });
-        let source_keys = canonical_foreign_keys_for(source, &table.table);
-        let target_keys = canonical_foreign_keys_for(target, &table.table);
+        let source_keys = relative_canonical_foreign_keys(
+            &canonical_foreign_keys_for(source, &table.table),
+            &source_inventory.schema,
+        );
+        let target_keys = relative_canonical_foreign_keys(
+            &canonical_foreign_keys_for(target, &table.table),
+            target_schema,
+        );
         let drops = target_keys
             .iter()
             .filter(|target_key| !source_keys.contains(target_key))
@@ -1483,7 +1524,7 @@ fn append_canonical_foreign_key_plan(
                 let statement = translate_for_table(
                     table,
                     SchemaPhase::Constraints,
-                    render_canonical_foreign_key(key),
+                    render_canonical_foreign_key(key, &source_inventory.schema),
                     vec![object.clone()],
                 )?;
                 let prerequisites = foreign_key_prerequisites
@@ -1526,14 +1567,13 @@ fn canonical_foreign_keys_for(
         .collect()
 }
 
-fn render_canonical_foreign_key(key: &CanonicalForeignKey) -> String {
+fn render_canonical_foreign_key(key: &CanonicalForeignKey, schema: &str) -> String {
     format!(
-        "ALTER TABLE `{}` ADD CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES `{}`.`{}` ({}) ON UPDATE {} ON DELETE {}",
+        "ALTER TABLE `{}` ADD CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES {} ({}) ON UPDATE {} ON DELETE {}",
         key.child_table,
         key.constraint_name,
         quoted_list(&key.child_columns),
-        key.parent_schema,
-        key.parent_table,
+        referenced_table_reference(schema, &key.parent_schema, &key.parent_table),
         quoted_list(&key.parent_columns),
         key.update_rule,
         key.delete_rule,
@@ -1616,7 +1656,7 @@ fn render_create_table(
                 .foreign_keys
                 .iter()
                 .filter(|foreign_key| foreign_key.table == table.name)
-                .map(render_inline_foreign_key),
+                .map(|foreign_key| render_inline_foreign_key(foreign_key, &inventory.schema)),
         );
     }
     let collation = table.collation.as_deref().map(|collation| {
@@ -1890,9 +1930,9 @@ fn schema_table_differences(
         .collect::<Vec<_>>();
     if source_foreign_keys.len() != target_foreign_keys.len()
         || source_foreign_keys.iter().any(|source_key| {
-            !target_foreign_keys
-                .iter()
-                .any(|target_key| foreign_keys_equal(source_key, target_key))
+            !target_foreign_keys.iter().any(|target_key| {
+                foreign_keys_equal(source_key, &source.schema, target_key, &target.schema)
+            })
         })
     {
         differences.push("foreign keys differ".to_string());
@@ -2309,10 +2349,48 @@ fn indexes_equal(left: &IndexInventory, right: &IndexInventory) -> bool {
         && left.columns == right.columns
 }
 
-fn foreign_keys_equal(left: &ForeignKeyInventory, right: &ForeignKeyInventory) -> bool {
+/// Replaces an endpoint's own database name, so a same-schema reference compares equal even
+/// when the target database is named differently from the source.
+const OWN_SCHEMA: &str = "<own schema>";
+
+fn relative_schema<'a>(inventory_schema: &str, schema: &'a str) -> &'a str {
+    if schema == inventory_schema {
+        OWN_SCHEMA
+    } else {
+        schema
+    }
+}
+
+/// The same canonical foreign key with every database name expressed relative to the endpoint
+/// that reported it.
+fn relative_canonical_foreign_key(key: &CanonicalForeignKey, schema: &str) -> CanonicalForeignKey {
+    CanonicalForeignKey {
+        constraint_schema: relative_schema(schema, &key.constraint_schema).to_string(),
+        child_schema: relative_schema(schema, &key.child_schema).to_string(),
+        parent_schema: relative_schema(schema, &key.parent_schema).to_string(),
+        ..key.clone()
+    }
+}
+
+fn relative_canonical_foreign_keys(
+    keys: &[CanonicalForeignKey],
+    schema: &str,
+) -> Vec<CanonicalForeignKey> {
+    keys.iter()
+        .map(|key| relative_canonical_foreign_key(key, schema))
+        .collect()
+}
+
+fn foreign_keys_equal(
+    left: &ForeignKeyInventory,
+    left_schema: &str,
+    right: &ForeignKeyInventory,
+    right_schema: &str,
+) -> bool {
     left.name == right.name
         && left.columns == right.columns
-        && left.referenced_schema == right.referenced_schema
+        && relative_schema(left_schema, &left.referenced_schema)
+            == relative_schema(right_schema, &right.referenced_schema)
         && left.referenced_table == right.referenced_table
         && left.referenced_columns == right.referenced_columns
 }
@@ -2379,27 +2457,47 @@ fn render_index_column(column: &crate::inventory::IndexColumnInventory) -> Strin
     format!("`{}`{prefix}{order}", column.name)
 }
 
-fn render_foreign_key(foreign_key: &ForeignKeyInventory) -> String {
+fn render_foreign_key(foreign_key: &ForeignKeyInventory, schema: &str) -> String {
     format!(
-        "ALTER TABLE `{}` ADD CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES `{}`.`{}` ({})",
+        "ALTER TABLE `{}` ADD CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES {} ({})",
         foreign_key.table,
         foreign_key.name,
         quoted_list(&foreign_key.columns),
-        foreign_key.referenced_schema,
-        foreign_key.referenced_table,
+        referenced_table_reference(
+            schema,
+            &foreign_key.referenced_schema,
+            &foreign_key.referenced_table
+        ),
         quoted_list(&foreign_key.referenced_columns)
     )
 }
 
-fn render_inline_foreign_key(foreign_key: &ForeignKeyInventory) -> String {
+fn render_inline_foreign_key(foreign_key: &ForeignKeyInventory, schema: &str) -> String {
     format!(
-        "CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES `{}`.`{}` ({})",
+        "CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES {} ({})",
         foreign_key.name,
         quoted_list(&foreign_key.columns),
-        foreign_key.referenced_schema,
-        foreign_key.referenced_table,
+        referenced_table_reference(
+            schema,
+            &foreign_key.referenced_schema,
+            &foreign_key.referenced_table
+        ),
         quoted_list(&foreign_key.referenced_columns)
     )
+}
+
+/// A foreign key inside the converged schema must resolve in the target database, so only a
+/// genuinely cross-schema parent keeps its schema qualifier.
+fn referenced_table_reference(
+    schema: &str,
+    referenced_schema: &str,
+    referenced_table: &str,
+) -> String {
+    if referenced_schema == schema {
+        format!("`{referenced_table}`")
+    } else {
+        format!("`{referenced_schema}`.`{referenced_table}`")
+    }
 }
 
 fn quoted_list(columns: &[String]) -> String {
@@ -3180,7 +3278,13 @@ mod tests {
         target_canonical.update_rule = "RESTRICT".to_string();
         target_canonical.delete_rule = "CASCADE".to_string();
 
-        append_canonical_foreign_key_plan(&mut plan, &source, &[canonical], &[target_canonical]);
+        append_canonical_foreign_key_plan(
+            &mut plan,
+            &source,
+            &[canonical],
+            &[target_canonical],
+            "globalcomix",
+        );
 
         let statement = plan
             .tables
@@ -3377,6 +3481,89 @@ mod tests {
             ..target
         };
         assert_ne!(source, other_column);
+    }
+
+    #[test]
+    fn a_same_schema_parent_matches_a_differently_named_target_database() {
+        let source_key = ForeignKeyInventory {
+            table: "children".to_string(),
+            name: "fk_parent".to_string(),
+            columns: vec!["parent_id".to_string()],
+            referenced_schema: "globalcomix".to_string(),
+            referenced_table: "parents".to_string(),
+            referenced_columns: vec!["id".to_string()],
+        };
+        let target_key = ForeignKeyInventory {
+            referenced_schema: "globalcomix_rehearsal".to_string(),
+            ..source_key.clone()
+        };
+        let cross_schema_key = ForeignKeyInventory {
+            referenced_schema: "other".to_string(),
+            ..source_key.clone()
+        };
+
+        assert!(foreign_keys_equal(
+            &source_key,
+            "globalcomix",
+            &target_key,
+            "globalcomix_rehearsal"
+        ));
+        assert!(!foreign_keys_equal(
+            &source_key,
+            "globalcomix",
+            &cross_schema_key,
+            "globalcomix_rehearsal"
+        ));
+        assert!(foreign_keys_equal(
+            &cross_schema_key,
+            "globalcomix",
+            &cross_schema_key,
+            "globalcomix_rehearsal"
+        ));
+    }
+
+    #[test]
+    fn check_names_reused_across_source_tables_are_qualified_for_mysql() {
+        let source = vec![
+            CheckConstraint {
+                table: "income_reconciliations".to_string(),
+                name: "config_json".to_string(),
+                clause: "json_valid(`config_json`)".to_string(),
+            },
+            CheckConstraint {
+                table: "income_reconciliations_history".to_string(),
+                name: "config_json".to_string(),
+                clause: "json_valid(`config_json`)".to_string(),
+            },
+            CheckConstraint {
+                table: "comics_enrichments".to_string(),
+                name: "ck_comic_identity".to_string(),
+                clause: "`comic_id` is not null".to_string(),
+            },
+        ];
+
+        let names = target_check_constraints(&source)
+            .into_iter()
+            .map(|check| (check.table, check.name))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                (
+                    "income_reconciliations".to_string(),
+                    "income_reconciliations_config_json".to_string()
+                ),
+                (
+                    "income_reconciliations_history".to_string(),
+                    "income_reconciliations_history_config_json".to_string()
+                ),
+                (
+                    "comics_enrichments".to_string(),
+                    "ck_comic_identity".to_string()
+                ),
+            ]
+        );
     }
 
     /// MariaDB permits one check name on several tables, so the source inventory must report the
