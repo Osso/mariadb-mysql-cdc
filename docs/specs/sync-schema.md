@@ -15,6 +15,8 @@
 
 - [x] Reuse the sole shared MariaDB-to-MySQL 8 DDL translator used by streamed DDL replay.
 - [x] Generate schema operations through that translator and apply the same semantic mappings, including temporal types, defaults, `ON UPDATE`, generated expressions, character sets, collations, indexes, checks, and foreign keys.
+- [x] Emit column `CHARACTER SET` and `COLLATE` as part of the data type, before nullability, defaults, and generated expressions.
+- [x] Converge the target to the source schema plus the unique parent indexes MySQL requires and MariaDB does not: when a source foreign key's referenced columns are not the leftmost prefix of a source primary key or unique index, expect a synthesized `uq_cdc_<parent>_<columns>` unique index on the parent. Create it when absent, keep it when present, and require it before adding the dependent foreign key.
 - [x] Maintain actual streamed-DDL parity: a mapping accepted by `sync-schema` must produce the same translated MySQL semantics as the corresponding streamed DDL operation.
 - [x] Have no alternate mapping, compatibility fallback, direct source-DDL execution path, or silent approximation.
 - [x] Fail explicitly on unsupported or ambiguous source constructs.

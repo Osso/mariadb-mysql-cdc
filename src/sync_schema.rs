@@ -1,8 +1,8 @@
 use crate::conflict_repair::CanonicalForeignKey;
 use crate::inventory::{
-    ColumnInventory, ForeignKeyInventory, IndexInventory, InventoryConfig, InventoryEndpointRole,
-    MariaDbInventoryReader, SchemaInventory, TableInventory, build_canonical_foreign_key_inventory,
-    build_inventory,
+    ColumnInventory, ForeignKeyInventory, IndexColumnInventory, IndexInventory, InventoryConfig,
+    InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory, TableInventory,
+    build_canonical_foreign_key_inventory, build_inventory,
 };
 use crate::live::ddl_semantics::{DDL_TRANSFORMATION_VERSION, translate_modeled_ddl};
 use crate::target::{SqlStatement, TargetExecutor};
@@ -229,12 +229,97 @@ pub(crate) fn selected_tables(
     Ok(selected.into_iter().collect())
 }
 
+/// The schema the target must hold: the source schema plus the unique parent indexes MySQL
+/// requires but MariaDB does not.
+///
+/// MariaDB accepts a foreign key whose referenced columns are only covered by a non-unique
+/// index. MySQL requires those columns to be the leftmost prefix of a UNIQUE or PRIMARY key
+/// and rejects the constraint otherwise, so the translated target carries one synthesized
+/// unique index per such parent identity.
+pub(crate) fn expected_target_inventory(source: &SchemaInventory) -> SchemaInventory {
+    let mut expected = source.clone();
+    expected.indexes.extend(synthesized_parent_indexes(source));
+    expected
+}
+
+fn synthesized_parent_indexes(source: &SchemaInventory) -> Vec<IndexInventory> {
+    let mut synthesized = BTreeMap::new();
+    for foreign_key in &source.foreign_keys {
+        if foreign_key.referenced_schema != source.schema
+            || standard_parent_key_exists(
+                source,
+                &foreign_key.referenced_table,
+                &foreign_key.referenced_columns,
+            )
+        {
+            continue;
+        }
+        let name = synthesized_parent_index_name(
+            &foreign_key.referenced_table,
+            &foreign_key.referenced_columns,
+        );
+        synthesized
+            .entry((foreign_key.referenced_table.clone(), name.clone()))
+            .or_insert_with(|| IndexInventory {
+                table: foreign_key.referenced_table.clone(),
+                name,
+                unique: true,
+                index_type: "BTREE".to_string(),
+                visible: true,
+                comment: None,
+                columns: foreign_key
+                    .referenced_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(position, column)| IndexColumnInventory {
+                        name: column.clone(),
+                        sequence: position as u32 + 1,
+                        prefix_length: None,
+                        collation: Some("A".to_string()),
+                        order: String::new(),
+                    })
+                    .collect(),
+            });
+    }
+    synthesized.into_values().collect()
+}
+
+fn synthesized_parent_index_name(table: &str, columns: &[String]) -> String {
+    format!("uq_cdc_{table}_{}", columns.join("_"))
+}
+
+/// True when `columns` are the leftmost prefix of the table's primary key or of a unique index.
+fn standard_parent_key_exists(
+    source: &SchemaInventory,
+    table_name: &str,
+    columns: &[String],
+) -> bool {
+    let primary_key_covers = source
+        .tables
+        .iter()
+        .find(|table| table.name == table_name)
+        .is_some_and(|table| table.primary_key.starts_with(columns));
+    primary_key_covers
+        || indexes_for(source, table_name).into_iter().any(|index| {
+            index.unique
+                && index.columns.len() >= columns.len()
+                && index
+                    .columns
+                    .iter()
+                    .map(|column| &column.name)
+                    .zip(columns)
+                    .all(|(actual, required)| actual == required)
+        })
+}
+
 pub(crate) fn plan_schema_convergence(
     source: &SchemaInventory,
     target: &SchemaInventory,
     selected: &[String],
     preflight: &dyn SchemaCoercionPreflight,
 ) -> Result<SchemaConvergencePlan, String> {
+    let source_fingerprint = fingerprint(source)?;
+    let source = &expected_target_inventory(source);
     let source_tables = table_map(source);
     let target_tables = table_map(target);
     let mut tables = Vec::new();
@@ -265,7 +350,7 @@ pub(crate) fn plan_schema_convergence(
         )?);
     }
     Ok(SchemaConvergencePlan {
-        source_fingerprint: fingerprint(source)?,
+        source_fingerprint,
         target_fingerprint: fingerprint(target)?,
         tables,
     })
@@ -969,6 +1054,7 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
     let target_config = inventory_config_target(&config.target);
     let source_checks_by_table = checks_by_table(&source_checks);
     let source_table_map = table_map(&source);
+    let expected = expected_target_inventory(&source);
     Ok(execute_schema_plan(plan, &mut executor, &|table| {
         let reader = MariaDbInventoryReader::new(target_config.clone());
         let target_inventory = match build_inventory(&config.target.database, &reader) {
@@ -978,7 +1064,7 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
         if !source_table_map.contains_key(table) {
             return vec!["source table disappeared during verification".to_string()];
         }
-        let mut differences = schema_table_differences(&source, &target_inventory, table);
+        let mut differences = schema_table_differences(&expected, &target_inventory, table);
         let target_checks =
             read_check_constraints(&target_config, &config.target.database).map(|checks| {
                 checks_by_table(&checks)
@@ -1502,6 +1588,14 @@ fn render_column(column: &ColumnInventory) -> String {
         column.name,
         column.column_type.to_ascii_uppercase()
     );
+    // `CHARACTER SET` and `COLLATE` belong to the data type, so MySQL rejects them after
+    // nullability, a default, or a generated expression.
+    if let Some(character_set) = &column.character_set {
+        rendered.push_str(&format!(" CHARACTER SET {character_set}"));
+    }
+    if let Some(collation) = &column.collation {
+        rendered.push_str(&format!(" COLLATE {collation}"));
+    }
     if let Some(generated) = &column.generated {
         rendered.push_str(&format!(
             " GENERATED ALWAYS AS ({}) {}",
@@ -1520,12 +1614,6 @@ fn render_column(column: &ColumnInventory) -> String {
         rendered.push_str(&render_default(default));
     } else if column.is_nullable {
         rendered.push_str(" DEFAULT NULL");
-    }
-    if let Some(character_set) = &column.character_set {
-        rendered.push_str(&format!(" CHARACTER SET {character_set}"));
-    }
-    if let Some(collation) = &column.collation {
-        rendered.push_str(&format!(" COLLATE {collation}"));
     }
     let lower_extra = column.extra.to_ascii_lowercase();
     if lower_extra.contains("auto_increment") {
@@ -2885,6 +2973,220 @@ mod tests {
 
         assert!(sql.contains("DEFAULT CHARACTER SET=utf8mb4"), "{sql}");
         assert!(sql.contains("COLLATE=utf8mb4_unicode_ci"), "{sql}");
+    }
+
+    #[test]
+    fn non_unique_parent_key_gains_a_synthesized_unique_index_the_target_keeps() {
+        let mut source = inventory(
+            vec![
+                table(
+                    "users",
+                    vec![
+                        column("id", "mediumint unsigned", false),
+                        column("name", "varchar(255)", false),
+                    ],
+                    vec!["id"],
+                ),
+                table(
+                    "users_replies",
+                    vec![
+                        column("id", "bigint", false),
+                        column("user_id", "mediumint unsigned", false),
+                        column("user_name", "varchar(255)", false),
+                    ],
+                    vec!["id"],
+                ),
+            ],
+            vec![ForeignKeyInventory {
+                table: "users_replies".to_string(),
+                name: "users_replies_ibfk_1".to_string(),
+                columns: vec!["user_id".to_string(), "user_name".to_string()],
+                referenced_schema: "globalcomix".to_string(),
+                referenced_table: "users".to_string(),
+                referenced_columns: vec!["id".to_string(), "name".to_string()],
+            }],
+        );
+        // MariaDB only requires a non-unique parent index for this constraint.
+        source.indexes.push(IndexInventory {
+            table: "users".to_string(),
+            name: "fk_user".to_string(),
+            unique: false,
+            index_type: "BTREE".to_string(),
+            visible: true,
+            comment: None,
+            columns: vec![
+                IndexColumnInventory {
+                    name: "id".to_string(),
+                    sequence: 1,
+                    prefix_length: None,
+                    collation: Some("A".to_string()),
+                    order: String::new(),
+                },
+                IndexColumnInventory {
+                    name: "name".to_string(),
+                    sequence: 2,
+                    prefix_length: None,
+                    collation: Some("A".to_string()),
+                    order: String::new(),
+                },
+            ],
+        });
+
+        let expected = expected_target_inventory(&source);
+        let synthesized = expected
+            .indexes
+            .iter()
+            .find(|index| index.name == "uq_cdc_users_id_name")
+            .expect("synthesized parent index");
+        assert!(synthesized.unique);
+        assert_eq!(synthesized.table, "users");
+        assert_eq!(
+            synthesized
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+
+        // A target that already holds the synthesized index keeps it, and the child foreign
+        // key waits for it.
+        let mut target = source.clone();
+        target.indexes.push(synthesized.clone());
+        target.foreign_keys.clear();
+        let plan = plan_schema_convergence(
+            &source,
+            &target,
+            &["users".to_string(), "users_replies".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("schema plan");
+        let sql = plan
+            .tables
+            .iter()
+            .flat_map(|table| table.statements.iter())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!sql.contains("DROP INDEX `uq_cdc_users_id_name`"), "{sql}");
+
+        let foreign_key = plan
+            .tables
+            .iter()
+            .flat_map(|table| table.statements.iter())
+            .find(|statement| {
+                statement
+                    .sql
+                    .contains("ADD CONSTRAINT `users_replies_ibfk_1`")
+            })
+            .expect("foreign key statement");
+        assert!(
+            foreign_key
+                .prerequisites
+                .contains(&"index:users.uq_cdc_users_id_name".to_string()),
+            "{:?}",
+            foreign_key.prerequisites
+        );
+
+        // A target without it is told to create it.
+        target
+            .indexes
+            .retain(|index| index.name != "uq_cdc_users_id_name");
+        let create_plan = plan_schema_convergence(
+            &source,
+            &target,
+            &["users".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("schema plan");
+        let create_sql = create_plan.tables[0]
+            .statements
+            .iter()
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            create_sql
+                .contains("CREATE UNIQUE INDEX `uq_cdc_users_id_name` ON `users` (`id`,`name`)"),
+            "{create_sql}"
+        );
+    }
+
+    #[test]
+    fn unique_parent_key_needs_no_synthesized_index() {
+        let mut source = inventory(
+            vec![table(
+                "guests",
+                vec![
+                    column("guest_id", "int unsigned", false),
+                    column("guest_hash", "varchar(64)", false),
+                ],
+                vec!["guest_id"],
+            )],
+            vec![ForeignKeyInventory {
+                table: "sessions".to_string(),
+                name: "fk_sessions_guest".to_string(),
+                columns: vec!["guest_id".to_string(), "guest_hash".to_string()],
+                referenced_schema: "globalcomix".to_string(),
+                referenced_table: "guests".to_string(),
+                referenced_columns: vec!["guest_id".to_string(), "guest_hash".to_string()],
+            }],
+        );
+        source.indexes.push(IndexInventory {
+            table: "guests".to_string(),
+            name: "idx_guest_fk".to_string(),
+            unique: true,
+            index_type: "BTREE".to_string(),
+            visible: true,
+            comment: None,
+            columns: vec![
+                IndexColumnInventory {
+                    name: "guest_id".to_string(),
+                    sequence: 1,
+                    prefix_length: None,
+                    collation: Some("A".to_string()),
+                    order: String::new(),
+                },
+                IndexColumnInventory {
+                    name: "guest_hash".to_string(),
+                    sequence: 2,
+                    prefix_length: None,
+                    collation: Some("A".to_string()),
+                    order: String::new(),
+                },
+            ],
+        });
+
+        assert_eq!(
+            expected_target_inventory(&source).indexes,
+            source.indexes,
+            "a unique parent index already satisfies MySQL"
+        );
+    }
+
+    #[test]
+    fn column_character_set_and_collation_precede_nullability_default_and_generation() {
+        let mut email = column("email", "varchar(255)", true);
+        email.character_set = Some("utf8mb3".to_string());
+        email.collation = Some("utf8mb3_bin".to_string());
+
+        assert_eq!(
+            render_column(&email),
+            "`email` VARCHAR(255) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin NULL DEFAULT NULL"
+        );
+
+        let mut slug = column("slug", "varchar(64)", false);
+        slug.character_set = Some("ascii".to_string());
+        slug.collation = Some("ascii_bin".to_string());
+        slug.generated = Some(crate::inventory::GeneratedColumn {
+            expression: "lower(`email`)".to_string(),
+            generation_kind: "stored".to_string(),
+        });
+
+        assert_eq!(
+            render_column(&slug),
+            "`slug` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin GENERATED ALWAYS AS (lower(`email`)) STORED"
+        );
     }
 
     #[test]
