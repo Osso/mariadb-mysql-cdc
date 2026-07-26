@@ -74,11 +74,13 @@ duplicate allowlists.
 ## Repair model
 
 The code contains a durable conflict schema contract wired into live row-event
-handling and an FK-aware phased planner. `cdc.row_conflicts` uses a lowercase
-ASCII SHA-256 `conflict_identity` primary key over the canonical full source
-identity tuple while retaining every source field for collision checks. This
-SHA-256 statement is limited to conflict identities; it does not claim that
-FNV-based sync-progress IDs migrated. Supported constraint-conflict evidence is
+handling and an FK-aware phased planner. `cdc.row_conflicts` retains every source
+field and uses two lowercase ASCII SHA-256 identities: `conflict_identity`
+includes source coordinates and operation, while `source_row_identity` covers
+source identity, schema, table, and complete source primary-key JSON for indexed
+unresolved-row lookup. The lookup retains every unhashed predicate as a collision
+defense. These SHA-256 identities are limited to row conflicts; they do not claim
+that FNV-based sync-progress IDs migrated. Supported constraint-conflict evidence is
 persisted on an independent connection before the target transaction rolls back,
 and the live target checkpoint does not advance. For native ROW `INSERT` changes,
 `--insert-conflict-policy ignore-duplicate` skips a `1062` only after the target
@@ -115,9 +117,11 @@ locked-target evidence `SELECT` statements plus the historical primary-key and
 unique-identity query parameters; credentials and unrelated row values are never
 logged. Every non-`INSERT` `1062` unique conflict also persists evidence
 and aborts; all other secondary-unique conflicts remain on that path.
-Startup validates the admin-bootstrap schema, guards, constraints, and exact
-table/application grants before opening the source stream; runtime never creates
-the table. `repair-drift` now invokes FK-aware
+Startup validates the admin-bootstrap schema, guards, constraints, stored
+generated `source_row_identity` expression, `(source_row_identity, status)`
+index, and exact table/application grants before opening the source stream;
+runtime never creates or migrates the table. Existing populated ledgers require
+the one-time source-row-identity migration before streaming. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, exact chunk verification,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
 conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 44 executable scenarios,

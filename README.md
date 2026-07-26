@@ -69,7 +69,10 @@ post-state can finalize; otherwise the row becomes `blocked`. Target binlog
 receipt is unavailable, so this is semantic proof only.
 
 No operator-authored target SQL or manual status transition is a supported DDL
-resolution path. Fresh bootstrap is the pre-production schema contract; obsolete
+resolution path. Fresh bootstrap remains the pre-production schema contract.
+Existing populated `cdc.row_conflicts` tables use
+`docs/row-conflicts-source-row-identity-migration.sql` once while stream and
+repair writers are stopped; runtime never performs this migration. Obsolete
 development migrations are not maintained as upgrade paths.
 
 The code contains a durable row-conflict ledger wired into the live stream and
@@ -122,14 +125,17 @@ coordinate/FK scope, predecessor, or commit checks roll back target effects and
 checkpoint advancement, while unresolved evidence is persisted independently.
 Guarded observation upserts
 are idempotent. The admin-bootstrapped
-`cdc.row_conflicts` schema, guards, constraints, definer-safe trigger inventory
-procedure, and exact table/procedure grants must validate at startup; runtime never
-creates the table. Different source primary keys remain different conflict
-identities. `repair-drift` now invokes the planner for child-first deletes,
+`cdc.row_conflicts` schema, guards, constraints, stored generated
+`source_row_identity`, `(source_row_identity, status)` index, definer-safe trigger
+inventory procedure, and exact table/procedure grants must validate at startup;
+runtime never creates or migrates the table. Different source primary keys remain
+different conflict identities. `repair-drift` now invokes the planner for child-first deletes,
 parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
 windows, a non-mutating full-scope Verify equality phase, and evidence-backed
 conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 44 executable scenarios.
-Earlier TLS harness coverage used a disposable TLS-enabled source, but the live
+Its `row-conflict-source-row-migration` and `row-conflict-indexed-resolution`
+scenarios prove populated-ledger migration, index selection, collision defense,
+and post-commit resolution. Earlier TLS harness coverage used a disposable TLS-enabled source, but the live
 GlobalComix source MariaDB (`source-mariadb.example` / `192.0.2.10`) is
 plaintext-only by accepted operational policy. Current production safety is:
 source plaintext only, target DigitalOcean MySQL with configured CA and hostname

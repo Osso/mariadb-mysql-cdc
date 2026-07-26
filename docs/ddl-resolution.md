@@ -29,9 +29,12 @@ The contract provisions checkpoint, row-conflict, and automatic DDL journal
 objects with exact control-plane scopes and journal/row-conflict trigger-inventory
 procedures.
 
-This schema is still pre-production. Fresh bootstrap is the only supported
-schema contract; obsolete development migrations are deleted rather than
-maintained as upgrade paths.
+For an existing populated `cdc.row_conflicts` table, run
+`docs/row-conflicts-source-row-identity-migration.sql` once with stream and repair
+writers stopped, before startup validation. Fresh installations use the bootstrap
+file directly. This supported transition adds the generated source-row identity
+and lookup index; obsolete development migrations are still deleted rather than
+maintained as compatibility paths.
 
 ## Startup/bootstrap validation boundary
 

@@ -94,8 +94,11 @@ or deployment readiness.
 ## Bootstrap
 
 This schema is pre-production. Run the fresh control-plane and journal bootstrap
-files while the stream is stopped. Obsolete development migrations are deleted
-instead of maintained as compatibility paths.
+files while the stream is stopped. For an existing populated
+`cdc.row_conflicts` table, first run
+`docs/row-conflicts-source-row-identity-migration.sql` once with stream and repair
+writers stopped, before startup validation. Obsolete development migrations are
+deleted instead of maintained as compatibility paths.
 
 ## Remaining proof gaps
 
