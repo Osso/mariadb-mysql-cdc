@@ -166,6 +166,34 @@ fn column_identity(
         .collect()
 }
 
+/// What the target holds at a source row's primary key when an insert reported a duplicate.
+#[derive(Debug, Eq, PartialEq)]
+enum DuplicateOwner {
+    /// No row: the duplicate belongs to some other primary key, so this row is still missing.
+    Absent,
+    /// The source row exactly: nothing to do.
+    Equal,
+    /// One row with different values. The insert lost a race - the stream applied the row between the
+    /// comparison and the insert - or a mutable column moved on, which is routine against a live
+    /// source: `comics_top_stats` differed only in the rolling `value_365_days`, 4895 against 4891, at
+    /// the same primary key and the same update_time. Applying the source image converges it.
+    Divergent,
+    /// More than one row claims the identity, which no repair can resolve safely.
+    Ambiguous,
+}
+
+fn classify_duplicate_owner(
+    target_rows: &[SnapshotRow],
+    source_row: &SnapshotRow,
+) -> DuplicateOwner {
+    match target_rows {
+        [] => DuplicateOwner::Absent,
+        [target_row] if target_row == source_row => DuplicateOwner::Equal,
+        [_] => DuplicateOwner::Divergent,
+        _ => DuplicateOwner::Ambiguous,
+    }
+}
+
 pub(crate) struct MySqlSyncRepairTarget {
     writer: TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
     fk_repair: Option<MySqlFkRepairContext>,
@@ -304,18 +332,23 @@ impl MySqlSyncRepairTarget {
             TableSyncError::Repair(format!("source inventory is missing table `{table_name}`"))
         })?;
         let mut missing = Vec::new();
+        let mut divergent = Vec::new();
         for source_row in rows {
             let identity = row_identity(table, source_row)?;
             let target_rows = context.target.read_exact_inventory_rows(table, &identity)?;
-            match target_rows.as_slice() {
-                [] => missing.push(source_row.clone()),
-                [target_row] if target_row == source_row => {}
-                _ => {
+            match classify_duplicate_owner(&target_rows, source_row) {
+                DuplicateOwner::Absent => missing.push(source_row.clone()),
+                DuplicateOwner::Equal => {}
+                DuplicateOwner::Divergent => divergent.push(source_row.clone()),
+                DuplicateOwner::Ambiguous => {
                     return Err(TableSyncError::Repair(format!(
-                        "concurrent duplicate owner diverges from source for `{table_name}` identity {identity:?}"
+                        "more than one target row owns identity {identity:?} on `{table_name}`"
                     )));
                 }
             }
+        }
+        for source_row in &divergent {
+            self.update_row(source_row)?;
         }
         if missing.len() == rows.len() {
             let reclaimed = self.reclaim_misfiled_duplicate_owners(rows, duplicate_error)?;
@@ -1005,6 +1038,62 @@ fn foreign_owned_duplicate_evidence(rows: &[SnapshotRow], duplicate_error: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stat_row(views: &str) -> SnapshotRow {
+        SnapshotRow {
+            primary_key: vec!["13553".to_string(), "views".to_string()],
+            values: [
+                ("comic_id".to_string(), Some("13553".to_string())),
+                ("statistic".to_string(), Some("views".to_string())),
+                ("value_365_days".to_string(), Some(views.to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    /// The observed production case: one row at the source primary key whose rolling counter moved on.
+    /// It is divergent, so the source image is applied; failing the run rejected a converging target.
+    #[test]
+    fn one_target_row_with_different_values_is_divergent() {
+        let source = stat_row("4895");
+        let target = stat_row("4891");
+
+        assert_eq!(
+            classify_duplicate_owner(&[target], &source),
+            DuplicateOwner::Divergent
+        );
+    }
+
+    #[test]
+    fn an_equal_target_row_needs_no_repair() {
+        let source = stat_row("4895");
+
+        assert_eq!(
+            classify_duplicate_owner(std::slice::from_ref(&source), &source),
+            DuplicateOwner::Equal
+        );
+    }
+
+    /// No row at the primary key means the duplicate is owned by a different one, so the row is still
+    /// missing and the misfiled-owner proof decides what happens next.
+    #[test]
+    fn no_target_row_leaves_the_source_row_missing() {
+        assert_eq!(
+            classify_duplicate_owner(&[], &stat_row("4895")),
+            DuplicateOwner::Absent
+        );
+    }
+
+    #[test]
+    fn more_than_one_owner_is_ambiguous_and_fails_closed() {
+        let source = stat_row("4895");
+
+        assert_eq!(
+            classify_duplicate_owner(&[stat_row("4891"), stat_row("4892")], &source),
+            DuplicateOwner::Ambiguous
+        );
+    }
 
     fn identity(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
