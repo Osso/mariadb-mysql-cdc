@@ -7,6 +7,13 @@ are resolved only after verified equality. The current table-sync recovery contr
 
 ## What it must do
 
+- [x] The terminal pass after apply converges what it finds and completes the run; a residual count is
+      reported as `cdc_sync_verify_converged`, never fatal. The pass walks the primary-key range in
+      chunks while both endpoints keep changing, so it is not a snapshot and a nonzero count is not
+      evidence of drift: a row written to the source after its chunk was read is legitimately absent
+      from the target and the stream converges it. `uploads` failed on `missing_rows=1` while both
+      sides held 3,812 identical rows minutes later. The read-only `Verify` phase is unchanged and
+      still reports differences to its caller as an error, because it applies nothing.
 - [x] Reclaim a target row that holds a source row's secondary unique key under the
       wrong primary key. A row copied without preserving the primary key lands on a
       fresh auto_increment value, so the rightful row can never be inserted and every

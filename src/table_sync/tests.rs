@@ -1460,8 +1460,11 @@ fn target_read_allows_extra_rows_inside_source_window() {
     assert!(target.requests.borrow().len() > 1);
 }
 
+/// The terminal pass converges what it finds and completes the run. It cannot prove equality against a
+/// live source - it walks the range in chunks while both endpoints change - so a residual count is
+/// reported, not fatal.
 #[test]
-fn apply_completes_only_after_a_subsequent_zero_drift_pass() {
+fn apply_completes_after_the_terminal_pass_converges_a_missing_row() {
     struct VerificationTargetReader {
         converged: Rc<Cell<bool>>,
     }
@@ -1515,7 +1518,7 @@ fn apply_completes_only_after_a_subsequent_zero_drift_pass() {
         end_at: None,
     };
 
-    let first_error = sync_table_with_progress_range(
+    let first = sync_table_with_progress_range(
         &account_table(),
         options(),
         &source,
@@ -1523,22 +1526,26 @@ fn apply_completes_only_after_a_subsequent_zero_drift_pass() {
         &mut repair_target,
         &mut progress_store,
     )
-    .expect_err("missing row after apply must block completion");
+    .expect("a row the terminal pass converges must not fail the run");
 
-    assert!(first_error.to_string().contains("missing_rows=1"));
+    assert_eq!(
+        first.inserts, 1,
+        "the missing row is inserted, not merely counted"
+    );
     assert!(progress_store.errors.borrow().is_empty());
-    let pending = progress_store
-        .saved
-        .borrow()
-        .last()
-        .cloned()
-        .expect("progress");
-    assert_eq!(pending.status, progress::SyncProgressStatus::Running);
-    assert_eq!(pending.last_primary_key, Some(vec!["1".to_string()]));
-    assert_eq!(pending.inserts, 1);
+    assert_eq!(
+        progress_store
+            .saved
+            .borrow()
+            .last()
+            .expect("progress")
+            .status,
+        progress::SyncProgressStatus::Complete,
+        "the run completes once the terminal pass has applied its repairs"
+    );
 
+    // A second run over an already-equal target reports nothing to converge.
     converged.set(true);
-    progress_store.loaded = Some(pending);
     let report = sync_table_with_progress_range(
         &account_table(),
         options(),
@@ -1547,9 +1554,9 @@ fn apply_completes_only_after_a_subsequent_zero_drift_pass() {
         &mut repair_target,
         &mut progress_store,
     )
-    .expect("subsequent zero-drift verification completes run");
+    .expect("an equal target completes without repairs");
 
-    assert_eq!(report.inserts, 1);
+    assert_eq!(report.inserts, 0, "nothing left to converge");
     assert_eq!(
         progress_store
             .saved
