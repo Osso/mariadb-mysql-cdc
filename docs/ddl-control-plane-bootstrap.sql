@@ -16,6 +16,19 @@ CREATE TABLE IF NOT EXISTS cdc.row_conflicts (
     table_name VARCHAR(255) NOT NULL,
     operation VARCHAR(16) NOT NULL,
     source_primary_key_json TEXT NOT NULL,
+    source_row_identity CHAR(64) CHARACTER SET ascii COLLATE ascii_bin
+        GENERATED ALWAYS AS (
+            SHA2(CONCAT(
+                UNHEX(LPAD(HEX(LENGTH(source_identity)), 16, '0')),
+                CONVERT(source_identity USING binary),
+                UNHEX(LPAD(HEX(LENGTH(schema_name)), 16, '0')),
+                CONVERT(schema_name USING binary),
+                UNHEX(LPAD(HEX(LENGTH(table_name)), 16, '0')),
+                CONVERT(table_name USING binary),
+                UNHEX(LPAD(HEX(LENGTH(source_primary_key_json)), 16, '0')),
+                CONVERT(source_primary_key_json USING binary)
+            ), 256)
+        ) STORED NOT NULL,
     duplicate_index VARCHAR(255) NULL,
     duplicate_owner_primary_key_json TEXT NULL,
     error_code INT UNSIGNED NOT NULL,
@@ -27,7 +40,8 @@ CREATE TABLE IF NOT EXISTS cdc.row_conflicts (
     repair_run_id VARCHAR(255) NULL,
     resolution_evidence TEXT NULL,
     CHECK (status IN ('unresolved', 'resolved')),
-    PRIMARY KEY (conflict_identity)
+    PRIMARY KEY (conflict_identity),
+    KEY row_conflicts_source_row_status (source_row_identity, status)
 );
 
 CREATE TABLE IF NOT EXISTS cdc.stream_checkpoint (
@@ -60,6 +74,7 @@ BEFORE UPDATE ON cdc.row_conflicts
 FOR EACH ROW
 BEGIN
     IF NOT (OLD.conflict_identity <=> NEW.conflict_identity)
+       OR NOT (OLD.source_row_identity <=> NEW.source_row_identity)
        OR NOT (OLD.source_identity <=> NEW.source_identity)
        OR NOT (OLD.source_server_id <=> NEW.source_server_id)
        OR NOT (OLD.source_file <=> NEW.source_file)

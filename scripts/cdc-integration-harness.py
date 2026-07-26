@@ -84,6 +84,8 @@ SCENARIOS = (
     ScenarioSpec("reconciliation-owner-missing-guest", True),
     ScenarioSpec("failed-run-claim-post-revalidation-race", True),
     ScenarioSpec("row-conflict-rollback", True),
+    ScenarioSpec("row-conflict-source-row-migration", True),
+    ScenarioSpec("row-conflict-indexed-resolution", True),
     ScenarioSpec("durable-row-conflict-retry", True),
     ScenarioSpec("pre-state-drift", True),
     ScenarioSpec("coordinate-reuse", True),
@@ -3074,6 +3076,135 @@ class Harness:
             raise HarnessError(f"claim-race owner did not repair target row: {target_row!r}")
         print(f"failed_run_claim_post_revalidation_race_ok states={final_states!r}")
 
+    def run_row_conflict_source_row_migration(self) -> None:
+        assert self.target
+        self.admin_sql(self.target, "DROP TRIGGER cdc.row_conflicts_update_guard;")
+        self.admin_sql(
+            self.target,
+            "ALTER TABLE cdc.row_conflicts "
+            "DROP INDEX row_conflicts_source_row_status, "
+            "DROP COLUMN source_row_identity;",
+        )
+        conflict_identity = self.conflict_identity(
+            "binlog.000001", 4, "accounts", ["1"], operation="insert"
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO cdc.row_conflicts "
+            "(conflict_identity,source_identity,source_server_id,source_file,"
+            "source_start_position,source_end_position,schema_name,table_name,operation,"
+            "source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json,"
+            "error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status) "
+            f"VALUES ({sql_literal(conflict_identity)},{sql_literal(SOURCE_IDENTITY)},101,"
+            "'binlog.000001',4,8,'globalcomix','accounts','insert','[\"1\"]',"
+            "NULL,NULL,1062,'legacy conflict',1,1,1,'unresolved');",
+        )
+        self.admin_sql_file(
+            self.target,
+            self.repo / "docs/row-conflicts-source-row-identity-migration.sql",
+        )
+        expected_identity = self.source_row_identity("accounts", ["1"])
+        migrated = self.admin_query(
+            self.target,
+            "SELECT source_row_identity FROM cdc.row_conflicts "
+            "WHERE conflict_identity=" + sql_literal(conflict_identity) + ";",
+        ).strip()
+        if migrated != expected_identity:
+            raise HarnessError(
+                f"source-row migration backfill mismatch: expected={expected_identity} actual={migrated}"
+            )
+        index_columns = self.admin_query(
+            self.target,
+            "SELECT column_name FROM information_schema.statistics "
+            "WHERE table_schema='cdc' AND table_name='row_conflicts' "
+            "AND index_name='row_conflicts_source_row_status' ORDER BY seq_in_index;",
+        ).strip()
+        if index_columns != "source_row_identity\nstatus":
+            raise HarnessError(f"source-row migration index mismatch: {index_columns!r}")
+        self.assert_admin_sql_rejected(
+            self.target,
+            "UPDATE cdc.row_conflicts SET source_identity='mutated' "
+            f"WHERE conflict_identity={sql_literal(conflict_identity)};",
+            "row conflict identity is immutable",
+        )
+        print(
+            "row-conflict-source-row-migration_ok existing_rows_backfilled=true "
+            "lookup_index=true identity_immutable=true"
+        )
+
+    def run_row_conflict_indexed_resolution(self) -> None:
+        assert self.source and self.target
+        self.setup_accounts_table()
+        equal_row = "INSERT INTO accounts VALUES (1, 'same@example.test', 'same');"
+        self.admin_sql(self.target, equal_row)
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        conflict_identity = self.conflict_identity(
+            start.file, start.position, "accounts", ["1"], operation="insert"
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO cdc.row_conflicts "
+            "(conflict_identity,source_identity,source_server_id,source_file,"
+            "source_start_position,source_end_position,schema_name,table_name,operation,"
+            "source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json,"
+            "error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status) "
+            f"VALUES ({sql_literal(conflict_identity)},{sql_literal(SOURCE_IDENTITY)},101,"
+            f"{sql_literal(start.file)},{start.position},{start.position},'globalcomix',"
+            "'accounts','insert','[\"1\"]','PRIMARY',NULL,1062,'existing debt',1,1,1,'unresolved');",
+        )
+        source_row_identity = self.source_row_identity("accounts", ["1"])
+        lookup_sql = (
+            "SELECT 1 FROM cdc.row_conflicts "
+            f"WHERE source_row_identity={sql_literal(source_row_identity)} "
+            f"AND source_identity={sql_literal(SOURCE_IDENTITY)} "
+            "AND schema_name='globalcomix' AND table_name='accounts' "
+            "AND source_primary_key_json='[\"1\"]' AND status='unresolved' LIMIT 1"
+        )
+        plan = self.admin_query(self.target, f"EXPLAIN {lookup_sql};").strip().split("\t")
+        if len(plan) < 7 or plan[6] != "row_conflicts_source_row_status":
+            raise HarnessError(f"source-row lookup did not use its exact index: {plan!r}")
+        collision_lookup = lookup_sql.replace(
+            sql_literal(SOURCE_IDENTITY), sql_literal("other-source"), 1
+        )
+        if self.query(
+            self.target,
+            f"{collision_lookup};",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip():
+            raise HarnessError("source-row hash lookup bypassed exact collision predicates")
+        self.admin_sql(self.source, equal_row)
+        stop = self.coordinate()
+        result = self.run_stream(start, stop, insert_conflict_policy="ignore-duplicate")
+        output = f"{result.stdout}\n{result.stderr}".lower()
+        if result.returncode != 0 or "cdc_row_conflict_skipped" not in output:
+            raise HarnessError(f"indexed conflict resolution replay failed: {output}")
+        resolution = self.admin_query(
+            self.target,
+            "SELECT source_row_identity,status,COALESCE(repair_run_id,''),"
+            "COALESCE(resolution_evidence,'') FROM cdc.row_conflicts "
+            f"WHERE conflict_identity={sql_literal(conflict_identity)};",
+        ).strip().split("\t", 3)
+        if (
+            len(resolution) != 4
+            or resolution[0] != source_row_identity
+            or resolution[1] != "resolved"
+            or not resolution[2]
+            or not resolution[3]
+        ):
+            raise HarnessError(f"indexed source-row debt did not resolve: {resolution!r}")
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint.get("source_file") != stop.file
+            or int(checkpoint.get("source_position", 0)) != stop.position
+        ):
+            raise HarnessError(f"indexed source-row replay did not checkpoint: {checkpoint}")
+        print(
+            "row-conflict-indexed-resolution_ok lookup_index=true "
+            "collision_defended=true resolved_after_commit=true"
+        )
+
     def run_row_conflict_rollback(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
@@ -3186,7 +3317,6 @@ class Harness:
         ).strip().splitlines()
         if evidence != ['["2"]\t2\tunresolved', '["3"]\t1\tunresolved']:
             raise HarnessError(f"different-PK evidence was not isolated: {evidence!r}")
-
         for endpoint in (self.source, self.target):
             self.admin_sql(endpoint, "DROP TABLE IF EXISTS constraint_rows;")
         self.admin_sql(
@@ -4652,6 +4782,19 @@ class Harness:
         encoded = b"".join(struct.pack(">Q", len(field)) + field for field in fields)
         return hashlib.sha256(encoded).hexdigest()
 
+    def source_row_identity(self, table: str, primary_key: list[str]) -> str:
+        import hashlib
+        import struct
+
+        fields = [
+            SOURCE_IDENTITY.encode(),
+            APP_SCHEMA.encode(),
+            table.encode(),
+            json.dumps(primary_key, separators=(",", ":")).encode(),
+        ]
+        encoded = b"".join(struct.pack(">Q", len(field)) + field for field in fields)
+        return hashlib.sha256(encoded).hexdigest()
+
     def run_bootstrap_contract(self) -> None:
         assert self.target
         self._assert_target_grants()
@@ -4831,6 +4974,10 @@ class Harness:
             self.run_failed_run_claim_post_revalidation_race()
         elif scenario == "row-conflict-rollback":
             self.run_row_conflict_rollback()
+        elif scenario == "row-conflict-source-row-migration":
+            self.run_row_conflict_source_row_migration()
+        elif scenario == "row-conflict-indexed-resolution":
+            self.run_row_conflict_indexed_resolution()
         elif scenario == "durable-row-conflict-retry":
             self.run_durable_row_conflict_retry()
         elif scenario == "pre-state-drift":

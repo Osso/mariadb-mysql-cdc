@@ -189,6 +189,14 @@ conflicting secondary key. Implementation detail for superseded release proofs:
 - [x] Replay the same source event into the same identity and increment its
       attempt count; a different source primary key creates a separate identity.
 - [x] Keep generated columns out of row writes.
+- [x] Derive a stored lowercase ASCII SHA-256 `source_row_identity` from the
+      canonical length-prefixed tuple of source identity, schema, table, and
+      complete source primary-key JSON. Index that identity with conflict status
+      so successful row replay never scans the ledger to find existing debt.
+- [x] Look up unresolved source-row debt with the canonical identity plus the
+      complete source identity, schema, table, and primary-key JSON as collision
+      defenses, stopping after the first exact match. Coordinate and operation
+      remain part of `conflict_identity`, but not source-row resolution identity.
 - [x] Provide a durable conflict-record schema/library contract containing source
       identity/server/file/start/end, schema/table/operation, source PK,
       duplicate index/owner when available, error code/text, first/last observed
@@ -235,17 +243,24 @@ inventory-driven FK parent repair and exact post-write child verification; the
 
 `cdc.row_conflicts` is bootstrapped by the admin DDL file and is never created by
 runtime code. Startup validates the exact columns, nullability/defaults,
-ASCII SHA-256 `conflict_identity` primary key, unresolved/resolved status CHECK,
-insert/update guards, and effective privileges before opening the source stream.
+ASCII SHA-256 `conflict_identity` primary key, the stored generated
+`source_row_identity` expression and `(source_row_identity, status)` index,
+unresolved/resolved status CHECK, insert/update guards, and effective privileges
+before opening the source stream. The one-time transition runs only while stream
+and repair writers are stopped; adding the stored generated column backfills
+existing rows from immutable ledger fields before the new index becomes usable.
 Trigger metadata is read only through the SQL SECURITY DEFINER, READS SQL DATA
 procedure `cdc.row_conflicts_trigger_inventory`; runtime calls that exact
 procedure and validates its returned trigger rows before streaming. Admin/resolver
 bootstrap separately reviews `SHOW CREATE PROCEDURE` and the direct trigger rows.
-The identity is lowercase SHA-256 over an ordered, length-prefixed tuple of
-`source_identity`, server ID, binlog file, start position, schema, table,
-operation, and the complete source primary-key JSON. All identity fields remain
-stored. Conflict-observation UPSERTs compare every hashed field; a mismatch fails via
-the immutable-identity guard instead of merging a theoretical hash collision.
+The conflict identity is lowercase SHA-256 over an ordered, length-prefixed tuple
+of `source_identity`, server ID, binlog file, start position, schema, table,
+operation, and the complete source primary-key JSON. The separate source-row
+identity uses the same framing over `source_identity`, schema, table, and primary-key
+JSON. All identity fields remain stored. Conflict-observation UPSERTs compare
+every conflict-identity field; source-row resolution queries use the indexed hash
+only to select candidates and retain every unhashed field as an exact collision
+defense. A mismatch therefore cannot resolve another source row.
 
 The runtime grant is exact table scope: `SELECT, INSERT, UPDATE` only, plus
 `EXECUTE` on the exact inventory procedure. Separately, the reviewed application
@@ -330,7 +345,13 @@ XID target commit and checkpoint advancement, successful replacement without
 creating a ledger row, and a replacement CHECK failure rolling back target DML
 without advancing the checkpoint. The harness does not inject a
 crash between target commit and process completion; that crash boundary remains
-unproven. The `row-conflict-rollback` scenario passes
+unproven. The `row-conflict-source-row-migration` scenario applies the one-time transition
+to an existing populated ledger and proves generated backfill, exact index shape,
+and guard immutability. The `row-conflict-indexed-resolution` scenario proves on
+real MySQL that the exact unresolved-row lookup selects the source-row/status
+index, rejects a hash candidate with different unhashed source identity, resolves
+existing evidence only after successful replay commit, and advances the
+checkpoint. The `row-conflict-rollback` scenario passes
 `--insert-conflict-policy ignore-duplicate` for an equal same-primary-key
 `ROW INSERT`, and asserts that the target transaction succeeds, the checkpoint
 advances to the event end, and no unresolved ledger row exists for that source

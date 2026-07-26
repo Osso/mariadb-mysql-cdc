@@ -191,6 +191,17 @@ pub struct ConflictResolution {
     pub evidence: String,
 }
 
+impl ConflictResolution {
+    pub fn source_row_identity(&self) -> String {
+        source_row_identity(
+            &self.source_identity,
+            &self.schema,
+            &self.table,
+            &self.source_primary_key,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConflictObservation {
     pub source_identity: String,
@@ -210,6 +221,15 @@ pub struct ConflictObservation {
 }
 
 impl ConflictObservation {
+    pub fn source_row_identity(&self) -> String {
+        source_row_identity(
+            &self.source_identity,
+            &self.schema,
+            &self.table,
+            &self.source_primary_key,
+        )
+    }
+
     pub fn key(&self) -> ConflictKey {
         ConflictKey {
             source_identity: self.source_identity.clone(),
@@ -230,7 +250,28 @@ impl ConflictObservation {
 const CONFLICT_IDENTITY_HEX_LENGTH: usize = 64;
 
 pub fn conflict_identity(key: &ConflictKey) -> String {
-    let digest = Sha256::digest(canonical_conflict_identity_input(key));
+    sha256_identity(canonical_conflict_identity_input(key))
+}
+
+pub fn source_row_identity(
+    source_identity: &str,
+    schema: &str,
+    table: &str,
+    source_primary_key: &[String],
+) -> String {
+    let source_primary_key_json =
+        serde_json::to_vec(source_primary_key).expect("source primary key is serializable");
+    let fields: &[&[u8]] = &[
+        source_identity.as_bytes(),
+        schema.as_bytes(),
+        table.as_bytes(),
+        &source_primary_key_json,
+    ];
+    sha256_identity(canonical_length_prefixed_input(fields))
+}
+
+fn sha256_identity(input: Vec<u8>) -> String {
+    let digest = Sha256::digest(input);
     let mut identity = String::with_capacity(CONFLICT_IDENTITY_HEX_LENGTH);
     for byte in digest {
         use std::fmt::Write;
@@ -240,21 +281,44 @@ pub fn conflict_identity(key: &ConflictKey) -> String {
 }
 
 pub fn validate_conflict_identity(identity: &str, key: &ConflictKey) -> Result<(), String> {
-    if identity.len() != CONFLICT_IDENTITY_HEX_LENGTH
-        || !identity
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(format!(
-            "invalid conflict identity encoding: expected {CONFLICT_IDENTITY_HEX_LENGTH} lowercase ASCII hex characters"
-        ));
-    }
+    validate_sha256_identity_encoding(identity, "conflict identity")?;
     let expected = key.conflict_identity();
     if identity == expected {
         Ok(())
     } else {
         Err(format!(
             "conflict identity mismatch: stored {identity}, expected {expected}"
+        ))
+    }
+}
+
+pub fn validate_source_row_identity(
+    identity: &str,
+    source_identity: &str,
+    schema: &str,
+    table: &str,
+    source_primary_key: &[String],
+) -> Result<(), String> {
+    validate_sha256_identity_encoding(identity, "source row identity")?;
+    let expected = source_row_identity(source_identity, schema, table, source_primary_key);
+    if identity == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "source row identity mismatch: stored {identity}, expected {expected}"
+        ))
+    }
+}
+
+fn validate_sha256_identity_encoding(identity: &str, name: &str) -> Result<(), String> {
+    let is_lowercase_hex = identity
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if identity.len() == CONFLICT_IDENTITY_HEX_LENGTH && is_lowercase_hex {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid {name} encoding: expected {CONFLICT_IDENTITY_HEX_LENGTH} lowercase ASCII hex characters"
         ))
     }
 }
@@ -277,6 +341,10 @@ fn canonical_conflict_identity_input(key: &ConflictKey) -> Vec<u8> {
         operation.as_bytes(),
         &source_primary_key_json,
     ];
+    canonical_length_prefixed_input(fields)
+}
+
+fn canonical_length_prefixed_input(fields: &[&[u8]]) -> Vec<u8> {
     let mut encoded = Vec::new();
     for field in fields {
         encoded.extend_from_slice(&(field.len() as u64).to_be_bytes());

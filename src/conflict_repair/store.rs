@@ -283,6 +283,10 @@ impl MySqlConflictStore {
             &mut conn, schema, table,
         )?)
         .map_err(conflict_validation_error)?;
+        validate_source_row_identity_definition(&query_source_row_identity_definition(
+            &mut conn, schema, table,
+        )?)
+        .map_err(conflict_validation_error)?;
         validate_conflict_keys(&query_conflict_keys(&mut conn, schema, table)?)
             .map_err(conflict_validation_error)?;
         validate_conflict_constraints(&query_conflict_constraints(&mut conn, schema, table)?)
@@ -341,7 +345,7 @@ impl MySqlConflictStore {
         table: Option<&str>,
     ) -> Result<(), String> {
         let mut query = format!(
-            "SELECT conflict_identity,source_identity,source_server_id,source_file,source_start_position,schema_name,table_name,operation,source_primary_key_json FROM {} WHERE status='unresolved'",
+            "SELECT conflict_identity,source_row_identity,source_identity,source_server_id,source_file,source_start_position,schema_name,table_name,operation,source_primary_key_json FROM {} WHERE status='unresolved'",
             self.table
         );
         if let Some(source_identity) = source_identity {
@@ -386,6 +390,19 @@ fn query_identity_definition(
     )).map_err(conflict_mysql_error)?.ok_or_else(|| "conflict identity column definition is missing".to_string())
 }
 
+fn query_source_row_identity_definition(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+) -> Result<SourceRowIdentityDefinition, String> {
+    conn.query_first(format!(
+        "SELECT LOWER(COALESCE(character_set_name,'')),LOWER(COALESCE(collation_name,'')),generation_expression FROM information_schema.columns WHERE table_schema={} AND table_name={} AND column_name='source_row_identity'",
+        quote_sql_literal(schema), quote_sql_literal(table),
+    ))
+    .map_err(conflict_mysql_error)?
+    .ok_or_else(|| "source row identity column definition is missing".to_string())
+}
+
 fn query_conflict_keys(
     conn: &mut Conn,
     schema: &str,
@@ -425,16 +442,17 @@ impl ConflictStore for MySqlConflictStore {
             .map_err(|error| format!("conflict primary key serialization failed: {error}"))?;
         self.conn
             .borrow_mut()
-            .query_first::<u64, _>(format!(
-                "SELECT COUNT(*) FROM {} WHERE source_identity={} AND schema_name={} AND table_name={} AND source_primary_key_json={} AND status='unresolved'",
+            .query_first::<u8, _>(format!(
+                "SELECT 1 FROM {} WHERE source_row_identity={} AND source_identity={} AND schema_name={} AND table_name={} AND source_primary_key_json={} AND status='unresolved' LIMIT 1",
                 self.table,
+                quote_sql_literal(&resolution.source_row_identity()),
                 quote_sql_literal(&resolution.source_identity),
                 quote_sql_literal(&resolution.schema),
                 quote_sql_literal(&resolution.table),
                 quote_sql_literal(&primary_key_json),
             ))
             .map_err(conflict_mysql_error)
-            .map(|count| count.unwrap_or(0) > 0)
+            .map(|row| row.is_some())
     }
 
     fn ensure(&mut self) -> Result<(), String> {

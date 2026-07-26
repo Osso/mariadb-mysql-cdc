@@ -305,14 +305,58 @@ fn conflict_identity_schema_is_compact_and_unprefixed() {
     assert_eq!(columns[0].1, "char(64)");
     let keys = expected_conflict_keys();
     assert_eq!(
-        keys,
-        vec![(
+        keys[0],
+        (
             "PRIMARY".to_string(),
             0,
             1,
             "conflict_identity".to_string(),
             None,
-        )]
+        )
+    );
+}
+
+#[test]
+fn conflict_schema_requires_indexed_source_row_identity() {
+    let columns = expected_conflict_columns();
+    assert_eq!(
+        columns
+            .iter()
+            .find(|column| column.0 == "source_row_identity")
+            .expect("source row identity column"),
+        &(
+            "source_row_identity".to_string(),
+            "char(64)".to_string(),
+            "NO".to_string(),
+            "<null>".to_string(),
+            "stored generated".to_string(),
+        )
+    );
+    assert_eq!(
+        expected_conflict_keys(),
+        vec![
+            (
+                "PRIMARY".to_string(),
+                0,
+                1,
+                "conflict_identity".to_string(),
+                None,
+            ),
+            (
+                "row_conflicts_source_row_status".to_string(),
+                1,
+                1,
+                "source_row_identity".to_string(),
+                None,
+            ),
+            (
+                "row_conflicts_source_row_status".to_string(),
+                1,
+                2,
+                "status".to_string(),
+                None,
+            ),
+        ]
     );
 }
 
@@ -352,6 +396,44 @@ fn mutated_conflict_identity_is_rejected() {
     let mut mutated = observation.key();
     mutated.table = "other_accounts".to_string();
     assert!(validate_conflict_identity(&identity, &mutated).is_err());
+}
+
+#[test]
+fn source_row_identity_ignores_event_identity_but_isolates_source_rows() {
+    let first = test_conflict("accounts", "1");
+    let mut same_row = first.clone();
+    same_row.source_server_id += 1;
+    same_row.coordinate.file = "other-binlog".into();
+    same_row.coordinate.start_position += 10;
+    same_row.operation = ConflictOperation::Update;
+    assert_eq!(first.source_row_identity(), same_row.source_row_identity());
+
+    same_row.source_primary_key = vec!["2".into()];
+    assert_ne!(first.source_row_identity(), same_row.source_row_identity());
+    same_row = first.clone();
+    same_row.source_identity = "other-source".into();
+    assert_ne!(first.source_row_identity(), same_row.source_row_identity());
+    same_row = first.clone();
+    same_row.schema = "other_schema".into();
+    assert_ne!(first.source_row_identity(), same_row.source_row_identity());
+    same_row = first.clone();
+    same_row.table = "other_accounts".into();
+    assert_ne!(first.source_row_identity(), same_row.source_row_identity());
+}
+
+#[test]
+fn accepts_mysql_source_row_identity_generation_expression() {
+    let definition = (
+        "ascii".to_string(),
+        "ascii_bin".to_string(),
+        "sha2(concat(unhex(lpad(hex(length(`source_identity`)),16,_latin1\\'0\\')),convert(`source_identity` using binary),unhex(lpad(hex(length(`schema_name`)),16,_latin1\\'0\\')),convert(`schema_name` using binary),unhex(lpad(hex(length(`table_name`)),16,_latin1\\'0\\')),convert(`table_name` using binary),unhex(lpad(hex(length(`source_primary_key_json`)),16,_latin1\\'0\\')),convert(`source_primary_key_json` using binary)),256)".to_string(),
+    );
+    validate_source_row_identity_definition(&definition)
+        .expect("MySQL normalized generation expression");
+
+    let mut wrong = definition;
+    wrong.2 = wrong.2.replace("table_name", "schema_name");
+    assert!(validate_source_row_identity_definition(&wrong).is_err());
 }
 
 #[test]
@@ -479,6 +561,28 @@ fn conflict_resolution_sql_has_guarded_resolution_fields() {
     assert!(sql.contains("status='unresolved'"));
     assert!(sql.contains("repair_run_id"));
     assert!(sql.contains("resolution_evidence"));
+}
+
+#[test]
+fn source_row_resolution_uses_canonical_identity_and_exact_collision_guard() {
+    let resolution = ConflictResolution {
+        source_identity: "source-a".into(),
+        schema: "globalcomix".into(),
+        table: "accounts".into(),
+        source_primary_key: vec!["1".into()],
+        repair_run_id: "repair-1".into(),
+        evidence: "verified".into(),
+    };
+
+    let sql = build_conflict_resolution_for_source_row_sql("cdc.row_conflicts", &resolution);
+
+    assert!(sql.contains(
+        "source_row_identity='baf8a9d5f0a3a73572a16ebced65c51b92a720dd0cd1de3a29cec93e40e55e5c'"
+    ));
+    assert!(sql.contains("source_identity='source-a'"));
+    assert!(sql.contains("schema_name='globalcomix'"));
+    assert!(sql.contains("table_name='accounts'"));
+    assert!(sql.contains("source_primary_key_json='[\"1\"]'"));
 }
 
 #[test]

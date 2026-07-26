@@ -56,6 +56,7 @@ enum ConflictResolutionScope<'a> {
         row_table: &'a str,
     },
     SourceSchemaTableRow {
+        source_row_identity: String,
         source_identity: &'a str,
         schema: &'a str,
         row_table: &'a str,
@@ -103,16 +104,17 @@ fn build_conflict_resolution_update_sql(
 fn build_conflict_scope_sql(scope: ConflictResolutionScope<'_>) -> String {
     match scope {
         ConflictResolutionScope::SourceSchemaTableRow {
+            source_row_identity,
             source_identity,
             schema,
             row_table,
             primary_key_json,
-        } => format!(
-            "source_identity={} AND schema_name={} AND table_name={} AND source_primary_key_json={}",
-            sql_literal(source_identity),
-            sql_literal(schema),
-            sql_literal(row_table),
-            sql_literal(&primary_key_json),
+        } => build_source_schema_table_row_scope_sql(
+            &source_row_identity,
+            source_identity,
+            schema,
+            row_table,
+            &primary_key_json,
         ),
         ConflictResolutionScope::Table {
             source_identity,
@@ -137,6 +139,23 @@ fn build_conflict_scope_sql(scope: ConflictResolutionScope<'_>) -> String {
             )
         }
     }
+}
+
+fn build_source_schema_table_row_scope_sql(
+    source_row_identity: &str,
+    source_identity: &str,
+    schema: &str,
+    row_table: &str,
+    primary_key_json: &str,
+) -> String {
+    format!(
+        "source_row_identity={} AND source_identity={} AND schema_name={} AND table_name={} AND source_primary_key_json={}",
+        sql_literal(source_row_identity),
+        sql_literal(source_identity),
+        sql_literal(schema),
+        sql_literal(row_table),
+        sql_literal(primary_key_json),
+    )
 }
 
 pub fn build_conflict_table_resolution_sql(
@@ -166,6 +185,7 @@ pub fn build_conflict_resolution_for_source_row_sql(
         &resolution.repair_run_id,
         &resolution.evidence,
         ConflictResolutionScope::SourceSchemaTableRow {
+            source_row_identity: resolution.source_row_identity(),
             source_identity: &resolution.source_identity,
             schema: &resolution.schema,
             row_table: &resolution.table,
