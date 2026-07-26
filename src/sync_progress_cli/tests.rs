@@ -48,10 +48,7 @@ fn parses_progress_config_with_source_scoped_checkpoint_and_counts() {
     assert_eq!(config.progress_table, "cdc.table_sync_progress");
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
     assert_eq!(config.run_id.as_deref(), Some("repair-20260710-01"));
-    assert_eq!(
-        config.source_identity.as_deref(),
-        Some("production-source")
-    );
+    assert_eq!(config.source_identity.as_deref(), Some("production-source"));
 }
 
 #[test]
@@ -76,10 +73,7 @@ fn parses_progress_config_without_source_or_checkpoint_file() {
 
     assert_eq!(config.progress_table, "cdc.table_sync_progress");
     assert_eq!(config.checkpoint_table, "cdc.stream_checkpoint");
-    assert_eq!(
-        config.source_identity.as_deref(),
-        Some("production-source")
-    );
+    assert_eq!(config.source_identity.as_deref(), Some("production-source"));
     assert_eq!(config.source.host, "");
 }
 

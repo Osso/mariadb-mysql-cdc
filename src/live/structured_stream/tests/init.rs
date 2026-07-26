@@ -129,8 +129,7 @@ fn source_inventory_uses_explicit_plaintext_without_ca() {
 fn target_inventory_keeps_tls_ca_for_verified_connection() {
     let config = ApplyBinlogConfig {
         target: TargetMySqlConfig {
-            host: "target-mysql.internal.example"
-                .to_string(),
+            host: "target-mysql.internal.example".to_string(),
             port: 25060,
             user: "target_user".to_string(),
             password: "secret".to_string(),

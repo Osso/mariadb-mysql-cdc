@@ -409,12 +409,7 @@ fn fixture_create_table_rejects_present_target_without_execution_or_checkpoint()
     let BinlogEvent::QueryEvent(query) = &event else {
         unreachable!("fixture CREATE TABLE query event");
     };
-    let ddl_event = ddl_event(
-        "production-source",
-        "mysqld-bin.000777",
-        &header,
-        query,
-    );
+    let ddl_event = ddl_event("production-source", "mysqld-bin.000777", &header, query);
     let error = prepare_and_execute_automatic_ddl(
         &mut applier,
         &journal,
