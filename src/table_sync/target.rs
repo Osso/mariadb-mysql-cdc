@@ -178,7 +178,12 @@ enum DuplicateOwner {
     /// source: `comics_top_stats` differed only in the rolling `value_365_days`, 4895 against 4891, at
     /// the same primary key and the same update_time. Applying the source image converges it.
     Divergent,
-    /// More than one row claims the identity, which no repair can resolve safely.
+    /// More than one row claims the identity.
+    ///
+    /// Unreachable while the schemas agree: the read is by primary key, MySQL enforces its uniqueness,
+    /// the catalog rejects a table whose source has no primary key, and `schemas_are_compatible`
+    /// requires the target's primary key to equal the source's. This arm is defence against a target
+    /// whose primary key no longer covers those columns, which the `LIMIT 2` read exists to detect.
     Ambiguous,
 }
 
@@ -1086,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn more_than_one_owner_is_ambiguous_and_fails_closed() {
+    fn more_than_one_owner_is_ambiguous_even_though_a_primary_key_read_cannot_return_two() {
         let source = stat_row("4895");
 
         assert_eq!(

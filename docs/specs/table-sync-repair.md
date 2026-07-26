@@ -12,7 +12,9 @@ are resolved only after verified equality. The current table-sync recovery contr
       between the comparison and the insert - or a mutable column moved on, which is routine against a
       live source: `comics_top_stats` differed only in the rolling `value_365_days`, 4895 against 4891,
       at the same primary key and the same `update_time`. No row at that primary key leaves the row
-      missing so the misfiled-owner proof decides; more than one row owning the identity fails closed.
+      missing so the misfiled-owner proof decides. More than one row owning the identity fails
+      closed, and is unreachable while the schemas agree: the read is by primary key, whose
+      uniqueness MySQL enforces and whose equality across endpoints the catalog already requires.
 - [x] The terminal pass after apply converges what it finds and completes the run; a residual count is
       reported as `cdc_sync_verify_converged`, never fatal. The pass walks the primary-key range in
       chunks while both endpoints keep changing, so it is not a snapshot and a nonzero count is not
