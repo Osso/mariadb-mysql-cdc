@@ -59,7 +59,7 @@ Commands:
   table-catalog
           Write deterministic syncable and non-syncable table catalogs ordered by estimated source rows.
   sync-catalog
-          Apply a syncable table catalog with dependency ordering and four total sync slots.
+          Apply a syncable table catalog with dependency ordering and sixteen total sync slots.
   sync-schema
           Converge selected target tables to the translated source schema; --all-tables true selects every source base table.
   drift-check

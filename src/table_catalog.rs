@@ -16,7 +16,13 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-const MAX_CATALOG_CONCURRENCY: usize = 8;
+/// Table-sync slots per target server.
+///
+/// Workers are latency-bound, not resource-bound: each sustains roughly 139 rows/s against a
+/// 10,000-row chunk, while both endpoints sit idle - source and target `Threads_running` of 4 and 2
+/// with no query older than a second. Raising the cap buys throughput from round-trip time that was
+/// otherwise spent waiting, and the queue is long enough that every slot fills immediately.
+const MAX_CATALOG_CONCURRENCY: usize = 16;
 const DEFAULT_CHUNK_SIZE: usize = 10_000;
 const DB_TIMEOUT: Duration = Duration::from_secs(30);
 const RESERVATION_SESSION_WAIT_TIMEOUT_SECONDS: u64 = 86_400;
