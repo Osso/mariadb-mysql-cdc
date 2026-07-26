@@ -129,8 +129,6 @@ identity matching stops immediately.
 
 - `docs/checkpoints.md` documents current checkpoint storage.
 - `docs/design.md` documents overall CDC architecture.
-- `docs/live-migration-log.md` records observed production stream behavior and
-  incidents.
 
 ## Implementation inventory
 
