@@ -21,6 +21,7 @@ pub struct SyncTableConfig {
 pub struct SyncTable {
     pub name: String,
     pub primary_key: Vec<String>,
+    #[serde(skip_serializing_if = "primary_key_ordering_is_native")]
     pub primary_key_ordering: Vec<SyncPrimaryKeyOrdering>,
     pub columns: Vec<String>,
 }
@@ -30,6 +31,12 @@ pub struct SyncTable {
 pub enum SyncPrimaryKeyOrdering {
     Native,
     Enum(Vec<String>),
+}
+
+fn primary_key_ordering_is_native(ordering: &[SyncPrimaryKeyOrdering]) -> bool {
+    ordering
+        .iter()
+        .all(|entry| *entry == SyncPrimaryKeyOrdering::Native)
 }
 
 pub(crate) fn primary_key_ordering_from_inventory(

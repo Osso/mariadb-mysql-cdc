@@ -38,7 +38,8 @@ are resolved only after verified equality. The current table-sync recovery contr
       column's ordering from source inventory. Native columns retain database
       ordering; ENUM columns use the declaration order consistently in `ORDER BY`
       and cursor bounds. Reject unknown ENUM bound labels and run specifications
-      whose persisted ordering disagrees with current source inventory.
+      whose persisted ENUM ordering disagrees with current source inventory. Omit
+      all-native ordering from run JSON so existing native-key runs remain resumable.
 - [x] Report missing source rows, divergent rows, and target extras.
 - [x] Apply divergent rows in bounded primary-key update batches, with at most
       128 rows per SQL statement, further split to stay under MySQL's

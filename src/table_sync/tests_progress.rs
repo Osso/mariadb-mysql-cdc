@@ -1020,6 +1020,32 @@ fn rejects_unknown_enum_primary_key_bound() {
 }
 
 #[test]
+fn native_primary_key_ordering_keeps_legacy_run_spec_shape() {
+    let table = account_table();
+    let run_spec = build_run_spec_json("scope", &table, 1000, SyncMode::Apply, &None, &None)
+        .expect("serialize native run spec");
+
+    assert!(!run_spec.contains("primary_key_ordering"));
+}
+
+#[test]
+fn enum_primary_key_ordering_is_persisted_in_run_spec() {
+    let table = SyncTable {
+        name: "comics_top_stats".to_string(),
+        primary_key: vec!["comic_id".to_string(), "statistic".to_string()],
+        primary_key_ordering: vec![
+            SyncPrimaryKeyOrdering::Native,
+            SyncPrimaryKeyOrdering::Enum(vec!["views".to_string(), "loved".to_string()]),
+        ],
+        columns: vec!["comic_id".to_string(), "statistic".to_string()],
+    };
+    let run_spec = build_run_spec_json("scope", &table, 1000, SyncMode::Apply, &None, &None)
+        .expect("serialize ENUM run spec");
+
+    assert!(run_spec.contains("primary_key_ordering"));
+}
+
+#[test]
 fn builds_sync_select_with_updated_since_filter() {
     let sql = build_sync_select_sql(&SyncChunkRequest {
         table: "accounts".to_string(),
