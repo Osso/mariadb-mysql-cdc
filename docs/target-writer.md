@@ -76,10 +76,16 @@ source parents, compares target parents, inserts missing parents or updates
 divergent parents, verifies each parent exactly, then retries only the failed
 schema-dependent writer subbatch (capped at 128 rows and reduced by prepared-statement placeholder capacity). Nullable FK values are skipped. A concurrent
 `1062` is reconciled by rereading the affected target rows: complete equality
-with the source is accepted, while a divergent owner fails closed. After a
-child insert, parent-retry, or update batch, every affected child row is
-reread by primary key and compared exactly; only then may the caller checkpoint
-the source chunk.
+with the source is accepted, while a divergent owner fails closed. When an
+absent parent insert hits a secondary-unique owner under another primary key,
+table-sync may restore that owner to its exact source row, reread the restored
+owner, and retry the parent insert. This requires exactly one target owner, a
+different primary key, one source row at that owner identity, and a different
+source unique value; primary, unknown, absent, ambiguous, rightful, or
+unverifiable owners fail closed, and retries are bounded by the table's unique
+index count. After a child insert, parent-retry, or update batch, every affected
+child row is reread by primary key and compared exactly; only then may the
+caller checkpoint the source chunk.
 
 The `sync-table --updated-since` path uses an upsert.
 
