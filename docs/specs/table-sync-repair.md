@@ -59,7 +59,9 @@ are resolved only after verified equality. The current table-sync recovery contr
       the table and immutable-specification scope; compatibility and uniqueness
       are revalidated in a per-transaction `REPEATABLE READ` selection
       transaction with `FOR UPDATE` candidate reads before marking it running,
-      and ambiguity fails closed without reclaiming a run.
+      and ambiguity fails closed without reclaiming a run. A run created before an
+      immutable specification field is added or changed is not resumable under the
+      new specification; use a fresh run ID after rebuilding the table configuration.
 - [x] Persist run-scoped progress in `cdc.table_sync_runs` by default and reject
       concurrent use of the same run ID with a target named lock.
 - [x] For an existing run-progress table, validate the full 16-column contract
