@@ -69,8 +69,9 @@ Qualifier handling is fail-closed outside the identity-scoped source-only
 procedure CREATE form. Tokenization removes comments from syntax but
 preserves identifier/dot/identifier detection across inline comments; index
 parsing rejects any comment outright. Backticks and ANSI_QUOTES double-quoted
-identifiers are not admitted when their mode is unavailable, except where an
-allowlisted body requires them. Trigger `ON` and index `ON` references are
+identifiers are not admitted when their mode is unavailable, except for the
+private exact-hash source-only procedure admission. Trigger `ON` and index `ON`
+references are
 qualified checks, not automatic exceptions.
 
 ## Automatic journal

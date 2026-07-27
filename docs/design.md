@@ -46,9 +46,11 @@ event-coordinate fences, persisted in evidence, rendered explicitly, and checked
 against target absence before and after capture plus the exact observed post-state;
 canonical table evidence sorts indexes by index name. The production-observed
 source-only `CREATE PROCEDURE` form is admitted only for unqualified routine
-identity `apply_release_move_purchase_repair` with the observed `DEFINER` and
-body/header shape. Admission precedes generic qualified-identifier rejection
-because that source statement contains qualified tokens. Target evidence must
+identity `apply_release_move_purchase_repair` through a private exact-hash
+allowlist. Public documentation intentionally omits raw production procedure
+bodies, `DEFINER` hosts, and event coordinates. Admission precedes generic
+qualified-identifier rejection because that source statement contains qualified
+tokens. Target evidence must
 prove the routine absent before and after, no target SQL runs, and later source
 ROW/FULL events carry data effects in source order. An existing
 `translation_pending` row promotes automatically after identity/header admission.

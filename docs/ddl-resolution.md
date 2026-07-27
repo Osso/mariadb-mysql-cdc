@@ -13,14 +13,16 @@ rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
 `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, named composite `ADD KEY`
 or `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS`
 with ASCII-case-insensitive target matching, one emitted drop per matched target spelling, and absent or repeated case-variant no-ops; the source-only
-`CREATE PROCEDURE` statements matching either admitted hash for the exact routine
-identity `apply_release_move_purchase_repair`; the generic exact
+`CREATE PROCEDURE` statements matching either private exact hash for the exact
+routine identity `apply_release_move_purchase_repair`; public documentation
+omits raw production procedure bodies, `DEFINER` hosts, and event coordinates;
+the generic exact
 unqualified, unquoted `DROP PROCEDURE IF EXISTS <identifier>` form; and the
 exact unqualified, unquoted plain `DROP PROCEDURE apply_release_move_purchase_repair`
 form; plus the existing `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator
 slice. The source-only CREATE admission occurs before generic
-qualified-identifier rejection because its observed statement contains qualified
-`DEFINER` and body tokens. Every other body, name, qualified, quoted, commented,
+qualified-identifier rejection because the admitted statement contains qualified
+tokens. Every other body, name, qualified, quoted, commented,
 other plain-name, or routine DDL variant remains unsupported.
 Every other DDL form enters the same journal as `translation_pending`; no operator-authored
 target SQL is accepted as a resolution path.

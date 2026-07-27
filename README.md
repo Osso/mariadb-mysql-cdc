@@ -28,9 +28,11 @@ comments/double quotes/qualification rejected, one or more `BIGINT` or
 `VARCHAR(positive canonical decimal length)` `NOT NULL` columns with at least one
 inline `PRIMARY KEY`, zero or more one-column named ordinary `KEY` items, and
 `ENGINE=InnoDB` with an optional semicolon; production-observed source-only `CREATE PROCEDURE` form for the exact
-unqualified routine identity `apply_release_move_purchase_repair`, with the
-observed `DEFINER` and body shape. Admission occurs before the generic
-qualified-identifier check because that source statement contains qualified
+unqualified routine identity `apply_release_move_purchase_repair`, admitted only
+by a private exact-hash allowlist. Public documentation intentionally omits raw
+production procedure bodies, `DEFINER` hosts, and event coordinates. Admission
+occurs before the generic qualified-identifier check because that source
+statement contains qualified
 tokens. The target routine must be absent before and after evidence capture, no
 target SQL runs, and later ROW/FULL events carry data effects in source order;
 the
