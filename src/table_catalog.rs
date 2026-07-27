@@ -509,8 +509,19 @@ fn run_sync_catalog(config: &SyncCatalogConfig) -> Result<(), String> {
 fn read_syncable_catalog(path: &Path) -> Result<SyncableCatalog, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| format!("failed to decode {}: {error}", path.display()))
+    let catalog: SyncableCatalog = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to decode {}: {error}", path.display()))?;
+    for table in &catalog.tables {
+        if table.primary_key_ordering.len() != table.primary_key.len() {
+            return Err(format!(
+                "catalog table `{}` has {} primary_key_ordering entries for {} primary-key columns; regenerate the catalog",
+                table.name,
+                table.primary_key_ordering.len(),
+                table.primary_key.len()
+            ));
+        }
+    }
+    Ok(catalog)
 }
 
 fn ensure_progress_table(config: &SyncCatalogConfig) -> Result<(), String> {
@@ -2845,6 +2856,24 @@ mod tests {
         assert_eq!(run_id, format!("catalog-v2-{tagged_digest:x}"));
         assert_ne!(run_id, format!("catalog-v2-{untagged_digest:x}"));
         assert_eq!(run_id.len(), 75);
+    }
+
+    #[test]
+    fn legacy_catalog_without_primary_key_ordering_is_rejected() {
+        let directory = unique_catalog_test_directory("legacy-ordering");
+        fs::create_dir_all(&directory).expect("create catalog test directory");
+        let path = directory.join("syncable.json");
+        fs::write(
+            &path,
+            r#"{"tables":[{"name":"accounts","primary_key":["id"],"columns":["id"],"estimated_source_rows":1,"parent_dependencies":[]}]}"#,
+        )
+        .expect("write legacy catalog");
+
+        let error = read_syncable_catalog(&path)
+            .expect_err("catalog without primary-key ordering must be regenerated");
+
+        assert!(error.contains("primary_key_ordering"));
+        fs::remove_dir_all(directory).expect("remove catalog test directory");
     }
 
     #[test]
