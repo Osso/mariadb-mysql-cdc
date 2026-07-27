@@ -146,6 +146,22 @@ fn owner_is_misfiled(
 }
 
 /// The named columns of a row as (column, value) pairs, in the order given.
+fn duplicate_index_name(duplicate_error: &str) -> Result<String, String> {
+    let index = crate::target::duplicate_index_from_error(duplicate_error)
+        .ok_or_else(|| format!("duplicate error has no index name: {duplicate_error}"))?;
+    let index = index.rsplit('.').next().unwrap_or(&index).to_string();
+    if index.eq_ignore_ascii_case("PRIMARY") {
+        return Err("cannot restore a stale owner for a PRIMARY duplicate".to_string());
+    }
+    Ok(index)
+}
+
+fn rows_match_columns(left: &SnapshotRow, right: &SnapshotRow, columns: &[String]) -> bool {
+    columns
+        .iter()
+        .all(|column| left.values.get(column) == right.values.get(column))
+}
+
 fn column_identity(
     table: &TableInventory,
     row: &SnapshotRow,
@@ -503,25 +519,27 @@ impl ParentRepairStore for MySqlParentRepairStore<'_> {
     }
 
     fn repair_parent(&mut self, row: &ParentRepairRow) -> Result<(), String> {
-        let table = self.table(&row.table)?;
-        let snapshot_row = parent_snapshot_row(table, row)?;
+        let table = self.table(&row.table)?.clone();
+        let snapshot_row = parent_snapshot_row(&table, row)?;
         let target_rows = self
             .context
             .target
             .read_exact_inventory_rows(
-                table,
-                &row_identity(table, &snapshot_row).map_err(|e| e.to_string())?,
+                &table,
+                &row_identity(&table, &snapshot_row).map_err(|e| e.to_string())?,
             )
             .map_err(|error| error.to_string())?;
         let parent_writer = TargetMySqlWriter::from_snapshot_table(
-            &SnapshotTable::from(table),
+            &SnapshotTable::from(&table),
             self.writer.executor.clone(),
             SnapshotInsertMode::Insert,
         );
         match target_rows.as_slice() {
-            [] => parent_writer
-                .insert_rows(std::slice::from_ref(&snapshot_row))
-                .map_err(|error| error.to_string()),
+            [] => self.insert_parent_after_restoring_stale_unique_owners(
+                &table,
+                &parent_writer,
+                &snapshot_row,
+            ),
             [_] => parent_writer
                 .update_row(&snapshot_row)
                 .map_err(|error| error.to_string()),
@@ -540,6 +558,157 @@ impl MySqlParentRepairStore<'_> {
             .tables
             .get(table)
             .ok_or_else(|| format!("source inventory is missing parent table `{table}`"))
+    }
+
+    fn insert_parent_after_restoring_stale_unique_owners(
+        &mut self,
+        table: &TableInventory,
+        parent_writer: &TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
+        source_parent: &SnapshotRow,
+    ) -> Result<(), String> {
+        let restore_limit = self
+            .context
+            .unique_indexes
+            .get(&table.name)
+            .map_or(0, Vec::len);
+        for _ in 0..=restore_limit {
+            match parent_writer.insert_rows(std::slice::from_ref(source_parent)) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.mysql_code() == Some(1062) => {
+                    self.restore_stale_unique_owner(table, source_parent, &error.to_string())?;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err(format!(
+            "target parent insert for `{}` exceeded the unique-owner restore limit",
+            table.name
+        ))
+    }
+
+    fn restore_stale_unique_owner(
+        &mut self,
+        table: &TableInventory,
+        source_parent: &SnapshotRow,
+        duplicate_error: &str,
+    ) -> Result<(), String> {
+        let index = duplicate_index_name(duplicate_error)?;
+        let key_columns = self.unique_index_columns(table, &index)?;
+        let key_identity = column_identity(table, source_parent, key_columns)
+            .map_err(|error| error.to_string())?;
+        let target_owner = self.read_unique_owner(table, &key_identity)?;
+        if target_owner.primary_key == source_parent.primary_key {
+            return Err(format!(
+                "target parent primary key already owns duplicate index `{index}` on `{}`",
+                table.name
+            ));
+        }
+        let owner_identity =
+            row_identity(table, &target_owner).map_err(|error| error.to_string())?;
+        let source_owner = self.read_source_owner(table, &owner_identity)?;
+        if rows_match_columns(&source_owner, source_parent, key_columns) {
+            return Err(format!(
+                "source agrees target owner {:?} owns duplicate index `{index}` on `{}`",
+                target_owner.primary_key, table.name
+            ));
+        }
+
+        self.restore_owner_row(table, &owner_identity, &source_owner)?;
+        println!(
+            "cdc_stale_unique_owner_restored table={} index={} owner_primary_key={:?} \
+             desired_primary_key={:?}",
+            table.name, index, target_owner.primary_key, source_parent.primary_key
+        );
+        Ok(())
+    }
+
+    fn unique_index_columns<'b>(
+        &'b self,
+        table: &TableInventory,
+        index: &str,
+    ) -> Result<&'b [String], String> {
+        self.context
+            .unique_indexes
+            .get(&table.name)
+            .and_then(|indexes| {
+                indexes
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(index))
+            })
+            .map(|(_, columns)| columns.as_slice())
+            .ok_or_else(|| format!("unknown duplicate index `{index}` on `{}`", table.name))
+    }
+
+    fn read_unique_owner(
+        &self,
+        table: &TableInventory,
+        identity: &[(String, String)],
+    ) -> Result<SnapshotRow, String> {
+        Self::read_exact_owner(&self.context.target, table, identity, "target")
+    }
+
+    fn read_source_owner(
+        &self,
+        table: &TableInventory,
+        identity: &[(String, String)],
+    ) -> Result<SnapshotRow, String> {
+        Self::read_exact_owner(&self.context.source, table, identity, "source")
+    }
+
+    fn read_exact_owner(
+        reader: &MySqlSyncReader,
+        table: &TableInventory,
+        identity: &[(String, String)],
+        endpoint: &str,
+    ) -> Result<SnapshotRow, String> {
+        let owners = reader
+            .read_exact_inventory_rows(table, identity)
+            .map_err(|error| error.to_string())?;
+        let [owner] = owners.as_slice() else {
+            return Err(format!(
+                "identity {identity:?} on `{}` has {} {endpoint} owners",
+                table.name,
+                owners.len()
+            ));
+        };
+        Ok(owner.clone())
+    }
+
+    fn restore_owner_row(
+        &self,
+        table: &TableInventory,
+        identity: &[(String, String)],
+        source_owner: &SnapshotRow,
+    ) -> Result<(), String> {
+        let owner_writer = TargetMySqlWriter::from_snapshot_table(
+            &SnapshotTable::from(table),
+            self.writer.executor.clone(),
+            SnapshotInsertMode::Insert,
+        );
+        owner_writer
+            .update_row(source_owner)
+            .map_err(|error| error.to_string())?;
+        self.verify_restored_owner(table, identity, source_owner)
+    }
+
+    fn verify_restored_owner(
+        &self,
+        table: &TableInventory,
+        identity: &[(String, String)],
+        source_owner: &SnapshotRow,
+    ) -> Result<(), String> {
+        let restored = self
+            .context
+            .target
+            .read_exact_inventory_rows(table, identity)
+            .map_err(|error| error.to_string())?;
+        if restored.as_slice() == std::slice::from_ref(source_owner) {
+            return Ok(());
+        }
+        Err(format!(
+            "target owner identity {identity:?} on `{}` did not match source after restore",
+            table.name
+        ))
     }
 
     fn read_parent(

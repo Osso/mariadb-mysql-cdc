@@ -86,6 +86,12 @@ are resolved only after verified equality. The current table-sync recovery contr
       parent before retrying the original child batch. An absent target parent
       is inserted; a divergent target parent is updated; an equal target parent
       is left unchanged; repeated identities are repaired once per batch.
+- [x] When an absent parent insert hits a secondary-unique owner under another
+      primary key, restore that owner to its exact source row before retrying the
+      parent insert. Require one target owner, a different primary key, one source
+      row at the owner's primary key, a different source unique value, and an exact
+      post-update reread. Bound retries by the table's unique-index count; PRIMARY,
+      unknown, absent, ambiguous, rightful, or unverifiable owners fail closed.
 - [x] Treat nullable FK values as having no parent to repair. Missing source
       parents, malformed identities, ambiguous target identities, and dependency
       cycles remain explicit repair errors.

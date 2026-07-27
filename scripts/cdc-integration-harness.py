@@ -46,6 +46,7 @@ class ScenarioSpec:
 SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
     ScenarioSpec("sync-table-fk-parent-repair", True),
+    ScenarioSpec("sync-table-fk-parent-stale-unique-owner", True),
     ScenarioSpec("sync-table-update-fk-parent-repair", True),
     ScenarioSpec("sync-table-fk-parent-concurrent-duplicate", True),
     ScenarioSpec("sync-table-wide-update-fk-retry", True),
@@ -4171,6 +4172,96 @@ class Harness:
             f"operation={operation} parent_first=true child_retried=true"
         )
 
+    def run_sync_table_fk_parent_stale_unique_owner(self) -> None:
+        assert self.source and self.target
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "DROP TABLE IF EXISTS favorites; DROP TABLE IF EXISTS users; "
+                "CREATE TABLE users ("
+                "id INT UNSIGNED NOT NULL PRIMARY KEY, "
+                "email VARCHAR(255) NULL UNIQUE, "
+                "name VARCHAR(255) NULL UNIQUE, "
+                "is_deleted TINYINT(1) NOT NULL, "
+                "UNIQUE KEY uq_users_id_name (id, name)"
+                ") ENGINE=InnoDB; "
+                "CREATE TABLE favorites ("
+                "id INT UNSIGNED NOT NULL PRIMARY KEY, "
+                "user_id INT UNSIGNED NOT NULL, "
+                "user_name VARCHAR(255) NOT NULL, "
+                "CONSTRAINT fk_favorites_user FOREIGN KEY (user_id, user_name) "
+                "REFERENCES users(id, name)"
+                ") ENGINE=InnoDB;",
+            )
+        self.admin_sql(
+            self.source,
+            "INSERT INTO users VALUES "
+            "(1, 'deleted-1@example.test', 'deleted-user-1', 1), "
+            "(2, 'live@example.test', 'LiveUser', 0); "
+            "INSERT INTO favorites VALUES (10, 2, 'LiveUser');",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO users VALUES (1, 'live@example.test', 'StaleOwner', 0);",
+        )
+        binary = self._repair_binary()
+        args = self._sync_table_args(binary)
+        args[args.index("accounts")] = "favorites"
+        args[args.index("id,email,payload")] = "id,user_id,user_name"
+        args[args.index("sync-table-source-ca-proof")] = (
+            "sync-table-fk-parent-stale-unique-owner"
+        )
+        args[args.index("globalcomix.sync_table_tls_progress")] = (
+            "globalcomix.table_sync_runs"
+        )
+        args.extend([
+            "--mode", "apply", "--chunk-size", "1",
+            "--start-after", "9", "--end-at", "10",
+        ])
+        result = run(
+            args,
+            cwd=self.repo,
+            env={
+                **os.environ,
+                "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            },
+            timeout=180,
+            check=False,
+        )
+        require_success(result, "sync-table stale unique parent owner repair")
+        parents = self.query(
+            self.target,
+            "SELECT id,email,name,is_deleted FROM users ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        child = self.query(
+            self.target,
+            "SELECT id,user_id,user_name FROM favorites WHERE id=10;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        progress = self.admin_query(
+            self.target,
+            "SELECT status,last_primary_key_json FROM globalcomix.table_sync_runs "
+            "WHERE run_id='sync-table-fk-parent-stale-unique-owner';",
+        ).strip()
+        expected_parents = (
+            "1\tdeleted-1@example.test\tdeleted-user-1\t1\n"
+            "2\tlive@example.test\tLiveUser\t0"
+        )
+        if parents != expected_parents:
+            raise HarnessError(f"stale unique owner did not converge: {parents!r}")
+        if child != "10\t2\tLiveUser":
+            raise HarnessError(f"child did not converge after parent displacement: {child!r}")
+        if progress != 'complete\t["10"]':
+            raise HarnessError(f"progress advanced without exact convergence: {progress!r}")
+        print(
+            "sync_table_fk_parent_stale_unique_owner_ok "
+            "owner_restored=true desired_parent_inserted=true child_retried=true"
+        )
+
     def run_sync_table_fk_parent_concurrent_duplicate(self) -> None:
         assert self.source and self.target
         for divergent in (False, True):
@@ -4907,6 +4998,8 @@ class Harness:
             self.run_strict_secondary_btree()
         elif scenario == "sync-table-fk-parent-repair":
             self.run_sync_table_fk_parent_repair()
+        elif scenario == "sync-table-fk-parent-stale-unique-owner":
+            self.run_sync_table_fk_parent_stale_unique_owner()
         elif scenario == "sync-table-update-fk-parent-repair":
             self.run_sync_table_fk_parent_repair(update_existing_child=True)
         elif scenario == "sync-table-fk-parent-concurrent-duplicate":

@@ -66,6 +66,12 @@ fn real_sync_table_fk_parent_repair_converges_after_1452() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_sync_table_fk_parent_reconciles_stale_unique_owner() {
+    run_harness_scenario("sync-table-fk-parent-stale-unique-owner");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_sync_table_update_repairs_fk_parent_after_1452() {
     let output = Command::new("python3")
         .arg(harness_script())
