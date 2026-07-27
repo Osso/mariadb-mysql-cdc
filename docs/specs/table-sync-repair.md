@@ -103,6 +103,12 @@ are resolved only after verified equality. The current table-sync recovery contr
       parent before retrying the original child batch. An absent target parent
       is inserted; a divergent target parent is updated; an equal target parent
       is left unchanged; repeated identities are repaired once per batch.
+- [x] Prove which direct parents are already converged in one keyed read per
+      parent table per side before recursing. Confirming an equal parent per
+      identity cost one source read plus one target read, both round-trip bound,
+      which an insert-heavy table paid for every row. Only unambiguous
+      single-row matches count as converged, so absent and ambiguous parents
+      still reach the per-identity path and raise their exact errors.
 - [x] When an absent parent insert hits a secondary-unique owner under another
       primary key, restore that owner to its exact source row before retrying the
       parent insert. Require one target owner, a different primary key, one source
