@@ -166,6 +166,33 @@ impl MySqlSyncReader {
         parse_sync_rows(&columns, &table.primary_key, self.query_rows(&sql)?)
     }
 
+    /// Reads every stored row matching one of `identities` in a single round-trip.
+    ///
+    /// Verification is round-trip bound, not query bound: a one-row primary-key lookup against the
+    /// managed target costs the same as `SELECT 1`. Reading one identity per statement therefore
+    /// capped repair throughput at one row per round-trip independent of table size.
+    ///
+    /// Cardinality is preserved rather than limited to one row per identity, so a caller can still
+    /// reject a duplicated identity instead of accepting the first row.
+    pub(crate) fn read_exact_inventory_rows_batch(
+        &self,
+        table: &crate::inventory::TableInventory,
+        identities: &[Vec<(String, String)>],
+    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let columns = inventory_stored_columns(table);
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} LIMIT {}",
+            quote_ident_list(&columns),
+            quote_ident(&table.name),
+            batch_identity_predicate(identities)?,
+            identities.len().saturating_mul(2)
+        );
+        parse_sync_rows(&columns, &table.primary_key, self.query_rows(&sql)?)
+    }
+
     /// Reads the rows owning a referenced foreign-key identity in any parent table.
     ///
     /// Cardinality is preserved up to the collision limit so the planner can reject an ambiguous
@@ -541,6 +568,46 @@ fn enum_field_expression(value: &str, labels: &[String]) -> String {
     format!("FIELD({value}, {labels})")
 }
 
+/// Builds a row-constructor `IN` predicate covering every identity in the batch.
+///
+/// Every identity must name the same columns in the same order, which `row_identity` guarantees by
+/// walking the table's primary key. A disagreement means the caller mixed tables, so fail closed
+/// rather than emit a predicate that silently matches the wrong rows.
+fn batch_identity_predicate(
+    identities: &[Vec<(String, String)>],
+) -> Result<String, TableSyncError> {
+    let Some(first) = identities.first() else {
+        return Err(TableSyncError::Repair(
+            "batch identity predicate needs at least one identity".to_string(),
+        ));
+    };
+    let columns = first
+        .iter()
+        .map(|(column, _)| column.clone())
+        .collect::<Vec<_>>();
+    for identity in identities {
+        let names = identity.iter().map(|(column, _)| column.as_str());
+        if !names.eq(columns.iter().map(String::as_str)) {
+            return Err(TableSyncError::Repair(
+                "batch identity columns disagree".to_string(),
+            ));
+        }
+    }
+    let tuples = identities
+        .iter()
+        .map(|identity| {
+            let values = identity
+                .iter()
+                .map(|(_, value)| quote_sql_literal(value))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("({values})")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!("({}) IN ({tuples})", quote_ident_list(&columns)))
+}
+
 fn quote_ident_list(columns: &[String]) -> String {
     columns
         .iter()
@@ -567,6 +634,69 @@ mod tests {
             "artist_id".to_string(),
             "name".to_string(),
         ]
+    }
+
+    fn identity(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(column, value)| (column.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn batch_identity_predicate_reads_every_single_column_identity_in_one_statement() {
+        let predicate = batch_identity_predicate(&[
+            identity(&[("id", "1")]),
+            identity(&[("id", "2")]),
+            identity(&[("id", "3")]),
+        ])
+        .expect("single-column batch predicate");
+
+        assert_eq!(predicate, "(`id`) IN (('1'),('2'),('3'))");
+    }
+
+    #[test]
+    fn batch_identity_predicate_keeps_composite_key_tuples_grouped() {
+        let predicate = batch_identity_predicate(&[
+            identity(&[("comic_id", "10279"), ("subscriber_id", "371917")]),
+            identity(&[("comic_id", "10280"), ("subscriber_id", "8835")]),
+        ])
+        .expect("composite batch predicate");
+
+        assert_eq!(
+            predicate,
+            "(`comic_id`, `subscriber_id`) IN (('10279','371917'),('10280','8835'))"
+        );
+    }
+
+    #[test]
+    fn batch_identity_predicate_escapes_quoted_identity_values() {
+        let predicate =
+            batch_identity_predicate(&[identity(&[("name", "O'Brien")])]).expect("escaped value");
+
+        assert_eq!(predicate, "(`name`) IN (('O''Brien'))");
+    }
+
+    #[test]
+    fn batch_identity_predicate_rejects_identities_naming_different_columns() {
+        let error = batch_identity_predicate(&[
+            identity(&[("id", "1")]),
+            identity(&[("comic_id", "1"), ("subscriber_id", "2")]),
+        ])
+        .expect_err("mixed identity columns must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("batch identity columns disagree")
+        );
+    }
+
+    #[test]
+    fn batch_identity_predicate_rejects_an_empty_batch() {
+        let error = batch_identity_predicate(&[]).expect_err("empty batch has no predicate");
+
+        assert!(error.to_string().contains("at least one identity"));
     }
 
     #[test]

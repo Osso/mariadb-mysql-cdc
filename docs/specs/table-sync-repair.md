@@ -46,6 +46,12 @@ are resolved only after verified equality. The current table-sync recovery contr
       prepared-statement placeholder limit; verify every updated row exactly
       afterward and persist run progress only after that verification succeeds,
       leaving a failed chunk uncheckpointed for retry.
+- [x] Read the whole batch's post-repair state in one primary-key
+      row-constructor `IN` statement, then match rows back by identity. Exact
+      verification is round-trip bound against a managed target, where a one-row
+      primary-key lookup costs the same as `SELECT 1`, so one read per row capped
+      repair at roughly one row per round-trip regardless of table size. A
+      missing, divergent, or duplicated identity remains a chunk failure.
 - [x] Apply missing rows in strict batched `INSERT` statements. Table-sync apply
       and missing-primary-key modes do not use `INSERT IGNORE`; `--updated-since`
       remains the explicit upsert path. Batch success is not inferred from the

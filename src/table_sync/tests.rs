@@ -796,6 +796,116 @@ fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
     );
 }
 
+/// One batched verification read returns every repaired row's target state interleaved, so a
+/// missing, divergent, or duplicated identity must still fail the chunk rather than be matched to
+/// another row's result.
+fn verification_table() -> crate::inventory::TableInventory {
+    crate::inventory::TableInventory {
+        name: "comics_subscriptions".to_string(),
+        table_type: "BASE TABLE".to_string(),
+        engine: Some("InnoDB".to_string()),
+        collation: None,
+        primary_key: vec!["comic_id".to_string(), "subscriber_id".to_string()],
+        columns: Vec::new(),
+    }
+}
+
+fn subscription(comic_id: &str, subscriber_id: &str, email: &str) -> SnapshotRow {
+    SnapshotRow {
+        primary_key: vec![comic_id.to_string(), subscriber_id.to_string()],
+        values: BTreeMap::from([
+            ("comic_id".to_string(), Some(comic_id.to_string())),
+            ("subscriber_id".to_string(), Some(subscriber_id.to_string())),
+            ("email".to_string(), Some(email.to_string())),
+        ]),
+    }
+}
+
+fn verify_batch(
+    source_rows: &[SnapshotRow],
+    target_rows: &[SnapshotRow],
+) -> Result<(), TableSyncError> {
+    let table = verification_table();
+    let borrowed = source_rows.iter().collect::<Vec<_>>();
+    let identities = borrowed
+        .iter()
+        .map(|row| {
+            table
+                .primary_key
+                .iter()
+                .map(|column| {
+                    (
+                        column.clone(),
+                        row.values
+                            .get(column)
+                            .and_then(Option::clone)
+                            .expect("fixture primary key"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    super::target::verify_batch_convergence(&table, &borrowed, &identities, target_rows, "update")
+}
+
+#[test]
+fn batched_verification_accepts_rows_returned_out_of_order() {
+    let first = subscription("10279", "371917", "a@example.com");
+    let second = subscription("10280", "8835", "b@example.com");
+
+    verify_batch(&[first.clone(), second.clone()], &[second, first])
+        .expect("interleaved target rows converge");
+}
+
+#[test]
+fn batched_verification_rejects_an_identity_absent_from_the_batched_read() {
+    let present = subscription("10279", "371917", "a@example.com");
+    let absent = subscription("10280", "8835", "b@example.com");
+
+    let error = verify_batch(&[present.clone(), absent], &[present])
+        .expect_err("a missing identity must fail the chunk");
+
+    assert!(
+        error.to_string().contains(
+            "post-update verification failed for `comics_subscriptions` identity [(\"comic_id\", \"10280\"), (\"subscriber_id\", \"8835\")]"
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn batched_verification_rejects_a_divergent_row_under_a_present_identity() {
+    let source = subscription("10279", "371917", "source@example.com");
+    let target = subscription("10279", "371917", "stale@example.com");
+
+    let error =
+        verify_batch(&[source], &[target]).expect_err("a divergent row must fail the chunk");
+
+    assert!(
+        error
+            .to_string()
+            .contains("post-update verification failed"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn batched_verification_rejects_a_duplicated_identity() {
+    let source = subscription("10279", "371917", "a@example.com");
+
+    let duplicated = [source.clone(), source.clone()];
+
+    let error = verify_batch(std::slice::from_ref(&source), &duplicated)
+        .expect_err("a duplicated identity must fail the chunk");
+
+    assert!(
+        error
+            .to_string()
+            .contains("post-update verification failed"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn failed_post_update_verification_does_not_advance_counters_or_cursor() {
     struct UpdateSucceedsWithoutConvergence;

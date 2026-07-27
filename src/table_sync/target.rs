@@ -322,16 +322,14 @@ impl MySqlSyncRepairTarget {
         let table = context.tables.get(table_name).ok_or_else(|| {
             TableSyncError::Repair(format!("source inventory is missing table `{table_name}`"))
         })?;
-        for source_row in rows {
-            let identity = row_identity(table, source_row)?;
-            let target_rows = context.target.read_exact_inventory_rows(table, &identity)?;
-            if target_rows.len() != 1 || target_rows.first() != Some(*source_row) {
-                return Err(TableSyncError::Repair(format!(
-                    "post-{operation} verification failed for `{table_name}` identity {identity:?}"
-                )));
-            }
-        }
-        Ok(())
+        let identities = rows
+            .iter()
+            .map(|row| row_identity(table, row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let target_rows = context
+            .target
+            .read_exact_inventory_rows_batch(table, &identities)?;
+        verify_batch_convergence(table, rows, &identities, &target_rows, operation)
     }
 
     fn verify_child_rows(&self, rows: &[SnapshotRow]) -> Result<(), TableSyncError> {
@@ -787,6 +785,40 @@ fn parent_snapshot_row(
         primary_key,
         values: row.values.clone(),
     })
+}
+
+/// Fails closed unless every repaired row has exactly one equal row on the target.
+///
+/// One batched read replaces one read per row, so the rows arrive interleaved and must be matched
+/// back by identity. A missing, divergent, or duplicated identity is a verification failure, which
+/// leaves the chunk uncheckpointed for retry.
+pub(super) fn verify_batch_convergence(
+    table: &TableInventory,
+    rows: &[&SnapshotRow],
+    identities: &[Vec<(String, String)>],
+    target_rows: &[SnapshotRow],
+    operation: &str,
+) -> Result<(), TableSyncError> {
+    let mut rows_by_identity: BTreeMap<Vec<(String, String)>, Vec<&SnapshotRow>> = BTreeMap::new();
+    for target_row in target_rows {
+        rows_by_identity
+            .entry(row_identity(table, target_row)?)
+            .or_default()
+            .push(target_row);
+    }
+    for (identity, source_row) in identities.iter().zip(rows) {
+        let found = rows_by_identity
+            .get(identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if found.len() != 1 || found.first().copied() != Some(*source_row) {
+            return Err(TableSyncError::Repair(format!(
+                "post-{operation} verification failed for `{}` identity {identity:?}",
+                table.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn row_identity(
