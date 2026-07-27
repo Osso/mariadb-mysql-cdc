@@ -119,6 +119,8 @@ Catchup snapshot options:
 
 Sync table options:
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
+  --mode MODE                     apply (default), dry-run, or missing-primary-keys. dry-run reports the
+                                  same chunk and row counts as apply and writes nothing.
   --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
   --run-id ID                     Immutable repair run ID. Reuse only for interrupted runs; completed IDs are terminal.
   --start-after CSV               Primary-key lower bound for targeted sync-table repair.

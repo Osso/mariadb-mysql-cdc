@@ -59,7 +59,7 @@ fn default_sync_table_config() -> table_sync::SyncTableConfig {
             columns: Vec::new(),
         },
         chunk_size: 1000,
-        mode: table_sync::SyncMode::DryRun,
+        mode: table_sync::SyncMode::Apply,
         progress_table: "cdc.table_sync_runs".to_string(),
         run_id: String::new(),
         start_after: None,
@@ -363,7 +363,7 @@ mod tests {
         assert_eq!(config.table.primary_key, vec!["id"]);
         assert_eq!(config.table.columns, vec!["id", "slug", "title"]);
         assert_eq!(config.chunk_size, 1000);
-        assert_eq!(config.mode, table_sync::SyncMode::DryRun);
+        assert_eq!(config.mode, table_sync::SyncMode::Apply);
         assert_eq!(config.progress_table, "cdc.table_sync_runs");
         assert_eq!(config.run_id, "repair-20260710-01");
     }

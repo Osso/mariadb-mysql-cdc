@@ -54,6 +54,10 @@ are resolved only after verified equality. The current table-sync recovery contr
       verify target writes and deletions exactly, and persist its cursor and
       counters only after verification. An interrupted run resumes from the next
       uncommitted chunk; no global full-table delete preflight occurs.
+- [x] Default `--mode` to `apply`. A repair invocation that omits the flag must
+      repair. `dry-run` reports the same chunk and row counts as `apply` and
+      writes nothing, so a silent dry-run default records a `complete` run that
+      is indistinguishable from a real repair in `cdc.table_sync_runs`.
 - [x] Require `--run-id`; direct `sync-table` resumes only the exact interrupted
       run and rejects a completed ID. Apply-mode `repair-drift` InsertMissing may
       atomically claim one specification-identical failed missing-PK run within
