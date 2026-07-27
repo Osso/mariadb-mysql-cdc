@@ -18,7 +18,7 @@ target with minimal downtime.
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in
-the target. Automatic DDL admission currently has four narrow slices: an explicitly named,
+the target. Automatic DDL admission currently has five narrow slices: an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
 when every key part/option is modeled and the operation is proven not to support
 or depend on a foreign key; a strict unqualified fixture `CREATE TABLE` grammar
@@ -27,13 +27,26 @@ or depend on a foreign key; a strict unqualified fixture `CREATE TABLE` grammar
 comments/double quotes/qualification rejected, one or more `BIGINT` or
 `VARCHAR(positive canonical decimal length)` `NOT NULL` columns with at least one
 inline `PRIMARY KEY`, zero or more one-column named ordinary `KEY` items, and
-`ENGINE=InnoDB` with an optional semicolon; the
+`ENGINE=InnoDB` with an optional semicolon; production-observed source-only `CREATE PROCEDURE` form for the exact
+unqualified routine identity `apply_release_move_purchase_repair`, with the
+observed `DEFINER` and body shape. Admission occurs before the generic
+qualified-identifier check because that source statement contains qualified
+tokens. The target routine must be absent before and after evidence capture, no
+target SQL runs, and later ROW/FULL events carry data effects in source order;
+the
 production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type grammar
 `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
 quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
 rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
 `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options; named composite `ADD KEY` or `ADD UNIQUE KEY` clauses over
-ordinary columns; and `DROP COLUMN IF EXISTS`, which matches target column identifiers ASCII-case-insensitively, emits each matched target spelling once, and treats absent or repeated case-variant clauses as proven no-ops. The ALTER path records a typed clause AST and derives expected
+ordinary columns; and `DROP COLUMN IF EXISTS`, which matches target column identifiers ASCII-case-insensitively, emits each matched target spelling once, and treats absent or repeated case-variant clauses as proven no-ops. Two routine-drop forms are admitted: the generic exact unqualified, unquoted
+`DROP PROCEDURE IF EXISTS <identifier>` form, and the exact unqualified,
+unquoted plain `DROP PROCEDURE apply_release_move_purchase_repair` form.
+Target-local routine inventory determines the result: an existing routine emits
+deterministic MySQL `DROP PROCEDURE` using the target spelling backtick-quoted;
+an absent routine emits no target SQL as a proven no-op. Qualified, quoted,
+commented, and other plain-name procedure drops remain `translation_pending`
+barriers. The ALTER path records a typed clause AST and derives expected
 post-state by applying that AST to a fenced target pre-state, without requiring a
 live source head at the historical event coordinate. The rename slice uses target
 column pre-state, emits deterministic MySQL 8 SQL without `IF EXISTS`, treats
@@ -45,15 +58,20 @@ exact event-coordinate fences and persisted in immutable evidence; generated SQL
 renders them explicitly as `DEFAULT CHARACTER SET ... COLLATE ...`. The target
 must be absent before and after capture, and the exact observed post-state must
 match the deterministic expected post-state; canonical table evidence sorts
-indexes by index name. Unsupported CREATE variants remain `translation_pending`
-with no target execution or checkpoint advance.
+indexes by index name. The admitted source-only procedure form is a target no-op: target evidence must
+prove `apply_release_move_purchase_repair` absent before and after capture,
+target SQL remains absent, and any data effects arrive through subsequent source
+ROW/FULL events in source order. An existing `translation_pending` row promotes
+automatically after identity/header admission. Unsupported CREATE variants
+remain `translation_pending` with no target execution or checkpoint advance.
 
-Every other unsupported DDL form—other `CREATE TABLE` syntax, other `ALTER TABLE`, views, routines,
+Every other unsupported DDL form—other `CREATE TABLE` syntax, other `ALTER TABLE`, views, other routine DDL,
 events, triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP`, qualified or
 cross-schema references, comments, ambiguous quoting, incomplete syntax,
-definer/security clauses, MariaDB-only syntax, and multi-object/multi-statement
-forms—enters the same automatic journal as `translation_pending`. It stores the
-exact source identity/coordinates and raw SQL with sentinel
+other procedure bodies or names, other plain procedure drops, other definer/security
+clauses, MariaDB-only syntax, and multi-object/multi-statement forms—enters the same automatic journal
+as `translation_pending`. It stores the exact source identity/coordinates and raw
+SQL with sentinel
 `translator-unavailable`, NULL generated SQL, and empty transformation evidence.
 It flushes earlier DML and blocks checkpoint/overtake. The removed manual ledger
 is not part of runtime, configuration, bootstrap, grants, or the harness.

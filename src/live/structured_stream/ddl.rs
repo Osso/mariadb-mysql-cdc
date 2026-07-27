@@ -1,7 +1,8 @@
 use super::*;
 use crate::live::ddl_semantics::{
     DDL_TRANSFORMATION_VERSION, DdlTransformation, supports_drop_columns_if_exists,
-    supports_fixture_create_table, supports_rename_columns_if_exists,
+    supports_drop_procedure, supports_fixture_create_table, supports_rename_columns_if_exists,
+    supports_source_only_release_move_procedure_create,
 };
 use crate::target::SqlStatement;
 
@@ -410,23 +411,38 @@ pub(super) fn automatically_handled_ddl_event<'a>(
     let BinlogEvent::QueryEvent(query) = event else {
         return None;
     };
-    let operation = parse_ddl_operation(&query.sql_statement).ok();
-    let supports_transformation = supports_fixture_create_table(&query.sql_statement)
-        || supports_production_alter_table(&query.sql_statement)
-        || supports_drop_columns_if_exists(&query.sql_statement)
-        || supports_rename_columns_if_exists(&query.sql_statement);
-    let supports_automatic_operation = operation.as_ref().is_some_and(|operation| {
-        if operation.family == DdlFamily::Index {
-            supports_automatic_index_ddl(&query.sql_statement)
-        } else {
-            supports_automatic_semantic_recovery(operation)
-        }
-    });
+    let supports_source_only_procedure =
+        supports_source_only_release_move_procedure_create(&query.sql_statement);
+    automatically_handled_ddl_event_with_source_only_support(
+        source_identity,
+        current_file,
+        header,
+        event,
+        state,
+        supports_source_only_procedure,
+    )
+}
+
+pub(super) fn automatically_handled_ddl_event_with_source_only_support<'a>(
+    source_identity: &str,
+    current_file: &str,
+    header: &EventHeader,
+    event: &'a BinlogEvent,
+    state: &StructuredEventState,
+    supports_source_only_procedure: bool,
+) -> Option<(&'a mysql_cdc::events::query_event::QueryEvent, DdlEvent)> {
+    let BinlogEvent::QueryEvent(query) = event else {
+        return None;
+    };
+    let supports_transformation =
+        supports_ddl_transformation(&query.sql_statement, supports_source_only_procedure);
     let supported_by_runtime = supports_transformation
         || (crate::statement::is_automatically_handled_schema_change(&query.sql_statement)
-            && supports_automatic_operation);
+            && supports_automatic_ddl_operation(&query.sql_statement));
+    let contains_disallowed_qualification = !supports_source_only_procedure
+        && query_contains_qualified_identifier(&query.sql_statement);
     let can_handle_automatically = state.should_apply_schema(&query.database_name)
-        && !query_contains_qualified_identifier(&query.sql_statement)
+        && !contains_disallowed_qualification
         && supported_by_runtime;
     if !can_handle_automatically {
         return None;
@@ -435,6 +451,27 @@ pub(super) fn automatically_handled_ddl_event<'a>(
         query,
         ddl_event(source_identity, current_file, header, query),
     ))
+}
+
+fn supports_ddl_transformation(source_sql: &str, supports_source_only_procedure: bool) -> bool {
+    supports_fixture_create_table(source_sql)
+        || supports_production_alter_table(source_sql)
+        || supports_source_only_procedure
+        || supports_drop_procedure(source_sql)
+        || supports_drop_columns_if_exists(source_sql)
+        || supports_rename_columns_if_exists(source_sql)
+}
+
+fn supports_automatic_ddl_operation(source_sql: &str) -> bool {
+    parse_ddl_operation(source_sql)
+        .ok()
+        .is_some_and(|operation| {
+            if operation.family == DdlFamily::Index {
+                supports_automatic_index_ddl(source_sql)
+            } else {
+                supports_automatic_semantic_recovery(&operation)
+            }
+        })
 }
 
 pub(super) fn manual_ddl_event<'a>(

@@ -17,7 +17,7 @@ MariaDB and MySQL differ in SQL, metadata, and binlog behavior.
 Production streaming requires `binlog_format=ROW` and
 `binlog_row_image=FULL`. Row events apply by source primary key.
 
-Automatic DDL admission currently covers four narrow slices: explicitly named,
+Automatic DDL admission currently covers five narrow slices: explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX`
 with complete parsed options and no FK dependency; a strict unqualified fixture
 `CREATE TABLE` grammar (the harness exercises `accounts`) whose identifiers match
@@ -44,9 +44,21 @@ variants remain `translation_pending` with no target DDL or checkpoint advance. 
 admitted CREATE TABLE, source charset/collation are read between exact
 event-coordinate fences, persisted in evidence, rendered explicitly, and checked
 against target absence before and after capture plus the exact observed post-state;
-canonical table evidence sorts indexes by index name. Unsupported CREATE variants
-remain `translation_pending` with no target execution or checkpoint advance. The rename slice selects executable clauses from
-target pre-state and emits MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
+canonical table evidence sorts indexes by index name. The production-observed
+source-only `CREATE PROCEDURE` form is admitted only for unqualified routine
+identity `apply_release_move_purchase_repair` with the observed `DEFINER` and
+body/header shape. Admission precedes generic qualified-identifier rejection
+because that source statement contains qualified tokens. Target evidence must
+prove the routine absent before and after, no target SQL runs, and later source
+ROW/FULL events carry data effects in source order. An existing
+`translation_pending` row promotes automatically after identity/header admission.
+Other bodies, names, and routine DDL remain `translation_pending` barriers. The
+generic exact unqualified, unquoted `DROP PROCEDURE IF EXISTS <identifier>` form
+and the additional exact unqualified, unquoted plain
+`DROP PROCEDURE apply_release_move_purchase_repair` form are admitted. Target
+inventory determines deterministic drop versus proven no-op; qualified, quoted,
+commented, and other plain-name forms remain blocked.
+The rename slice selects executable clauses from target pre-state and emits MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
 `cdc.ddl_replay_journal` as `translation_pending` with sentinel/no evidence;
 translator availability promotes that same row once to `prepared`, after which
 generated SQL, postcondition evidence, and checkpointing proceed automatically.

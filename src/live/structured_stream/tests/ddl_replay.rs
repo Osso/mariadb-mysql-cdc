@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn admitted_source_only_release_move_procedure_bypasses_qualification_rejection() {
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE DEFINER=`service`@`example.invalid` PROCEDURE \
+            `apply_release_move_purchase_repair`() SELECT 1"
+            .to_string(),
+    });
+    let state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+
+    assert!(
+        automatically_handled_ddl_event_with_source_only_support(
+            "production-source",
+            "mysqld-bin.000777",
+            &event_header(2, 777),
+            &event,
+            &state,
+            true,
+        )
+        .is_some(),
+        "admitted source-only procedure must enter automatic replay"
+    );
+}
+
+#[test]
 fn source_query_ddl_is_replayed_as_checkpointed_statement() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;

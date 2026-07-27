@@ -13,9 +13,11 @@ mod tokenizer;
 mod transform;
 
 #[cfg(test)]
-pub(super) use canonical::build_fenced_create_table_evidence;
-#[cfg(test)]
 pub(super) use canonical::canonical_absent_state;
+#[cfg(test)]
+pub(super) use canonical::{
+    build_fenced_create_table_evidence, build_source_only_procedure_create_evidence,
+};
 pub use canonical::{
     build_semantic_evidence, observe_operation_state, supports_automatic_semantic_recovery,
 };
@@ -29,10 +31,11 @@ pub use parser::{parse_ddl_operation, supports_automatic_index_ddl};
 pub(super) use tokenizer::tokenize_ddl;
 pub use transform::{
     DDL_TRANSFORMATION_VERSION, DdlTransformation, render_modeled_index_ddl,
-    supports_drop_columns_if_exists, supports_fixture_create_table,
+    supports_drop_columns_if_exists, supports_drop_procedure, supports_fixture_create_table,
     supports_production_alter_table, supports_rename_columns_if_exists,
-    transform_drop_columns_if_exists, transform_generated_schema_ddl,
-    transform_production_alter_table, transform_rename_columns_if_exists,
+    supports_source_only_release_move_procedure_create, transform_drop_columns_if_exists,
+    transform_drop_procedure, transform_generated_schema_ddl, transform_production_alter_table,
+    transform_rename_columns_if_exists, transform_source_only_release_move_procedure_create,
 };
 
 pub trait DdlSemanticInventory {
@@ -81,6 +84,45 @@ impl LiveDdlSemanticInventory {
             inventory,
             table_runtime,
         })
+    }
+
+    fn read_target_inventory(&self) -> Result<crate::inventory::SchemaInventory, String> {
+        build_inventory(&self.target_schema, &self.target).map_err(|error| {
+            format!(
+                "failed to build target inventory for DDL transformation in {}: {error}",
+                self.target_schema
+            )
+        })
+    }
+
+    fn read_target_procedure_names(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .read_target_inventory()?
+            .routines
+            .into_iter()
+            .filter(|routine| routine.routine_type == "PROCEDURE")
+            .map(|routine| routine.name)
+            .collect())
+    }
+
+    fn read_target_column_names(&self, table_name: &str) -> Result<Vec<String>, String> {
+        self.read_target_inventory()?
+            .tables
+            .into_iter()
+            .find(|table| table.name == table_name)
+            .ok_or_else(|| {
+                format!(
+                    "target table {}.{table_name} is missing for DDL transformation",
+                    self.target_schema
+                )
+            })
+            .map(|table| {
+                table
+                    .columns
+                    .into_iter()
+                    .map(|column| column.name)
+                    .collect()
+            })
     }
 }
 
@@ -153,6 +195,12 @@ fn translate_ddl_with_provenance(
     if supports_fixture_create_table(sql) {
         return transform::transform_fixture_create_table(sql);
     }
+    if supports_source_only_release_move_procedure_create(sql) {
+        return transform_source_only_release_move_procedure_create(sql);
+    }
+    if supports_drop_procedure(sql) {
+        return transform_drop_procedure(sql, &target_columns.iter().cloned().collect());
+    }
     if supports_production_alter_table(sql) {
         return transform_production_alter_table(sql);
     }
@@ -170,37 +218,32 @@ fn translate_ddl_with_provenance(
     }
 }
 
+fn parse_semantic_operation(sql: &str) -> Result<DdlOperation, String> {
+    if supports_source_only_release_move_procedure_create(sql) {
+        return Ok(DdlOperation {
+            family: DdlFamily::Procedure,
+            object_kind: DdlObjectKind::Procedure,
+            primary_object: "apply_release_move_purchase_repair".to_string(),
+            secondary_object: None,
+            index_ast: None,
+            create_table_ast: None,
+            alter_table_ast: None,
+        });
+    }
+    parse_ddl_operation(sql)
+}
+
 impl DdlSemanticInventory for LiveDdlSemanticInventory {
     fn transform_sql(&self, sql: &str) -> Result<DdlTransformation, String> {
-        let operation = parse_ddl_operation(sql).ok();
-        let target_columns =
-            if supports_drop_columns_if_exists(sql) || supports_rename_columns_if_exists(sql) {
-                let operation =
-                    operation.ok_or_else(|| "failed to parse target-aware DDL".to_string())?;
-                let inventory = build_inventory(&self.target_schema, &self.target).map_err(|error| {
-                format!(
-                    "failed to build target inventory for DDL transformation in {}: {error}",
-                    self.target_schema
-                )
-            })?;
-                inventory
-                    .tables
-                    .iter()
-                    .find(|table| table.name == operation.primary_object)
-                    .ok_or_else(|| {
-                        format!(
-                            "target table {}.{} is missing for DDL transformation",
-                            self.target_schema, operation.primary_object
-                        )
-                    })?
-                    .columns
-                    .iter()
-                    .map(|column| column.name.clone())
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-        translate_ddl(sql, &target_columns)
+        let target_objects = if supports_drop_procedure(sql) {
+            self.read_target_procedure_names()?
+        } else if supports_drop_columns_if_exists(sql) || supports_rename_columns_if_exists(sql) {
+            let operation = parse_ddl_operation(sql)?;
+            self.read_target_column_names(&operation.primary_object)?
+        } else {
+            Vec::new()
+        };
+        translate_ddl(sql, &target_objects)
     }
 
     fn capture_evidence(
@@ -209,8 +252,11 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         source_file: &str,
         event_end_position: u64,
     ) -> Result<DdlSemanticEvidence, String> {
-        let operation = parse_ddl_operation(sql)?;
+        let operation = parse_semantic_operation(sql)?;
         let target_before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+        if supports_source_only_release_move_procedure_create(sql) {
+            return capture_source_only_procedure_create_evidence(self, &operation, &target_before);
+        }
         if operation.create_table_ast.is_some() {
             return capture_fenced_create_table_evidence(
                 self,
@@ -220,7 +266,11 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
                 event_end_position,
             );
         }
-        if operation.object_kind == DdlObjectKind::Index || operation.alter_table_ast.is_some() {
+        if operation.object_kind == DdlObjectKind::Index
+            || operation.alter_table_ast.is_some()
+            || supports_drop_procedure(sql)
+            || supports_source_only_release_move_procedure_create(sql)
+        {
             return capture_translated_evidence(self, &operation, &target_before);
         }
         capture_source_evidence(
@@ -233,12 +283,23 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
     }
 
     fn observe_target_state(&self, sql: &str) -> Result<String, String> {
-        let operation = parse_ddl_operation(sql)?;
+        let operation = parse_semantic_operation(sql)?;
         let before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
         let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
         validate_target_snapshot_consistency(&before, &after)?;
         observe_operation_state(&before, &operation)
     }
+}
+
+fn capture_source_only_procedure_create_evidence(
+    inventory: &LiveDdlSemanticInventory,
+    operation: &DdlOperation,
+    target_before: &SemanticSchemaSnapshot,
+) -> Result<DdlSemanticEvidence, String> {
+    let target_after =
+        LiveDdlSemanticInventory::snapshot(&inventory.target, &inventory.target_schema, operation)?;
+    validate_target_snapshot_consistency(target_before, &target_after)?;
+    canonical::build_source_only_procedure_create_evidence(operation, target_before)
 }
 
 fn capture_fenced_create_table_evidence(

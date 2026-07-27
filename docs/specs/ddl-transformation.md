@@ -31,6 +31,8 @@ allowlist.
 
 - [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`, named `ADD KEY`, and named `ADD UNIQUE KEY` clauses.
 - [x] Convert MariaDB `ALTER TABLE ... DROP COLUMN IF EXISTS ...` into MySQL 8 `DROP COLUMN` clauses by matching target identifiers ASCII-case-insensitively, emitting each matched target spelling once, and treating absent or repeated case-variant clauses as proven no-ops.
+- [x] Transform the generic exact unqualified, unquoted `DROP PROCEDURE IF EXISTS <identifier>` form and the exact unqualified, unquoted plain `DROP PROCEDURE apply_release_move_purchase_repair` form using target-local routine inventory. An existing target routine emits deterministic MySQL `DROP PROCEDURE` with the target spelling backtick-quoted; an absent target records a proven no-op. Qualified, quoted, commented, and other plain-name variants remain `translation_pending` barriers.
+- [x] Admit the source-only `CREATE PROCEDURE` form only when the complete statement matches one of two recorded hashes for the exact unqualified routine identity `apply_release_move_purchase_repair`. Admission precedes generic qualified-identifier rejection because the admitted statements contain qualified tokens. Require the target routine to be absent before and after evidence capture, execute no target SQL, and record a proven no-op. The body is never executed; data effects may arrive only through subsequent source ROW/FULL events in source order. An existing `translation_pending` row promotes automatically after exact-hash admission. Every other body, name, and routine DDL remains a `translation_pending` barrier.
 - [x] Transform the observed `ADD COLUMN` forms only under the exact unquoted type grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`, with the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options. Expected post-state for added character columns records the table-inherited character set and collation so live inventory comparison matches MySQL metadata. The type keyword, `VARCHAR` parentheses and length, and `UNSIGNED` keyword must be unquoted; `DATETIME` precision and `SMALLINT` display width are unsupported.
 - [x] Reject quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms as unsupported syntax. These variants remain `translation_pending` with no target DDL or checkpoint advance.
 - [x] Transform named composite `ADD KEY` and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; broader index and clause options remain outside this slice.
@@ -43,8 +45,9 @@ allowlist.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
 
 This is a production-derived ALTER TABLE slice plus one exact fixture CREATE
-TABLE admission, not full ALTER TABLE, generic CREATE TABLE, or the full
-MariaDB-to-MySQL 8 transformation pipeline. Coordinate-anchored reconstruction
+TABLE admission, one identity-scoped source-only CREATE PROCEDURE form, and
+two exact procedure-drop admissions, not full ALTER TABLE, generic CREATE TABLE,
+general routine DDL, or the full MariaDB-to-MySQL 8 transformation pipeline. Coordinate-anchored reconstruction
 of historical source schema lineage is explicitly excluded from the current
 cycle. The translator may use only semantics completely represented by the
 admitted event AST and fenced target pre-state; it must not infer unmodeled
@@ -132,8 +135,8 @@ No other `CREATE TABLE` syntax is admitted.
 - `src/live/ddl_semantics.rs` — dispatches current DDL transformations and
   captures semantic evidence.
 - `src/live/ddl_semantics/transform.rs` — production-derived `ADD COLUMN`,
-  `ADD KEY`, `ADD UNIQUE KEY`, `DROP COLUMN IF EXISTS`, and
-  `RENAME COLUMN IF EXISTS` translators,
+  `ADD KEY`, `ADD UNIQUE KEY`, generic and exact `DROP PROCEDURE` translators,
+  and `RENAME COLUMN IF EXISTS` translators,
   including deterministic SQL emission.
 - `src/live/ddl_semantics/canonical.rs` — typed ALTER clause AST encoding and
   expected post-state derivation from the fenced target pre-state.
@@ -149,15 +152,18 @@ No other `CREATE TABLE` syntax is admitted.
 The current slice is covered by:
 
 - [x] `src/live/ddl_semantics/tests.rs` — deterministic production `ADD COLUMN`,
-      `ADD KEY`, `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` SQL/no-op behavior,
+      `ADD KEY`, `ADD UNIQUE KEY`, generic and exact `DROP PROCEDURE` SQL/no-op
+      behavior, and the exact-hash source-only
+      `CREATE PROCEDURE apply_release_move_purchase_repair` form, target-absence
+      evidence, and proven no-op behavior,
       typed ALTER AST/post-state behavior and rename boundaries, plus the strict
       fixture `CREATE TABLE` grammar/typed AST/renderer, fenced source-default
       evidence, exact-coordinate rejection, explicit charset/collation SQL,
       deterministic post-state with sorted indexes, exact-grammar rejection, and
       runtime-admission contract.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
-      generated SQL and preserves journal/checkpoint ordering for the exact
-      fixture; unsupported CREATE remains pending without target/checkpoint
+      generated SQL and preserves journal/checkpoint ordering for supported
+      fixtures; unsupported CREATE remains pending without target/checkpoint
       execution.
 - [x] `scripts/cdc-integration-harness.py --scenario create-table-crash-restart` —
       real differing-default MariaDB/MySQL fixture admission, target-absence
@@ -174,15 +180,18 @@ The current slice is covered by:
       execution and unchanged checkpoint.
 
 These tests prove only the observed ALTER slice, the exact fixture CREATE TABLE
-admission, the real differing-default crash/restart scenario, and existing narrow
-DDL paths. They do not prove full ALTER TABLE, generic CREATE TABLE, the broader
+admission, the identity-scoped source-only `CREATE PROCEDURE` form, the generic
+and exact `DROP PROCEDURE` admissions, the real differing-default crash/restart
+scenario, and existing narrow DDL paths. They do not prove full
+ALTER TABLE, generic CREATE TABLE, the broader
 transformation contract, a full MariaDB/MySQL matrix, or deployment safety.
 
 ## Known gaps (current cycle)
 
 - [ ] Extend the current translator beyond the production-observed
-      `ADD COLUMN`/`ADD KEY`/`ADD UNIQUE KEY`/`DROP COLUMN IF EXISTS` and rename
-      slices into the canonical
+      `ADD COLUMN`/`ADD KEY`/`ADD UNIQUE KEY`/`DROP COLUMN IF EXISTS`, the
+      identity-scoped source-only `CREATE PROCEDURE` form, generic and exact
+      `DROP PROCEDURE`, and rename slices into the canonical
       MariaDB DDL parser and MySQL 8 transformation pipeline.
 - [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
       retired manual DDL ledger without restoring manual replay.

@@ -9,7 +9,7 @@ statement DML QueryEvent is a contract violation.
 Statement DML is never replayed in the production stream. The removed
 `apply-binlog` text path is not a supported health check.
 
-Automatic DDL admission currently has three narrow slices:
+Automatic DDL admission currently has five narrow slices:
 
 - explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE
   INDEX` or `DROP INDEX` whose key parts and options are completely modeled and
@@ -29,7 +29,20 @@ Automatic DDL admission currently has three narrow slices:
   head; and
 - the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
   COLUMN IF EXISTS ...` form, which is token-parsed and transformed from target
-  column pre-state into deterministic MySQL 8 SQL.
+  column pre-state into deterministic MySQL 8 SQL;
+- the source-only `CREATE PROCEDURE` statements matching either recorded hash
+  for the exact unqualified routine identity
+  `apply_release_move_purchase_repair`. Admission precedes generic
+  qualified-identifier rejection because the admitted statements contain
+  qualified tokens. It requires
+  target absence, executes no target SQL, and relies on subsequent source ROW/FULL
+  events for data effects in source order;
+- the generic exact unqualified, unquoted `DROP PROCEDURE IF EXISTS <identifier>`
+  form; and
+- the additional exact unqualified, unquoted plain
+  `DROP PROCEDURE apply_release_move_purchase_repair` form. Both use target-local
+  routine existence evidence: an existing target routine is dropped with
+  deterministic quoted MySQL SQL, while an absent routine is a proven no-op.
 
 The index parser rejects comments, ambiguous/incomplete syntax, double-quoted
 identifiers when ANSI_QUOTES mode is not captured, qualified names (including
@@ -41,20 +54,24 @@ and index options outside the observed slice remain translation boundaries. The
 rename translator removes `IF EXISTS`; absent old columns become a proven no-op,
 while old/new coexistence fails closed.
 
-Other table DDL and unsupported `ALTER TABLE` forms, views, routines, events,
-triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
-qualified/cross-schema references, definer/security clauses, MariaDB-only syntax,
-and multi-object or multi-statement forms are translation boundaries in the
-stream event path. The intended behavior flushes earlier DML, records exact
+Other table DDL and unsupported `ALTER TABLE` forms, views, other routine DDL,
+events, triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
+all other procedure bodies or names, plain drops for other names,
+qualified/cross-schema references, quoted or commented forms, other
+definer/security clauses, MariaDB-only syntax, and multi-object or multi-statement
+forms are translation boundaries in the stream event path. The intended behavior
+flushes earlier DML, records exact
 SQL/coordinates in `cdc.ddl_replay_journal` as `translation_pending`, and stops
 before advancing. The retired manual ledger has no remaining runtime,
 configuration, bootstrap, grant, or harness dependency.
 
-Qualifier handling is fail-closed. Tokenization removes comments from syntax
-but preserves identifier/dot/identifier detection across inline comments; index
+Qualifier handling is fail-closed outside the identity-scoped source-only
+procedure CREATE form. Tokenization removes comments from syntax but
+preserves identifier/dot/identifier detection across inline comments; index
 parsing rejects any comment outright. Backticks and ANSI_QUOTES double-quoted
-identifiers are not admitted when their mode is unavailable. Trigger `ON` and
-index `ON` references are qualified checks, not automatic exceptions.
+identifiers are not admitted when their mode is unavailable, except where an
+allowlisted body requires them. Trigger `ON` and index `ON` references are
+qualified checks, not automatic exceptions.
 
 ## Automatic journal
 

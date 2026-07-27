@@ -1,6 +1,9 @@
 use super::transform::{
     DDL_TRANSFORMATION_VERSION, parse_fixture_create_table, parse_production_alter_table_ast,
-    transform_drop_columns_if_exists, transform_fixture_create_table,
+    supports_drop_procedure, supports_source_only_release_move_procedure_create,
+    supports_source_only_release_move_procedure_digest, transform_drop_columns_if_exists,
+    transform_drop_procedure, transform_fixture_create_table,
+    transform_source_only_release_move_procedure_digest,
 };
 use super::*;
 use crate::inventory::{
@@ -947,6 +950,131 @@ fn fixture_event(row_count: u64) -> EventInventory {
         status: "ENABLED".to_string(),
         definition: format!("delete from accounts where id <= {row_count}"),
     }
+}
+
+#[test]
+fn exact_source_only_release_move_procedure_digest_is_a_proven_noop() {
+    let transformation = transform_source_only_release_move_procedure_digest(
+        "1326338ea27069ed94e2f1a94f2cfc118465939a2312d7bba0adafb3da3728ec",
+    )
+    .expect("source-only CREATE PROCEDURE transformation");
+
+    assert_eq!(transformation.version, "mariadb-mysql8-v1");
+    assert_eq!(transformation.target_sql, None);
+}
+
+#[test]
+fn source_only_release_move_procedure_create_admits_only_observed_body_hashes() {
+    for digest in [
+        "1326338ea27069ed94e2f1a94f2cfc118465939a2312d7bba0adafb3da3728ec",
+        "a3e4b4b54295bd0374965761f3ec3a8bfd7ab857b623d25c9010e8fe6b3449c3",
+    ] {
+        assert!(supports_source_only_release_move_procedure_digest(digest));
+    }
+
+    assert!(!supports_source_only_release_move_procedure_digest(
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ));
+    assert!(!supports_source_only_release_move_procedure_create(
+        "CREATE PROCEDURE apply_release_move_purchase_repair() SELECT 1"
+    ));
+}
+
+#[test]
+fn source_only_release_move_procedure_create_requires_target_absence() {
+    let mut target = semantic_snapshot(7, Some(8));
+    target.inventory.routines.push(RoutineInventory {
+        name: "apply_release_move_purchase_repair".to_string(),
+        routine_type: "PROCEDURE".to_string(),
+        definition: Some("select 1".to_string()),
+    });
+    let operation = DdlOperation {
+        family: DdlFamily::Procedure,
+        object_kind: DdlObjectKind::Procedure,
+        primary_object: "apply_release_move_purchase_repair".to_string(),
+        secondary_object: None,
+        index_ast: None,
+        create_table_ast: None,
+        alter_table_ast: None,
+    };
+
+    let error = build_source_only_procedure_create_evidence(&operation, &target)
+        .expect_err("present target procedure must block source-only no-op");
+
+    assert!(error.contains("already exists"), "{error}");
+}
+
+#[test]
+fn transforms_unqualified_drop_procedure_if_exists_for_mysql8() {
+    let procedures = ["apply_release_move_purchase_repair".to_string()]
+        .into_iter()
+        .collect();
+
+    let transformation = transform_drop_procedure(
+        "DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair",
+        &procedures,
+    )
+    .expect("DROP PROCEDURE IF EXISTS transformation");
+
+    assert_eq!(transformation.version, "mariadb-mysql8-v1");
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some("DROP PROCEDURE `apply_release_move_purchase_repair`")
+    );
+}
+
+#[test]
+fn plain_drop_release_move_procedure_is_proven_noop_when_target_is_absent() {
+    let transformation = transform_drop_procedure(
+        "DROP PROCEDURE apply_release_move_purchase_repair",
+        &Default::default(),
+    )
+    .expect("plain DROP PROCEDURE no-op");
+
+    assert_eq!(transformation.target_sql, None);
+}
+
+#[test]
+fn drop_procedure_if_exists_is_proven_noop_when_target_procedure_is_absent() {
+    let transformation = transform_drop_procedure(
+        "DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair",
+        &Default::default(),
+    )
+    .expect("DROP PROCEDURE IF EXISTS no-op");
+
+    assert_eq!(transformation.target_sql, None);
+}
+
+#[test]
+fn drop_procedure_admission_is_limited_to_supported_forms() {
+    assert!(supports_drop_procedure(
+        "DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair"
+    ));
+    assert!(supports_drop_procedure(
+        "DROP PROCEDURE apply_release_move_purchase_repair"
+    ));
+    for sql in [
+        "DROP PROCEDURE another_release_move_procedure",
+        "DROP PROCEDURE IF EXISTS globalcomix.apply_release_move_purchase_repair",
+        "DROP PROCEDURE IF EXISTS `apply_release_move_purchase_repair`",
+        "/* migration */ DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair",
+        "DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair, another_procedure",
+    ] {
+        assert!(!supports_drop_procedure(sql), "accepted {sql}");
+    }
+}
+
+#[test]
+fn drop_procedure_uses_target_local_absent_postcondition() {
+    let target = semantic_snapshot(7, Some(8));
+    let operation =
+        parse_ddl_operation("DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair")
+            .expect("DROP PROCEDURE operation");
+
+    let evidence = build_semantic_evidence(&operation, &target, &target)
+        .expect("target-local DROP PROCEDURE evidence");
+
+    assert_eq!(evidence.expected_post_state, canonical_absent_state());
 }
 
 #[test]

@@ -46,6 +46,20 @@ pub fn build_fenced_create_table_evidence(
     })
 }
 
+pub fn build_source_only_procedure_create_evidence(
+    operation: &DdlOperation,
+    target: &SemanticSchemaSnapshot,
+) -> Result<DdlSemanticEvidence, String> {
+    let pre_state = canonical_pre_state(operation, target)?;
+    if pre_state != canonical_absent_state() {
+        return Err(format!(
+            "target procedure `{}` already exists before source-only CREATE PROCEDURE",
+            operation.primary_object
+        ));
+    }
+    build_semantic_evidence(operation, target, target)
+}
+
 pub fn build_semantic_evidence(
     operation: &DdlOperation,
     target: &SemanticSchemaSnapshot,

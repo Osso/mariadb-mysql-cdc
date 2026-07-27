@@ -12,9 +12,17 @@ quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
 rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
 `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, named composite `ADD KEY`
 or `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS`
-with ASCII-case-insensitive target matching, one emitted drop per matched target spelling, and absent or repeated case-variant no-ops; plus the existing
-`ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator slice. Every other DDL
-form enters the same journal as `translation_pending`; no operator-authored
+with ASCII-case-insensitive target matching, one emitted drop per matched target spelling, and absent or repeated case-variant no-ops; the source-only
+`CREATE PROCEDURE` statements matching either admitted hash for the exact routine
+identity `apply_release_move_purchase_repair`; the generic exact
+unqualified, unquoted `DROP PROCEDURE IF EXISTS <identifier>` form; and the
+exact unqualified, unquoted plain `DROP PROCEDURE apply_release_move_purchase_repair`
+form; plus the existing `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator
+slice. The source-only CREATE admission occurs before generic
+qualified-identifier rejection because its observed statement contains qualified
+`DEFINER` and body tokens. Every other body, name, qualified, quoted, commented,
+other plain-name, or routine DDL variant remains unsupported.
+Every other DDL form enters the same journal as `translation_pending`; no operator-authored
 target SQL is accepted as a resolution path.
 
 The stream does not create or repair control-plane objects. Bootstrap must run
@@ -94,13 +102,62 @@ and the canonical AST, derives the expected post-state by applying that AST to
 the pre-state, and promotes the existing `translation_pending` row exactly once
 to `prepared`. For the implemented production ALTER slice, this derivation is
 purely target-pre-state-plus-event-AST; historical replay does not require a live
-source snapshot or source head at the event coordinate. The promotion fills
-immutable transformation evidence. It then executes the generated MySQL SQL, or
-records a proven no-op with `generated_sql = NULL`, validates the complete
-affected target state, marks `applied`, and atomically checkpoints the event.
+source snapshot or source head at the event coordinate. For the identity-scoped source-only procedure CREATE, target evidence must prove
+the routine is absent before and after capture; it executes no target SQL and
+records `generated_sql = NULL`. Identity/header admission precedes the
+qualification bypass. For either admitted procedure DROP form, target-local
+routine pre/post evidence determines whether to emit the quoted target procedure
+name or record a proven no-op. The promotion fills immutable transformation evidence. It then executes the generated MySQL SQL,
+or records a proven no-op with `generated_sql = NULL`, validates the complete
+affected target state, marks `applied`, and atomically checkpoints the event. The
+admitted CREATE bodies are never executed: ROW/FULL effects replicate only through
+subsequent source events in source order.
 
 No operator-authored target SQL, `resolution_note`, or manual status transition
-is part of this flow.
+is part of this flow. An existing `translation_pending` row for the exact
+procedure event is promoted automatically; no replacement journal row is
+created.
+
+### Identity-scoped source-only CREATE PROCEDURE
+
+The source-only `CREATE PROCEDURE` form is admitted only when the complete
+statement matches one of two recorded hashes for unqualified routine identity
+`apply_release_move_purchase_repair`. Admission is exact-statement scoped, not
+generalized procedure grammar. Qualified tokens are allowed only after this
+admission. Target evidence must prove the routine absent
+before and after capture; a present target procedure fails closed. The target
+receives no CREATE, the body never runs, and later source ROW/FULL events carry
+any data changes in source order. Any existing `translation_pending` row for an
+admitted event is promoted automatically; no operator SQL or replacement journal
+row is used. Every other body, name, and routine DDL remains
+`translation_pending`.
+
+### Procedure DROP proof
+
+Two routine-drop forms are admitted. The generic form is exact unqualified,
+unquoted `DROP PROCEDURE IF EXISTS <identifier>`. The additional plain form is
+only exact unqualified, unquoted `DROP PROCEDURE apply_release_move_purchase_repair`.
+Target-local routine inventory determines the operation: an existing target
+routine emits deterministic MySQL `DROP PROCEDURE` with the target inventory
+spelling backtick-quoted; an absent routine emits no target SQL as a proven
+no-op. Qualified, quoted, commented, and other plain-name forms remain
+`translation_pending` barriers with no target execution or checkpoint advance.
+
+### Exact DROP PROCEDURE IF EXISTS proof
+
+The generic routine-drop form is exact unqualified, unquoted
+`DROP PROCEDURE IF EXISTS <identifier>`, with no comments and an optional
+semicolon. Target-local routine inventory is the evidence source. When the named
+procedure exists, the translator emits deterministic MySQL `DROP PROCEDURE`
+with the target name backtick-quoted, using the target inventory spelling. When
+it is absent, it emits no target SQL and records the expected routine state as
+absent, which is a proven no-op.
+
+The additional plain routine-drop form is exact unqualified, unquoted
+`DROP PROCEDURE apply_release_move_purchase_repair`, without `IF EXISTS`.
+Target-local routine inventory determines the same deterministic drop versus
+proven no-op. Qualified, quoted, commented, and other plain-name variants remain
+`translation_pending` barriers with no target execution or checkpoint advance.
 
 ### Production ALTER proof
 

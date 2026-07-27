@@ -3,6 +3,7 @@ use super::model::{
     ParsedCreateTableAst, ParsedDropColumnAst, ParsedIndexAst, ParsedIndexKeyPart,
 };
 use super::tokenizer::{ddl_contains_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub const DDL_TRANSFORMATION_VERSION: &str = "mariadb-mysql8-v1";
@@ -1178,6 +1179,101 @@ fn validate_schema_default_identifier(value: &str, kind: &str) -> Result<(), Str
     } else {
         Err(format!("invalid source schema {kind} `{value}`"))
     }
+}
+
+const SOURCE_ONLY_RELEASE_MOVE_PROCEDURE_HASHES: [&str; 2] = [
+    "1326338ea27069ed94e2f1a94f2cfc118465939a2312d7bba0adafb3da3728ec",
+    "a3e4b4b54295bd0374965761f3ec3a8bfd7ab857b623d25c9010e8fe6b3449c3",
+];
+
+pub(super) fn supports_source_only_release_move_procedure_digest(digest: &str) -> bool {
+    SOURCE_ONLY_RELEASE_MOVE_PROCEDURE_HASHES.contains(&digest)
+}
+
+pub fn supports_source_only_release_move_procedure_create(source_sql: &str) -> bool {
+    let digest = format!("{:x}", Sha256::digest(source_sql.trim_end().as_bytes()));
+    supports_source_only_release_move_procedure_digest(&digest)
+}
+
+pub(super) fn transform_source_only_release_move_procedure_digest(
+    digest: &str,
+) -> Result<DdlTransformation, String> {
+    if !supports_source_only_release_move_procedure_digest(digest) {
+        return Err(
+            "source-only release-move CREATE PROCEDURE does not match an admitted body hash"
+                .to_string(),
+        );
+    }
+    Ok(DdlTransformation {
+        version: DDL_TRANSFORMATION_VERSION,
+        target_sql: None,
+    })
+}
+
+pub fn transform_source_only_release_move_procedure_create(
+    source_sql: &str,
+) -> Result<DdlTransformation, String> {
+    let digest = format!("{:x}", Sha256::digest(source_sql.trim_end().as_bytes()));
+    transform_source_only_release_move_procedure_digest(&digest)
+}
+
+pub fn supports_drop_procedure(source_sql: &str) -> bool {
+    parse_supported_drop_procedure(source_sql).is_ok()
+}
+
+pub fn transform_drop_procedure(
+    source_sql: &str,
+    target_procedures: &BTreeSet<String>,
+) -> Result<DdlTransformation, String> {
+    let source_name = parse_supported_drop_procedure(source_sql)?;
+    let target_name = target_procedures
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(&source_name));
+    Ok(DdlTransformation {
+        version: DDL_TRANSFORMATION_VERSION,
+        target_sql: target_name.map(|name| format!("DROP PROCEDURE {}", quote_identifier(name))),
+    })
+}
+
+fn parse_supported_drop_procedure(source_sql: &str) -> Result<String, String> {
+    if ddl_contains_comments(source_sql) {
+        return Err("DROP PROCEDURE comments are not supported".to_string());
+    }
+    if source_sql.contains('"') {
+        return Err("DROP PROCEDURE double-quoted identifiers are not supported".to_string());
+    }
+    let (tokens, quoted_flags) = tokenize_ddl_with_quoted_flags(source_sql)?;
+    require_keyword(&tokens, 0, "DROP")?;
+    require_keyword(&tokens, 1, "PROCEDURE")?;
+    let has_if_exists = tokens
+        .get(2)
+        .is_some_and(|token| token.eq_ignore_ascii_case("IF"));
+    let name_index = if has_if_exists {
+        require_keyword(&tokens, 3, "EXISTS")?;
+        4
+    } else {
+        2
+    };
+    if quoted_flags.get(name_index).copied().unwrap_or(false) {
+        return Err("quoted DROP PROCEDURE identifiers are not supported".to_string());
+    }
+    let name = require_identifier(&tokens, name_index, "DROP PROCEDURE name")?;
+    if !has_if_exists && name != "apply_release_move_purchase_repair" {
+        return Err(
+            "plain DROP PROCEDURE is supported only for the release-move repair routine"
+                .to_string(),
+        );
+    }
+    let trailing_index = name_index + 1;
+    let end = if tokens.get(trailing_index).map(String::as_str) == Some(";") {
+        trailing_index + 1
+    } else {
+        trailing_index
+    };
+    if tokens.len() != end {
+        return Err("DROP PROCEDURE requires one unqualified procedure name".to_string());
+    }
+    Ok(name)
 }
 
 pub fn supports_drop_columns_if_exists(source_sql: &str) -> bool {
