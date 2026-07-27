@@ -9,7 +9,7 @@ use crate::inventory::{
     build_canonical_foreign_key_inventory,
 };
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::table_sync::SyncTable;
+use crate::table_sync::{SyncTable, primary_key_ordering_from_inventory};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) type RepairTableInputs = BTreeMap<String, (u64, u64, SyncTable)>;
@@ -119,9 +119,17 @@ pub(crate) fn compatible_sync_table(
         skipped.push(skip_table(source, reason));
         return None;
     }
+    let primary_key_ordering = match primary_key_ordering_from_inventory(source) {
+        Ok(ordering) => ordering,
+        Err(error) => {
+            skipped.push(skip_table(source, error.to_string()));
+            return None;
+        }
+    };
     Some(SyncTable {
         name: source.name.clone(),
         primary_key: source.primary_key.clone(),
+        primary_key_ordering,
         columns,
     })
 }

@@ -34,7 +34,11 @@ are resolved only after verified equality. The current table-sync recovery contr
       deleted. Ambiguous reads, a NULL key column, a `PRIMARY` duplicate, an unknown
       index, and more than 64 owners in one batch all fail closed. Each deletion emits
       `cdc_misfiled_duplicate_owner_reclaimed` with both primary keys.
-- [x] Compare rows by configured primary-key columns.
+- [x] Compare rows by configured primary-key columns. Derive each primary-key
+      column's ordering from source inventory. Native columns retain database
+      ordering; ENUM columns use the declaration order consistently in `ORDER BY`
+      and cursor bounds. Reject unknown ENUM bound labels and run specifications
+      whose persisted ordering disagrees with current source inventory.
 - [x] Report missing source rows, divergent rows, and target extras.
 - [x] Apply divergent rows in bounded primary-key update batches, with at most
       128 rows per SQL statement, further split to stay under MySQL's

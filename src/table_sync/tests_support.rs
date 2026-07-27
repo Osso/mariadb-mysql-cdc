@@ -7,6 +7,7 @@ pub(crate) fn account_table() -> SyncTable {
     SyncTable {
         name: "accounts".to_string(),
         primary_key: vec!["id".to_string()],
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: vec!["id".to_string(), "name".to_string()],
     }
 }
@@ -15,6 +16,7 @@ pub(crate) fn account_table_with_updated_at() -> SyncTable {
     SyncTable {
         name: "accounts".to_string(),
         primary_key: vec!["id".to_string()],
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: vec![
             "id".to_string(),
             "name".to_string(),

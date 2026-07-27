@@ -45,6 +45,7 @@ class ScenarioSpec:
 
 SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
+    ScenarioSpec("sync-table-composite-enum-primary-key", True),
     ScenarioSpec("sync-table-fk-parent-repair", True),
     ScenarioSpec("sync-table-fk-parent-stale-unique-owner", True),
     ScenarioSpec("sync-table-update-fk-parent-repair", True),
@@ -4078,6 +4079,83 @@ class Harness:
             "progress_rows=0 target_rows=0"
         )
 
+    def run_sync_table_composite_enum_primary_key(self) -> None:
+        assert self.source and self.target
+        create_table = (
+            "DROP TABLE IF EXISTS comics_top_stats; "
+            "CREATE TABLE comics_top_stats ("
+            "comic_id INT UNSIGNED NOT NULL, "
+            "statistic ENUM('views','popularity','likes','purchases','loved','rising') NOT NULL, "
+            "value_365_days FLOAT UNSIGNED NOT NULL, "
+            "PRIMARY KEY (comic_id, statistic)"
+            ") ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, create_table)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO comics_top_stats VALUES "
+            "(13553, 'views', 4895), "
+            "(13553, 'popularity', 9.02522), "
+            "(13553, 'loved', 0.00989477);",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO comics_top_stats VALUES "
+            "(13553, 'views', 4891), "
+            "(13553, 'popularity', 9.02522);",
+        )
+        run_id = "sync-table-composite-enum-primary-key"
+        binary = self._repair_binary()
+        args = self._sync_table_args(binary)
+        args[args.index("accounts")] = "comics_top_stats"
+        args[args.index("id,email,payload")] = "comic_id,statistic,value_365_days"
+        args[args.index("id")] = "comic_id,statistic"
+        args[args.index("sync-table-source-ca-proof")] = run_id
+        args[args.index("globalcomix.sync_table_tls_progress")] = (
+            "globalcomix.table_sync_runs"
+        )
+        args.extend(["--mode", "apply", "--chunk-size", "2"])
+        result = run(
+            args,
+            cwd=self.repo,
+            env={
+                **os.environ,
+                "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            },
+            timeout=180,
+            check=False,
+        )
+        require_success(result, "sync-table composite ENUM primary key")
+        rows = self.query(
+            self.target,
+            "SELECT comic_id,statistic,value_365_days FROM comics_top_stats "
+            "ORDER BY comic_id,statistic;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        progress = self.admin_query(
+            self.target,
+            "SELECT status,last_primary_key_json,chunks,rows_scanned,"
+            "inserts_applied,updates_applied,extra_target_rows "
+            "FROM globalcomix.table_sync_runs "
+            f"WHERE run_id='{run_id}';",
+        ).strip()
+        expected_rows = (
+            "13553\tviews\t4895\n"
+            "13553\tpopularity\t9.02522\n"
+            "13553\tloved\t0.00989477"
+        )
+        if rows != expected_rows:
+            raise HarnessError(f"composite ENUM rows did not converge: {rows!r}")
+        if progress != 'complete\t["13553","loved"]\t2\t3\t1\t1\t0':
+            raise HarnessError(f"composite ENUM progress is wrong: {progress!r}")
+        print(
+            "sync_table_composite_enum_primary_key_ok "
+            "rows_scanned=3 inserts=1 updates=1 extras=0"
+        )
+
     def run_sync_table_fk_parent_repair(self, update_existing_child: bool = False) -> None:
         assert self.source and self.target
         run_id = (
@@ -4996,6 +5074,8 @@ class Harness:
         self.prepare()
         if scenario == "strict-secondary-btree":
             self.run_strict_secondary_btree()
+        elif scenario == "sync-table-composite-enum-primary-key":
+            self.run_sync_table_composite_enum_primary_key()
         elif scenario == "sync-table-fk-parent-repair":
             self.run_sync_table_fk_parent_repair()
         elif scenario == "sync-table-fk-parent-stale-unique-owner":

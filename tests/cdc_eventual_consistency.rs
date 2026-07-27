@@ -66,6 +66,12 @@ fn real_sync_table_fk_parent_repair_converges_after_1452() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_sync_table_composite_enum_primary_key_uses_enum_order() {
+    run_harness_scenario("sync-table-composite-enum-primary-key");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_sync_table_fk_parent_reconciles_stale_unique_owner() {
     run_harness_scenario("sync-table-fk-parent-stale-unique-owner");
 }

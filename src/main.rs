@@ -15,6 +15,7 @@ pub mod repair_drift;
 pub mod row;
 pub mod snapshot;
 mod snapshot_ranges;
+mod sql_type;
 pub mod statement;
 pub mod stream_checkpoint;
 mod sync_cli;

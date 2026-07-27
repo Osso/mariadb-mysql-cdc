@@ -522,6 +522,7 @@ fn exact_home_feed_card_sync_config(
         table: SyncTable {
             name: crate::live::HOME_FEED_CARD_PARENT_TABLE.to_string(),
             primary_key: vec![crate::live::HOME_FEED_CARD_PARENT_PRIMARY_KEY.to_string()],
+            primary_key_ordering: vec![super::SyncPrimaryKeyOrdering::Native],
             columns: home_feed_card_columns(),
         },
         chunk_size: 1,
@@ -551,6 +552,7 @@ fn exact_guest_sync_config(
         table: SyncTable {
             name: crate::live::SESSIONS_GUEST_PARENT_TABLE.to_string(),
             primary_key: vec![crate::live::SESSIONS_GUEST_PARENT_PRIMARY_KEY.to_string()],
+            primary_key_ordering: vec![super::SyncPrimaryKeyOrdering::Native],
             columns: guest_columns(),
         },
         chunk_size: 1,
@@ -697,16 +699,20 @@ pub(crate) fn run_sync_table_phase_with_run_spec(
     run_spec_json: Option<&str>,
 ) -> Result<SyncTableReport, TableSyncError> {
     validate_sync_table_config(config)?;
+    let source_inventory = read_source_inventory(config)?;
+    let target_inventory = read_target_inventory(config)?;
+    let config = resolved_sync_table_config(config, &source_inventory)?;
     let source = MySqlSyncReader::new(config.source.clone());
-    let target = MySqlSyncReader::new_with_target(target_connection_config(config), &config.target)
-        .map_err(TableSyncError::Read)?;
+    let target =
+        MySqlSyncReader::new_with_target(target_connection_config(&config), &config.target)
+            .map_err(TableSyncError::Read)?;
     let mut progress_store = progress::MySqlSyncRunProgressStore::new(
         config.target.clone(),
         config.progress_table.clone(),
     );
-    let mut repair_target = mysql_repair_target(config)?;
+    let mut repair_target = mysql_repair_target(&config, source_inventory, target_inventory)?;
     run_sync_table_with_targets_phase(
-        config,
+        &config,
         &source,
         &target,
         &mut repair_target,
@@ -743,11 +749,13 @@ fn connect_mysql_recovery_target(
     Ok(build_mysql_repair_target(config, executor))
 }
 
-fn mysql_repair_target(config: &SyncTableConfig) -> Result<MySqlSyncRepairTarget, TableSyncError> {
+fn mysql_repair_target(
+    config: &SyncTableConfig,
+    source_inventory: SchemaInventory,
+    target_inventory: SchemaInventory,
+) -> Result<MySqlSyncRepairTarget, TableSyncError> {
     let executor = crate::mysql_client::PersistentTargetExecutor::new_for_sync(&config.target)
         .map_err(|error| TableSyncError::Repair(error.to_string()))?;
-    let source_inventory = read_source_inventory(config)?;
-    let target_inventory = read_target_inventory(config)?;
     let writer = crate::target::TargetMySqlWriter::from_snapshot_table(
         &snapshot_table(&config.table),
         executor,
@@ -763,6 +771,34 @@ fn mysql_repair_target(config: &SyncTableConfig) -> Result<MySqlSyncRepairTarget
         source_inventory,
         target_inventory,
     ))
+}
+
+fn resolved_sync_table_config(
+    config: &SyncTableConfig,
+    source_inventory: &SchemaInventory,
+) -> Result<SyncTableConfig, TableSyncError> {
+    let source_table = source_inventory
+        .tables
+        .iter()
+        .find(|table| table.name == config.table.name)
+        .ok_or_else(|| {
+            TableSyncError::InvalidTable(format!(
+                "table `{}` is absent from source inventory",
+                config.table.name
+            ))
+        })?;
+    let ordering = super::primary_key_ordering_from_inventory(source_table)?;
+    if !config.table.primary_key_ordering.is_empty()
+        && config.table.primary_key_ordering != ordering
+    {
+        return Err(TableSyncError::InvalidTable(format!(
+            "primary-key ordering for `{}` disagrees with source inventory",
+            config.table.name
+        )));
+    }
+    let mut resolved = config.clone();
+    resolved.table.primary_key_ordering = ordering;
+    Ok(resolved)
 }
 
 fn read_source_inventory(config: &SyncTableConfig) -> Result<SchemaInventory, TableSyncError> {

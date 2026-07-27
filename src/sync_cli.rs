@@ -55,6 +55,7 @@ fn default_sync_table_config() -> table_sync::SyncTableConfig {
         table: table_sync::SyncTable {
             name: String::new(),
             primary_key: Vec::new(),
+            primary_key_ordering: Vec::new(),
             columns: Vec::new(),
         },
         chunk_size: 1000,

@@ -1,4 +1,6 @@
-use super::{SyncChunkRequest, SyncTableReader, TableSyncError, UpdatedSince};
+use super::{
+    SyncChunkRequest, SyncPrimaryKeyOrdering, SyncTableReader, TableSyncError, UpdatedSince,
+};
 use crate::live::TargetMySqlConfig;
 use crate::mysql_client::{PersistentMySqlSource, target_reader_opts};
 use crate::snapshot::{SnapshotError, SnapshotRow};
@@ -338,7 +340,7 @@ fn snapshot_error_to_table_sync(error: SnapshotError) -> TableSyncError {
 
 pub(crate) fn build_sync_select_sql(request: &SyncChunkRequest) -> String {
     let columns = quote_ident_list(&request.columns);
-    let order_by = quote_ident_list(&request.primary_key);
+    let order_by = primary_key_order_by(&request.primary_key, &request.primary_key_ordering);
     let bounds = sync_bounds(request);
     format!(
         "SELECT {columns} FROM {}{bounds} ORDER BY {order_by} LIMIT {}",
@@ -361,12 +363,14 @@ fn sync_bound_predicates(request: &SyncChunkRequest) -> Vec<String> {
     if let Some(start_after) = &request.start_after {
         predicates.push(primary_key_after_predicate(
             &request.primary_key,
+            &request.primary_key_ordering,
             start_after,
         ));
     }
     if let Some(end_at) = &request.end_at {
         predicates.push(primary_key_at_or_before_predicate(
             &request.primary_key,
+            &request.primary_key_ordering,
             end_at,
         ));
     }
@@ -436,23 +440,38 @@ fn primary_key_values(
         .collect()
 }
 
-fn primary_key_after_predicate(columns: &[String], values: &[String]) -> String {
-    primary_key_bound_predicate(columns, values, ">")
+fn primary_key_after_predicate(
+    columns: &[String],
+    ordering: &[SyncPrimaryKeyOrdering],
+    values: &[String],
+) -> String {
+    primary_key_bound_predicate(columns, ordering, values, ">")
 }
 
-fn primary_key_at_or_before_predicate(columns: &[String], values: &[String]) -> String {
+fn primary_key_at_or_before_predicate(
+    columns: &[String],
+    ordering: &[SyncPrimaryKeyOrdering],
+    values: &[String],
+) -> String {
     format!(
         "NOT ({})",
-        primary_key_bound_predicate(columns, values, ">")
+        primary_key_bound_predicate(columns, ordering, values, ">")
     )
 }
 
-fn primary_key_bound_predicate(columns: &[String], values: &[String], operator: &str) -> String {
+fn primary_key_bound_predicate(
+    columns: &[String],
+    ordering: &[SyncPrimaryKeyOrdering],
+    values: &[String],
+    operator: &str,
+) -> String {
     group_primary_key_bound_branches(
         columns
             .iter()
             .enumerate()
-            .map(|(index, _column)| primary_key_bound_branch(columns, values, index, operator))
+            .map(|(index, _column)| {
+                primary_key_bound_branch(columns, ordering, values, index, operator)
+            })
             .collect(),
     )
 }
@@ -469,6 +488,7 @@ fn group_primary_key_bound_branches(branches: Vec<String>) -> String {
 
 fn primary_key_bound_branch(
     columns: &[String],
+    ordering: &[SyncPrimaryKeyOrdering],
     values: &[String],
     index: usize,
     operator: &str,
@@ -481,12 +501,44 @@ fn primary_key_bound_branch(
             quote_sql_literal(&values[equal_index])
         ));
     }
-    parts.push(format!(
-        "{} {operator} {}",
-        quote_ident(&columns[index]),
-        quote_sql_literal(&values[index])
-    ));
+    let column = primary_key_order_expression(&columns[index], &ordering[index]);
+    let value = primary_key_bound_expression(&values[index], &ordering[index]);
+    parts.push(format!("{column} {operator} {value}"));
     format!("({})", parts.join(" AND "))
+}
+
+fn primary_key_order_by(columns: &[String], ordering: &[SyncPrimaryKeyOrdering]) -> String {
+    columns
+        .iter()
+        .zip(ordering)
+        .map(|(column, ordering)| primary_key_order_expression(column, ordering))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn primary_key_order_expression(column: &str, ordering: &SyncPrimaryKeyOrdering) -> String {
+    match ordering {
+        SyncPrimaryKeyOrdering::Native => quote_ident(column),
+        SyncPrimaryKeyOrdering::Enum(labels) => enum_field_expression(&quote_ident(column), labels),
+    }
+}
+
+fn primary_key_bound_expression(value: &str, ordering: &SyncPrimaryKeyOrdering) -> String {
+    match ordering {
+        SyncPrimaryKeyOrdering::Native => quote_sql_literal(value),
+        SyncPrimaryKeyOrdering::Enum(labels) => {
+            enum_field_expression(&quote_sql_literal(value), labels)
+        }
+    }
+}
+
+fn enum_field_expression(value: &str, labels: &[String]) -> String {
+    let labels = labels
+        .iter()
+        .map(|label| quote_sql_literal(label))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("FIELD({value}, {labels})")
 }
 
 fn quote_ident_list(columns: &[String]) -> String {

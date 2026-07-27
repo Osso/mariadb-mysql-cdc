@@ -915,6 +915,7 @@ fn builds_sync_select_with_start_and_end_bounds() {
     let sql = build_sync_select_sql(&SyncChunkRequest {
         table: "accounts".to_string(),
         primary_key: vec!["id".to_string()],
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: vec!["id".to_string(), "name".to_string()],
         start_after: Some(vec!["10".to_string()]),
         end_at: Some(vec!["20".to_string()]),
@@ -937,6 +938,10 @@ fn bounds_a_composite_primary_key_window_on_both_ends() {
     let sql = build_sync_select_sql(&SyncChunkRequest {
         table: "comics_releases_fragments_stats".to_string(),
         primary_key: vec!["datehour".to_string(), "fragment_id".to_string()],
+        primary_key_ordering: vec![
+            SyncPrimaryKeyOrdering::Native,
+            SyncPrimaryKeyOrdering::Native,
+        ],
         columns: vec!["datehour".to_string(), "fragment_id".to_string()],
         start_after: Some(vec!["2023-05-29 08:00:00".to_string(), "71169".to_string()]),
         end_at: Some(vec!["2018-01-07 16:00:00".to_string(), "4619".to_string()]),
@@ -956,10 +961,70 @@ fn bounds_a_composite_primary_key_window_on_both_ends() {
 }
 
 #[test]
+fn builds_sync_select_with_enum_primary_key_ordering() {
+    let labels = [
+        "views",
+        "popularity",
+        "likes",
+        "purchases",
+        "loved",
+        "rising",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    let sql = build_sync_select_sql(&SyncChunkRequest {
+        table: "comics_top_stats".to_string(),
+        primary_key: vec!["comic_id".to_string(), "statistic".to_string()],
+        primary_key_ordering: vec![
+            SyncPrimaryKeyOrdering::Native,
+            SyncPrimaryKeyOrdering::Enum(labels),
+        ],
+        columns: vec![
+            "comic_id".to_string(),
+            "statistic".to_string(),
+            "value_365_days".to_string(),
+        ],
+        start_after: Some(vec!["13552".to_string(), "rising".to_string()]),
+        end_at: Some(vec!["13553".to_string(), "views".to_string()]),
+        updated_since: None,
+        limit: 2,
+    });
+
+    let enum_order =
+        "FIELD(`statistic`, 'views', 'popularity', 'likes', 'purchases', 'loved', 'rising')";
+    assert!(sql.contains(&format!("{enum_order} > FIELD('rising'")));
+    assert!(sql.contains(&format!("{enum_order} > FIELD('views'")));
+    assert!(sql.contains(&format!("ORDER BY `comic_id`, {enum_order} LIMIT 2")));
+}
+
+#[test]
+fn rejects_unknown_enum_primary_key_bound() {
+    let table = SyncTable {
+        name: "comics_top_stats".to_string(),
+        primary_key: vec!["comic_id".to_string(), "statistic".to_string()],
+        primary_key_ordering: vec![
+            SyncPrimaryKeyOrdering::Native,
+            SyncPrimaryKeyOrdering::Enum(vec!["views".to_string(), "loved".to_string()]),
+        ],
+        columns: vec!["comic_id".to_string(), "statistic".to_string()],
+    };
+
+    let error = validate_sync_range(
+        &table,
+        Some(&vec!["13553".to_string(), "unknown".to_string()]),
+        None,
+    )
+    .expect_err("unknown ENUM bound must fail before query execution");
+
+    assert!(error.to_string().contains("is not an ENUM label"));
+}
+
+#[test]
 fn builds_sync_select_with_updated_since_filter() {
     let sql = build_sync_select_sql(&SyncChunkRequest {
         table: "accounts".to_string(),
         primary_key: vec!["id".to_string()],
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: vec!["id".to_string(), "updated_at".to_string()],
         start_after: Some(vec!["10".to_string()]),
         end_at: None,

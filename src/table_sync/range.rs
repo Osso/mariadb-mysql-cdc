@@ -405,6 +405,7 @@ where
         primary_key_only_table = SyncTable {
             name: context.table.name.clone(),
             primary_key: context.table.primary_key.clone(),
+            primary_key_ordering: context.table.primary_key_ordering.clone(),
             columns: context.table.primary_key.clone(),
         };
         &primary_key_only_table

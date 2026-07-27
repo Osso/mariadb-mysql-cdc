@@ -1,5 +1,6 @@
+use crate::inventory::TableInventory;
 use crate::snapshot::SnapshotRow;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -20,13 +21,49 @@ pub struct SyncTableConfig {
 pub struct SyncTable {
     pub name: String,
     pub primary_key: Vec<String>,
+    pub primary_key_ordering: Vec<SyncPrimaryKeyOrdering>,
     pub columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "labels")]
+pub enum SyncPrimaryKeyOrdering {
+    Native,
+    Enum(Vec<String>),
+}
+
+pub(crate) fn primary_key_ordering_from_inventory(
+    table: &TableInventory,
+) -> Result<Vec<SyncPrimaryKeyOrdering>, TableSyncError> {
+    table
+        .primary_key
+        .iter()
+        .map(|name| {
+            let column = table
+                .columns
+                .iter()
+                .find(|column| column.name == *name)
+                .ok_or_else(|| {
+                    TableSyncError::InvalidTable(format!(
+                        "primary-key column `{name}` is absent from `{}` inventory",
+                        table.name
+                    ))
+                })?;
+            Ok(
+                match crate::sql_type::parse_enum_column_type(&column.column_type) {
+                    Some(labels) => SyncPrimaryKeyOrdering::Enum(labels),
+                    None => SyncPrimaryKeyOrdering::Native,
+                },
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncChunkRequest {
     pub table: String,
     pub primary_key: Vec<String>,
+    pub primary_key_ordering: Vec<SyncPrimaryKeyOrdering>,
     pub columns: Vec<String>,
     pub start_after: Option<Vec<String>>,
     pub end_at: Option<Vec<String>>,
@@ -188,6 +225,33 @@ pub(crate) fn validate_sync_range(
 ) -> Result<(), TableSyncError> {
     validate_bound_arity(&table.primary_key, start_after, "start_after")?;
     validate_bound_arity(&table.primary_key, end_at, "end_at")?;
+    validate_bound_ordering(table, start_after, "start_after")?;
+    validate_bound_ordering(table, end_at, "end_at")?;
+    Ok(())
+}
+
+fn validate_bound_ordering(
+    table: &SyncTable,
+    values: Option<&Vec<String>>,
+    label: &str,
+) -> Result<(), TableSyncError> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    for ((column, ordering), value) in table
+        .primary_key
+        .iter()
+        .zip(&table.primary_key_ordering)
+        .zip(values)
+    {
+        if let SyncPrimaryKeyOrdering::Enum(labels) = ordering
+            && !labels.contains(value)
+        {
+            return Err(TableSyncError::InvalidTable(format!(
+                "{label} value `{value}` is not an ENUM label for primary-key column `{column}`"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -228,6 +292,13 @@ pub(crate) fn validate_sync_table(
             "columns are required".to_string(),
         ));
     }
+    if table.primary_key_ordering.len() != table.primary_key.len() {
+        return Err(TableSyncError::InvalidTable(format!(
+            "primary-key ordering has {} entries for {} columns",
+            table.primary_key_ordering.len(),
+            table.primary_key.len()
+        )));
+    }
     if chunk_size == 0 {
         return Err(TableSyncError::InvalidTable(
             "chunk size must be greater than zero".to_string(),
@@ -257,6 +328,7 @@ pub(crate) fn sync_chunk_request(
     SyncChunkRequest {
         table: table.name.clone(),
         primary_key: table.primary_key.clone(),
+        primary_key_ordering: table.primary_key_ordering.clone(),
         columns: table.columns.clone(),
         start_after,
         end_at,

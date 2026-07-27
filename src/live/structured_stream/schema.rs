@@ -418,49 +418,7 @@ fn is_set_column(column_type: u8, metadata: u16) -> bool {
             && metadata >> 8 == u16::from(MYSQL_COLUMN_TYPE_SET))
 }
 
-pub(super) fn parse_enum_column_type(column_type: &str) -> Option<Vec<String>> {
-    let values = column_type.strip_prefix("enum(")?.strip_suffix(')')?;
-    Some(parse_sql_string_list(values))
-}
-
-pub(super) fn parse_set_column_type(column_type: &str) -> Option<Vec<String>> {
-    let values = column_type.strip_prefix("set(")?.strip_suffix(')')?;
-    Some(parse_sql_string_list(values))
-}
-
-pub(super) fn parse_sql_string_list(values: &str) -> Vec<String> {
-    let mut parsed = Vec::new();
-    let mut chars = values.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character == '\'' {
-            parsed.push(parse_sql_string_value(&mut chars));
-        }
-    }
-    parsed
-}
-
-pub(super) fn parse_sql_string_value<I>(chars: &mut std::iter::Peekable<I>) -> String
-where
-    I: Iterator<Item = char>,
-{
-    let mut value = String::new();
-    while let Some(character) = chars.next() {
-        match character {
-            '\'' if chars.peek() == Some(&'\'') => {
-                value.push('\'');
-                chars.next();
-            }
-            '\'' => break,
-            '\\' => {
-                if let Some(escaped) = chars.next() {
-                    value.push(escaped);
-                }
-            }
-            _ => value.push(character),
-        }
-    }
-    value
-}
+pub(super) use crate::sql_type::{parse_enum_column_type, parse_set_column_type};
 
 pub(super) fn is_signed_integer_column(data_type: &str, column_type: &str) -> bool {
     matches!(

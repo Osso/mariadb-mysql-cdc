@@ -63,6 +63,8 @@ pub struct NonSyncableCatalog {
 pub struct SyncableTableEntry {
     pub name: String,
     pub primary_key: Vec<String>,
+    #[serde(default)]
+    pub primary_key_ordering: Vec<table_sync::SyncPrimaryKeyOrdering>,
     pub columns: Vec<String>,
     pub estimated_source_rows: u64,
     pub parent_dependencies: Vec<String>,
@@ -335,6 +337,8 @@ fn syncable_entry(
     SyncableTableEntry {
         name: table.name.clone(),
         primary_key: table.primary_key.clone(),
+        primary_key_ordering: table_sync::primary_key_ordering_from_inventory(table)
+            .expect("catalog primary-key columns exist in source inventory"),
         columns: writable_columns(table),
         estimated_source_rows: estimated_rows.get(&table.name).copied().unwrap_or(0),
         parent_dependencies: inventory
@@ -1062,6 +1066,7 @@ fn catalog_table_sync_config(
         table: table_sync::SyncTable {
             name: entry.name.clone(),
             primary_key: entry.primary_key.clone(),
+            primary_key_ordering: entry.primary_key_ordering.clone(),
             columns: entry.columns.clone(),
         },
         chunk_size: config.chunk_size,
@@ -3107,6 +3112,7 @@ mod tests {
         let entry = SyncableTableEntry {
             name: "orphaned_rows".to_string(),
             primary_key: vec!["id".to_string()],
+            primary_key_ordering: vec![table_sync::SyncPrimaryKeyOrdering::Native],
             columns: vec!["id".to_string()],
             estimated_source_rows: 1,
             parent_dependencies: vec![],
@@ -3253,6 +3259,7 @@ mod tests {
         SyncableTableEntry {
             name: name.into(),
             primary_key: vec!["id".into()],
+            primary_key_ordering: vec![table_sync::SyncPrimaryKeyOrdering::Native],
             columns: vec!["id".into()],
             estimated_source_rows: rows,
             parent_dependencies: parents.iter().map(|v| (*v).into()).collect(),

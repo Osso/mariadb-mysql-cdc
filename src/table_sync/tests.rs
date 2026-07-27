@@ -732,6 +732,7 @@ fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
     let table = SyncTable {
         name: "guests".to_string(),
         primary_key: vec!["guest_id".to_string()],
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: vec![
             "guest_id".to_string(),
             "guest_hash".to_string(),
@@ -952,6 +953,7 @@ fn later_update_statement_repair_does_not_replay_committed_subbatch() {
     let wide_table = SyncTable {
         name: "wide_accounts".to_string(),
         primary_key: vec!["id".to_string()],
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: std::iter::once("id".to_string())
             .chain((1..=256).map(|index| format!("value_{index}")))
             .collect(),
@@ -1171,6 +1173,10 @@ fn rejects_range_bounds_with_wrong_composite_primary_key_arity() {
     let table = SyncTable {
         name: "accounts".to_string(),
         primary_key: vec!["tenant_id".to_string(), "id".to_string()],
+        primary_key_ordering: vec![
+            SyncPrimaryKeyOrdering::Native,
+            SyncPrimaryKeyOrdering::Native,
+        ],
         columns: vec!["tenant_id".to_string(), "id".to_string()],
     };
 
