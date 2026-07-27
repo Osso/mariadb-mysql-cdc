@@ -516,6 +516,27 @@ impl ParentRepairStore for MySqlParentRepairStore<'_> {
         self.read_parent(&self.context.target, identity)
     }
 
+    fn converged_parents(
+        &mut self,
+        identities: &[ParentIdentity],
+    ) -> Result<BTreeSet<ParentIdentity>, String> {
+        let mut converged = BTreeSet::new();
+        for (table_name, table_identities) in group_identities_by_table(identities) {
+            let table = self.table(&table_name)?;
+            let source = self.read_parents_batch(&self.context.source, table, &table_identities)?;
+            if source.is_empty() {
+                continue;
+            }
+            let target = self.read_parents_batch(&self.context.target, table, &table_identities)?;
+            for (identity, source_row) in source {
+                if target.get(&identity) == Some(&source_row) {
+                    converged.insert(identity);
+                }
+            }
+        }
+        Ok(converged)
+    }
+
     fn repair_parent(&mut self, row: &ParentRepairRow) -> Result<(), String> {
         let table = self.table(&row.table)?.clone();
         let snapshot_row = parent_snapshot_row(&table, row)?;
@@ -709,6 +730,46 @@ impl MySqlParentRepairStore<'_> {
         ))
     }
 
+    /// Reads one parent table's identities in a single statement, keeping only unambiguous matches.
+    ///
+    /// An identity that returns more than one row is omitted rather than reported, so the caller
+    /// cannot treat it as converged and the per-identity path still raises the ambiguity error.
+    fn read_parents_batch(
+        &self,
+        reader: &MySqlSyncReader,
+        table: &TableInventory,
+        identities: &[ParentIdentity],
+    ) -> Result<BTreeMap<ParentIdentity, ParentRepairRow>, String> {
+        let keys = identities
+            .iter()
+            .map(|identity| identity.values.clone())
+            .collect::<Vec<_>>();
+        let rows = reader
+            .read_exact_inventory_rows_batch(table, &keys)
+            .map_err(|error| error.to_string())?;
+        let mut by_identity: BTreeMap<ParentIdentity, Vec<ParentRepairRow>> = BTreeMap::new();
+        for row in rows {
+            let values = row_identity(table, &row).map_err(|error| error.to_string())?;
+            by_identity
+                .entry(ParentIdentity {
+                    table: table.name.clone(),
+                    values,
+                })
+                .or_default()
+                .push(ParentRepairRow {
+                    table: table.name.clone(),
+                    values: row.values.clone(),
+                });
+        }
+        Ok(by_identity
+            .into_iter()
+            .filter_map(|(identity, mut rows)| match rows.len() {
+                1 => Some((identity, rows.remove(0))),
+                _ => None,
+            })
+            .collect())
+    }
+
     fn read_parent(
         &self,
         reader: &MySqlSyncReader,
@@ -785,6 +846,23 @@ fn parent_snapshot_row(
         primary_key,
         values: row.values.clone(),
     })
+}
+
+/// Groups parent identities by table so each table is read in one statement.
+///
+/// A child batch usually references several parent tables, and one row-constructor `IN` cannot span
+/// tables. Grouping keeps the round-trip count at one per parent table per side.
+fn group_identities_by_table(
+    identities: &[ParentIdentity],
+) -> BTreeMap<String, Vec<ParentIdentity>> {
+    let mut grouped: BTreeMap<String, Vec<ParentIdentity>> = BTreeMap::new();
+    for identity in identities {
+        grouped
+            .entry(identity.table.clone())
+            .or_default()
+            .push(identity.clone());
+    }
+    grouped
 }
 
 /// Fails closed unless every repaired row has exactly one equal row on the target.

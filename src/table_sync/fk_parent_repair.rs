@@ -38,6 +38,21 @@ pub(crate) trait ParentRepairStore {
     ) -> Result<Option<ParentRepairRow>, String>;
 
     fn repair_parent(&mut self, row: &ParentRepairRow) -> Result<(), String>;
+
+    /// Returns the identities whose target parent already equals its source parent.
+    ///
+    /// An already-converged parent needs no repair, but proving that per identity costs one source
+    /// read plus one target read, and both are round-trip bound. A child batch normally names one
+    /// distinct parent identity per row per foreign key, so the common case paid two round-trips per
+    /// row for parents that were already correct. Answering the same question once per batch keeps
+    /// the recursive path for the identities that actually diverge.
+    ///
+    /// An ambiguous or absent parent must not be reported as converged, so the per-identity path
+    /// still produces its exact error.
+    fn converged_parents(
+        &mut self,
+        identities: &[ParentIdentity],
+    ) -> Result<BTreeSet<ParentIdentity>, String>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +79,9 @@ pub(crate) enum ParentRepairError {
         identity: ParentIdentity,
         message: String,
     },
+    ConvergedParentRead {
+        message: String,
+    },
 }
 
 impl fmt::Display for ParentRepairError {
@@ -78,14 +96,43 @@ pub(crate) fn repair_fk_parents_and_retry(
     ordered_edges: &[ForeignKeyEdge],
     store: &mut impl ParentRepairStore,
 ) -> Result<(), ParentRepairError> {
-    let mut repaired = BTreeSet::new();
     let mut path = Vec::new();
+    let mut repaired = converged_batch_parents(child_rows, ordered_edges, store)?;
 
     for child_row in child_rows {
         repair_row_parents(child_row, ordered_edges, store, &mut repaired, &mut path)?;
     }
 
     Ok(())
+}
+
+/// Proves in one batch which of the child batch's direct parents are already converged.
+///
+/// Only direct parents are pre-checked. A transitive grandparent is reached exclusively through a
+/// parent that diverged, which is the uncommon case the recursive path still handles per identity.
+fn converged_batch_parents(
+    child_rows: &[ParentRepairRow],
+    ordered_edges: &[ForeignKeyEdge],
+    store: &mut impl ParentRepairStore,
+) -> Result<BTreeSet<ParentIdentity>, ParentRepairError> {
+    let mut identities = BTreeSet::new();
+    for child_row in child_rows {
+        for edge in ordered_edges
+            .iter()
+            .filter(|edge| edge.child_table == child_row.table)
+        {
+            if let Some(identity) = parent_identity(child_row, edge)? {
+                identities.insert(identity);
+            }
+        }
+    }
+    if identities.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let identities = identities.into_iter().collect::<Vec<_>>();
+    store
+        .converged_parents(&identities)
+        .map_err(|message| ParentRepairError::ConvergedParentRead { message })
 }
 
 fn repair_row_parents(
@@ -215,6 +262,8 @@ mod tests {
         drop_parent_repair: bool,
         error_after_parent_repair: Option<String>,
         repaired: Vec<ParentIdentity>,
+        converged_batches: Vec<Vec<ParentIdentity>>,
+        source_reads: Vec<ParentIdentity>,
     }
 
     impl ParentRepairStore for RecordingStore {
@@ -222,6 +271,7 @@ mod tests {
             &mut self,
             identity: &ParentIdentity,
         ) -> Result<Option<ParentRepairRow>, String> {
+            self.source_reads.push(identity.clone());
             if let Some(error) = self.source_errors.get(identity) {
                 return Err(error.clone());
             }
@@ -233,6 +283,22 @@ mod tests {
             identity: &ParentIdentity,
         ) -> Result<Option<ParentRepairRow>, String> {
             Ok(self.target.get(identity).cloned())
+        }
+
+        fn converged_parents(
+            &mut self,
+            identities: &[ParentIdentity],
+        ) -> Result<BTreeSet<ParentIdentity>, String> {
+            self.converged_batches.push(identities.to_vec());
+            let mut converged = BTreeSet::new();
+            for identity in identities {
+                if let Some(source) = self.source.get(identity)
+                    && self.target.get(identity) == Some(source)
+                {
+                    converged.insert(identity.clone());
+                }
+            }
+            Ok(converged)
         }
 
         fn repair_parent(&mut self, row: &ParentRepairRow) -> Result<(), String> {
@@ -335,6 +401,69 @@ mod tests {
         repair_fk_parents_and_retry("guests", &[child], &edges, &mut store).unwrap();
 
         assert!(store.repaired.is_empty());
+    }
+
+    /// A converged parent used to cost one source read plus one target read per child row. The batch
+    /// pre-check must answer for the whole batch in one call and leave the per-identity reads unused.
+    #[test]
+    fn converged_parents_are_proven_once_for_the_whole_batch() {
+        let edges = vec![edge("users_profiles", "user_id", "users", "id")];
+        let children = (1..=64)
+            .map(|id| {
+                row(
+                    "users_profiles",
+                    &[
+                        ("id", Some(&id.to_string())),
+                        ("user_id", Some(&id.to_string())),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut store = RecordingStore::default();
+        for id in 1..=64 {
+            let parent = row("users", &[("id", Some(&id.to_string()))]);
+            store
+                .source
+                .insert(identity("users", "id", &id.to_string()), parent.clone());
+            store
+                .target
+                .insert(identity("users", "id", &id.to_string()), parent);
+        }
+
+        repair_fk_parents_and_retry("users_profiles", &children, &edges, &mut store).unwrap();
+
+        assert_eq!(store.converged_batches.len(), 1);
+        assert_eq!(store.converged_batches[0].len(), 64);
+        assert!(store.source_reads.is_empty(), "{:?}", store.source_reads);
+        assert!(store.repaired.is_empty());
+    }
+
+    #[test]
+    fn a_parent_absent_from_the_batch_check_is_still_repaired_per_identity() {
+        let edges = vec![edge("users_profiles", "user_id", "users", "id")];
+        let children = vec![
+            row(
+                "users_profiles",
+                &[("id", Some("1")), ("user_id", Some("1"))],
+            ),
+            row(
+                "users_profiles",
+                &[("id", Some("2")), ("user_id", Some("2"))],
+            ),
+        ];
+        let converged = row("users", &[("id", Some("1"))]);
+        let missing = row("users", &[("id", Some("2"))]);
+        let mut store = RecordingStore::default();
+        store
+            .source
+            .insert(identity("users", "id", "1"), converged.clone());
+        store.target.insert(identity("users", "id", "1"), converged);
+        store.source.insert(identity("users", "id", "2"), missing);
+
+        repair_fk_parents_and_retry("users_profiles", &children, &edges, &mut store).unwrap();
+
+        assert_eq!(store.repaired, vec![identity("users", "id", "2")]);
+        assert_eq!(store.source_reads, vec![identity("users", "id", "2")]);
     }
 
     #[test]

@@ -648,6 +648,19 @@ fn missing_fk_parent_is_repaired_before_child_retry_and_progress_advance() {
             Ok(self.target_parents.get(identity).cloned())
         }
 
+        fn converged_parents(
+            &mut self,
+            identities: &[ParentIdentity],
+        ) -> Result<BTreeSet<ParentIdentity>, String> {
+            let mut converged = BTreeSet::new();
+            for identity in identities {
+                if self.target_parents.get(identity) == Some(&self.source_parent) {
+                    converged.insert(identity.clone());
+                }
+            }
+            Ok(converged)
+        }
+
         fn repair_parent(&mut self, row: &ParentRepairRow) -> Result<(), String> {
             self.operations
                 .push("insert-parent:utms:184041".to_string());
