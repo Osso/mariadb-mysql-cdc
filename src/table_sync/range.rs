@@ -657,6 +657,7 @@ where
                 &mut report,
                 SyncPhase::Verify,
             )?;
+            record_terminal_verification_heartbeat(context)?;
             break;
         }
 
@@ -692,8 +693,10 @@ where
                 &mut report,
                 SyncPhase::Verify,
             )?;
+            record_terminal_verification_heartbeat(context)?;
             break;
         }
+        record_terminal_verification_heartbeat(context)?;
         start_after = Some(end_at);
     }
 
@@ -714,6 +717,18 @@ where
         );
     }
     Ok(())
+}
+
+fn record_terminal_verification_heartbeat<S, T, R, P>(
+    context: &mut RangeExecution<'_, S, T, R, P>,
+) -> Result<(), TableSyncError>
+where
+    S: SyncTableReader,
+    T: SyncTableReader,
+    R: SyncRepairTarget,
+    P: SyncProgressStore,
+{
+    context.progress_store.save(&context.progress)
 }
 
 fn verification_result<S, T, R, P>(

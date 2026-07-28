@@ -1662,6 +1662,20 @@ fn apply_completes_after_the_terminal_pass_converges_a_missing_row() {
         "the missing row is inserted, not merely counted"
     );
     assert!(progress_store.errors.borrow().is_empty());
+    let verified_cursor_heartbeats = progress_store
+        .saved
+        .borrow()
+        .iter()
+        .filter(|progress| {
+            progress.status == progress::SyncProgressStatus::Running
+                && progress.last_primary_key.as_deref() == Some(&["1".to_string()])
+                && progress.chunks == 1
+        })
+        .count();
+    assert_eq!(
+        verified_cursor_heartbeats, 3,
+        "terminal verification refreshes activity without advancing repair progress"
+    );
     assert_eq!(
         progress_store
             .saved
