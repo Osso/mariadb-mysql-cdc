@@ -19,7 +19,10 @@ the production-observed unqualified multi-clause `ALTER TABLE` form with
 `ADD COLUMN` under the exact unquoted type grammar
 `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`,
 the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and named
-composite `ADD KEY` or `ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with
+composite `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, or
+`ADD UNIQUE KEY` clauses. Multiple admitted clauses render in source order as
+deterministic MySQL 8 SQL; source `ADD INDEX` emits as target `ADD KEY`. The
+slice also admits `DROP COLUMN IF EXISTS` with
 ASCII-case-insensitive target matching, one emitted drop per matched target spelling,
 and absent or repeated case-variant no-ops; and the production-observed unqualified
 multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form. For the

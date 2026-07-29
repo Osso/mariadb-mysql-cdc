@@ -19,8 +19,11 @@ Automatic DDL admission currently has five narrow slices:
   `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
   quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
   rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
-  `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and a named
-  composite `ADD KEY` or `ADD UNIQUE KEY`, plus `DROP COLUMN IF EXISTS` with
+  `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and named composite
+  `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD
+  UNIQUE KEY` clauses. Multiple admitted clauses are rendered in source order
+  as deterministic MySQL 8 SQL; source `ADD INDEX` is emitted as target `ADD
+  KEY`. The slice also admits `DROP COLUMN IF EXISTS` with
   ASCII-case-insensitive target matching, one emitted drop per matched target spelling,
   and absent or repeated case-variant no-ops; this path records a
   canonical typed clause AST,

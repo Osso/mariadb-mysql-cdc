@@ -1621,6 +1621,23 @@ fn production_add_column_and_key_ddl_transforms_to_deterministic_mysql8_sql() {
 }
 
 #[test]
+fn production_multiple_add_index_clauses_transform_to_deterministic_mysql8_sql() {
+    let source_sql = "ALTER TABLE `contact_forms`\n\
+         ADD INDEX `idx_type_create_time` (`contact_form_type_id`, `create_time`),\n\
+         ADD INDEX `idx_context_create_time` (`context`, `create_time`)";
+
+    let transformation = transform_production_alter_table(source_sql)
+        .expect("production multiple ADD INDEX clauses must be translatable");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `contact_forms` ADD KEY `idx_type_create_time` (`contact_form_type_id`, `create_time`), ADD KEY `idx_context_create_time` (`context`, `create_time`)"
+        )
+    );
+}
+
+#[test]
 fn production_add_unique_key_transforms_to_deterministic_mysql8_sql() {
     let transformation = transform_production_alter_table(
         "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email (email)",

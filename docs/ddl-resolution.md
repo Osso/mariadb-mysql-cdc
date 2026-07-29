@@ -10,8 +10,11 @@ metadata and no FK dependency; the production-observed unqualified multi-clause
 `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
 quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
 rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
-`DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, named composite `ADD KEY`
-or `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS`
+`DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, named composite `ADD
+KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
+clauses. Multiple admitted clauses render in source order as deterministic MySQL
+8 SQL; source `ADD INDEX` emits as target `ADD KEY`. The slice also admits
+`DROP COLUMN IF EXISTS`
 with ASCII-case-insensitive target matching, one emitted drop per matched target spelling, and absent or repeated case-variant no-ops; the source-only
 `CREATE PROCEDURE` statements matching either private exact hash for the exact
 routine identity `apply_release_move_purchase_repair`; public documentation

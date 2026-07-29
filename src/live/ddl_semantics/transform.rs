@@ -1407,7 +1407,9 @@ fn parse_production_add_clause(
         Some(kind) if kind == "COLUMN" => {
             parse_add_column_clause(tokens, quoted_flags, index, literals)
         }
-        Some(kind) if kind == "KEY" => parse_add_key_clause(tokens, index + 1, table, false),
+        Some(kind) if matches!(kind.as_str(), "KEY" | "INDEX") => {
+            parse_add_key_clause(tokens, index + 1, table, false)
+        }
         Some(kind) if kind == "UNIQUE" => {
             require_keyword(tokens, index + 2, "KEY")?;
             parse_add_key_clause(tokens, index + 2, table, true)

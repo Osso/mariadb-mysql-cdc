@@ -29,13 +29,13 @@ allowlist.
 
 ### Current implemented slice
 
-- [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`, named `ADD KEY`, and named `ADD UNIQUE KEY` clauses.
+- [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`, named `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, and named `ADD UNIQUE KEY` clauses; preserve clause order and render deterministic MySQL 8 SQL with source `ADD INDEX` emitted as target `ADD KEY`.
 - [x] Convert MariaDB `ALTER TABLE ... DROP COLUMN IF EXISTS ...` into MySQL 8 `DROP COLUMN` clauses by matching target identifiers ASCII-case-insensitively, emitting each matched target spelling once, and treating absent or repeated case-variant clauses as proven no-ops.
 - [x] Transform the generic exact unqualified, unquoted `DROP PROCEDURE IF EXISTS <identifier>` form and the exact unqualified, unquoted plain `DROP PROCEDURE apply_release_move_purchase_repair` form using target-local routine inventory. An existing target routine emits deterministic MySQL `DROP PROCEDURE` with the target spelling backtick-quoted; an absent target records a proven no-op. Qualified, quoted, commented, and other plain-name variants remain `translation_pending` barriers.
 - [x] Admit the source-only `CREATE PROCEDURE` form only when the complete statement matches one of two private exact hashes for the exact unqualified routine identity `apply_release_move_purchase_repair`. Admission precedes generic qualified-identifier rejection because the admitted statements contain qualified tokens. Require the target routine to be absent before and after evidence capture, execute no target SQL, and record a proven no-op. The body is never executed; data effects may arrive only through subsequent source ROW/FULL events in source order. An existing `translation_pending` row promotes automatically after exact-hash admission. Every other body, name, and routine DDL remains a `translation_pending` barrier. Raw production procedure bodies, `DEFINER` hosts, and event coordinates are intentionally excluded from public documentation.
 - [x] Transform the observed `ADD COLUMN` forms only under the exact unquoted type grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`, with the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options. Expected post-state for added character columns records the table-inherited character set and collation so live inventory comparison matches MySQL metadata. The type keyword, `VARCHAR` parentheses and length, and `UNSIGNED` keyword must be unquoted; `DATETIME` precision and `SMALLINT` display width are unsupported.
 - [x] Reject quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms as unsupported syntax. These variants remain `translation_pending` with no target DDL or checkpoint advance.
-- [x] Transform named composite `ADD KEY` and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; broader index and clause options remain outside this slice.
+- [x] Transform named composite `ADD KEY`, MariaDB-syntax `ADD INDEX`, and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; multiple admitted clauses remain ordered, source `ADD INDEX` emits as target `ADD KEY`, and broader index and clause options remain outside this slice.
 - [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
 - [x] Record expected target object state for crash/replay verification without treating that evidence as source/target reconciliation.
 - [x] Fail closed as `translation_pending` before target execution when syntax, context, dependencies, or semantics fall outside that explicit slice; the stream checkpoint and later-event barrier must remain unchanged.
@@ -146,7 +146,7 @@ No other `CREATE TABLE` syntax is admitted.
 - `src/live/ddl_semantics.rs` — dispatches current DDL transformations and
   captures semantic evidence.
 - `src/live/ddl_semantics/transform.rs` — production-derived `ADD COLUMN`,
-  `ADD KEY`, `ADD UNIQUE KEY`, generic and exact `DROP PROCEDURE` translators,
+  `ADD KEY`/MariaDB `ADD INDEX`, `ADD UNIQUE KEY`, generic and exact `DROP PROCEDURE` translators,
   and `RENAME COLUMN IF EXISTS` translators,
   including deterministic SQL emission.
 - `src/live/ddl_semantics/canonical.rs` — typed ALTER clause AST encoding and
@@ -163,7 +163,7 @@ No other `CREATE TABLE` syntax is admitted.
 The current slice is covered by:
 
 - [x] `src/live/ddl_semantics/tests.rs` — deterministic production `ADD COLUMN`,
-      `ADD KEY`, `ADD UNIQUE KEY`, generic and exact `DROP PROCEDURE` SQL/no-op
+      `ADD KEY`/MariaDB `ADD INDEX`, `ADD UNIQUE KEY`, generic and exact `DROP PROCEDURE` SQL/no-op
       behavior, and the exact-hash source-only
       `CREATE PROCEDURE apply_release_move_purchase_repair` form, target-absence
       evidence, and proven no-op behavior,
@@ -200,7 +200,7 @@ transformation contract, a full MariaDB/MySQL matrix, or deployment safety.
 ## Known gaps (current cycle)
 
 - [ ] Extend the current translator beyond the production-observed
-      `ADD COLUMN`/`ADD KEY`/`ADD UNIQUE KEY`/`DROP COLUMN IF EXISTS`, the
+      `ADD COLUMN`/`ADD KEY`/MariaDB `ADD INDEX`/`ADD UNIQUE KEY`/`DROP COLUMN IF EXISTS`, the
       identity-scoped source-only `CREATE PROCEDURE` form, generic and exact
       `DROP PROCEDURE`, and rename slices into the canonical
       MariaDB DDL parser and MySQL 8 transformation pipeline.
@@ -219,8 +219,8 @@ transformation contract, a full MariaDB/MySQL matrix, or deployment safety.
 
 - Manual target-SQL authoring or operator resolution as a CDC fallback.
 - Index-only automatic replay as the target DDL architecture.
-- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`, `ADD KEY`,
-  `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` forms.
+- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`, `ADD KEY`/MariaDB
+  `ADD INDEX`, `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` forms.
 - Additional column types, defaults, clauses, index options, and DDL families not
   listed in the implemented slice.
 - Silently dropping, weakening, or approximating parsed DDL clauses.
