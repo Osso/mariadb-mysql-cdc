@@ -9,6 +9,7 @@ use std::time::Instant;
 
 const TABLE: &str = "comics_releases_views";
 const UTM_COLUMN: &str = "utm_id";
+type CanonicalRowsByKey = BTreeMap<Vec<String>, BTreeMap<String, Option<String>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceSide {
@@ -462,9 +463,7 @@ fn validate_equal_rows(
     Ok(())
 }
 
-fn canonical_rows_by_key(
-    rows: &[SnapshotRow],
-) -> Result<BTreeMap<Vec<String>, BTreeMap<String, Option<String>>>, String> {
+fn canonical_rows_by_key(rows: &[SnapshotRow]) -> Result<CanonicalRowsByKey, String> {
     let mut indexed = BTreeMap::new();
     for row in rows {
         let values = row
