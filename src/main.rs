@@ -44,6 +44,7 @@ Usage:
   mariadb-mysql-cdc sync-schema --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH [--table TABLE ... | --catalog FILE | --all-tables true]
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
+  mariadb-mysql-cdc resolve-comics-releases-views-conflicts --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --run-id ID [--batch-size ROWS]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
 
@@ -68,6 +69,8 @@ Commands:
           Read-only source/target COUNT(*) drift check for selected tables, or all source base tables when no --table is supplied.
   repair-drift
           Inventory both endpoints, count-check source tables, and run bounded sync-table repairs only for drifted tables.
+  resolve-comics-releases-views-conflicts
+          Verify exact unresolved child and referenced UTM rows, then resolve only equal conflicts.
   apply-binlog
           Read remote MariaDB binlog text and apply compatible statements.
   stream-binlog
@@ -182,6 +185,12 @@ fn main() {
         Some("sync-schema") => sync_schema::run_sync_schema_command(args.collect(), USAGE),
         Some("drift-check") => run_drift_check_command(args.collect()),
         Some("repair-drift") => repair_drift::run_repair_drift_command(args.collect(), USAGE),
+        Some("resolve-comics-releases-views-conflicts") => {
+            targeted_conflict_resolution::run_targeted_conflict_resolution_command(
+                args.collect(),
+                USAGE,
+            )
+        }
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),
         Some("stream-binlog") => run_stream_binlog_command(args.collect()),
         Some("-h" | "--help") | None => print!("{USAGE}"),
