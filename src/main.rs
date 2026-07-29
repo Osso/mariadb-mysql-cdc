@@ -24,6 +24,7 @@ mod sync_schema;
 pub mod table_catalog;
 pub mod table_sync;
 pub mod target;
+pub mod targeted_conflict_resolution;
 pub mod validation;
 
 use std::{env, path::PathBuf, time::Duration};
