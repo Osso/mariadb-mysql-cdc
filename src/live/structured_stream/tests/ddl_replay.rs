@@ -318,6 +318,128 @@ fn unsupported_create_table_stays_translation_pending_without_target_or_checkpoi
     assert!(applier.executor().operations().is_empty());
 }
 
+struct DurableBlockedCheckpointStore {
+    checkpoint: crate::checkpoint::Checkpoint,
+    saved: RefCell<Option<crate::checkpoint::Checkpoint>>,
+}
+
+impl StreamCheckpointStore for DurableBlockedCheckpointStore {
+    fn load_checkpoint(&self) -> Result<Option<crate::checkpoint::Checkpoint>, ApplyBinlogError> {
+        Ok(Some(self.checkpoint.clone()))
+    }
+
+    fn save_checkpoint(
+        &self,
+        checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> Result<(), ApplyBinlogError> {
+        self.saved.replace(Some(checkpoint.clone()));
+        Ok(())
+    }
+}
+
+#[test]
+fn unsupported_ddl_keeps_replicator_alive_at_unchanged_checkpoint() {
+    let checkpoint_store = DurableBlockedCheckpointStore {
+        checkpoint: crate::checkpoint::Checkpoint {
+            source_file: "mysqld-bin.000777".to_string(),
+            source_position: 100,
+            gtid: None,
+            event_timestamp: 0,
+            last_event: crate::checkpoint::LastEvent {
+                event_type: "QueryEvent".to_string(),
+                description: "before unsupported DDL".to_string(),
+            },
+        },
+        saved: RefCell::new(None),
+    };
+    let config = ApplyBinlogConfig {
+        source: SourceBinlogConfig {
+            binlog_file: "mysqld-bin.000777".to_string(),
+            start_position: 100,
+            ..SourceBinlogConfig::default()
+        },
+        max_reconnects: 0,
+        reconnect_forever: false,
+        ..ApplyBinlogConfig::default()
+    };
+    let journal = RecordingDdlReplayJournal::default();
+    let semantic_inventory = RecordingSemanticInventory {
+        use_live_transform: true,
+        ..RecordingSemanticInventory::default()
+    };
+    let starts = RefCell::new(Vec::new());
+    let attempts = std::cell::Cell::new(0);
+
+    crate::live::reconnect::run_stream_reconnect_loop(
+        &config,
+        Some(&checkpoint_store),
+        |attempt_config| {
+            starts
+                .borrow_mut()
+                .push(attempt_config.source.start_position);
+            attempts.set(attempts.get() + 1);
+            if attempts.get() > 1 {
+                return Ok(());
+            }
+
+            let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+            let resolver = FixtureSchemaResolver;
+            let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+            let mut current_file = attempt_config.source.binlog_file.clone();
+            let mut transaction = TargetTransaction::default();
+            let event = BinlogEvent::QueryEvent(QueryEvent {
+                thread_id: 1,
+                duration: 0,
+                error_code: 0,
+                status_variables: Vec::new(),
+                database_name: "fixture_cdc".to_string(),
+                sql_statement: "CREATE TABLE accounts (\
+                    id BIGINT NOT NULL PRIMARY KEY, \
+                    email VARCHAR(255) NOT NULL, \
+                    payload VARCHAR(64) NOT NULL, \
+                    created_at DATETIME NOT NULL, \
+                    KEY idx_accounts_payload (payload)\
+                ) ENGINE=InnoDB"
+                    .to_string(),
+            });
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&checkpoint_store),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
+                current_file: &mut current_file,
+                group_config: TargetTransactionGroupConfig::default(),
+            };
+
+            let error = handle_ddl_event(
+                &mut applier,
+                &journal,
+                &semantic_inventory,
+                "production-source",
+                &mut context,
+                &event_header(2, 180),
+                &event,
+            )
+            .expect_err("unsupported CREATE TABLE must block durably");
+
+            assert!(applier.executor().operations().is_empty());
+            Err(error)
+        },
+        |_| {},
+    )
+    .expect("durably blocked DDL must keep the replicator process alive");
+
+    assert_eq!(starts.into_inner(), vec![100, 100]);
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(
+        *journal.status.borrow(),
+        Some(DdlReplayStatus::TranslationPending)
+    );
+    assert!(checkpoint_store.saved.borrow().is_none());
+}
+
 #[test]
 fn fixture_create_table_executes_evidence_sql_and_checkpoints_once() {
     let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
