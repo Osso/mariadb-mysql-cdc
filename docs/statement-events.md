@@ -40,6 +40,12 @@ Automatic DDL admission currently has five narrow slices:
 - the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
   COLUMN IF EXISTS ...` form, which is token-parsed and transformed from target
   column pre-state into deterministic MySQL 8 SQL;
+- the exact production-observed unqualified `CREATE TABLE IF NOT EXISTS
+  home_feed_artist_blacklist` form, including its modeled columns, inline
+  primary key, unique artist index, InnoDB engine, and observed charset/collation.
+  Leading ordinary `--`, `#`, and `/* ... */` comments are ignored before this
+  exact admission; executable comments, MariaDB executable comments, optimizer
+  hints, embedded comments, and other CREATE TABLE forms remain rejected;
 - the source-only `CREATE PROCEDURE` statements matching either recorded hash
   for the exact unqualified routine identity
   `apply_release_move_purchase_repair`. Admission precedes generic
@@ -67,16 +73,20 @@ while old/new coexistence fails closed.
 Other table DDL and unsupported `ALTER TABLE` forms, views, other routine DDL,
 events, triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
 all other procedure bodies or names, plain drops for other names,
-qualified/cross-schema references, quoted or commented forms, other
-definer/security clauses, MariaDB-only syntax, and multi-object or multi-statement
-forms are translation boundaries in the stream event path. The intended behavior
+qualified/cross-schema references, quoted forms, comments outside the exact leading
+ordinary-comment CREATE admission, other definer/security clauses, MariaDB-only
+syntax, and multi-object or multi-statement forms are translation boundaries in the
+stream event path. The intended behavior
 flushes earlier DML, records exact
 SQL/coordinates in `cdc.ddl_replay_journal` as `translation_pending`, and stops
 before advancing. The retired manual ledger has no remaining runtime,
 configuration, bootstrap, grant, or harness dependency.
 
 Qualifier handling is fail-closed outside the identity-scoped source-only
-procedure CREATE form. Tokenization removes comments from syntax but
+procedure CREATE form and the exact production blacklist CREATE form. The
+blacklist CREATE path strips only leading ordinary `--`, `#`, and `/* ... */`
+comments before exact admission; executable comments, optimizer hints, and
+embedded comments remain rejected. Tokenization removes comments from syntax but
 preserves identifier/dot/identifier detection across inline comments; index
 parsing rejects any comment outright. Backticks and ANSI_QUOTES double-quoted
 identifiers are not admitted when their mode is unavailable, except for the

@@ -44,10 +44,11 @@ allowlist.
 - [x] Set journal `transformation_version` and nullable `generated_sql` from the actual transformation before `prepared`; proven no-ops persist `generated_sql = NULL`.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
 
-This is a production-derived ALTER TABLE slice plus one exact fixture CREATE
-TABLE admission, one identity-scoped source-only CREATE PROCEDURE form, and
-two exact procedure-drop admissions, not full ALTER TABLE, generic CREATE TABLE,
-general routine DDL, or the full MariaDB-to-MySQL 8 transformation pipeline. Coordinate-anchored reconstruction
+This is a production-derived ALTER TABLE slice plus one exact production
+`home_feed_artist_blacklist` CREATE TABLE admission, one identity-scoped
+source-only CREATE PROCEDURE form, and two exact procedure-drop admissions, not
+full ALTER TABLE, generic CREATE TABLE, general routine DDL, or the full
+MariaDB-to-MySQL 8 transformation pipeline. Coordinate-anchored reconstruction
 of historical source schema lineage is explicitly excluded from the current
 cycle. The translator may use only semantics completely represented by the
 admitted event AST and fenced target pre-state; it must not infer unmodeled
@@ -75,6 +76,16 @@ broader DDL coverage and operational proof gaps listed below.
       least one inline `PRIMARY KEY`, zero or more one-column named ordinary
       `KEY` items, and `ENGINE=InnoDB` with an optional semicolon. It records a
       typed AST and deterministic MySQL 8 SQL.
+- [x] The exact production-observed unqualified
+      `CREATE TABLE IF NOT EXISTS home_feed_artist_blacklist` form is admitted
+      with its observed `INT`/`MEDIUMINT`/`VARCHAR`/`TIMESTAMP` columns,
+      nullability/defaults, auto-increment inline primary key, unique artist
+      index, `ENGINE=InnoDB`, and `utf8mb4` charset/collation. This is an exact
+      modeled form, not generalized CREATE TABLE support.
+- [x] Leading ordinary `--`, `#`, and `/* ... */` comments are stripped before
+      that exact production CREATE admission. Executable comments, MariaDB
+      executable comments, optimizer hints, embedded comments, and all other
+      commented or unmodeled CREATE forms remain rejected.
 - [x] Production `LiveDdlSemanticInventory` captures source schema
       charset/collation only between fences whose before/after source master
       coordinate exactly equals the event file/end position; the target
@@ -86,7 +97,8 @@ broader DDL coverage and operational proof gaps listed below.
 - [x] Runtime admission executes an admitted grammar form only after the evidence
       gates, validates the exact observed post-state, and checkpoints it.
       Unsupported `CREATE TABLE` variants remain `translation_pending` with zero
-      target DDL and zero checkpoint execution.
+      target DDL and zero checkpoint execution. The exact production blacklist
+      CREATE is the sole additional modeled production form.
 
 The exact production `assistant_reply_reports` CREATE event is a bounded
 convergence recovery, not generic `CREATE TABLE` support. Its target table must
