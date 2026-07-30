@@ -1,10 +1,12 @@
-pub(crate) fn strip_one_leading_mysql_line_comment(sql: &str) -> &str {
-    let sql = sql.trim_start();
-    if is_mysql_line_comment_text(sql) {
-        after_line_comment(sql, 2).trim_start()
-    } else {
-        sql
+pub(crate) fn split_one_leading_mysql_line_comment(sql: &str) -> (Option<&str>, &str) {
+    let trimmed_sql = sql.trim_start();
+    if !is_mysql_line_comment_text(trimmed_sql) {
+        return (None, trimmed_sql);
     }
+
+    let statement_sql = after_line_comment(trimmed_sql, 2).trim_start();
+    let prefix_length = sql.len() - statement_sql.len();
+    (Some(&sql[..prefix_length]), statement_sql)
 }
 
 pub(crate) fn strip_leading_ordinary_ddl_comments(sql: &str) -> Result<&str, String> {

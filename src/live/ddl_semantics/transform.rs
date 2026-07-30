@@ -3,8 +3,8 @@ use super::model::{
     ParsedCreateTableAst, ParsedDropColumnAst, ParsedIndexAst, ParsedIndexKeyPart,
 };
 use super::tokenizer::{
-    ddl_contains_comments, strip_leading_ordinary_ddl_comments,
-    strip_one_leading_mysql_line_comment, tokenize_ddl, tokenize_ddl_with_quoted_flags,
+    ddl_contains_comments, split_one_leading_mysql_line_comment,
+    strip_leading_ordinary_ddl_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -35,10 +35,16 @@ pub fn supports_production_alter_table(source_sql: &str) -> bool {
 }
 
 pub fn transform_production_alter_table(source_sql: &str) -> Result<DdlTransformation, String> {
+    let (leading_comment, _) = split_one_leading_mysql_line_comment(source_sql);
     let ast = parse_production_alter_table_ast(source_sql)?;
+    let rendered_sql = render_production_alter_table(&ast);
+    let target_sql = match leading_comment {
+        Some(comment) => format!("{comment}{rendered_sql}"),
+        None => rendered_sql,
+    };
     Ok(DdlTransformation {
         version: DDL_TRANSFORMATION_VERSION,
-        target_sql: Some(render_production_alter_table(&ast)),
+        target_sql: Some(target_sql),
     })
 }
 
@@ -1471,11 +1477,11 @@ pub fn transform_rename_columns_if_exists(
 }
 
 fn production_alter_sql(source_sql: &str) -> Result<&str, String> {
-    let source_sql = strip_one_leading_mysql_line_comment(source_sql);
-    if ddl_contains_comments(source_sql) {
+    let (_, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
+    if ddl_contains_comments(statement_sql) {
         return Err("production ALTER TABLE comments are not supported".to_string());
     }
-    Ok(source_sql)
+    Ok(statement_sql)
 }
 
 pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterTableAst, String> {
