@@ -1657,6 +1657,21 @@ CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\n\
 
     assert!(evidence.generated_sql.is_some());
     assert!(evidence.expected_post_state.contains("utf8mb4_unicode_ci"));
+    assert!(
+        evidence
+            .expected_post_state
+            .contains("\"data_type\":\"int\"")
+    );
+    assert!(
+        !evidence
+            .expected_post_state
+            .contains("\"data_type\":\"int unsigned\"")
+    );
+    assert!(
+        evidence
+            .expected_post_state
+            .contains("\"extra\":\"DEFAULT_GENERATED\"")
+    );
 }
 
 #[test]

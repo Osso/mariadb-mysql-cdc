@@ -315,7 +315,7 @@ fn expected_create_table_post_state(
             .map(|(index, column)| {
                 let data_type = column
                     .column_type
-                    .split('(')
+                    .split(['(', ' '])
                     .next()
                     .unwrap_or_default()
                     .to_ascii_lowercase();
@@ -337,11 +337,7 @@ fn expected_create_table_post_state(
                         .as_ref()
                         .filter(|value| !value.eq_ignore_ascii_case("NULL"))
                         .cloned(),
-                    extra: if column.auto_increment {
-                        "auto_increment".to_string()
-                    } else {
-                        String::new()
-                    },
+                    extra: expected_create_column_extra(column),
                     comment: String::new(),
                     generated: None,
                 }
@@ -383,6 +379,20 @@ fn expected_create_table_post_state(
         "foreign_keys": [],
     }))
     .map_err(|error| format!("failed to encode expected CREATE TABLE state: {error}"))
+}
+
+fn expected_create_column_extra(column: &super::model::ParsedCreateColumnAst) -> String {
+    if column.auto_increment {
+        return "auto_increment".to_string();
+    }
+    if column
+        .default_sql
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("CURRENT_TIMESTAMP"))
+    {
+        return "DEFAULT_GENERATED".to_string();
+    }
+    String::new()
 }
 
 fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::Value {
