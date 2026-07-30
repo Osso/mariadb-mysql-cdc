@@ -35,8 +35,10 @@ Automatic DDL admission currently has five narrow slices:
   `mysqld-bin.002778:750897987-750898224`, whose raw SQL SHA-256 is
   `ea9f789b158dca0146715bafe9f2712b5945b9c6626411b382347e60e52eb85f`, is
   admitted when this otherwise-supported ALTER has exactly one leading ordinary
-  MySQL `-- ` line comment; embedded comments, executable/version comments,
-  optimizer hints, and all other leading comment forms remain rejected; and
+  MySQL `-- ` line comment. The renderer strips that comment for parsing and
+  prepends its exact source prefix, including the source line ending, to the
+  generated SQL. Embedded comments, executable/version comments, optimizer
+  hints, and all other leading comment forms remain rejected; and
 - the exact production `assistant_reply_reports` `CREATE TABLE` event, which
   is admitted only by its exact raw-event hash after the target table has been
   provisioned out of band from the recorded source definition. Replay fences a
@@ -93,8 +95,10 @@ Qualifier handling is fail-closed outside the identity-scoped source-only
 procedure CREATE form and the exact production blacklist CREATE form. The
 blacklist CREATE path strips only leading ordinary `--`, `#`, and `/* ... */`
 comments before exact admission. The exact production ALTER path strips only one
-leading ordinary MySQL `-- ` line comment. Executable/version comments, optimizer
-hints, embedded comments, and other leading comment forms remain rejected.
+leading ordinary MySQL `-- ` line comment for parsing, then preserves that exact
+source prefix when rendering generated SQL. Executable/version comments,
+optimizer hints, embedded comments, and other leading comment forms remain
+rejected.
 Tokenization removes comments from syntax but preserves identifier/dot/identifier
 detection across inline comments; index parsing rejects any comment outright. Backticks and ANSI_QUOTES double-quoted
 identifiers are not admitted when their mode is unavailable, except for the

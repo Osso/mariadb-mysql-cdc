@@ -54,7 +54,7 @@ This matrix records every current path that removes, ignores, normalizes, or rej
 | Modeled planner CREATE INDEX | `ddl_semantics/transform.rs:render_modeled_index_ddl` | Reconstructed SQL: identifier quoting/order normalized, `USING BTREE` always emitted, default ASC omitted, modeled visibility/comment/key options re-emitted | Non-create or non-BTREE model rejected |
 | Generated planner schema DDL | `ddl_semantics/transform.rs:generated_schema_tokens`, `transform_generated_schema_ddl` | Leading ordinary comments are removed only for validation; emitted SQL preserves them but loses outer whitespace and trailing semicolons | Remaining comments, double quotes, unsupported family/action/type/modifier/options reject generation |
 | Fixture/exact production CREATE TABLE | `ddl_semantics/transform.rs:parse_fixture_create_table`, `transform_fixture_create_table_ast` | All leading ordinary `--`, `#`, `/*...*/` comments removed. Generated SQL drops `IF NOT EXISTS`, original formatting/casing, integer display widths, inline PRIMARY KEY placement, and original `CHARSET` spelling; it re-quotes identifiers and canonicalizes defaults/options. | Any remaining comment (including executable comment/hint), double quote, unsupported type/engine/trailing option/shape blocks |
-| Production ADD COLUMN/ADD KEY ALTER | `ddl_semantics/transform.rs:production_alter_sql`, `render_production_alter_table` | Exactly one leading MySQL `-- ` comment removed. Output drops source formatting/casing; `ADD INDEX` becomes `ADD KEY`; column null/default form is canonicalized; identifiers and string literals are re-quoted. | Any remaining comment, unsupported clause/type/option/quote/shape blocks |
+| Production ADD COLUMN/ADD KEY ALTER | `ddl_semantics/transform.rs:production_alter_sql`, `render_production_alter_table` | Exactly one leading ordinary MySQL `-- ` comment is stripped for parsing and reattached verbatim to rendered SQL, including its source line ending. Output drops source formatting/casing; `ADD INDEX` becomes `ADD KEY`; column null/default form is canonicalized; identifiers and string literals are re-quoted. | Any remaining comment, unsupported clause/type/option/quote/shape blocks |
 | `DROP COLUMN IF EXISTS` ALTER | `ddl_semantics/transform.rs:transform_drop_columns_if_exists` | Leading comment behavior above; `IF EXISTS` removed; absent target columns and repeated case variants are omitted; entire target SQL becomes `None` when no target column remains | Mixed/unsupported clauses block |
 | `RENAME COLUMN IF EXISTS` ALTER | `ddl_semantics/transform.rs:transform_rename_columns_if_exists` | `tokenize_ddl` removes every comment form anywhere, including executable comments/hints. Output removes `IF EXISTS`, formatting, and non-executable absent clauses; can become `None`. | Ambiguous target state or unsupported shape blocks |
 | DROP PROCEDURE | `ddl_semantics/transform.rs:parse_supported_drop_procedure`, `transform_drop_procedure` | Output removes `IF EXISTS`, source formatting, and source spelling in favor of matched target spelling; becomes `None` if target procedure is absent | Any comment, double quote, qualification, extra token, or unsupported plain name blocks |
@@ -76,7 +76,7 @@ This matrix records every current path that removes, ignores, normalizes, or rej
 | Generic target execution error | No DDL journal state in generic path | No checkpoint | Fatal `Statement` error; exits |
 | Retryable source transport error | No query mutation | Resume from durable checkpoint | Internal bounded/unbounded reconnect; process stays alive |
 
-## First production-fidelity RED test
+## Production-fidelity preservation test
 
 Use the exact previously observed event, because it proves a source component was silently removed on the production automatic-DDL path:
 
@@ -97,6 +97,6 @@ ALTER TABLE `artists_imprints`\r\n\
 }
 ```
 
-Current result must be RED: `render_production_alter_table` emits only `ALTER TABLE ... ADD KEY ...`, because `production_alter_sql` removes the comment before parsing and the AST carries no comment node.
+At commit `f9b35d5`, the supported production ALTER renderer preserves the exact leading ordinary MySQL `-- ` comment prefix, including its source line ending, while still rendering the parsed ALTER body deterministically. This behavior is limited to this production ALTER path; other comment forms and query paths retain their separately documented behavior.
 
-The separate non-fatal-blocking RED test comes second. Combining it with preservation would hide which contract failed first.
+The separate non-fatal-blocking RED test remains independent. Combining it with preservation would hide which contract failed first.
