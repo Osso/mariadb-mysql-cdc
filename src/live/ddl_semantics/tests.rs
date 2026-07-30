@@ -1764,7 +1764,7 @@ fn production_multiple_add_index_clauses_transform_to_deterministic_mysql8_sql()
 }
 
 #[test]
-fn production_add_key_with_observed_leading_comment_transforms() {
+fn observed_alter_preserves_its_leading_comment_in_generated_sql() {
     let source_sql = "-- The serve-time blacklist check resolves a blacklisted artist's imprints.\r\n\
 ALTER TABLE `artists_imprints`\r\n\
     ADD KEY `idx_artist_id` (`artist_id`)";
@@ -1774,7 +1774,10 @@ ALTER TABLE `artists_imprints`\r\n\
 
     assert_eq!(
         transformation.target_sql.as_deref(),
-        Some("ALTER TABLE `artists_imprints` ADD KEY `idx_artist_id` (`artist_id`)")
+        Some(
+            "-- The serve-time blacklist check resolves a blacklisted artist's imprints.\r\n\
+ALTER TABLE `artists_imprints` ADD KEY `idx_artist_id` (`artist_id`)"
+        )
     );
 }
 
