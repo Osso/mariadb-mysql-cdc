@@ -116,7 +116,11 @@ coordinates, schema, and raw SQL. It stores:
 
 The event-end checkpoint does not advance. The earliest
 `translation_pending`, `prepared`, or `blocked` row for the source identity is a
-startup barrier, so later source coordinates cannot overtake it.
+startup barrier, so later source coordinates cannot overtake it. Once the
+journal barrier is durable, the live reconnect loop retries the same source
+coordinate in-process indefinitely without consuming the ordinary transport
+retry budget. It does not skip the event, advance the checkpoint, or execute raw
+source SQL.
 
 ### Translator becomes available
 
@@ -221,8 +225,10 @@ A restart never blindly re-executes a `prepared` DDL. Reconciliation can finaliz
 only when observed target state exactly equals a unique expected post-state and
 differs from the recorded pre-state. Observed pre-state, both/neither states,
 mixed/unavailable proof, or any mismatch transitions the row to `blocked` and
-halts progress. Target-binlog receipt is unavailable; this is semantic proof
-only.
+halts progress at that source coordinate. The durable block keeps the process
+alive while the reconnect loop retries in-process without consuming the ordinary
+transport retry budget. Target-binlog receipt is unavailable; this is semantic
+proof only.
 
 ### Journal inspection
 
@@ -253,7 +259,9 @@ immutable evidence and target state. Do not apply an operator-authored SQL
 statement or mutate the journal to bypass the barrier. A `translation_pending`
 row is cleared only by translator code becoming available and automatic
 promotion; a `blocked` row requires an explicitly reviewed product/operations
-resolution outside this runtime slice.
+resolution outside this runtime slice. Until that resolution is proven, the
+process remains alive at the unchanged checkpoint and retries the barrier; it
+never skips the source event or falls back to raw SQL.
 
 ## Runtime grant contract
 

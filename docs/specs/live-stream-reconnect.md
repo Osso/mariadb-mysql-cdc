@@ -17,6 +17,10 @@ source connection loss without replaying from static startup coordinates.
   last durable coordinate.
 - [x] After a durably persisted row conflict, roll back, keep the checkpoint
   unchanged, and retry the same transaction in-process with bounded backoff.
+- [x] After unsupported or semantically blocked automatic DDL persists its
+  journal barrier, keep the checkpoint unchanged and retry the same source
+  coordinate in-process indefinitely without consuming the ordinary transport
+  retry budget. Never skip the DDL or execute its raw source SQL.
 - [x] For an `INSERT` into `globalcomix.payments` that returns MySQL `1644` with
       the exact message `This external payment has already been applied to a
       previous order`, roll back and inspect the target row selected by source
@@ -51,11 +55,17 @@ source connection loss without replaying from static startup coordinates.
   real-database proof remains a separate unchecked gap below.
 - [x] Stop and fail explicitly on other non-transient errors such as authentication
   failure, missing binlog file, unsupported event type, quarantine, or target
-  write failure without durable row-conflict evidence.
+  write failure without durable row-conflict evidence. Durable automatic-DDL
+  barriers are the explicit exception: they remain process-live and retry at the
+  unchanged coordinate.
 
 Reconnect/backoff applies after transient source loss and after a durable row
-conflict. Ordinary transport reconnects use a default budget of 12 after the
-initial attempt (13 attempts total). `--max-reconnects 0` disables reconnects
+conflict. Durable automatic-DDL barriers use a separate process-live retry loop:
+they retry indefinitely from the unchanged checkpoint without consuming the
+ordinary transport retry budget, and they never skip or raw-execute the source
+statement. Generic non-DDL quarantine and mapping errors remain fatal. Ordinary
+transport reconnects use a default budget of 12 after the initial attempt (13
+attempts total). `--max-reconnects 0` disables reconnects
 unless `--reconnect-forever true` is set; the latter removes the ordinary
 transport cap and admits exact-parent retries even when the max is zero. An
 exact-parent retry is admitted only with a positive `max-reconnects` setting or
@@ -158,6 +168,9 @@ identity matching stops immediately.
   `--reconnect-forever true` allows unlimited retryable stream failures, and
   non-transient or purged-binlog failures do not reconnect. Exact-parent retry
   budget behavior is covered separately below.
+- `src/live/structured_stream/tests/ddl_replay.rs` — asserts an unsupported DDL
+  barrier keeps the process-live reconnect loop at the unchanged checkpoint,
+  with no target execution or checkpoint write.
 - `src/live/tests/reconnect.rs` — asserts exact parent recovery is admitted only
   after its retry gate, observes the unchanged checkpoint, retries failed
   recoveries beyond the ordinary transport budget, and mutates each distinct

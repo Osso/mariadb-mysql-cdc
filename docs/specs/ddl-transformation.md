@@ -39,11 +39,12 @@ allowlist.
 - [x] Transform named composite `ADD KEY`, MariaDB-syntax `ADD INDEX`, and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; multiple admitted clauses remain ordered, source `ADD INDEX` emits as target `ADD KEY`, and broader index and clause options remain outside this slice.
 - [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
 - [x] Record expected target object state for crash/replay verification without treating that evidence as source/target reconciliation.
-- [x] Fail closed as `translation_pending` before target execution when syntax, context, dependencies, or semantics fall outside that explicit slice; the stream checkpoint and later-event barrier must remain unchanged.
+- [x] Fail closed as `translation_pending` before target execution when syntax, context, dependencies, or semantics fall outside that explicit slice; the stream checkpoint and later-event barrier must remain unchanged, and the durable DDL block retries in-process without skipping or executing raw source SQL.
 - [x] Carry `TIMESTAMP` column types across unchanged. The former unconditional `TIMESTAMP` to `DATETIME` rewrite is removed: MySQL rejects values past 2038-01-19 that MariaDB 11 accepts, but no source column holds one, so the rewrite bought nothing and would have required rebuilding 384 tables and about 864 GB with `ALGORITHM=COPY`.
 - [x] Emit deterministic MySQL 8 SQL and record transformation version `mariadb-mysql8-v1`.
 - [x] Set journal `transformation_version` and nullable `generated_sql` from the actual transformation before `prepared`; proven no-ops persist `generated_sql = NULL`.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
+- [x] Keep unsupported or semantically blocked DDL durable and observable: persist the journal barrier, leave the checkpoint unchanged, and retry in-process indefinitely without consuming transport retry budget, skipping the event, or falling back to raw source SQL.
 
 This is a production-derived ALTER TABLE slice plus one exact production
 `home_feed_artist_blacklist` CREATE TABLE admission, one identity-scoped
@@ -58,10 +59,13 @@ historical source state.
 Unsupported or ambiguous DDL syntax enters the durable journal as
 `translation_pending` with sentinel/no execution evidence. It performs no target
 DDL, does not advance the stream checkpoint, and blocks later events from
-overtaking it. When translator code later supports the exact syntax, the same row
-may promote once to `prepared`, fill immutable evidence, execute generated SQL,
-and checkpoint automatically. Target execution failures caused by preexisting
-target schema or data differences are execution/reconciliation failures, not
+overtaking it. After that barrier is durable, the live reconnect loop retries the
+same source coordinate in-process indefinitely without consuming the ordinary
+transport retry budget. It never skips the statement or executes raw source SQL.
+When translator code later supports the exact syntax, the same row may promote
+once to `prepared`, fill immutable evidence, execute generated SQL, and
+checkpoint automatically. Target execution failures caused by preexisting target
+schema or data differences are execution/reconciliation failures, not
 translator-unavailable events.
 The retired manual ledger is absent from runtime, configuration, bootstrap,
 grants, and harness behavior. This contract remains deployment-blocked by the
@@ -188,7 +192,8 @@ The current slice is covered by:
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
       generated SQL and preserves journal/checkpoint ordering for supported
       fixtures; unsupported CREATE remains pending without target/checkpoint
-      execution.
+      execution, and `unsupported_ddl_keeps_replicator_alive_at_unchanged_checkpoint`
+      proves the durable block loop retries from the unchanged checkpoint.
 - [x] `scripts/cdc-integration-harness.py --scenario create-table-crash-restart` —
       real differing-default MariaDB/MySQL fixture admission, target-absence
       evidence, explicit charset/collation SQL, exact observed post-state,

@@ -1,10 +1,10 @@
 # Query preservation audit
 
 verified: 2026-07-30
-revision: `a201c7f472d27a79e4a669bd64f00716ba534d45`
+revision: `c084ff6`
 scope: live `stream-binlog` QueryEvent handling plus the shared `StatementApplier` used by `apply-binlog`
 
-This matrix records every current path that removes, ignores, normalizes, or rejects source query text. “Blocked” means no checkpoint advance. “Exit” means the error is not reconnect-eligible, reaches `run_stream_binlog_command`, and exits the process with status 1.
+This matrix records every current path that removes, ignores, normalizes, or rejects source query text. “Blocked” means no checkpoint advance. Durable automatic-DDL blocks persist a journal barrier and retry the same source coordinate in-process without consuming the ordinary transport retry budget. “Exit” means the error is not reconnect-eligible, reaches `run_stream_binlog_command`, and exits the process with status 1; generic non-DDL mapping/quarantine failures still use that fatal path.
 
 ## Routing before statement execution
 
@@ -42,7 +42,7 @@ This matrix records every current path that removes, ignores, normalizes, or rej
 | `IF EXISTS`/`IF NOT EXISTS` in guarded ALTER/index DDL | `statement.rs:find_ddl_if_exists_pattern` | Whole normalized query quarantined | Structured DDL routing normally records `translation_pending`; otherwise quarantine exits |
 | Unknown first statement keyword | `statement.rs:classify_statement` | Whole normalized query quarantined | Blocked; exits in live stream |
 | `GRANT` or `REVOKE` | `statement.rs:is_skipped_administrative_ddl` | Whole normalized query skipped with no target statement | Counted as applied/commit by `StatementApplier` callers |
-| Other administrative CREATE/ALTER/DROP/RENAME forms in the skip list | `statement.rs:is_skipped_administrative_ddl` plus structured DDL routing | `apply-binlog` skips them; live `stream-binlog` normally intercepts them as untranslated schema changes | Batch mode can checkpoint without target write; live mode records `translation_pending` then exits |
+| Other administrative CREATE/ALTER/DROP/RENAME forms in the skip list | `statement.rs:is_skipped_administrative_ddl` plus structured DDL routing | `apply-binlog` skips them; live `stream-binlog` normally intercepts them as untranslated schema changes | Batch mode can checkpoint without target write; live mode records `translation_pending`, leaves the checkpoint unchanged, and retries the same coordinate in-process indefinitely without raw execution |
 
 ## DDL tokenization and generated SQL
 
@@ -65,13 +65,13 @@ This matrix records every current path that removes, ignores, normalizes, or rej
 
 | Condition | Durable state | Target/checkpoint | Process consequence |
 |---|---|---|---|
-| Untranslated schema-changing query | Exact `raw_sql` inserted as `translation_pending` | No target write; no checkpoint | `ApplyBinlogError::Statement` is not reconnect-eligible; stream loop stops; CLI exits 1; Kubernetes restarts |
-| Modeled transformation returns error | `translation_pending` | No target write; no checkpoint | Same fatal exit/CrashLoop path |
-| Evidence capture unavailable | `translation_pending` | No target write; no checkpoint | Same fatal exit/CrashLoop path |
-| Transformed target SQL fails | Usually remains `prepared` | Target result uncertain; no checkpoint | Fatal exit/CrashLoop; restart enters prepared reconciliation |
-| Post-state differs from expected | `blocked` | Target may already have changed; no checkpoint | Fatal exit/CrashLoop |
-| Existing blocked row remains divergent | `blocked` | No additional target write/checkpoint | Fatal exit/CrashLoop on every restart |
-| Prepared row cannot be proven applied | Transitioned to `blocked` | No checkpoint | Fatal exit/CrashLoop |
+| Untranslated schema-changing query | Exact `raw_sql` inserted as `translation_pending` | No target write; no checkpoint | Durable `DdlBlocked`; stream reconnects in-process at the unchanged coordinate indefinitely without consuming transport retry budget |
+| Modeled transformation returns error | `translation_pending` | No target write; no checkpoint | Same durable DDL-block loop; no statement skip or raw execution |
+| Evidence capture unavailable | `translation_pending` | No target write; no checkpoint | Same durable DDL-block loop; no statement skip or raw execution |
+| Transformed target SQL fails | Usually remains `prepared` | Target result uncertain; no checkpoint | Fatal target failure; restart enters prepared reconciliation |
+| Post-state differs from expected | `blocked` | Target may already have changed; no checkpoint | Durable `DdlBlocked`; same coordinate retries in-process until reviewed resolution |
+| Existing blocked row remains divergent | `blocked` | No additional target write/checkpoint | Durable `DdlBlocked`; process remains alive and retries without raw execution |
+| Prepared row cannot be proven applied | Transitioned to `blocked` | No checkpoint | Durable DDL-block loop; no checkpoint advancement or statement skip |
 | Generic statement quarantine | Only in-memory `RecordingQuarantine` in live path | No target write/checkpoint | Fatal `Quarantined` error; exits |
 | Generic target execution error | No DDL journal state in generic path | No checkpoint | Fatal `Statement` error; exits |
 | Retryable source transport error | No query mutation | Resume from durable checkpoint | Internal bounded/unbounded reconnect; process stays alive |
@@ -99,4 +99,4 @@ ALTER TABLE `artists_imprints`\r\n\
 
 At commit `f9b35d5`, the supported production ALTER renderer preserves the exact leading ordinary MySQL `-- ` comment prefix, including its source line ending, while still rendering the parsed ALTER body deterministically. This behavior is limited to this production ALTER path; other comment forms and query paths retain their separately documented behavior.
 
-The separate non-fatal-blocking RED test remains independent. Combining it with preservation would hide which contract failed first.
+The independent RED test `unsupported_ddl_keeps_replicator_alive_at_unchanged_checkpoint` now proves the production boundary: the journal records `translation_pending`, no target SQL or checkpoint write occurs, and the reconnect loop retries from the unchanged coordinate instead of terminating the process. This durable DDL-block path never skips the statement or falls back to raw source SQL.

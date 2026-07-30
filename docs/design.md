@@ -78,7 +78,10 @@ The rename slice selects executable clauses from target pre-state and emits MySQ
 `cdc.ddl_replay_journal` as `translation_pending` with sentinel/no evidence;
 translator availability promotes that same row once to `prepared`, after which
 generated SQL, postcondition evidence, and checkpointing proceed automatically.
-The journal state machine is
+Unsupported or semantically blocked DDL leaves the checkpoint unchanged and
+retries the same source coordinate in-process indefinitely after its journal
+barrier is durable, without consuming the ordinary transport retry budget,
+skipping the event, or executing raw source SQL. The journal state machine is
 `translation_pending -> prepared -> applied -> checkpointed` plus
 `prepared -> blocked`; startup barriers prevent overtake. The event-handler behavior is implemented in
 this slice, but config/bootstrap/grant/harness cleanup and safe migration rollout

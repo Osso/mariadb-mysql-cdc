@@ -85,11 +85,12 @@ all other procedure bodies or names, plain drops for other names,
 qualified/cross-schema references, quoted forms, comments outside the exact leading
 ordinary-comment CREATE and ALTER admissions, other definer/security clauses,
 MariaDB-only syntax, and multi-object or multi-statement forms are translation
-boundaries in the stream event path. The intended behavior
-flushes earlier DML, records exact
-SQL/coordinates in `cdc.ddl_replay_journal` as `translation_pending`, and stops
-before advancing. The retired manual ledger has no remaining runtime,
-configuration, bootstrap, grant, or harness dependency.
+boundaries in the stream event path. The intended behavior flushes earlier DML,
+records exact SQL/coordinates in `cdc.ddl_replay_journal` as `translation_pending`,
+leaves the checkpoint unchanged, and retries that same source coordinate
+in-process indefinitely without skipping or executing raw source SQL. The
+retired manual ledger has no remaining runtime, configuration, bootstrap, grant,
+or harness dependency.
 
 Qualifier handling is fail-closed outside the identity-scoped source-only
 procedure CREATE form and the exact production blacklist CREATE form. The
@@ -117,7 +118,11 @@ transitions to `checkpointed` with the exact predecessor checkpoint.
 `translation_pending`, `prepared`, and `blocked` rows stop startup from
 overtaking the event. Translation and evidence-capture failures use the same
 `translation_pending` barrier. Only a unique exact expected post-state can
-reconcile a crash; otherwise the row blocks.
+reconcile a crash; otherwise the row blocks. Once the barrier is durably
+persisted, the live reconnect loop keeps the process alive and retries the same
+coordinate indefinitely without consuming the ordinary transport retry budget.
+The loop never advances the checkpoint, skips the source event, or executes raw
+source SQL.
 
 No operator-authored target SQL or manual journal status transition is a
 supported DDL resolution path in the event handler. The retired manual-ledger
@@ -126,5 +131,5 @@ runtime, configuration, bootstrap, grants, and harness paths have been removed.
 ## Quarantine
 
 Unsupported non-DDL statements are quarantined with source coordinates, raw SQL,
-and a reason. Quarantine is not silent data loss and remains a cutover blocker
-until reviewed.
+and a reason. Quarantine is not silent data loss and remains a cutover blocker;
+it is still a fatal non-DDL path, not the durable automatic-DDL block loop.
