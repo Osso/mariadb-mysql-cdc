@@ -1571,6 +1571,69 @@ fn fixture_create_accounts_table_has_typed_ast_and_deterministic_mysql8_sql() {
 }
 
 #[test]
+fn production_create_table_with_leading_comments_transforms_to_mysql8_sql() {
+    let inventory = LiveDdlSemanticInventory::new(
+        InventoryConfig::default(),
+        InventoryConfig::default(),
+        "globalcomix".to_string(),
+        "globalcomix".to_string(),
+    );
+    let source_sql = "-- Exclude the full Image Comics catalog from home-feed mining and serving.\n\
+-- Artist-level scope also covers newly-created Image Comics titles and its\n\
+-- imprints; the PHP serve policy resolves this table on every request.\n\
+\n\
+CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\n\
+    `id`          INT(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,\n\
+    `artist_id`   MEDIUMINT(8) UNSIGNED NOT NULL,\n\
+    `reason`      VARCHAR(255) DEFAULT NULL,\n\
+    `creator_id`  MEDIUMINT(8) UNSIGNED DEFAULT NULL,\n\
+    `create_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\
+    UNIQUE KEY `uidx_hfab_artist` (`artist_id`)\n\
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+
+    let expected_sql = "CREATE TABLE `home_feed_artist_blacklist` (`id` INT UNSIGNED NOT NULL AUTO_INCREMENT, `artist_id` MEDIUMINT UNSIGNED NOT NULL, `reason` VARCHAR(255) NULL DEFAULT NULL, `creator_id` MEDIUMINT UNSIGNED NULL DEFAULT NULL, `create_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`), UNIQUE KEY `uidx_hfab_artist` (`artist_id`)) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+    let create_sql = source_sql
+        .find("CREATE TABLE")
+        .map(|start| &source_sql[start..])
+        .expect("production CREATE TABLE body");
+    let ordinary_comment_variants = [
+        source_sql.to_string(),
+        format!("# operational description\n{create_sql}"),
+        format!("/* operational description */\n{create_sql}"),
+    ];
+
+    for commented_sql in ordinary_comment_variants {
+        let transformation = inventory
+            .transform_sql(&commented_sql)
+            .expect("commented production CREATE TABLE must be translatable");
+        assert_eq!(transformation.version, DDL_TRANSFORMATION_VERSION);
+        assert_eq!(transformation.target_sql.as_deref(), Some(expected_sql));
+    }
+}
+
+#[test]
+fn production_create_table_rejects_active_and_embedded_comments() {
+    let inventory = LiveDdlSemanticInventory::new(
+        InventoryConfig::default(),
+        InventoryConfig::default(),
+        "globalcomix".to_string(),
+        "globalcomix".to_string(),
+    );
+    let create_sql = "CREATE TABLE accounts (id BIGINT NOT NULL PRIMARY KEY) ENGINE=InnoDB";
+    let rejected = [
+        format!("/*!40101 SET sql_mode='' */ {create_sql}"),
+        format!("/*M!100100 SET sql_mode='' */ {create_sql}"),
+        format!("/*+ SET_VAR(sort_buffer_size=16M) */ {create_sql}"),
+        "CREATE TABLE accounts (id BIGINT /* identity */ NOT NULL PRIMARY KEY) ENGINE=InnoDB"
+            .to_string(),
+    ];
+
+    for sql in rejected {
+        assert!(inventory.transform_sql(&sql).is_err(), "accepted {sql}");
+    }
+}
+
+#[test]
 fn production_add_column_ddl_transforms_to_deterministic_mysql8_sql() {
     let inventory = LiveDdlSemanticInventory::new(
         InventoryConfig::default(),

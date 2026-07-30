@@ -1,3 +1,50 @@
+pub(crate) fn strip_leading_ordinary_ddl_comments(sql: &str) -> Result<&str, String> {
+    let mut remaining = sql;
+    loop {
+        remaining = remaining.trim_start();
+        if is_mysql_line_comment_text(remaining) {
+            remaining = after_line_comment(remaining, 2);
+        } else if remaining.starts_with('#') {
+            remaining = after_line_comment(remaining, 1);
+        } else if remaining.starts_with("/*")
+            && !starts_semantically_active_block_comment(remaining)
+        {
+            remaining = after_block_comment(remaining)?;
+        } else {
+            return Ok(remaining);
+        }
+    }
+}
+
+fn is_mysql_line_comment_text(sql: &str) -> bool {
+    sql.starts_with("--")
+        && sql
+            .chars()
+            .nth(2)
+            .is_none_or(|character| character.is_whitespace() || character.is_control())
+}
+
+fn after_line_comment(sql: &str, marker_length: usize) -> &str {
+    sql[marker_length..]
+        .find('\n')
+        .map_or("", |newline| &sql[marker_length + newline + 1..])
+}
+
+fn starts_semantically_active_block_comment(sql: &str) -> bool {
+    sql.starts_with("/*!")
+        || sql.starts_with("/*+")
+        || sql
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/*M!"))
+}
+
+fn after_block_comment(sql: &str) -> Result<&str, String> {
+    let closing_offset = sql[2..]
+        .find("*/")
+        .ok_or_else(|| "unterminated DDL block comment".to_string())?;
+    Ok(&sql[closing_offset + 4..])
+}
+
 pub(crate) fn ddl_contains_comments(sql: &str) -> bool {
     let characters = sql.chars().collect::<Vec<_>>();
     ddl_characters_contain_comments(&characters)

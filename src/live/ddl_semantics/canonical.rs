@@ -314,8 +314,16 @@ fn expected_create_table_post_state(
                     is_nullable: column.nullable,
                     character_set,
                     collation,
-                    default_value: None,
-                    extra: String::new(),
+                    default_value: column
+                        .default_sql
+                        .as_ref()
+                        .filter(|value| !value.eq_ignore_ascii_case("NULL"))
+                        .cloned(),
+                    extra: if column.auto_increment {
+                        "auto_increment".to_string()
+                    } else {
+                        String::new()
+                    },
                     comment: String::new(),
                     generated: None,
                 }
@@ -366,10 +374,14 @@ fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::V
             "name": column.name,
             "column_type": column.column_type,
             "nullable": column.nullable,
+            "default_sql": column.default_sql,
+            "auto_increment": column.auto_increment,
         })).collect::<Vec<_>>(),
         "primary_key": ast.primary_key,
         "indexes": ast.indexes.iter().map(canonical_index_ast_value).collect::<Vec<_>>(),
         "engine": ast.engine,
+        "character_set": ast.character_set,
+        "collation": ast.collation,
     })
 }
 

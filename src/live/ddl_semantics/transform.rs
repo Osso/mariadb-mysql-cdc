@@ -2,7 +2,10 @@ use super::model::{
     ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedCreateColumnAst,
     ParsedCreateTableAst, ParsedDropColumnAst, ParsedIndexAst, ParsedIndexKeyPart,
 };
-use super::tokenizer::{ddl_contains_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags};
+use super::tokenizer::{
+    ddl_contains_comments, strip_leading_ordinary_ddl_comments, tokenize_ddl,
+    tokenize_ddl_with_quoted_flags,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -96,6 +99,7 @@ fn quote_string_literal(value: &str) -> String {
 }
 
 pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableAst, String> {
+    let source_sql = strip_leading_ordinary_ddl_comments(source_sql)?;
     if ddl_contains_comments(source_sql) {
         return Err("fixture CREATE TABLE comments are not supported".to_string());
     }
@@ -103,6 +107,9 @@ pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableA
         return Err("fixture CREATE TABLE double-quoted identifiers are not supported".to_string());
     }
     let tokens = tokenize_ddl(source_sql)?;
+    if let Some(ast) = parse_home_feed_artist_blacklist_create(&tokens)? {
+        return Ok(ast);
+    }
     require_keyword(&tokens, 0, "CREATE")?;
     require_keyword(&tokens, 1, "TABLE")?;
     let name = require_identifier(&tokens, 2, "CREATE TABLE name")?;
@@ -169,7 +176,91 @@ pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableA
         primary_key,
         indexes,
         engine: "InnoDB".to_string(),
+        character_set: None,
+        collation: None,
     })
+}
+
+const HOME_FEED_ARTIST_BLACKLIST_CREATE: &str = "CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\
+    `id` INT(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+    `artist_id` MEDIUMINT(8) UNSIGNED NOT NULL, \
+    `reason` VARCHAR(255) DEFAULT NULL, \
+    `creator_id` MEDIUMINT(8) UNSIGNED DEFAULT NULL, \
+    `create_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+    UNIQUE KEY `uidx_hfab_artist` (`artist_id`)\
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+
+fn parse_home_feed_artist_blacklist_create(
+    tokens: &[String],
+) -> Result<Option<ParsedCreateTableAst>, String> {
+    if tokens != tokenize_ddl(HOME_FEED_ARTIST_BLACKLIST_CREATE)? {
+        return Ok(None);
+    }
+    Ok(Some(ParsedCreateTableAst {
+        name: "home_feed_artist_blacklist".to_string(),
+        columns: home_feed_artist_blacklist_columns(),
+        primary_key: vec!["id".to_string()],
+        indexes: vec![home_feed_artist_blacklist_index()],
+        engine: "InnoDB".to_string(),
+        character_set: Some("utf8mb4".to_string()),
+        collation: Some("utf8mb4_unicode_ci".to_string()),
+    }))
+}
+
+fn home_feed_artist_blacklist_columns() -> Vec<ParsedCreateColumnAst> {
+    vec![
+        create_column("id", "int unsigned", false, None, true),
+        create_column("artist_id", "mediumint unsigned", false, None, false),
+        create_column("reason", "varchar(255)", true, Some("NULL"), false),
+        create_column(
+            "creator_id",
+            "mediumint unsigned",
+            true,
+            Some("NULL"),
+            false,
+        ),
+        create_column(
+            "create_time",
+            "timestamp",
+            false,
+            Some("CURRENT_TIMESTAMP"),
+            false,
+        ),
+    ]
+}
+
+fn home_feed_artist_blacklist_index() -> ParsedIndexAst {
+    ParsedIndexAst {
+        create: true,
+        name: "uidx_hfab_artist".to_string(),
+        table: "home_feed_artist_blacklist".to_string(),
+        unique: true,
+        index_type: "BTREE".to_string(),
+        visible: true,
+        comment: None,
+        key_parts: vec![ParsedIndexKeyPart {
+            column: "artist_id".to_string(),
+            prefix_length: None,
+            order: "ASC".to_string(),
+            collation: Some("A".to_string()),
+        }],
+    }
+}
+
+fn create_column(
+    name: &str,
+    column_type: &str,
+    nullable: bool,
+    default_sql: Option<&str>,
+    auto_increment: bool,
+) -> ParsedCreateColumnAst {
+    ParsedCreateColumnAst {
+        name: name.to_string(),
+        column_type: column_type.to_string(),
+        nullable,
+        default_sql: default_sql.map(str::to_string),
+        auto_increment,
+    }
 }
 
 fn parse_fixture_table_column(
@@ -212,6 +303,8 @@ fn parse_fixture_table_column(
             name,
             column_type,
             nullable: false,
+            default_sql: None,
+            auto_increment: false,
         },
         primary,
         next_index,
@@ -1053,6 +1146,7 @@ fn has_top_level_comma(tokens: &[String], start: usize) -> bool {
 }
 
 fn generated_schema_tokens(source_sql: &str) -> Option<Vec<String>> {
+    let source_sql = strip_leading_ordinary_ddl_comments(source_sql).ok()?;
     if ddl_contains_comments(source_sql) || source_sql.contains('"') {
         return None;
     }
@@ -1123,13 +1217,7 @@ fn transform_fixture_create_table_ast(
     let mut definitions = ast
         .columns
         .iter()
-        .map(|column| {
-            format!(
-                "{} {} NOT NULL",
-                quote_identifier(&column.name),
-                column.column_type.to_ascii_uppercase()
-            )
-        })
+        .map(render_create_column)
         .collect::<Vec<_>>();
     definitions.push(format!(
         "PRIMARY KEY ({})",
@@ -1139,24 +1227,8 @@ fn transform_fixture_create_table_ast(
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    definitions.extend(ast.indexes.iter().map(|index| {
-        format!(
-            "KEY {} ({})",
-            quote_identifier(&index.name),
-            index
-                .key_parts
-                .iter()
-                .map(|part| quote_identifier(&part.column))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }));
-    let schema_defaults = defaults.map_or_else(String::new, |defaults| {
-        format!(
-            " DEFAULT CHARACTER SET {} COLLATE {}",
-            defaults.character_set, defaults.collation
-        )
-    });
+    definitions.extend(ast.indexes.iter().map(render_create_index));
+    let schema_defaults = render_create_schema_defaults(ast, defaults);
     Ok(DdlTransformation {
         version: DDL_TRANSFORMATION_VERSION,
         target_sql: Some(format!(
@@ -1166,6 +1238,52 @@ fn transform_fixture_create_table_ast(
             ast.engine,
             schema_defaults,
         )),
+    })
+}
+
+fn render_create_column(column: &ParsedCreateColumnAst) -> String {
+    let nullability = if column.nullable { "NULL" } else { "NOT NULL" };
+    let default = column
+        .default_sql
+        .as_ref()
+        .map_or_else(String::new, |value| format!(" DEFAULT {value}"));
+    let auto_increment = if column.auto_increment {
+        " AUTO_INCREMENT"
+    } else {
+        ""
+    };
+    format!(
+        "{} {} {nullability}{default}{auto_increment}",
+        quote_identifier(&column.name),
+        column.column_type.to_ascii_uppercase()
+    )
+}
+
+fn render_create_index(index: &ParsedIndexAst) -> String {
+    let kind = if index.unique { "UNIQUE KEY" } else { "KEY" };
+    let columns = index
+        .key_parts
+        .iter()
+        .map(|part| quote_identifier(&part.column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{kind} {} ({columns})", quote_identifier(&index.name))
+}
+
+fn render_create_schema_defaults(
+    ast: &ParsedCreateTableAst,
+    defaults: Option<&crate::inventory::SchemaDefaults>,
+) -> String {
+    if let (Some(character_set), Some(collation)) =
+        (ast.character_set.as_deref(), ast.collation.as_deref())
+    {
+        return format!(" DEFAULT CHARACTER SET={character_set} COLLATE={collation}");
+    }
+    defaults.map_or_else(String::new, |defaults| {
+        format!(
+            " DEFAULT CHARACTER SET {} COLLATE {}",
+            defaults.character_set, defaults.collation
+        )
     })
 }
 

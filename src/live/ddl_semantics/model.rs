@@ -52,6 +52,8 @@ pub struct ParsedCreateColumnAst {
     pub name: String,
     pub column_type: String,
     pub nullable: bool,
+    pub default_sql: Option<String>,
+    pub auto_increment: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +63,8 @@ pub struct ParsedCreateTableAst {
     pub primary_key: Vec<String>,
     pub indexes: Vec<ParsedIndexAst>,
     pub engine: String,
+    pub character_set: Option<String>,
+    pub collation: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
