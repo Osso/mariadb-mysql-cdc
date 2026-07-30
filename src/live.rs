@@ -387,6 +387,7 @@ pub enum ApplyBinlogError {
         conflict: Box<ExactParentRecovery>,
         source: RecoveryAttemptError,
     },
+    DdlBlocked(String),
     Statement(String),
     Quarantined(Vec<QuarantinedStatement>),
     Checkpoint(String),
@@ -414,6 +415,7 @@ impl fmt::Display for ApplyBinlogError {
                 conflict.source_start_position(),
                 conflict.child_primary_key()
             ),
+            Self::DdlBlocked(message) => write!(formatter, "DDL blocked: {message}"),
             Self::Statement(message) => write!(formatter, "statement apply failed: {message}"),
             Self::Quarantined(statements) => write!(
                 formatter,

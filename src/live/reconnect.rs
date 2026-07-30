@@ -229,8 +229,11 @@ where
         return Ok(FailedAttemptOutcome::Stop(stale_error));
     }
     let exact_parent_retry = error.parent_recovery().is_some();
+    let durable_ddl_block = matches!(error, ApplyBinlogError::DdlBlocked(_));
     let exact_parent_retry_enabled = config.reconnect_forever || config.max_reconnects > 0;
-    let reconnect_eligible = if exact_parent_retry {
+    let reconnect_eligible = if durable_ddl_block {
+        true
+    } else if exact_parent_retry {
         exact_parent_retry_enabled && is_retryable_stream_error(&error)
     } else {
         should_reconnect(
@@ -247,7 +250,7 @@ where
     match attempt_exact_parent_recovery(&error, attempted_recoveries, recover) {
         Ok(()) => Ok(FailedAttemptOutcome::Retry {
             error,
-            budget: retry_budget(exact_parent_retry),
+            budget: retry_budget(exact_parent_retry || durable_ddl_block),
         }),
         Err(source) => Ok(FailedAttemptOutcome::Retry {
             error: parent_recovery_error(&error, source),
@@ -256,8 +259,8 @@ where
     }
 }
 
-fn retry_budget(exact_parent_retry: bool) -> RetryBudget {
-    if exact_parent_retry {
+fn retry_budget(preserve_transport_budget: bool) -> RetryBudget {
+    if preserve_transport_budget {
         RetryBudget::PreserveTransport
     } else {
         RetryBudget::ConsumeTransport

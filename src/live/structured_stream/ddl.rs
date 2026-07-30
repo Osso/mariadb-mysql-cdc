@@ -72,7 +72,7 @@ where
     };
     flush_grouped_transaction(executor, context)?;
     ensure_translation_pending(journal, &ddl_event)?;
-    Err(ApplyBinlogError::Statement(format!(
+    Err(ApplyBinlogError::DdlBlocked(format!(
         "DDL translator unavailable at {}:{}; checkpoint remains blocked",
         ddl_event.binlog_file, ddl_event.event_start_position
     )))
@@ -227,7 +227,7 @@ where
             Ok(transformation) => transformation,
             Err(error) => {
                 ensure_translation_pending(journal, ddl_event)?;
-                return Err(ApplyBinlogError::Statement(error));
+                return Err(ApplyBinlogError::DdlBlocked(error));
             }
         };
         let evidence = capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event)?;
@@ -307,7 +307,7 @@ where
         Ok(evidence) => Ok(evidence),
         Err(error) => {
             ensure_translation_pending(journal, ddl_event)?;
-            Err(ApplyBinlogError::Statement(format!(
+            Err(ApplyBinlogError::DdlBlocked(format!(
                 "DDL transformation evidence unavailable at {}:{}: {error}",
                 ddl_event.binlog_file, ddl_event.event_start_position
             )))
@@ -334,7 +334,7 @@ where
     journal
         .mark_blocked(ddl_event)
         .map_err(ApplyBinlogError::Statement)?;
-    Err(ApplyBinlogError::Statement(format!(
+    Err(ApplyBinlogError::DdlBlocked(format!(
         "automatic DDL postcondition mismatch at {}:{}",
         ddl_event.binlog_file, ddl_event.event_start_position
     )))
@@ -399,7 +399,7 @@ where
         .observe_target_state(&ddl_event.raw_sql)
         .map_err(ApplyBinlogError::Statement)?;
     if observed != expected {
-        return Err(ApplyBinlogError::Statement(format!(
+        return Err(ApplyBinlogError::DdlBlocked(format!(
             "blocked automatic DDL remains divergent at {}:{}",
             ddl_event.binlog_file, ddl_event.event_start_position
         )));
@@ -463,7 +463,7 @@ where
             journal
                 .mark_blocked(ddl_event)
                 .map_err(ApplyBinlogError::Statement)?;
-            return Err(ApplyBinlogError::Statement(format!(
+            return Err(ApplyBinlogError::DdlBlocked(format!(
                 "automatic DDL semantic reconciliation blocked at {}:{}: {}",
                 ddl_event.binlog_file,
                 ddl_event.event_start_position,
