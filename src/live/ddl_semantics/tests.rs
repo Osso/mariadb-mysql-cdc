@@ -1612,6 +1612,54 @@ CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\n\
 }
 
 #[test]
+fn explicit_production_create_evidence_does_not_require_historical_source_defaults() {
+    let source_sql = "-- operational description\n\
+CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\n\
+    `id` INT(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,\n\
+    `artist_id` MEDIUMINT(8) UNSIGNED NOT NULL,\n\
+    `reason` VARCHAR(255) DEFAULT NULL,\n\
+    `creator_id` MEDIUMINT(8) UNSIGNED DEFAULT NULL,\n\
+    `create_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\
+    UNIQUE KEY `uidx_hfab_artist` (`artist_id`)\n\
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+    let operation = parse_ddl_operation(source_sql).expect("production CREATE TABLE operation");
+    let target = SemanticSchemaSnapshot {
+        inventory: SchemaInventory {
+            schema: "globalcomix".to_string(),
+            tables: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            views: Vec::new(),
+            triggers: Vec::new(),
+            routines: Vec::new(),
+            events: Vec::new(),
+        },
+        table_runtime: Default::default(),
+    };
+    let live_source = crate::inventory::SourceMasterCoordinate {
+        file: "mysqld-bin.002779".to_string(),
+        position: 579_176_271,
+    };
+
+    let evidence = build_fenced_create_table_evidence(
+        &operation,
+        &target,
+        &crate::inventory::SchemaDefaults {
+            character_set: "utf8mb4".to_string(),
+            collation: "utf8mb4_uca1400_ai_ci".to_string(),
+        },
+        "mysqld-bin.002778",
+        750_896_630,
+        &live_source,
+        &live_source,
+    )
+    .expect("explicit CREATE semantics must not require historical source defaults");
+
+    assert!(evidence.generated_sql.is_some());
+    assert!(evidence.expected_post_state.contains("utf8mb4_unicode_ci"));
+}
+
+#[test]
 fn production_create_table_rejects_active_and_embedded_comments() {
     let inventory = LiveDdlSemanticInventory::new(
         InventoryConfig::default(),

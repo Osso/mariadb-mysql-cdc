@@ -15,11 +15,20 @@ pub fn build_fenced_create_table_evidence(
     before: &crate::inventory::SourceMasterCoordinate,
     after: &crate::inventory::SourceMasterCoordinate,
 ) -> Result<DdlSemanticEvidence, String> {
-    super::validate_source_snapshot_coordinate(expected_file, expected_position, before, after)?;
     let ast = operation
         .create_table_ast
         .as_ref()
         .ok_or_else(|| "typed fixture CREATE TABLE AST is missing".to_string())?;
+    let explicit_defaults = explicit_create_table_defaults(ast);
+    if explicit_defaults.is_none() {
+        super::validate_source_snapshot_coordinate(
+            expected_file,
+            expected_position,
+            before,
+            after,
+        )?;
+    }
+    let defaults = explicit_defaults.as_ref().unwrap_or(defaults);
     let pre_state = canonical_pre_state(operation, target)?;
     if pre_state != canonical_absent_state() {
         return Err(format!(
@@ -43,6 +52,15 @@ pub fn build_fenced_create_table_evidence(
         canonical_ast,
         pre_state,
         expected_post_state: expected_create_table_post_state(ast, defaults)?,
+    })
+}
+
+fn explicit_create_table_defaults(
+    ast: &ParsedCreateTableAst,
+) -> Option<crate::inventory::SchemaDefaults> {
+    Some(crate::inventory::SchemaDefaults {
+        character_set: ast.character_set.clone()?,
+        collation: ast.collation.clone()?,
     })
 }
 
