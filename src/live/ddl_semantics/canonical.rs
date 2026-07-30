@@ -55,7 +55,7 @@ pub fn build_fenced_create_table_evidence(
     })
 }
 
-fn explicit_create_table_defaults(
+pub(crate) fn explicit_create_table_defaults(
     ast: &ParsedCreateTableAst,
 ) -> Option<crate::inventory::SchemaDefaults> {
     Some(crate::inventory::SchemaDefaults {
@@ -298,7 +298,7 @@ fn canonical_index_state(
     canonical_table_structure_state(snapshot, table)
 }
 
-fn expected_create_table_post_state(
+pub(crate) fn expected_create_table_post_state(
     ast: &ParsedCreateTableAst,
     defaults: &crate::inventory::SchemaDefaults,
 ) -> Result<String, String> {

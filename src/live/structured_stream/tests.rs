@@ -424,6 +424,10 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
             .clone()
             .unwrap_or_else(|| self.observed_state.clone()))
     }
+
+    fn expected_target_state(&self, _sql: &str) -> Result<String, String> {
+        Ok(self.evidence.expected_post_state.clone())
+    }
 }
 
 #[derive(Default)]
@@ -491,6 +495,17 @@ impl DdlReplayJournal for RecordingDdlReplayJournal {
     fn mark_applied(&self, _event: &DdlEvent) -> Result<(), String> {
         self.operations.borrow_mut().push("APPLIED");
         *self.status.borrow_mut() = Some(DdlReplayStatus::Applied);
+        Ok(())
+    }
+
+    fn recover_blocked(
+        &self,
+        _event: &DdlEvent,
+        evidence: &super::super::ddl_semantics::DdlSemanticEvidence,
+    ) -> Result<(), String> {
+        self.operations.borrow_mut().push("RECOVER_BLOCKED");
+        *self.status.borrow_mut() = Some(DdlReplayStatus::Applied);
+        *self.evidence.borrow_mut() = Some(evidence.clone());
         Ok(())
     }
 

@@ -148,6 +148,17 @@ where
             )?;
             resolved_ddl_outcome(ddl_event)
         }
+        Some(DdlReplayStatus::Blocked) => {
+            recover_blocked_automatic_ddl(
+                applier.executor(),
+                journal,
+                semantic_inventory,
+                context,
+                event,
+                &ddl_event,
+            )?;
+            resolved_ddl_outcome(ddl_event)
+        }
         _ => match replay_action(&ddl_event, status).map_err(ApplyBinlogError::Statement)? {
             DdlReplayAction::PrepareAndExecute => prepare_and_execute_automatic_ddl(
                 applier,
@@ -348,6 +359,68 @@ where
     );
     finalize_automatic_ddl_checkpoint(executor, journal, context, event, ddl_event)?;
     Ok(resolved_ddl_outcome(ddl_event.clone()))
+}
+
+pub(super) fn recover_blocked_automatic_ddl<E, R, C, J, S>(
+    executor: &E,
+    journal: &J,
+    semantic_inventory: &S,
+    context: &mut StreamEventContext<'_, R, C>,
+    event: &BinlogEvent,
+    ddl_event: &DdlEvent,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    C: StreamCheckpointStore,
+    J: DdlReplayJournal,
+    S: DdlSemanticInventory,
+{
+    let evidence = verified_blocked_recovery_evidence(journal, semantic_inventory, ddl_event)?;
+    journal
+        .recover_blocked(ddl_event, &evidence)
+        .map_err(ApplyBinlogError::Statement)?;
+    finalize_automatic_ddl_checkpoint(executor, journal, context, event, ddl_event)
+}
+
+fn verified_blocked_recovery_evidence<J, S>(
+    journal: &J,
+    semantic_inventory: &S,
+    ddl_event: &DdlEvent,
+) -> Result<DdlSemanticEvidence, ApplyBinlogError>
+where
+    J: DdlReplayJournal,
+    S: DdlSemanticInventory,
+{
+    let mut evidence = read_blocked_evidence(journal, ddl_event)?;
+    let expected = semantic_inventory
+        .expected_target_state(&ddl_event.raw_sql)
+        .map_err(ApplyBinlogError::Statement)?;
+    let observed = semantic_inventory
+        .observe_target_state(&ddl_event.raw_sql)
+        .map_err(ApplyBinlogError::Statement)?;
+    if observed != expected {
+        return Err(ApplyBinlogError::Statement(format!(
+            "blocked automatic DDL remains divergent at {}:{}",
+            ddl_event.binlog_file, ddl_event.event_start_position
+        )));
+    }
+    evidence.expected_post_state = expected;
+    Ok(evidence)
+}
+
+fn read_blocked_evidence(
+    journal: &impl DdlReplayJournal,
+    ddl_event: &DdlEvent,
+) -> Result<DdlSemanticEvidence, ApplyBinlogError> {
+    journal
+        .read_evidence(ddl_event)
+        .map_err(ApplyBinlogError::Statement)?
+        .ok_or_else(|| {
+            ApplyBinlogError::Statement(format!(
+                "blocked automatic DDL lacks evidence at {}:{}",
+                ddl_event.binlog_file, ddl_event.event_start_position
+            ))
+        })
 }
 
 pub(super) fn reconcile_prepared_automatic_ddl<E, R, C, J, S>(

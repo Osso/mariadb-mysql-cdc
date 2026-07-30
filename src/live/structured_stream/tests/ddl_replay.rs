@@ -717,6 +717,67 @@ fn prepared_restart_with_proven_post_state_finalizes_without_replay() {
 }
 
 #[test]
+fn blocked_create_with_matching_current_post_state_recovers_without_replay() {
+    let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let executor = TransactionRecordingExecutor::with_operations(operations.clone());
+    let mut applier = crate::row::RowApplier::new(executor);
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "fixture_cdc".to_string(),
+        sql_statement: "CREATE TABLE accounts (id BIGINT NOT NULL PRIMARY KEY) ENGINE=InnoDB"
+            .to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    let journal = RecordingDdlReplayJournal::with_operations(operations.clone());
+    *journal.status.borrow_mut() = Some(DdlReplayStatus::Blocked);
+    *journal.evidence.borrow_mut() = Some(RecordingSemanticInventory::default().evidence);
+
+    handle_automatic_ddl_event(
+        &mut applier,
+        AutomaticDdlDependencies {
+            journal: &journal,
+            semantic_inventory: &RecordingSemanticInventory::default(),
+            source_identity: "production-source",
+        },
+        AutomaticDdlInput {
+            context: &mut context,
+            header: &event_header(2, 180),
+            event: &event,
+        },
+    )
+    .expect("matching blocked CREATE recovery")
+    .expect("automatic DDL outcome");
+
+    assert_eq!(
+        operations.borrow().as_slice(),
+        &[
+            "RECOVER_BLOCKED",
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "EXEC",
+            "CHECKPOINT",
+            "COMMIT",
+        ]
+    );
+}
+
+#[test]
 fn prepared_restart_with_pre_state_blocks_without_replay_or_checkpoint() {
     let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let executor = TransactionRecordingExecutor::with_operations(operations.clone());

@@ -48,6 +48,7 @@ pub trait DdlSemanticInventory {
         event_end_position: u64,
     ) -> Result<DdlSemanticEvidence, String>;
     fn observe_target_state(&self, sql: &str) -> Result<String, String>;
+    fn expected_target_state(&self, sql: &str) -> Result<String, String>;
 }
 
 pub struct LiveDdlSemanticInventory {
@@ -288,6 +289,18 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
         validate_target_snapshot_consistency(&before, &after)?;
         observe_operation_state(&before, &operation)
+    }
+
+    fn expected_target_state(&self, sql: &str) -> Result<String, String> {
+        let operation = parse_semantic_operation(sql)?;
+        let ast = operation
+            .create_table_ast
+            .as_ref()
+            .ok_or_else(|| "blocked recovery requires modeled CREATE TABLE".to_string())?;
+        let defaults = canonical::explicit_create_table_defaults(ast).ok_or_else(|| {
+            "blocked recovery requires explicit CREATE TABLE defaults".to_string()
+        })?;
+        canonical::expected_create_table_post_state(ast, &defaults)
     }
 }
 

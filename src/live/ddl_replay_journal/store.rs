@@ -20,6 +20,11 @@ pub trait DdlReplayJournal {
     fn record_translation_pending(&self, event: &DdlEvent) -> Result<(), String>;
     fn prepare(&self, event: &DdlEvent, evidence: &DdlSemanticEvidence) -> Result<(), String>;
     fn mark_applied(&self, event: &DdlEvent) -> Result<(), String>;
+    fn recover_blocked(
+        &self,
+        event: &DdlEvent,
+        evidence: &DdlSemanticEvidence,
+    ) -> Result<(), String>;
     fn mark_blocked(&self, event: &DdlEvent) -> Result<(), String>;
     fn checkpoint_transition_statement(&self, event: &DdlEvent) -> Result<SqlStatement, String>;
 }
@@ -154,6 +159,18 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
 
     fn mark_applied(&self, event: &DdlEvent) -> Result<(), String> {
         self.transition(event, DdlReplayStatus::Prepared, DdlReplayStatus::Applied)
+    }
+
+    fn recover_blocked(
+        &self,
+        event: &DdlEvent,
+        evidence: &DdlSemanticEvidence,
+    ) -> Result<(), String> {
+        let mut connection = self.connect()?;
+        connection
+            .query_drop(build_recover_blocked_sql(&self.table, event, evidence))
+            .map_err(mysql_error)?;
+        ensure_one_write(&connection, event, "blocked automatic DDL recovery")
     }
 
     fn mark_blocked(&self, event: &DdlEvent) -> Result<(), String> {
@@ -389,6 +406,32 @@ pub fn build_transition_sql(
         quote_sql_literal(&event.schema_name),
         quote_sql_literal(&event.raw_sql),
         from.as_str(),
+    )
+}
+
+pub fn build_recover_blocked_sql(
+    table: &str,
+    event: &DdlEvent,
+    evidence: &DdlSemanticEvidence,
+) -> String {
+    format!(
+        "UPDATE {} SET transformation_version={},generated_sql={},canonical_ast={},pre_state={},expected_post_state={},status='applied' WHERE source_identity={} AND source_server_id={} AND binlog_file={} AND event_start_position={} AND event_end_position={} AND schema_name={} AND raw_sql={} AND status='blocked'",
+        quote_identifier_path(table),
+        quote_sql_literal(&evidence.transformation_version),
+        evidence
+            .generated_sql
+            .as_deref()
+            .map_or_else(|| "NULL".to_string(), quote_sql_literal),
+        quote_sql_literal(&evidence.canonical_ast),
+        quote_sql_literal(&evidence.pre_state),
+        quote_sql_literal(&evidence.expected_post_state),
+        quote_sql_literal(&event.source_identity),
+        event.source_server_id,
+        quote_sql_literal(&event.binlog_file),
+        event.event_start_position,
+        event.event_end_position,
+        quote_sql_literal(&event.schema_name),
+        quote_sql_literal(&event.raw_sql),
     )
 }
 
