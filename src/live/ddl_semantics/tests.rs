@@ -1764,6 +1764,21 @@ fn production_multiple_add_index_clauses_transform_to_deterministic_mysql8_sql()
 }
 
 #[test]
+fn production_add_key_with_observed_leading_comment_transforms() {
+    let source_sql = "-- The serve-time blacklist check resolves a blacklisted artist's imprints.\r\n\
+ALTER TABLE `artists_imprints`\r\n\
+    ADD KEY `idx_artist_id` (`artist_id`)";
+
+    let transformation = transform_production_alter_table(source_sql)
+        .expect("observed leading-comment ADD KEY must be translatable");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some("ALTER TABLE `artists_imprints` ADD KEY `idx_artist_id` (`artist_id`)")
+    );
+}
+
+#[test]
 fn production_add_unique_key_transforms_to_deterministic_mysql8_sql() {
     let transformation = transform_production_alter_table(
         "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email (email)",
@@ -1798,9 +1813,10 @@ fn production_alter_rendering_depends_only_on_typed_ast() {
 }
 
 #[test]
-fn production_alter_rejects_comment_bearing_and_executable_comment_syntax() {
+fn production_alter_rejects_embedded_and_semantically_active_comments() {
     for sql in [
-        "-- deployment comment\nALTER TABLE accounts ADD COLUMN c VARCHAR(64)",
+        "/*!40101 SET sql_mode='' */ ALTER TABLE accounts ADD COLUMN c VARCHAR(64)",
+        "/*+ SET_VAR(sort_buffer_size=16M) */ ALTER TABLE accounts ADD COLUMN c VARCHAR(64)",
         "ALTER TABLE accounts /* 'decoy' */ ADD COLUMN c VARCHAR(64) COMMENT 'real'",
         "ALTER TABLE accounts ADD COLUMN c VARCHAR(64) /*M!100000 NOT NULL */",
     ] {

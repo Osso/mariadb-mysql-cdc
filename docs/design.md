@@ -44,7 +44,13 @@ case-variant no-ops; and the production-observed unqualified multi-clause `ALTER
 COLUMN IF EXISTS ...` form. The implemented ALTER path records a canonical typed
 clause AST and derives expected post-state by applying that AST to a fenced target
 pre-state, so historical replay does not require a live source head at the event
-coordinate. For the ALTER `ADD COLUMN` slice, the exact unquoted type grammar is
+coordinate. The exact production event at
+`mysqld-bin.002778:750897987-750898224` has raw SQL SHA-256
+`ea9f789b158dca0146715bafe9f2712b5945b9c6626411b382347e60e52eb85f` and is
+admitted when this otherwise-supported ALTER has exactly one leading ordinary
+MySQL `-- ` line comment. Embedded comments, executable/version comments,
+optimizer hints, and all other leading comment forms remain rejected. For the
+ALTER `ADD COLUMN` slice, the exact unquoted type grammar is
 `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
 quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
 rejected, as are `DATETIME` precision and `SMALLINT` display width. Those unsupported

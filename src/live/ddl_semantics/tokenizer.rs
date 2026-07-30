@@ -1,3 +1,12 @@
+pub(crate) fn strip_one_leading_mysql_line_comment(sql: &str) -> &str {
+    let sql = sql.trim_start();
+    if is_mysql_line_comment_text(sql) {
+        after_line_comment(sql, 2).trim_start()
+    } else {
+        sql
+    }
+}
+
 pub(crate) fn strip_leading_ordinary_ddl_comments(sql: &str) -> Result<&str, String> {
     let mut remaining = sql;
     loop {

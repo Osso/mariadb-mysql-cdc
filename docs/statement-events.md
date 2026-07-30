@@ -29,7 +29,12 @@ Automatic DDL admission currently has five narrow slices:
   canonical typed clause AST,
   emits deterministic MySQL 8 SQL, and derives expected post-state from fenced
   target pre-state plus the event AST without requiring the historical source
-  head; and
+  head. The exact production event at
+  `mysqld-bin.002778:750897987-750898224`, whose raw SQL SHA-256 is
+  `ea9f789b158dca0146715bafe9f2712b5945b9c6626411b382347e60e52eb85f`, is
+  admitted when this otherwise-supported ALTER has exactly one leading ordinary
+  MySQL `-- ` line comment; embedded comments, executable/version comments,
+  optimizer hints, and all other leading comment forms remain rejected; and
 - the exact production `assistant_reply_reports` `CREATE TABLE` event, which
   is admitted only by its exact raw-event hash after the target table has been
   provisioned out of band from the recorded source definition. Replay fences a
@@ -74,9 +79,9 @@ Other table DDL and unsupported `ALTER TABLE` forms, views, other routine DDL,
 events, triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
 all other procedure bodies or names, plain drops for other names,
 qualified/cross-schema references, quoted forms, comments outside the exact leading
-ordinary-comment CREATE admission, other definer/security clauses, MariaDB-only
-syntax, and multi-object or multi-statement forms are translation boundaries in the
-stream event path. The intended behavior
+ordinary-comment CREATE and ALTER admissions, other definer/security clauses,
+MariaDB-only syntax, and multi-object or multi-statement forms are translation
+boundaries in the stream event path. The intended behavior
 flushes earlier DML, records exact
 SQL/coordinates in `cdc.ddl_replay_journal` as `translation_pending`, and stops
 before advancing. The retired manual ledger has no remaining runtime,
@@ -85,10 +90,11 @@ configuration, bootstrap, grant, or harness dependency.
 Qualifier handling is fail-closed outside the identity-scoped source-only
 procedure CREATE form and the exact production blacklist CREATE form. The
 blacklist CREATE path strips only leading ordinary `--`, `#`, and `/* ... */`
-comments before exact admission; executable comments, optimizer hints, and
-embedded comments remain rejected. Tokenization removes comments from syntax but
-preserves identifier/dot/identifier detection across inline comments; index
-parsing rejects any comment outright. Backticks and ANSI_QUOTES double-quoted
+comments before exact admission. The exact production ALTER path strips only one
+leading ordinary MySQL `-- ` line comment. Executable/version comments, optimizer
+hints, embedded comments, and other leading comment forms remain rejected.
+Tokenization removes comments from syntax but preserves identifier/dot/identifier
+detection across inline comments; index parsing rejects any comment outright. Backticks and ANSI_QUOTES double-quoted
 identifiers are not admitted when their mode is unavailable, except for the
 private exact-hash source-only procedure admission. Trigger `ON` and index `ON`
 references are

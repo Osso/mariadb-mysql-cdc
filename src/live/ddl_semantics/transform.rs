@@ -3,8 +3,8 @@ use super::model::{
     ParsedCreateTableAst, ParsedDropColumnAst, ParsedIndexAst, ParsedIndexKeyPart,
 };
 use super::tokenizer::{
-    ddl_contains_comments, strip_leading_ordinary_ddl_comments, tokenize_ddl,
-    tokenize_ddl_with_quoted_flags,
+    ddl_contains_comments, strip_leading_ordinary_ddl_comments,
+    strip_one_leading_mysql_line_comment, tokenize_ddl, tokenize_ddl_with_quoted_flags,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -1470,10 +1470,16 @@ pub fn transform_rename_columns_if_exists(
     })
 }
 
-pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterTableAst, String> {
+fn production_alter_sql(source_sql: &str) -> Result<&str, String> {
+    let source_sql = strip_one_leading_mysql_line_comment(source_sql);
     if ddl_contains_comments(source_sql) {
         return Err("production ALTER TABLE comments are not supported".to_string());
     }
+    Ok(source_sql)
+}
+
+pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterTableAst, String> {
+    let source_sql = production_alter_sql(source_sql)?;
     let (tokens, quoted_flags) = tokenize_ddl_with_quoted_flags(source_sql)?;
     require_keyword(&tokens, 0, "ALTER")?;
     require_keyword(&tokens, 1, "TABLE")?;

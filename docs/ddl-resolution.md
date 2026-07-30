@@ -30,6 +30,24 @@ other plain-name, or routine DDL variant remains unsupported.
 Every other DDL form enters the same journal as `translation_pending`; no operator-authored
 target SQL is accepted as a resolution path.
 
+### Exact production ALTER recovery target
+
+The active recovery target is the exact source event at
+`mysqld-bin.002778:750897987-750898224`. The event is 150 raw bytes with
+CRLF line endings and SHA-256
+`ea9f789b158dca0146715bafe9f2712b5945b9c6626411b382347e60e52eb85f`:
+
+```sql
+-- The serve-time blacklist check resolves a blacklisted artist's imprints.
+ALTER TABLE `artists_imprints`
+    ADD KEY `idx_artist_id` (`artist_id`)
+```
+
+Admission is limited to this otherwise-supported ALTER preceded by exactly one
+ordinary MySQL `-- ` line comment. Embedded comments, executable/version comments,
+optimizer hints, and all other leading comment forms remain `translation_pending`
+barriers with no target execution or checkpoint advance.
+
 The stream does not create or repair control-plane objects. Bootstrap must run
 with admin/resolver credentials while the stream is stopped:
 
