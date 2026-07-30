@@ -7,7 +7,9 @@ statement DML QueryEvent is a contract violation.
 ## Replay policy
 
 Statement DML is never replayed in the production stream. The removed
-`apply-binlog` text path is not a supported health check.
+`apply-binlog` text path is not a supported health check. The current strip,
+skip, normalization, rejection, and process-lifecycle behavior is cataloged in
+the [query preservation audit](query-preservation-audit.md).
 
 Automatic DDL admission currently has five narrow slices:
 
