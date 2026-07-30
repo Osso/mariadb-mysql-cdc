@@ -88,6 +88,17 @@ broader DDL coverage and operational proof gaps listed below.
       Unsupported `CREATE TABLE` variants remain `translation_pending` with zero
       target DDL and zero checkpoint execution.
 
+The exact production `assistant_reply_reports` CREATE event is a bounded
+convergence recovery, not generic `CREATE TABLE` support. Its target table must
+be provisioned out of band from the recorded source definition before replay is
+retried; runtime emits no CREATE. The raw event hash is the admission boundary,
+and a stable source inventory must exactly match the target table, indexes, and
+foreign-key metadata. Equality records a proven no-op with `generated_sql = NULL`
+and permits the normal journal/checkpoint sequence. A changed statement, absent
+target, moving source fence, or schema mismatch remains `translation_pending`
+with no checkpoint advance; operator-authored SQL and manual journal mutation
+are not resolution paths.
+
 No other `CREATE TABLE` syntax is admitted.
 
 ### Execution and recovery

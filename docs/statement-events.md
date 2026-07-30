@@ -27,6 +27,13 @@ Automatic DDL admission currently has five narrow slices:
   emits deterministic MySQL 8 SQL, and derives expected post-state from fenced
   target pre-state plus the event AST without requiring the historical source
   head; and
+- the exact production `assistant_reply_reports` `CREATE TABLE` event, which
+  is admitted only by its exact raw-event hash after the target table has been
+  provisioned out of band from the recorded source definition. Replay fences a
+  stable current source inventory and requires complete table, index, and
+  foreign-key equality; equality is a proven no-op, while absent/mismatched
+  target state or a moving source fence remains `translation_pending` with no
+  checkpoint advance; and
 - the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
   COLUMN IF EXISTS ...` form, which is token-parsed and transformed from target
   column pre-state into deterministic MySQL 8 SQL;

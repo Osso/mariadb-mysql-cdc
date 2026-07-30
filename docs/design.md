@@ -25,7 +25,13 @@ with complete parsed options and no FK dependency; a strict unqualified fixture
 comments/double quotes/qualification rejected, one or more `BIGINT` or
 `VARCHAR(positive canonical decimal length)` `NOT NULL` columns with at least one
 inline `PRIMARY KEY`, zero or more one-column named ordinary `KEY` items, and
-`ENGINE=InnoDB` with an optional semicolon; the production-observed unqualified
+`ENGINE=InnoDB` with an optional semicolon; the exact production
+`assistant_reply_reports` `CREATE TABLE` event, admitted only by its exact
+raw-event hash after out-of-band target provisioning from the recorded source
+definition. Replay requires a stable source inventory with complete table,
+index, and foreign-key equality; equality is a proven no-op, while a changed
+statement, absent or mismatched target, or moving source fence remains a
+barrier without checkpoint advance; and the production-observed unqualified
 multi-clause `ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type
 grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT
 UNSIGNED`, the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options,

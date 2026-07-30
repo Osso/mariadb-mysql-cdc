@@ -120,6 +120,21 @@ is part of this flow. An existing `translation_pending` row for the exact
 procedure event is promoted automatically; no replacement journal row is
 created.
 
+### Exact `assistant_reply_reports` CREATE convergence recovery
+
+The exact production `assistant_reply_reports` CREATE event has a bounded
+convergence recovery, not generic `CREATE TABLE` support. Before retrying its
+barrier, an operator must provision the target table out of band from the
+recorded source definition; the CDC runtime never executes this CREATE. Replay
+then admits only the exact raw-event hash, fences a stable current source
+inventory, and requires complete equality of the source and target table,
+indexes, and foreign-key metadata. A successful equality proof records a
+proven no-op (`generated_sql = NULL`) and advances through the normal journal
+and checkpoint sequence. A changed statement, absent target, moving source
+fence, or semantic mismatch remains `translation_pending` with no checkpoint
+advance. Do not clear the barrier with operator-authored SQL or a manual journal
+status change.
+
 ### Identity-scoped source-only CREATE PROCEDURE
 
 The source-only `CREATE PROCEDURE` form is admitted only when the complete
