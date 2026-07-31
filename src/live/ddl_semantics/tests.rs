@@ -1,9 +1,8 @@
 use super::transform::{
     DDL_TRANSFORMATION_VERSION, parse_fixture_create_table, parse_production_alter_table_ast,
     supports_drop_procedure, supports_source_only_release_move_procedure_create,
-    supports_source_only_release_move_procedure_digest, transform_drop_columns_if_exists,
-    transform_drop_procedure, transform_fixture_create_table,
-    transform_source_only_release_move_procedure_digest,
+    transform_drop_columns_if_exists, transform_drop_procedure, transform_fixture_create_table,
+    transform_source_only_release_move_procedure_create,
 };
 use super::*;
 use crate::inventory::{
@@ -982,11 +981,15 @@ fn fixture_event(row_count: u64) -> EventInventory {
 }
 
 #[test]
-fn exact_source_only_release_move_procedure_digest_is_a_proven_noop() {
-    let transformation = transform_source_only_release_move_procedure_digest(
-        "1326338ea27069ed94e2f1a94f2cfc118465939a2312d7bba0adafb3da3728ec",
-    )
-    .expect("source-only CREATE PROCEDURE transformation");
+fn exact_source_only_release_move_procedure_create_is_a_proven_noop() {
+    let source_sql =
+        include_str!("../../../fixtures/ddl/create-apply-release-move-purchase-repair.sql");
+
+    assert!(supports_source_only_release_move_procedure_create(
+        source_sql
+    ));
+    let transformation = transform_source_only_release_move_procedure_create(source_sql)
+        .expect("source-only CREATE PROCEDURE transformation");
 
     assert_eq!(transformation.version, "mariadb-mysql8-v1");
     assert_eq!(transformation.target_sql, None);
@@ -994,15 +997,25 @@ fn exact_source_only_release_move_procedure_digest_is_a_proven_noop() {
 
 #[test]
 fn source_only_release_move_procedure_create_admits_only_observed_body_hashes() {
-    for digest in [
-        "1326338ea27069ed94e2f1a94f2cfc118465939a2312d7bba0adafb3da3728ec",
-        "a3e4b4b54295bd0374965761f3ec3a8bfd7ab857b623d25c9010e8fe6b3449c3",
-    ] {
-        assert!(supports_source_only_release_move_procedure_digest(digest));
-    }
+    let first_run =
+        include_str!("../../../fixtures/ddl/create-apply-release-move-purchase-repair.sql");
+    let final_run =
+        include_str!("../../../fixtures/ddl/create-apply-release-move-purchase-repair-95.sql");
 
-    assert!(!supports_source_only_release_move_procedure_digest(
-        "0000000000000000000000000000000000000000000000000000000000000000"
+    assert!(supports_source_only_release_move_procedure_create(
+        first_run
+    ));
+    assert!(supports_source_only_release_move_procedure_create(
+        final_run
+    ));
+    assert!(!supports_source_only_release_move_procedure_create(
+        &final_run.replace(
+            "apply_release_move_purchase_repair",
+            "another_release_move_procedure"
+        )
+    ));
+    assert!(!supports_source_only_release_move_procedure_create(
+        &format!("-- comment\n{first_run}")
     ));
     assert!(!supports_source_only_release_move_procedure_create(
         "CREATE PROCEDURE apply_release_move_purchase_repair() SELECT 1"

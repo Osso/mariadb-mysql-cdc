@@ -27,7 +27,11 @@ form; plus the existing `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` translator
 slice. The source-only CREATE admission occurs before generic
 qualified-identifier rejection because the admitted statement contains qualified
 tokens. Every other body, name, qualified, quoted, commented,
-other plain-name, or routine DDL variant remains unsupported.
+other plain-name, or routine DDL variant remains unsupported. The two admitted
+source bodies are tracked as exact fixtures at
+`fixtures/ddl/create-apply-release-move-purchase-repair.sql` and
+`fixtures/ddl/create-apply-release-move-purchase-repair-95.sql`; adding a
+comment or changing any body text changes the hash and remains rejected.
 Every other DDL form enters the same journal as `translation_pending`; no operator-authored
 target SQL is accepted as a resolution path.
 
@@ -165,7 +169,8 @@ status change.
 
 The source-only `CREATE PROCEDURE` form is admitted only when the complete
 statement matches one of two recorded hashes for unqualified routine identity
-`apply_release_move_purchase_repair`. Admission is exact-statement scoped, not
+`apply_release_move_purchase_repair`. The exact admitted bodies are the two
+tracked DDL fixtures named above. Admission is exact-statement scoped, not
 generalized procedure grammar. Qualified tokens are allowed only after this
 admission. Target evidence must prove the routine absent
 before and after capture; a present target procedure fails closed. The target

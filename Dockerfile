@@ -3,6 +3,7 @@ FROM rust:1.92-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY vendor ./vendor
+COPY fixtures/ddl ./fixtures/ddl
 COPY src ./src
 RUN cargo build --release
 
