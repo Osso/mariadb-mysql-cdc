@@ -1867,6 +1867,24 @@ fn production_add_unique_key_transforms_to_deterministic_mysql8_sql() {
 }
 
 #[test]
+fn production_float_unsigned_add_column_preserves_required_options() {
+    let source_sql = "ALTER TABLE `comics_top_stats`\n\
+        ADD COLUMN `value_1_day` FLOAT UNSIGNED NOT NULL DEFAULT 0 AFTER `statistic`";
+    let transformation =
+        transform_production_alter_table(source_sql).expect("production FLOAT UNSIGNED ADD COLUMN");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `comics_top_stats` ADD COLUMN `value_1_day` FLOAT UNSIGNED NOT NULL DEFAULT 0 AFTER `statistic`"
+        )
+    );
+    assert!(!supports_production_alter_table(
+        "ALTER TABLE `comics_top_stats` ADD COLUMN `value_1_day` FLOAT UNSIGNED NOT NULL DEFAULT 1 AFTER `statistic`"
+    ));
+}
+
+#[test]
 fn production_alter_rendering_depends_only_on_typed_ast() {
     let compact = transform_production_alter_table(
         "ALTER TABLE accounts ADD COLUMN handle VARCHAR(64) COMMENT 'user''s handle' AFTER id",

@@ -7,11 +7,12 @@ Automatic admission currently covers strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
 metadata and no FK dependency; the production-observed unqualified multi-clause
 `ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type grammar
-`VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
-quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
-rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
-`DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, named composite `ADD
-KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
+`VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or
+`FLOAT UNSIGNED`; quoted type keywords, quoted `VARCHAR` lengths, and quoted
+`UNSIGNED` forms are rejected, as are `DATETIME` precision, `SMALLINT` display
+width, and `FLOAT` parameters. The observed `NULL` or `NOT NULL`, `DEFAULT NULL`
+or `DEFAULT 0`, `COMMENT`, and `AFTER` options, named composite `ADD KEY`,
+MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
 clauses. Multiple admitted clauses render in source order as deterministic MySQL
 8 SQL; source `ADD INDEX` emits as target `ADD KEY`. The slice also admits
 `DROP COLUMN IF EXISTS`
@@ -208,8 +209,10 @@ replays five source ALTER events. It verifies `VARCHAR(64)`, `DATETIME`, and
 `SMALLINT UNSIGNED` column metadata, comments and placement, named composite
 non-unique and unique BTREE indexes, duplicate-row rejection parity, translated
 column removal and its absent-column no-op, five `checkpointed` journal rows with transformation evidence/version, and the final
-stream checkpoint. A neighboring unique-prefix option remains
-`translation_pending` with no target index and no checkpoint advancement. This is implemented-slice proof only, not full ALTER TABLE coverage,
+stream checkpoint. Focused parser and structured-stream replay tests cover the
+production `FLOAT UNSIGNED NOT NULL DEFAULT 0` form. A neighboring unique-prefix
+option remains `translation_pending` with no target index and no checkpoint
+advancement. This is implemented-slice proof only, not full ALTER TABLE coverage,
 a full compatibility matrix, or deployment proof.
 
 ## Transformation/evidence failure

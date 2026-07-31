@@ -33,10 +33,11 @@ index, and foreign-key equality; equality is a proven no-op, while a changed
 statement, absent or mismatched target, or moving source fence remains a
 barrier without checkpoint advance; and the production-observed unqualified
 multi-clause `ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type
-grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT
-UNSIGNED`, the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options,
-and named composite `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the
-same AST, or `ADD UNIQUE KEY` clauses. Multiple admitted clauses render in source
+grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT
+UNSIGNED`, or `FLOAT UNSIGNED`, the observed `NULL` or `NOT NULL`, `DEFAULT NULL`
+or `DEFAULT 0`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY`,
+MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
+clauses. Multiple admitted clauses render in source
 order as deterministic MySQL 8 SQL; source `ADD INDEX` emits as target `ADD KEY`.
 The slice also admits `DROP COLUMN IF EXISTS` with ASCII-case-insensitive target
 matching, one emitted drop per matched target spelling, and absent or repeated
@@ -51,10 +52,11 @@ admitted when this otherwise-supported ALTER has exactly one leading ordinary
 MySQL `-- ` line comment. Embedded comments, executable/version comments,
 optimizer hints, and all other leading comment forms remain rejected. For the
 ALTER `ADD COLUMN` slice, the exact unquoted type grammar is
-`VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`;
-quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
-rejected, as are `DATETIME` precision and `SMALLINT` display width. Those unsupported
-variants remain `translation_pending` with no target DDL or checkpoint advance. For
+`VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or
+`FLOAT UNSIGNED`; quoted type keywords, quoted `VARCHAR` lengths, and quoted
+`UNSIGNED` forms are rejected, as are `DATETIME` precision, `SMALLINT` display
+width, and `FLOAT` parameters. Unsupported defaults, options, comments, and
+clauses remain `translation_pending` with no target DDL or checkpoint advance. For
 admitted CREATE TABLE, source charset/collation are read between exact
 event-coordinate fences, persisted in evidence, rendered explicitly, and checked
 against target absence before and after capture plus the exact observed post-state;

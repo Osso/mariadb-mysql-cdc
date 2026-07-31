@@ -17,10 +17,11 @@ slices: explicitly named, unqualified, visible, non-unique secondary BTREE
 `CREATE INDEX`/`DROP INDEX` with complete parsed options and no FK dependency;
 the production-observed unqualified multi-clause `ALTER TABLE` form with
 `ADD COLUMN` under the exact unquoted type grammar
-`VARCHAR(positive canonical decimal length)`, `DATETIME`, or `SMALLINT UNSIGNED`,
-the observed `DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options, and named
-composite `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, or
-`ADD UNIQUE KEY` clauses. Multiple admitted clauses render in source order as
+`VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or
+`FLOAT UNSIGNED`, the observed `NULL` or `NOT NULL`, `DEFAULT NULL` or
+`DEFAULT 0`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY`,
+MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
+clauses. Multiple admitted clauses render in source order as
 deterministic MySQL 8 SQL; source `ADD INDEX` emits as target `ADD KEY`. The
 slice also admits `DROP COLUMN IF EXISTS` with
 ASCII-case-insensitive target matching, one emitted drop per matched target spelling,
@@ -29,10 +30,11 @@ multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form. For the
 implemented ALTER slice, expected post-state is derived from fenced target
 pre-state plus the event AST; historical replay does not require a live source
 head at the event coordinate. The ALTER `ADD COLUMN` slice admits only the exact
-unquoted type grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, or
-`SMALLINT UNSIGNED`; quoted type keywords, quoted `VARCHAR` lengths, and quoted
-`UNSIGNED` forms are unsupported, as are `DATETIME` precision and `SMALLINT` display
-width. Such variants enter `translation_pending` with no target DDL or checkpoint
+unquoted type grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`,
+`SMALLINT UNSIGNED`, or `FLOAT UNSIGNED`; quoted type keywords, quoted `VARCHAR`
+lengths, and quoted `UNSIGNED` forms are unsupported, as are `DATETIME` precision,
+`SMALLINT` display width, and `FLOAT` parameters. Unsupported defaults, options,
+comments, and clauses enter `translation_pending` with no target DDL or checkpoint
 advance.
 
 For an admitted event, the order is:

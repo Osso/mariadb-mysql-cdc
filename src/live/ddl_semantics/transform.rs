@@ -69,8 +69,10 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
 }
 
 fn render_add_column(column: &ParsedAddColumnAst) -> String {
+    let nullability = if column.nullable { "NULL" } else { "NOT NULL" };
+    let default_value = column.default_value.as_deref().unwrap_or("NULL");
     let mut sql = format!(
-        "ADD COLUMN {} {} NULL DEFAULT NULL",
+        "ADD COLUMN {} {} {nullability} DEFAULT {default_value}",
         quote_identifier(&column.name),
         column.column_type.to_ascii_uppercase()
     );
@@ -1601,7 +1603,7 @@ fn parse_add_column_clause(
     let name = require_identifier(tokens, index + 2, "added column")?;
     let (column_type, data_type, options_start) =
         parse_observed_column_type(tokens, quoted_flags, index + 3)?;
-    let options = parse_observed_column_options(tokens, options_start, literals)?;
+    let options = parse_observed_column_options(tokens, options_start, literals, &data_type)?;
     Ok((
         ParsedAlterClause::AddColumn(ParsedAddColumnAst {
             name,
@@ -1666,7 +1668,10 @@ fn parse_observed_column_type(
 ) -> Result<(String, String, usize), String> {
     require_unquoted_token(quoted_flags, index, "added column type")?;
     let data_type = require_identifier(tokens, index, "added column type")?.to_ascii_lowercase();
-    if !matches!(data_type.as_str(), "varchar" | "datetime" | "smallint") {
+    if !matches!(
+        data_type.as_str(),
+        "varchar" | "datetime" | "smallint" | "float"
+    ) {
         return Err(format!(
             "unsupported production ADD COLUMN type {data_type}"
         ));
@@ -1707,6 +1712,15 @@ fn parse_observed_column_type(
             index += 1;
             "smallint unsigned".to_string()
         }
+        "float" => {
+            if tokens.get(index).map(String::as_str) == Some("(") {
+                return Err("FLOAT parameters are unsupported".to_string());
+            }
+            require_unquoted_token(quoted_flags, index, "FLOAT UNSIGNED keyword")?;
+            require_keyword(tokens, index, "UNSIGNED")?;
+            index += 1;
+            "float unsigned".to_string()
+        }
         _ => unreachable!("supported types were checked above"),
     };
     if tokens
@@ -1733,6 +1747,7 @@ fn parse_observed_column_options(
     tokens: &[String],
     mut index: usize,
     literals: &mut impl Iterator<Item = String>,
+    data_type: &str,
 ) -> Result<ParsedColumnOptions, String> {
     let mut nullable = true;
     let mut default_value = None;
@@ -1742,9 +1757,27 @@ fn parse_observed_column_options(
         if tokens[index].eq_ignore_ascii_case("NULL") {
             nullable = true;
             index += 1;
-        } else if tokens[index].eq_ignore_ascii_case("DEFAULT") {
+        } else if tokens[index].eq_ignore_ascii_case("NOT") {
+            if data_type != "float" {
+                return Err(format!(
+                    "unsupported production ADD COLUMN option {:?}",
+                    tokens.get(index)
+                ));
+            }
             require_keyword(tokens, index + 1, "NULL")?;
-            default_value = None;
+            nullable = false;
+            index += 2;
+        } else if tokens[index].eq_ignore_ascii_case("DEFAULT") {
+            let value = tokens
+                .get(index + 1)
+                .ok_or_else(|| "DEFAULT value is missing".to_string())?;
+            if value.eq_ignore_ascii_case("NULL") {
+                default_value = None;
+            } else if data_type == "float" && value == "0" {
+                default_value = Some("0".to_string());
+            } else {
+                return Err(format!("unsupported production ADD COLUMN default {value}"));
+            }
             index += 2;
         } else if tokens[index].eq_ignore_ascii_case("COMMENT") {
             require_keyword(tokens, index + 1, "<string>")?;

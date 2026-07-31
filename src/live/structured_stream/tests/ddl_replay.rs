@@ -200,6 +200,67 @@ fn production_add_column_ddl_is_admitted_by_live_stream() {
 }
 
 #[test]
+fn production_float_unsigned_add_column_is_admitted_by_live_stream() {
+    let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let executor = TransactionRecordingExecutor::with_operations(operations.clone());
+    let mut applier = crate::row::RowApplier::new(executor);
+    let journal = RecordingDdlReplayJournal::with_operations(operations.clone());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let mut current_file = "mysqld-bin.002769".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "globalcomix".to_string(),
+        sql_statement: "ALTER TABLE `comics_top_stats`\n    ADD COLUMN `value_1_day` FLOAT UNSIGNED NOT NULL DEFAULT 0 AFTER `statistic`"
+            .to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let outcome = handle_ddl_event(
+        &mut applier,
+        &journal,
+        &RecordingSemanticInventory::default(),
+        "globalcomix-prod-mariadb-2026-01",
+        &mut context,
+        &event_header(3, 329601175),
+        &event,
+    )
+    .expect("FLOAT UNSIGNED ADD COLUMN must enter automatic replay")
+    .expect("DDL outcome");
+
+    assert_eq!(
+        outcome.resume_coordinate.map(|value| value.position),
+        Some(329601175)
+    );
+    assert_eq!(
+        operations.borrow().as_slice(),
+        &[
+            "PREPARE",
+            "EXEC",
+            "APPLIED",
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "EXEC",
+            "CHECKPOINT",
+            "COMMIT",
+        ]
+    );
+}
+
+#[test]
 fn mariadb_rename_column_if_exists_executes_generated_mysql8_sql() {
     let executor = TransactionRecordingExecutor::failing();
     let mut applier = crate::row::RowApplier::new(executor);
