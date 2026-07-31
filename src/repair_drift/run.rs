@@ -1,9 +1,13 @@
 use super::config::{parse_repair_drift_config, validate_repair_drift_config};
+use super::equivalent_conflicts::reconcile_exact_equivalent_conflicts;
 use super::plan::{
     RepairTableInputs, build_runtime_repair_plan, collect_repair_table_inputs, drifted_table_names,
     ordered_candidate_tables,
 };
-use super::{RepairDriftConfig, RepairDriftError, RepairDriftReport, RepairDriftTableReport};
+use super::{
+    EquivalentConflictReport, RepairDriftConfig, RepairDriftError, RepairDriftReport,
+    RepairDriftTableReport,
+};
 use crate::drift_check::{self, DriftCheckConfig};
 use crate::inventory::{InventoryConfig, InventoryEndpointRole, SchemaInventory, build_inventory};
 use crate::mysql_snapshot::MySqlConnectionConfig;
@@ -52,8 +56,15 @@ fn execute_repair_drift(
     plan: crate::repair_drift::RepairPlan,
     tables: Vec<String>,
 ) -> Result<RepairDriftReport, RepairDriftError> {
-    if tables.is_empty() {
-        return Ok(empty_report(&run_id, &source, &target));
+    let equivalent_conflicts =
+        reconcile_exact_equivalent_conflicts(config, &run_id, &source, &tables)?;
+    if config.conflict_reconcile_limit > 0 || tables.is_empty() {
+        return Ok(empty_report(
+            &run_id,
+            &source,
+            &target,
+            equivalent_conflicts,
+        ));
     }
     let drift = run_drift_check(config, tables.clone())?;
     let (repair_tables, skipped) =
@@ -65,6 +76,7 @@ fn execute_repair_drift(
         target_tables: target.tables.len(),
         compared_tables: drift.comparisons.len(),
         drifted_tables: drifted_table_names(&drift.comparisons).len(),
+        equivalent_conflicts,
         repaired,
         skipped,
     })
@@ -74,6 +86,7 @@ fn empty_report(
     run_id: &str,
     source: &SchemaInventory,
     target: &SchemaInventory,
+    equivalent_conflicts: EquivalentConflictReport,
 ) -> RepairDriftReport {
     RepairDriftReport {
         run_id: run_id.to_string(),
@@ -81,6 +94,7 @@ fn empty_report(
         target_tables: target.tables.len(),
         compared_tables: 0,
         drifted_tables: 0,
+        equivalent_conflicts,
         repaired: Vec::new(),
         skipped: Vec::new(),
     }
@@ -124,12 +138,15 @@ fn format_repair_drift_report(report: &RepairDriftReport) -> String {
 
 fn format_summary_line(report: &RepairDriftReport) -> String {
     format!(
-        "repair_drift run_id={} source_tables={} target_tables={} compared_tables={} drifted_tables={} repaired_tables={} skipped_tables={}",
+        "repair_drift run_id={} source_tables={} target_tables={} compared_tables={} drifted_tables={} equivalent_conflicts_examined={} equivalent_conflicts_resolved={} equivalent_conflicts_deferred={} repaired_tables={} skipped_tables={}",
         report.run_id,
         report.source_tables,
         report.target_tables,
         report.compared_tables,
         report.drifted_tables,
+        report.equivalent_conflicts.examined,
+        report.equivalent_conflicts.resolved,
+        report.equivalent_conflicts.deferred,
         report.repaired.len(),
         report.skipped.len()
     )

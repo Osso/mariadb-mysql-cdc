@@ -32,6 +32,7 @@ pub(crate) use model::{
     sync_chunk_request_with_updated_since, sync_insert_mode, target_connection_config,
     validate_sync_range, validate_sync_table, validate_sync_table_config,
 };
+pub(crate) use mysql::MySqlSyncReader;
 #[cfg(test)]
 pub(crate) use mysql::build_sync_select_sql;
 pub(crate) use progress::{SyncRunCandidate, claim_compatible_failed_run};

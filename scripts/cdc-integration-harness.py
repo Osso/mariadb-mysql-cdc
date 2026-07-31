@@ -105,6 +105,7 @@ SCENARIOS = (
     ScenarioSpec("selected-window-repair", True),
     ScenarioSpec("delete-only-descendants", True),
     ScenarioSpec("conflict-resolution-zero-debt", True),
+    ScenarioSpec("exact-equivalent-conflict-reconciliation", True),
 )
 SCENARIO_BY_NAME = {scenario.name: scenario for scenario in SCENARIOS}
 
@@ -782,6 +783,8 @@ class Harness:
         start_after: list[str] | None = None,
         end_at: list[str] | None = None,
         progress_table: str = "globalcomix.table_sync_runs",
+        content_check: bool = True,
+        conflict_reconcile_limit: int | None = None,
         integration_failpoint: str | None = None,
     ) -> list[str]:
         args = [
@@ -817,6 +820,8 @@ class Harness:
             str(chunk_size),
             "--progress-table",
             progress_table,
+            "--content-check",
+            str(content_check).lower(),
         ]
         for table in tables:
             args.extend(["--table", table])
@@ -826,6 +831,8 @@ class Harness:
             args.extend(["--start-after-json", json.dumps(start_after)])
         if end_at is not None:
             args.extend(["--end-at-json", json.dumps(end_at)])
+        if conflict_reconcile_limit is not None:
+            args.extend(["--conflict-reconcile-limit", str(conflict_reconcile_limit)])
         if integration_failpoint is not None:
             args.extend(["--integration-failpoint", integration_failpoint])
         return args
@@ -840,6 +847,8 @@ class Harness:
         start_after: list[str] | None = None,
         end_at: list[str] | None = None,
         progress_table: str = "globalcomix.table_sync_runs",
+        content_check: bool = True,
+        conflict_reconcile_limit: int | None = None,
         timeout: float = 180,
     ) -> CommandResult:
         assert self.source and self.target
@@ -859,6 +868,8 @@ class Harness:
                 start_after=start_after,
                 end_at=end_at,
                 progress_table=progress_table,
+                content_check=content_check,
+                conflict_reconcile_limit=conflict_reconcile_limit,
             ),
             cwd=self.repo,
             env=env,
@@ -4925,6 +4936,112 @@ class Harness:
             print(f"{scenario}_converged secondary_owner_preserved=true verified_equality=true unresolved=0")
             return
 
+        if scenario == "exact-equivalent-conflict-reconciliation":
+            table = "repair_equivalent_conflicts"
+            self.setup_repair_accounts(table)
+            self.admin_sql(
+                self.source,
+                f"INSERT INTO {table} VALUES "
+                "(1, 'equal@example.test', 'equal-row'), "
+                "(2, 'missing@example.test', 'missing-row'), "
+                "(3, 'divergent@example.test', 'source-row');",
+            )
+            self.admin_sql(
+                self.target,
+                f"INSERT INTO {table} VALUES "
+                "(1, 'equal@example.test', 'equal-row'), "
+                "(3, 'divergent@example.test', 'target-row'), "
+                "(4, 'extra@example.test', 'extra-row');",
+            )
+            coordinate = self.coordinate()
+            self.write_checkpoint(coordinate)
+            for offset, primary_key in enumerate((["1"], ["2"], ["3"])):
+                start_position = coordinate.position + offset
+                identity = self.conflict_identity(
+                    coordinate.file,
+                    start_position,
+                    table,
+                    primary_key,
+                    operation="insert",
+                )
+                self.admin_sql(
+                    self.target,
+                    "INSERT INTO cdc.row_conflicts "
+                    "(conflict_identity,source_identity,source_server_id,source_file,source_start_position,source_end_position,"
+                    "schema_name,table_name,operation,source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json,"
+                    "error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status) VALUES ("
+                    f"{sql_literal(identity)},{sql_literal(SOURCE_IDENTITY)},101,{sql_literal(coordinate.file)},{start_position},{start_position + 1},"
+                    f"'globalcomix',{sql_literal(table)},'insert',{sql_literal(json.dumps(primary_key, separators=(',', ':')))},"
+                    "NULL,NULL,1452,'fixture conflict',1,1,1,'unresolved');",
+                )
+            checkpoint_before = self.checkpoint()
+            rows_before = self.query(
+                self.target,
+                f"SELECT id,email,payload FROM {table} ORDER BY id;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            first = self.run_repair(
+                tables=[table],
+                run_id="exact-equivalent-conflicts-first",
+                content_check=False,
+                conflict_reconcile_limit=3,
+            )
+            require_success(first, scenario)
+            evidence = self.query(
+                self.target,
+                "SELECT source_primary_key_json,status,COALESCE(repair_run_id,'NULL') "
+                "FROM cdc.row_conflicts "
+                f"WHERE source_identity={sql_literal(SOURCE_IDENTITY)} AND table_name={sql_literal(table)} "
+                "ORDER BY source_primary_key_json;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            expected = (
+                '["1"]\tresolved\texact-equivalent-conflicts-first\n'
+                '["2"]\tunresolved\tNULL\n'
+                '["3"]\tunresolved\tNULL'
+            )
+            if evidence != expected:
+                raise HarnessError(f"{scenario} resolved the wrong durable evidence: {evidence!r}")
+            if self.checkpoint() != checkpoint_before:
+                raise HarnessError(f"{scenario} advanced the stream checkpoint")
+            rows_after_first = self.query(
+                self.target,
+                f"SELECT id,email,payload FROM {table} ORDER BY id;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            if rows_after_first != rows_before:
+                raise HarnessError(f"{scenario} mutated target rows: {rows_after_first!r}")
+            second = self.run_repair(
+                tables=[table],
+                run_id="exact-equivalent-conflicts-second",
+                content_check=False,
+                conflict_reconcile_limit=3,
+            )
+            require_success(second, f"{scenario} idempotent rerun")
+            evidence_after_second = self.query(
+                self.target,
+                "SELECT source_primary_key_json,status,COALESCE(repair_run_id,'NULL') "
+                "FROM cdc.row_conflicts "
+                f"WHERE source_identity={sql_literal(SOURCE_IDENTITY)} AND table_name={sql_literal(table)} "
+                "ORDER BY source_primary_key_json;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            if evidence_after_second != expected:
+                raise HarnessError(
+                    f"{scenario} was not idempotent: {evidence_after_second!r}"
+                )
+            if self.checkpoint() != checkpoint_before:
+                raise HarnessError(f"{scenario} idempotent rerun advanced checkpoint")
+            print(
+                f"{scenario}_converged resolved_equal=1 unresolved_missing=1 "
+                "unresolved_divergent=1 target_unchanged=true checkpoint_unchanged=true"
+            )
+            return
+
         raise HarnessError(f"unknown repair scenario: {scenario}")
 
     def conflict_identity(
@@ -5185,6 +5302,8 @@ class Harness:
             self.run_repair_scenario("delete-only-descendants")
         elif scenario == "conflict-resolution-zero-debt":
             self.run_repair_scenario("conflict-resolution-zero-debt")
+        elif scenario == "exact-equivalent-conflict-reconciliation":
+            self.run_repair_scenario("exact-equivalent-conflict-reconciliation")
         else:
             raise HarnessError(f"scenario has no implementation: {scenario}")
 

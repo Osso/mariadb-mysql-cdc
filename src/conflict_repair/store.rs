@@ -301,6 +301,42 @@ impl MySqlConflictStore {
         self.unresolved.borrow().len()
     }
 
+    pub(crate) fn unresolved_source_rows(
+        &self,
+        source_identity: &str,
+        schema: &str,
+        tables: &[String],
+        limit: usize,
+    ) -> Result<Vec<ConflictKey>, String> {
+        if tables.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let table_values = tables
+            .iter()
+            .map(|table| quote_sql_literal(table))
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!(
+            "SELECT conflict_identity,source_row_identity,source_identity,source_server_id,source_file,source_start_position,schema_name,table_name,operation,source_primary_key_json FROM {} WHERE status='unresolved' AND source_identity={} AND schema_name={} AND table_name IN ({}) ORDER BY first_observed_at_ms,conflict_identity LIMIT {}",
+            self.table,
+            quote_sql_literal(source_identity),
+            quote_sql_literal(schema),
+            table_values,
+            limit,
+        );
+        let rows = self
+            .conn
+            .borrow_mut()
+            .query::<ConflictIdentityRow, _>(query)
+            .map_err(|error| format!("conflict candidate read failed: {error}"))?;
+        rows.into_iter()
+            .map(|row| {
+                validate_conflict_identity_row(&row)?;
+                conflict_key_from_identity_row(&row)
+            })
+            .collect()
+    }
+
     pub fn resolve_verified_table(
         &mut self,
         source_identity: &str,

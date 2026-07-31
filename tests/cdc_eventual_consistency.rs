@@ -72,6 +72,12 @@ fn real_sync_table_composite_enum_primary_key_uses_enum_order() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_exact_equivalent_conflict_reconciliation_is_bounded_and_checkpoint_independent() {
+    run_harness_scenario("exact-equivalent-conflict-reconciliation");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_sync_table_fk_parent_reconciles_stale_unique_owner() {
     run_harness_scenario("sync-table-fk-parent-stale-unique-owner");
 }

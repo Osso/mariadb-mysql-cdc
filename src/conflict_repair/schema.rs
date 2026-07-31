@@ -197,7 +197,9 @@ pub(crate) fn validate_conflict_identity_row(row: &ConflictIdentityRow) -> Resul
     )
 }
 
-fn conflict_key_from_identity_row(row: &ConflictIdentityRow) -> Result<ConflictKey, String> {
+pub(crate) fn conflict_key_from_identity_row(
+    row: &ConflictIdentityRow,
+) -> Result<ConflictKey, String> {
     let operation = parse_conflict_operation(&row.8)?;
     let source_primary_key = serde_json::from_str(&row.9)
         .map_err(|error| format!("invalid stored source primary key JSON: {error}"))?;

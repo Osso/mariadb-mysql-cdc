@@ -161,6 +161,13 @@ Repair drift options:
   --end-at-json JSON               Upper primary-key bound as a JSON string array.
   --content-check BOOL             Run bounded content checks when counts match. Defaults to true.
   --mode MODE                     dry-run (default) or apply.
+  --conflict-reconcile-limit ROWS  Apply-only bounded pass over at most this many unresolved rows
+                                  in the selected source/table scope. Read complete source and
+                                  target rows by primary key; resolve only one-row complete
+                                  equality with matching unresolved evidence. Missing, divergent,
+                                  malformed, or ambiguous rows remain unresolved. Writes no
+                                  target-table repairs and never reads or advances stream
+                                  checkpoints; repeated passes are idempotent. Defaults to 0.
   --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
   --run-id ID                     Reuse an interrupted repair run; plan hash must match.
   --run-id-prefix PREFIX          Prefix for the fresh run-scoped repair ID.

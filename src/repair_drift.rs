@@ -1,4 +1,5 @@
 mod config;
+mod equivalent_conflicts;
 mod plan;
 mod run;
 
@@ -25,6 +26,7 @@ pub struct RepairDriftConfig {
     pub content_check: bool,
     pub mode: SyncMode,
     pub chunk_size: usize,
+    pub conflict_reconcile_limit: usize,
     pub progress_table: String,
     pub run_id: Option<String>,
     pub run_id_prefix: String,
@@ -47,6 +49,13 @@ pub struct RepairDriftSkip {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EquivalentConflictReport {
+    pub examined: usize,
+    pub resolved: usize,
+    pub deferred: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepairDriftReport {
     pub run_id: String,
@@ -54,6 +63,7 @@ pub struct RepairDriftReport {
     pub target_tables: usize,
     pub compared_tables: usize,
     pub drifted_tables: usize,
+    pub equivalent_conflicts: EquivalentConflictReport,
     pub repaired: Vec<RepairDriftTableReport>,
     pub skipped: Vec<RepairDriftSkip>,
 }

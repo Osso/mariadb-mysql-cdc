@@ -30,6 +30,7 @@ pub(crate) fn default_repair_drift_config() -> RepairDriftConfig {
         content_check: true,
         mode: SyncMode::DryRun,
         chunk_size: 1000,
+        conflict_reconcile_limit: 0,
         progress_table: "cdc.table_sync_runs".to_string(),
         run_id: None,
         run_id_prefix: "repair-drift".to_string(),
@@ -135,6 +136,9 @@ fn apply_repair_execution_option(
         "--content-check" => config.content_check = crate::parse_bool(flag, value)?,
         "--mode" => config.mode = parse_sync_mode(value)?,
         "--chunk-size" => config.chunk_size = crate::parse_usize(flag, value)?,
+        "--conflict-reconcile-limit" => {
+            config.conflict_reconcile_limit = crate::parse_usize(flag, value)?
+        }
         "--progress-table" => config.progress_table = value.to_string(),
         _ => return Ok(false),
     }
@@ -251,6 +255,9 @@ fn validate_repair_options(config: &RepairDriftConfig) -> Result<(), String> {
 }
 
 fn validate_apply_config(config: &RepairDriftConfig) -> Result<(), String> {
+    if config.conflict_reconcile_limit > 0 && config.mode != SyncMode::Apply {
+        return Err("conflict reconciliation requires apply mode".to_string());
+    }
     if config.mode != SyncMode::Apply {
         return Ok(());
     }

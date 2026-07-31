@@ -314,6 +314,29 @@ fn parses_selected_primary_key_window_for_bounded_repair() {
 }
 
 #[test]
+fn parses_bounded_exact_equivalent_conflict_reconciliation() {
+    let mut config = valid_config();
+    config.mode = SyncMode::Apply;
+    config.source_identity = "source-a".to_string();
+    repair_drift_option(&mut config, "--conflict-reconcile-limit", "25")
+        .expect("conflict reconciliation limit");
+
+    validate_repair_drift_config(&config).expect("valid reconciliation config");
+    assert_eq!(config.conflict_reconcile_limit, 25);
+}
+
+#[test]
+fn exact_equivalent_conflict_reconciliation_requires_apply_mode() {
+    let mut config = valid_config();
+    config.conflict_reconcile_limit = 1;
+
+    assert_eq!(
+        validate_repair_drift_config(&config).expect_err("dry-run reconciliation"),
+        "conflict reconciliation requires apply mode"
+    );
+}
+
+#[test]
 fn repair_source_inventory_uses_plaintext_without_tls_ca() {
     let mut config = valid_config();
     config.source.host = "127.0.0.1".to_string();

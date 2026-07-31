@@ -4,7 +4,7 @@
 application. Each recurrence gets a fresh orchestration ID. Direct child-run
 reuse remains limited to the exact interrupted run; an apply-mode InsertMissing
 phase may reclaim exactly one failed `missing-primary-keys` run whose full
-immutable specification matches. The real Docker harness defines 44 executable
+immutable specification matches. The real Docker harness defines 45 executable
 scenarios and proves FK ordering, fail-closed planning, resumable runs, PK-window
 bounds, secondary-unique safety, and zero unresolved debt for the repaired scope.
 
@@ -32,6 +32,13 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
 - [x] Keep content-check bounds visible; at most 1,000 mismatch ranges are
       recorded and floating-point columns are skipped.
 - [x] Keep target writes primary-key based.
+- [x] In apply mode, `--conflict-reconcile-limit N` runs a bounded
+      reconciliation-only cycle over at most `N` unresolved rows in the selected
+      source/table scope. Read complete source and target rows by primary key and
+      resolve only exact one-row equality with matching durable evidence. Missing,
+      divergent, malformed, or ambiguous rows remain unresolved. The cycle performs
+      no target-table repair, never reads or advances the stream checkpoint, and
+      repeated cycles are idempotent.
 
 ## Wired phased behavior
 
@@ -63,9 +70,11 @@ bounds, secondary-unique safety, and zero unresolved debt for the repaired scope
 - [x] Individual MariaDB 11.4 → MySQL 8.0 Docker scenarios pass.
 
 Remaining eventual-consistency gates are recurring scheduling from unresolved
-conflicts, full-tree parity, and deployment/cutover proof. Until a scheduler exists,
-operators must start each recurrence with a fresh bounded orchestration ID and
-review the persisted child run states. Reclamation occurs only when that invoked
-cycle encounters one compatible failed missing-PK child; it is not scheduling.
+conflicts, automatic parent-aware admission for missing-row conflicts, full-tree
+parity, and deployment/cutover proof. Until a scheduler exists, operators must start
+each recurrence with a fresh bounded orchestration ID and review the persisted child
+run states. Exact-equivalent reconciliation is available as a bounded
+reconciliation-only cycle; reclamation occurs only when an invoked repair cycle
+encounters one compatible failed missing-PK child. Neither behavior is scheduling.
 
 Out of scope: unbounded deletion and automatic cutover.
