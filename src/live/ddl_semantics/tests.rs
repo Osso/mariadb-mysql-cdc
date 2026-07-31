@@ -1200,6 +1200,48 @@ fn transforms_mariadb_multi_clause_rename_column_if_exists_for_mysql8() {
 }
 
 #[test]
+fn rename_column_if_exists_comments_preserve_leading_prefix() {
+    let columns = ["arc_start_order"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let source_sql = concat!(
+        "-- Preserve the source migration context.\r\n",
+        "ALTER TABLE `home_feed_captions`\r\n",
+        "  RENAME COLUMN IF EXISTS `arc_start_order` TO `deprecated_arc_start_order`",
+    );
+
+    let transformation = transform_rename_columns_if_exists(source_sql, &columns)
+        .expect("commented MariaDB rename transformation");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "-- Preserve the source migration context.\r\n\
+             ALTER TABLE `home_feed_captions` RENAME COLUMN `arc_start_order` TO `deprecated_arc_start_order`"
+        )
+    );
+}
+
+#[test]
+fn rename_column_if_exists_comments_reject_embedded_comment() {
+    let columns = ["arc_start_order"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let error = transform_rename_columns_if_exists(
+        "ALTER TABLE `home_feed_captions` \
+         RENAME COLUMN IF EXISTS `arc_start_order` /* migration context */ \
+         TO `deprecated_arc_start_order`",
+        &columns,
+    )
+    .expect_err("embedded comment must not be discarded");
+
+    assert!(error.contains("comments are not supported"), "{error}");
+}
+
+#[test]
 fn rename_column_if_exists_becomes_proven_noop_when_source_columns_are_absent() {
     let columns = ["deprecated_arc_start_order", "deprecated_arc_end_order"]
         .into_iter()
