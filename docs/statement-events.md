@@ -52,7 +52,11 @@ Automatic DDL admission currently has five narrow slices:
   checkpoint advance; and
 - the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
   COLUMN IF EXISTS ...` form, which is token-parsed and transformed from target
-  column pre-state into deterministic MySQL 8 SQL;
+  column pre-state into deterministic MySQL 8 SQL. Exactly one leading ordinary
+  MySQL `-- ` line comment is preserved verbatim, including its source prefix
+  and line ending, when executable generated SQL is emitted. Any remaining or
+  embedded comment form is rejected into the durable DDL block path. Absent
+  rename clauses remain proven no-ops and emit no target SQL;
 - the exact production-observed unqualified `CREATE TABLE IF NOT EXISTS
   home_feed_artist_blacklist` form, including its modeled columns, inline
   primary key, unique artist index, InnoDB engine, and observed charset/collation.

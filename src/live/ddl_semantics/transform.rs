@@ -1456,8 +1456,9 @@ pub fn transform_drop_columns_if_exists(
 }
 
 pub fn supports_rename_columns_if_exists(source_sql: &str) -> bool {
-    tokenize_ddl(source_sql)
+    rename_columns_if_exists_sql(source_sql)
         .ok()
+        .and_then(|(_, statement_sql)| tokenize_ddl(statement_sql).ok())
         .and_then(|tokens| parse_rename_columns_if_exists(&tokens).ok())
         .is_some()
 }
@@ -1466,14 +1467,27 @@ pub fn transform_rename_columns_if_exists(
     source_sql: &str,
     target_columns: &BTreeSet<String>,
 ) -> Result<DdlTransformation, String> {
-    let tokens = tokenize_ddl(source_sql)?;
+    let (leading_comment, statement_sql) = rename_columns_if_exists_sql(source_sql)?;
+    let tokens = tokenize_ddl(statement_sql)?;
     let (table, clauses) = parse_rename_columns_if_exists(&tokens)?;
     let executable_clauses = select_executable_renames(&table, clauses, target_columns)?;
-    let target_sql = emit_rename_columns(&table, &executable_clauses);
+    let target_sql =
+        emit_rename_columns(&table, &executable_clauses).map(|sql| match leading_comment {
+            Some(comment) => format!("{comment}{sql}"),
+            None => sql,
+        });
     Ok(DdlTransformation {
         version: DDL_TRANSFORMATION_VERSION,
         target_sql,
     })
+}
+
+fn rename_columns_if_exists_sql(source_sql: &str) -> Result<(Option<&str>, &str), String> {
+    let (leading_comment, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
+    if ddl_contains_comments(statement_sql) {
+        return Err("RENAME COLUMN IF EXISTS comments are not supported".to_string());
+    }
+    Ok((leading_comment, statement_sql))
 }
 
 fn production_alter_sql(source_sql: &str) -> Result<&str, String> {
