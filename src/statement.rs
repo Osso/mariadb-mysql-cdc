@@ -980,22 +980,22 @@ mod tests {
     }
 
     #[test]
-    fn replays_alter_table_after_leading_line_comments() {
+    fn preserves_leading_line_comments_when_replaying_alter_table() {
         let executor = RecordingExecutor::default();
         let quarantine = RecordingQuarantine::default();
         let applier = StatementApplier::new(executor, quarantine);
-        let ddl = [
-            "-- Non-unique lookup key backing app-level upserts",
-            "-- The UNIQUE version lands after data is backfilled.",
-            "ALTER TABLE `kg_characters`",
-            "  ADD KEY `idx_artist_canonical_hash` (`artist_id`, `canonical_name_hash`),",
+        let ddl = concat!(
+            "-- Non-unique lookup key backing app-level upserts\r\n",
+            "-- The UNIQUE version lands after data is backfilled.\r\n",
+            "ALTER TABLE `kg_characters`\r\n",
+            "  ADD KEY `idx_artist_canonical_hash` (`artist_id`, `canonical_name_hash`),\r\n",
             "  ALGORITHM=INPLACE, LOCK=NONE",
-        ]
-        .join("\n");
+        );
 
-        let outcome = applier.apply(&statement(&ddl)).expect("apply statement");
+        let outcome = applier.apply(&statement(ddl)).expect("apply statement");
 
         assert_eq!(outcome, StatementOutcome::Replayed);
+        assert_eq!(applier.executor.statements.borrow()[0].sql, ddl);
         assert!(applier.quarantine.statements.borrow().is_empty());
     }
 
