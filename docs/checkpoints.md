@@ -12,11 +12,15 @@ control plane.
 ## Automatic DDL journal
 
 The event handler represents DDL in the durable journal
-(`cdc.ddl_replay_journal`). Automatic admission currently covers three narrow
-slices: explicitly named, unqualified, visible, non-unique secondary BTREE
-`CREATE INDEX`/`DROP INDEX` with complete parsed options and no FK dependency;
-the production-observed unqualified multi-clause `ALTER TABLE` form with
-`ADD COLUMN` under the exact unquoted type grammar
+(`cdc.ddl_replay_journal`). Automatic admission currently covers the narrow
+slices described in the [DDL transformation spec](specs/ddl-transformation.md):
+explicitly named, unqualified, visible, non-unique secondary BTREE
+`CREATE INDEX`/`DROP INDEX`; fixture and exact production `CREATE TABLE` forms;
+the exact `assistant_reply_reports` convergence recovery; production-observed
+`ALTER TABLE` add/drop/rename forms; and the identity-scoped exact procedure
+`CREATE` plus exact generic/plain `DROP` forms. The production-observed
+unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` under the exact
+unquoted type grammar
 `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or
 `FLOAT UNSIGNED`, the observed `NULL` or `NOT NULL`, `DEFAULT NULL` or
 `DEFAULT 0`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY`,

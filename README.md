@@ -18,7 +18,7 @@ target with minimal downtime.
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in
-the target. Automatic DDL admission currently has five narrow slices: an explicitly named,
+the target. Automatic DDL admission currently covers these narrow slices: an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
 when every key part/option is modeled and the operation is proven not to support
 or depend on a foreign key; a strict unqualified fixture `CREATE TABLE` grammar
@@ -152,7 +152,12 @@ runtime never creates or migrates the table. Different source primary keys remai
 different conflict identities. `repair-drift` now invokes the planner for child-first deletes,
 parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
 windows, a non-mutating full-scope Verify equality phase, and evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness defines 44 executable scenarios.
+conflict resolution. In apply mode, `--conflict-reconcile-limit N` also runs a
+bounded reconciliation-only pass over unresolved evidence: it reads complete
+source and target rows by primary key, resolves only one-row exact equality,
+writes no target-table repairs, never reads or advances stream checkpoints, and
+is idempotent across repeated passes. The disposable MariaDB 11.4/MySQL 8.0
+harness defines 45 executable scenarios.
 Its `row-conflict-source-row-migration` and `row-conflict-indexed-resolution`
 scenarios prove populated-ledger migration, index selection, collision defense,
 and post-commit resolution. Earlier TLS harness coverage used a disposable TLS-enabled source, but the live

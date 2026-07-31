@@ -17,7 +17,7 @@ MariaDB and MySQL differ in SQL, metadata, and binlog behavior.
 Production streaming requires `binlog_format=ROW` and
 `binlog_row_image=FULL`. Row events apply by source primary key.
 
-Automatic DDL admission currently covers five narrow slices: explicitly named,
+Automatic DDL admission currently covers these narrow slices: explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX`
 with complete parsed options and no FK dependency; a strict unqualified fixture
 `CREATE TABLE` grammar (the harness exercises `accounts`) whose identifiers match
@@ -157,7 +157,12 @@ runtime never creates or migrates the table. Existing populated ledgers require
 the one-time source-row-identity migration before streaming. `repair-drift` now invokes FK-aware
 phases with immutable child runs, cycle/schema blocking, exact chunk verification,
 selected PK windows, and a full-scope Verify equality phase before evidence-backed
-conflict resolution. The disposable MariaDB 11.4/MySQL 8.0 harness exposes 44 executable scenarios,
+conflict resolution. In apply mode, `--conflict-reconcile-limit N` also runs a
+bounded reconciliation-only pass over unresolved evidence: it reads complete
+source and target rows by primary key, resolves only one-row exact equality,
+writes no target-table repairs, never reads or advances stream checkpoints, and
+is idempotent across repeated passes. The disposable MariaDB 11.4/MySQL 8.0
+harness exposes 45 executable scenarios,
 including catchup, repair, conflict, DDL, and reconnect boundaries, plus a real
 `replace-divergent-pk` XID/commit/checkpoint and replay-evidence scenario. The live
 GlobalComix source MariaDB is plaintext-only by accepted operational policy;

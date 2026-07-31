@@ -15,7 +15,7 @@ whitespace, trailing semicolons, line endings, and other source components;
 strip, skip, normalization, rejection, and process-lifecycle behavior is
 cataloged in the [query preservation audit](query-preservation-audit.md).
 
-Automatic DDL admission currently has five narrow slices:
+Automatic DDL admission currently has these narrow slices:
 
 - explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE
   INDEX` or `DROP INDEX` whose key parts and options are completely modeled and
