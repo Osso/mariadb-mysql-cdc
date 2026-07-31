@@ -137,13 +137,15 @@ where
     }
 
     pub fn apply(&self, event: &StatementEvent) -> Result<StatementOutcome, StatementApplyError> {
-        let normalized_sql = normalize_statement(&event.sql);
-        let decision = classify_statement(&normalized_sql);
+        let classification_sql = normalize_statement(&event.sql);
+        let decision = classify_statement(&classification_sql);
 
         match decision {
-            StatementDecision::Replay => self.replay(event, normalized_sql),
+            StatementDecision::Replay => self.replay(event, event.sql.clone()),
             StatementDecision::Skip => Ok(StatementOutcome::Skipped),
-            StatementDecision::Quarantine(reason) => self.quarantine(event, normalized_sql, reason),
+            StatementDecision::Quarantine(reason) => {
+                self.quarantine(event, classification_sql, reason)
+            }
         }
     }
 
@@ -696,7 +698,7 @@ mod tests {
         assert_eq!(
             applier.executor.statements.borrow().as_slice(),
             &[SqlStatement {
-                sql: "UPDATE accounts SET name = 'Ada' WHERE id = 7".to_string(),
+                sql: "UPDATE accounts SET name = 'Ada' WHERE id = 7;".to_string(),
                 params: Vec::new(),
             }]
         );

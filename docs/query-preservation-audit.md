@@ -1,7 +1,6 @@
 # Query preservation audit
 
 verified: 2026-07-30
-revision: `c084ff6`
 scope: live `stream-binlog` QueryEvent handling plus the shared `StatementApplier` used by `apply-binlog`
 
 This matrix records every current path that removes, ignores, normalizes, or rejects source query text. “Blocked” means no checkpoint advance. Durable automatic-DDL blocks persist a journal barrier and retry the same source coordinate in-process without consuming the ordinary transport retry budget. “Exit” means the error is not reconnect-eligible, reaches `run_stream_binlog_command`, and exits the process with status 1; generic non-DDL mapping/quarantine failures still use that fatal path.
@@ -21,21 +20,21 @@ This matrix records every current path that removes, ignores, normalizes, or rej
 
 ## Shared statement normalization and policy
 
-`StatementApplier::apply` executes `normalize_statement(event.sql)`, not `event.sql`.
+`StatementApplier::apply` normalizes a copy of `event.sql` for classification. When classification returns `Replay`, execution receives the exact original `event.sql`; `Skip` and quarantine decisions remain based on the normalized copy.
 
 | Source piece/condition | Code path | Current action | Runtime consequence |
 |---|---|---|---|
-| Leading whitespace | `statement.rs:normalize_statement` | Removed | Replay uses modified SQL |
-| Any leading `--...` line, including `--` without MySQL’s required following whitespace | `statement.rs:strip_one_leading_comment` | Entire comment removed; repeated leading comments all removed | Replay uses modified SQL |
-| Leading `#...` line | `statement.rs:strip_one_leading_comment` | Entire comment removed; repeated leading comments all removed | Replay uses modified SQL |
-| Leading ordinary `/*...*/` | `statement.rs:strip_one_leading_comment` | Entire comment removed | Replay uses modified SQL |
-| Leading MariaDB executable `/*M!...*/` | `statement.rs:strip_one_leading_comment` | Entire semantic comment removed because only `/*!` is exempted | Remainder may replay or be classified independently |
-| Leading optimizer hint `/*+...*/` | `statement.rs:strip_one_leading_comment` | Entire semantic hint removed because only `/*!` is exempted | Remainder may replay or be classified independently |
-| Leading MySQL executable `/*!...*/` | `statement.rs:strip_one_leading_comment` | Preserved by normalizer | Usually fails prefix classification and is quarantined |
-| Outer trailing whitespace | `statement.rs:normalize_statement` | Removed | Replay uses modified SQL |
-| Every trailing semicolon after trim | `statement.rs:normalize_statement` | Removed by `trim_end_matches(';')` | Replay uses modified SQL |
-| Semicolon inside `'...'` or `"..."` | `statement.rs:contains_multi_statement` | Preserved and ignored for multi-statement detection | No loss from this check |
-| Text inside `--` or `/*...*/` while detecting multiple statements | `statement.rs:skip_line_comment`, `skip_block_comment` | Ignored only for classification | Replay still uses normalized SQL |
+| Leading whitespace | `statement.rs:normalize_statement` | Removed only from the classification copy | Replay executes the exact source SQL |
+| Any leading `--...` line, including `--` without MySQL’s required following whitespace | `statement.rs:strip_one_leading_comment` | Entire comment removed only from the classification copy; repeated leading comments remain in replay | Replay executes the exact source SQL |
+| Leading `#...` line | `statement.rs:strip_one_leading_comment` | Entire comment removed only from the classification copy; repeated leading comments remain in replay | Replay executes the exact source SQL |
+| Leading ordinary `/*...*/` | `statement.rs:strip_one_leading_comment` | Entire comment removed only from the classification copy | Replay executes the exact source SQL |
+| Leading MariaDB executable `/*M!...*/` | `statement.rs:strip_one_leading_comment` | Entire semantic comment removed only from the classification copy because only `/*!` is exempted | If classification replays, execution receives the exact source SQL; otherwise the normalized copy is quarantined/skipped as before |
+| Leading optimizer hint `/*+...*/` | `statement.rs:strip_one_leading_comment` | Entire semantic hint removed only from the classification copy because only `/*!` is exempted | If classification replays, execution receives the exact source SQL; otherwise the normalized copy is quarantined/skipped as before |
+| Leading MySQL executable `/*!...*/` | `statement.rs:strip_one_leading_comment` | Preserved by the classification copy | Usually fails prefix classification and is quarantined; no replay occurs |
+| Outer trailing whitespace | `statement.rs:normalize_statement` | Removed only from the classification copy | Replay executes the exact source SQL |
+| Every trailing semicolon after trim | `statement.rs:normalize_statement` | Removed only from the classification copy by `trim_end_matches(';')` | Replay executes the exact source SQL |
+| Semicolon inside `'...'` or `"..."` | `statement.rs:contains_multi_statement` | Preserved and ignored for multi-statement detection | No loss from this check; replay still receives exact source SQL |
+| Text inside `--` or `/*...*/` while detecting multiple statements | `statement.rs:skip_line_comment`, `skip_block_comment` | Ignored only for classification | Replay still receives exact source SQL |
 | More than one statement outside recognized compound routine/event/trigger bodies | `statement.rs:classify_statement` | Whole normalized query quarantined | Live stream converts quarantine to fatal `ApplyBinlogError::Quarantined`; blocked; exits |
 | `RETURNING`, `SEQUENCE`, `SYSTEM VERSIONING`, `VERSIONING`, `DELETE HISTORY`, `INSERT DELAYED` outside string literals | `statement.rs:find_mariadb_only_pattern` | Whole normalized query quarantined | Blocked; exits in live stream |
 | `LOAD_FILE(`, `INTO OUTFILE`, `INTO DUMPFILE`, `LOAD DATA`, `DEFINER`, `SQL SECURITY DEFINER` outside string literals | `statement.rs:find_unsafe_pattern` | Whole normalized query quarantined | Blocked; exits in live stream |
