@@ -801,6 +801,35 @@ fn rename_has_explicit_destination_postcondition() {
 }
 
 #[test]
+fn assistant_reply_reports_create_requires_exact_source_target_structure() {
+    let operation = DdlOperation {
+        family: DdlFamily::Table,
+        object_kind: DdlObjectKind::Table,
+        primary_object: "assistant_reply_reports".to_string(),
+        secondary_object: None,
+        index_ast: None,
+        create_table_ast: None,
+        alter_table_ast: None,
+    };
+    let mut target = semantic_snapshot(7, Some(8));
+    target.inventory.tables[0].name = "assistant_reply_reports".to_string();
+    target.inventory.indexes[0].table = "assistant_reply_reports".to_string();
+    let source = target.clone();
+
+    validate_assistant_reply_reports_convergence(&source, &target)
+        .expect("equal source and target structures");
+    let evidence = build_assistant_reply_reports_create_evidence(&operation, &target)
+        .expect("converged CREATE evidence");
+    assert_eq!(evidence.pre_state, evidence.expected_post_state);
+
+    let mut divergent_source = source;
+    divergent_source.inventory.tables[0].columns[0].comment = "changed".to_string();
+    let error = validate_assistant_reply_reports_convergence(&divergent_source, &target)
+        .expect_err("schema mismatch must remain blocked");
+    assert!(error.contains("does not converge"), "{error}");
+}
+
+#[test]
 fn truncate_has_explicit_runtime_postcondition() {
     let target = semantic_snapshot(7, Some(8));
     let source = semantic_snapshot(9, Some(10));

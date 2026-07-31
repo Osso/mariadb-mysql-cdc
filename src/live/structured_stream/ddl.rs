@@ -527,7 +527,8 @@ pub(super) fn automatically_handled_ddl_event_with_source_only_support<'a>(
 }
 
 fn supports_ddl_transformation(source_sql: &str, supports_source_only_procedure: bool) -> bool {
-    supports_fixture_create_table(source_sql)
+    supports_assistant_reply_reports_create(source_sql)
+        || supports_fixture_create_table(source_sql)
         || supports_production_alter_table(source_sql)
         || supports_source_only_procedure
         || supports_drop_procedure(source_sql)

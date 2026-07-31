@@ -1305,6 +1305,26 @@ fn validate_schema_default_identifier(value: &str, kind: &str) -> Result<(), Str
     }
 }
 
+const ASSISTANT_REPLY_REPORTS_CREATE_HASH: &str =
+    "f1decd8ad26d7f01f0cea5f3f78fca2ecaa9c97fa40c6a3a1c951e278560cf10";
+
+pub fn supports_assistant_reply_reports_create(source_sql: &str) -> bool {
+    let digest = format!("{:x}", Sha256::digest(source_sql.trim_end().as_bytes()));
+    digest == ASSISTANT_REPLY_REPORTS_CREATE_HASH
+}
+
+pub fn transform_assistant_reply_reports_create(
+    source_sql: &str,
+) -> Result<DdlTransformation, String> {
+    if !supports_assistant_reply_reports_create(source_sql) {
+        return Err("unsupported assistant_reply_reports CREATE TABLE statement".to_string());
+    }
+    Ok(DdlTransformation {
+        version: DDL_TRANSFORMATION_VERSION,
+        target_sql: None,
+    })
+}
+
 const SOURCE_ONLY_RELEASE_MOVE_PROCEDURE_HASHES: [&str; 2] = [
     "1326338ea27069ed94e2f1a94f2cfc118465939a2312d7bba0adafb3da3728ec",
     "a3e4b4b54295bd0374965761f3ec3a8bfd7ab857b623d25c9010e8fe6b3449c3",

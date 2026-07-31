@@ -2687,12 +2687,12 @@ fn fingerprint(value: &impl Serialize) -> Result<String, String> {
 }
 
 /// Fingerprint of the MySQL table the translated source schema produces.
-fn expected_target_table_fingerprint(table: &TableInventory) -> Result<String, String> {
+pub(crate) fn expected_target_table_fingerprint(table: &TableInventory) -> Result<String, String> {
     semantic_table_fingerprint(table, expected_target_column)
 }
 
 /// Fingerprint of the MySQL table as the target reports it.
-fn observed_target_table_fingerprint(table: &TableInventory) -> Result<String, String> {
+pub(crate) fn observed_target_table_fingerprint(table: &TableInventory) -> Result<String, String> {
     semantic_table_fingerprint(table, observed_target_column)
 }
 

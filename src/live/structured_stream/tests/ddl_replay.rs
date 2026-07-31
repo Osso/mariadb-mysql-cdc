@@ -441,6 +441,102 @@ fn unsupported_ddl_keeps_replicator_alive_at_unchanged_checkpoint() {
 }
 
 #[test]
+fn production_create_table_replays_existing_translation_pending_barrier() {
+    let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let executor = TransactionRecordingExecutor::with_operations(operations.clone());
+    let mut applier = crate::row::RowApplier::new(executor);
+    let journal = RecordingDdlReplayJournal::with_operations(operations.clone());
+    *journal.status.borrow_mut() = Some(DdlReplayStatus::TranslationPending);
+    let semantic_inventory = RecordingSemanticInventory {
+        use_live_transform: true,
+        ..RecordingSemanticInventory::default()
+    };
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let mut current_file = "mysqld-bin.002768".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "globalcomix".to_string(),
+        sql_statement: "CREATE TABLE IF NOT EXISTS `assistant_reply_reports` (\n    `id` int(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,\n    `contact_form_id` int(11) UNSIGNED NOT NULL,\n    `reason` varchar(32) NOT NULL COMMENT 'inaccurate | offensive | sexual_content | other',\n    `reported_reply_index` smallint(5) UNSIGNED NOT NULL\n        COMMENT 'Zero-based index into conversation.messages of the reported assistant turn',\n    `conversation` mediumtext NOT NULL\n        COMMENT 'Slim message JSON as sent to /v1/assistant: ordered role + blocks, card blocks collapsed to entity ids',\n    `is_active` tinyint(1) UNSIGNED NOT NULL DEFAULT 1,\n    `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    `creator_id` int(11) UNSIGNED NOT NULL,\n    UNIQUE KEY `uk_contact_form` (`contact_form_id`),\n    KEY `idx_reason_create_time` (`reason`, `create_time`),\n    CONSTRAINT `fk_assistant_reply_reports_contact_form_id`\n        FOREIGN KEY (`contact_form_id`) REFERENCES `contact_forms` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+            .to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let outcome = handle_ddl_event(
+        &mut applier,
+        &journal,
+        &semantic_inventory,
+        "globalcomix-prod-mariadb-2026-01",
+        &mut context,
+        &event_header(3, 1019084595),
+        &event,
+    )
+    .expect("production CREATE TABLE replay")
+    .expect("production CREATE TABLE outcome");
+
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
+    assert_eq!(
+        operations.borrow().as_slice(),
+        &[
+            "PROMOTE",
+            "APPLIED",
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "EXEC",
+            "CHECKPOINT",
+            "COMMIT",
+        ]
+    );
+}
+
+#[test]
+fn altered_assistant_reply_reports_create_remains_translation_pending() {
+    let state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "globalcomix".to_string(),
+        sql_statement: "CREATE TABLE IF NOT EXISTS `assistant_reply_reports` (`id` int(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci".to_string(),
+    });
+
+    assert!(
+        automatically_handled_ddl_event(
+            "globalcomix-prod-mariadb-2026-01",
+            "mysqld-bin.002768",
+            &event_header(3, 1019084595),
+            &event,
+            &state,
+        )
+        .is_none()
+    );
+    assert!(
+        manual_ddl_event(
+            "globalcomix-prod-mariadb-2026-01",
+            "mysqld-bin.002768",
+            &event_header(3, 1019084595),
+            &event,
+            &state,
+        )
+        .is_some()
+    );
+}
+
+#[test]
 fn fixture_create_table_executes_evidence_sql_and_checkpoints_once() {
     let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let executor = TransactionRecordingExecutor::with_operations(operations.clone());

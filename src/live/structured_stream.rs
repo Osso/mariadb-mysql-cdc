@@ -6,8 +6,8 @@ use super::ddl_replay_journal::{
 };
 use super::ddl_semantics::{
     DdlSemanticEvidence, DdlSemanticInventory, LiveDdlSemanticInventory, parse_ddl_operation,
-    supports_automatic_index_ddl, supports_automatic_semantic_recovery,
-    supports_production_alter_table,
+    supports_assistant_reply_reports_create, supports_automatic_index_ddl,
+    supports_automatic_semantic_recovery, supports_production_alter_table,
 };
 use super::{
     ApplyBinlogConfig, ApplyBinlogError, QuarantineRecorder, RecordingQuarantine,

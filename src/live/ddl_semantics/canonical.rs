@@ -64,6 +64,12 @@ pub(crate) fn explicit_create_table_defaults(
     })
 }
 
+pub fn build_assistant_reply_reports_create_evidence(
+    operation: &DdlOperation,
+    target: &SemanticSchemaSnapshot,
+) -> Result<DdlSemanticEvidence, String> {
+    build_semantic_evidence(operation, target, target)
+}
 pub fn build_source_only_procedure_create_evidence(
     operation: &DdlOperation,
     target: &SemanticSchemaSnapshot,

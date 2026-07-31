@@ -364,6 +364,9 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
         source_file: &str,
         event_end_position: u64,
     ) -> Result<super::super::ddl_semantics::DdlSemanticEvidence, String> {
+        if super::super::ddl_semantics::supports_assistant_reply_reports_create(sql) {
+            return Ok(self.evidence.clone());
+        }
         if self.present_target_create_evidence || self.absent_target_create_evidence {
             let operation = super::super::ddl_semantics::parse_ddl_operation(sql)?;
             let tables = if self.present_target_create_evidence {

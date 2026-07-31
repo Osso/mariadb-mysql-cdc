@@ -14,12 +14,13 @@ mod transform;
 
 #[cfg(test)]
 pub(super) use canonical::canonical_absent_state;
+pub use canonical::{
+    build_assistant_reply_reports_create_evidence, build_semantic_evidence,
+    observe_operation_state, supports_automatic_semantic_recovery,
+};
 #[cfg(test)]
 pub(super) use canonical::{
     build_fenced_create_table_evidence, build_source_only_procedure_create_evidence,
-};
-pub use canonical::{
-    build_semantic_evidence, observe_operation_state, supports_automatic_semantic_recovery,
 };
 pub(super) use model::SemanticSchemaSnapshot;
 pub use model::{DdlObjectKind, DdlSemanticEvidence};
@@ -31,9 +32,10 @@ pub use parser::{parse_ddl_operation, supports_automatic_index_ddl};
 pub(super) use tokenizer::tokenize_ddl;
 pub use transform::{
     DDL_TRANSFORMATION_VERSION, DdlTransformation, render_modeled_index_ddl,
-    supports_drop_columns_if_exists, supports_drop_procedure, supports_fixture_create_table,
-    supports_production_alter_table, supports_rename_columns_if_exists,
-    supports_source_only_release_move_procedure_create, transform_drop_columns_if_exists,
+    supports_assistant_reply_reports_create, supports_drop_columns_if_exists,
+    supports_drop_procedure, supports_fixture_create_table, supports_production_alter_table,
+    supports_rename_columns_if_exists, supports_source_only_release_move_procedure_create,
+    transform_assistant_reply_reports_create, transform_drop_columns_if_exists,
     transform_drop_procedure, transform_generated_schema_ddl, transform_production_alter_table,
     transform_rename_columns_if_exists, transform_source_only_release_move_procedure_create,
 };
@@ -193,6 +195,9 @@ fn translate_ddl_with_provenance(
             target_sql: Some(sql.trim().trim_end_matches(';').trim().to_string()),
         });
     }
+    if supports_assistant_reply_reports_create(sql) {
+        return transform_assistant_reply_reports_create(sql);
+    }
     if supports_fixture_create_table(sql) {
         return transform::transform_fixture_create_table(sql);
     }
@@ -220,6 +225,17 @@ fn translate_ddl_with_provenance(
 }
 
 fn parse_semantic_operation(sql: &str) -> Result<DdlOperation, String> {
+    if supports_assistant_reply_reports_create(sql) {
+        return Ok(DdlOperation {
+            family: DdlFamily::Table,
+            object_kind: DdlObjectKind::Table,
+            primary_object: "assistant_reply_reports".to_string(),
+            secondary_object: None,
+            index_ast: None,
+            create_table_ast: None,
+            alter_table_ast: None,
+        });
+    }
     if supports_source_only_release_move_procedure_create(sql) {
         return Ok(DdlOperation {
             family: DdlFamily::Procedure,
@@ -255,6 +271,13 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
     ) -> Result<DdlSemanticEvidence, String> {
         let operation = parse_semantic_operation(sql)?;
         let target_before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+        if supports_assistant_reply_reports_create(sql) {
+            return capture_assistant_reply_reports_create_evidence(
+                self,
+                &operation,
+                &target_before,
+            );
+        }
         if supports_source_only_release_move_procedure_create(sql) {
             return capture_source_only_procedure_create_evidence(self, &operation, &target_before);
         }
@@ -301,6 +324,115 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
             "blocked recovery requires explicit CREATE TABLE defaults".to_string()
         })?;
         canonical::expected_create_table_post_state(ast, &defaults)
+    }
+}
+
+fn capture_assistant_reply_reports_create_evidence(
+    inventory: &LiveDdlSemanticInventory,
+    operation: &DdlOperation,
+    target_before: &SemanticSchemaSnapshot,
+) -> Result<DdlSemanticEvidence, String> {
+    let source_before = inventory
+        .source
+        .read_source_master_coordinate()
+        .map_err(|error| format!("failed to fence source schema: {error}"))?;
+    let source =
+        LiveDdlSemanticInventory::snapshot(&inventory.source, &inventory.source_schema, operation)?;
+    let source_after = inventory
+        .source
+        .read_source_master_coordinate()
+        .map_err(|error| format!("failed to fence source schema: {error}"))?;
+    if source_before != source_after {
+        return Err(
+            "source schema changed during assistant_reply_reports convergence proof".to_string(),
+        );
+    }
+    let target_after =
+        LiveDdlSemanticInventory::snapshot(&inventory.target, &inventory.target_schema, operation)?;
+    validate_target_snapshot_consistency(target_before, &target_after)?;
+    validate_assistant_reply_reports_convergence(&source, target_before)?;
+    build_assistant_reply_reports_create_evidence(operation, target_before)
+}
+
+fn validate_assistant_reply_reports_convergence(
+    source: &SemanticSchemaSnapshot,
+    target: &SemanticSchemaSnapshot,
+) -> Result<(), String> {
+    let table = "assistant_reply_reports";
+    let source_table = source
+        .inventory
+        .tables
+        .iter()
+        .find(|candidate| candidate.name == table)
+        .ok_or_else(|| format!("source table `{table}` is missing"))?;
+    let target_table = target
+        .inventory
+        .tables
+        .iter()
+        .find(|candidate| candidate.name == table)
+        .ok_or_else(|| format!("target table `{table}` is missing"))?;
+    let expected = crate::sync_schema::expected_target_table_fingerprint(source_table)?;
+    let observed = crate::sync_schema::observed_target_table_fingerprint(target_table)?;
+    if expected != observed {
+        return Err("assistant_reply_reports table definition does not converge".to_string());
+    }
+    validate_assistant_reply_reports_indexes(source, target, table)?;
+    validate_assistant_reply_reports_foreign_keys(source, target, table)
+}
+
+fn validate_assistant_reply_reports_indexes(
+    source: &SemanticSchemaSnapshot,
+    target: &SemanticSchemaSnapshot,
+    table: &str,
+) -> Result<(), String> {
+    let mut source_indexes = source
+        .inventory
+        .indexes
+        .iter()
+        .filter(|index| index.table == table)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut target_indexes = target
+        .inventory
+        .indexes
+        .iter()
+        .filter(|index| index.table == table)
+        .cloned()
+        .collect::<Vec<_>>();
+    source_indexes.sort_by(|left, right| left.name.cmp(&right.name));
+    target_indexes.sort_by(|left, right| left.name.cmp(&right.name));
+    if source_indexes == target_indexes {
+        Ok(())
+    } else {
+        Err("assistant_reply_reports indexes do not converge".to_string())
+    }
+}
+
+fn validate_assistant_reply_reports_foreign_keys(
+    source: &SemanticSchemaSnapshot,
+    target: &SemanticSchemaSnapshot,
+    table: &str,
+) -> Result<(), String> {
+    let mut source_foreign_keys = source
+        .inventory
+        .foreign_keys
+        .iter()
+        .filter(|foreign_key| foreign_key.table == table)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut target_foreign_keys = target
+        .inventory
+        .foreign_keys
+        .iter()
+        .filter(|foreign_key| foreign_key.table == table)
+        .cloned()
+        .collect::<Vec<_>>();
+    source_foreign_keys.sort_by(|left, right| left.name.cmp(&right.name));
+    target_foreign_keys.sort_by(|left, right| left.name.cmp(&right.name));
+    if source_foreign_keys == target_foreign_keys {
+        Ok(())
+    } else {
+        Err("assistant_reply_reports foreign keys do not converge".to_string())
     }
 }
 

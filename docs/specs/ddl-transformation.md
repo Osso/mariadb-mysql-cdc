@@ -48,10 +48,11 @@ allowlist.
 - [x] Keep unsupported or semantically blocked DDL durable and observable: persist the journal barrier, leave the checkpoint unchanged, and retry in-process indefinitely without consuming transport retry budget, skipping the event, or falling back to raw source SQL.
 
 This is a production-derived ALTER TABLE slice plus one exact production
-`home_feed_artist_blacklist` CREATE TABLE admission, one identity-scoped
-source-only CREATE PROCEDURE form, and two exact procedure-drop admissions, not
-full ALTER TABLE, generic CREATE TABLE, general routine DDL, or the full
-MariaDB-to-MySQL 8 transformation pipeline. Coordinate-anchored reconstruction
+`home_feed_artist_blacklist` CREATE TABLE admission, one exact production
+`assistant_reply_reports` CREATE recovery, one identity-scoped source-only
+CREATE PROCEDURE form, and two exact procedure-drop admissions, not full ALTER
+TABLE, generic CREATE TABLE, general routine DDL, or the full MariaDB-to-MySQL 8
+transformation pipeline. Coordinate-anchored reconstruction
 of historical source schema lineage is explicitly excluded from the current
 cycle. The translator may use only semantics completely represented by the
 admitted event AST and fenced target pre-state; it must not infer unmodeled
