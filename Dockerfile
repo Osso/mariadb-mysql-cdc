@@ -1,3 +1,4 @@
+ARG BASE_IMAGE
 FROM rust:1.92-bookworm AS builder
 
 WORKDIR /src
@@ -7,7 +8,6 @@ COPY fixtures/ddl ./fixtures/ddl
 COPY src ./src
 RUN cargo build --release
 
-ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 COPY --from=builder /src/target/release/mariadb-mysql-cdc /usr/local/bin/mariadb-mysql-cdc
