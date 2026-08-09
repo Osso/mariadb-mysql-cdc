@@ -1500,6 +1500,7 @@ fn append_check_constraint_plan(
     for table in &mut plan.tables {
         let source_checks = source.get(&table.table).cloned().unwrap_or_default();
         let target_checks = target.get(&table.table).cloned().unwrap_or_default();
+        let foreign_key_drops = same_table_foreign_key_drop_prerequisites(table);
         let drops = target_checks
             .iter()
             .filter(|target_check| !source_checks.contains(target_check))
@@ -1525,10 +1526,11 @@ fn append_check_constraint_plan(
                     ),
                     vec![format!("check:{}.{}", table.table, check.name)],
                 )?;
-                Some(with_prerequisites(
-                    statement,
-                    check_constraint_prerequisites(source_inventory, check),
-                ))
+                let mut prerequisites = check_constraint_prerequisites(source_inventory, check);
+                prerequisites.extend(foreign_key_drops.iter().cloned());
+                prerequisites.sort();
+                prerequisites.dedup();
+                Some(with_prerequisites(statement, prerequisites))
             })
             .collect::<Vec<_>>();
         table.statements.splice(0..0, drops);
@@ -1563,6 +1565,18 @@ fn target_check_constraints(source: &[CheckConstraint]) -> Vec<CheckConstraint> 
                 ..check.clone()
             }
         })
+        .collect()
+}
+
+fn same_table_foreign_key_drop_prerequisites(table: &TableSchemaPlan) -> Vec<String> {
+    let foreign_key_prefix = format!("foreign_key:{}.", table.table);
+    table
+        .statements
+        .iter()
+        .filter(|statement| is_drop_statement(statement))
+        .flat_map(|statement| statement.objects.iter())
+        .filter(|object| object.starts_with(&foreign_key_prefix))
+        .cloned()
         .collect()
 }
 
@@ -4363,6 +4377,90 @@ mod tests {
             execution.sql.contains("ADD CONSTRAINT `positive_balance`")
                 && execution.status == "skipped"
         }));
+    }
+
+    #[test]
+    fn check_recreation_waits_for_same_table_foreign_key_drop() {
+        let source_inventory = inventory(
+            vec![
+                table(
+                    "accounts",
+                    vec![
+                        column("id", "bigint", false),
+                        column("parent_id", "bigint", false),
+                    ],
+                    vec!["id"],
+                ),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![],
+        );
+        let target_inventory = inventory(
+            source_inventory.tables.clone(),
+            vec![foreign_key("accounts", "parents")],
+        );
+        let mut plan = plan_schema_convergence(
+            &source_inventory,
+            &target_inventory,
+            &["accounts".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("schema plan");
+        let source_checks = vec![
+            CheckConstraint {
+                table: "accounts".to_string(),
+                name: "parent_id_valid".to_string(),
+                clause: "(`parent_id` >= 0)".to_string(),
+            },
+            CheckConstraint {
+                table: "parents".to_string(),
+                name: "parent_id_valid".to_string(),
+                clause: "(`id` >= 0)".to_string(),
+            },
+        ];
+        let target_checks = vec![CheckConstraint {
+            table: "accounts".to_string(),
+            name: "parent_id_valid".to_string(),
+            clause: "(`parent_id` >= 0)".to_string(),
+        }];
+
+        append_check_constraint_plan(&mut plan, &source_inventory, &source_checks, &target_checks);
+
+        let check = plan.tables[0]
+            .statements
+            .iter()
+            .find(|statement| {
+                statement
+                    .sql
+                    .contains("ADD CONSTRAINT `accounts_parent_id_valid`")
+            })
+            .expect("CHECK recreation");
+        assert_eq!(
+            check.prerequisites,
+            vec![
+                "column:accounts.parent_id",
+                "foreign_key:accounts.fk_accounts_parents",
+            ]
+        );
+
+        let mut executor = RecordingExecutor::failing_sql("DROP FOREIGN KEY");
+        let report = execute_schema_plan(plan, &mut executor, &|_| Vec::new());
+        let check_execution = report.tables[0]
+            .executions
+            .iter()
+            .find(|execution| {
+                execution
+                    .sql
+                    .contains("ADD CONSTRAINT `accounts_parent_id_valid`")
+            })
+            .expect("CHECK execution");
+        assert_eq!(check_execution.status, "skipped");
+        assert!(
+            check_execution
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("foreign_key:accounts.fk_accounts_parents"))
+        );
     }
 
     #[test]
