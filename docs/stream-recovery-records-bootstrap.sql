@@ -17,6 +17,18 @@ CREATE TABLE IF NOT EXISTS cdc.stream_recovery_records (
     old_barrier_raw_sql LONGTEXT NOT NULL,
     old_barrier_raw_sql_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin
         GENERATED ALWAYS AS (SHA2(old_barrier_raw_sql, 256)) STORED NOT NULL,
+    barrier_identity CHAR(64) CHARACTER SET ascii COLLATE ascii_bin
+        GENERATED ALWAYS AS (
+            SHA2(CONCAT(
+                UNHEX(LPAD(HEX(LENGTH(old_barrier_source_identity)), 16, '0')),
+                CONVERT(old_barrier_source_identity USING binary),
+                UNHEX(LPAD(HEX(LENGTH(old_barrier_file)), 16, '0')),
+                CONVERT(old_barrier_file USING binary),
+                UNHEX(LPAD(HEX(old_barrier_start_position), 16, '0')),
+                UNHEX(LPAD(HEX(old_barrier_end_position), 16, '0')),
+                CONVERT(old_barrier_raw_sql_sha256 USING binary)
+            ), 256)
+        ) STORED NOT NULL,
     operator_identity VARCHAR(255) NOT NULL,
     reason TEXT NOT NULL,
     prepared_evidence_json LONGTEXT NOT NULL,
@@ -34,13 +46,7 @@ CREATE TABLE IF NOT EXISTS cdc.stream_recovery_records (
     CHECK (status IN ('prepared', 'committed', 'verified')),
     CHECK (old_barrier_end_position > old_barrier_start_position),
     PRIMARY KEY (recovery_id),
-    UNIQUE KEY stream_recovery_exact_barrier (
-        old_barrier_source_identity,
-        old_barrier_file,
-        old_barrier_start_position,
-        old_barrier_end_position,
-        old_barrier_raw_sql_sha256
-    ),
+    UNIQUE KEY stream_recovery_exact_barrier (barrier_identity),
     KEY stream_recovery_checkpoint_status (checkpoint_name, status)
 );
 
