@@ -51,11 +51,15 @@ fn sort_foreign_key_rows(mut rows: Vec<CanonicalForeignKeyRow>) -> Vec<Canonical
         (
             &left.constraint_schema,
             &left.constraint_name,
+            &left.child_schema,
+            &left.child_table,
             left.ordinal_position,
         )
             .cmp(&(
                 &right.constraint_schema,
                 &right.constraint_name,
+                &right.child_schema,
+                &right.child_table,
                 right.ordinal_position,
             ))
     });
@@ -64,20 +68,28 @@ fn sort_foreign_key_rows(mut rows: Vec<CanonicalForeignKeyRow>) -> Vec<Canonical
 
 fn group_foreign_key_rows(
     rows: Vec<CanonicalForeignKeyRow>,
-) -> BTreeMap<(String, String), Vec<CanonicalForeignKeyRow>> {
+) -> BTreeMap<(String, String, String, String), Vec<CanonicalForeignKeyRow>> {
     rows.into_iter().fold(BTreeMap::new(), |mut grouped, row| {
         grouped
-            .entry((row.constraint_schema.clone(), row.constraint_name.clone()))
+            .entry((
+                row.constraint_schema.clone(),
+                row.constraint_name.clone(),
+                row.child_schema.clone(),
+                row.child_table.clone(),
+            ))
             .or_default()
             .push(row);
         grouped
     })
 }
 
-type ForeignKeyGroup = ((String, String), Vec<CanonicalForeignKeyRow>);
+type ForeignKeyGroup = (
+    (String, String, String, String),
+    Vec<CanonicalForeignKeyRow>,
+);
 
 fn build_canonical_foreign_key(
-    ((constraint_schema, constraint_name), rows): ForeignKeyGroup,
+    ((constraint_schema, constraint_name, child_schema, child_table), rows): ForeignKeyGroup,
 ) -> Result<CanonicalForeignKey, String> {
     let first = first_foreign_key_row(&rows)?;
     let update_rule = normalize_fk_rule(&first.update_rule);
@@ -93,8 +105,8 @@ fn build_canonical_foreign_key(
     Ok(CanonicalForeignKey {
         constraint_schema,
         constraint_name,
-        child_schema: first.child_schema.clone(),
-        child_table: first.child_table.clone(),
+        child_schema,
+        child_table,
         child_columns: rows.iter().map(|row| row.child_column.clone()).collect(),
         parent_schema: first.parent_schema.clone(),
         parent_table: first.parent_table.clone(),

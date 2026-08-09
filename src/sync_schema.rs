@@ -262,6 +262,66 @@ pub(crate) fn selected_tables(
     Ok(selected.into_iter().collect())
 }
 
+const MYSQL_IDENTIFIER_MAX_CHARACTERS: usize = 64;
+const TARGET_CONSTRAINT_HASH_CHARACTERS: usize = 16;
+
+#[derive(Clone, Copy)]
+enum TargetConstraintKind {
+    Check,
+    ForeignKey,
+}
+
+impl TargetConstraintKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::ForeignKey => "foreign_key",
+        }
+    }
+}
+
+fn target_constraint_name(kind: TargetConstraintKind, table: &str, source_name: &str) -> String {
+    let table_prefix = format!("{table}_");
+    let qualified = if source_name.starts_with(&table_prefix) {
+        source_name.to_string()
+    } else {
+        format!("{table_prefix}{source_name}")
+    };
+    if qualified.chars().count() <= MYSQL_IDENTIFIER_MAX_CHARACTERS {
+        return qualified;
+    }
+    let identity = format!("{}\0{table}\0{source_name}", kind.label());
+    let hash = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    let prefix_characters = MYSQL_IDENTIFIER_MAX_CHARACTERS - TARGET_CONSTRAINT_HASH_CHARACTERS - 1;
+    let prefix = qualified
+        .chars()
+        .take(prefix_characters)
+        .collect::<String>();
+    format!("{prefix}_{}", &hash[..TARGET_CONSTRAINT_HASH_CHARACTERS])
+}
+
+fn target_foreign_key(source: &ForeignKeyInventory) -> ForeignKeyInventory {
+    ForeignKeyInventory {
+        name: target_constraint_name(
+            TargetConstraintKind::ForeignKey,
+            &source.table,
+            &source.name,
+        ),
+        ..source.clone()
+    }
+}
+
+fn target_canonical_foreign_key(source: &CanonicalForeignKey) -> CanonicalForeignKey {
+    CanonicalForeignKey {
+        constraint_name: target_constraint_name(
+            TargetConstraintKind::ForeignKey,
+            &source.child_table,
+            &source.constraint_name,
+        ),
+        ..source.clone()
+    }
+}
+
 /// The schema the target must hold: the source schema plus the unique parent indexes MySQL
 /// requires but MariaDB does not.
 ///
@@ -271,6 +331,7 @@ pub(crate) fn selected_tables(
 /// unique index per such parent identity.
 pub(crate) fn expected_target_inventory(source: &SchemaInventory) -> SchemaInventory {
     let mut expected = source.clone();
+    expected.foreign_keys = source.foreign_keys.iter().map(target_foreign_key).collect();
     expected.indexes.extend(synthesized_parent_indexes(source));
     expected
 }
@@ -1191,7 +1252,10 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
         let target_canonical =
             build_canonical_foreign_key_inventory(&config.target.database, &verification_reader);
         let source_table_foreign_keys = relative_canonical_foreign_keys(
-            &canonical_foreign_keys_for(&source_canonical_foreign_keys, table),
+            &canonical_foreign_keys_for(&source_canonical_foreign_keys, table)
+                .iter()
+                .map(target_canonical_foreign_key)
+                .collect::<Vec<_>>(),
             &config.source.database,
         );
         match target_canonical {
@@ -1540,30 +1604,14 @@ fn append_check_constraint_plan(
 
 /// The check constraints the target must hold.
 ///
-/// MariaDB only requires a check name to be unique within its table, and this source reuses
-/// several across tables. MySQL requires schema-wide uniqueness, so a reused name is qualified
-/// with its table. Names already unique keep their source spelling.
+/// MariaDB requires a check name to be unique only within its table. MySQL requires schema-wide
+/// uniqueness, so every target check name includes its table identity.
 fn target_check_constraints(source: &[CheckConstraint]) -> Vec<CheckConstraint> {
-    let mut tables_per_name = BTreeMap::<&str, BTreeSet<&str>>::new();
-    for check in source {
-        tables_per_name
-            .entry(check.name.as_str())
-            .or_default()
-            .insert(check.table.as_str());
-    }
     source
         .iter()
-        .map(|check| {
-            let reused = tables_per_name
-                .get(check.name.as_str())
-                .is_some_and(|tables| tables.len() > 1);
-            if !reused {
-                return check.clone();
-            }
-            CheckConstraint {
-                name: format!("{}_{}", check.table, check.name),
-                ..check.clone()
-            }
+        .map(|check| CheckConstraint {
+            name: target_constraint_name(TargetConstraintKind::Check, &check.table, &check.name),
+            ..check.clone()
         })
         .collect()
 }
@@ -1644,7 +1692,10 @@ fn append_canonical_foreign_key_plan(
                 .any(|object| object.starts_with("foreign_key:"))
         });
         let source_keys = relative_canonical_foreign_keys(
-            &canonical_foreign_keys_for(source, &table.table),
+            &canonical_foreign_keys_for(source, &table.table)
+                .iter()
+                .map(target_canonical_foreign_key)
+                .collect::<Vec<_>>(),
             &source_inventory.schema,
         );
         let target_keys = relative_canonical_foreign_keys(
@@ -3397,6 +3448,101 @@ mod tests {
     }
 
     #[test]
+    fn foreign_key_plan_uses_table_qualified_target_name() {
+        let source = inventory(
+            vec![
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("parent_id", "bigint", false),
+                    ],
+                    vec!["id"],
+                ),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![foreign_key("children", "parents")],
+        );
+        let target = inventory(source.tables.clone(), vec![]);
+
+        let plan = plan_schema_convergence(
+            &source,
+            &target,
+            &["parents".to_string(), "children".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("schema plan");
+        let statement = plan
+            .tables
+            .iter()
+            .find(|table| table.table == "children")
+            .and_then(|table| {
+                table.statements.iter().find(|statement| {
+                    statement
+                        .sql
+                        .contains("ADD CONSTRAINT `children_fk_children_parents`")
+                })
+            })
+            .expect("table-qualified foreign key");
+
+        assert_eq!(
+            statement.objects,
+            vec!["foreign_key:children.children_fk_children_parents"]
+        );
+    }
+
+    #[test]
+    fn canonical_foreign_key_comparison_uses_table_qualified_target_name() {
+        let source = inventory(
+            vec![
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("parent_id", "bigint", false),
+                    ],
+                    vec!["id"],
+                ),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![foreign_key("children", "parents")],
+        );
+        let mut target_key = source.foreign_keys[0].clone();
+        target_key.name = "children_fk_children_parents".to_string();
+        let target = inventory(source.tables.clone(), vec![target_key]);
+        let mut plan = plan_schema_convergence(
+            &source,
+            &target,
+            &["parents".to_string(), "children".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("schema plan");
+        let source_canonical = canonical_foreign_key("fk_children_parents");
+        let target_canonical = canonical_foreign_key("children_fk_children_parents");
+
+        append_canonical_foreign_key_plan(
+            &mut plan,
+            &source,
+            &[source_canonical],
+            &[target_canonical],
+            "globalcomix",
+        );
+
+        let foreign_key_statements = plan
+            .tables
+            .iter()
+            .flat_map(|table| table.statements.iter())
+            .filter(|statement| {
+                statement
+                    .objects
+                    .iter()
+                    .any(|object| object.starts_with("foreign_key:"))
+            })
+            .count();
+        assert_eq!(foreign_key_statements, 0);
+    }
+
+    #[test]
     fn canonical_foreign_key_replacement_keeps_columns_indexes_and_parent_prerequisites() {
         let mut source = inventory(
             vec![
@@ -3469,7 +3615,7 @@ mod tests {
                 table.statements.iter().find(|statement| {
                     statement
                         .sql
-                        .contains("ADD CONSTRAINT `fk_children_parents`")
+                        .contains("ADD CONSTRAINT `children_fk_children_parents`")
                 })
             })
             .expect("canonical foreign key statement");
@@ -3725,9 +3871,13 @@ mod tests {
             check("home_feed_variants", "config", "config"),
         ];
         let target = vec![
-            check("home_feed_bakes", "editorial_chat", "editorial_chat"),
+            check(
+                "home_feed_bakes",
+                "home_feed_bakes_editorial_chat",
+                "editorial_chat",
+            ),
             check("home_feed_bakes", "home_feed_bakes_config", "config"),
-            check("home_feed_bakes", "slot_list", "slot_list"),
+            check("home_feed_bakes", "home_feed_bakes_slot_list", "slot_list"),
         ];
 
         let expected = checks_by_table(&target_check_constraints(&source));
@@ -3830,7 +3980,7 @@ mod tests {
     }
 
     #[test]
-    fn check_names_reused_across_source_tables_are_qualified_for_mysql() {
+    fn every_check_name_is_table_qualified_for_mysql() {
         let source = vec![
             CheckConstraint {
                 table: "income_reconciliations".to_string(),
@@ -3867,10 +4017,50 @@ mod tests {
                 ),
                 (
                     "comics_enrichments".to_string(),
-                    "ck_comic_identity".to_string()
+                    "comics_enrichments_ck_comic_identity".to_string()
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn long_table_qualified_check_names_are_deterministic_and_bounded() {
+        let source = vec![CheckConstraint {
+            table: "llm_messages_with_a_very_long_table_identity".to_string(),
+            name: "metadata_with_a_very_long_constraint_identity".to_string(),
+            clause: "json_valid(`metadata`)".to_string(),
+        }];
+
+        let first = target_check_constraints(&source)[0].name.clone();
+        let second = target_check_constraints(&source)[0].name.clone();
+
+        assert_eq!(first, second);
+        assert!(first.len() <= 64, "{first}");
+        assert!(
+            first.starts_with("llm_messages_with_a_very_long_table_identity_"),
+            "{first}"
+        );
+        assert_ne!(first, source[0].name);
+    }
+
+    #[test]
+    fn long_table_qualified_constraint_names_do_not_collapse() {
+        let source = vec![
+            CheckConstraint {
+                table: "llm_messages_with_a_very_long_table_identity".to_string(),
+                name: "metadata_with_a_very_long_constraint_identity_a".to_string(),
+                clause: "json_valid(`metadata_a`)".to_string(),
+            },
+            CheckConstraint {
+                table: "llm_messages_with_a_very_long_table_identity".to_string(),
+                name: "metadata_with_a_very_long_constraint_identity_b".to_string(),
+                clause: "json_valid(`metadata_b`)".to_string(),
+            },
+        ];
+
+        let target = target_check_constraints(&source);
+
+        assert_ne!(target[0].name, target[1].name);
     }
 
     /// MariaDB permits one check name on several tables, so the source inventory must report the
@@ -4365,7 +4555,11 @@ mod tests {
         let check = plan.tables[0]
             .statements
             .iter()
-            .find(|statement| statement.sql.contains("ADD CONSTRAINT `positive_balance`"))
+            .find(|statement| {
+                statement
+                    .sql
+                    .contains("ADD CONSTRAINT `accounts_positive_balance`")
+            })
             .expect("CHECK addition");
         assert_eq!(check.prerequisites, vec!["column:accounts.balance"]);
 
@@ -4374,7 +4568,9 @@ mod tests {
             vec!["schema remains divergent".to_string()]
         });
         assert!(report.tables[0].executions.iter().any(|execution| {
-            execution.sql.contains("ADD CONSTRAINT `positive_balance`")
+            execution
+                .sql
+                .contains("ADD CONSTRAINT `accounts_positive_balance`")
                 && execution.status == "skipped"
         }));
     }
@@ -4499,7 +4695,7 @@ mod tests {
         assert!(
             plan.tables[0].statements[1]
                 .sql
-                .contains("ADD CONSTRAINT `positive_balance` CHECK")
+                .contains("ADD CONSTRAINT `accounts_positive_balance` CHECK")
         );
     }
 
@@ -5065,6 +5261,23 @@ mod tests {
             referenced_schema: "globalcomix".to_string(),
             referenced_table: parent.to_string(),
             referenced_columns: vec!["id".to_string()],
+        }
+    }
+
+    fn canonical_foreign_key(name: &str) -> CanonicalForeignKey {
+        CanonicalForeignKey {
+            constraint_schema: "globalcomix".to_string(),
+            constraint_name: name.to_string(),
+            child_schema: "globalcomix".to_string(),
+            child_table: "children".to_string(),
+            child_columns: vec!["parent_id".to_string()],
+            parent_schema: "globalcomix".to_string(),
+            parent_table: "parents".to_string(),
+            parent_columns: vec!["id".to_string()],
+            update_rule: "RESTRICT".to_string(),
+            delete_rule: "RESTRICT".to_string(),
+            match_option: "NONE".to_string(),
+            enforced: true,
         }
     }
 
