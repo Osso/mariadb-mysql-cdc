@@ -52,6 +52,7 @@ Both engines describe an identical converged column differently, so comparison u
 - [x] Never truncate, coerce, discard, clamp, or silently rewrite existing target values to make an ALTER succeed.
 - [x] If data would be rejected, truncated, or coerced, fail that table's operation, report the blocking condition and representative primary-key sample values, and continue independent tables.
 - [x] Apply foreign keys and other dependency-sensitive objects only after their prerequisites converge; skip dependent operations when a prerequisite failed.
+- [x] Recreate CHECK constraints only after referenced columns converge and all planned same-table foreign-key drops complete; a failed foreign-key drop blocks CHECK re-add.
 
 ### Failure and verification
 
