@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+type TableCounts = BTreeMap<String, u64>;
 
 pub(crate) fn run_repair_drift(
     config: &RepairDriftConfig,
@@ -150,7 +151,7 @@ fn read_snapshot_repair_counts(
     config: &RepairDriftConfig,
     source: &crate::mysql_client::PersistentMySqlSource,
     tables: &[String],
-) -> Result<(BTreeMap<String, u64>, BTreeMap<String, u64>), RepairDriftError> {
+) -> Result<(TableCounts, TableCounts), RepairDriftError> {
     let target_config = snapshot_target_connection_config(config);
     let target = crate::mysql_client::PersistentMySqlSource::new_with_tls_ca(
         &target_config,
