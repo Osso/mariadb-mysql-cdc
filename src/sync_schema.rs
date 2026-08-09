@@ -1069,6 +1069,19 @@ pub(crate) fn run_sync_schema_command(args: Vec<String>, _usage: &str) {
     }
 }
 
+pub(crate) fn run_full_schema_sync(
+    source: crate::mysql_snapshot::MySqlConnectionConfig,
+    target: crate::live::TargetMySqlConfig,
+) -> Result<SchemaConvergenceReport, String> {
+    run_sync_schema(SyncSchemaConfig {
+        source,
+        target,
+        tables: Vec::new(),
+        catalog: None,
+        all_tables: true,
+    })
+}
+
 fn render_sync_schema_termination(
     result: Result<SchemaConvergenceReport, String>,
 ) -> (String, i32) {

@@ -75,7 +75,12 @@ generic exact unqualified, unquoted `DROP PROCEDURE IF EXISTS <identifier>` form
 and the additional exact unqualified, unquoted plain
 `DROP PROCEDURE apply_release_move_purchase_repair` form are admitted. Target
 inventory determines deterministic drop versus proven no-op; qualified, quoted,
-commented, and other plain-name forms remain blocked.
+commented, and other plain-name forms remain blocked. The exact raw,
+unqualified, unquoted, comment-free `DROP TRIGGER IF EXISTS
+prevent_deactivating_cloned_archives` form is also admitted, with an optional
+trailing semicolon. Stable target trigger inventory emits quoted MySQL `DROP
+TRIGGER` when present or records a proven no-op when absent; every other trigger
+form remains unsupported.
 The rename slice selects executable clauses from target pre-state and emits MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
 `cdc.ddl_replay_journal` as `translation_pending` with sentinel/no evidence;
 translator availability promotes that same row once to `prepared`, after which
@@ -96,13 +101,38 @@ Static control-plane prerequisites are validated once during admin/bootstrap and
 startup, before source replication; see the [DDL Resolution Runbook](ddl-resolution.md#startupbootstrap-validation-boundary).
 That validation covers effective grants, control-plane schema, guards, triggers,
 procedures, and checkpoint plus single-writer `GET_LOCK` prerequisites as
-deployment-drift detection. There is no multi-writer fence, CAS, or fencing-token
-protocol.
+deployment-drift detection. The normal stream path has no multi-writer fence or
+fencing-token protocol; the separate lost-binlog recovery path uses exact
+transactional CAS checks for its authorized checkpoint/barrier transition.
 Binlog DDL remains untrusted input and is classified per event. After admission,
 CDC-generated SQL is trusted internal program behavior: event handling executes
 known operations directly, keeps only event-specific state/evidence checks, and
 surfaces database errors without rerunning grant policy validation or maintaining
 duplicate allowlists.
+
+## Lost-binlog recovery
+
+`recover-lost-binlog` is a narrowly authorized availability-first transition
+when the live checkpoint names purged MariaDB history. JSON authorization binds
+one recovery ID to the exact old checkpoint and exact journal barrier; source
+identity and checkpoint name must also match the configured stream. The command
+first converges the full schema, computes the current complete scope hash, and
+rejects non-InnoDB source tables.
+
+The command acquires the stream lease, briefly holds `FLUSH TABLES WITH READ
+LOCK`, opens one MariaDB `REPEATABLE READ` consistent snapshot, and captures its
+current binlog coordinate. It releases the write fence only after the snapshot
+is established and keeps that source transaction for all full-scope
+insert/update/delete/verify work. It does not treat independent live reads as
+anchored evidence.
+
+A prepared immutable recovery record links old state, new coordinate, source,
+scope, operator, reason, and evidence. After zero skipped scope and successful
+schema/data proof, one target transaction revalidates the exact old state,
+updates the checkpoint, and commits only the exact historical barrier
+supersession. The journal row is preserved. This transition skips purged source
+history; it is not replay proof and does not claim production completion until
+restart health and subsequent zero-drift verification are recorded.
 
 ## Repair model
 

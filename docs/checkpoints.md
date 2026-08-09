@@ -9,6 +9,42 @@ must change when the source incarnation changes. Runtime validates the
 pre-created table and source-scoped row; it does not create or repair the
 control plane.
 
+## Lost-binlog recovery control plane
+
+`recover-lost-binlog` is the availability-first, incident-scoped transition for
+one purged-history barrier. It is not a generic checkpoint setter and does not
+claim that the skipped source interval was replayed.
+
+The CLI reads operator JSON containing the exact old checkpoint and exact
+`cdc.ddl_replay_journal` barrier, including source identity, file, start/end
+positions, and raw SQL. It rejects a configured source/checkpoint identity
+mismatch. Before preparing recovery it runs full schema convergence, computes
+the current complete source scope hash, and rejects any non-InnoDB source table.
+An explicitly supplied scope hash must match; an omitted hash is filled from the
+current source inventory and recorded as evidence.
+
+The stream lease is acquired before transition. A dedicated MariaDB connection
+briefly executes `FLUSH TABLES WITH READ LOCK` while another connection opens
+one `REPEATABLE READ` consistent snapshot and reads its current binlog
+coordinate. The write fence is then released, but that one source transaction
+remains open for the complete configured-scope insert, update, delete, and
+verification phases. Independent live reads are not recovery evidence.
+
+A prepared immutable row is inserted into `cdc.stream_recovery_records` with the
+old state, captured coordinate, source identity, scope hash, operator, reason,
+and preparation evidence. Only after zero skipped/unsupported tables and
+successful schema/data proof does one target transaction revalidate the exact
+checkpoint, barrier, source/scope identity, and prepared recovery row, update
+`cdc.stream_checkpoint`, and mark the recovery `committed`. The historical
+journal row remains intact. Active-barrier selection excludes only the exact
+committed source/file/start/end/raw-SQL hash. Any failed validation or commit
+rolls back; duplicate recovery IDs and non-advancing coordinates are refused.
+
+Bootstrap `cdc.stream_recovery_records` and its immutability guards with
+`docs/stream-recovery-records-bootstrap.sql` while stream writers are stopped.
+This documentation records the control-plane contract only; production
+execution, restart health, and post-transition `verified` evidence remain open.
+
 ## Automatic DDL journal
 
 The event handler represents DDL in the durable journal
@@ -111,6 +147,10 @@ deleted instead of maintained as compatibility paths.
 
 ## Remaining proof gaps
 
+- [ ] Bootstrap and execute the lost-binlog recovery control plane against the
+      intended target; no production recovery is claimed.
+- [ ] Record post-transition recovery `verified` evidence with zero unresolved
+      schema/data drift.
 - [ ] Exercise journal/bootstrap validation against the live target and review
       deployment credentials.
 - [ ] Prove target schema/data convergence and lag after deployment.

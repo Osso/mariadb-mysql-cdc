@@ -57,5 +57,6 @@ pub(crate) use run::{
 };
 pub(crate) use run::{
     expected_sync_run_spec_json, find_compatible_failed_run, read_parent_table_inventory,
-    reconcile_exact_parent_live, run_sync_table_phase_with_run_spec, should_record_sync_run_error,
+    reconcile_exact_parent_live, run_sync_table_phase_with_consistent_source,
+    run_sync_table_phase_with_run_spec, should_record_sync_run_error,
 };

@@ -23,6 +23,30 @@ fn formats_mysql_values_like_snapshot_text_rows() {
 }
 
 #[test]
+fn parses_consistent_snapshot_coordinate_from_mariadb_session_variables() {
+    let checkpoint = parse_consistent_snapshot_checkpoint(vec![vec![
+        Some("mysqld-bin.000123".to_string()),
+        Some("456".to_string()),
+    ]])
+    .expect("valid MariaDB consistent snapshot coordinate");
+
+    assert_eq!(checkpoint.source_file, "mysqld-bin.000123");
+    assert_eq!(checkpoint.source_position, 456);
+    assert_eq!(
+        checkpoint.last_event.event_type,
+        "LostBinlogRecoverySnapshot"
+    );
+}
+
+#[test]
+fn rejects_missing_consistent_snapshot_coordinate() {
+    let error = parse_consistent_snapshot_checkpoint(Vec::new())
+        .expect_err("missing MariaDB snapshot coordinate must fail closed");
+
+    assert!(error.to_string().contains("snapshot coordinate"));
+}
+
+#[test]
 fn shared_source_opts_accept_plaintext_without_tls_ca() {
     let opts = base_opts(
         "source-db",

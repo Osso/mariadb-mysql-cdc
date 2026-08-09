@@ -99,6 +99,8 @@ pub fn run_repair_drift(config: &RepairDriftConfig) -> Result<RepairDriftReport,
     run::run_repair_drift(config)
 }
 
+pub(crate) use run::run_consistent_snapshot_repair;
+
 pub fn run_repair_drift_command(args: Vec<String>, usage: &str) {
     run::run_repair_drift_command(args, usage);
 }

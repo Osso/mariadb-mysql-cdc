@@ -1,0 +1,1020 @@
+use crate::checkpoint::Checkpoint;
+use crate::inventory::{
+    InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
+    build_inventory,
+};
+use crate::live::TargetMySqlConfig;
+use crate::lost_binlog_recovery_store::MySqlLostBinlogRecoveryStore;
+use crate::mysql_client::PersistentMySqlSource;
+use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::repair_drift::{RepairDriftConfig, RepairDriftReport, run_consistent_snapshot_repair};
+use crate::table_sync::SyncMode;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::rc::Rc;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct LostBinlogBarrier {
+    pub source_identity: String,
+    pub binlog_file: String,
+    pub event_start_position: u64,
+    pub event_end_position: u64,
+    pub raw_sql: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct LostBinlogRecoveryRequest {
+    pub recovery_id: String,
+    pub checkpoint_name: String,
+    pub expected_checkpoint: Checkpoint,
+    pub expected_barrier: LostBinlogBarrier,
+    #[serde(default)]
+    pub scope_hash: String,
+    pub operator_identity: String,
+    pub reason: String,
+    #[serde(default)]
+    pub prepared_evidence_json: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LostBinlogRecoveryStatus {
+    Prepared,
+    Committed,
+    Verified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LostBinlogRecoveryRecord {
+    pub recovery_id: String,
+    pub checkpoint_name: String,
+    pub source_identity: String,
+    pub scope_hash: String,
+    pub operator_identity: String,
+    pub reason: String,
+    pub prepared_evidence_json: String,
+    pub expected_checkpoint: Checkpoint,
+    pub expected_barrier: LostBinlogBarrier,
+    pub new_checkpoint: Checkpoint,
+    pub status: LostBinlogRecoveryStatus,
+}
+
+impl LostBinlogRecoveryRecord {
+    pub fn prepared(request: &LostBinlogRecoveryRequest, new_checkpoint: Checkpoint) -> Self {
+        Self {
+            recovery_id: request.recovery_id.clone(),
+            checkpoint_name: request.checkpoint_name.clone(),
+            source_identity: request.expected_barrier.source_identity.clone(),
+            scope_hash: request.scope_hash.clone(),
+            operator_identity: request.operator_identity.clone(),
+            reason: request.reason.clone(),
+            prepared_evidence_json: request.prepared_evidence_json.clone(),
+            expected_checkpoint: request.expected_checkpoint.clone(),
+            expected_barrier: request.expected_barrier.clone(),
+            new_checkpoint,
+            status: LostBinlogRecoveryStatus::Prepared,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LostBinlogReconciliationProof {
+    pub recovery_id: String,
+    pub source_identity: String,
+    pub scope_hash: String,
+    pub schema_converged: bool,
+    pub data_converged: bool,
+    pub unsupported_scope: Vec<String>,
+    pub evidence_json: String,
+}
+
+pub trait LostBinlogBoundaryReader {
+    fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String>;
+}
+
+struct FencedSnapshotBoundaryReader<'a> {
+    snapshot_source: &'a PersistentMySqlSource,
+    write_fence_source: &'a PersistentMySqlSource,
+}
+
+impl LostBinlogBoundaryReader for FencedSnapshotBoundaryReader<'_> {
+    fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String> {
+        self.write_fence_source
+            .execute_session_sql("FLUSH TABLES WITH READ LOCK")
+            .map_err(|error| format!("acquire source snapshot write fence: {error}"))?;
+        let snapshot = self
+            .snapshot_source
+            .begin_consistent_snapshot()
+            .map_err(|error| format!("begin source consistent snapshot: {error}"));
+        let unlock = self
+            .write_fence_source
+            .execute_session_sql("UNLOCK TABLES")
+            .map_err(|error| format!("release source snapshot write fence: {error}"));
+        match (snapshot, unlock) {
+            (Ok(checkpoint), Ok(())) => Ok(checkpoint),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+}
+
+pub trait LostBinlogRecoveryStore {
+    fn acquire_stream_lease(&self, lease_name: &str) -> Result<(), String>;
+    fn begin_transaction(&self) -> Result<(), String>;
+    fn load_checkpoint_for_update(
+        &self,
+        checkpoint_name: &str,
+    ) -> Result<Option<Checkpoint>, String>;
+    fn load_barrier_for_update(
+        &self,
+        barrier: &LostBinlogBarrier,
+    ) -> Result<Option<LostBinlogBarrier>, String>;
+    fn load_recovery_for_update(
+        &self,
+        recovery_id: &str,
+    ) -> Result<Option<LostBinlogRecoveryRecord>, String>;
+    fn insert_prepared_recovery(&self, recovery: &LostBinlogRecoveryRecord) -> Result<(), String>;
+    fn save_checkpoint(&self, checkpoint_name: &str, checkpoint: &Checkpoint)
+    -> Result<(), String>;
+    fn mark_recovery_committed(
+        &self,
+        recovery_id: &str,
+        proof: &LostBinlogReconciliationProof,
+    ) -> Result<(), String>;
+    fn commit_transaction(&self) -> Result<(), String>;
+    fn rollback_transaction(&self) -> Result<(), String>;
+}
+
+pub fn prepare_lost_binlog_recovery<B, S>(
+    boundary_reader: &B,
+    store: &S,
+    request: &LostBinlogRecoveryRequest,
+) -> Result<LostBinlogRecoveryRecord, String>
+where
+    B: LostBinlogBoundaryReader,
+    S: LostBinlogRecoveryStore,
+{
+    validate_recovery_request(request)?;
+    store.acquire_stream_lease(&request.checkpoint_name)?;
+    let new_checkpoint = boundary_reader.begin_consistent_snapshot_and_read_checkpoint()?;
+    validate_new_checkpoint(&request.expected_checkpoint, &new_checkpoint)?;
+    let prepared = LostBinlogRecoveryRecord::prepared(request, new_checkpoint);
+
+    run_recovery_transaction(store, || {
+        insert_prepared_recovery(store, request, &prepared)
+    })?;
+    Ok(prepared)
+}
+
+fn insert_prepared_recovery<S>(
+    store: &S,
+    request: &LostBinlogRecoveryRequest,
+    prepared: &LostBinlogRecoveryRecord,
+) -> Result<(), String>
+where
+    S: LostBinlogRecoveryStore,
+{
+    require_expected_recovery_state(store, request)?;
+    if store
+        .load_recovery_for_update(&request.recovery_id)?
+        .is_some()
+    {
+        return Err(format!(
+            "lost-binlog recovery already exists: {}",
+            request.recovery_id
+        ));
+    }
+    store.insert_prepared_recovery(prepared)
+}
+
+pub fn commit_lost_binlog_recovery<S>(
+    store: &S,
+    request: &LostBinlogRecoveryRequest,
+    proof: &LostBinlogReconciliationProof,
+) -> Result<(), String>
+where
+    S: LostBinlogRecoveryStore,
+{
+    validate_reconciliation_proof(request, proof)?;
+    store.acquire_stream_lease(&request.checkpoint_name)?;
+
+    run_recovery_transaction(store, || {
+        require_expected_recovery_state(store, request)?;
+        let prepared = store
+            .load_recovery_for_update(&request.recovery_id)?
+            .ok_or_else(|| format!("prepared recovery is missing: {}", request.recovery_id))?;
+        validate_prepared_recovery(request, &prepared)?;
+        store.save_checkpoint(&request.checkpoint_name, &prepared.new_checkpoint)?;
+        store.mark_recovery_committed(&request.recovery_id, proof)
+    })
+}
+
+fn validate_recovery_request(request: &LostBinlogRecoveryRequest) -> Result<(), String> {
+    for (field, value) in [
+        ("recovery_id", request.recovery_id.as_str()),
+        ("checkpoint_name", request.checkpoint_name.as_str()),
+        (
+            "source_identity",
+            request.expected_barrier.source_identity.as_str(),
+        ),
+        ("scope_hash", request.scope_hash.as_str()),
+        ("operator_identity", request.operator_identity.as_str()),
+        ("reason", request.reason.as_str()),
+        (
+            "prepared_evidence_json",
+            request.prepared_evidence_json.as_str(),
+        ),
+        ("raw_sql", request.expected_barrier.raw_sql.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("lost-binlog recovery {field} is empty"));
+        }
+    }
+    if request.expected_barrier.event_end_position <= request.expected_barrier.event_start_position
+    {
+        return Err("lost-binlog barrier coordinates are invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_new_checkpoint(old: &Checkpoint, new: &Checkpoint) -> Result<(), String> {
+    if source_coordinate_advances(old, new) {
+        return Ok(());
+    }
+    Err(format!(
+        "lost-binlog recovery boundary {}:{} does not advance checkpoint {}:{}",
+        new.source_file, new.source_position, old.source_file, old.source_position
+    ))
+}
+
+fn source_coordinate_advances(old: &Checkpoint, new: &Checkpoint) -> bool {
+    if new.source_file == old.source_file {
+        return new.source_position > old.source_position;
+    }
+    binlog_sequence(&new.source_file)
+        .zip(binlog_sequence(&old.source_file))
+        .is_some_and(|(new_sequence, old_sequence)| new_sequence > old_sequence)
+}
+
+fn binlog_sequence(file: &str) -> Option<u64> {
+    file.rsplit_once('.')?.1.parse().ok()
+}
+
+fn require_expected_recovery_state<S>(
+    store: &S,
+    request: &LostBinlogRecoveryRequest,
+) -> Result<(), String>
+where
+    S: LostBinlogRecoveryStore,
+{
+    let checkpoint = store
+        .load_checkpoint_for_update(&request.checkpoint_name)?
+        .ok_or_else(|| "lost-binlog checkpoint is missing".to_string())?;
+    if checkpoint != request.expected_checkpoint {
+        return Err("lost-binlog checkpoint mismatch".to_string());
+    }
+    let barrier = store
+        .load_barrier_for_update(&request.expected_barrier)?
+        .ok_or_else(|| "lost-binlog barrier is missing".to_string())?;
+    if barrier != request.expected_barrier {
+        return Err("lost-binlog barrier mismatch".to_string());
+    }
+    Ok(())
+}
+
+fn validate_reconciliation_proof(
+    request: &LostBinlogRecoveryRequest,
+    proof: &LostBinlogReconciliationProof,
+) -> Result<(), String> {
+    let identity_matches = proof.recovery_id == request.recovery_id;
+    let source_matches = proof.source_identity == request.expected_barrier.source_identity;
+    let scope_matches = proof.scope_hash == request.scope_hash;
+    let scope_is_complete = proof.unsupported_scope.is_empty();
+    let evidence_exists = !proof.evidence_json.trim().is_empty();
+    if identity_matches
+        && source_matches
+        && scope_matches
+        && proof.schema_converged
+        && proof.data_converged
+        && scope_is_complete
+        && evidence_exists
+    {
+        return Ok(());
+    }
+    Err("lost-binlog reconciliation proof is incomplete".to_string())
+}
+
+fn validate_prepared_recovery(
+    request: &LostBinlogRecoveryRequest,
+    prepared: &LostBinlogRecoveryRecord,
+) -> Result<(), String> {
+    let expected = LostBinlogRecoveryRecord::prepared(request, prepared.new_checkpoint.clone());
+    if prepared == &expected {
+        return Ok(());
+    }
+    Err("prepared lost-binlog recovery does not match the authorized request".to_string())
+}
+
+fn run_recovery_transaction<S, T>(
+    store: &S,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String>
+where
+    S: LostBinlogRecoveryStore,
+{
+    store.begin_transaction()?;
+    match operation() {
+        Ok(value) => match store.commit_transaction() {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                let _ = store.rollback_transaction();
+                Err(error)
+            }
+        },
+        Err(error) => {
+            let _ = store.rollback_transaction();
+            Err(error)
+        }
+    }
+}
+
+pub struct RecoverLostBinlogConfig {
+    pub source: MySqlConnectionConfig,
+    pub source_identity: String,
+    pub target: TargetMySqlConfig,
+    pub authorization_file: PathBuf,
+    pub checkpoint_table: String,
+    pub journal_table: String,
+    pub recovery_table: String,
+    pub progress_table: String,
+    pub chunk_size: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoverLostBinlogReport {
+    pub recovery_id: String,
+    pub new_checkpoint: Checkpoint,
+    pub scope_hash: String,
+    pub repaired_tables: usize,
+    pub compared_tables: usize,
+}
+
+pub fn run_recover_lost_binlog(
+    config: &RecoverLostBinlogConfig,
+) -> Result<RecoverLostBinlogReport, String> {
+    let preparation = prepare_recovery_context(config)?;
+    let result = run_anchored_recovery(
+        config,
+        &preparation.request,
+        &preparation.store,
+        Rc::clone(&preparation.source),
+        preparation.source_inventory,
+        preparation.target_inventory,
+        preparation.scope_hash,
+    );
+    close_recovery_snapshot(&preparation.source, result)
+}
+
+struct RecoveryPreparation {
+    request: LostBinlogRecoveryRequest,
+    source: Rc<PersistentMySqlSource>,
+    store: MySqlLostBinlogRecoveryStore,
+    source_inventory: SchemaInventory,
+    target_inventory: SchemaInventory,
+    scope_hash: String,
+}
+
+fn prepare_recovery_context(
+    config: &RecoverLostBinlogConfig,
+) -> Result<RecoveryPreparation, String> {
+    let mut request = read_recovery_authorization(&config.authorization_file)?;
+    validate_authorized_source(config, &request)?;
+    let schema_report =
+        crate::sync_schema::run_full_schema_sync(config.source.clone(), config.target.clone())?;
+    require_converged_schema(&schema_report)?;
+    let source_inventory = read_source_inventory(&config.source)?;
+    let target_inventory = read_target_inventory(&config.target)?;
+    validate_transactional_scope(&source_inventory)?;
+    let scope_hash = authorize_current_scope(&mut request, &source_inventory)?;
+    request.prepared_evidence_json =
+        prepared_evidence_json(&schema_report, &source_inventory, &scope_hash);
+    let source = Rc::new(
+        PersistentMySqlSource::new(&config.source)
+            .map_err(|error| format!("connect recovery snapshot source: {error}"))?,
+    );
+    let store = MySqlLostBinlogRecoveryStore::new(
+        &config.target,
+        config.checkpoint_table.clone(),
+        config.journal_table.clone(),
+        config.recovery_table.clone(),
+    )?;
+    store.ensure()?;
+    Ok(RecoveryPreparation {
+        request,
+        source,
+        store,
+        source_inventory,
+        target_inventory,
+        scope_hash,
+    })
+}
+
+fn require_converged_schema(
+    report: &crate::sync_schema::SchemaConvergenceReport,
+) -> Result<(), String> {
+    if report.overall_status == crate::sync_schema::OverallSchemaStatus::Converged {
+        return Ok(());
+    }
+    Err("full schema convergence did not complete".to_string())
+}
+
+fn authorize_current_scope(
+    request: &mut LostBinlogRecoveryRequest,
+    source_inventory: &SchemaInventory,
+) -> Result<String, String> {
+    let scope_hash = inventory_scope_hash(source_inventory)?;
+    if request.scope_hash.is_empty() {
+        request.scope_hash = scope_hash.clone();
+        return Ok(scope_hash);
+    }
+    if request.scope_hash == scope_hash {
+        return Ok(scope_hash);
+    }
+    Err(format!(
+        "authorized scope hash {} does not match current source scope {scope_hash}",
+        request.scope_hash
+    ))
+}
+
+fn prepared_evidence_json(
+    schema_report: &crate::sync_schema::SchemaConvergenceReport,
+    source_inventory: &SchemaInventory,
+    scope_hash: &str,
+) -> String {
+    serde_json::json!({
+        "scope_hash": scope_hash,
+        "source_schema_fingerprint": schema_report.source_fingerprint,
+        "target_schema_fingerprint": schema_report.target_fingerprint,
+        "source_tables": source_inventory.tables.len(),
+    })
+    .to_string()
+}
+
+fn close_recovery_snapshot(
+    source: &PersistentMySqlSource,
+    result: Result<RecoverLostBinlogReport, String>,
+) -> Result<RecoverLostBinlogReport, String> {
+    let rollback = source
+        .rollback_consistent_snapshot()
+        .map_err(|error| format!("close recovery source snapshot: {error}"));
+    match (result, rollback) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_anchored_recovery(
+    config: &RecoverLostBinlogConfig,
+    request: &LostBinlogRecoveryRequest,
+    store: &MySqlLostBinlogRecoveryStore,
+    source: Rc<PersistentMySqlSource>,
+    source_inventory: SchemaInventory,
+    target_inventory: SchemaInventory,
+    scope_hash: String,
+) -> Result<RecoverLostBinlogReport, String> {
+    let prepared = begin_authorized_snapshot(config, request, store, source.as_ref())?;
+    let repair = repair_consistent_snapshot(
+        config,
+        request,
+        Rc::clone(&source),
+        source_inventory,
+        target_inventory,
+    )?;
+    require_unchanged_source_scope(config, &scope_hash)?;
+    let proof = reconciliation_proof(request, &repair, &scope_hash);
+    commit_lost_binlog_recovery(store, request, &proof)?;
+    Ok(recovery_report(request, prepared, repair, scope_hash))
+}
+
+fn begin_authorized_snapshot(
+    config: &RecoverLostBinlogConfig,
+    request: &LostBinlogRecoveryRequest,
+    store: &MySqlLostBinlogRecoveryStore,
+    source: &PersistentMySqlSource,
+) -> Result<LostBinlogRecoveryRecord, String> {
+    let write_fence_source = PersistentMySqlSource::new(&config.source)
+        .map_err(|error| format!("connect recovery write-fence source: {error}"))?;
+    let boundary_reader = FencedSnapshotBoundaryReader {
+        snapshot_source: source,
+        write_fence_source: &write_fence_source,
+    };
+    prepare_lost_binlog_recovery(&boundary_reader, store, request)
+}
+
+fn repair_consistent_snapshot(
+    config: &RecoverLostBinlogConfig,
+    request: &LostBinlogRecoveryRequest,
+    source: Rc<PersistentMySqlSource>,
+    source_inventory: SchemaInventory,
+    target_inventory: SchemaInventory,
+) -> Result<RepairDriftReport, String> {
+    run_consistent_snapshot_repair(
+        &full_repair_config(config, request),
+        source,
+        source_inventory,
+        target_inventory,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn require_unchanged_source_scope(
+    config: &RecoverLostBinlogConfig,
+    expected_scope_hash: &str,
+) -> Result<(), String> {
+    let current_inventory = read_source_inventory(&config.source)?;
+    let current_scope_hash = inventory_scope_hash(&current_inventory)?;
+    if current_scope_hash == expected_scope_hash {
+        return Ok(());
+    }
+    Err("source schema changed during the consistent snapshot repair".to_string())
+}
+
+fn reconciliation_proof(
+    request: &LostBinlogRecoveryRequest,
+    repair: &RepairDriftReport,
+    scope_hash: &str,
+) -> LostBinlogReconciliationProof {
+    let unsupported_scope = repair
+        .skipped
+        .iter()
+        .map(|item| item.table.clone())
+        .collect::<Vec<_>>();
+    LostBinlogReconciliationProof {
+        recovery_id: request.recovery_id.clone(),
+        source_identity: request.expected_barrier.source_identity.clone(),
+        scope_hash: request.scope_hash.clone(),
+        schema_converged: true,
+        data_converged: unsupported_scope.is_empty()
+            && repair.compared_tables == repair.source_tables,
+        evidence_json: reconciliation_evidence_json(repair, scope_hash),
+        unsupported_scope,
+    }
+}
+
+fn reconciliation_evidence_json(repair: &RepairDriftReport, scope_hash: &str) -> String {
+    let skipped_tables = repair
+        .skipped
+        .iter()
+        .map(|item| serde_json::json!({"table": item.table, "reason": item.reason}))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "scope_hash": scope_hash,
+        "compared_tables": repair.compared_tables,
+        "repaired_tables": repair.repaired.len(),
+        "skipped_tables": skipped_tables,
+    })
+    .to_string()
+}
+
+fn recovery_report(
+    request: &LostBinlogRecoveryRequest,
+    prepared: LostBinlogRecoveryRecord,
+    repair: RepairDriftReport,
+    scope_hash: String,
+) -> RecoverLostBinlogReport {
+    RecoverLostBinlogReport {
+        recovery_id: request.recovery_id.clone(),
+        new_checkpoint: prepared.new_checkpoint,
+        scope_hash,
+        repaired_tables: repair.repaired.len(),
+        compared_tables: repair.compared_tables,
+    }
+}
+
+fn read_recovery_authorization(path: &PathBuf) -> Result<LostBinlogRecoveryRequest, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("read recovery authorization {}: {error}", path.display()))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("decode recovery authorization {}: {error}", path.display()))
+}
+
+fn validate_authorized_source(
+    config: &RecoverLostBinlogConfig,
+    request: &LostBinlogRecoveryRequest,
+) -> Result<(), String> {
+    let expected_prefix = format!("{}#server-id=", config.source_identity);
+    if !request
+        .expected_barrier
+        .source_identity
+        .starts_with(&expected_prefix)
+    {
+        return Err(
+            "recovery authorization source identity does not match configured source".to_string(),
+        );
+    }
+    let expected_checkpoint_name =
+        crate::stream_checkpoint::stream_checkpoint_name(&config.source_identity);
+    if request.checkpoint_name != expected_checkpoint_name {
+        return Err(format!(
+            "recovery authorization checkpoint name must be {expected_checkpoint_name}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transactional_scope(inventory: &SchemaInventory) -> Result<(), String> {
+    let unsupported = inventory
+        .tables
+        .iter()
+        .filter(|table| table.engine.as_deref() != Some("InnoDB"))
+        .map(|table| format!("{}:{:?}", table.name, table.engine))
+        .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "consistent snapshot recovery does not support non-InnoDB tables: {}",
+        unsupported.join(", ")
+    ))
+}
+
+fn inventory_scope_hash(inventory: &SchemaInventory) -> Result<String, String> {
+    let encoded = serde_json::to_vec(inventory)
+        .map_err(|error| format!("encode recovery scope inventory: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn read_source_inventory(config: &MySqlConnectionConfig) -> Result<SchemaInventory, String> {
+    let reader = MariaDbInventoryReader::new(InventoryConfig {
+        host: config.host.clone(),
+        port: config.port,
+        user: config.user.clone(),
+        password: config.password.clone(),
+        endpoint_role: InventoryEndpointRole::Source,
+        use_tls: false,
+        tls_ca_file: None,
+        ..InventoryConfig::default()
+    });
+    build_inventory(&config.database, &reader)
+        .map_err(|error| format!("source recovery inventory failed: {error}"))
+}
+
+fn read_target_inventory(config: &TargetMySqlConfig) -> Result<SchemaInventory, String> {
+    let reader = MariaDbInventoryReader::new(InventoryConfig {
+        host: config.host.clone(),
+        port: config.port,
+        user: config.user.clone(),
+        password: config.password.clone(),
+        endpoint_role: InventoryEndpointRole::Target,
+        use_tls: true,
+        tls_ca_file: Some(config.tls_ca_file.clone()),
+        ..InventoryConfig::default()
+    });
+    build_inventory(&config.database, &reader)
+        .map_err(|error| format!("target recovery inventory failed: {error}"))
+}
+
+fn full_repair_config(
+    config: &RecoverLostBinlogConfig,
+    request: &LostBinlogRecoveryRequest,
+) -> RepairDriftConfig {
+    RepairDriftConfig {
+        source: config.source.clone(),
+        source_identity: config.source_identity.clone(),
+        target: config.target.clone(),
+        tables: Vec::new(),
+        parent_first: Vec::new(),
+        start_after: None,
+        end_at: None,
+        content_check: true,
+        mode: SyncMode::Apply,
+        chunk_size: config.chunk_size,
+        conflict_reconcile_limit: 0,
+        progress_table: config.progress_table.clone(),
+        run_id: Some(request.recovery_id.clone()),
+        run_id_prefix: request.recovery_id.clone(),
+        #[cfg(feature = "integration-failpoints")]
+        integration_failpoint: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::{Checkpoint, LastEvent};
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct RecordingRecoveryStore {
+        checkpoint: RefCell<Option<Checkpoint>>,
+        barrier: RefCell<Option<LostBinlogBarrier>>,
+        recovery: RefCell<Option<LostBinlogRecoveryRecord>>,
+        committed_checkpoint: RefCell<Option<Checkpoint>>,
+        operations: RefCell<Vec<&'static str>>,
+        fail_mark_committed: bool,
+    }
+
+    impl LostBinlogRecoveryStore for RecordingRecoveryStore {
+        fn acquire_stream_lease(&self, _lease_name: &str) -> Result<(), String> {
+            self.operations.borrow_mut().push("LEASE");
+            Ok(())
+        }
+
+        fn begin_transaction(&self) -> Result<(), String> {
+            self.operations.borrow_mut().push("BEGIN");
+            Ok(())
+        }
+
+        fn load_checkpoint_for_update(
+            &self,
+            _checkpoint_name: &str,
+        ) -> Result<Option<Checkpoint>, String> {
+            self.operations.borrow_mut().push("LOCK_CHECKPOINT");
+            Ok(self.checkpoint.borrow().clone())
+        }
+
+        fn load_barrier_for_update(
+            &self,
+            _barrier: &LostBinlogBarrier,
+        ) -> Result<Option<LostBinlogBarrier>, String> {
+            self.operations.borrow_mut().push("LOCK_BARRIER");
+            Ok(self.barrier.borrow().clone())
+        }
+
+        fn load_recovery_for_update(
+            &self,
+            _recovery_id: &str,
+        ) -> Result<Option<LostBinlogRecoveryRecord>, String> {
+            self.operations.borrow_mut().push("LOCK_RECOVERY");
+            Ok(self.recovery.borrow().clone())
+        }
+
+        fn insert_prepared_recovery(
+            &self,
+            recovery: &LostBinlogRecoveryRecord,
+        ) -> Result<(), String> {
+            self.operations.borrow_mut().push("INSERT_RECOVERY");
+            self.recovery.replace(Some(recovery.clone()));
+            Ok(())
+        }
+
+        fn save_checkpoint(
+            &self,
+            _checkpoint_name: &str,
+            checkpoint: &Checkpoint,
+        ) -> Result<(), String> {
+            self.operations.borrow_mut().push("SAVE_CHECKPOINT");
+            self.committed_checkpoint.replace(Some(checkpoint.clone()));
+            Ok(())
+        }
+
+        fn mark_recovery_committed(
+            &self,
+            _recovery_id: &str,
+            _proof: &LostBinlogReconciliationProof,
+        ) -> Result<(), String> {
+            self.operations.borrow_mut().push("COMMIT_RECOVERY");
+            if self.fail_mark_committed {
+                return Err("injected recovery commit failure".to_string());
+            }
+            Ok(())
+        }
+
+        fn commit_transaction(&self) -> Result<(), String> {
+            self.operations.borrow_mut().push("COMMIT");
+            Ok(())
+        }
+
+        fn rollback_transaction(&self) -> Result<(), String> {
+            self.operations.borrow_mut().push("ROLLBACK");
+            self.committed_checkpoint.replace(None);
+            Ok(())
+        }
+    }
+
+    struct FixedBoundaryReader(Checkpoint);
+
+    impl LostBinlogBoundaryReader for FixedBoundaryReader {
+        fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn prepares_recovery_with_latest_source_boundary_and_exact_old_state() {
+        let old = checkpoint("mysqld-bin.000001", 100);
+        let latest = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let store = RecordingRecoveryStore {
+            checkpoint: RefCell::new(Some(old.clone())),
+            barrier: RefCell::new(Some(barrier.clone())),
+            ..Default::default()
+        };
+        let request = recovery_request(old, barrier);
+
+        let prepared =
+            prepare_lost_binlog_recovery(&FixedBoundaryReader(latest.clone()), &store, &request)
+                .expect("prepare exact authorized recovery");
+
+        assert_eq!(prepared.new_checkpoint, latest);
+        assert_eq!(prepared.status, LostBinlogRecoveryStatus::Prepared);
+        assert_eq!(
+            store.operations.borrow().as_slice(),
+            [
+                "LEASE",
+                "BEGIN",
+                "LOCK_CHECKPOINT",
+                "LOCK_BARRIER",
+                "LOCK_RECOVERY",
+                "INSERT_RECOVERY",
+                "COMMIT"
+            ]
+        );
+    }
+
+    #[test]
+    fn prepare_refuses_checkpoint_mismatch_without_recording_recovery() {
+        let expected = checkpoint("mysqld-bin.000001", 100);
+        let actual = checkpoint("mysqld-bin.000003", 4);
+        let barrier = production_barrier();
+        let store = RecordingRecoveryStore {
+            checkpoint: RefCell::new(Some(actual)),
+            barrier: RefCell::new(Some(barrier.clone())),
+            ..Default::default()
+        };
+        let request = recovery_request(expected, barrier);
+
+        let error = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(checkpoint("mysqld-bin.000002", 300)),
+            &store,
+            &request,
+        )
+        .expect_err("mismatched checkpoint must fail closed");
+
+        assert!(error.contains("checkpoint mismatch"));
+        assert!(store.recovery.borrow().is_none());
+        assert_eq!(store.operations.borrow().last(), Some(&"ROLLBACK"));
+    }
+
+    #[test]
+    fn prepare_refuses_duplicate_recovery_id_without_mutating_state() {
+        let old = checkpoint("mysqld-bin.000001", 100);
+        let latest = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let request = recovery_request(old.clone(), barrier.clone());
+        let existing = LostBinlogRecoveryRecord::prepared(&request, latest.clone());
+        let store = RecordingRecoveryStore {
+            checkpoint: RefCell::new(Some(old)),
+            barrier: RefCell::new(Some(barrier)),
+            recovery: RefCell::new(Some(existing)),
+            ..Default::default()
+        };
+
+        let error = prepare_lost_binlog_recovery(&FixedBoundaryReader(latest), &store, &request)
+            .expect_err("duplicate recovery IDs must fail closed");
+
+        assert!(error.contains("recovery already exists"));
+        assert!(store.committed_checkpoint.borrow().is_none());
+        assert_eq!(store.operations.borrow().last(), Some(&"ROLLBACK"));
+    }
+
+    #[test]
+    fn prepare_refuses_a_boundary_that_does_not_advance_the_checkpoint() {
+        let old = checkpoint("mysqld-bin.000001", 100);
+        let barrier = production_barrier();
+        let store = RecordingRecoveryStore {
+            checkpoint: RefCell::new(Some(old.clone())),
+            barrier: RefCell::new(Some(barrier.clone())),
+            ..Default::default()
+        };
+        let request = recovery_request(old.clone(), barrier);
+
+        let error = prepare_lost_binlog_recovery(&FixedBoundaryReader(old), &store, &request)
+            .expect_err("recovery boundary must advance beyond the obsolete checkpoint");
+
+        assert!(error.contains("does not advance"));
+        assert!(store.recovery.borrow().is_none());
+    }
+
+    #[test]
+    fn commit_requires_complete_full_scope_reconciliation_proof() {
+        let old = checkpoint("mysqld-bin.000001", 100);
+        let latest = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let request = recovery_request(old.clone(), barrier.clone());
+        let prepared = LostBinlogRecoveryRecord::prepared(&request, latest);
+        let store = RecordingRecoveryStore {
+            checkpoint: RefCell::new(Some(old)),
+            barrier: RefCell::new(Some(barrier)),
+            recovery: RefCell::new(Some(prepared)),
+            ..Default::default()
+        };
+        let proof = LostBinlogReconciliationProof {
+            recovery_id: request.recovery_id.clone(),
+            source_identity: request.expected_barrier.source_identity.clone(),
+            scope_hash: request.scope_hash.clone(),
+            schema_converged: true,
+            data_converged: false,
+            unsupported_scope: vec!["audit_logs".to_string()],
+            evidence_json: "{}".to_string(),
+        };
+
+        let error = commit_lost_binlog_recovery(&store, &request, &proof)
+            .expect_err("incomplete proof must block checkpoint transition");
+
+        assert!(error.contains("reconciliation proof is incomplete"));
+        assert!(store.committed_checkpoint.borrow().is_none());
+    }
+
+    #[test]
+    fn commit_rolls_back_checkpoint_when_recovery_record_cannot_commit() {
+        let old = checkpoint("mysqld-bin.000001", 100);
+        let latest = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let request = recovery_request(old.clone(), barrier.clone());
+        let prepared = LostBinlogRecoveryRecord::prepared(&request, latest);
+        let store = RecordingRecoveryStore {
+            checkpoint: RefCell::new(Some(old)),
+            barrier: RefCell::new(Some(barrier)),
+            recovery: RefCell::new(Some(prepared)),
+            fail_mark_committed: true,
+            ..Default::default()
+        };
+
+        let error = commit_lost_binlog_recovery(&store, &request, &complete_proof(&request))
+            .expect_err("recovery and checkpoint must commit atomically");
+
+        assert!(error.contains("injected recovery commit failure"));
+        assert!(store.committed_checkpoint.borrow().is_none());
+        assert_eq!(store.operations.borrow().last(), Some(&"ROLLBACK"));
+    }
+
+    #[test]
+    fn verified_recovery_exempts_only_its_exact_historical_barrier() {
+        let barrier = production_barrier();
+        let sql = crate::lost_binlog_recovery_store::build_active_barrier_select_sql(
+            "cdc.ddl_replay_journal",
+            "cdc.stream_recovery_records",
+            &barrier.source_identity,
+        );
+
+        assert!(sql.contains("recovery.status IN ('committed','verified')"));
+        assert!(sql.contains("recovery.old_barrier_source_identity = journal.source_identity"));
+        assert!(sql.contains("recovery.old_barrier_file = journal.binlog_file"));
+        assert!(sql.contains("recovery.old_barrier_start_position = journal.event_start_position"));
+        assert!(sql.contains("recovery.old_barrier_end_position = journal.event_end_position"));
+        assert!(sql.contains("recovery.old_barrier_raw_sql_sha256 = SHA2(journal.raw_sql, 256)"));
+    }
+
+    fn checkpoint(file: &str, position: u64) -> Checkpoint {
+        Checkpoint {
+            source_file: file.to_string(),
+            source_position: position,
+            gtid: None,
+            event_timestamp: 0,
+            last_event: LastEvent {
+                event_type: "LostBinlogRecovery".to_string(),
+                description: "authorized lost-binlog recovery boundary".to_string(),
+            },
+        }
+    }
+
+    fn production_barrier() -> LostBinlogBarrier {
+        LostBinlogBarrier {
+            source_identity: "source-1#server-id=3".to_string(),
+            binlog_file: "mysqld-bin.000001".to_string(),
+            event_start_position: 120,
+            event_end_position: 180,
+            raw_sql: "DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives".to_string(),
+        }
+    }
+
+    fn recovery_request(
+        expected_checkpoint: Checkpoint,
+        expected_barrier: LostBinlogBarrier,
+    ) -> LostBinlogRecoveryRequest {
+        LostBinlogRecoveryRequest {
+            recovery_id: "fixture-lost-binlog-recovery".to_string(),
+            checkpoint_name: "stream-binlog:source-1".to_string(),
+            expected_checkpoint,
+            expected_barrier,
+            scope_hash: "full-replicated-scope-sha256".to_string(),
+            operator_identity: "operator@example.com".to_string(),
+            reason: "authorized recovery after source binlog purge".to_string(),
+            prepared_evidence_json: "{\"scope\":\"complete\"}".to_string(),
+        }
+    }
+
+    fn complete_proof(request: &LostBinlogRecoveryRequest) -> LostBinlogReconciliationProof {
+        LostBinlogReconciliationProof {
+            recovery_id: request.recovery_id.clone(),
+            source_identity: request.expected_barrier.source_identity.clone(),
+            scope_hash: request.scope_hash.clone(),
+            schema_converged: true,
+            data_converged: true,
+            unsupported_scope: Vec::new(),
+            evidence_json: "{\"schema\":\"converged\",\"data\":\"converged\"}".to_string(),
+        }
+    }
+}

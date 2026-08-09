@@ -48,7 +48,11 @@ Target-local routine inventory determines the result: an existing routine emits
 deterministic MySQL `DROP PROCEDURE` using the target spelling backtick-quoted;
 an absent routine emits no target SQL as a proven no-op. Qualified, quoted,
 commented, and other plain-name procedure drops remain `translation_pending`
-barriers. The ALTER path records a typed clause AST and derives expected
+barriers. The exact raw, unqualified, unquoted, comment-free
+`DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives` form, with an
+optional trailing semicolon, is admitted. Stable target trigger inventory emits
+quoted MySQL `DROP TRIGGER` when present or records a proven no-op when absent;
+all other trigger variants remain `translation_pending`. The ALTER path records a typed clause AST and derives expected
 post-state by applying that AST to a fenced target pre-state, without requiring a
 live source head at the historical event coordinate. The rename slice uses target
 column pre-state, emits deterministic MySQL 8 SQL without `IF EXISTS`, treats
@@ -68,7 +72,7 @@ automatically after identity/header admission. Unsupported CREATE variants
 remain `translation_pending` with no target execution or checkpoint advance.
 
 Every other unsupported DDL form—other `CREATE TABLE` syntax, other `ALTER TABLE`, views, other routine DDL,
-events, triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP`, qualified or
+events, unsupported trigger DDL, `RENAME`, `TRUNCATE`, non-admitted `DROP`, qualified or
 cross-schema references, comments, ambiguous quoting, incomplete syntax,
 other procedure bodies or names, other plain procedure drops, other definer/security
 clauses, MariaDB-only syntax, and multi-object/multi-statement forms—enters the same automatic journal

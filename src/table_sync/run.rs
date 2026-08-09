@@ -9,6 +9,7 @@ use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
     build_inventory,
 };
+use std::rc::Rc;
 use std::time::Duration;
 
 const SYNC_CONNECTION_ATTEMPTS: usize = 5;
@@ -722,6 +723,69 @@ pub(crate) fn run_sync_table_phase_with_run_spec(
     )
 }
 
+pub(crate) fn run_sync_table_phase_with_consistent_source(
+    config: &SyncTableConfig,
+    phase: SyncPhase,
+    run_spec_json: Option<&str>,
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<SyncTableReport, TableSyncError> {
+    validate_sync_table_config(config)?;
+    let config = resolved_sync_table_config(config, source_inventory)?;
+    run_consistent_source_phase(
+        &config,
+        phase,
+        run_spec_json,
+        shared_source,
+        source_inventory,
+        target_inventory,
+    )
+}
+
+fn run_consistent_source_phase(
+    config: &SyncTableConfig,
+    phase: SyncPhase,
+    run_spec_json: Option<&str>,
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<SyncTableReport, TableSyncError> {
+    let source = consistent_source_reader(config, &shared_source);
+    let target = consistent_target_reader(config)?;
+    let mut progress_store = progress::MySqlSyncRunProgressStore::new(
+        config.target.clone(),
+        config.progress_table.clone(),
+    );
+    let mut repair_target = mysql_repair_target_with_consistent_source(
+        config,
+        shared_source,
+        source_inventory.clone(),
+        target_inventory.clone(),
+    )?;
+    run_sync_table_with_targets_phase(
+        config,
+        &source,
+        &target,
+        &mut repair_target,
+        &mut progress_store,
+        phase,
+        run_spec_json,
+    )
+}
+
+fn consistent_source_reader(
+    config: &SyncTableConfig,
+    shared_source: &Rc<crate::mysql_client::PersistentMySqlSource>,
+) -> MySqlSyncReader {
+    MySqlSyncReader::new_with_shared_source(config.source.clone(), Rc::clone(shared_source))
+}
+
+fn consistent_target_reader(config: &SyncTableConfig) -> Result<MySqlSyncReader, TableSyncError> {
+    MySqlSyncReader::new_with_target(target_connection_config(config), &config.target)
+        .map_err(TableSyncError::Read)
+}
+
 pub(crate) fn should_record_sync_run_error(error: &TableSyncError) -> bool {
     matches!(error, TableSyncError::Read(_) | TableSyncError::Repair(_))
         && !is_retryable_sync_error(error)
@@ -762,6 +826,31 @@ fn mysql_repair_target(
         sync_insert_mode(config),
     );
     let source = MySqlSyncReader::new(config.source.clone());
+    let target = MySqlSyncReader::new_with_target(target_connection_config(config), &config.target)
+        .map_err(TableSyncError::Read)?;
+    Ok(MySqlSyncRepairTarget::new_with_fk_repair(
+        writer,
+        source,
+        target,
+        source_inventory,
+        target_inventory,
+    ))
+}
+
+fn mysql_repair_target_with_consistent_source(
+    config: &SyncTableConfig,
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+    source_inventory: SchemaInventory,
+    target_inventory: SchemaInventory,
+) -> Result<MySqlSyncRepairTarget, TableSyncError> {
+    let executor = crate::mysql_client::PersistentTargetExecutor::new_for_sync(&config.target)
+        .map_err(|error| TableSyncError::Repair(error.to_string()))?;
+    let writer = crate::target::TargetMySqlWriter::from_snapshot_table(
+        &snapshot_table(&config.table),
+        executor,
+        sync_insert_mode(config),
+    );
+    let source = MySqlSyncReader::new_with_shared_source(config.source.clone(), shared_source);
     let target = MySqlSyncReader::new_with_target(target_connection_config(config), &config.target)
         .map_err(TableSyncError::Read)?;
     Ok(MySqlSyncRepairTarget::new_with_fk_repair(

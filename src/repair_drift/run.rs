@@ -1,8 +1,8 @@
 use super::config::{parse_repair_drift_config, validate_repair_drift_config};
 use super::equivalent_conflicts::reconcile_exact_equivalent_conflicts;
 use super::plan::{
-    RepairTableInputs, build_runtime_repair_plan, collect_repair_table_inputs, drifted_table_names,
-    ordered_candidate_tables,
+    RepairTableInputs, build_runtime_repair_plan, collect_full_repair_table_inputs,
+    collect_repair_table_inputs, drifted_table_names, ordered_candidate_tables,
 };
 use super::{
     EquivalentConflictReport, RepairDriftConfig, RepairDriftError, RepairDriftReport,
@@ -13,6 +13,7 @@ use crate::inventory::{InventoryConfig, InventoryEndpointRole, SchemaInventory, 
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::table_sync::{self, SyncMode, SyncPhase, SyncTable, SyncTableConfig};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +30,160 @@ pub(crate) fn run_repair_drift(
     let plan = build_runtime_repair_plan(config, &run_id, &source, &target)?;
     let tables = ordered_candidate_tables(config, &source, &plan)?;
     execute_repair_drift(config, run_id, source, target, plan, tables)
+}
+
+pub(crate) fn run_consistent_snapshot_repair(
+    config: &RepairDriftConfig,
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+    source_inventory: SchemaInventory,
+    target_inventory: SchemaInventory,
+) -> Result<RepairDriftReport, RepairDriftError> {
+    let prepared = prepare_consistent_snapshot_repair(
+        config,
+        &shared_source,
+        &source_inventory,
+        &target_inventory,
+    )?;
+    let repaired = run_consistent_snapshot_repair_phases(
+        config,
+        &prepared.run_id,
+        &prepared.plan,
+        &prepared.repair_tables,
+        shared_source,
+        &source_inventory,
+        &target_inventory,
+    )?;
+    Ok(consistent_snapshot_repair_report(
+        prepared,
+        repaired,
+        &source_inventory,
+        &target_inventory,
+    ))
+}
+
+fn consistent_snapshot_repair_report(
+    prepared: ConsistentSnapshotRepairPlan,
+    repaired: Vec<RepairDriftTableReport>,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> RepairDriftReport {
+    let compared_tables = prepared.repair_tables.len();
+    RepairDriftReport {
+        run_id: prepared.run_id,
+        source_tables: source_inventory.tables.len(),
+        target_tables: target_inventory.tables.len(),
+        compared_tables,
+        drifted_tables: compared_tables,
+        equivalent_conflicts: EquivalentConflictReport::default(),
+        repaired,
+        skipped: Vec::new(),
+    }
+}
+
+struct ConsistentSnapshotRepairPlan {
+    run_id: String,
+    plan: crate::repair_drift::RepairPlan,
+    repair_tables: RepairTableInputs,
+}
+
+fn prepare_consistent_snapshot_repair(
+    config: &RepairDriftConfig,
+    shared_source: &crate::mysql_client::PersistentMySqlSource,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<ConsistentSnapshotRepairPlan, RepairDriftError> {
+    validate_repair_drift_config(config).map_err(RepairDriftError::Config)?;
+    validate_complete_snapshot_repair_config(config)?;
+    let run_id = configured_run_id(config);
+    let plan = build_runtime_repair_plan(config, &run_id, source_inventory, target_inventory)?;
+    let tables = ordered_candidate_tables(config, source_inventory, &plan)?;
+    let (source_counts, target_counts) =
+        read_snapshot_repair_counts(config, shared_source, &tables)?;
+    let (repair_tables, skipped) = collect_full_repair_table_inputs(
+        &tables,
+        source_inventory,
+        target_inventory,
+        &source_counts,
+        &target_counts,
+    );
+    require_supported_snapshot_scope(&skipped)?;
+    Ok(ConsistentSnapshotRepairPlan {
+        run_id,
+        plan,
+        repair_tables,
+    })
+}
+
+fn require_supported_snapshot_scope(
+    skipped: &[crate::repair_drift::RepairDriftSkip],
+) -> Result<(), RepairDriftError> {
+    if skipped.is_empty() {
+        return Ok(());
+    }
+    let reasons = skipped
+        .iter()
+        .map(|item| format!("{}: {}", item.table, item.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(RepairDriftError::Repair(format!(
+        "consistent snapshot scope is unsupported: {reasons}"
+    )))
+}
+
+fn validate_complete_snapshot_repair_config(
+    config: &RepairDriftConfig,
+) -> Result<(), RepairDriftError> {
+    if config.mode != SyncMode::Apply
+        || !config.tables.is_empty()
+        || config.start_after.is_some()
+        || config.end_at.is_some()
+    {
+        return Err(RepairDriftError::Config(
+            "lost-binlog recovery requires full-scope apply without table or range filters"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_snapshot_repair_counts(
+    config: &RepairDriftConfig,
+    source: &crate::mysql_client::PersistentMySqlSource,
+    tables: &[String],
+) -> Result<(BTreeMap<String, u64>, BTreeMap<String, u64>), RepairDriftError> {
+    let target_config = snapshot_target_connection_config(config);
+    let target = crate::mysql_client::PersistentMySqlSource::new_with_tls_ca(
+        &target_config,
+        Some(&config.target.tls_ca_file),
+    )
+    .map_err(|error| RepairDriftError::Repair(error.to_string()))?;
+    let mut source_counts = BTreeMap::new();
+    let mut target_counts = BTreeMap::new();
+    for table in tables {
+        source_counts.insert(
+            table.clone(),
+            source
+                .count_rows(table)
+                .map_err(|error| RepairDriftError::Repair(error.to_string()))?,
+        );
+        target_counts.insert(
+            table.clone(),
+            target
+                .count_rows(table)
+                .map_err(|error| RepairDriftError::Repair(error.to_string()))?,
+        );
+    }
+    Ok((source_counts, target_counts))
+}
+
+fn snapshot_target_connection_config(config: &RepairDriftConfig) -> MySqlConnectionConfig {
+    MySqlConnectionConfig {
+        host: config.target.host.clone(),
+        port: config.target.port,
+        user: config.target.user.clone(),
+        password: config.target.password.clone(),
+        database: config.target.database.clone(),
+    }
 }
 
 fn configured_run_id(config: &RepairDriftConfig) -> String {
@@ -80,6 +235,76 @@ fn execute_repair_drift(
         repaired,
         skipped,
     })
+}
+
+fn run_consistent_snapshot_repair_phases(
+    config: &RepairDriftConfig,
+    run_id: &str,
+    plan: &crate::repair_drift::RepairPlan,
+    repair_tables: &RepairTableInputs,
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<Vec<RepairDriftTableReport>, RepairDriftError> {
+    let mut conflict_store = initialize_conflict_store(config)?;
+    let mut state = RepairState::default();
+    for (phase, order) in repair_phases(plan) {
+        run_consistent_snapshot_phase_order(
+            ConsistentSnapshotPhaseContext {
+                config,
+                run_id,
+                plan,
+                repair_tables,
+                phase,
+                conflict_store: &mut conflict_store,
+                state: &mut state,
+            },
+            order,
+            Rc::clone(&shared_source),
+            source_inventory,
+            target_inventory,
+        )?;
+    }
+    Ok(state.repaired_by_table.into_values().collect())
+}
+
+struct ConsistentSnapshotPhaseContext<'a> {
+    config: &'a RepairDriftConfig,
+    run_id: &'a str,
+    plan: &'a crate::repair_drift::RepairPlan,
+    repair_tables: &'a RepairTableInputs,
+    phase: SyncPhase,
+    conflict_store: &'a mut Option<crate::conflict_repair::MySqlConflictStore>,
+    state: &'a mut RepairState,
+}
+
+fn run_consistent_snapshot_phase_order(
+    context: ConsistentSnapshotPhaseContext<'_>,
+    order: &[String],
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<(), RepairDriftError> {
+    for table_name in order {
+        run_repair_phase_for_table_with_consistent_source(
+            RepairPhaseRequest {
+                config: context.config,
+                run_id: context.run_id,
+                plan: context.plan,
+                repair_tables: context.repair_tables,
+                phase: context.phase,
+                table_name,
+                run: RepairPhaseRun {
+                    conflict_store: context.conflict_store,
+                    state: context.state,
+                },
+            },
+            Rc::clone(&shared_source),
+            source_inventory,
+            target_inventory,
+        )?;
+    }
+    Ok(())
 }
 
 fn empty_report(
@@ -193,38 +418,71 @@ fn run_repair_phases(
     repair_tables: &RepairTableInputs,
 ) -> Result<Vec<RepairDriftTableReport>, RepairDriftError> {
     let mut conflict_store = initialize_conflict_store(config)?;
-    let mut state = RepairState {
-        repaired_by_table: BTreeMap::new(),
-        observed_verify_scopes: BTreeMap::new(),
-    };
+    let mut state = RepairState::default();
     for (phase, order) in repair_phases(plan) {
-        if phase == SyncPhase::Verify {
-            run_verification_phases(
+        run_repair_phase_order(
+            RepairPhaseOrderContext {
                 config,
                 run_id,
                 plan,
                 repair_tables,
-                &mut conflict_store,
-                &mut state,
-            )?;
-            continue;
-        }
-        for table_name in order {
-            run_repair_phase_for_table(RepairPhaseRequest {
-                config,
-                run_id,
-                plan,
-                repair_tables,
-                phase,
-                table_name,
-                run: RepairPhaseRun {
-                    conflict_store: &mut conflict_store,
-                    state: &mut state,
-                },
-            })?;
-        }
+                conflict_store: &mut conflict_store,
+                state: &mut state,
+            },
+            phase,
+            order,
+        )?;
     }
     Ok(state.repaired_by_table.into_values().collect())
+}
+
+struct RepairPhaseOrderContext<'a> {
+    config: &'a RepairDriftConfig,
+    run_id: &'a str,
+    plan: &'a crate::repair_drift::RepairPlan,
+    repair_tables: &'a RepairTableInputs,
+    conflict_store: &'a mut Option<crate::conflict_repair::MySqlConflictStore>,
+    state: &'a mut RepairState,
+}
+
+fn run_repair_phase_order(
+    context: RepairPhaseOrderContext<'_>,
+    phase: SyncPhase,
+    order: &[String],
+) -> Result<(), RepairDriftError> {
+    if phase == SyncPhase::Verify {
+        return run_verification_phases(
+            context.config,
+            context.run_id,
+            context.plan,
+            context.repair_tables,
+            context.conflict_store,
+            context.state,
+        );
+    }
+    run_nonverification_phase_order(context, phase, order)
+}
+
+fn run_nonverification_phase_order(
+    context: RepairPhaseOrderContext<'_>,
+    phase: SyncPhase,
+    order: &[String],
+) -> Result<(), RepairDriftError> {
+    for table_name in order {
+        run_repair_phase_for_table(RepairPhaseRequest {
+            config: context.config,
+            run_id: context.run_id,
+            plan: context.plan,
+            repair_tables: context.repair_tables,
+            phase,
+            table_name,
+            run: RepairPhaseRun {
+                conflict_store: context.conflict_store,
+                state: context.state,
+            },
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,6 +491,7 @@ enum VerifyScope {
     NoTargetExtras,
 }
 
+#[derive(Default)]
 struct RepairState {
     repaired_by_table: BTreeMap<String, RepairDriftTableReport>,
     observed_verify_scopes: BTreeMap<String, VerifyScope>,
@@ -335,6 +594,57 @@ fn run_repair_phase_for_table(request: RepairPhaseRequest<'_>) -> Result<(), Rep
         request.table_name,
     )?;
     complete_phase(request, source_count, target_count, phase_report)
+}
+
+fn run_repair_phase_for_table_with_consistent_source(
+    request: RepairPhaseRequest<'_>,
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<(), RepairDriftError> {
+    let Some((source_count, target_count, table)) = request.repair_tables.get(request.table_name)
+    else {
+        return Ok(());
+    };
+    let (phase_config, run_spec_json) = resumable_phase_config(&request, table)?;
+    let phase_report = table_sync::run_sync_table_phase_with_consistent_source(
+        &phase_config,
+        request.phase,
+        run_spec_json.as_deref(),
+        shared_source,
+        source_inventory,
+        target_inventory,
+    )
+    .map_err(|error| repair_phase_error(&request, error))?;
+    complete_phase(request, source_count, target_count, phase_report)
+}
+
+fn resumable_phase_config(
+    request: &RepairPhaseRequest<'_>,
+    table: &SyncTable,
+) -> Result<(SyncTableConfig, Option<String>), RepairDriftError> {
+    let mut config = phase_config_for_request(request, table);
+    let candidate =
+        table_sync::find_compatible_failed_run(&config, request.phase, request.table_name)
+            .map_err(|error| repair_phase_error(request, error))?;
+    let run_spec_json = candidate
+        .as_ref()
+        .map(|candidate| candidate.run_spec_json.clone());
+    if let Some(candidate) = candidate {
+        config.run_id = candidate.run_id;
+        config.mode = SyncMode::MissingPrimaryKeys;
+    }
+    Ok((config, run_spec_json))
+}
+
+fn repair_phase_error(
+    request: &RepairPhaseRequest<'_>,
+    error: impl std::fmt::Display,
+) -> RepairDriftError {
+    RepairDriftError::Repair(format!(
+        "{} {:?}: {error}",
+        request.table_name, request.phase
+    ))
 }
 
 fn phase_config_for_request(

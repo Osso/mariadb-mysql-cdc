@@ -1047,6 +1047,69 @@ fn source_only_release_move_procedure_create_requires_target_absence() {
 }
 
 #[test]
+fn exact_drop_trigger_allowlist_transforms_present_and_absent_targets() {
+    let source_sql = "DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives";
+    let target_name = "prevent_deactivating_cloned_archives".to_string();
+
+    let present = translate_ddl(source_sql, std::slice::from_ref(&target_name))
+        .expect("exact production DROP TRIGGER must be admitted");
+    assert_eq!(present.version, DDL_TRANSFORMATION_VERSION);
+    assert_eq!(
+        present.target_sql.as_deref(),
+        Some("DROP TRIGGER `prevent_deactivating_cloned_archives`")
+    );
+
+    let absent = translate_ddl(source_sql, &[]).expect("absent trigger must be a proven no-op");
+    assert_eq!(absent.version, DDL_TRANSFORMATION_VERSION);
+    assert_eq!(absent.target_sql, None);
+}
+
+#[test]
+fn exact_drop_trigger_allowlist_rejects_comments_quoting_qualification_extra_tokens_and_names() {
+    let rejected = [
+        "-- comment\nDROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives",
+        "/* comment */ DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives",
+        "DROP TRIGGER prevent_deactivating_cloned_archives",
+        "DROP TRIGGER IF EXISTS `prevent_deactivating_cloned_archives`",
+        "DROP TRIGGER IF EXISTS \"prevent_deactivating_cloned_archives\"",
+        "DROP TRIGGER IF EXISTS globalcomix.prevent_deactivating_cloned_archives",
+        "DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives EXTRA",
+        "DROP TRIGGER IF EXISTS another_trigger",
+    ];
+
+    for source_sql in rejected {
+        assert!(
+            translate_ddl(source_sql, &[]).is_err(),
+            "unsupported DROP TRIGGER form was admitted: {source_sql}"
+        );
+    }
+}
+
+#[test]
+fn drop_trigger_evidence_requires_absent_canonical_post_state() {
+    let operation =
+        parse_ddl_operation("DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives")
+            .expect("production DROP TRIGGER operation");
+    let mut target = semantic_snapshot(7, Some(8));
+    target.inventory.triggers.push(TriggerInventory {
+        name: "prevent_deactivating_cloned_archives".to_string(),
+        table: "comics_assets_archives".to_string(),
+        timing: "BEFORE".to_string(),
+        event: "UPDATE".to_string(),
+        statement: "SET NEW.is_active = OLD.is_active".to_string(),
+    });
+    let evidence =
+        build_semantic_evidence(&operation, &target, &target).expect("DROP TRIGGER evidence");
+
+    assert!(
+        evidence
+            .pre_state
+            .contains("prevent_deactivating_cloned_archives")
+    );
+    assert!(evidence.expected_post_state.contains("absent"));
+}
+
+#[test]
 fn transforms_unqualified_drop_procedure_if_exists_for_mysql8() {
     let procedures = ["apply_release_move_purchase_repair".to_string()]
         .into_iter()

@@ -1367,6 +1367,63 @@ pub fn supports_drop_procedure(source_sql: &str) -> bool {
     parse_supported_drop_procedure(source_sql).is_ok()
 }
 
+pub fn supports_drop_trigger_if_exists(source_sql: &str) -> bool {
+    parse_supported_drop_trigger_if_exists(source_sql).is_ok()
+}
+
+pub fn transform_drop_trigger_if_exists(
+    source_sql: &str,
+    target_triggers: &BTreeSet<String>,
+) -> Result<DdlTransformation, String> {
+    let source_name = parse_supported_drop_trigger_if_exists(source_sql)?;
+    let target_name = target_triggers
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(&source_name));
+    Ok(DdlTransformation {
+        version: DDL_TRANSFORMATION_VERSION,
+        target_sql: target_name.map(|name| format!("DROP TRIGGER {}", quote_identifier(name))),
+    })
+}
+
+fn parse_supported_drop_trigger_if_exists(source_sql: &str) -> Result<String, String> {
+    if ddl_contains_comments(source_sql) {
+        return Err("DROP TRIGGER comments are not supported".to_string());
+    }
+    if source_sql.contains('"') {
+        return Err("DROP TRIGGER double-quoted identifiers are not supported".to_string());
+    }
+    let (tokens, quoted_flags) = tokenize_ddl_with_quoted_flags(source_sql)?;
+    require_keyword(&tokens, 0, "DROP")?;
+    require_keyword(&tokens, 1, "TRIGGER")?;
+    require_keyword(&tokens, 2, "IF")?;
+    require_keyword(&tokens, 3, "EXISTS")?;
+    parse_exact_drop_trigger_name(&tokens, &quoted_flags)
+}
+
+fn parse_exact_drop_trigger_name(
+    tokens: &[String],
+    quoted_flags: &[bool],
+) -> Result<String, String> {
+    let name_index = 4;
+    if quoted_flags.get(name_index).copied().unwrap_or(false) {
+        return Err("quoted DROP TRIGGER identifiers are not supported".to_string());
+    }
+    let name = require_identifier(tokens, name_index, "DROP TRIGGER name")?;
+    if name != "prevent_deactivating_cloned_archives" {
+        return Err("DROP TRIGGER name is not admitted".to_string());
+    }
+    let trailing_index = name_index + 1;
+    let expected_len = if tokens.get(trailing_index).map(String::as_str) == Some(";") {
+        trailing_index + 1
+    } else {
+        trailing_index
+    };
+    if tokens.len() != expected_len {
+        return Err("DROP TRIGGER requires one exact unqualified trigger name".to_string());
+    }
+    Ok(name)
+}
+
 pub fn transform_drop_procedure(
     source_sql: &str,
     target_procedures: &BTreeSet<String>,

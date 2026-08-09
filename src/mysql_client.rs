@@ -1,4 +1,4 @@
-use crate::checkpoint::Checkpoint;
+use crate::checkpoint::{Checkpoint, LastEvent};
 use crate::live::{
     InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
     should_replace_divergent_primary,
@@ -190,6 +190,62 @@ impl PersistentMySqlSource {
             .map_err(snapshot_query_error)?;
         Ok(rows.into_iter().map(row_to_strings).collect())
     }
+
+    pub(crate) fn begin_consistent_snapshot(&self) -> Result<Checkpoint, SnapshotError> {
+        self.execute_session_sql("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")?;
+        self.execute_session_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
+        let rows = self.query_rows_as_strings(
+            "SELECT @@session.binlog_snapshot_file, @@session.binlog_snapshot_position",
+        )?;
+        parse_consistent_snapshot_checkpoint(rows)
+    }
+
+    pub(crate) fn rollback_consistent_snapshot(&self) -> Result<(), SnapshotError> {
+        self.execute_session_sql("ROLLBACK")
+    }
+}
+
+fn parse_consistent_snapshot_checkpoint(
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<Checkpoint, SnapshotError> {
+    let row = rows.into_iter().next().ok_or_else(|| {
+        SnapshotError::InvalidTable("MariaDB snapshot coordinate is missing".to_string())
+    })?;
+    let source_file = required_snapshot_coordinate_value(&row, 0, "file")?;
+    let source_position = parse_snapshot_coordinate_position(&row)?;
+    Ok(Checkpoint {
+        source_file,
+        source_position,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: LastEvent {
+            event_type: "LostBinlogRecoverySnapshot".to_string(),
+            description: "MariaDB consistent snapshot boundary".to_string(),
+        },
+    })
+}
+
+fn parse_snapshot_coordinate_position(row: &[Option<String>]) -> Result<u64, SnapshotError> {
+    required_snapshot_coordinate_value(row, 1, "position")?
+        .parse::<u64>()
+        .map_err(|error| {
+            SnapshotError::InvalidTable(format!(
+                "invalid MariaDB snapshot coordinate position: {error}"
+            ))
+        })
+}
+
+fn required_snapshot_coordinate_value(
+    row: &[Option<String>],
+    index: usize,
+    field: &str,
+) -> Result<String, SnapshotError> {
+    row.get(index)
+        .and_then(Clone::clone)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            SnapshotError::InvalidTable(format!("MariaDB snapshot coordinate {field} is missing"))
+        })
 }
 
 impl SnapshotSource for PersistentMySqlSource {
