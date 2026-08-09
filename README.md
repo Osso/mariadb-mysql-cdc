@@ -15,6 +15,19 @@ target with minimal downtime.
 - Stop or quarantine unsupported data-changing events with exact coordinates.
 - Keep the target out of service until repeated reconciliation proves parity.
 
+## Deployment
+
+`deploy.sh` requires `IMAGE_REPO` and `BASE_IMAGE`:
+
+```sh
+IMAGE_REPO=registry.example/mariadb-mysql-cdc \
+BASE_IMAGE=registry.example/mariadb:tag \
+./deploy.sh [TAG]
+```
+
+`OPS_REPO` is optional and defaults to the sibling `../ops` checkout. The script
+passes `BASE_IMAGE` to Docker as a build argument for the runtime image.
+
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in

@@ -7,7 +7,8 @@ COPY fixtures/ddl ./fixtures/ddl
 COPY src ./src
 RUN cargo build --release
 
-FROM registry.digitalocean.com/globalcomix/mariadb:2025.07.10
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 COPY --from=builder /src/target/release/mariadb-mysql-cdc /usr/local/bin/mariadb-mysql-cdc
 

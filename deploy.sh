@@ -1,9 +1,10 @@
 #!/bin/sh
 set -eu
 
-image_repo="registry.digitalocean.com/globalcomix/mariadb-mysql-cdc"
+image_repo="${IMAGE_REPO:?IMAGE_REPO is required}"
+base_image="${BASE_IMAGE:?BASE_IMAGE is required}"
 tag="${1:-$(git rev-parse --short HEAD)}"
-ops_repo="${OPS_REPO:-/syncthing/Sync/Projects/globalcomix/ops}"
+ops_repo="${OPS_REPO:-../ops}"
 image="${image_repo}:${tag}"
 
 stream_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-stream.yaml"
@@ -39,7 +40,7 @@ if [ "${SKIP_VERIFIED_CHECKS:-0}" != "1" ]; then
 fi
 cargo install --force --path .
 
-docker build -t "$image" .
+docker build --build-arg BASE_IMAGE="$base_image" -t "$image" .
 docker push "$image"
 
 update_image_tag "$stream_manifest"
