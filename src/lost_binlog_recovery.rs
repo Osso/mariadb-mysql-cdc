@@ -237,7 +237,6 @@ fn validate_replacement_owner(
         || owner.expected_checkpoint != request.expected_checkpoint
         || owner.expected_barrier != request.expected_barrier
         || owner.source_identity != request.expected_barrier.source_identity
-        || owner.scope_hash != request.scope_hash
     {
         return Err(format!(
             "lost-binlog barrier recovery owner does not match replacement authorization: {}",
@@ -1785,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_scope_mismatch_refuses_replacement() {
+    fn replacement_uses_current_scope_without_mutating_old_scope_evidence() {
         let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
         let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
         let barrier = production_barrier();
@@ -1798,15 +1797,28 @@ mod tests {
         replacement_request.scope_hash = "new-scope-hash".to_string();
         let store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![owner]);
 
-        let error = prepare_lost_binlog_recovery(
+        let prepared = prepare_lost_binlog_recovery(
             &FixedBoundaryReader(latest_checkpoint),
             &store,
             &replacement_request,
         )
-        .expect_err("owner scope mismatch must refuse replacement");
+        .expect("replacement may use the current scope hash");
 
-        assert!(error.contains("owner"));
-        assert!(store.recovery("recovery-replacement").is_none());
+        assert_eq!(prepared.scope_hash, "new-scope-hash");
+        let abandoned = store.recovery("recovery-old-owner").unwrap();
+        assert_eq!(abandoned.status, LostBinlogRecoveryStatus::Abandoned);
+        assert_eq!(abandoned.scope_hash, "old-scope-hash");
+        assert_eq!(abandoned.prepared_evidence_json, "{\"scope\":\"complete\"}");
+        assert!(
+            abandoned
+                .abandoned_evidence_json
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("new-scope-hash"))
+        );
+        assert_eq!(
+            store.recovery("recovery-replacement").unwrap().scope_hash,
+            "new-scope-hash"
+        );
     }
 
     #[test]
