@@ -452,6 +452,83 @@ pub struct RecoverLostBinlogReport {
     pub compared_tables: usize,
 }
 
+pub struct ResyncStreamConfig {
+    pub source: MySqlConnectionConfig,
+    pub source_identity: String,
+    pub target: TargetMySqlConfig,
+    pub checkpoint_table: String,
+    pub progress_table: String,
+    pub chunk_size: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResyncStreamReport {
+    pub source_identity: String,
+    pub start_checkpoint: Checkpoint,
+    pub repaired_tables: usize,
+    pub compared_tables: usize,
+}
+
+pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamReport, String> {
+    let source = Rc::new(
+        PersistentMySqlSource::new(&config.source)
+            .map_err(|error| format!("connect resync source: {error}"))?,
+    );
+    let start_checkpoint = source
+        .read_binlog_coordinate()
+        .map_err(|error| format!("read resync source coordinate: {error}"))?;
+    let source_evidence = read_source_evidence(source.as_ref(), &config.source.database)?;
+    validate_transactional_scope(&source_evidence.inventory)?;
+    let target_inventory = read_target_inventory(&config.target)?;
+    let repair = run_consistent_snapshot_repair(
+        &resync_repair_config(config),
+        Rc::clone(&source),
+        source_evidence.inventory.clone(),
+        target_inventory,
+    )
+    .map_err(|error| error.to_string())?;
+    let schema_report = run_schema_convergence_from_source_evidence(
+        source_evidence.clone(),
+        config.target.clone(),
+    )?;
+    require_converged_schema(&schema_report)?;
+    let final_target_inventory = read_target_inventory(&config.target)?;
+    require_exact_table_inventory(&source_evidence.inventory, &final_target_inventory)?;
+    let checkpoint_store = crate::stream_checkpoint::MySqlStreamCheckpointStore::new(
+        config.target.clone(),
+        config.checkpoint_table.clone(),
+        &config.source_identity,
+    );
+    checkpoint_store.bootstrap(&start_checkpoint)?;
+    Ok(ResyncStreamReport {
+        source_identity: config.source_identity.clone(),
+        start_checkpoint,
+        repaired_tables: repair.repaired.len(),
+        compared_tables: repair.compared_tables,
+    })
+}
+
+fn resync_repair_config(config: &ResyncStreamConfig) -> RepairDriftConfig {
+    RepairDriftConfig {
+        source: config.source.clone(),
+        source_identity: config.source_identity.clone(),
+        target: config.target.clone(),
+        tables: Vec::new(),
+        parent_first: Vec::new(),
+        start_after: None,
+        end_at: None,
+        content_check: true,
+        mode: SyncMode::Apply,
+        chunk_size: config.chunk_size,
+        conflict_reconcile_limit: 0,
+        progress_table: config.progress_table.clone(),
+        run_id: Some(format!("resync-stream:{}", config.source_identity)),
+        run_id_prefix: "resync-stream".to_string(),
+        #[cfg(feature = "integration-failpoints")]
+        integration_failpoint: None,
+    }
+}
+
 pub fn run_recover_lost_binlog(
     config: &RecoverLostBinlogConfig,
 ) -> Result<RecoverLostBinlogReport, String> {

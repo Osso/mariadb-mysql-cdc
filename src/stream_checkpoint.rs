@@ -113,6 +113,29 @@ impl MySqlStreamCheckpointStore {
         Ok(())
     }
 
+    pub fn bootstrap(&self, checkpoint: &Checkpoint) -> Result<(), String> {
+        self.validate_schema()?;
+        let existing = self.query_checkpoint_json(&build_checkpoint_select_sql(
+            &self.table,
+            &self.checkpoint_name,
+        ))?;
+        if existing.is_some() {
+            return Err(format!(
+                "source-scoped stream checkpoint `{}` already exists in `{}`",
+                self.checkpoint_name, self.table
+            ));
+        }
+        let sql = build_checkpoint_insert_sql_for_checkpoint(
+            &self.table,
+            &self.checkpoint_name,
+            checkpoint,
+        )?;
+        self.execute(&sql)?;
+        self.last_checkpoint.replace(Some(checkpoint.clone()));
+        self.ensured.set(true);
+        Ok(())
+    }
+
     fn execute(&self, sql: &str) -> Result<(), String> {
         self.with_conn(|conn| conn.query_drop(sql).map_err(mysql_error))
     }
@@ -198,6 +221,21 @@ pub(crate) fn build_checkpoint_upsert_sql_for_checkpoint(
     let json = serde_json::to_string(checkpoint)
         .map_err(|error| format!("failed to encode stream checkpoint: {error}"))?;
     Ok(build_checkpoint_upsert_sql(table, checkpoint_name, &json))
+}
+
+fn build_checkpoint_insert_sql_for_checkpoint(
+    table: &str,
+    checkpoint_name: &str,
+    checkpoint: &Checkpoint,
+) -> Result<String, String> {
+    let json = serde_json::to_string(checkpoint)
+        .map_err(|error| format!("failed to encode stream checkpoint: {error}"))?;
+    Ok(format!(
+        "INSERT INTO {} (checkpoint_name, checkpoint_json) VALUES ({}, {})",
+        quote_identifier_path(table),
+        quote_sql_literal(checkpoint_name),
+        quote_sql_literal(&json)
+    ))
 }
 
 fn build_checkpoint_upsert_sql(

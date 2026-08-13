@@ -47,6 +47,7 @@ Usage:
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
+  mariadb-mysql-cdc resync-stream --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity NEW_ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
   mariadb-mysql-cdc resolve-comics-releases-views-conflicts --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --run-id ID [--batch-size ROWS]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -196,6 +197,7 @@ fn main() {
         Some("drift-check") => run_drift_check_command(args.collect()),
         Some("repair-drift") => repair_drift::run_repair_drift_command(args.collect(), USAGE),
         Some("recover-lost-binlog") => run_recover_lost_binlog_command(args.collect()),
+        Some("resync-stream") => run_resync_stream_command(args.collect()),
         Some("resolve-comics-releases-views-conflicts") => {
             run_targeted_conflict_resolution_command(args.collect())
         }
@@ -217,6 +219,51 @@ fn run_targeted_conflict_resolution_command(args: Vec<String>) {
 fn exit_unknown_command(command: &str) {
     eprintln!("unknown command: {command}\n\n{USAGE}");
     std::process::exit(2);
+}
+
+fn run_resync_stream_command(mut args: Vec<String>) {
+    args.extend([
+        "--binlog-file".to_string(),
+        "resync-boundary".to_string(),
+        "--start-position".to_string(),
+        "4".to_string(),
+    ]);
+    let apply = match parse_apply_binlog_config(args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let source_database = apply
+        .source
+        .database
+        .clone()
+        .expect("validated source database");
+    let config = lost_binlog_recovery::ResyncStreamConfig {
+        source: mysql_snapshot::MySqlConnectionConfig {
+            host: apply.source.host,
+            port: apply.source.port,
+            user: apply.source.user,
+            password: apply.source.password,
+            database: source_database,
+        },
+        source_identity: apply.source_identity,
+        target: apply.target,
+        checkpoint_table: apply.checkpoint_table,
+        progress_table: "cdc.table_sync_runs".to_string(),
+        chunk_size: 10_000,
+    };
+    match lost_binlog_recovery::run_resync_stream(&config) {
+        Ok(report) => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("resync report JSON")
+        ),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_recover_lost_binlog_command(args: Vec<String>) {
