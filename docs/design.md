@@ -121,27 +121,31 @@ tables. Recovery data repair covers every current source-scope table even when
 target-only base tables exist; generic `repair-drift` remains strict about its
 source/target inventory contract.
 
-The command acquires the stream lease, briefly holds `FLUSH TABLES WITH READ
-LOCK`, opens one MariaDB `REPEATABLE READ` consistent snapshot, and captures its
-current binlog coordinate. It releases the write fence only after the snapshot
-is established and keeps that source transaction for all full-scope
-insert/update/delete/verify work. It does not treat independent live reads as
-anchored evidence.
+The command acquires the stream lease and captures the current MariaDB binlog
+coordinate with ordinary non-locking reads. It does not execute `FLUSH TABLES
+WITH READ LOCK`, `UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and
+does not keep a cross-table repeatable-read transaction open. Source schema
+and row reconciliation use normally committed reads for the attempt's actual
+scope. Commits after the captured coordinate remain in the binlog and are
+replayed by the stream after recovery advances the checkpoint.
 
-A prepared immutable recovery record links old state, new coordinate, source,
-scope, operator, reason, and evidence. After source-scoped data repair, recovery-
-only schema convergence drops target-only base tables child-before-parent with
-normal foreign-key enforcement; cycles and source-table references to target-only
-parents fail closed. The final target inventory must exactly match source before
-one target transaction revalidates the exact old state, updates the checkpoint,
-and commits only the exact historical barrier supersession. A separately
-authorized replacement may atomically mark the exact prepared owner `abandoned`
-with server-generated evidence and insert a new `prepared` owner; all old
-identity and prepared evidence remain durable. Abandoned history never suppresses
-the journal barrier. Only `committed` or `verified` ownership excludes that exact
-barrier, and both are terminal. This transition skips purged source history; it
-is not replay proof and does not claim production completion until restart health
-and subsequent zero-drift verification are recorded.
+A prepared immutable recovery record links old state, the captured coordinate,
+source, the attempt's actual scope, operator, reason, and evidence. After
+source-scoped data repair, recovery-only schema convergence drops target-only
+base tables child-before-parent with normal foreign-key enforcement; cycles and
+source-table references to target-only parents fail closed. The final target
+inventory must exactly match the attempt's source inventory before one target
+transaction revalidates the exact old state, updates the checkpoint, and commits
+only the exact historical barrier supersession. A separately authorized
+replacement may atomically mark the exact prepared owner `abandoned` with
+server-generated evidence and insert a new `prepared` owner for the same exact
+checkpoint, barrier, and source identity. The replacement records its own
+current scope; its scope hash need not equal the abandoned owner's. All old
+identity, scope, and prepared evidence remain durable. Abandoned history never
+suppresses the journal barrier. Only `committed` or `verified` ownership excludes
+that exact barrier, and both are terminal. This transition skips purged source
+history; it is not replay proof and does not claim production completion until
+restart health and subsequent zero-drift verification are recorded.
 
 ## Repair model
 

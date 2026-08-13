@@ -1,6 +1,6 @@
 # Lost-binlog recovery
 
-`recover-lost-binlog` is the audited availability-first transition for a stream whose durable MariaDB binlog checkpoint names purged history. It consumes an operator JSON authorization, repairs every current source-scope table from one MariaDB consistent snapshot even when the target has extra base tables, then performs recovery-only schema convergence before atomically advancing only the authorized stream checkpoint and superseding only the exact historical journal barrier. The implementation is present on `ad-drop-trigger-lost-binlog-recovery`; production execution and post-transition verification are not claimed here.
+`recover-lost-binlog` is the audited availability-first transition for a stream whose durable MariaDB binlog checkpoint names purged history. It consumes an operator JSON authorization, captures a non-locking MariaDB binlog coordinate, reconciles committed source state for the attempt's actual scope even when the target has extra base tables, then performs recovery-only schema convergence before atomically advancing only the authorized stream checkpoint and superseding only the exact historical journal barrier. Binlog events after the captured coordinate are replayed by the stream after recovery. The implementation is present on `ad-drop-trigger-lost-binlog-recovery`; production execution and post-transition verification are not claimed here.
 
 ## What it must do
 
@@ -8,15 +8,15 @@
 
 - [x] Read an authorization JSON containing the exact old checkpoint, exact journal barrier and SQL, source identity, checkpoint name, recovery ID, operator identity, and reason.
 - [x] Reject a configured source identity or checkpoint name that does not match the authorization.
-- [x] Compute the current source scope hash and reject an authorization hash that differs.
+- [x] Compute and record the current source scope hash for each attempt; when authorization supplies a scope hash, reject an authorization hash that differs from that attempt's current source scope.
 - [x] Reject any configured source table whose engine is not InnoDB.
 
 ### Anchored reconciliation
 
 - [x] Acquire the stream lease before recovery state changes.
-- [x] Acquire the source write fence before any source schema/data read; while it is held, open one MariaDB `REPEATABLE READ` consistent snapshot and execute `SHOW MASTER STATUS` on that same snapshot connection to capture its binlog coordinate and source schema evidence; target reads and data reconciliation occur after unlock.
-- [x] Keep that source snapshot transaction open for full-scope source data reads, insert, update, delete, and verification phases.
-- [x] Capture source table, index, foreign-key, check, view, trigger, routine, and event evidence through that same snapshot connection; independent live source metadata reads are forbidden.
+- [x] Capture the MariaDB binlog coordinate with ordinary non-locking source reads; source recovery must not require `FLUSH TABLES WITH READ LOCK`, `UNLOCK TABLES`, `LOCK TABLES`, or `RELOAD`.
+- [x] Reconcile normally committed source rows and schema evidence without a long-lived cross-table transaction or repeatable-read snapshot.
+- [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
 - [x] Reconcile every current source-scope table, including target-only orphan rows; target-only target tables do not narrow the recovery data plan, and generic `repair-drift` remains strict about its source/target inventory contract.
 - [x] Run recovery-only schema convergence after data reconciliation: drop target-only base tables child-before-parent with normal foreign-key enforcement, fail closed on cycles or source-table references to target-only parents, and converge remaining source tables and constraints.
 - [x] Require the final target base-table inventory to exactly match the source inventory before commit.
@@ -27,9 +27,9 @@
 
 - [x] Insert an immutable `prepared` recovery record containing old state, new coordinate, source identity, scope, operator, reason, and evidence; a prepared recovery ID is non-resumable.
 - [x] Lock the checkpoint, exact barrier, new recovery ID, and exact-barrier recovery owner in one preparation transaction.
-- [x] When a separately authorized recovery ID replaces an exact matching `prepared` owner, atomically mark only the old row `abandoned` with server-generated `abandoned_at` and evidence binding both recovery IDs, operator, reason, checkpoint, barrier, source identity, and scope, then insert the replacement `prepared` row.
-- [x] Preserve all old identity and prepared-evidence fields during abandonment; refuse committed, verified, abandoned, duplicate-ID, or checkpoint/barrier/source/scope-mismatched owners.
-- [x] Revalidate the exact checkpoint, barrier, source identity, scope, and prepared recovery record under transaction locks; after a prepared failure, reject reuse and require a separately authorized new recovery ID.
+- [x] When a separately authorized recovery ID replaces a `prepared` owner for the exact checkpoint, barrier, and source identity, atomically mark only the old row `abandoned` with server-generated `abandoned_at` and evidence binding both recovery IDs, operator, reason, checkpoint, barrier, source identity, and both attempts' scopes, then insert the replacement `prepared` row.
+- [x] Preserve all old identity, scope, and prepared-evidence fields during abandonment; refuse committed, verified, abandoned, duplicate-ID, or checkpoint/barrier/source-mismatched owners. The replacement records its actual current scope and need not equal the abandoned owner's scope.
+- [x] Revalidate the exact checkpoint, barrier, source identity, and prepared recovery record in the target transaction; after a prepared failure, reject reuse and require a separately authorized new recovery ID.
 - [x] Require complete zero-drift schema/data proof before atomically updating the checkpoint, superseding the exact barrier, and marking the recovery `committed`.
 - [x] Preserve the historical journal row; active-barrier selection excludes only the exact committed or verified recovery identity and barrier coordinates/raw-SQL hash; abandoned history never suppresses the journal barrier.
 - [x] Roll back the transition on checkpoint/recovery commit failure.
@@ -46,15 +46,15 @@
 
 - [Checkpoint control plane](../checkpoints.md#lost-binlog-recovery-control-plane) — authoritative checkpoint, journal, lease, and recovery-record rules.
 - [Validation](../validation.md#lost-binlog-recovery-evidence) — reconciliation evidence and verification gates.
-- [Design](../design.md#lost-binlog-recovery) — availability-first skip boundary and source snapshot fence.
+- [Design](../design.md#lost-binlog-recovery) — availability-first skip boundary, committed reads, and replay boundary.
 - `docs/stream-recovery-records-bootstrap.sql` — bootstrap for `cdc.stream_recovery_records` and its immutability guards.
 
 ## Implementation inventory
 
-- `src/lost_binlog_recovery.rs` — authorization, source/scope validation, snapshot fence, reconciliation orchestration, and atomic transition.
+- `src/lost_binlog_recovery.rs` — authorization, per-attempt source-scope validation, committed-state boundary, reconciliation orchestration, and atomic transition.
 - `src/lost_binlog_recovery_store.rs` — target-side CAS reads, exact-barrier owner locking, immutable prepared insert, abandoned replacement transition, checkpoint update, commit, and exact barrier exclusion.
-- `src/mysql_client.rs` — MariaDB consistent-snapshot transaction and source coordinate capture.
-- `src/inventory/reader.rs` — snapshot-backed source metadata reader on the persistent transaction connection.
+- `src/mysql_client.rs` — non-locking MariaDB coordinate capture.
+- `src/inventory/reader.rs` — committed source metadata reads.
 - `src/repair_drift/` — full-scope insert/update/delete and verification phases.
 - `src/sync_schema.rs` — final schema convergence and foreign-key creation after anchored data repair.
 - `docs/stream-recovery-records-bootstrap.sql` — recovery-record table, active-barrier identity, guards, inventory procedure, and grants.
@@ -68,7 +68,7 @@
 ## Known gaps (current cycle)
 
 - [ ] Run bootstrap and startup validation against the target with stream writers stopped.
-- [ ] Prove the full CLI path with the complete configured scope and current source snapshot; production success is not claimed by this branch.
+- [ ] Prove the full CLI path with the complete configured scope and current committed source state; production success is not claimed by this branch.
 - [ ] Execute the separately authorized replacement recovery `cdc-lost-binlog-2026-08-13-drop-trigger-retry3` and replace any superseded stream runtime; production completion is not claimed.
 - [ ] Complete post-transition schema/data validation with zero unresolved drift and record `verified` evidence.
 

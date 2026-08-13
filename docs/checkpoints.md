@@ -18,39 +18,40 @@ claim that the skipped source interval was replayed.
 The CLI reads operator JSON containing the exact old checkpoint and exact
 `cdc.ddl_replay_journal` barrier, including source identity, file, start/end
 positions, and raw SQL. It rejects a configured source/checkpoint identity
-mismatch. Before preparing recovery it computes the current complete source
-scope hash and rejects any non-InnoDB source table. Recovery data repair covers
-every current source-scope table even when target-only base tables exist; the
-generic `repair-drift` contract remains strict. An explicitly supplied scope
-hash must match; an omitted hash is filled from the current source inventory and
-recorded as evidence.
+mismatch. Before preparing recovery it computes and records the current complete source
+scope hash for that attempt and rejects any non-InnoDB source table. Recovery
+data repair covers every current source-scope table even when target-only base
+tables exist; the generic `repair-drift` contract remains strict. An explicitly
+supplied scope hash must match that attempt's current source inventory; an omitted
+hash is filled from the current source inventory and recorded as evidence.
 
-The stream lease is acquired before transition. A dedicated MariaDB connection
-briefly executes `FLUSH TABLES WITH READ LOCK` while the snapshot connection
-opens one `REPEATABLE READ` consistent snapshot and executes `SHOW MASTER STATUS`
-on that same connection to capture its binlog coordinate. The write fence is
-then released, but that one source transaction remains open for the complete
-configured-scope insert, update, delete, and verification phases. Independent
-live reads are not recovery evidence.
+The stream lease is acquired before transition. The source binlog coordinate is
+captured with ordinary non-locking reads. Recovery does not execute `FLUSH TABLES
+WITH READ LOCK`, `UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and
+does not keep a cross-table repeatable-read snapshot open. Source schema and row
+reconciliation use normally committed reads. Source commits after the captured
+coordinate remain eligible for stream replay after the checkpoint advances.
 
 A prepared immutable row is inserted into `cdc.stream_recovery_records` with the
-old state, captured coordinate, source identity, scope hash, operator, reason,
-and preparation evidence. Recovery-only schema convergence runs after
-source-scoped data repair, drops target-only base tables child-before-parent
-with normal foreign-key enforcement, and fails closed on cycles or source-table
-references to target-only parents. The final target table inventory must exactly
-match source. A separately authorized replacement may, in the same target
-transaction, lock the exact prepared owner, mark it `abandoned` with
-server-generated timestamp/evidence, and insert the replacement `prepared` row;
-all old identity and prepared evidence remain intact. Only after zero
-skipped/unsupported tables and successful schema/data proof does one target
-transaction revalidate the exact checkpoint, barrier, source/scope identity, and
-prepared recovery row, update `cdc.stream_checkpoint`, and mark the recovery
-`committed`. Abandoned history remains durable and does not suppress the journal
-barrier; active-barrier selection excludes only exact `committed` or `verified`
-ownership, which is terminal. Any failed validation or commit rolls back both
-replacement steps. Duplicate recovery IDs and non-advancing coordinates are
-refused.
+old state, captured coordinate, source identity, that attempt's scope hash,
+operator, reason, and preparation evidence. Recovery-only schema convergence
+runs after source-scoped data repair, drops target-only base tables
+child-before-parent with normal foreign-key enforcement, and fails closed on
+cycles or source-table references to target-only parents. The final target table
+inventory must exactly match the attempt's source inventory. A separately
+authorized replacement may, in the same target transaction, lock the exact
+prepared owner, mark it `abandoned` with server-generated timestamp/evidence, and
+insert the replacement `prepared` row for the same exact checkpoint, barrier,
+and source identity. The replacement records its own scope hash; it need not
+equal the abandoned scope. All old identity, scope, and prepared evidence remain
+intact. Only after zero skipped/unsupported tables and successful schema/data
+proof does one target transaction revalidate the exact checkpoint, barrier,
+source identity, and prepared recovery row, update `cdc.stream_checkpoint`, and
+mark the recovery `committed`. Abandoned history remains durable and does not
+suppress the journal barrier; active-barrier selection excludes only exact
+`committed` or `verified` ownership, which is terminal. Any failed validation or
+commit rolls back both replacement steps. Duplicate recovery IDs and
+non-advancing coordinates are refused.
 
 Bootstrap `cdc.stream_recovery_records` and its immutability guards with
 `docs/stream-recovery-records-bootstrap.sql` while stream writers are stopped.

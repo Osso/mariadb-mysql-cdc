@@ -103,11 +103,11 @@ identity matching stops immediately.
 - [x] Make checkpoint writes atomic so pod eviction or node loss cannot leave a
   partially written checkpoint.
 - [ ] For purged-history incidents, use only the audited `recover-lost-binlog`
-  transition: exact JSON old-state/barrier authorization, source/scope
-  validation, one fenced MariaDB consistent snapshot, full-scope reconciliation,
-  and atomic checkpoint plus exact-barrier commit. This is an availability-first
-  skip, not replay proof; production execution and post-transition verification
-  remain open.
+  transition: exact JSON old-state/barrier authorization, per-attempt source/scope
+  validation, non-locking coordinate capture, committed-state full-scope
+  reconciliation, and atomic checkpoint plus exact-barrier commit. This is an
+  availability-first skip, not replay proof; production execution and
+  post-transition verification remain open.
 
 ### Replay safety
 

@@ -32,28 +32,32 @@ optional `start_after` primary key, and limit so row-level reports can be paged.
 `recover-lost-binlog` requires two evidence phases:
 
 1. **Preparation:** exact JSON authorization, source/checkpoint identity,
-   complete source scope hash, and an all-InnoDB scope. The source boundary is
-   read from one MariaDB `REPEATABLE READ` consistent snapshot opened behind a
-   brief `FLUSH TABLES WITH READ LOCK`. Recovery data repair covers every
-   current source-scope table even when target-only base tables exist; the
-   generic `repair-drift` contract remains strict.
-2. **Reconciliation and commit:** the same snapshot transaction supplies every
-   full-scope insert/update/delete/verify comparison. Recovery-only schema
-   convergence then drops target-only base tables child-before-parent with
-   normal foreign-key enforcement; cycles and source-table references to
-   target-only parents fail closed. Its coordinate comes from `SHOW MASTER
-   STATUS` on that snapshot connection while the source write fence is held.
-   The final target table inventory must exactly equal source. Any skipped
-   table, unsupported engine, unresolved conflict, schema difference,
-   count/content mismatch, inventory mismatch, or scope-hash change blocks the
-   checkpoint transition.
+   the current source scope hash for this attempt, and an all-InnoDB scope. The
+   source boundary is captured with ordinary non-locking MariaDB reads; recovery
+   requires no `FLUSH TABLES WITH READ LOCK`, `UNLOCK TABLES`, `LOCK TABLES`, or
+   `RELOAD`. Recovery data repair covers every current source-scope table even
+   when target-only base tables exist; the generic `repair-drift` contract
+   remains strict.
+2. **Reconciliation and commit:** committed source reads supply the full-scope
+   insert/update/delete/verify comparison without a long-lived cross-table
+   repeatable-read snapshot. Recovery-only schema convergence then drops
+   target-only base tables child-before-parent with normal foreign-key
+   enforcement; cycles and source-table references to target-only parents fail
+   closed. The captured coordinate is the replay boundary: source commits after
+   it remain eligible for stream replay after checkpoint advancement. The final
+   target table inventory must exactly equal this attempt's source inventory.
+   Any skipped table, unsupported engine, unresolved conflict, schema
+   difference, count/content mismatch, inventory mismatch, or failed
+   attempt-scope proof blocks the checkpoint transition.
 
 Every recovery record retains its immutable old checkpoint, exact historical
-barrier, source/scope identity, operator, reason, and phase evidence. A
-separately authorized replacement atomically marks the exact prepared owner
-`abandoned` with server-generated evidence and inserts a new `prepared` owner;
-all old identity and prepared evidence remain durable. The historical journal row
-is preserved. Abandoned history does not suppress the barrier; active-barrier
+barrier, source identity, its own scope hash, operator, reason, and phase
+evidence. A separately authorized replacement atomically marks the exact
+prepared owner `abandoned` with server-generated evidence and inserts a new
+`prepared` owner for the same exact checkpoint, barrier, and source identity;
+the replacement may record a different current scope hash. All old identity,
+scope, and prepared evidence remain durable. The historical journal row is
+preserved. Abandoned history does not suppress the barrier; active-barrier
 selection excludes it only after exact `committed` or `verified` ownership, and
 those statuses are terminal. `committed` is an availability-first skip over
 purged history, not proof that the skipped interval was replayed. The recovery
