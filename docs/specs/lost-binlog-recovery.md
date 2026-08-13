@@ -14,7 +14,7 @@
 ### Anchored reconciliation
 
 - [x] Acquire the stream lease before recovery state changes.
-- [x] Hold `FLUSH TABLES WITH READ LOCK` only while opening one MariaDB `REPEATABLE READ` consistent snapshot and reading its current binlog coordinate.
+- [x] Hold `FLUSH TABLES WITH READ LOCK` only while opening one MariaDB `REPEATABLE READ` consistent snapshot, reading its current binlog coordinate, and capturing source schema evidence; target reads and data reconciliation occur after unlock.
 - [x] Keep that source snapshot transaction open for full-scope source reads, insert, update, delete, and verification phases.
 - [x] Capture source table, index, foreign-key, check, view, trigger, routine, and event evidence through that same snapshot connection; independent live source metadata reads are forbidden.
 - [x] Reconcile target data, including target-only orphan rows, before creating foreign keys.

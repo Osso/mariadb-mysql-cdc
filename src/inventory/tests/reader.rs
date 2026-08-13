@@ -1,6 +1,6 @@
 use crate::inventory::reader::{
     InventoryConnectionFactory, InventoryQueryConnection, InventoryQueryFailure,
-    InventoryQueryStage, inventory_opts,
+    InventoryQueryStage, SnapshotInventoryQuery, SnapshotInventoryReader, inventory_opts,
 };
 use crate::inventory::retry::format_inventory_reset_log;
 use crate::inventory::{
@@ -11,6 +11,28 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
+
+#[test]
+fn snapshot_inventory_reader_delegates_queries_and_normalizes_nullable_fields() {
+    let source = RecordingSnapshotQuery {
+        queries: RefCell::new(Vec::new()),
+        rows: vec![vec![
+            Some("accounts".to_string()),
+            Some("BASE TABLE".to_string()),
+            Some("InnoDB".to_string()),
+            None,
+        ]],
+    };
+    let reader = SnapshotInventoryReader::new(&source, InventoryEndpointRole::Source);
+
+    let tables = reader.read_tables("globalcomix").expect("snapshot tables");
+
+    assert_eq!(tables[0].table_name, "accounts");
+    assert_eq!(tables[0].engine.as_deref(), Some("InnoDB"));
+    assert_eq!(tables[0].table_collation, None);
+    assert_eq!(source.queries.borrow().len(), 1);
+    assert!(source.queries.borrow()[0].contains("information_schema.TABLES"));
+}
 
 #[test]
 fn inventory_reader_does_not_shell_out_to_mariadb_cli() {
@@ -149,6 +171,18 @@ fn inventory_query_replaces_expired_connection_before_reuse() {
 }
 
 type ScriptedQueryResult = Result<Vec<Vec<String>>, mysql::Error>;
+
+struct RecordingSnapshotQuery {
+    queries: RefCell<Vec<String>>,
+    rows: Vec<Vec<Option<String>>>,
+}
+
+impl SnapshotInventoryQuery for RecordingSnapshotQuery {
+    fn query_rows_as_strings(&self, query: &str) -> Result<Vec<Vec<Option<String>>>, String> {
+        self.queries.borrow_mut().push(query.to_string());
+        Ok(self.rows.clone())
+    }
+}
 
 struct ScriptedInventoryConnection {
     results: VecDeque<ScriptedQueryResult>,

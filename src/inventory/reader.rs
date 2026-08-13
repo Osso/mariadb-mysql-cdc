@@ -449,14 +449,24 @@ impl MariaDbInventoryReader {
     }
 }
 
+pub(crate) trait SnapshotInventoryQuery {
+    fn query_rows_as_strings(&self, query: &str) -> Result<Vec<Vec<Option<String>>>, String>;
+}
+
+impl SnapshotInventoryQuery for PersistentMySqlSource {
+    fn query_rows_as_strings(&self, query: &str) -> Result<Vec<Vec<Option<String>>>, String> {
+        PersistentMySqlSource::query_rows_as_strings(self, query).map_err(|error| error.to_string())
+    }
+}
+
 pub(crate) struct SnapshotInventoryReader<'a> {
-    source: &'a PersistentMySqlSource,
+    source: &'a dyn SnapshotInventoryQuery,
     endpoint_role: InventoryEndpointRole,
 }
 
 impl<'a> SnapshotInventoryReader<'a> {
     pub(crate) fn new(
-        source: &'a PersistentMySqlSource,
+        source: &'a dyn SnapshotInventoryQuery,
         endpoint_role: InventoryEndpointRole,
     ) -> Self {
         Self {
