@@ -32,14 +32,20 @@ optional `start_after` primary key, and limit so row-level reports can be paged.
 `recover-lost-binlog` requires two evidence phases:
 
 1. **Preparation:** exact JSON authorization, source/checkpoint identity,
-   full schema convergence, complete source scope hash, and an all-InnoDB
-   scope. The source boundary is read from one MariaDB `REPEATABLE READ`
-   consistent snapshot opened behind a brief `FLUSH TABLES WITH READ LOCK`.
-2. **Commit:** the same snapshot transaction supplies every full-scope
-   insert/update/delete/verify comparison. Its coordinate comes from
-   `SHOW MASTER STATUS` on that snapshot connection while the source write
-   fence is held. Any skipped table, unsupported engine, unresolved conflict,
-   schema difference, count/content mismatch, or scope-hash change blocks the
+   complete source scope hash, and an all-InnoDB scope. The source boundary is
+   read from one MariaDB `REPEATABLE READ` consistent snapshot opened behind a
+   brief `FLUSH TABLES WITH READ LOCK`. Recovery data repair covers every
+   current source-scope table even when target-only base tables exist; the
+   generic `repair-drift` contract remains strict.
+2. **Reconciliation and commit:** the same snapshot transaction supplies every
+   full-scope insert/update/delete/verify comparison. Recovery-only schema
+   convergence then drops target-only base tables child-before-parent with
+   normal foreign-key enforcement; cycles and source-table references to
+   target-only parents fail closed. Its coordinate comes from `SHOW MASTER
+   STATUS` on that snapshot connection while the source write fence is held.
+   The final target table inventory must exactly equal source. Any skipped
+   table, unsupported engine, unresolved conflict, schema difference,
+   count/content mismatch, inventory mismatch, or scope-hash change blocks the
    checkpoint transition.
 
 The committed record retains the old checkpoint, exact historical barrier, new
@@ -47,8 +53,10 @@ coordinate, source/scope identity, operator, reason, and measured evidence.
 The historical journal row is preserved; only the exact committed barrier is
 excluded from active-barrier selection. `committed` is an availability-first
 skip over purged history, not proof that the skipped interval was replayed.
-The recovery may be marked `verified` only after post-transition full
-schema/data validation reports zero unresolved drift.
+Prepared recovery IDs are immutable and non-resumable: a prepared failure
+requires a separately authorized new recovery ID. The recovery may be marked
+`verified` only after post-transition full schema/data validation reports zero
+unresolved drift.
 
 Production execution, restart health, and `verified` evidence remain open until
 measured and recorded; this document does not claim recovery completion.

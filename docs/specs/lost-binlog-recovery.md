@@ -1,6 +1,6 @@
 # Lost-binlog recovery
 
-`recover-lost-binlog` is the audited availability-first transition for a stream whose durable MariaDB binlog checkpoint names purged history. It consumes an operator JSON authorization, reconciles the complete configured scope from one MariaDB consistent snapshot, then atomically advances only the authorized stream checkpoint and supersedes only the exact historical journal barrier. The implementation is present on `ad-drop-trigger-lost-binlog-recovery`; production execution and post-transition verification are not claimed here.
+`recover-lost-binlog` is the audited availability-first transition for a stream whose durable MariaDB binlog checkpoint names purged history. It consumes an operator JSON authorization, repairs every current source-scope table from one MariaDB consistent snapshot even when the target has extra base tables, then performs recovery-only schema convergence before atomically advancing only the authorized stream checkpoint and superseding only the exact historical journal barrier. The implementation is present on `ad-drop-trigger-lost-binlog-recovery`; production execution and post-transition verification are not claimed here.
 
 ## What it must do
 
@@ -17,15 +17,16 @@
 - [x] Acquire the source write fence before any source schema/data read; while it is held, open one MariaDB `REPEATABLE READ` consistent snapshot and execute `SHOW MASTER STATUS` on that same snapshot connection to capture its binlog coordinate and source schema evidence; target reads and data reconciliation occur after unlock.
 - [x] Keep that source snapshot transaction open for full-scope source data reads, insert, update, delete, and verification phases.
 - [x] Capture source table, index, foreign-key, check, view, trigger, routine, and event evidence through that same snapshot connection; independent live source metadata reads are forbidden.
-- [x] Reconcile target data, including target-only orphan rows, before creating foreign keys.
-- [x] Run final schema convergence, including foreign-key creation, after data reconciliation; schema convergence must gate the atomic transition.
-- [x] Refuse checkpoint transition when any table is skipped, unsupported, or unresolved.
+- [x] Reconcile every current source-scope table, including target-only orphan rows; target-only target tables do not narrow the recovery data plan, and generic `repair-drift` remains strict about its source/target inventory contract.
+- [x] Run recovery-only schema convergence after data reconciliation: drop target-only base tables child-before-parent with normal foreign-key enforcement, fail closed on cycles or source-table references to target-only parents, and converge remaining source tables and constraints.
+- [x] Require the final target base-table inventory to exactly match the source inventory before commit.
+- [x] Refuse checkpoint transition when any table is skipped, unsupported, unresolved, or the final target inventory differs from source.
 - [ ] Prove the complete live CLI path against the production-shaped full scope, including data repair before final schema/FK convergence.
 
 ### Durable transition
 
-- [x] Insert an immutable `prepared` recovery record containing old state, new coordinate, source identity, scope, operator, reason, and evidence.
-- [x] Revalidate the exact checkpoint, barrier, source identity, scope, and prepared recovery record under transaction locks.
+- [x] Insert an immutable `prepared` recovery record containing old state, new coordinate, source identity, scope, operator, reason, and evidence; a prepared recovery ID is non-resumable.
+- [x] Revalidate the exact checkpoint, barrier, source identity, scope, and prepared recovery record under transaction locks; after a prepared failure, reject reuse and require a separately authorized new recovery ID.
 - [x] Require complete zero-drift schema/data proof before atomically updating the checkpoint, superseding the exact barrier, and marking the recovery `committed`.
 - [x] Preserve the historical journal row; active-barrier selection excludes only the exact committed recovery identity and barrier coordinates/raw-SQL hash.
 - [x] Roll back the transition on checkpoint/recovery commit failure.

@@ -116,8 +116,10 @@ duplicate allowlists.
 when the live checkpoint names purged MariaDB history. JSON authorization binds
 one recovery ID to the exact old checkpoint and exact journal barrier; source
 identity and checkpoint name must also match the configured stream. The command
-first converges the full schema, computes the current complete scope hash, and
-rejects non-InnoDB source tables.
+computes the current complete source scope hash and rejects non-InnoDB source
+tables. Recovery data repair covers every current source-scope table even when
+target-only base tables exist; generic `repair-drift` remains strict about its
+source/target inventory contract.
 
 The command acquires the stream lease, briefly holds `FLUSH TABLES WITH READ
 LOCK`, opens one MariaDB `REPEATABLE READ` consistent snapshot, and captures its
@@ -127,10 +129,14 @@ insert/update/delete/verify work. It does not treat independent live reads as
 anchored evidence.
 
 A prepared immutable recovery record links old state, new coordinate, source,
-scope, operator, reason, and evidence. After zero skipped scope and successful
-schema/data proof, one target transaction revalidates the exact old state,
-updates the checkpoint, and commits only the exact historical barrier
-supersession. The journal row is preserved. This transition skips purged source
+scope, operator, reason, and evidence. After source-scoped data repair, recovery-
+only schema convergence drops target-only base tables child-before-parent with
+normal foreign-key enforcement; cycles and source-table references to target-only
+parents fail closed. The final target inventory must exactly match source before
+one target transaction revalidates the exact old state, updates the checkpoint,
+and commits only the exact historical barrier supersession. A prepared recovery
+ID is non-resumable; a prepared failure requires a separately authorized new
+recovery ID. The journal row is preserved. This transition skips purged source
 history; it is not replay proof and does not claim production completion until
 restart health and subsequent zero-drift verification are recorded.
 
