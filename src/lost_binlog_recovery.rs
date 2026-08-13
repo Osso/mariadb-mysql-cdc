@@ -477,6 +477,12 @@ pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamRepo
     let start_checkpoint = source
         .read_binlog_coordinate()
         .map_err(|error| format!("read resync source coordinate: {error}"))?;
+    let checkpoint_store = crate::stream_checkpoint::MySqlStreamCheckpointStore::new(
+        config.target.clone(),
+        config.checkpoint_table.clone(),
+        &config.source_identity,
+    );
+    checkpoint_store.bootstrap(&start_checkpoint)?;
     let source_evidence = read_source_evidence(source.as_ref(), &config.source.database)?;
     validate_transactional_scope(&source_evidence.inventory)?;
     let target_inventory = read_target_inventory(&config.target)?;
@@ -494,12 +500,6 @@ pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamRepo
     require_converged_schema(&schema_report)?;
     let final_target_inventory = read_target_inventory(&config.target)?;
     require_exact_table_inventory(&source_evidence.inventory, &final_target_inventory)?;
-    let checkpoint_store = crate::stream_checkpoint::MySqlStreamCheckpointStore::new(
-        config.target.clone(),
-        config.checkpoint_table.clone(),
-        &config.source_identity,
-    );
-    checkpoint_store.bootstrap(&start_checkpoint)?;
     Ok(ResyncStreamReport {
         source_identity: config.source_identity.clone(),
         start_checkpoint,
