@@ -3343,6 +3343,45 @@ mod tests {
     }
 
     #[test]
+    fn target_only_table_cycle_fails_closed_without_drop_statements() {
+        let source = inventory(vec![table("current", vec![], vec![])], vec![]);
+        let target = inventory(
+            vec![
+                table("current", vec![], vec![]),
+                table("legacy_a", vec![], vec![]),
+                table("legacy_b", vec![], vec![]),
+            ],
+            vec![
+                foreign_key("legacy_a", "legacy_b"),
+                foreign_key("legacy_b", "legacy_a"),
+            ],
+        );
+
+        let result = target_only_table_drop_statements(&source, &target);
+        let expected_error =
+            "target-only table dependency cycle blocks removal: legacy_a, legacy_b";
+
+        assert_eq!(result, Err(expected_error.to_string()));
+    }
+
+    #[test]
+    fn source_table_referencing_target_only_parent_fails_closed_without_drop_statements() {
+        let source = inventory(vec![table("current_child", vec![], vec![])], vec![]);
+        let target = inventory(
+            vec![
+                table("current_child", vec![], vec![]),
+                table("legacy_parent", vec![], vec![]),
+            ],
+            vec![foreign_key("current_child", "legacy_parent")],
+        );
+
+        let result = target_only_table_drop_statements(&source, &target);
+        let expected_error = "target-only parent table `legacy_parent` is referenced by source table `current_child` through foreign key `fk_current_child_legacy_parent`";
+
+        assert_eq!(result, Err(expected_error.to_string()));
+    }
+
+    #[test]
     fn blocks_signedness_change_and_decimal_narrowing_on_nonempty_tables() {
         let mut source_id = column("id", "bigint unsigned", false);
         source_id.data_type = "bigint".to_string();
