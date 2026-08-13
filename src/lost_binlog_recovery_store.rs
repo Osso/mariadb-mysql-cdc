@@ -103,9 +103,43 @@ pub fn build_barrier_cas_select_sql(
 
 pub fn build_recovery_cas_select_sql(table: &str, recovery_id: &str) -> String {
     format!(
-        "SELECT recovery_id,checkpoint_name,source_identity,scope_hash,operator_identity,reason,prepared_evidence_json,old_checkpoint_json,new_checkpoint_json,old_barrier_source_identity,old_barrier_file,old_barrier_start_position,old_barrier_end_position,old_barrier_raw_sql,status FROM {} WHERE recovery_id = {} LIMIT 1 FOR UPDATE",
+        "SELECT recovery_id,checkpoint_name,source_identity,scope_hash,operator_identity,reason,prepared_evidence_json,old_checkpoint_json,new_checkpoint_json,old_barrier_source_identity,old_barrier_file,old_barrier_start_position,old_barrier_end_position,old_barrier_raw_sql,status,abandoned_evidence_json,CAST(abandoned_at AS CHAR) FROM {} WHERE recovery_id = {} LIMIT 1 FOR UPDATE",
         quote_identifier_path(table),
         quote_sql_literal(recovery_id),
+    )
+}
+
+pub fn build_barrier_recovery_owner_select_sql(table: &str, barrier: &LostBinlogBarrier) -> String {
+    format!(
+        "SELECT recovery_id,checkpoint_name,source_identity,scope_hash,operator_identity,reason,prepared_evidence_json,old_checkpoint_json,new_checkpoint_json,old_barrier_source_identity,old_barrier_file,old_barrier_start_position,old_barrier_end_position,old_barrier_raw_sql,status,abandoned_evidence_json,CAST(abandoned_at AS CHAR) FROM {} WHERE old_barrier_source_identity = {} AND old_barrier_file = {} AND old_barrier_start_position = {} AND old_barrier_end_position = {} AND old_barrier_raw_sql = {} ORDER BY CASE status WHEN 'prepared' THEN 0 WHEN 'committed' THEN 1 WHEN 'verified' THEN 2 ELSE 3 END,recovery_id LIMIT 1 FOR UPDATE",
+        quote_identifier_path(table),
+        quote_sql_literal(&barrier.source_identity),
+        quote_sql_literal(&barrier.binlog_file),
+        barrier.event_start_position,
+        barrier.event_end_position,
+        quote_sql_literal(&barrier.raw_sql),
+    )
+}
+
+pub fn build_abandon_recovery_sql(
+    table: &str,
+    recovery: &LostBinlogRecoveryRecord,
+    _replacement_recovery_id: &str,
+    evidence_json: &str,
+) -> String {
+    format!(
+        "UPDATE {} SET status = 'abandoned', abandoned_evidence_json = {}, abandoned_at = UTC_TIMESTAMP(6) WHERE recovery_id = {} AND checkpoint_name = {} AND source_identity = {} AND scope_hash = {} AND old_barrier_source_identity = {} AND old_barrier_file = {} AND old_barrier_start_position = {} AND old_barrier_end_position = {} AND old_barrier_raw_sql = {} AND status = 'prepared'",
+        quote_identifier_path(table),
+        quote_sql_literal(evidence_json),
+        quote_sql_literal(&recovery.recovery_id),
+        quote_sql_literal(&recovery.checkpoint_name),
+        quote_sql_literal(&recovery.source_identity),
+        quote_sql_literal(&recovery.scope_hash),
+        quote_sql_literal(&recovery.expected_barrier.source_identity),
+        quote_sql_literal(&recovery.expected_barrier.binlog_file),
+        recovery.expected_barrier.event_start_position,
+        recovery.expected_barrier.event_end_position,
+        quote_sql_literal(&recovery.expected_barrier.raw_sql),
     )
 }
 
@@ -274,6 +308,32 @@ impl LostBinlogRecoveryStore for MySqlLostBinlogRecoveryStore {
         row.map(parse_recovery_row).transpose()
     }
 
+    fn load_barrier_recovery_owner_for_update(
+        &self,
+        barrier: &LostBinlogBarrier,
+    ) -> Result<Option<LostBinlogRecoveryRecord>, String> {
+        let row = self.query_optional_row(build_barrier_recovery_owner_select_sql(
+            &self.recovery_table,
+            barrier,
+        ))?;
+        row.map(parse_recovery_row).transpose()
+    }
+
+    fn mark_recovery_abandoned(
+        &self,
+        recovery: &LostBinlogRecoveryRecord,
+        replacement_recovery_id: &str,
+        evidence_json: &str,
+    ) -> Result<(), String> {
+        let sql = build_abandon_recovery_sql(
+            &self.recovery_table,
+            recovery,
+            replacement_recovery_id,
+            evidence_json,
+        );
+        self.execute_and_require_one(sql, "abandon lost-binlog recovery")
+    }
+
     fn insert_prepared_recovery(&self, recovery: &LostBinlogRecoveryRecord) -> Result<(), String> {
         let old_checkpoint_json = serde_json::to_string(&recovery.expected_checkpoint)
             .map_err(|error| format!("encode old recovery checkpoint: {error}"))?;
@@ -356,6 +416,7 @@ fn parse_recovery_row(row: Vec<Option<String>>) -> Result<LostBinlogRecoveryReco
         "prepared" => LostBinlogRecoveryStatus::Prepared,
         "committed" => LostBinlogRecoveryStatus::Committed,
         "verified" => LostBinlogRecoveryStatus::Verified,
+        "abandoned" => LostBinlogRecoveryStatus::Abandoned,
         value => return Err(format!("unsupported lost-binlog recovery status {value}")),
     };
     let expected_checkpoint = decode_checkpoint(&row, 7, "old recovery checkpoint")?;
@@ -378,6 +439,8 @@ fn parse_recovery_row(row: Vec<Option<String>>) -> Result<LostBinlogRecoveryReco
         },
         new_checkpoint,
         status,
+        abandoned_evidence_json: optional_row_value(&row, 15),
+        abandoned_at: optional_row_value(&row, 16),
     })
 }
 
@@ -400,6 +463,10 @@ fn required_row_value(row: &[Option<String>], index: usize, field: &str) -> Resu
     row.get(index)
         .and_then(Clone::clone)
         .ok_or_else(|| format!("missing {field}"))
+}
+
+fn optional_row_value(row: &[Option<String>], index: usize) -> Option<String> {
+    row.get(index).and_then(Clone::clone)
 }
 
 #[cfg(test)]
@@ -454,7 +521,100 @@ mod tests {
         );
         assert_eq!(
             build_recovery_cas_select_sql("cdc.stream_recovery_records", "recovery-1"),
-            "SELECT recovery_id,checkpoint_name,source_identity,scope_hash,operator_identity,reason,prepared_evidence_json,old_checkpoint_json,new_checkpoint_json,old_barrier_source_identity,old_barrier_file,old_barrier_start_position,old_barrier_end_position,old_barrier_raw_sql,status FROM `cdc`.`stream_recovery_records` WHERE recovery_id = 'recovery-1' LIMIT 1 FOR UPDATE"
+            "SELECT recovery_id,checkpoint_name,source_identity,scope_hash,operator_identity,reason,prepared_evidence_json,old_checkpoint_json,new_checkpoint_json,old_barrier_source_identity,old_barrier_file,old_barrier_start_position,old_barrier_end_position,old_barrier_raw_sql,status,abandoned_evidence_json,CAST(abandoned_at AS CHAR) FROM `cdc`.`stream_recovery_records` WHERE recovery_id = 'recovery-1' LIMIT 1 FOR UPDATE"
+        );
+    }
+
+    #[test]
+    fn locks_exact_barrier_recovery_owner_and_abandons_only_prepared_identity() {
+        let barrier = LostBinlogBarrier {
+            source_identity: "source-1#server-id=3".to_string(),
+            binlog_file: "mysqld-bin.000001".to_string(),
+            event_start_position: 100,
+            event_end_position: 200,
+            raw_sql: "DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives".to_string(),
+        };
+        let owner_sql =
+            build_barrier_recovery_owner_select_sql("cdc.stream_recovery_records", &barrier);
+        assert!(owner_sql.contains("old_barrier_source_identity = 'source-1#server-id=3'"));
+        assert!(owner_sql.contains("status WHEN 'prepared' THEN 0"));
+        assert!(owner_sql.contains("LIMIT 1 FOR UPDATE"));
+
+        let recovery = LostBinlogRecoveryRecord {
+            recovery_id: "recovery-old".to_string(),
+            checkpoint_name: "stream-binlog:source-1".to_string(),
+            source_identity: barrier.source_identity.clone(),
+            scope_hash: "scope-sha256".to_string(),
+            operator_identity: "operator@example.com".to_string(),
+            reason: "old reason".to_string(),
+            prepared_evidence_json: "{\"prepared\":true}".to_string(),
+            expected_checkpoint: Checkpoint {
+                source_file: "mysqld-bin.000001".to_string(),
+                source_position: 10,
+                gtid: None,
+                event_timestamp: 0,
+                last_event: crate::checkpoint::LastEvent {
+                    event_type: "QueryEvent".to_string(),
+                    description: "old".to_string(),
+                },
+            },
+            expected_barrier: barrier,
+            new_checkpoint: Checkpoint {
+                source_file: "mysqld-bin.000002".to_string(),
+                source_position: 20,
+                gtid: None,
+                event_timestamp: 0,
+                last_event: crate::checkpoint::LastEvent {
+                    event_type: "QueryEvent".to_string(),
+                    description: "new".to_string(),
+                },
+            },
+            status: LostBinlogRecoveryStatus::Prepared,
+            abandoned_evidence_json: None,
+            abandoned_at: None,
+        };
+        let abandon_sql = build_abandon_recovery_sql(
+            "cdc.stream_recovery_records",
+            &recovery,
+            "recovery-new",
+            "{\"old_recovery_id\":\"recovery-old\",\"replacement_recovery_id\":\"recovery-new\"}",
+        );
+        assert!(abandon_sql.contains("status = 'abandoned'"));
+        assert!(abandon_sql.contains("abandoned_at = UTC_TIMESTAMP(6)"));
+        assert!(abandon_sql.contains("status = 'prepared'"));
+        assert!(!abandon_sql.contains("abandoned_at = '"));
+    }
+
+    #[test]
+    fn parses_abandoned_recovery_evidence_and_server_timestamp() {
+        let row = vec![
+            Some("recovery-old".to_string()),
+            Some("stream-binlog:source-1".to_string()),
+            Some("source-1#server-id=3".to_string()),
+            Some("scope-sha256".to_string()),
+            Some("operator@example.com".to_string()),
+            Some("old reason".to_string()),
+            Some("{\"prepared\":true}".to_string()),
+            Some("{\"source_file\":\"mysqld-bin.000001\",\"source_position\":10,\"gtid\":null,\"event_timestamp\":0,\"last_event\":{\"event_type\":\"QueryEvent\",\"description\":\"old\"}}".to_string()),
+            Some("{\"source_file\":\"mysqld-bin.000002\",\"source_position\":20,\"gtid\":null,\"event_timestamp\":0,\"last_event\":{\"event_type\":\"QueryEvent\",\"description\":\"new\"}}".to_string()),
+            Some("source-1#server-id=3".to_string()),
+            Some("mysqld-bin.000001".to_string()),
+            Some("100".to_string()),
+            Some("200".to_string()),
+            Some("DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives".to_string()),
+            Some("abandoned".to_string()),
+            Some("{\"old_recovery_id\":\"recovery-old\"}".to_string()),
+            Some("2026-08-13 01:02:03.000000".to_string()),
+        ];
+        let parsed = parse_recovery_row(row).expect("abandoned recovery row parses");
+        assert_eq!(parsed.status, LostBinlogRecoveryStatus::Abandoned);
+        assert_eq!(
+            parsed.abandoned_evidence_json.as_deref(),
+            Some("{\"old_recovery_id\":\"recovery-old\"}")
+        );
+        assert_eq!(
+            parsed.abandoned_at.as_deref(),
+            Some("2026-08-13 01:02:03.000000")
         );
     }
 

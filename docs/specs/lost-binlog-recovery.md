@@ -26,9 +26,12 @@
 ### Durable transition
 
 - [x] Insert an immutable `prepared` recovery record containing old state, new coordinate, source identity, scope, operator, reason, and evidence; a prepared recovery ID is non-resumable.
+- [x] Lock the checkpoint, exact barrier, new recovery ID, and exact-barrier recovery owner in one preparation transaction.
+- [x] When a separately authorized recovery ID replaces an exact matching `prepared` owner, atomically mark only the old row `abandoned` with server-generated `abandoned_at` and evidence binding both recovery IDs, operator, reason, checkpoint, barrier, source identity, and scope, then insert the replacement `prepared` row.
+- [x] Preserve all old identity and prepared-evidence fields during abandonment; refuse committed, verified, abandoned, duplicate-ID, or checkpoint/barrier/source/scope-mismatched owners.
 - [x] Revalidate the exact checkpoint, barrier, source identity, scope, and prepared recovery record under transaction locks; after a prepared failure, reject reuse and require a separately authorized new recovery ID.
 - [x] Require complete zero-drift schema/data proof before atomically updating the checkpoint, superseding the exact barrier, and marking the recovery `committed`.
-- [x] Preserve the historical journal row; active-barrier selection excludes only the exact committed recovery identity and barrier coordinates/raw-SQL hash.
+- [x] Preserve the historical journal row; active-barrier selection excludes only the exact committed or verified recovery identity and barrier coordinates/raw-SQL hash; abandoned history never suppresses the journal barrier.
 - [x] Roll back the transition on checkpoint/recovery commit failure.
 - [x] Fail closed on interruption or error before proof/commit: no checkpoint or barrier transition is allowed without complete proof and exact CAS revalidation; resumability is not claimed.
 - [ ] Verify interrupted full-scope reconciliation and live stream restart behavior.
@@ -49,17 +52,18 @@
 ## Implementation inventory
 
 - `src/lost_binlog_recovery.rs` — authorization, source/scope validation, snapshot fence, reconciliation orchestration, and atomic transition.
-- `src/lost_binlog_recovery_store.rs` — target-side CAS reads, immutable prepared-record insert, checkpoint update, commit, and exact barrier exclusion.
+- `src/lost_binlog_recovery_store.rs` — target-side CAS reads, exact-barrier owner locking, immutable prepared insert, abandoned replacement transition, checkpoint update, commit, and exact barrier exclusion.
 - `src/mysql_client.rs` — MariaDB consistent-snapshot transaction and source coordinate capture.
 - `src/inventory/reader.rs` — snapshot-backed source metadata reader on the persistent transaction connection.
 - `src/repair_drift/` — full-scope insert/update/delete and verification phases.
 - `src/sync_schema.rs` — final schema convergence and foreign-key creation after anchored data repair.
-- `docs/stream-recovery-records-bootstrap.sql` — recovery-record table, guards, inventory procedure, and grants.
+- `docs/stream-recovery-records-bootstrap.sql` — recovery-record table, active-barrier identity, guards, inventory procedure, and grants.
+- `docs/stream-recovery-records-abandoned-replacement-migration.sql` — target-only live-schema migration with duplicate-owner preflight and prepared-row postflight.
 
 ## Tests asserting this spec
 
-- `src/lost_binlog_recovery.rs` — phase ordering, target-orphan repair before schema/FK convergence, exact old-state validation, duplicate/non-advancing refusal, incomplete-proof refusal, atomic rollback, and exact historical-barrier supersession.
-- `src/lost_binlog_recovery_store.rs` — immutable prepared insert, locked CAS queries, checkpoint update, committed transition, and exact barrier predicates.
+- `src/lost_binlog_recovery.rs` — phase ordering, target-orphan repair before schema/FK convergence, replacement owner abandonment, rollback/refusal cases, exact old-state validation, duplicate/non-advancing refusal, incomplete-proof refusal, atomic rollback, and exact historical-barrier supersession.
+- `src/lost_binlog_recovery_store.rs` — immutable prepared insert, locked CAS queries, abandoned parsing/replacement SQL, checkpoint update, committed transition, and exact barrier predicates.
 
 ## Known gaps (current cycle)
 

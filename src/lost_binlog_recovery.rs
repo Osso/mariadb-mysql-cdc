@@ -47,6 +47,7 @@ pub enum LostBinlogRecoveryStatus {
     Prepared,
     Committed,
     Verified,
+    Abandoned,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +63,8 @@ pub struct LostBinlogRecoveryRecord {
     pub expected_barrier: LostBinlogBarrier,
     pub new_checkpoint: Checkpoint,
     pub status: LostBinlogRecoveryStatus,
+    pub abandoned_evidence_json: Option<String>,
+    pub abandoned_at: Option<String>,
 }
 
 impl LostBinlogRecoveryRecord {
@@ -78,6 +81,8 @@ impl LostBinlogRecoveryRecord {
             expected_barrier: request.expected_barrier.clone(),
             new_checkpoint,
             status: LostBinlogRecoveryStatus::Prepared,
+            abandoned_evidence_json: None,
+            abandoned_at: None,
         }
     }
 }
@@ -174,6 +179,16 @@ pub trait LostBinlogRecoveryStore {
         &self,
         recovery_id: &str,
     ) -> Result<Option<LostBinlogRecoveryRecord>, String>;
+    fn load_barrier_recovery_owner_for_update(
+        &self,
+        barrier: &LostBinlogBarrier,
+    ) -> Result<Option<LostBinlogRecoveryRecord>, String>;
+    fn mark_recovery_abandoned(
+        &self,
+        recovery: &LostBinlogRecoveryRecord,
+        replacement_recovery_id: &str,
+        evidence_json: &str,
+    ) -> Result<(), String>;
     fn insert_prepared_recovery(&self, recovery: &LostBinlogRecoveryRecord) -> Result<(), String>;
     fn save_checkpoint(&self, checkpoint_name: &str, checkpoint: &Checkpoint)
     -> Result<(), String>;
@@ -220,7 +235,63 @@ where
             request.recovery_id
         ));
     }
+
+    let owner = store.load_barrier_recovery_owner_for_update(&request.expected_barrier)?;
+    let Some(owner) = owner else {
+        return store.insert_prepared_recovery(prepared);
+    };
+
+    validate_replacement_owner(request, &owner)?;
+    let evidence_json = abandoned_evidence_json(&owner, request)?;
+    store.mark_recovery_abandoned(&owner, &request.recovery_id, &evidence_json)?;
     store.insert_prepared_recovery(prepared)
+}
+
+fn validate_replacement_owner(
+    request: &LostBinlogRecoveryRequest,
+    owner: &LostBinlogRecoveryRecord,
+) -> Result<(), String> {
+    if owner.status != LostBinlogRecoveryStatus::Prepared {
+        return Err(format!(
+            "lost-binlog barrier recovery owner is not replaceable: {}",
+            owner.recovery_id
+        ));
+    }
+    if owner.checkpoint_name != request.checkpoint_name
+        || owner.expected_checkpoint != request.expected_checkpoint
+        || owner.expected_barrier != request.expected_barrier
+        || owner.source_identity != request.expected_barrier.source_identity
+        || owner.scope_hash != request.scope_hash
+    {
+        return Err(format!(
+            "lost-binlog barrier recovery owner does not match replacement authorization: {}",
+            owner.recovery_id
+        ));
+    }
+    Ok(())
+}
+
+fn abandoned_evidence_json(
+    owner: &LostBinlogRecoveryRecord,
+    replacement: &LostBinlogRecoveryRequest,
+) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({
+        "old_recovery_id": owner.recovery_id,
+        "replacement_recovery_id": replacement.recovery_id,
+        "operator_identity": replacement.operator_identity,
+        "reason": replacement.reason,
+        "checkpoint_name": replacement.checkpoint_name,
+        "expected_checkpoint": replacement.expected_checkpoint,
+        "expected_barrier": {
+            "source_identity": replacement.expected_barrier.source_identity,
+            "binlog_file": replacement.expected_barrier.binlog_file,
+            "event_start_position": replacement.expected_barrier.event_start_position,
+            "event_end_position": replacement.expected_barrier.event_end_position,
+            "raw_sql": replacement.expected_barrier.raw_sql,
+        },
+        "scope_hash": replacement.scope_hash,
+    }))
+    .map_err(|error| format!("encode abandoned recovery evidence: {error}"))
 }
 
 pub fn commit_lost_binlog_recovery<S>(
@@ -946,6 +1017,24 @@ mod tests {
             Ok(self.recovery.borrow().clone())
         }
 
+        fn load_barrier_recovery_owner_for_update(
+            &self,
+            _barrier: &LostBinlogBarrier,
+        ) -> Result<Option<LostBinlogRecoveryRecord>, String> {
+            self.operations.borrow_mut().push("LOCK_ACTIVE_OWNER");
+            Ok(None)
+        }
+
+        fn mark_recovery_abandoned(
+            &self,
+            _recovery: &LostBinlogRecoveryRecord,
+            _replacement_recovery_id: &str,
+            _evidence_json: &str,
+        ) -> Result<(), String> {
+            self.operations.borrow_mut().push("ABANDON_RECOVERY");
+            Ok(())
+        }
+
         fn insert_prepared_recovery(
             &self,
             recovery: &LostBinlogRecoveryRecord,
@@ -994,6 +1083,169 @@ mod tests {
     impl LostBinlogBoundaryReader for FixedBoundaryReader {
         fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String> {
             Ok(self.0.clone())
+        }
+    }
+
+    struct ReplacementRecoveryStore {
+        checkpoint: RefCell<Option<Checkpoint>>,
+        barrier: RefCell<Option<LostBinlogBarrier>>,
+        recoveries: RefCell<std::collections::BTreeMap<String, LostBinlogRecoveryRecord>>,
+        operations: RefCell<Vec<&'static str>>,
+        fail_abandon: bool,
+        fail_insert: bool,
+        fail_commit: bool,
+        transaction_snapshot: RefCell<
+            Option<(
+                Option<Checkpoint>,
+                std::collections::BTreeMap<String, LostBinlogRecoveryRecord>,
+            )>,
+        >,
+    }
+
+    impl ReplacementRecoveryStore {
+        fn new(
+            checkpoint: Checkpoint,
+            barrier: LostBinlogBarrier,
+            recoveries: Vec<LostBinlogRecoveryRecord>,
+        ) -> Self {
+            Self {
+                checkpoint: RefCell::new(Some(checkpoint)),
+                barrier: RefCell::new(Some(barrier)),
+                recoveries: RefCell::new(
+                    recoveries
+                        .into_iter()
+                        .map(|recovery| (recovery.recovery_id.clone(), recovery))
+                        .collect(),
+                ),
+                operations: RefCell::new(Vec::new()),
+                fail_abandon: false,
+                fail_insert: false,
+                fail_commit: false,
+                transaction_snapshot: RefCell::new(None),
+            }
+        }
+
+        fn recovery(&self, recovery_id: &str) -> Option<LostBinlogRecoveryRecord> {
+            self.recoveries.borrow().get(recovery_id).cloned()
+        }
+    }
+
+    impl LostBinlogRecoveryStore for ReplacementRecoveryStore {
+        fn acquire_stream_lease(&self, _lease_name: &str) -> Result<(), String> {
+            self.operations.borrow_mut().push("LEASE");
+            Ok(())
+        }
+
+        fn begin_transaction(&self) -> Result<(), String> {
+            self.operations.borrow_mut().push("BEGIN");
+            *self.transaction_snapshot.borrow_mut() = Some((
+                self.checkpoint.borrow().clone(),
+                self.recoveries.borrow().clone(),
+            ));
+            Ok(())
+        }
+
+        fn load_checkpoint_for_update(
+            &self,
+            _checkpoint_name: &str,
+        ) -> Result<Option<Checkpoint>, String> {
+            self.operations.borrow_mut().push("LOCK_CHECKPOINT");
+            Ok(self.checkpoint.borrow().clone())
+        }
+
+        fn load_barrier_for_update(
+            &self,
+            _barrier: &LostBinlogBarrier,
+        ) -> Result<Option<LostBinlogBarrier>, String> {
+            self.operations.borrow_mut().push("LOCK_BARRIER");
+            Ok(self.barrier.borrow().clone())
+        }
+
+        fn load_recovery_for_update(
+            &self,
+            recovery_id: &str,
+        ) -> Result<Option<LostBinlogRecoveryRecord>, String> {
+            self.operations.borrow_mut().push("LOCK_RECOVERY");
+            Ok(self.recovery(recovery_id))
+        }
+
+        fn load_barrier_recovery_owner_for_update(
+            &self,
+            _barrier: &LostBinlogBarrier,
+        ) -> Result<Option<LostBinlogRecoveryRecord>, String> {
+            self.operations.borrow_mut().push("LOCK_ACTIVE_OWNER");
+            Ok(self.recoveries.borrow().values().next().cloned())
+        }
+
+        fn mark_recovery_abandoned(
+            &self,
+            recovery: &LostBinlogRecoveryRecord,
+            _replacement_recovery_id: &str,
+            evidence_json: &str,
+        ) -> Result<(), String> {
+            self.operations.borrow_mut().push("ABANDON_RECOVERY");
+            if self.fail_abandon {
+                return Err("injected abandonment update failure".to_string());
+            }
+            let mut abandoned = recovery.clone();
+            abandoned.status = LostBinlogRecoveryStatus::Abandoned;
+            abandoned.abandoned_evidence_json = Some(evidence_json.to_string());
+            abandoned.abandoned_at = Some("server-generated".to_string());
+            self.recoveries
+                .borrow_mut()
+                .insert(abandoned.recovery_id.clone(), abandoned);
+            Ok(())
+        }
+
+        fn insert_prepared_recovery(
+            &self,
+            recovery: &LostBinlogRecoveryRecord,
+        ) -> Result<(), String> {
+            self.operations.borrow_mut().push("INSERT_RECOVERY");
+            if self.fail_insert {
+                return Err("injected replacement insert failure".to_string());
+            }
+            self.recoveries
+                .borrow_mut()
+                .insert(recovery.recovery_id.clone(), recovery.clone());
+            Ok(())
+        }
+
+        fn save_checkpoint(
+            &self,
+            _checkpoint_name: &str,
+            checkpoint: &Checkpoint,
+        ) -> Result<(), String> {
+            self.operations.borrow_mut().push("SAVE_CHECKPOINT");
+            self.checkpoint.replace(Some(checkpoint.clone()));
+            Ok(())
+        }
+
+        fn mark_recovery_committed(
+            &self,
+            _recovery_id: &str,
+            _proof: &LostBinlogReconciliationProof,
+        ) -> Result<(), String> {
+            self.operations.borrow_mut().push("COMMIT_RECOVERY");
+            Ok(())
+        }
+
+        fn commit_transaction(&self) -> Result<(), String> {
+            self.operations.borrow_mut().push("COMMIT");
+            if self.fail_commit {
+                return Err("injected preparation commit failure".to_string());
+            }
+            self.transaction_snapshot.borrow_mut().take();
+            Ok(())
+        }
+
+        fn rollback_transaction(&self) -> Result<(), String> {
+            self.operations.borrow_mut().push("ROLLBACK");
+            if let Some((checkpoint, recoveries)) = self.transaction_snapshot.borrow_mut().take() {
+                self.checkpoint.replace(checkpoint);
+                self.recoveries.replace(recoveries);
+            }
+            Ok(())
         }
     }
 
@@ -1298,6 +1550,363 @@ mod tests {
     }
 
     #[test]
+    fn replacement_abandons_old_prepared_owner_before_inserting_new_record() {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut old_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        old_request.recovery_id = "recovery-old-owner".to_string();
+        let old_prepared =
+            LostBinlogRecoveryRecord::prepared(&old_request, latest_checkpoint.clone());
+        let mut replacement_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        let store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![old_prepared]);
+
+        let prepared = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect("replacement preparation should succeed");
+
+        assert_eq!(prepared.recovery_id, "recovery-replacement");
+        assert_eq!(
+            format!("{:?}", store.recovery("recovery-old-owner").unwrap().status),
+            "Abandoned"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                store.recovery("recovery-replacement").unwrap().status
+            ),
+            "Prepared"
+        );
+        let operations = store.operations.borrow();
+        let abandon = operations
+            .iter()
+            .position(|operation| *operation == "ABANDON_RECOVERY")
+            .expect("old owner must be abandoned");
+        let insert = operations
+            .iter()
+            .position(|operation| *operation == "INSERT_RECOVERY")
+            .expect("replacement must be inserted");
+        assert!(abandon < insert);
+        assert_eq!(operations.first(), Some(&"LEASE"));
+        assert_eq!(operations.get(1), Some(&"BEGIN"));
+        assert_eq!(operations.get(2), Some(&"LOCK_CHECKPOINT"));
+        assert_eq!(operations.get(3), Some(&"LOCK_BARRIER"));
+        assert_eq!(operations.last(), Some(&"COMMIT"));
+    }
+
+    #[test]
+    fn replacement_insert_failure_rolls_back_abandonment() {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut old_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        old_request.recovery_id = "recovery-old-owner".to_string();
+        let old_prepared =
+            LostBinlogRecoveryRecord::prepared(&old_request, latest_checkpoint.clone());
+        let mut replacement_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        let mut store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![old_prepared]);
+        store.fail_insert = true;
+
+        let error = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect_err("replacement insert failure must fail closed");
+
+        assert!(error.contains("replacement insert failure"));
+        assert_eq!(
+            format!("{:?}", store.recovery("recovery-old-owner").unwrap().status),
+            "Prepared"
+        );
+        assert!(store.recovery("recovery-replacement").is_none());
+        assert_eq!(store.operations.borrow().last(), Some(&"ROLLBACK"));
+    }
+
+    #[test]
+    fn abandonment_update_failure_rolls_back_without_inserting_replacement() {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut old_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        old_request.recovery_id = "recovery-old-owner".to_string();
+        let old_prepared =
+            LostBinlogRecoveryRecord::prepared(&old_request, latest_checkpoint.clone());
+        let mut replacement_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        let mut store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![old_prepared]);
+        store.fail_abandon = true;
+
+        let error = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect_err("abandonment failure must fail closed");
+
+        assert!(error.contains("abandon"));
+        assert_eq!(
+            format!("{:?}", store.recovery("recovery-old-owner").unwrap().status),
+            "Prepared"
+        );
+        assert!(store.recovery("recovery-replacement").is_none());
+        assert_eq!(store.operations.borrow().last(), Some(&"ROLLBACK"));
+    }
+
+    #[test]
+    fn preparation_commit_failure_rolls_back_old_and_new_recovery_rows() {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut old_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        old_request.recovery_id = "recovery-old-owner".to_string();
+        let old_prepared =
+            LostBinlogRecoveryRecord::prepared(&old_request, latest_checkpoint.clone());
+        let mut replacement_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        let mut store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![old_prepared]);
+        store.fail_commit = true;
+
+        let error = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect_err("transaction commit failure must fail closed");
+
+        assert!(error.contains("preparation commit failure"));
+        assert_eq!(
+            format!("{:?}", store.recovery("recovery-old-owner").unwrap().status),
+            "Prepared"
+        );
+        assert!(store.recovery("recovery-replacement").is_none());
+        assert_eq!(store.operations.borrow().last(), Some(&"ROLLBACK"));
+    }
+
+    #[test]
+    fn prepared_owner_with_committed_status_refuses_replacement() {
+        assert_replacement_refuses_owner_status(LostBinlogRecoveryStatus::Committed);
+    }
+
+    #[test]
+    fn prepared_owner_with_verified_status_refuses_replacement() {
+        assert_replacement_refuses_owner_status(LostBinlogRecoveryStatus::Verified);
+    }
+
+    fn assert_replacement_refuses_owner_status(status: LostBinlogRecoveryStatus) {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut old_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        old_request.recovery_id = "recovery-old-owner".to_string();
+        let mut old_owner =
+            LostBinlogRecoveryRecord::prepared(&old_request, latest_checkpoint.clone());
+        old_owner.status = status;
+        let mut replacement_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        let store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![old_owner]);
+
+        let error = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect_err("terminal owner status must refuse replacement");
+
+        assert!(error.contains("owner"));
+        assert!(store.recovery("recovery-replacement").is_none());
+    }
+
+    #[test]
+    fn prepared_owner_with_abandoned_status_refuses_replacement() {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut old_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        old_request.recovery_id = "recovery-old-owner".to_string();
+        let mut abandoned_owner =
+            LostBinlogRecoveryRecord::prepared(&old_request, latest_checkpoint.clone());
+        abandoned_owner.status = LostBinlogRecoveryStatus::Abandoned;
+        abandoned_owner.abandoned_evidence_json =
+            Some("{\"old_recovery_id\":\"recovery-old-owner\"}".to_string());
+        abandoned_owner.abandoned_at = Some("server-generated".to_string());
+        let mut replacement_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        let store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![abandoned_owner]);
+
+        let error = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect_err("abandoned owner must refuse replacement");
+
+        assert!(error.contains("owner"));
+        assert!(store.recovery("recovery-replacement").is_none());
+    }
+
+    #[test]
+    fn replacement_abandonment_evidence_binds_exact_authorization_without_client_timestamp() {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut old_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        old_request.recovery_id = "recovery-old-owner".to_string();
+        let old_prepared =
+            LostBinlogRecoveryRecord::prepared(&old_request, latest_checkpoint.clone());
+        let mut replacement_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        replacement_request.operator_identity = "retry-operator@example.com".to_string();
+        replacement_request.reason = "retry after stale prepared owner".to_string();
+        let store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![old_prepared]);
+
+        prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect("replacement preparation should succeed");
+
+        let owner = store.recovery("recovery-old-owner").unwrap();
+        let evidence = owner.abandoned_evidence_json.unwrap();
+        for expected in [
+            "old_recovery_id",
+            "replacement_recovery_id",
+            "retry-operator@example.com",
+            "retry after stale prepared owner",
+            "stream-binlog:source-1",
+            "full-replicated-scope-sha256",
+            "source-1#server-id=3",
+            "mysqld-bin.000001",
+            "DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives",
+        ] {
+            assert!(
+                evidence.contains(expected),
+                "missing evidence value: {expected}"
+            );
+        }
+        assert!(!evidence.contains("abandoned_at"));
+    }
+
+    #[test]
+    fn duplicate_new_recovery_id_refuses_replacement() {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        request.recovery_id = "recovery-duplicate".to_string();
+        let existing = LostBinlogRecoveryRecord::prepared(&request, latest_checkpoint.clone());
+        let store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![existing]);
+
+        let error =
+            prepare_lost_binlog_recovery(&FixedBoundaryReader(latest_checkpoint), &store, &request)
+                .expect_err("duplicate recovery ID must refuse replacement");
+
+        assert!(error.contains("already exists"));
+        assert!(store.recovery("recovery-duplicate").is_some());
+    }
+
+    #[test]
+    fn owner_checkpoint_mismatch_refuses_replacement() {
+        let request_checkpoint = checkpoint("mysqld-bin.000002", 200);
+        let owner_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000003", 300);
+        let barrier = production_barrier();
+        let mut owner_request = recovery_request(owner_checkpoint, barrier.clone());
+        owner_request.recovery_id = "recovery-old-owner".to_string();
+        let owner = LostBinlogRecoveryRecord::prepared(&owner_request, latest_checkpoint.clone());
+        let mut replacement_request = recovery_request(request_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        let store = ReplacementRecoveryStore::new(request_checkpoint, barrier, vec![owner]);
+
+        let error = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect_err("owner checkpoint mismatch must refuse replacement");
+
+        assert!(error.contains("owner"));
+        assert!(store.recovery("recovery-replacement").is_none());
+    }
+
+    #[test]
+    fn owner_source_identity_mismatch_refuses_replacement() {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut owner_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        owner_request.recovery_id = "recovery-old-owner".to_string();
+        let mut owner =
+            LostBinlogRecoveryRecord::prepared(&owner_request, latest_checkpoint.clone());
+        owner.source_identity = "different-source#server-id=9".to_string();
+        let mut replacement_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        let store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![owner]);
+
+        let error = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect_err("owner source identity mismatch must refuse replacement");
+
+        assert!(error.contains("owner"));
+        assert!(store.recovery("recovery-replacement").is_none());
+    }
+
+    #[test]
+    fn owner_scope_mismatch_refuses_replacement() {
+        let old_checkpoint = checkpoint("mysqld-bin.000001", 100);
+        let latest_checkpoint = checkpoint("mysqld-bin.000002", 300);
+        let barrier = production_barrier();
+        let mut owner_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        owner_request.recovery_id = "recovery-old-owner".to_string();
+        owner_request.scope_hash = "old-scope-hash".to_string();
+        let owner = LostBinlogRecoveryRecord::prepared(&owner_request, latest_checkpoint.clone());
+        let mut replacement_request = recovery_request(old_checkpoint.clone(), barrier.clone());
+        replacement_request.recovery_id = "recovery-replacement".to_string();
+        replacement_request.scope_hash = "new-scope-hash".to_string();
+        let store = ReplacementRecoveryStore::new(old_checkpoint, barrier, vec![owner]);
+
+        let error = prepare_lost_binlog_recovery(
+            &FixedBoundaryReader(latest_checkpoint),
+            &store,
+            &replacement_request,
+        )
+        .expect_err("owner scope mismatch must refuse replacement");
+
+        assert!(error.contains("owner"));
+        assert!(store.recovery("recovery-replacement").is_none());
+    }
+
+    #[test]
+    fn recovery_schema_has_abandoned_history_and_one_active_barrier_owner() {
+        let bootstrap = include_str!("../docs/stream-recovery-records-bootstrap.sql");
+        assert!(bootstrap.contains("abandoned_evidence_json"));
+        assert!(bootstrap.contains("abandoned_at"));
+        assert!(bootstrap.contains("active_barrier_identity"));
+        assert!(bootstrap.contains("stream_recovery_active_barrier"));
+        assert!(bootstrap.contains("'abandoned'"));
+
+        let migration_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/stream-recovery-records-abandoned-replacement-migration.sql"
+        );
+        let migration = std::fs::read_to_string(migration_path)
+            .expect("abandoned replacement migration must be tracked");
+        assert!(migration.contains("stream_recovery_records_chk_6"));
+        assert!(migration.contains("stream_recovery_exact_barrier"));
+        assert!(migration.contains("stream_recovery_active_barrier"));
+        assert!(migration.contains("prepared -> abandoned"));
+    }
+
+    #[test]
     fn prepares_recovery_with_latest_source_boundary_and_exact_old_state() {
         let old = checkpoint("mysqld-bin.000001", 100);
         let latest = checkpoint("mysqld-bin.000002", 300);
@@ -1323,6 +1932,7 @@ mod tests {
                 "LOCK_CHECKPOINT",
                 "LOCK_BARRIER",
                 "LOCK_RECOVERY",
+                "LOCK_ACTIVE_OWNER",
                 "INSERT_RECOVERY",
                 "COMMIT"
             ]

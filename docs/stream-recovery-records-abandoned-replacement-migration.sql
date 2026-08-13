@@ -1,59 +1,59 @@
+-- Target-only migration for the live stream_recovery_records schema observed on
+-- 2026-08-13. It intentionally refuses a second run before making changes.
 -- Run with target admin credentials while stream-binlog is stopped.
--- Recovery identity fields and prepared evidence are immutable. The only allowed
--- transitions are prepared -> abandoned/committed and committed -> verified.
--- Abandoned history remains durable but does not own the active barrier identity.
-CREATE DATABASE IF NOT EXISTS cdc;
+-- The existing prepared row for recovery_id
+-- cdc-lost-binlog-2026-08-09-drop-trigger must remain present and exact.
+-- This migration changes only prepared -> abandoned/committed and committed -> verified guards.
+DELIMITER //
 
-CREATE TABLE IF NOT EXISTS cdc.stream_recovery_records (
-    recovery_id VARCHAR(191) NOT NULL,
-    checkpoint_name VARCHAR(512) NOT NULL,
-    source_identity VARCHAR(512) NOT NULL,
-    scope_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-    old_checkpoint_json LONGTEXT NOT NULL,
-    new_checkpoint_json LONGTEXT NOT NULL,
-    old_barrier_source_identity VARCHAR(512) NOT NULL,
-    old_barrier_file VARCHAR(255) NOT NULL,
-    old_barrier_start_position BIGINT UNSIGNED NOT NULL,
-    old_barrier_end_position BIGINT UNSIGNED NOT NULL,
-    old_barrier_raw_sql LONGTEXT NOT NULL,
-    old_barrier_raw_sql_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin
-        GENERATED ALWAYS AS (SHA2(old_barrier_raw_sql, 256)) STORED NOT NULL,
-    barrier_identity CHAR(64) CHARACTER SET ascii COLLATE ascii_bin
-        GENERATED ALWAYS AS (
-            SHA2(CONCAT(
-                UNHEX(LPAD(HEX(LENGTH(old_barrier_source_identity)), 16, '0')),
-                CONVERT(old_barrier_source_identity USING binary),
-                UNHEX(LPAD(HEX(LENGTH(old_barrier_file)), 16, '0')),
-                CONVERT(old_barrier_file USING binary),
-                UNHEX(LPAD(HEX(old_barrier_start_position), 16, '0')),
-                UNHEX(LPAD(HEX(old_barrier_end_position), 16, '0')),
-                CONVERT(old_barrier_raw_sql_sha256 USING binary)
-            ), 256)
-        ) STORED NOT NULL,
-    operator_identity VARCHAR(255) NOT NULL,
-    reason TEXT NOT NULL,
-    prepared_evidence_json LONGTEXT NOT NULL,
-    status VARCHAR(16) NOT NULL,
-    prepared_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    committed_evidence_json LONGTEXT NULL,
-    committed_at TIMESTAMP(6) NULL,
-    verified_evidence_json LONGTEXT NULL,
-    verified_at TIMESTAMP(6) NULL,
-    abandoned_evidence_json LONGTEXT NULL,
-    abandoned_at TIMESTAMP(6) NULL,
-    active_barrier_identity CHAR(64) CHARACTER SET ascii COLLATE ascii_bin
+DROP PROCEDURE IF EXISTS cdc.assert_stream_recovery_abandoned_replacement_preflight//
+CREATE PROCEDURE cdc.assert_stream_recovery_abandoned_replacement_preflight()
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'cdc'
+          AND table_name = 'stream_recovery_records'
+          AND column_name = 'abandoned_evidence_json'
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'abandoned replacement migration already applied; rerun refused';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM cdc.stream_recovery_records
+        WHERE status IN ('prepared', 'committed', 'verified')
+        GROUP BY old_barrier_source_identity,
+                 old_barrier_file,
+                 old_barrier_start_position,
+                 old_barrier_end_position,
+                 old_barrier_raw_sql_sha256
+        HAVING COUNT(*) > 1
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'duplicate active stream recovery barrier owners require manual review';
+    END IF;
+END//
+
+CALL cdc.assert_stream_recovery_abandoned_replacement_preflight()//
+DROP PROCEDURE cdc.assert_stream_recovery_abandoned_replacement_preflight//
+DELIMITER ;
+
+ALTER TABLE cdc.stream_recovery_records
+    ADD COLUMN abandoned_evidence_json LONGTEXT NULL AFTER verified_at,
+    ADD COLUMN abandoned_at TIMESTAMP(6) NULL AFTER abandoned_evidence_json,
+    ADD COLUMN active_barrier_identity CHAR(64) CHARACTER SET ascii COLLATE ascii_bin
         GENERATED ALWAYS AS (
             CASE
                 WHEN status IN ('prepared', 'committed', 'verified') THEN barrier_identity
                 ELSE NULL
             END
-        ) STORED,
-    CHECK (JSON_VALID(old_checkpoint_json)),
-    CHECK (JSON_VALID(new_checkpoint_json)),
-    CHECK (JSON_VALID(prepared_evidence_json)),
-    CHECK (committed_evidence_json IS NULL OR JSON_VALID(committed_evidence_json)),
-    CHECK (verified_evidence_json IS NULL OR JSON_VALID(verified_evidence_json)),
-    CONSTRAINT stream_recovery_records_chk_6 CHECK (
+        ) STORED AFTER abandoned_at;
+
+ALTER TABLE cdc.stream_recovery_records
+    DROP CHECK stream_recovery_records_chk_6,
+    ADD CONSTRAINT stream_recovery_records_chk_6 CHECK (
         status IN ('prepared', 'committed', 'verified', 'abandoned')
         AND (
             (
@@ -69,12 +69,16 @@ CREATE TABLE IF NOT EXISTS cdc.stream_recovery_records (
                 AND abandoned_at IS NULL
             )
         )
-    ),
-    CHECK (old_barrier_end_position > old_barrier_start_position),
-    PRIMARY KEY (recovery_id),
-    UNIQUE KEY stream_recovery_active_barrier (active_barrier_identity),
-    KEY stream_recovery_checkpoint_status (checkpoint_name, status)
-);
+    );
+
+-- Add the nullable active identity before removing the old all-history unique key.
+-- Multiple abandoned rows may then share the historical barrier while active rows
+-- remain unique because MySQL permits multiple NULLs in a unique index.
+ALTER TABLE cdc.stream_recovery_records
+    ADD UNIQUE KEY stream_recovery_active_barrier (active_barrier_identity);
+
+ALTER TABLE cdc.stream_recovery_records
+    DROP INDEX stream_recovery_exact_barrier;
 
 DELIMITER //
 DROP TRIGGER IF EXISTS cdc.stream_recovery_records_insert_guard//
@@ -160,43 +164,39 @@ BEGIN
             SET MESSAGE_TEXT = 'stream recovery identity is immutable and status transition is not allowed';
     END IF;
 END//
-
-DROP TRIGGER IF EXISTS cdc.stream_recovery_records_delete_guard//
-CREATE TRIGGER cdc.stream_recovery_records_delete_guard
-BEFORE DELETE ON cdc.stream_recovery_records
-FOR EACH ROW
-BEGIN
-    SIGNAL SQLSTATE '45000'
-        SET MESSAGE_TEXT = 'stream recovery records are immutable';
-END//
-
-DROP PROCEDURE IF EXISTS cdc.stream_recovery_records_trigger_inventory//
-CREATE DEFINER=CURRENT_USER PROCEDURE cdc.stream_recovery_records_trigger_inventory()
-SQL SECURITY DEFINER
-READS SQL DATA
-BEGIN
-    SELECT
-        trigger_name,
-        event_object_schema,
-        event_object_table,
-        event_manipulation,
-        action_timing,
-        action_statement,
-        action_order
-    FROM information_schema.triggers
-    WHERE event_object_schema = 'cdc'
-      AND event_object_table = 'stream_recovery_records'
-    ORDER BY event_manipulation, action_order;
-END//
 DELIMITER ;
 
-GRANT SELECT, INSERT, UPDATE
-    ON cdc.stream_recovery_records
-    TO 'cdc_stream'@'%';
+DELIMITER //
+DROP PROCEDURE IF EXISTS cdc.assert_stream_recovery_abandoned_replacement_postflight//
+CREATE PROCEDURE cdc.assert_stream_recovery_abandoned_replacement_postflight()
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM cdc.stream_recovery_records
+        WHERE recovery_id = 'cdc-lost-binlog-2026-08-09-drop-trigger'
+          AND status = 'prepared'
+          AND active_barrier_identity IS NOT NULL
+          AND active_barrier_identity = barrier_identity
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'current prepared recovery is not active after abandoned replacement migration';
+    END IF;
 
-GRANT EXECUTE
-    ON PROCEDURE cdc.stream_recovery_records_trigger_inventory
-    TO 'cdc_stream'@'%';
+    IF EXISTS (
+        SELECT 1
+        FROM cdc.stream_recovery_records
+        WHERE status IN ('prepared', 'committed', 'verified')
+        GROUP BY active_barrier_identity
+        HAVING COUNT(*) > 1
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'active barrier ownership is not unique after migration';
+    END IF;
+END//
 
-SHOW CREATE PROCEDURE cdc.stream_recovery_records_trigger_inventory;
-SHOW GRANTS FOR 'cdc_stream'@'%';
+CALL cdc.assert_stream_recovery_abandoned_replacement_postflight()//
+DROP PROCEDURE cdc.assert_stream_recovery_abandoned_replacement_postflight//
+DELIMITER ;
+
+SHOW CREATE TABLE cdc.stream_recovery_records;
+SHOW TRIGGERS FROM cdc LIKE 'stream_recovery_records';
