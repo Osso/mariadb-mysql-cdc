@@ -23,12 +23,19 @@ fn formats_mysql_values_like_snapshot_text_rows() {
 }
 
 #[test]
-fn parses_consistent_snapshot_coordinate_from_mariadb_session_variables() {
+fn consistent_snapshot_uses_exact_mariadb_master_status_query() {
+    assert_eq!(consistent_snapshot_coordinate_query(), "SHOW MASTER STATUS");
+}
+
+#[test]
+fn parses_mariadb_master_status_row_shape() {
     let checkpoint = parse_consistent_snapshot_checkpoint(vec![vec![
         Some("mysqld-bin.000123".to_string()),
         Some("456".to_string()),
+        Some(String::new()),
+        Some(String::new()),
     ]])
-    .expect("valid MariaDB consistent snapshot coordinate");
+    .expect("valid MariaDB SHOW MASTER STATUS row");
 
     assert_eq!(checkpoint.source_file, "mysqld-bin.000123");
     assert_eq!(checkpoint.source_position, 456);
@@ -39,11 +46,41 @@ fn parses_consistent_snapshot_coordinate_from_mariadb_session_variables() {
 }
 
 #[test]
-fn rejects_missing_consistent_snapshot_coordinate() {
-    let error = parse_consistent_snapshot_checkpoint(Vec::new())
-        .expect_err("missing MariaDB snapshot coordinate must fail closed");
+fn rejects_invalid_mariadb_master_status_shapes() {
+    let cases = [
+        (Vec::new(), "MariaDB snapshot coordinate is missing"),
+        (
+            vec![vec![None, Some("456".to_string()), None, None]],
+            "MariaDB snapshot coordinate file is missing",
+        ),
+        (
+            vec![vec![
+                Some("mysqld-bin.000123".to_string()),
+                None,
+                None,
+                None,
+            ]],
+            "MariaDB snapshot coordinate position is missing",
+        ),
+        (
+            vec![vec![
+                Some("mysqld-bin.000123".to_string()),
+                Some("not-a-number".to_string()),
+                None,
+                None,
+            ]],
+            "invalid MariaDB snapshot coordinate position",
+        ),
+    ];
 
-    assert!(error.to_string().contains("snapshot coordinate"));
+    for (rows, expected_message) in cases {
+        let error = parse_consistent_snapshot_checkpoint(rows)
+            .expect_err("invalid MariaDB SHOW MASTER STATUS row must fail closed");
+        assert!(
+            error.to_string().contains(expected_message),
+            "expected {expected_message:?}, got {error}"
+        );
+    }
 }
 
 #[test]

@@ -194,15 +194,17 @@ impl PersistentMySqlSource {
     pub(crate) fn begin_consistent_snapshot(&self) -> Result<Checkpoint, SnapshotError> {
         self.execute_session_sql("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")?;
         self.execute_session_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
-        let rows = self.query_rows_as_strings(
-            "SELECT @@session.binlog_snapshot_file, @@session.binlog_snapshot_position",
-        )?;
+        let rows = self.query_rows_as_strings(consistent_snapshot_coordinate_query())?;
         parse_consistent_snapshot_checkpoint(rows)
     }
 
     pub(crate) fn rollback_consistent_snapshot(&self) -> Result<(), SnapshotError> {
         self.execute_session_sql("ROLLBACK")
     }
+}
+
+fn consistent_snapshot_coordinate_query() -> &'static str {
+    "SHOW MASTER STATUS"
 }
 
 fn parse_consistent_snapshot_checkpoint(
