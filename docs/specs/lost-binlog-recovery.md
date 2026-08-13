@@ -14,7 +14,7 @@
 ### Anchored reconciliation
 
 - [x] Acquire the stream lease before recovery state changes.
-- [x] Acquire the source write fence before any source schema/data read; while it is held, open one MariaDB `REPEATABLE READ` consistent snapshot, read its current binlog coordinate, and capture source schema evidence; target reads and data reconciliation occur after unlock.
+- [x] Acquire the source write fence before any source schema/data read; while it is held, open one MariaDB `REPEATABLE READ` consistent snapshot and execute `SHOW MASTER STATUS` on that same snapshot connection to capture its binlog coordinate and source schema evidence; target reads and data reconciliation occur after unlock.
 - [x] Keep that source snapshot transaction open for full-scope source data reads, insert, update, delete, and verification phases.
 - [x] Capture source table, index, foreign-key, check, view, trigger, routine, and event evidence through that same snapshot connection; independent live source metadata reads are forbidden.
 - [x] Reconcile target data, including target-only orphan rows, before creating foreign keys.

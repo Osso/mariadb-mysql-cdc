@@ -24,11 +24,12 @@ An explicitly supplied scope hash must match; an omitted hash is filled from the
 current source inventory and recorded as evidence.
 
 The stream lease is acquired before transition. A dedicated MariaDB connection
-briefly executes `FLUSH TABLES WITH READ LOCK` while another connection opens
-one `REPEATABLE READ` consistent snapshot and reads its current binlog
-coordinate. The write fence is then released, but that one source transaction
-remains open for the complete configured-scope insert, update, delete, and
-verification phases. Independent live reads are not recovery evidence.
+briefly executes `FLUSH TABLES WITH READ LOCK` while the snapshot connection
+opens one `REPEATABLE READ` consistent snapshot and executes `SHOW MASTER STATUS`
+on that same connection to capture its binlog coordinate. The write fence is
+then released, but that one source transaction remains open for the complete
+configured-scope insert, update, delete, and verification phases. Independent
+live reads are not recovery evidence.
 
 A prepared immutable row is inserted into `cdc.stream_recovery_records` with the
 old state, captured coordinate, source identity, scope hash, operator, reason,

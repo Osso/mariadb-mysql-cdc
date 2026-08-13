@@ -36,9 +36,11 @@ optional `start_after` primary key, and limit so row-level reports can be paged.
    scope. The source boundary is read from one MariaDB `REPEATABLE READ`
    consistent snapshot opened behind a brief `FLUSH TABLES WITH READ LOCK`.
 2. **Commit:** the same snapshot transaction supplies every full-scope
-   insert/update/delete/verify comparison. Any skipped table, unsupported
-   engine, unresolved conflict, schema difference, count/content mismatch, or
-   scope-hash change blocks the checkpoint transition.
+   insert/update/delete/verify comparison. Its coordinate comes from
+   `SHOW MASTER STATUS` on that snapshot connection while the source write
+   fence is held. Any skipped table, unsupported engine, unresolved conflict,
+   schema difference, count/content mismatch, or scope-hash change blocks the
+   checkpoint transition.
 
 The committed record retains the old checkpoint, exact historical barrier, new
 coordinate, source/scope identity, operator, reason, and measured evidence.
