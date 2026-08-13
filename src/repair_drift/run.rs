@@ -1,8 +1,9 @@
 use super::config::{parse_repair_drift_config, validate_repair_drift_config};
 use super::equivalent_conflicts::reconcile_exact_equivalent_conflicts;
 use super::plan::{
-    RepairTableInputs, build_runtime_repair_plan, collect_full_repair_table_inputs,
-    collect_repair_table_inputs, drifted_table_names, ordered_candidate_tables,
+    RepairTableInputs, build_runtime_recovery_repair_plan, build_runtime_repair_plan,
+    collect_full_repair_table_inputs, collect_repair_table_inputs, drifted_table_names,
+    ordered_candidate_tables,
 };
 use super::{
     EquivalentConflictReport, RepairDriftConfig, RepairDriftError, RepairDriftReport,
@@ -96,7 +97,8 @@ fn prepare_consistent_snapshot_repair(
     validate_repair_drift_config(config).map_err(RepairDriftError::Config)?;
     validate_complete_snapshot_repair_config(config)?;
     let run_id = configured_run_id(config);
-    let plan = build_runtime_repair_plan(config, &run_id, source_inventory, target_inventory)?;
+    let plan =
+        build_runtime_recovery_repair_plan(config, &run_id, source_inventory, target_inventory)?;
     let tables = ordered_candidate_tables(config, source_inventory, &plan)?;
     let (source_counts, target_counts) =
         read_snapshot_repair_counts(config, shared_source, &tables)?;

@@ -1142,8 +1142,12 @@ pub(crate) fn run_schema_convergence_from_source_evidence(
     target: crate::live::TargetMySqlConfig,
 ) -> Result<SchemaConvergenceReport, String> {
     let target_reader = MariaDbInventoryReader::new(inventory_config_target(&target));
-    let target_inventory = build_inventory(&target.database, &target_reader)
+    let initial_target_inventory = build_inventory(&target.database, &target_reader)
         .map_err(|error| format!("target schema inventory failed: {error}"))?;
+    drop_target_only_tables(&target, &evidence.inventory, &initial_target_inventory)?;
+    let target_inventory = build_inventory(&target.database, &target_reader).map_err(|error| {
+        format!("target schema inventory after stale-table removal failed: {error}")
+    })?;
     let target_checks = CheckConstraintReader::new(inventory_config_target(&target))
         .read(&target.database, None)?;
     let target_canonical_foreign_keys =
@@ -1161,6 +1165,98 @@ pub(crate) fn run_schema_convergence_from_source_evidence(
         target_canonical_foreign_keys: &target_canonical_foreign_keys,
         target: &target,
     })
+}
+
+pub(crate) fn target_only_table_drop_statements(
+    source: &SchemaInventory,
+    target: &SchemaInventory,
+) -> Result<Vec<String>, String> {
+    let source_tables = source_table_names(source);
+    let extra_tables = target_only_table_names(target, &source_tables);
+    if extra_tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    let extra_set = extra_tables.iter().map(String::as_str).collect();
+    reject_source_child_of_target_only_parent(target, &source_tables, &extra_set)?;
+    let ordered = target_only_table_drop_order(target, &extra_tables)?;
+    Ok(ordered
+        .into_iter()
+        .map(|table| format!("DROP TABLE {}", crate::mysql_support::quote_ident(&table)))
+        .collect())
+}
+
+fn source_table_names(source: &SchemaInventory) -> BTreeSet<&str> {
+    source
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect()
+}
+
+fn target_only_table_names(
+    target: &SchemaInventory,
+    source_tables: &BTreeSet<&str>,
+) -> Vec<String> {
+    target
+        .tables
+        .iter()
+        .map(|table| table.name.clone())
+        .filter(|table| !source_tables.contains(table.as_str()))
+        .collect()
+}
+
+fn reject_source_child_of_target_only_parent(
+    target: &SchemaInventory,
+    source_tables: &BTreeSet<&str>,
+    extra_tables: &BTreeSet<&str>,
+) -> Result<(), String> {
+    let Some(foreign_key) = target.foreign_keys.iter().find(|foreign_key| {
+        extra_tables.contains(foreign_key.referenced_table.as_str())
+            && source_tables.contains(foreign_key.table.as_str())
+    }) else {
+        return Ok(());
+    };
+    Err(format!(
+        "target-only parent table `{}` is referenced by source table `{}` through foreign key `{}`",
+        foreign_key.referenced_table, foreign_key.table, foreign_key.name
+    ))
+}
+
+fn target_only_table_drop_order(
+    target: &SchemaInventory,
+    extra_tables: &[String],
+) -> Result<Vec<String>, String> {
+    let (mut ordered, cyclic) = dependency_order(target, extra_tables);
+    if !cyclic.is_empty() {
+        return Err(format!(
+            "target-only table dependency cycle blocks removal: {}",
+            cyclic.join(", ")
+        ));
+    }
+    ordered.reverse();
+    Ok(ordered)
+}
+
+fn drop_target_only_tables(
+    target: &crate::live::TargetMySqlConfig,
+    source: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<(), String> {
+    let statements = target_only_table_drop_statements(source, target_inventory)?;
+    if statements.is_empty() {
+        return Ok(());
+    }
+    let executor = crate::mysql_client::PersistentTargetExecutor::new(target)
+        .map_err(|error| format!("connect target for stale-table removal: {error}"))?;
+    for sql in statements {
+        executor
+            .execute(&SqlStatement {
+                sql: sql.clone(),
+                params: Vec::new(),
+            })
+            .map_err(|error| format!("drop target-only table with `{sql}`: {error}"))?;
+    }
+    Ok(())
 }
 
 struct SchemaConvergenceInputs<'a> {
@@ -3203,6 +3299,47 @@ mod tests {
         assert_eq!(plan.tables[0].status, TableSchemaStatus::Planned);
         assert!(plan.tables[0].blockers[0].contains("coercion preflight"));
         assert_eq!(plan.tables[1].status, TableSchemaStatus::Planned);
+    }
+
+    #[test]
+    fn recovery_drops_legacy_tables_in_child_before_parent_order() {
+        let source = inventory(
+            vec![
+                table("llm_conversations", vec![], vec![]),
+                table("llm_messages", vec![], vec![]),
+            ],
+            vec![],
+        );
+        let target = inventory(
+            vec![
+                table("llm_conversations", vec![], vec![]),
+                table("llm_messages", vec![], vec![]),
+                table("capy_conversations", vec![], vec![]),
+                table("capy_messages", vec![], vec![]),
+                table("capy_message_attachments", vec![], vec![]),
+            ],
+            vec![
+                foreign_key("capy_messages", "capy_conversations"),
+                foreign_key("capy_message_attachments", "capy_messages"),
+            ],
+        );
+
+        let statements =
+            target_only_table_drop_statements(&source, &target).expect("legacy table drop plan");
+
+        assert_eq!(
+            statements,
+            vec![
+                "DROP TABLE `capy_message_attachments`",
+                "DROP TABLE `capy_messages`",
+                "DROP TABLE `capy_conversations`",
+            ]
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|statement| !statement.contains("FOREIGN_KEY_CHECKS"))
+        );
     }
 
     #[test]

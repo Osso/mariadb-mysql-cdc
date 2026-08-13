@@ -389,6 +389,41 @@ pub(crate) fn build_runtime_repair_plan(
     build_plan(config, run_id, source, target)
 }
 
+pub(crate) fn build_runtime_recovery_repair_plan(
+    config: &RepairDriftConfig,
+    run_id: &str,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<RepairPlan, RepairDriftError> {
+    let source = build_source_repair_inventory(config, source_inventory)?;
+    let target = build_target_repair_inventory(config, target_inventory)?;
+    let target = DependencyRepairScopes {
+        insert_update: source_scoped_target_repair_inventory(
+            &source.insert_update,
+            &target.insert_update,
+        ),
+        delete: source_scoped_target_repair_inventory(&source.delete, &target.delete),
+    };
+    build_plan(config, run_id, source, target)
+}
+
+fn source_scoped_target_repair_inventory(
+    source: &RepairInventory,
+    target: &RepairInventory,
+) -> RepairInventory {
+    let source_tables = source.tables.iter().collect::<BTreeSet<_>>();
+    RepairInventory {
+        schema: target.schema.clone(),
+        tables: target
+            .tables
+            .iter()
+            .filter(|table| source_tables.contains(table))
+            .cloned()
+            .collect(),
+        foreign_keys: source.foreign_keys.clone(),
+    }
+}
+
 fn build_source_repair_inventory(
     config: &RepairDriftConfig,
     inventory: &SchemaInventory,
@@ -808,5 +843,27 @@ mod tests {
             plan.tables
         );
         assert!(!plan.tables.contains(&"unrelated".to_string()));
+    }
+
+    #[test]
+    fn recovery_repair_plan_ignores_target_only_tables_but_selects_every_source_table() {
+        let source = repair_inventory(
+            &["llm_conversations", "llm_messages"],
+            vec![fk("llm_messages", "llm_conversations")],
+        );
+        let target = repair_inventory(
+            &["llm_conversations", "llm_messages", "capy_conversations"],
+            vec![fk("llm_messages", "llm_conversations")],
+        );
+
+        assert!(build_repair_plan("generic", "source", "target", &source, &target).is_err());
+
+        let scoped_target = source_scoped_target_repair_inventory(&source, &target);
+        let plan = build_repair_plan("recovery", "source", "target", &source, &scoped_target)
+            .expect("target-only recovery tables must not block source repair");
+
+        assert_eq!(plan.tables, vec!["llm_conversations", "llm_messages"]);
+        assert_eq!(plan.insert_order, vec!["llm_conversations", "llm_messages"]);
+        assert_eq!(plan.delete_order, vec!["llm_messages", "llm_conversations"]);
     }
 }

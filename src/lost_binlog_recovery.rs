@@ -15,6 +15,7 @@ use crate::sync_schema::{
 use crate::table_sync::SyncMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -582,6 +583,8 @@ fn commit_anchored_recovery(
     schema_report: crate::sync_schema::SchemaConvergenceReport,
 ) -> Result<RecoverLostBinlogReport, String> {
     require_unchanged_source_scope(source, &config.source.database, &prepared.scope_hash)?;
+    let target_inventory = read_target_inventory(&config.target)?;
+    require_exact_table_inventory(&prepared.source_evidence.inventory, &target_inventory)?;
     let proof = reconciliation_proof(
         &prepared.request,
         &repair,
@@ -683,6 +686,40 @@ fn require_unchanged_source_scope(
         return Ok(());
     }
     Err("source schema changed during the consistent snapshot repair".to_string())
+}
+
+fn require_exact_table_inventory(
+    source: &SchemaInventory,
+    target: &SchemaInventory,
+) -> Result<(), String> {
+    let (missing, extras) = table_inventory_difference(source, target);
+    if missing.is_empty() && extras.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "final target table inventory differs: missing={} target_only={}",
+        missing.join(","),
+        extras.join(",")
+    ))
+}
+
+fn table_inventory_difference(
+    source: &SchemaInventory,
+    target: &SchemaInventory,
+) -> (Vec<String>, Vec<String>) {
+    let source_tables = source
+        .tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect::<BTreeSet<_>>();
+    let target_tables = target
+        .tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect::<BTreeSet<_>>();
+    let missing = source_tables.difference(&target_tables).cloned().collect();
+    let extras = target_tables.difference(&source_tables).cloned().collect();
+    (missing, extras)
 }
 
 fn reconciliation_proof(
@@ -1205,6 +1242,62 @@ mod tests {
     }
 
     #[test]
+    fn recovery_schema_failure_stops_before_commit() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let result = run_recovery_phases(
+            {
+                let steps = Rc::clone(&steps);
+                move || {
+                    steps.borrow_mut().push("snapshot");
+                    Ok(())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                move |_snapshot| {
+                    steps.borrow_mut().push("reconcile_data");
+                    Ok(())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                move |_snapshot, _repair| {
+                    steps.borrow_mut().push("converge_schema");
+                    Err::<(), String>("legacy table drop failed".to_string())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                move |_snapshot, _repair, _schema| {
+                    steps.borrow_mut().push("commit");
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result, Err("legacy table drop failed".to_string()));
+        assert_eq!(
+            steps.borrow().as_slice(),
+            ["snapshot", "reconcile_data", "converge_schema"]
+        );
+    }
+
+    #[test]
+    fn final_target_inventory_extras_block_recovery_proof() {
+        let source = inventory_with_table_names(&["llm_conversations", "llm_messages"]);
+        let target = inventory_with_table_names(&[
+            "llm_conversations",
+            "llm_messages",
+            "capy_conversations",
+        ]);
+
+        let error = require_exact_table_inventory(&source, &target)
+            .expect_err("target-only table must block recovery proof");
+
+        assert!(error.contains("capy_conversations"));
+    }
+
+    #[test]
     fn prepares_recovery_with_latest_source_boundary_and_exact_old_state() {
         let old = checkpoint("mysqld-bin.000001", 100);
         let latest = checkpoint("mysqld-bin.000002", 300);
@@ -1368,6 +1461,29 @@ mod tests {
         assert!(sql.contains("recovery.old_barrier_start_position = journal.event_start_position"));
         assert!(sql.contains("recovery.old_barrier_end_position = journal.event_end_position"));
         assert!(sql.contains("recovery.old_barrier_raw_sql_sha256 = SHA2(journal.raw_sql, 256)"));
+    }
+
+    fn inventory_with_table_names(names: &[&str]) -> SchemaInventory {
+        SchemaInventory {
+            schema: "globalcomix".to_string(),
+            tables: names
+                .iter()
+                .map(|name| crate::inventory::TableInventory {
+                    name: (*name).to_string(),
+                    table_type: "BASE TABLE".to_string(),
+                    engine: Some("InnoDB".to_string()),
+                    collation: None,
+                    primary_key: vec!["id".to_string()],
+                    columns: Vec::new(),
+                })
+                .collect(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            views: Vec::new(),
+            triggers: Vec::new(),
+            routines: Vec::new(),
+            events: Vec::new(),
+        }
     }
 
     fn checkpoint(file: &str, position: u64) -> Checkpoint {
