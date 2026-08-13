@@ -180,6 +180,24 @@ fn planner_deletes_child_before_parent_and_inserts_parent_before_child() {
 }
 
 #[test]
+fn planner_ignores_comics_facets_groups_options_self_reference_for_dependency_ordering() {
+    let table = "comics_facets_groups_options";
+    let inventory = repair_inventory(&[table], &[fk(table, table)]);
+
+    let plan = build_repair_plan(
+        "run-self-reference",
+        "source",
+        "target",
+        &inventory,
+        &inventory,
+    )
+    .expect("self-referential foreign keys do not create inter-table cycles");
+
+    assert_eq!(plan.insert_order, vec![table]);
+    assert_eq!(plan.delete_order, vec![table]);
+}
+
+#[test]
 fn cycle_blocks_before_any_mutation() {
     let inventory = repair_inventory(&["a", "b"], &[fk("a", "b"), fk("b", "a")]);
     let error = build_repair_plan("run-cycle", "source", "target", &inventory, &inventory)

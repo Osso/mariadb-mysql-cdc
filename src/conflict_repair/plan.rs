@@ -188,7 +188,10 @@ fn build_dependency_graph(
     let mut indegree: BTreeMap<String, usize> =
         table_set.iter().map(|table| (table.clone(), 0)).collect();
     let mut children = BTreeMap::new();
-    for fk in foreign_keys.iter().filter(|fk| fk.enforced) {
+    for fk in foreign_keys
+        .iter()
+        .filter(|fk| fk.enforced && fk.child_table != fk.parent_table)
+    {
         validate_dependency(table_set, fk)?;
         if children
             .entry(fk.parent_table.clone())
@@ -205,9 +208,6 @@ fn validate_dependency(
     table_set: &BTreeSet<String>,
     fk: &CanonicalForeignKey,
 ) -> Result<(), RepairPlanError> {
-    if fk.child_table == fk.parent_table {
-        return Err(RepairPlanError::Cycle(vec![fk.child_table.clone()]));
-    }
     if table_set.contains(&fk.child_table) && table_set.contains(&fk.parent_table) {
         Ok(())
     } else {
