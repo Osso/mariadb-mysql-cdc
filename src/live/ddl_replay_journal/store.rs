@@ -101,7 +101,6 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
             .connect()?
             .query_first::<(String, u64, String), _>(build_barrier_select_sql(
                 &self.table,
-                crate::lost_binlog_recovery_store::DEFAULT_RECOVERY_TABLE,
                 source_identity,
             ))
             .map_err(mysql_error)?;
@@ -366,21 +365,16 @@ pub fn build_prepare_sql(table: &str, event: &DdlEvent, evidence: &DdlSemanticEv
     )
 }
 
-pub fn build_barrier_select_sql(
-    journal_table: &str,
-    recovery_table: &str,
-    source_identity: &str,
-) -> String {
+pub fn build_barrier_select_sql(journal_table: &str, source_identity: &str) -> String {
     let escaped_identity = source_identity
         .replace('=', "==")
         .replace('%', "=%")
         .replace('_', "=_");
     let pattern = format!("{escaped_identity}#server-id=%");
     format!(
-        "SELECT journal.binlog_file,journal.event_start_position,journal.status FROM {} journal WHERE journal.source_identity LIKE {} ESCAPE '=' AND journal.status IN ('translation_pending','prepared','blocked') AND NOT EXISTS (SELECT 1 FROM {} recovery WHERE recovery.status IN ('committed','verified') AND recovery.old_barrier_source_identity = journal.source_identity AND recovery.old_barrier_file = journal.binlog_file AND recovery.old_barrier_start_position = journal.event_start_position AND recovery.old_barrier_end_position = journal.event_end_position AND recovery.old_barrier_raw_sql_sha256 = SHA2(journal.raw_sql, 256)) ORDER BY journal.binlog_file,journal.event_start_position LIMIT 1",
+        "SELECT binlog_file,event_start_position,status FROM {} WHERE source_identity LIKE {} ESCAPE '=' AND status IN ('translation_pending','prepared','blocked') ORDER BY binlog_file,event_start_position LIMIT 1",
         quote_identifier_path(journal_table),
         quote_sql_literal(&pattern),
-        quote_identifier_path(recovery_table),
     )
 }
 
