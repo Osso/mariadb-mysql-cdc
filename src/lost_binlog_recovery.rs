@@ -471,7 +471,7 @@ pub struct ResyncStreamReport {
 
 pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamReport, String> {
     let source = Rc::new(
-        PersistentMySqlSource::new(&config.source)
+        PersistentMySqlSource::new_without_operation_timeout(&config.source)
             .map_err(|error| format!("connect resync source: {error}"))?,
     );
     let start_checkpoint = source

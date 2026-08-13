@@ -4,7 +4,9 @@ use crate::live::{
     should_replace_divergent_primary,
 };
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::{apply_default_mysql_network_bounds, target_mysql_opts};
+use crate::mysql_support::{
+    apply_default_mysql_network_bounds, apply_mysql_connection_liveness, target_mysql_opts,
+};
 use crate::snapshot::{ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource};
 use crate::table_sync::progress::{
     build_add_total_rows_column_sql, build_create_progress_schema_sql,
@@ -104,6 +106,19 @@ impl PersistentMySqlSource {
         )
         .map_err(SnapshotError::InvalidTable)?;
         Self::new_with_opts(opts)
+    }
+
+    pub(crate) fn new_without_operation_timeout(
+        config: &MySqlConnectionConfig,
+    ) -> Result<Self, SnapshotError> {
+        let builder = OptsBuilder::default()
+            .ip_or_hostname(Some(config.host.clone()))
+            .tcp_port(config.port)
+            .user(Some(config.user.clone()))
+            .pass(Some(config.password.clone()))
+            .db_name(Some(config.database.clone()))
+            .prefer_socket(false);
+        Self::new_with_opts(Opts::from(apply_mysql_connection_liveness(builder)))
     }
 
     pub fn count_rows(&self, table: &str) -> Result<u64, SnapshotError> {
