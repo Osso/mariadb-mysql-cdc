@@ -459,6 +459,7 @@ pub struct ResyncStreamConfig {
     pub checkpoint_table: String,
     pub progress_table: String,
     pub chunk_size: usize,
+    pub parallelism: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -470,6 +471,7 @@ pub struct ResyncStreamReport {
 }
 
 pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamReport, String> {
+    println!("resync_stream_parallelism={}", config.parallelism);
     let source = Rc::new(
         PersistentMySqlSource::new_without_operation_timeout(&config.source)
             .map_err(|error| format!("connect resync source: {error}"))?,
@@ -520,6 +522,7 @@ fn resync_repair_config(config: &ResyncStreamConfig) -> RepairDriftConfig {
         content_check: true,
         mode: SyncMode::Apply,
         chunk_size: config.chunk_size,
+        parallelism: config.parallelism,
         conflict_reconcile_limit: 0,
         progress_table: config.progress_table.clone(),
         run_id: Some(format!("resync-stream:{}", config.source_identity)),
@@ -991,6 +994,7 @@ fn full_repair_config(
         content_check: true,
         mode: SyncMode::Apply,
         chunk_size: config.chunk_size,
+        parallelism: 1,
         conflict_reconcile_limit: 0,
         progress_table: config.progress_table.clone(),
         run_id: Some(request.recovery_id.clone()),

@@ -228,32 +228,244 @@ struct ConsistentSnapshotPhaseContext<'a> {
 }
 
 fn run_consistent_snapshot_phase_order(
-    context: ConsistentSnapshotPhaseContext<'_>,
+    mut context: ConsistentSnapshotPhaseContext<'_>,
     order: &[String],
     shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
     source_inventory: &SchemaInventory,
     target_inventory: &SchemaInventory,
 ) -> Result<(), RepairDriftError> {
-    for table_name in order {
-        run_repair_phase_for_table_with_consistent_source(
-            RepairPhaseRequest {
-                config: context.config,
-                run_id: context.run_id,
-                plan: context.plan,
-                repair_tables: context.repair_tables,
-                phase: context.phase,
-                table_name,
-                run: RepairPhaseRun {
-                    conflict_store: context.conflict_store,
-                    state: context.state,
-                },
-            },
+    let batches = phase_batches(
+        context.phase,
+        order,
+        source_inventory,
+        context.config.parallelism,
+    );
+    for batch in batches {
+        log_phase_batch(context.phase, batch.len(), context.config.parallelism);
+        run_consistent_snapshot_phase_batch(
+            &mut context,
+            &batch,
             Rc::clone(&shared_source),
             source_inventory,
             target_inventory,
         )?;
     }
     Ok(())
+}
+
+fn log_phase_batch(phase: SyncPhase, batch_size: usize, parallelism: usize) {
+    println!(
+        "repair_drift_phase phase={phase:?} batch_tables={batch_size} source_connections={}",
+        batch_size.min(parallelism)
+    );
+}
+
+fn run_consistent_snapshot_phase_batch(
+    context: &mut ConsistentSnapshotPhaseContext<'_>,
+    batch: &[String],
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<(), RepairDriftError> {
+    if let [table_name] = batch {
+        return run_sequential_consistent_snapshot_phase_table(
+            context,
+            table_name,
+            shared_source,
+            source_inventory,
+            target_inventory,
+        );
+    }
+    let results = run_parallel_consistent_snapshot_phase_batch(
+        context,
+        batch,
+        source_inventory,
+        target_inventory,
+    )?;
+    record_parallel_phase_results(context, results)
+}
+
+fn run_sequential_consistent_snapshot_phase_table(
+    context: &mut ConsistentSnapshotPhaseContext<'_>,
+    table_name: &str,
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<(), RepairDriftError> {
+    run_repair_phase_for_table_with_consistent_source(
+        RepairPhaseRequest {
+            config: context.config,
+            run_id: context.run_id,
+            plan: context.plan,
+            repair_tables: context.repair_tables,
+            phase: context.phase,
+            table_name,
+            run: RepairPhaseRun {
+                conflict_store: context.conflict_store,
+                state: context.state,
+            },
+        },
+        shared_source,
+        source_inventory,
+        target_inventory,
+    )
+}
+
+fn phase_batches(
+    phase: SyncPhase,
+    order: &[String],
+    source_inventory: &SchemaInventory,
+    parallelism: usize,
+) -> Vec<Vec<String>> {
+    let direction = match phase {
+        SyncPhase::DeleteExtras => DependencyDirection::ChildFirst,
+        SyncPhase::InsertMissing | SyncPhase::UpdateDivergent => DependencyDirection::ParentFirst,
+        SyncPhase::Verify | SyncPhase::VerifyNoTargetExtras | SyncPhase::All => {
+            return parallel_phase_batches(
+                order,
+                &[],
+                DependencyDirection::ParentFirst,
+                parallelism,
+            );
+        }
+    };
+    parallel_phase_batches(
+        order,
+        &source_inventory.foreign_keys,
+        direction,
+        parallelism,
+    )
+}
+
+fn run_parallel_consistent_snapshot_phase_batch(
+    context: &ConsistentSnapshotPhaseContext<'_>,
+    batch: &[String],
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<Vec<Option<ParallelPhaseResult>>, RepairDriftError> {
+    let worker_context = ParallelPhaseTableContext {
+        config: context.config,
+        run_id: context.run_id,
+        plan: context.plan,
+        repair_tables: context.repair_tables,
+        phase: context.phase,
+        source_inventory,
+        target_inventory,
+    };
+    std::thread::scope(|scope| {
+        let worker_context = &worker_context;
+        let handles = batch
+            .iter()
+            .map(|table_name| {
+                scope.spawn(move || run_parallel_phase_worker(worker_context, table_name))
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().map_err(|_| {
+                    RepairDriftError::Repair("parallel table worker panicked".to_string())
+                })?
+            })
+            .collect()
+    })
+}
+
+fn run_parallel_phase_worker(
+    context: &ParallelPhaseTableContext<'_>,
+    table_name: &str,
+) -> Result<Option<ParallelPhaseResult>, RepairDriftError> {
+    let source = Rc::new(
+        crate::mysql_client::PersistentMySqlSource::new_without_operation_timeout(
+            &context.config.source,
+        )
+        .map_err(|error| {
+            RepairDriftError::Repair(format!(
+                "{table_name} {:?}: connect source: {error}",
+                context.phase
+            ))
+        })?,
+    );
+    run_parallel_consistent_snapshot_phase_table(context, table_name, source)
+}
+
+fn record_parallel_phase_results(
+    context: &mut ConsistentSnapshotPhaseContext<'_>,
+    results: Vec<Option<ParallelPhaseResult>>,
+) -> Result<(), RepairDriftError> {
+    for result in results.into_iter().flatten() {
+        complete_phase(
+            RepairPhaseRequest {
+                config: context.config,
+                run_id: context.run_id,
+                plan: context.plan,
+                repair_tables: context.repair_tables,
+                phase: context.phase,
+                table_name: &result.table_name,
+                run: RepairPhaseRun {
+                    conflict_store: context.conflict_store,
+                    state: context.state,
+                },
+            },
+            &result.source_count,
+            &result.target_count,
+            result.phase_report,
+        )?;
+    }
+    Ok(())
+}
+
+struct ParallelPhaseResult {
+    table_name: String,
+    source_count: u64,
+    target_count: u64,
+    phase_report: table_sync::SyncTableReport,
+}
+
+struct ParallelPhaseTableContext<'a> {
+    config: &'a RepairDriftConfig,
+    run_id: &'a str,
+    plan: &'a crate::repair_drift::RepairPlan,
+    repair_tables: &'a RepairTableInputs,
+    phase: SyncPhase,
+    source_inventory: &'a SchemaInventory,
+    target_inventory: &'a SchemaInventory,
+}
+
+fn run_parallel_consistent_snapshot_phase_table(
+    context: &ParallelPhaseTableContext<'_>,
+    table_name: &str,
+    shared_source: Rc<crate::mysql_client::PersistentMySqlSource>,
+) -> Result<Option<ParallelPhaseResult>, RepairDriftError> {
+    let Some((source_count, target_count, table)) = context.repair_tables.get(table_name) else {
+        return Ok(None);
+    };
+    let (phase_config, run_spec_json) = resumable_phase_config_parts(
+        context.config,
+        context.plan,
+        context.phase,
+        table,
+        context.run_id,
+        table_name,
+    )
+    .map_err(RepairDriftError::Repair)?;
+    let phase_report = table_sync::run_sync_table_phase_with_consistent_source(
+        &phase_config,
+        context.phase,
+        run_spec_json.as_deref(),
+        shared_source,
+        context.source_inventory,
+        context.target_inventory,
+    )
+    .map_err(|error| {
+        RepairDriftError::Repair(format!("{table_name} {:?}: {error}", context.phase))
+    })?;
+    Ok(Some(ParallelPhaseResult {
+        table_name: table_name.to_string(),
+        source_count: *source_count,
+        target_count: *target_count,
+        phase_report,
+    }))
 }
 
 fn empty_report(
@@ -455,6 +667,90 @@ fn repair_phases(plan: &crate::repair_drift::RepairPlan) -> [(SyncPhase, &[Strin
     ]
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DependencyDirection {
+    ParentFirst,
+    ChildFirst,
+}
+
+fn parallel_phase_batches(
+    order: &[String],
+    foreign_keys: &[crate::inventory::ForeignKeyInventory],
+    direction: DependencyDirection,
+    parallelism: usize,
+) -> Vec<Vec<String>> {
+    let parallelism = parallelism.max(1);
+    let levels = phase_dependency_levels(order, foreign_keys, direction);
+    split_phase_levels(order, &levels, parallelism)
+}
+
+fn phase_dependency_levels(
+    order: &[String],
+    foreign_keys: &[crate::inventory::ForeignKeyInventory],
+    direction: DependencyDirection,
+) -> BTreeMap<String, usize> {
+    let positions = order
+        .iter()
+        .enumerate()
+        .map(|(index, table)| (table.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut levels = BTreeMap::new();
+
+    for table in order {
+        let level = foreign_keys
+            .iter()
+            .filter_map(|foreign_key| dependency_table(foreign_key, table, direction))
+            .filter(|dependency| {
+                positions
+                    .get(dependency.as_str())
+                    .is_some_and(|position| *position < positions[table.as_str()])
+            })
+            .filter_map(|dependency| levels.get(dependency.as_str()).copied())
+            .map(|dependency_level| dependency_level + 1)
+            .max()
+            .unwrap_or(0);
+        levels.insert(table.clone(), level);
+    }
+    levels
+}
+
+fn split_phase_levels(
+    order: &[String],
+    levels: &BTreeMap<String, usize>,
+    parallelism: usize,
+) -> Vec<Vec<String>> {
+    let max_level = levels.values().copied().max().unwrap_or(0);
+    (0..=max_level)
+        .flat_map(|level| {
+            let tables = order
+                .iter()
+                .filter(|table| levels.get(table.as_str()) == Some(&level))
+                .cloned()
+                .collect::<Vec<_>>();
+            tables
+                .chunks(parallelism)
+                .map(|batch| batch.to_vec())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn dependency_table(
+    foreign_key: &crate::inventory::ForeignKeyInventory,
+    table: &str,
+    direction: DependencyDirection,
+) -> Option<String> {
+    match direction {
+        DependencyDirection::ParentFirst if foreign_key.table == table => {
+            Some(foreign_key.referenced_table.clone())
+        }
+        DependencyDirection::ChildFirst if foreign_key.referenced_table == table => {
+            Some(foreign_key.table.clone())
+        }
+        _ => None,
+    }
+}
+
 fn run_verification_phases(
     config: &RepairDriftConfig,
     run_id: &str,
@@ -572,10 +868,28 @@ fn resumable_phase_config(
     request: &RepairPhaseRequest<'_>,
     table: &SyncTable,
 ) -> Result<(SyncTableConfig, Option<String>), RepairDriftError> {
-    let mut config = phase_config_for_request(request, table);
-    let candidate =
-        table_sync::find_compatible_failed_run(&config, request.phase, request.table_name)
-            .map_err(|error| repair_phase_error(request, error))?;
+    resumable_phase_config_parts(
+        request.config,
+        request.plan,
+        request.phase,
+        table,
+        request.run_id,
+        request.table_name,
+    )
+    .map_err(|error| repair_phase_error(request, error))
+}
+
+fn resumable_phase_config_parts(
+    config: &RepairDriftConfig,
+    plan: &crate::repair_drift::RepairPlan,
+    phase: SyncPhase,
+    table: &SyncTable,
+    run_id: &str,
+    table_name: &str,
+) -> Result<(SyncTableConfig, Option<String>), String> {
+    let mut config = build_phase_config(config, plan, phase, table, run_id, table_name);
+    let candidate = table_sync::find_compatible_failed_run(&config, phase, table_name)
+        .map_err(|error| error.to_string())?;
     let run_spec_json = candidate
         .as_ref()
         .map(|candidate| candidate.run_spec_json.clone());
@@ -978,5 +1292,70 @@ mod tests {
 
         assert_eq!(phases[3].0, SyncPhase::Verify);
         assert_eq!(phases[3].1, plan.tables.as_slice());
+    }
+
+    #[test]
+    fn parallel_phase_batches_keep_foreign_key_dependencies_in_separate_batches() {
+        let foreign_keys = vec![
+            crate::inventory::ForeignKeyInventory {
+                table: "children".to_string(),
+                name: "children_parent_a".to_string(),
+                columns: vec!["parent_a_id".to_string()],
+                referenced_schema: "globalcomix".to_string(),
+                referenced_table: "parent_a".to_string(),
+                referenced_columns: vec!["id".to_string()],
+            },
+            crate::inventory::ForeignKeyInventory {
+                table: "children".to_string(),
+                name: "children_parent_b".to_string(),
+                columns: vec!["parent_b_id".to_string()],
+                referenced_schema: "globalcomix".to_string(),
+                referenced_table: "parent_b".to_string(),
+                referenced_columns: vec!["id".to_string()],
+            },
+        ];
+
+        let insert_batches = parallel_phase_batches(
+            &["parent_a", "parent_b", "children"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            &foreign_keys,
+            DependencyDirection::ParentFirst,
+            16,
+        );
+        let delete_batches = parallel_phase_batches(
+            &["children", "parent_a", "parent_b"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            &foreign_keys,
+            DependencyDirection::ChildFirst,
+            16,
+        );
+
+        assert_eq!(
+            insert_batches,
+            vec![vec!["parent_a", "parent_b"], vec!["children"]]
+        );
+        assert_eq!(
+            delete_batches,
+            vec![vec!["children"], vec!["parent_a", "parent_b"]]
+        );
+    }
+
+    #[test]
+    fn parallel_phase_batches_cap_unrelated_tables_at_requested_parallelism() {
+        let tables = (0..20).map(|index| format!("table_{index}"));
+        let batches = parallel_phase_batches(
+            &tables.clone().collect::<Vec<_>>(),
+            &[],
+            DependencyDirection::ParentFirst,
+            16,
+        );
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 16);
+        assert_eq!(batches[1].len(), 4);
     }
 }

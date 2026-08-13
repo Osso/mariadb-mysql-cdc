@@ -47,7 +47,7 @@ Usage:
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
-  mariadb-mysql-cdc resync-stream --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity NEW_ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
+  mariadb-mysql-cdc resync-stream --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity NEW_ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
   mariadb-mysql-cdc resolve-comics-releases-views-conflicts --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --run-id ID [--batch-size ROWS]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -72,7 +72,7 @@ Commands:
   drift-check
           Read-only source/target COUNT(*) drift check for selected tables, or all source base tables when no --table is supplied.
   repair-drift
-          Inventory both endpoints, count-check source tables, and run bounded sync-table repairs only for drifted tables.
+          Inventory both endpoints, count-check source tables, and run bounded sync-table repairs only for drifted tables; --parallelism runs independent tables concurrently within FK-safe phase barriers.
   recover-lost-binlog
           Execute one authorization-file-scoped lost-binlog recovery with a source-consistent full-scope repair and immutable audit record.
   resolve-comics-releases-views-conflicts
@@ -222,6 +222,13 @@ fn exit_unknown_command(command: &str) {
 }
 
 fn run_resync_stream_command(mut args: Vec<String>) {
+    let parallelism = match take_optional_nonzero_usize(&mut args, "--parallelism", 1) {
+        Ok(parallelism) => parallelism,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     args.extend([
         "--binlog-file".to_string(),
         "resync-boundary".to_string(),
@@ -253,6 +260,7 @@ fn run_resync_stream_command(mut args: Vec<String>) {
         checkpoint_table: apply.checkpoint_table,
         progress_table: "cdc.table_sync_runs".to_string(),
         chunk_size: 10_000,
+        parallelism,
     };
     match lost_binlog_recovery::run_resync_stream(&config) {
         Ok(report) => println!(
@@ -329,6 +337,30 @@ fn print_recovery_report(report: &lost_binlog_recovery::RecoverLostBinlogReport)
         "{}",
         serde_json::to_string_pretty(report).expect("recovery report JSON")
     );
+}
+
+fn take_optional_nonzero_usize(
+    args: &mut Vec<String>,
+    option: &str,
+    default: usize,
+) -> Result<usize, String> {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut value = default;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == option {
+            let raw = args
+                .get(index + 1)
+                .ok_or_else(|| format!("{option} needs a value"))?;
+            value = parse_nonzero_usize(option, raw)?;
+            index += 2;
+        } else {
+            remaining.push(args[index].clone());
+            index += 1;
+        }
+    }
+    *args = remaining;
+    Ok(value)
 }
 
 fn take_required_option(

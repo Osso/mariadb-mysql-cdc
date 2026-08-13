@@ -30,6 +30,7 @@ pub(crate) fn default_repair_drift_config() -> RepairDriftConfig {
         content_check: true,
         mode: SyncMode::DryRun,
         chunk_size: 1000,
+        parallelism: 1,
         conflict_reconcile_limit: 0,
         progress_table: "cdc.table_sync_runs".to_string(),
         run_id: None,
@@ -136,6 +137,7 @@ fn apply_repair_execution_option(
         "--content-check" => config.content_check = crate::parse_bool(flag, value)?,
         "--mode" => config.mode = parse_sync_mode(value)?,
         "--chunk-size" => config.chunk_size = crate::parse_usize(flag, value)?,
+        "--parallelism" => config.parallelism = crate::parse_nonzero_usize(flag, value)?,
         "--conflict-reconcile-limit" => {
             config.conflict_reconcile_limit = crate::parse_usize(flag, value)?
         }
@@ -244,6 +246,9 @@ fn validate_target_config(config: &RepairDriftConfig) -> Result<(), String> {
 fn validate_repair_options(config: &RepairDriftConfig) -> Result<(), String> {
     if config.chunk_size == 0 {
         return Err("chunk size must be greater than zero".to_string());
+    }
+    if config.parallelism == 0 {
+        return Err("parallelism must be greater than zero".to_string());
     }
     if config.progress_table.is_empty() {
         return Err("progress table is required".to_string());

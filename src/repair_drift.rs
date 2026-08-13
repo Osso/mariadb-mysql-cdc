@@ -26,6 +26,7 @@ pub struct RepairDriftConfig {
     pub content_check: bool,
     pub mode: SyncMode,
     pub chunk_size: usize,
+    pub parallelism: usize,
     pub conflict_reconcile_limit: usize,
     pub progress_table: String,
     pub run_id: Option<String>,

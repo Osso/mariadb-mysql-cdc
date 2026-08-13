@@ -17,6 +17,7 @@
 - [x] Capture the MariaDB binlog coordinate with ordinary non-locking source reads; source recovery must not require `FLUSH TABLES WITH READ LOCK`, `UNLOCK TABLES`, `LOCK TABLES`, or `RELOAD`.
 - [x] Reconcile normally committed source rows and schema evidence without a long-lived cross-table transaction or repeatable-read snapshot.
 - [x] Begin full-scope row synchronization directly from table inventories; do not run source or target `COUNT(*)` pre-scans.
+- [x] When configured with `--parallelism`, run independent full-scope tables concurrently within delete/insert/update/verify phase barriers, never crossing foreign-key dependency levels; each worker reads from the configured source endpoint.
 - [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
 - [x] Reconcile every current source-scope table, including target-only orphan rows; target-only target tables do not narrow the recovery data plan, and generic `repair-drift` remains strict about its source/target inventory contract.
 - [x] Run recovery-only schema convergence after data reconciliation: drop target-only base tables child-before-parent with normal foreign-key enforcement, fail closed on cycles or source-table references to target-only parents, and converge remaining source tables and constraints.
