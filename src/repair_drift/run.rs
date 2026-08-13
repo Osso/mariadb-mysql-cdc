@@ -19,8 +19,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
-type TableCounts = BTreeMap<String, u64>;
-
 pub(crate) fn run_repair_drift(
     config: &RepairDriftConfig,
 ) -> Result<RepairDriftReport, RepairDriftError> {
@@ -40,12 +38,8 @@ pub(crate) fn run_consistent_snapshot_repair(
     source_inventory: SchemaInventory,
     target_inventory: SchemaInventory,
 ) -> Result<RepairDriftReport, RepairDriftError> {
-    let prepared = prepare_consistent_snapshot_repair(
-        config,
-        &shared_source,
-        &source_inventory,
-        &target_inventory,
-    )?;
+    let prepared =
+        prepare_consistent_snapshot_repair(config, &source_inventory, &target_inventory)?;
     let repaired = run_consistent_snapshot_repair_phases(
         config,
         &prepared.run_id,
@@ -90,7 +84,6 @@ struct ConsistentSnapshotRepairPlan {
 
 fn prepare_consistent_snapshot_repair(
     config: &RepairDriftConfig,
-    shared_source: &crate::mysql_client::PersistentMySqlSource,
     source_inventory: &SchemaInventory,
     target_inventory: &SchemaInventory,
 ) -> Result<ConsistentSnapshotRepairPlan, RepairDriftError> {
@@ -100,15 +93,8 @@ fn prepare_consistent_snapshot_repair(
     let plan =
         build_runtime_recovery_repair_plan(config, &run_id, source_inventory, target_inventory)?;
     let tables = ordered_candidate_tables(config, source_inventory, &plan)?;
-    let (source_counts, target_counts) =
-        read_snapshot_repair_counts(config, shared_source, &tables)?;
-    let (repair_tables, skipped) = collect_full_repair_table_inputs(
-        &tables,
-        source_inventory,
-        target_inventory,
-        &source_counts,
-        &target_counts,
-    );
+    let (repair_tables, skipped) =
+        collect_full_repair_table_inputs(&tables, source_inventory, target_inventory);
     require_supported_snapshot_scope(&skipped)?;
     Ok(ConsistentSnapshotRepairPlan {
         run_id,
@@ -147,46 +133,6 @@ fn validate_complete_snapshot_repair_config(
         ));
     }
     Ok(())
-}
-
-fn read_snapshot_repair_counts(
-    config: &RepairDriftConfig,
-    source: &crate::mysql_client::PersistentMySqlSource,
-    tables: &[String],
-) -> Result<(TableCounts, TableCounts), RepairDriftError> {
-    let target_config = snapshot_target_connection_config(config);
-    let target = crate::mysql_client::PersistentMySqlSource::new_with_tls_ca(
-        &target_config,
-        Some(&config.target.tls_ca_file),
-    )
-    .map_err(|error| RepairDriftError::Repair(error.to_string()))?;
-    let mut source_counts = BTreeMap::new();
-    let mut target_counts = BTreeMap::new();
-    for table in tables {
-        source_counts.insert(
-            table.clone(),
-            source
-                .count_rows(table)
-                .map_err(|error| RepairDriftError::Repair(error.to_string()))?,
-        );
-        target_counts.insert(
-            table.clone(),
-            target
-                .count_rows(table)
-                .map_err(|error| RepairDriftError::Repair(error.to_string()))?,
-        );
-    }
-    Ok((source_counts, target_counts))
-}
-
-fn snapshot_target_connection_config(config: &RepairDriftConfig) -> MySqlConnectionConfig {
-    MySqlConnectionConfig {
-        host: config.target.host.clone(),
-        port: config.target.port,
-        user: config.target.user.clone(),
-        password: config.target.password.clone(),
-        database: config.target.database.clone(),
-    }
 }
 
 fn configured_run_id(config: &RepairDriftConfig) -> String {
