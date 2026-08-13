@@ -412,13 +412,7 @@ fn parse_barrier_row(row: Vec<Option<String>>) -> Result<LostBinlogBarrier, Stri
 }
 
 fn parse_recovery_row(row: Vec<Option<String>>) -> Result<LostBinlogRecoveryRecord, String> {
-    let status = match required_row_value(&row, 14, "recovery status")?.as_str() {
-        "prepared" => LostBinlogRecoveryStatus::Prepared,
-        "committed" => LostBinlogRecoveryStatus::Committed,
-        "verified" => LostBinlogRecoveryStatus::Verified,
-        "abandoned" => LostBinlogRecoveryStatus::Abandoned,
-        value => return Err(format!("unsupported lost-binlog recovery status {value}")),
-    };
+    let status = parse_recovery_status(&row)?;
     let expected_checkpoint = decode_checkpoint(&row, 7, "old recovery checkpoint")?;
     let new_checkpoint = decode_checkpoint(&row, 8, "new recovery checkpoint")?;
     Ok(LostBinlogRecoveryRecord {
@@ -442,6 +436,16 @@ fn parse_recovery_row(row: Vec<Option<String>>) -> Result<LostBinlogRecoveryReco
         abandoned_evidence_json: optional_row_value(&row, 15),
         abandoned_at: optional_row_value(&row, 16),
     })
+}
+
+fn parse_recovery_status(row: &[Option<String>]) -> Result<LostBinlogRecoveryStatus, String> {
+    match required_row_value(row, 14, "recovery status")?.as_str() {
+        "prepared" => Ok(LostBinlogRecoveryStatus::Prepared),
+        "committed" => Ok(LostBinlogRecoveryStatus::Committed),
+        "verified" => Ok(LostBinlogRecoveryStatus::Verified),
+        "abandoned" => Ok(LostBinlogRecoveryStatus::Abandoned),
+        value => Err(format!("unsupported lost-binlog recovery status {value}")),
+    }
 }
 
 fn decode_checkpoint(

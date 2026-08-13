@@ -1086,6 +1086,11 @@ mod tests {
         }
     }
 
+    type RecoveryTransactionSnapshot = (
+        Option<Checkpoint>,
+        std::collections::BTreeMap<String, LostBinlogRecoveryRecord>,
+    );
+
     struct ReplacementRecoveryStore {
         checkpoint: RefCell<Option<Checkpoint>>,
         barrier: RefCell<Option<LostBinlogBarrier>>,
@@ -1094,12 +1099,7 @@ mod tests {
         fail_abandon: bool,
         fail_insert: bool,
         fail_commit: bool,
-        transaction_snapshot: RefCell<
-            Option<(
-                Option<Checkpoint>,
-                std::collections::BTreeMap<String, LostBinlogRecoveryRecord>,
-            )>,
-        >,
+        transaction_snapshot: RefCell<Option<RecoveryTransactionSnapshot>>,
     }
 
     impl ReplacementRecoveryStore {
