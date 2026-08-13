@@ -14,8 +14,8 @@
 ### Anchored reconciliation
 
 - [x] Acquire the stream lease before recovery state changes.
-- [x] Hold `FLUSH TABLES WITH READ LOCK` only while opening one MariaDB `REPEATABLE READ` consistent snapshot, reading its current binlog coordinate, and capturing source schema evidence; target reads and data reconciliation occur after unlock.
-- [x] Keep that source snapshot transaction open for full-scope source reads, insert, update, delete, and verification phases.
+- [x] Acquire the source write fence before any source schema/data read; while it is held, open one MariaDB `REPEATABLE READ` consistent snapshot, read its current binlog coordinate, and capture source schema evidence; target reads and data reconciliation occur after unlock.
+- [x] Keep that source snapshot transaction open for full-scope source data reads, insert, update, delete, and verification phases.
 - [x] Capture source table, index, foreign-key, check, view, trigger, routine, and event evidence through that same snapshot connection; independent live source metadata reads are forbidden.
 - [x] Reconcile target data, including target-only orphan rows, before creating foreign keys.
 - [x] Run final schema convergence, including foreign-key creation, after data reconciliation; schema convergence must gate the atomic transition.
@@ -26,11 +26,11 @@
 
 - [x] Insert an immutable `prepared` recovery record containing old state, new coordinate, source identity, scope, operator, reason, and evidence.
 - [x] Revalidate the exact checkpoint, barrier, source identity, scope, and prepared recovery record under transaction locks.
-- [x] Atomically update the checkpoint and mark the recovery `committed` only after reconciliation proof succeeds.
+- [x] Require complete zero-drift schema/data proof before atomically updating the checkpoint, superseding the exact barrier, and marking the recovery `committed`.
 - [x] Preserve the historical journal row; active-barrier selection excludes only the exact committed recovery identity and barrier coordinates/raw-SQL hash.
 - [x] Roll back the transition on checkpoint/recovery commit failure.
-- [x] Reject duplicate recovery IDs and non-advancing source coordinates.
-- [ ] Verify interrupted/resumable full-scope reconciliation and live stream restart behavior.
+- [x] Fail closed on interruption or error before proof/commit: no checkpoint or barrier transition is allowed without complete proof and exact CAS revalidation; resumability is not claimed.
+- [ ] Verify interrupted full-scope reconciliation and live stream restart behavior.
 
 ### Verification
 
