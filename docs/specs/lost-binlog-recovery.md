@@ -8,7 +8,6 @@
 
 - [x] Read an authorization JSON containing the exact old checkpoint, exact journal barrier and SQL, source identity, checkpoint name, recovery ID, operator identity, and reason.
 - [x] Reject a configured source identity or checkpoint name that does not match the authorization.
-- [x] Read current source and target schema before transition; require full schema convergence.
 - [x] Compute the current source scope hash and reject an authorization hash that differs.
 - [x] Reject any configured source table whose engine is not InnoDB.
 
@@ -17,8 +16,10 @@
 - [x] Acquire the stream lease before recovery state changes.
 - [x] Hold `FLUSH TABLES WITH READ LOCK` only while opening one MariaDB `REPEATABLE READ` consistent snapshot and reading its current binlog coordinate.
 - [x] Keep that source snapshot transaction open for full-scope insert, update, delete, and verification phases.
+- [x] Reconcile target data, including target-only orphan rows, before creating foreign keys.
+- [x] Run final schema convergence, including foreign-key creation, after data reconciliation; schema convergence must gate the atomic transition.
 - [x] Refuse checkpoint transition when any table is skipped, unsupported, or unresolved.
-- [ ] Prove the complete live CLI path against the production-shaped full scope.
+- [ ] Prove the complete live CLI path against the production-shaped full scope, including data repair before final schema/FK convergence.
 
 ### Durable transition
 
@@ -49,18 +50,18 @@
 - `src/lost_binlog_recovery_store.rs` — target-side CAS reads, immutable prepared-record insert, checkpoint update, commit, and exact barrier exclusion.
 - `src/mysql_client.rs` — MariaDB consistent-snapshot transaction and source coordinate capture.
 - `src/repair_drift/` — full-scope insert/update/delete and verification phases.
-- `src/sync_schema.rs` — pre-transition schema convergence.
+- `src/sync_schema.rs` — final schema convergence and foreign-key creation after anchored data repair.
 - `docs/stream-recovery-records-bootstrap.sql` — recovery-record table, guards, inventory procedure, and grants.
 
 ## Tests asserting this spec
 
-- `src/lost_binlog_recovery.rs` — exact old-state validation, duplicate/non-advancing refusal, incomplete-proof refusal, atomic rollback, and exact historical-barrier supersession.
+- `src/lost_binlog_recovery.rs` — phase ordering, target-orphan repair before schema/FK convergence, exact old-state validation, duplicate/non-advancing refusal, incomplete-proof refusal, atomic rollback, and exact historical-barrier supersession.
 - `src/lost_binlog_recovery_store.rs` — immutable prepared insert, locked CAS queries, checkpoint update, committed transition, and exact barrier predicates.
 
 ## Known gaps (current cycle)
 
 - [ ] Run bootstrap and startup validation against the target with stream writers stopped.
-- [ ] Prove the full CLI path with the complete configured scope and current source snapshot.
+- [ ] Prove the full CLI path with the complete configured scope and current source snapshot; production success is not claimed by this branch.
 - [ ] Execute the authorized recovery and replace any superseded stream runtime.
 - [ ] Complete post-transition schema/data validation with zero unresolved drift and record `verified` evidence.
 

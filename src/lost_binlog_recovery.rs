@@ -389,15 +389,14 @@ fn prepare_recovery_context(
 ) -> Result<RecoveryPreparation, String> {
     let mut request = read_recovery_authorization(&config.authorization_file)?;
     validate_authorized_source(config, &request)?;
-    let schema_report =
-        crate::sync_schema::run_full_schema_sync(config.source.clone(), config.target.clone())?;
-    require_converged_schema(&schema_report)?;
     let source_inventory = read_source_inventory(&config.source)?;
     let target_inventory = read_target_inventory(&config.target)?;
     validate_transactional_scope(&source_inventory)?;
     let scope_hash = authorize_current_scope(&mut request, &source_inventory)?;
-    request.prepared_evidence_json =
-        prepared_evidence_json(&schema_report, &source_inventory, &scope_hash);
+    if request.prepared_evidence_json.trim().is_empty() {
+        request.prepared_evidence_json =
+            prepared_evidence_json(&source_inventory, &target_inventory, &scope_hash)?;
+    }
     let source = Rc::new(
         PersistentMySqlSource::new(&config.source)
             .map_err(|error| format!("connect recovery snapshot source: {error}"))?,
@@ -447,17 +446,19 @@ fn authorize_current_scope(
 }
 
 fn prepared_evidence_json(
-    schema_report: &crate::sync_schema::SchemaConvergenceReport,
     source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
     scope_hash: &str,
-) -> String {
-    serde_json::json!({
+) -> Result<String, String> {
+    let source_schema_fingerprint = inventory_scope_hash(source_inventory)?;
+    let target_schema_fingerprint = inventory_scope_hash(target_inventory)?;
+    Ok(serde_json::json!({
         "scope_hash": scope_hash,
-        "source_schema_fingerprint": schema_report.source_fingerprint,
-        "target_schema_fingerprint": schema_report.target_fingerprint,
+        "source_schema_fingerprint": source_schema_fingerprint,
+        "target_schema_fingerprint": target_schema_fingerprint,
         "source_tables": source_inventory.tables.len(),
     })
-    .to_string()
+    .to_string())
 }
 
 fn close_recovery_snapshot(
@@ -483,18 +484,44 @@ fn run_anchored_recovery(
     target_inventory: SchemaInventory,
     scope_hash: String,
 ) -> Result<RecoverLostBinlogReport, String> {
-    let prepared = begin_authorized_snapshot(config, request, store, source.as_ref())?;
-    let repair = repair_consistent_snapshot(
-        config,
-        request,
-        Rc::clone(&source),
-        source_inventory,
-        target_inventory,
-    )?;
-    require_unchanged_source_scope(config, &scope_hash)?;
-    let proof = reconciliation_proof(request, &repair, &scope_hash);
-    commit_lost_binlog_recovery(store, request, &proof)?;
-    Ok(recovery_report(request, prepared, repair, scope_hash))
+    run_recovery_phases(
+        || begin_authorized_snapshot(config, request, store, source.as_ref()),
+        |_prepared| {
+            repair_consistent_snapshot(
+                config,
+                request,
+                Rc::clone(&source),
+                source_inventory,
+                target_inventory,
+            )
+        },
+        |_prepared, _repair| {
+            let schema_report = crate::sync_schema::run_full_schema_sync(
+                config.source.clone(),
+                config.target.clone(),
+            )?;
+            require_converged_schema(&schema_report)?;
+            Ok(schema_report)
+        },
+        |prepared, repair, schema_report| {
+            require_unchanged_source_scope(config, &scope_hash)?;
+            let proof = reconciliation_proof(request, &repair, &scope_hash, &schema_report);
+            commit_lost_binlog_recovery(store, request, &proof)?;
+            Ok(recovery_report(request, prepared, repair, scope_hash))
+        },
+    )
+}
+
+fn run_recovery_phases<Snapshot, Repair, Schema, Output>(
+    begin_snapshot: impl FnOnce() -> Result<Snapshot, String>,
+    reconcile_data: impl FnOnce(&Snapshot) -> Result<Repair, String>,
+    converge_schema: impl FnOnce(&Snapshot, &Repair) -> Result<Schema, String>,
+    commit: impl FnOnce(Snapshot, Repair, Schema) -> Result<Output, String>,
+) -> Result<Output, String> {
+    let snapshot = begin_snapshot()?;
+    let repair = reconcile_data(&snapshot)?;
+    let schema = converge_schema(&snapshot, &repair)?;
+    commit(snapshot, repair, schema)
 }
 
 fn begin_authorized_snapshot(
@@ -544,6 +571,7 @@ fn reconciliation_proof(
     request: &LostBinlogRecoveryRequest,
     repair: &RepairDriftReport,
     scope_hash: &str,
+    schema_report: &crate::sync_schema::SchemaConvergenceReport,
 ) -> LostBinlogReconciliationProof {
     let unsupported_scope = repair
         .skipped
@@ -554,7 +582,8 @@ fn reconciliation_proof(
         recovery_id: request.recovery_id.clone(),
         source_identity: request.expected_barrier.source_identity.clone(),
         scope_hash: request.scope_hash.clone(),
-        schema_converged: true,
+        schema_converged: schema_report.overall_status
+            == crate::sync_schema::OverallSchemaStatus::Converged,
         data_converged: unsupported_scope.is_empty()
             && repair.compared_tables == repair.source_tables,
         evidence_json: reconciliation_evidence_json(repair, scope_hash),
@@ -799,6 +828,55 @@ mod tests {
         fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String> {
             Ok(self.0.clone())
         }
+    }
+
+    #[test]
+    fn recovery_repairs_target_orphans_before_schema_fk_convergence() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let target_has_orphans = Rc::new(RefCell::new(true));
+
+        let result = run_recovery_phases(
+            {
+                let steps = Rc::clone(&steps);
+                move || {
+                    steps.borrow_mut().push("snapshot");
+                    Ok(())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                let target_has_orphans = Rc::clone(&target_has_orphans);
+                move |_snapshot| {
+                    steps.borrow_mut().push("reconcile_data");
+                    target_has_orphans.replace(false);
+                    Ok(())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                let target_has_orphans = Rc::clone(&target_has_orphans);
+                move |_snapshot, _repair| {
+                    steps.borrow_mut().push("converge_schema");
+                    if *target_has_orphans.borrow() {
+                        return Err("MySQL 1452: target FK has orphan rows".to_string());
+                    }
+                    Ok(())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                move |_snapshot, _repair, _schema| {
+                    steps.borrow_mut().push("commit");
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            steps.borrow().as_slice(),
+            ["snapshot", "reconcile_data", "converge_schema", "commit"]
+        );
     }
 
     #[test]
