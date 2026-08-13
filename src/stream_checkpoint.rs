@@ -119,11 +119,12 @@ impl MySqlStreamCheckpointStore {
             &self.table,
             &self.checkpoint_name,
         ))?;
-        if existing.is_some() {
-            return Err(format!(
-                "source-scoped stream checkpoint `{}` already exists in `{}`",
-                self.checkpoint_name, self.table
-            ));
+        if let Some(value) = existing {
+            let existing_checkpoint: Checkpoint = serde_json::from_str(&value)
+                .map_err(|error| format!("invalid stream checkpoint JSON: {error}"))?;
+            self.last_checkpoint.replace(Some(existing_checkpoint));
+            self.ensured.set(true);
+            return Ok(());
         }
         let sql = build_checkpoint_insert_sql_for_checkpoint(
             &self.table,

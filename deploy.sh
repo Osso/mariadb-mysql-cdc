@@ -11,6 +11,7 @@ image="${image_repo}:${tag}"
 stream_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-stream.yaml"
 catchup_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-catchup-existing-tables.yaml"
 repair_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-repair-drift.yaml"
+resync_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-resync-stream.yaml"
 
 require_clean_tree() {
     repo="$1"
@@ -50,9 +51,10 @@ depot build \
 update_image_tag "$stream_manifest"
 update_image_tag "$catchup_manifest"
 update_image_tag "$repair_manifest"
+update_image_tag "$resync_manifest"
 remove_file_checkpoint_arg
 
-git -C "$ops_repo" add "$stream_manifest" "$catchup_manifest" "$repair_manifest"
+git -C "$ops_repo" add "$stream_manifest" "$catchup_manifest" "$repair_manifest" "$resync_manifest"
 if git -C "$ops_repo" diff --cached --quiet; then
     echo "ops manifests already use $image"
 else
