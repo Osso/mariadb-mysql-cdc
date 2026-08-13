@@ -92,6 +92,7 @@ pub struct LostBinlogReconciliationProof {
     pub evidence_json: String,
 }
 
+#[cfg(test)]
 pub trait LostBinlogBoundaryReader {
     fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String>;
 }
@@ -149,6 +150,7 @@ fn capture_under_source_write_fence<Checkpoint, Evidence>(
     }
 }
 
+#[cfg(test)]
 impl LostBinlogBoundaryReader for FencedSnapshotBoundaryReader<'_> {
     fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String> {
         self.begin_consistent_snapshot_and_read_checkpoint_and_evidence()
