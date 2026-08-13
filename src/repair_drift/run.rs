@@ -352,13 +352,17 @@ fn run_parallel_consistent_snapshot_phase_batch(
         source_inventory,
         target_inventory,
     };
+    spawn_parallel_phase_workers(&worker_context, batch)
+}
+
+fn spawn_parallel_phase_workers(
+    context: &ParallelPhaseTableContext<'_>,
+    batch: &[String],
+) -> Result<Vec<Option<ParallelPhaseResult>>, RepairDriftError> {
     std::thread::scope(|scope| {
-        let worker_context = &worker_context;
         let handles = batch
             .iter()
-            .map(|table_name| {
-                scope.spawn(move || run_parallel_phase_worker(worker_context, table_name))
-            })
+            .map(|table_name| scope.spawn(move || run_parallel_phase_worker(context, table_name)))
             .collect::<Vec<_>>();
         handles
             .into_iter()
