@@ -118,13 +118,20 @@ pub(crate) struct SchemaConvergenceReport {
     pub(crate) tables: Vec<TableSchemaReport>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SchemaSourceEvidence {
+    pub(crate) inventory: SchemaInventory,
+    pub(crate) checks: Vec<CheckConstraint>,
+    pub(crate) canonical_foreign_keys: Vec<CanonicalForeignKey>,
+}
+
 /// `clause` keeps the endpoint's own text so an addition renders the source expression, while
 /// identity ignores the parentheses and charset introducers MySQL adds when it re-renders one.
 #[derive(Clone, Debug, Serialize)]
-struct CheckConstraint {
-    table: String,
-    name: String,
-    clause: String,
+pub(crate) struct CheckConstraint {
+    pub(crate) table: String,
+    pub(crate) name: String,
+    pub(crate) clause: String,
 }
 
 impl CheckConstraint {
@@ -1130,17 +1137,166 @@ pub(crate) fn run_sync_schema_command(args: Vec<String>, _usage: &str) {
     }
 }
 
-pub(crate) fn run_full_schema_sync(
-    source: crate::mysql_snapshot::MySqlConnectionConfig,
+pub(crate) fn run_schema_convergence_from_source_evidence(
+    evidence: SchemaSourceEvidence,
     target: crate::live::TargetMySqlConfig,
 ) -> Result<SchemaConvergenceReport, String> {
-    run_sync_schema(SyncSchemaConfig {
-        source,
-        target,
-        tables: Vec::new(),
-        catalog: None,
-        all_tables: true,
+    let target_reader = MariaDbInventoryReader::new(inventory_config_target(&target));
+    let target_inventory = build_inventory(&target.database, &target_reader)
+        .map_err(|error| format!("target schema inventory failed: {error}"))?;
+    let target_checks = CheckConstraintReader::new(inventory_config_target(&target))
+        .read(&target.database, None)?;
+    let target_canonical_foreign_keys =
+        build_canonical_foreign_key_inventory(&target.database, &target_reader)
+            .map_err(|error| format!("target canonical foreign key inventory failed: {error}"))?;
+    let selected =
+        resolve_schema_selection(&SchemaSelection::AllSourceTables, &evidence.inventory)?;
+    execute_schema_convergence(SchemaConvergenceInputs {
+        source: &evidence.inventory,
+        target_inventory: &target_inventory,
+        selected: &selected,
+        source_checks: &evidence.checks,
+        target_checks: &target_checks,
+        source_canonical_foreign_keys: &evidence.canonical_foreign_keys,
+        target_canonical_foreign_keys: &target_canonical_foreign_keys,
+        target: &target,
     })
+}
+
+struct SchemaConvergenceInputs<'a> {
+    source: &'a SchemaInventory,
+    target_inventory: &'a SchemaInventory,
+    selected: &'a [String],
+    source_checks: &'a [CheckConstraint],
+    target_checks: &'a [CheckConstraint],
+    source_canonical_foreign_keys: &'a [CanonicalForeignKey],
+    target_canonical_foreign_keys: &'a [CanonicalForeignKey],
+    target: &'a crate::live::TargetMySqlConfig,
+}
+
+fn execute_schema_convergence(
+    inputs: SchemaConvergenceInputs<'_>,
+) -> Result<SchemaConvergenceReport, String> {
+    let SchemaConvergenceInputs {
+        source,
+        target_inventory,
+        selected,
+        source_checks,
+        target_checks,
+        source_canonical_foreign_keys,
+        target_canonical_foreign_keys,
+        target,
+    } = inputs;
+    let preflight = MySqlCoercionPreflight {
+        config: inventory_config_target(target),
+        schema: target.database.clone(),
+    };
+    let mut plan = plan_schema_convergence(source, target_inventory, selected, &preflight)?;
+    append_check_constraint_plan(&mut plan, source, source_checks, target_checks);
+    append_canonical_foreign_key_plan(
+        &mut plan,
+        source,
+        source_canonical_foreign_keys,
+        target_canonical_foreign_keys,
+        &target.database,
+    );
+    let executor = crate::mysql_client::PersistentTargetExecutor::new(target)
+        .map_err(|error| error.to_string())?;
+    let mut executor = MySqlSchemaExecutor { executor };
+    let target_config = inventory_config_target(target);
+    let source_checks_by_table = checks_by_table(&target_check_constraints(source_checks));
+    let expected = expected_target_inventory(source);
+    let verification_reader = MariaDbInventoryReader::new(target_config.clone());
+    let check_reader = RefCell::new(CheckConstraintReader::new(target_config));
+    let verification = SchemaVerificationContext {
+        source,
+        expected: &expected,
+        source_checks_by_table: &source_checks_by_table,
+        source_canonical_foreign_keys,
+        verification_reader: &verification_reader,
+        check_reader: &check_reader,
+        target_database: &target.database,
+    };
+    Ok(execute_schema_plan(plan, &mut executor, &|table| {
+        verify_schema_table(&verification, table)
+    }))
+}
+
+struct SchemaVerificationContext<'a> {
+    source: &'a SchemaInventory,
+    expected: &'a SchemaInventory,
+    source_checks_by_table: &'a BTreeMap<String, Vec<CheckConstraint>>,
+    source_canonical_foreign_keys: &'a [CanonicalForeignKey],
+    verification_reader: &'a MariaDbInventoryReader,
+    check_reader: &'a RefCell<CheckConstraintReader>,
+    target_database: &'a str,
+}
+
+fn verify_schema_table(context: &SchemaVerificationContext<'_>, table: &str) -> Vec<String> {
+    context.verification_reader.scope_to_table(table);
+    let target_inventory =
+        match build_inventory(context.target_database, context.verification_reader) {
+            Ok(inventory) => inventory,
+            Err(error) => return vec![format!("target re-inventory failed: {error}")],
+        };
+    if !context.source.tables.iter().any(|item| item.name == table) {
+        return vec!["source table disappeared during verification".to_string()];
+    }
+    let mut differences = schema_table_differences(context.expected, &target_inventory, table);
+    differences.extend(verify_table_checks(context, table));
+    differences.extend(verify_table_foreign_keys(context, table));
+    differences
+}
+
+fn verify_table_checks(context: &SchemaVerificationContext<'_>, table: &str) -> Vec<String> {
+    let target_checks = context
+        .check_reader
+        .borrow_mut()
+        .read(context.target_database, Some(table))
+        .map(|checks| {
+            checks_by_table(&checks)
+                .get(table)
+                .cloned()
+                .unwrap_or_default()
+        });
+    match target_checks {
+        Ok(target_checks)
+            if target_checks
+                == context
+                    .source_checks_by_table
+                    .get(table)
+                    .cloned()
+                    .unwrap_or_default() =>
+        {
+            Vec::new()
+        }
+        Ok(_) => vec!["check constraints differ".to_string()],
+        Err(error) => vec![format!("check verification failed: {error}")],
+    }
+}
+
+fn verify_table_foreign_keys(context: &SchemaVerificationContext<'_>, table: &str) -> Vec<String> {
+    let target_canonical =
+        build_canonical_foreign_key_inventory(context.target_database, context.verification_reader);
+    let source_table_foreign_keys = relative_canonical_foreign_keys(
+        &canonical_foreign_keys_for(context.source_canonical_foreign_keys, table)
+            .iter()
+            .map(target_canonical_foreign_key)
+            .collect::<Vec<_>>(),
+        &context.source.schema,
+    );
+    match target_canonical {
+        Ok(target_keys)
+            if relative_canonical_foreign_keys(
+                &canonical_foreign_keys_for(&target_keys, table),
+                context.target_database,
+            ) == source_table_foreign_keys =>
+        {
+            Vec::new()
+        }
+        Ok(_) => vec!["foreign key rules differ".to_string()],
+        Err(error) => vec![format!("foreign key verification failed: {error}")],
+    }
 }
 
 fn render_sync_schema_termination(
@@ -1184,91 +1340,26 @@ fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, 
     let target = build_inventory(&config.target.database, &target_reader)
         .map_err(|error| format!("target schema inventory failed: {error}"))?;
     let selected = resolve_schema_selection(&selection, &source)?;
-    let preflight = MySqlCoercionPreflight {
-        config: inventory_config_target(&config.target),
-        schema: config.target.database.clone(),
-    };
-    let mut plan = plan_schema_convergence(&source, &target, &selected, &preflight)?;
     let source_checks = CheckConstraintReader::new(inventory_config_source(&config.source))
         .read(&config.source.database, None)?;
     let target_checks = CheckConstraintReader::new(inventory_config_target(&config.target))
         .read(&config.target.database, None)?;
-    append_check_constraint_plan(&mut plan, &source, &source_checks, &target_checks);
     let source_canonical_foreign_keys =
         build_canonical_foreign_key_inventory(&config.source.database, &source_reader)
             .map_err(|error| format!("source canonical foreign key inventory failed: {error}"))?;
     let target_canonical_foreign_keys =
         build_canonical_foreign_key_inventory(&config.target.database, &target_reader)
             .map_err(|error| format!("target canonical foreign key inventory failed: {error}"))?;
-    append_canonical_foreign_key_plan(
-        &mut plan,
-        &source,
-        &source_canonical_foreign_keys,
-        &target_canonical_foreign_keys,
-        &config.target.database,
-    );
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
-        .map_err(|error| error.to_string())?;
-    let mut executor = MySqlSchemaExecutor { executor };
-    let target_config = inventory_config_target(&config.target);
-    let source_checks_by_table = checks_by_table(&target_check_constraints(&source_checks));
-    let source_table_map = table_map(&source);
-    let expected = expected_target_inventory(&source);
-    // One reader and one check-constraint connection serve every table, because a fresh TLS
-    // handshake per table costs more than the metadata reads themselves.
-    let verification_reader = MariaDbInventoryReader::new(target_config.clone());
-    let check_reader = RefCell::new(CheckConstraintReader::new(target_config.clone()));
-    Ok(execute_schema_plan(plan, &mut executor, &|table| {
-        // Verification describes one table, so it must not re-read the whole schema per table.
-        verification_reader.scope_to_table(table);
-        let target_inventory = match build_inventory(&config.target.database, &verification_reader)
-        {
-            Ok(inventory) => inventory,
-            Err(error) => return vec![format!("target re-inventory failed: {error}")],
-        };
-        if !source_table_map.contains_key(table) {
-            return vec!["source table disappeared during verification".to_string()];
-        }
-        let mut differences = schema_table_differences(&expected, &target_inventory, table);
-        let target_checks = check_reader
-            .borrow_mut()
-            .read(&config.target.database, Some(table))
-            .map(|checks| {
-                checks_by_table(&checks)
-                    .get(table)
-                    .cloned()
-                    .unwrap_or_default()
-            });
-        match target_checks {
-            Ok(target_checks)
-                if target_checks
-                    == source_checks_by_table
-                        .get(table)
-                        .cloned()
-                        .unwrap_or_default() => {}
-            Ok(_) => differences.push("check constraints differ".to_string()),
-            Err(error) => differences.push(format!("check verification failed: {error}")),
-        }
-        let target_canonical =
-            build_canonical_foreign_key_inventory(&config.target.database, &verification_reader);
-        let source_table_foreign_keys = relative_canonical_foreign_keys(
-            &canonical_foreign_keys_for(&source_canonical_foreign_keys, table)
-                .iter()
-                .map(target_canonical_foreign_key)
-                .collect::<Vec<_>>(),
-            &config.source.database,
-        );
-        match target_canonical {
-            Ok(target_keys)
-                if relative_canonical_foreign_keys(
-                    &canonical_foreign_keys_for(&target_keys, table),
-                    &config.target.database,
-                ) == source_table_foreign_keys => {}
-            Ok(_) => differences.push("foreign key rules differ".to_string()),
-            Err(error) => differences.push(format!("foreign key verification failed: {error}")),
-        }
-        differences
-    }))
+    execute_schema_convergence(SchemaConvergenceInputs {
+        source: &source,
+        target_inventory: &target,
+        selected: &selected,
+        source_checks: &source_checks,
+        target_checks: &target_checks,
+        source_canonical_foreign_keys: &source_canonical_foreign_keys,
+        target_canonical_foreign_keys: &target_canonical_foreign_keys,
+        target: &config.target,
+    })
 }
 
 struct MySqlSchemaExecutor {
@@ -1479,6 +1570,40 @@ impl CheckConstraintReader {
         }
         result
     }
+}
+
+pub(crate) fn read_snapshot_check_constraints(
+    source: &crate::mysql_client::PersistentMySqlSource,
+    schema: &str,
+) -> Result<Vec<CheckConstraint>, String> {
+    let sql = format!(
+        "SELECT TABLE_NAME,CONSTRAINT_NAME,CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS WHERE CONSTRAINT_SCHEMA={} ORDER BY TABLE_NAME,CONSTRAINT_NAME",
+        crate::mysql_support::quote_sql_literal(schema)
+    );
+    source
+        .query_rows_as_strings(&sql)
+        .map_err(|error| format!("snapshot check constraint inventory failed: {error}"))?
+        .into_iter()
+        .map(|row| {
+            let [table, name, clause] = row.as_slice() else {
+                return Err(format!(
+                    "snapshot check constraint row has {} columns, expected 3",
+                    row.len()
+                ));
+            };
+            Ok(CheckConstraint {
+                table: table
+                    .clone()
+                    .ok_or_else(|| "snapshot check constraint table name is NULL".to_string())?,
+                name: name
+                    .clone()
+                    .ok_or_else(|| "snapshot check constraint name is NULL".to_string())?,
+                clause: clause
+                    .clone()
+                    .ok_or_else(|| "snapshot check constraint clause is NULL".to_string())?,
+            })
+        })
+        .collect()
 }
 
 fn query_check_constraints(

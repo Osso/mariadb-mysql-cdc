@@ -15,7 +15,8 @@
 
 - [x] Acquire the stream lease before recovery state changes.
 - [x] Hold `FLUSH TABLES WITH READ LOCK` only while opening one MariaDB `REPEATABLE READ` consistent snapshot and reading its current binlog coordinate.
-- [x] Keep that source snapshot transaction open for full-scope insert, update, delete, and verification phases.
+- [x] Keep that source snapshot transaction open for full-scope source reads, insert, update, delete, and verification phases.
+- [x] Capture source table, index, foreign-key, check, view, trigger, routine, and event evidence through that same snapshot connection; independent live source metadata reads are forbidden.
 - [x] Reconcile target data, including target-only orphan rows, before creating foreign keys.
 - [x] Run final schema convergence, including foreign-key creation, after data reconciliation; schema convergence must gate the atomic transition.
 - [x] Refuse checkpoint transition when any table is skipped, unsupported, or unresolved.
@@ -49,6 +50,7 @@
 - `src/lost_binlog_recovery.rs` — authorization, source/scope validation, snapshot fence, reconciliation orchestration, and atomic transition.
 - `src/lost_binlog_recovery_store.rs` — target-side CAS reads, immutable prepared-record insert, checkpoint update, commit, and exact barrier exclusion.
 - `src/mysql_client.rs` — MariaDB consistent-snapshot transaction and source coordinate capture.
+- `src/inventory/reader.rs` — snapshot-backed source metadata reader on the persistent transaction connection.
 - `src/repair_drift/` — full-scope insert/update/delete and verification phases.
 - `src/sync_schema.rs` — final schema convergence and foreign-key creation after anchored data repair.
 - `docs/stream-recovery-records-bootstrap.sql` — recovery-record table, guards, inventory procedure, and grants.

@@ -1,13 +1,17 @@
 use crate::checkpoint::Checkpoint;
 use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
-    build_inventory,
+    SnapshotInventoryReader, build_canonical_foreign_key_inventory, build_inventory,
 };
 use crate::live::TargetMySqlConfig;
 use crate::lost_binlog_recovery_store::MySqlLostBinlogRecoveryStore;
 use crate::mysql_client::PersistentMySqlSource;
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::repair_drift::{RepairDriftConfig, RepairDriftReport, run_consistent_snapshot_repair};
+use crate::sync_schema::{
+    SchemaSourceEvidence, read_snapshot_check_constraints,
+    run_schema_convergence_from_source_evidence,
+};
 use crate::table_sync::SyncMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -145,6 +149,7 @@ pub trait LostBinlogRecoveryStore {
     fn rollback_transaction(&self) -> Result<(), String>;
 }
 
+#[cfg(test)]
 pub fn prepare_lost_binlog_recovery<B, S>(
     boundary_reader: &B,
     store: &S,
@@ -157,13 +162,7 @@ where
     validate_recovery_request(request)?;
     store.acquire_stream_lease(&request.checkpoint_name)?;
     let new_checkpoint = boundary_reader.begin_consistent_snapshot_and_read_checkpoint()?;
-    validate_new_checkpoint(&request.expected_checkpoint, &new_checkpoint)?;
-    let prepared = LostBinlogRecoveryRecord::prepared(request, new_checkpoint);
-
-    run_recovery_transaction(store, || {
-        insert_prepared_recovery(store, request, &prepared)
-    })?;
-    Ok(prepared)
+    prepare_recovery_at_checkpoint(store, request, new_checkpoint)
 }
 
 fn insert_prepared_recovery<S>(
@@ -210,6 +209,22 @@ where
 }
 
 fn validate_recovery_request(request: &LostBinlogRecoveryRequest) -> Result<(), String> {
+    validate_static_recovery_request(request)?;
+    for (field, value) in [
+        ("scope_hash", request.scope_hash.as_str()),
+        (
+            "prepared_evidence_json",
+            request.prepared_evidence_json.as_str(),
+        ),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("lost-binlog recovery {field} is empty"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_static_recovery_request(request: &LostBinlogRecoveryRequest) -> Result<(), String> {
     for (field, value) in [
         ("recovery_id", request.recovery_id.as_str()),
         ("checkpoint_name", request.checkpoint_name.as_str()),
@@ -217,13 +232,8 @@ fn validate_recovery_request(request: &LostBinlogRecoveryRequest) -> Result<(), 
             "source_identity",
             request.expected_barrier.source_identity.as_str(),
         ),
-        ("scope_hash", request.scope_hash.as_str()),
         ("operator_identity", request.operator_identity.as_str()),
         ("reason", request.reason.as_str()),
-        (
-            "prepared_evidence_json",
-            request.prepared_evidence_json.as_str(),
-        ),
         ("raw_sql", request.expected_barrier.raw_sql.as_str()),
     ] {
         if value.trim().is_empty() {
@@ -363,40 +373,23 @@ pub fn run_recover_lost_binlog(
     config: &RecoverLostBinlogConfig,
 ) -> Result<RecoverLostBinlogReport, String> {
     let preparation = prepare_recovery_context(config)?;
-    let result = run_anchored_recovery(
-        config,
-        &preparation.request,
-        &preparation.store,
-        Rc::clone(&preparation.source),
-        preparation.source_inventory,
-        preparation.target_inventory,
-        preparation.scope_hash,
-    );
-    close_recovery_snapshot(&preparation.source, result)
+    let source = Rc::clone(&preparation.source);
+    let result = run_anchored_recovery(config, preparation);
+    close_recovery_snapshot(&source, result)
 }
 
 struct RecoveryPreparation {
     request: LostBinlogRecoveryRequest,
     source: Rc<PersistentMySqlSource>,
     store: MySqlLostBinlogRecoveryStore,
-    source_inventory: SchemaInventory,
-    target_inventory: SchemaInventory,
-    scope_hash: String,
 }
 
 fn prepare_recovery_context(
     config: &RecoverLostBinlogConfig,
 ) -> Result<RecoveryPreparation, String> {
-    let mut request = read_recovery_authorization(&config.authorization_file)?;
+    let request = read_recovery_authorization(&config.authorization_file)?;
     validate_authorized_source(config, &request)?;
-    let source_inventory = read_source_inventory(&config.source)?;
-    let target_inventory = read_target_inventory(&config.target)?;
-    validate_transactional_scope(&source_inventory)?;
-    let scope_hash = authorize_current_scope(&mut request, &source_inventory)?;
-    if request.prepared_evidence_json.trim().is_empty() {
-        request.prepared_evidence_json =
-            prepared_evidence_json(&source_inventory, &target_inventory, &scope_hash)?;
-    }
+    validate_static_recovery_request(&request)?;
     let source = Rc::new(
         PersistentMySqlSource::new(&config.source)
             .map_err(|error| format!("connect recovery snapshot source: {error}"))?,
@@ -412,9 +405,6 @@ fn prepare_recovery_context(
         request,
         source,
         store,
-        source_inventory,
-        target_inventory,
-        scope_hash,
     })
 }
 
@@ -475,43 +465,104 @@ fn close_recovery_snapshot(
     }
 }
 
-fn run_anchored_recovery(
-    config: &RecoverLostBinlogConfig,
-    request: &LostBinlogRecoveryRequest,
-    store: &MySqlLostBinlogRecoveryStore,
-    source: Rc<PersistentMySqlSource>,
-    source_inventory: SchemaInventory,
+struct PreparedRecoverySnapshot {
+    request: LostBinlogRecoveryRequest,
+    prepared: LostBinlogRecoveryRecord,
+    source_evidence: SchemaSourceEvidence,
     target_inventory: SchemaInventory,
     scope_hash: String,
+}
+
+fn run_anchored_recovery(
+    config: &RecoverLostBinlogConfig,
+    preparation: RecoveryPreparation,
 ) -> Result<RecoverLostBinlogReport, String> {
-    run_recovery_phases(
-        || begin_authorized_snapshot(config, request, store, source.as_ref()),
-        |_prepared| {
-            repair_consistent_snapshot(
-                config,
-                request,
-                Rc::clone(&source),
-                source_inventory,
-                target_inventory,
-            )
-        },
-        |_prepared, _repair| {
-            let schema_report = crate::sync_schema::run_full_schema_sync(
-                config.source.clone(),
-                config.target.clone(),
-            )?;
-            require_converged_schema(&schema_report)?;
-            Ok(schema_report)
-        },
-        |prepared, repair, schema_report| {
-            require_unchanged_source_scope(config, &scope_hash)?;
-            let proof = reconciliation_proof(request, &repair, &scope_hash, &schema_report);
-            commit_lost_binlog_recovery(store, request, &proof)?;
-            Ok(recovery_report(request, prepared, repair, scope_hash))
-        },
+    let RecoveryPreparation {
+        mut request,
+        source,
+        store,
+    } = preparation;
+    store.acquire_stream_lease(&request.checkpoint_name)?;
+    let new_checkpoint = begin_fenced_snapshot(config, source.as_ref())?;
+    let prepared_snapshot = capture_prepared_recovery_snapshot(
+        config,
+        source.as_ref(),
+        &store,
+        &mut request,
+        new_checkpoint,
+    )?;
+    let repair = repair_consistent_snapshot(
+        config,
+        &prepared_snapshot.request,
+        Rc::clone(&source),
+        prepared_snapshot.source_evidence.inventory.clone(),
+        prepared_snapshot.target_inventory.clone(),
+    )?;
+    let schema_report = run_schema_convergence_from_source_evidence(
+        prepared_snapshot.source_evidence.clone(),
+        config.target.clone(),
+    )?;
+    require_converged_schema(&schema_report)?;
+    commit_anchored_recovery(
+        config,
+        source.as_ref(),
+        &store,
+        prepared_snapshot,
+        repair,
+        schema_report,
     )
 }
 
+fn capture_prepared_recovery_snapshot(
+    config: &RecoverLostBinlogConfig,
+    source: &PersistentMySqlSource,
+    store: &MySqlLostBinlogRecoveryStore,
+    request: &mut LostBinlogRecoveryRequest,
+    new_checkpoint: Checkpoint,
+) -> Result<PreparedRecoverySnapshot, String> {
+    let source_evidence = read_snapshot_source_evidence(source, &config.source.database)?;
+    let target_inventory = read_target_inventory(&config.target)?;
+    validate_transactional_scope(&source_evidence.inventory)?;
+    let scope_hash = authorize_current_scope(request, &source_evidence.inventory)?;
+    if request.prepared_evidence_json.trim().is_empty() {
+        request.prepared_evidence_json =
+            prepared_evidence_json(&source_evidence.inventory, &target_inventory, &scope_hash)?;
+    }
+    let prepared = prepare_recovery_at_checkpoint(store, request, new_checkpoint)?;
+    Ok(PreparedRecoverySnapshot {
+        request: request.clone(),
+        prepared,
+        source_evidence,
+        target_inventory,
+        scope_hash,
+    })
+}
+
+fn commit_anchored_recovery(
+    config: &RecoverLostBinlogConfig,
+    source: &PersistentMySqlSource,
+    store: &MySqlLostBinlogRecoveryStore,
+    prepared: PreparedRecoverySnapshot,
+    repair: RepairDriftReport,
+    schema_report: crate::sync_schema::SchemaConvergenceReport,
+) -> Result<RecoverLostBinlogReport, String> {
+    require_unchanged_source_scope(source, &config.source.database, &prepared.scope_hash)?;
+    let proof = reconciliation_proof(
+        &prepared.request,
+        &repair,
+        &prepared.scope_hash,
+        &schema_report,
+    );
+    commit_lost_binlog_recovery(store, &prepared.request, &proof)?;
+    Ok(recovery_report(
+        &prepared.request,
+        prepared.prepared,
+        repair,
+        prepared.scope_hash,
+    ))
+}
+
+#[cfg(test)]
 fn run_recovery_phases<Snapshot, Repair, Schema, Output>(
     begin_snapshot: impl FnOnce() -> Result<Snapshot, String>,
     reconcile_data: impl FnOnce(&Snapshot) -> Result<Repair, String>,
@@ -524,19 +575,49 @@ fn run_recovery_phases<Snapshot, Repair, Schema, Output>(
     commit(snapshot, repair, schema)
 }
 
-fn begin_authorized_snapshot(
+#[cfg(test)]
+fn run_recovery_phases_with_source_evidence<Snapshot, Evidence, Repair, Schema, Output>(
+    begin_snapshot: impl FnOnce() -> Result<Snapshot, String>,
+    capture_source_evidence: impl FnOnce(&Snapshot) -> Result<Evidence, String>,
+    reconcile_data: impl FnOnce(&Snapshot, &Evidence) -> Result<Repair, String>,
+    converge_schema: impl FnOnce(&Snapshot, &Evidence, &Repair) -> Result<Schema, String>,
+    commit: impl FnOnce(Snapshot, Evidence, Repair, Schema) -> Result<Output, String>,
+) -> Result<Output, String> {
+    let snapshot = begin_snapshot()?;
+    let evidence = capture_source_evidence(&snapshot)?;
+    let repair = reconcile_data(&snapshot, &evidence)?;
+    let schema = converge_schema(&snapshot, &evidence, &repair)?;
+    commit(snapshot, evidence, repair, schema)
+}
+
+fn begin_fenced_snapshot(
     config: &RecoverLostBinlogConfig,
-    request: &LostBinlogRecoveryRequest,
-    store: &MySqlLostBinlogRecoveryStore,
     source: &PersistentMySqlSource,
-) -> Result<LostBinlogRecoveryRecord, String> {
+) -> Result<Checkpoint, String> {
     let write_fence_source = PersistentMySqlSource::new(&config.source)
         .map_err(|error| format!("connect recovery write-fence source: {error}"))?;
     let boundary_reader = FencedSnapshotBoundaryReader {
         snapshot_source: source,
         write_fence_source: &write_fence_source,
     };
-    prepare_lost_binlog_recovery(&boundary_reader, store, request)
+    boundary_reader.begin_consistent_snapshot_and_read_checkpoint()
+}
+
+fn prepare_recovery_at_checkpoint<S>(
+    store: &S,
+    request: &LostBinlogRecoveryRequest,
+    new_checkpoint: Checkpoint,
+) -> Result<LostBinlogRecoveryRecord, String>
+where
+    S: LostBinlogRecoveryStore,
+{
+    validate_recovery_request(request)?;
+    validate_new_checkpoint(&request.expected_checkpoint, &new_checkpoint)?;
+    let prepared = LostBinlogRecoveryRecord::prepared(request, new_checkpoint);
+    run_recovery_transaction(store, || {
+        insert_prepared_recovery(store, request, &prepared)
+    })?;
+    Ok(prepared)
 }
 
 fn repair_consistent_snapshot(
@@ -556,10 +637,11 @@ fn repair_consistent_snapshot(
 }
 
 fn require_unchanged_source_scope(
-    config: &RecoverLostBinlogConfig,
+    source: &PersistentMySqlSource,
+    schema: &str,
     expected_scope_hash: &str,
 ) -> Result<(), String> {
-    let current_inventory = read_source_inventory(&config.source)?;
+    let current_inventory = read_snapshot_source_inventory(source, schema)?;
     let current_scope_hash = inventory_scope_hash(&current_inventory)?;
     if current_scope_hash == expected_scope_hash {
         return Ok(());
@@ -674,19 +756,31 @@ fn inventory_scope_hash(inventory: &SchemaInventory) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
-fn read_source_inventory(config: &MySqlConnectionConfig) -> Result<SchemaInventory, String> {
-    let reader = MariaDbInventoryReader::new(InventoryConfig {
-        host: config.host.clone(),
-        port: config.port,
-        user: config.user.clone(),
-        password: config.password.clone(),
-        endpoint_role: InventoryEndpointRole::Source,
-        use_tls: false,
-        tls_ca_file: None,
-        ..InventoryConfig::default()
-    });
-    build_inventory(&config.database, &reader)
-        .map_err(|error| format!("source recovery inventory failed: {error}"))
+fn read_snapshot_source_inventory(
+    source: &PersistentMySqlSource,
+    schema: &str,
+) -> Result<SchemaInventory, String> {
+    let reader = SnapshotInventoryReader::new(source, InventoryEndpointRole::Source);
+    build_inventory(schema, &reader)
+        .map_err(|error| format!("snapshot source recovery inventory failed: {error}"))
+}
+
+fn read_snapshot_source_evidence(
+    source: &PersistentMySqlSource,
+    schema: &str,
+) -> Result<SchemaSourceEvidence, String> {
+    let inventory = read_snapshot_source_inventory(source, schema)?;
+    let checks = read_snapshot_check_constraints(source, schema)?;
+    let reader = SnapshotInventoryReader::new(source, InventoryEndpointRole::Source);
+    let canonical_foreign_keys =
+        build_canonical_foreign_key_inventory(schema, &reader).map_err(|error| {
+            format!("snapshot source canonical foreign key inventory failed: {error}")
+        })?;
+    Ok(SchemaSourceEvidence {
+        inventory,
+        checks,
+        canonical_foreign_keys,
+    })
 }
 
 fn read_target_inventory(config: &TargetMySqlConfig) -> Result<SchemaInventory, String> {
@@ -828,6 +922,70 @@ mod tests {
         fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String> {
             Ok(self.0.clone())
         }
+    }
+
+    #[test]
+    fn recovery_reads_source_evidence_after_snapshot_and_reuses_it_for_schema() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let source_evidence = Rc::new(RefCell::new(None::<String>));
+
+        let result = run_recovery_phases_with_source_evidence(
+            {
+                let steps = Rc::clone(&steps);
+                move || {
+                    steps.borrow_mut().push("snapshot");
+                    Ok("snapshot-1".to_string())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                let source_evidence = Rc::clone(&source_evidence);
+                move |snapshot| {
+                    steps.borrow_mut().push("source_evidence");
+                    assert_eq!(snapshot.as_str(), "snapshot-1");
+                    source_evidence.replace(Some("schema-1".to_string()));
+                    Ok("schema-1".to_string())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                move |snapshot, evidence| {
+                    steps.borrow_mut().push("reconcile_data");
+                    assert_eq!(snapshot.as_str(), "snapshot-1");
+                    assert_eq!(evidence.as_str(), "schema-1");
+                    Ok("repaired".to_string())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                move |_snapshot, evidence, _repair| {
+                    steps.borrow_mut().push("converge_schema");
+                    assert_eq!(evidence.as_str(), "schema-1");
+                    Ok("converged".to_string())
+                }
+            },
+            {
+                let steps = Rc::clone(&steps);
+                move |_snapshot, evidence, _repair, _schema| {
+                    steps.borrow_mut().push("commit");
+                    assert_eq!(evidence.as_str(), "schema-1");
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(source_evidence.borrow().as_deref(), Some("schema-1"));
+        assert_eq!(
+            steps.borrow().as_slice(),
+            [
+                "snapshot",
+                "source_evidence",
+                "reconcile_data",
+                "converge_schema",
+                "commit"
+            ]
+        );
     }
 
     #[test]

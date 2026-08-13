@@ -12,3 +12,4 @@ mod tests;
 pub use build::{build_canonical_foreign_key_inventory, build_inventory};
 pub use model::*;
 pub use reader::MariaDbInventoryReader;
+pub(crate) use reader::SnapshotInventoryReader;

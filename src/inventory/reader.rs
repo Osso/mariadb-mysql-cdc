@@ -1,7 +1,8 @@
 use super::model::{
-    ColumnRow, EventRow, ForeignKeyRow, IndexRow, InventoryConfig, InventoryError, InventoryReader,
-    PrimaryKeyRow, RoutineRow, SchemaDefaults, SourceBinlogSettings, SourceMasterCoordinate,
-    TableRow, TableRuntimeMetadata, TriggerRow, ViewRow,
+    ColumnRow, EventRow, ForeignKeyRow, IndexRow, InventoryConfig, InventoryEndpointRole,
+    InventoryError, InventoryReader, PrimaryKeyRow, RoutineRow, SchemaDefaults,
+    SourceBinlogSettings, SourceMasterCoordinate, TableRow, TableRuntimeMetadata, TriggerRow,
+    ViewRow,
 };
 use super::parse::{
     parse_canonical_foreign_key_row, parse_column_row, parse_event_row, parse_foreign_key_row,
@@ -20,6 +21,7 @@ use super::retry::{
 };
 use super::values::row_to_inventory_fields;
 use crate::conflict_repair::CanonicalForeignKeyRow;
+use crate::mysql_client::PersistentMySqlSource;
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Row};
 use std::cell::RefCell;
@@ -444,6 +446,115 @@ impl MariaDbInventoryReader {
             connected_at: Instant::now(),
         }));
         Ok(())
+    }
+}
+
+pub(crate) struct SnapshotInventoryReader<'a> {
+    source: &'a PersistentMySqlSource,
+    endpoint_role: InventoryEndpointRole,
+}
+
+impl<'a> SnapshotInventoryReader<'a> {
+    pub(crate) fn new(
+        source: &'a PersistentMySqlSource,
+        endpoint_role: InventoryEndpointRole,
+    ) -> Self {
+        Self {
+            source,
+            endpoint_role,
+        }
+    }
+
+    fn query_rows(&self, query: String) -> Result<Vec<Vec<String>>, InventoryError> {
+        self.source
+            .query_rows_as_strings(&query)
+            .map_err(|error| {
+                InventoryError::new(format!("snapshot inventory query failed: {error}"))
+            })
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|value| value.unwrap_or_default())
+                            .collect()
+                    })
+                    .collect()
+            })
+    }
+}
+
+impl InventoryReader for SnapshotInventoryReader<'_> {
+    fn read_tables(&self, schema: &str) -> Result<Vec<TableRow>, InventoryError> {
+        self.query_rows(tables_query(schema, None))?
+            .iter()
+            .map(|row| parse_table_row(row))
+            .collect()
+    }
+
+    fn read_columns(&self, schema: &str) -> Result<Vec<ColumnRow>, InventoryError> {
+        self.query_rows(columns_query(schema, None))?
+            .iter()
+            .map(|row| parse_column_row(row))
+            .collect()
+    }
+
+    fn read_primary_keys(&self, schema: &str) -> Result<Vec<PrimaryKeyRow>, InventoryError> {
+        self.query_rows(primary_keys_query(schema, None))?
+            .iter()
+            .map(|row| parse_primary_key_row(row))
+            .collect()
+    }
+
+    fn read_indexes(&self, schema: &str) -> Result<Vec<IndexRow>, InventoryError> {
+        self.query_rows(indexes_query(schema, self.endpoint_role, None))?
+            .iter()
+            .map(|row| parse_index_row(row))
+            .collect()
+    }
+
+    fn read_foreign_keys(&self, schema: &str) -> Result<Vec<ForeignKeyRow>, InventoryError> {
+        self.query_rows(foreign_keys_query(schema, None))?
+            .iter()
+            .map(|row| parse_foreign_key_row(row))
+            .collect()
+    }
+
+    fn read_canonical_foreign_keys(
+        &self,
+        schema: &str,
+    ) -> Result<Vec<CanonicalForeignKeyRow>, InventoryError> {
+        self.query_rows(canonical_foreign_keys_query(schema, None))?
+            .iter()
+            .map(|row| parse_canonical_foreign_key_row(row))
+            .collect()
+    }
+
+    fn read_views(&self, schema: &str) -> Result<Vec<ViewRow>, InventoryError> {
+        self.query_rows(views_query(schema))?
+            .iter()
+            .map(|row| parse_view_row(row))
+            .collect()
+    }
+
+    fn read_triggers(&self, schema: &str) -> Result<Vec<TriggerRow>, InventoryError> {
+        self.query_rows(triggers_query(schema))?
+            .iter()
+            .map(|row| parse_trigger_row(row))
+            .collect()
+    }
+
+    fn read_routines(&self, schema: &str) -> Result<Vec<RoutineRow>, InventoryError> {
+        self.query_rows(routines_query(schema))?
+            .iter()
+            .map(|row| parse_routine_row(row))
+            .collect()
+    }
+
+    fn read_events(&self, schema: &str) -> Result<Vec<EventRow>, InventoryError> {
+        self.query_rows(events_query(schema))?
+            .iter()
+            .map(|row| parse_event_row(row))
+            .collect()
     }
 }
 
