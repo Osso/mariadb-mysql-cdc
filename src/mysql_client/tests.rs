@@ -23,13 +23,13 @@ fn formats_mysql_values_like_snapshot_text_rows() {
 }
 
 #[test]
-fn consistent_snapshot_uses_exact_mariadb_master_status_query() {
-    assert_eq!(consistent_snapshot_coordinate_query(), "SHOW MASTER STATUS");
+fn binlog_coordinate_uses_exact_mariadb_master_status_query() {
+    assert_eq!(binlog_coordinate_query(), "SHOW MASTER STATUS");
 }
 
 #[test]
 fn parses_mariadb_master_status_row_shape() {
-    let checkpoint = parse_consistent_snapshot_checkpoint(vec![vec![
+    let checkpoint = parse_binlog_coordinate_checkpoint(vec![vec![
         Some("mysqld-bin.000123".to_string()),
         Some("456".to_string()),
         Some(String::new()),
@@ -41,17 +41,17 @@ fn parses_mariadb_master_status_row_shape() {
     assert_eq!(checkpoint.source_position, 456);
     assert_eq!(
         checkpoint.last_event.event_type,
-        "LostBinlogRecoverySnapshot"
+        "LostBinlogRecoveryCoordinate"
     );
 }
 
 #[test]
 fn rejects_invalid_mariadb_master_status_shapes() {
     let cases = [
-        (Vec::new(), "MariaDB snapshot coordinate is missing"),
+        (Vec::new(), "MariaDB binlog coordinate is missing"),
         (
             vec![vec![None, Some("456".to_string()), None, None]],
-            "MariaDB snapshot coordinate file is missing",
+            "MariaDB binlog coordinate file is missing",
         ),
         (
             vec![vec![
@@ -60,7 +60,7 @@ fn rejects_invalid_mariadb_master_status_shapes() {
                 None,
                 None,
             ]],
-            "MariaDB snapshot coordinate position is missing",
+            "MariaDB binlog coordinate position is missing",
         ),
         (
             vec![vec![
@@ -69,12 +69,12 @@ fn rejects_invalid_mariadb_master_status_shapes() {
                 None,
                 None,
             ]],
-            "invalid MariaDB snapshot coordinate position",
+            "invalid MariaDB binlog coordinate position",
         ),
     ];
 
     for (rows, expected_message) in cases {
-        let error = parse_consistent_snapshot_checkpoint(rows)
+        let error = parse_binlog_coordinate_checkpoint(rows)
             .expect_err("invalid MariaDB SHOW MASTER STATUS row must fail closed");
         assert!(
             error.to_string().contains(expected_message),

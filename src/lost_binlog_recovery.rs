@@ -100,67 +100,43 @@ pub struct LostBinlogReconciliationProof {
 
 #[cfg(test)]
 pub trait LostBinlogBoundaryReader {
-    fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String>;
+    fn read_binlog_coordinate(&self) -> Result<Checkpoint, String>;
 }
 
-struct FencedSnapshotBoundaryReader<'a> {
-    snapshot_source: &'a PersistentMySqlSource,
-    write_fence_source: &'a PersistentMySqlSource,
+struct CommittedSourceBoundaryReader<'a> {
+    source: &'a PersistentMySqlSource,
     schema: &'a str,
 }
 
-impl FencedSnapshotBoundaryReader<'_> {
-    fn begin_consistent_snapshot_and_read_checkpoint_and_evidence(
+impl CommittedSourceBoundaryReader<'_> {
+    fn read_binlog_coordinate_and_source_evidence(
         &self,
     ) -> Result<(Checkpoint, SchemaSourceEvidence), String> {
-        capture_under_source_write_fence(
+        read_committed_source_boundary(
             || {
-                self.write_fence_source
-                    .execute_session_sql("FLUSH TABLES WITH READ LOCK")
-                    .map_err(|error| format!("acquire source snapshot write fence: {error}"))
+                self.source
+                    .read_binlog_coordinate()
+                    .map_err(|error| format!("read source binlog coordinate: {error}"))
             },
-            || {
-                self.snapshot_source
-                    .begin_consistent_snapshot()
-                    .map_err(|error| format!("begin source consistent snapshot: {error}"))
-            },
-            |_captured_checkpoint| read_snapshot_source_evidence(self.snapshot_source, self.schema),
-            || {
-                self.write_fence_source
-                    .execute_session_sql("UNLOCK TABLES")
-                    .map_err(|error| format!("release source snapshot write fence: {error}"))
-            },
+            |_coordinate| read_source_evidence(self.source, self.schema),
         )
     }
 }
 
-fn capture_under_source_write_fence<Checkpoint, Evidence>(
-    acquire_fence: impl FnOnce() -> Result<(), String>,
-    open_snapshot: impl FnOnce() -> Result<Checkpoint, String>,
-    capture_evidence: impl FnOnce(&Checkpoint) -> Result<Evidence, String>,
-    release_fence: impl FnOnce() -> Result<(), String>,
-) -> Result<(Checkpoint, Evidence), String> {
-    acquire_fence()?;
-    let snapshot = open_snapshot();
-    let evidence = match snapshot.as_ref() {
-        Ok(checkpoint) => capture_evidence(checkpoint),
-        Err(error) => Err(error.clone()),
-    };
-    let release = release_fence();
-
-    match (snapshot, evidence, release) {
-        (Ok(checkpoint), Ok(evidence), Ok(())) => Ok((checkpoint, evidence)),
-        (Err(error), _, _) => Err(error),
-        (Ok(_), Err(error), _) => Err(error),
-        (Ok(_), Ok(_), Err(error)) => Err(error),
-    }
+fn read_committed_source_boundary<Coordinate, Evidence>(
+    read_coordinate: impl FnOnce() -> Result<Coordinate, String>,
+    read_evidence: impl FnOnce(&Coordinate) -> Result<Evidence, String>,
+) -> Result<(Coordinate, Evidence), String> {
+    let coordinate = read_coordinate()?;
+    let evidence = read_evidence(&coordinate)?;
+    Ok((coordinate, evidence))
 }
 
 #[cfg(test)]
-impl LostBinlogBoundaryReader for FencedSnapshotBoundaryReader<'_> {
-    fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String> {
-        self.begin_consistent_snapshot_and_read_checkpoint_and_evidence()
-            .map(|(checkpoint, _evidence)| checkpoint)
+impl LostBinlogBoundaryReader for CommittedSourceBoundaryReader<'_> {
+    fn read_binlog_coordinate(&self) -> Result<Checkpoint, String> {
+        self.read_binlog_coordinate_and_source_evidence()
+            .map(|(coordinate, _evidence)| coordinate)
     }
 }
 
@@ -213,7 +189,7 @@ where
 {
     validate_recovery_request(request)?;
     store.acquire_stream_lease(&request.checkpoint_name)?;
-    let new_checkpoint = boundary_reader.begin_consistent_snapshot_and_read_checkpoint()?;
+    let new_checkpoint = boundary_reader.read_binlog_coordinate()?;
     prepare_recovery_at_checkpoint(store, request, new_checkpoint)
 }
 
@@ -481,9 +457,7 @@ pub fn run_recover_lost_binlog(
     config: &RecoverLostBinlogConfig,
 ) -> Result<RecoverLostBinlogReport, String> {
     let preparation = prepare_recovery_context(config)?;
-    let source = Rc::clone(&preparation.source);
-    let result = run_anchored_recovery(config, preparation);
-    close_recovery_snapshot(&source, result)
+    run_anchored_recovery(config, preparation)
 }
 
 struct RecoveryPreparation {
@@ -500,7 +474,7 @@ fn prepare_recovery_context(
     validate_static_recovery_request(&request)?;
     let source = Rc::new(
         PersistentMySqlSource::new(&config.source)
-            .map_err(|error| format!("connect recovery snapshot source: {error}"))?,
+            .map_err(|error| format!("connect recovery source: {error}"))?,
     );
     let store = MySqlLostBinlogRecoveryStore::new(
         &config.target,
@@ -559,20 +533,6 @@ fn prepared_evidence_json(
     .to_string())
 }
 
-fn close_recovery_snapshot(
-    source: &PersistentMySqlSource,
-    result: Result<RecoverLostBinlogReport, String>,
-) -> Result<RecoverLostBinlogReport, String> {
-    let rollback = source
-        .rollback_consistent_snapshot()
-        .map_err(|error| format!("close recovery source snapshot: {error}"));
-    match (result, rollback) {
-        (Ok(report), Ok(())) => Ok(report),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-    }
-}
-
 struct PreparedRecoverySnapshot {
     request: LostBinlogRecoveryRequest,
     prepared: LostBinlogRecoveryRecord,
@@ -591,7 +551,8 @@ fn run_anchored_recovery(
         store,
     } = preparation;
     store.acquire_stream_lease(&request.checkpoint_name)?;
-    let (new_checkpoint, source_evidence) = begin_fenced_snapshot(config, source.as_ref())?;
+    let (new_checkpoint, source_evidence) =
+        begin_committed_source_boundary(config, source.as_ref())?;
     let prepared_snapshot = capture_prepared_recovery_snapshot(
         config,
         &store,
@@ -699,18 +660,15 @@ fn run_recovery_phases_with_source_evidence<Snapshot, Evidence, Repair, Schema, 
     commit(snapshot, evidence, repair, schema)
 }
 
-fn begin_fenced_snapshot(
+fn begin_committed_source_boundary(
     config: &RecoverLostBinlogConfig,
     source: &PersistentMySqlSource,
 ) -> Result<(Checkpoint, SchemaSourceEvidence), String> {
-    let write_fence_source = PersistentMySqlSource::new(&config.source)
-        .map_err(|error| format!("connect recovery write-fence source: {error}"))?;
-    let boundary_reader = FencedSnapshotBoundaryReader {
-        snapshot_source: source,
-        write_fence_source: &write_fence_source,
+    let boundary_reader = CommittedSourceBoundaryReader {
+        source,
         schema: &config.source.database,
     };
-    boundary_reader.begin_consistent_snapshot_and_read_checkpoint_and_evidence()
+    boundary_reader.read_binlog_coordinate_and_source_evidence()
 }
 
 fn prepare_recovery_at_checkpoint<S>(
@@ -751,7 +709,7 @@ fn require_unchanged_source_scope(
     schema: &str,
     expected_scope_hash: &str,
 ) -> Result<(), String> {
-    let current_inventory = read_snapshot_source_inventory(source, schema)?;
+    let current_inventory = read_source_inventory(source, schema)?;
     let current_scope_hash = inventory_scope_hash(&current_inventory)?;
     if current_scope_hash == expected_scope_hash {
         return Ok(());
@@ -900,7 +858,7 @@ fn inventory_scope_hash(inventory: &SchemaInventory) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
-fn read_snapshot_source_inventory(
+fn read_source_inventory(
     source: &PersistentMySqlSource,
     schema: &str,
 ) -> Result<SchemaInventory, String> {
@@ -909,11 +867,11 @@ fn read_snapshot_source_inventory(
         .map_err(|error| format!("snapshot source recovery inventory failed: {error}"))
 }
 
-fn read_snapshot_source_evidence(
+fn read_source_evidence(
     source: &PersistentMySqlSource,
     schema: &str,
 ) -> Result<SchemaSourceEvidence, String> {
-    let inventory = read_snapshot_source_inventory(source, schema)?;
+    let inventory = read_source_inventory(source, schema)?;
     let checks = read_snapshot_check_constraints(source, schema)?;
     let reader = SnapshotInventoryReader::new(source, InventoryEndpointRole::Source);
     let canonical_foreign_keys =
@@ -1081,7 +1039,7 @@ mod tests {
     struct FixedBoundaryReader(Checkpoint);
 
     impl LostBinlogBoundaryReader for FixedBoundaryReader {
-        fn begin_consistent_snapshot_and_read_checkpoint(&self) -> Result<Checkpoint, String> {
+        fn read_binlog_coordinate(&self) -> Result<Checkpoint, String> {
             Ok(self.0.clone())
         }
     }
@@ -1250,23 +1208,16 @@ mod tests {
     }
 
     #[test]
-    fn source_evidence_is_captured_before_releasing_the_write_fence() {
+    fn committed_source_boundary_reads_coordinate_then_committed_evidence_without_locking() {
         let steps = Rc::new(RefCell::new(Vec::new()));
         let expected_checkpoint = checkpoint("mysqld-bin.000010", 500);
 
-        let result = capture_under_source_write_fence(
-            {
-                let steps = Rc::clone(&steps);
-                move || {
-                    steps.borrow_mut().push("lock");
-                    Ok(())
-                }
-            },
+        let result = read_committed_source_boundary(
             {
                 let steps = Rc::clone(&steps);
                 let expected_checkpoint = expected_checkpoint.clone();
                 move || {
-                    steps.borrow_mut().push("snapshot");
+                    steps.borrow_mut().push("coordinate");
                     Ok(expected_checkpoint)
                 }
             },
@@ -1278,61 +1229,34 @@ mod tests {
                     Ok("evidence")
                 }
             },
-            {
-                let steps = Rc::clone(&steps);
-                move || {
-                    steps.borrow_mut().push("unlock");
-                    Ok(())
-                }
-            },
         );
 
         assert_eq!(result, Ok((expected_checkpoint, "evidence")));
-        assert_eq!(
-            steps.borrow().as_slice(),
-            ["lock", "snapshot", "source_evidence", "unlock"]
-        );
+        assert_eq!(steps.borrow().as_slice(), ["coordinate", "source_evidence"]);
     }
 
     #[test]
-    fn source_evidence_capture_error_unlocks_and_blocks_following_phases() {
+    fn committed_source_boundary_coordinate_error_stops_before_source_evidence() {
         let steps = Rc::new(RefCell::new(Vec::new()));
-        let result = capture_under_source_write_fence(
+        let result = read_committed_source_boundary(
             {
                 let steps = Rc::clone(&steps);
                 move || {
-                    steps.borrow_mut().push("lock");
-                    Ok(())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move || {
-                    steps.borrow_mut().push("snapshot");
-                    Ok(checkpoint("mysqld-bin.000010", 500))
+                    steps.borrow_mut().push("coordinate");
+                    Err::<Checkpoint, String>("coordinate failed".to_string())
                 }
             },
             {
                 let steps = Rc::clone(&steps);
                 move |_captured_checkpoint| {
                     steps.borrow_mut().push("source_evidence");
-                    Err::<&str, String>("source evidence failed".to_string())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move || {
-                    steps.borrow_mut().push("unlock");
-                    Ok(())
+                    Ok::<&str, String>("evidence")
                 }
             },
         );
 
-        assert_eq!(result, Err("source evidence failed".to_string()));
-        assert_eq!(
-            steps.borrow().as_slice(),
-            ["lock", "snapshot", "source_evidence", "unlock"]
-        );
+        assert_eq!(result, Err("coordinate failed".to_string()));
+        assert_eq!(steps.borrow().as_slice(), ["coordinate"]);
     }
 
     #[test]
@@ -1342,34 +1266,34 @@ mod tests {
             {
                 let steps = Rc::clone(&steps);
                 move || {
-                    steps.borrow_mut().push("snapshot");
-                    Ok("snapshot-1".to_string())
+                    steps.borrow_mut().push("coordinate");
+                    Ok("coordinate-1".to_string())
                 }
             },
             {
                 let steps = Rc::clone(&steps);
-                move |_snapshot| {
+                move |_coordinate| {
                     steps.borrow_mut().push("source_evidence");
                     Err::<&str, String>("source evidence failed".to_string())
                 }
             },
             {
                 let steps = Rc::clone(&steps);
-                move |_snapshot, _evidence| {
+                move |_coordinate, _evidence| {
                     steps.borrow_mut().push("reconcile_data");
                     Ok("repaired")
                 }
             },
             {
                 let steps = Rc::clone(&steps);
-                move |_snapshot, _evidence, _repair| {
+                move |_coordinate, _evidence, _repair| {
                     steps.borrow_mut().push("converge_schema");
                     Ok("converged")
                 }
             },
             {
                 let steps = Rc::clone(&steps);
-                move |_snapshot, _evidence, _repair, _schema| {
+                move |_coordinate, _evidence, _repair, _schema| {
                     steps.borrow_mut().push("commit");
                     Ok(())
                 }
@@ -1377,11 +1301,11 @@ mod tests {
         );
 
         assert_eq!(result, Err("source evidence failed".to_string()));
-        assert_eq!(steps.borrow().as_slice(), ["snapshot", "source_evidence"]);
+        assert_eq!(steps.borrow().as_slice(), ["coordinate", "source_evidence"]);
     }
 
     #[test]
-    fn recovery_reads_source_evidence_after_snapshot_and_reuses_it_for_schema() {
+    fn recovery_reuses_committed_source_evidence_for_schema() {
         let steps = Rc::new(RefCell::new(Vec::new()));
         let source_evidence = Rc::new(RefCell::new(None::<String>));
 
@@ -1389,32 +1313,32 @@ mod tests {
             {
                 let steps = Rc::clone(&steps);
                 move || {
-                    steps.borrow_mut().push("snapshot");
-                    Ok("snapshot-1".to_string())
+                    steps.borrow_mut().push("coordinate");
+                    Ok("coordinate-1".to_string())
                 }
             },
             {
                 let steps = Rc::clone(&steps);
                 let source_evidence = Rc::clone(&source_evidence);
-                move |snapshot| {
+                move |coordinate| {
                     steps.borrow_mut().push("source_evidence");
-                    assert_eq!(snapshot.as_str(), "snapshot-1");
+                    assert_eq!(coordinate.as_str(), "coordinate-1");
                     source_evidence.replace(Some("schema-1".to_string()));
                     Ok("schema-1".to_string())
                 }
             },
             {
                 let steps = Rc::clone(&steps);
-                move |snapshot, evidence| {
+                move |coordinate, evidence| {
                     steps.borrow_mut().push("reconcile_data");
-                    assert_eq!(snapshot.as_str(), "snapshot-1");
+                    assert_eq!(coordinate.as_str(), "coordinate-1");
                     assert_eq!(evidence.as_str(), "schema-1");
                     Ok("repaired".to_string())
                 }
             },
             {
                 let steps = Rc::clone(&steps);
-                move |_snapshot, evidence, _repair| {
+                move |_coordinate, evidence, _repair| {
                     steps.borrow_mut().push("converge_schema");
                     assert_eq!(evidence.as_str(), "schema-1");
                     Ok("converged".to_string())
@@ -1422,7 +1346,7 @@ mod tests {
             },
             {
                 let steps = Rc::clone(&steps);
-                move |_snapshot, evidence, _repair, _schema| {
+                move |_coordinate, evidence, _repair, _schema| {
                     steps.borrow_mut().push("commit");
                     assert_eq!(evidence.as_str(), "schema-1");
                     Ok(())
@@ -1435,7 +1359,7 @@ mod tests {
         assert_eq!(
             steps.borrow().as_slice(),
             [
-                "snapshot",
+                "coordinate",
                 "source_evidence",
                 "reconcile_data",
                 "converge_schema",

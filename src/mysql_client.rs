@@ -191,53 +191,47 @@ impl PersistentMySqlSource {
         Ok(rows.into_iter().map(row_to_strings).collect())
     }
 
-    pub(crate) fn begin_consistent_snapshot(&self) -> Result<Checkpoint, SnapshotError> {
-        self.execute_session_sql("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")?;
-        self.execute_session_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT")?;
-        let rows = self.query_rows_as_strings(consistent_snapshot_coordinate_query())?;
-        parse_consistent_snapshot_checkpoint(rows)
-    }
-
-    pub(crate) fn rollback_consistent_snapshot(&self) -> Result<(), SnapshotError> {
-        self.execute_session_sql("ROLLBACK")
+    pub(crate) fn read_binlog_coordinate(&self) -> Result<Checkpoint, SnapshotError> {
+        let rows = self.query_rows_as_strings(binlog_coordinate_query())?;
+        parse_binlog_coordinate_checkpoint(rows)
     }
 }
 
-fn consistent_snapshot_coordinate_query() -> &'static str {
+fn binlog_coordinate_query() -> &'static str {
     "SHOW MASTER STATUS"
 }
 
-fn parse_consistent_snapshot_checkpoint(
+fn parse_binlog_coordinate_checkpoint(
     rows: Vec<Vec<Option<String>>>,
 ) -> Result<Checkpoint, SnapshotError> {
     let row = rows.into_iter().next().ok_or_else(|| {
-        SnapshotError::InvalidTable("MariaDB snapshot coordinate is missing".to_string())
+        SnapshotError::InvalidTable("MariaDB binlog coordinate is missing".to_string())
     })?;
-    let source_file = required_snapshot_coordinate_value(&row, 0, "file")?;
-    let source_position = parse_snapshot_coordinate_position(&row)?;
+    let source_file = required_binlog_coordinate_value(&row, 0, "file")?;
+    let source_position = parse_binlog_coordinate_position(&row)?;
     Ok(Checkpoint {
         source_file,
         source_position,
         gtid: None,
         event_timestamp: 0,
         last_event: LastEvent {
-            event_type: "LostBinlogRecoverySnapshot".to_string(),
-            description: "MariaDB consistent snapshot boundary".to_string(),
+            event_type: "LostBinlogRecoveryCoordinate".to_string(),
+            description: "MariaDB current committed binlog coordinate".to_string(),
         },
     })
 }
 
-fn parse_snapshot_coordinate_position(row: &[Option<String>]) -> Result<u64, SnapshotError> {
-    required_snapshot_coordinate_value(row, 1, "position")?
+fn parse_binlog_coordinate_position(row: &[Option<String>]) -> Result<u64, SnapshotError> {
+    required_binlog_coordinate_value(row, 1, "position")?
         .parse::<u64>()
         .map_err(|error| {
             SnapshotError::InvalidTable(format!(
-                "invalid MariaDB snapshot coordinate position: {error}"
+                "invalid MariaDB binlog coordinate position: {error}"
             ))
         })
 }
 
-fn required_snapshot_coordinate_value(
+fn required_binlog_coordinate_value(
     row: &[Option<String>],
     index: usize,
     field: &str,
@@ -246,7 +240,7 @@ fn required_snapshot_coordinate_value(
         .and_then(Clone::clone)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            SnapshotError::InvalidTable(format!("MariaDB snapshot coordinate {field} is missing"))
+            SnapshotError::InvalidTable(format!("MariaDB binlog coordinate {field} is missing"))
         })
 }
 
