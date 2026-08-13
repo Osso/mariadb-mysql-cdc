@@ -3,6 +3,7 @@ set -eu
 
 image_repo="${IMAGE_REPO:?IMAGE_REPO is required}"
 base_image="${BASE_IMAGE:?BASE_IMAGE is required}"
+depot_project_id="${DEPOT_PROJECT_ID:-jnnl97r4s7}"
 tag="${1:-$(git rev-parse --short HEAD)}"
 ops_repo="${OPS_REPO:-../ops}"
 image="${image_repo}:${tag}"
@@ -38,10 +39,13 @@ if [ "${SKIP_VERIFIED_CHECKS:-0}" != "1" ]; then
     cargo test
     cargo clippy --all-targets --all-features -- -D warnings
 fi
-cargo install --force --path .
-
-docker build --build-arg BASE_IMAGE="$base_image" -t "$image" .
-docker push "$image"
+depot build \
+    --project "$depot_project_id" \
+    --platform linux/amd64 \
+    --build-arg "BASE_IMAGE=$base_image" \
+    --tag "$image" \
+    --push \
+    .
 
 update_image_tag "$stream_manifest"
 update_image_tag "$catchup_manifest"
