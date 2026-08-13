@@ -1,7 +1,9 @@
 -- Run with target admin credentials while stream-binlog is stopped.
 -- Recovery identity fields and prepared evidence are immutable. The only allowed
--- transitions are prepared -> abandoned/committed and committed -> verified.
--- Abandoned history remains durable but does not own the active barrier identity.
+-- transitions are prepared -> abandoned/committed and committed -> verified;
+-- abandonment plus replacement insertion is one target transaction.
+-- Abandoned history remains durable but does not own the active barrier identity;
+-- committed and verified owners are terminal.
 CREATE DATABASE IF NOT EXISTS cdc;
 
 CREATE TABLE IF NOT EXISTS cdc.stream_recovery_records (

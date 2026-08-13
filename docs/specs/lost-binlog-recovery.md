@@ -69,7 +69,7 @@
 
 - [ ] Run bootstrap and startup validation against the target with stream writers stopped.
 - [ ] Prove the full CLI path with the complete configured scope and current source snapshot; production success is not claimed by this branch.
-- [ ] Execute the authorized recovery and replace any superseded stream runtime.
+- [ ] Execute the separately authorized replacement recovery `cdc-lost-binlog-2026-08-13-drop-trigger-retry3` and replace any superseded stream runtime; production completion is not claimed.
 - [ ] Complete post-transition schema/data validation with zero unresolved drift and record `verified` evidence.
 
 ## Out of scope

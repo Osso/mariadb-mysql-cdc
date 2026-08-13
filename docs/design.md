@@ -134,11 +134,14 @@ only schema convergence drops target-only base tables child-before-parent with
 normal foreign-key enforcement; cycles and source-table references to target-only
 parents fail closed. The final target inventory must exactly match source before
 one target transaction revalidates the exact old state, updates the checkpoint,
-and commits only the exact historical barrier supersession. A prepared recovery
-ID is non-resumable; a prepared failure requires a separately authorized new
-recovery ID. The journal row is preserved. This transition skips purged source
-history; it is not replay proof and does not claim production completion until
-restart health and subsequent zero-drift verification are recorded.
+and commits only the exact historical barrier supersession. A separately
+authorized replacement may atomically mark the exact prepared owner `abandoned`
+with server-generated evidence and insert a new `prepared` owner; all old
+identity and prepared evidence remain durable. Abandoned history never suppresses
+the journal barrier. Only `committed` or `verified` ownership excludes that exact
+barrier, and both are terminal. This transition skips purged source history; it
+is not replay proof and does not claim production completion until restart health
+and subsequent zero-drift verification are recorded.
 
 ## Repair model
 

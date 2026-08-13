@@ -48,15 +48,17 @@ optional `start_after` primary key, and limit so row-level reports can be paged.
    count/content mismatch, inventory mismatch, or scope-hash change blocks the
    checkpoint transition.
 
-The committed record retains the old checkpoint, exact historical barrier, new
-coordinate, source/scope identity, operator, reason, and measured evidence.
-The historical journal row is preserved; only the exact committed barrier is
-excluded from active-barrier selection. `committed` is an availability-first
-skip over purged history, not proof that the skipped interval was replayed.
-Prepared recovery IDs are immutable and non-resumable: a prepared failure
-requires a separately authorized new recovery ID. The recovery may be marked
-`verified` only after post-transition full schema/data validation reports zero
-unresolved drift.
+Every recovery record retains its immutable old checkpoint, exact historical
+barrier, source/scope identity, operator, reason, and phase evidence. A
+separately authorized replacement atomically marks the exact prepared owner
+`abandoned` with server-generated evidence and inserts a new `prepared` owner;
+all old identity and prepared evidence remain durable. The historical journal row
+is preserved. Abandoned history does not suppress the barrier; active-barrier
+selection excludes it only after exact `committed` or `verified` ownership, and
+those statuses are terminal. `committed` is an availability-first skip over
+purged history, not proof that the skipped interval was replayed. The recovery
+may be marked `verified` only after post-transition full schema/data validation
+reports zero unresolved drift.
 
 Production execution, restart health, and `verified` evidence remain open until
 measured and recorded; this document does not claim recovery completion.

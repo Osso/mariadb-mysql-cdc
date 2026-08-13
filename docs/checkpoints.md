@@ -39,15 +39,18 @@ and preparation evidence. Recovery-only schema convergence runs after
 source-scoped data repair, drops target-only base tables child-before-parent
 with normal foreign-key enforcement, and fails closed on cycles or source-table
 references to target-only parents. The final target table inventory must exactly
-match source. Only after zero skipped/unsupported tables and successful
-schema/data proof does one target transaction revalidate the exact checkpoint,
-barrier, source/scope identity, and prepared recovery row, update
-`cdc.stream_checkpoint`, and mark the recovery `committed`. The historical
-journal row remains intact. Active-barrier selection excludes only the exact
-committed source/file/start/end/raw-SQL hash. Any failed validation or commit
-rolls back; prepared recovery IDs are immutable and non-resumable, so a prepared
-failure requires a separately authorized new recovery ID. Duplicate recovery IDs
-and non-advancing coordinates are refused.
+match source. A separately authorized replacement may, in the same target
+transaction, lock the exact prepared owner, mark it `abandoned` with
+server-generated timestamp/evidence, and insert the replacement `prepared` row;
+all old identity and prepared evidence remain intact. Only after zero
+skipped/unsupported tables and successful schema/data proof does one target
+transaction revalidate the exact checkpoint, barrier, source/scope identity, and
+prepared recovery row, update `cdc.stream_checkpoint`, and mark the recovery
+`committed`. Abandoned history remains durable and does not suppress the journal
+barrier; active-barrier selection excludes only exact `committed` or `verified`
+ownership, which is terminal. Any failed validation or commit rolls back both
+replacement steps. Duplicate recovery IDs and non-advancing coordinates are
+refused.
 
 Bootstrap `cdc.stream_recovery_records` and its immutability guards with
 `docs/stream-recovery-records-bootstrap.sql` while stream writers are stopped.

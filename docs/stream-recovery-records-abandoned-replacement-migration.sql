@@ -3,7 +3,9 @@
 -- Run with target admin credentials while stream-binlog is stopped.
 -- The existing prepared row for recovery_id
 -- cdc-lost-binlog-2026-08-09-drop-trigger must remain present and exact.
--- This migration changes only prepared -> abandoned/committed and committed -> verified guards.
+-- This migration adds durable abandonment evidence, active-owner uniqueness, and
+-- guards for prepared -> abandoned/committed and committed -> verified. It does
+-- not abandon or replace any row; that is one audited runtime transaction.
 DELIMITER //
 
 DROP PROCEDURE IF EXISTS cdc.assert_stream_recovery_abandoned_replacement_preflight//
