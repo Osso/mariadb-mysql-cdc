@@ -34,8 +34,11 @@ coordinate remain eligible for stream replay after the checkpoint advances.
 
 A prepared immutable row is inserted into `cdc.stream_recovery_records` with the
 old state, captured coordinate, source identity, that attempt's scope hash,
-operator, reason, and preparation evidence. Recovery-only schema convergence
-runs after source-scoped data repair, drops target-only base tables
+operator, reason, and preparation evidence. Before source-scoped data repair,
+pre-repair convergence may add only required source tables, columns, primary
+keys, and indexes; it performs no `DROP`, target-only table removal,
+foreign-key convergence, or CHECK-constraint convergence. Recovery-only schema
+convergence then runs after source-scoped data repair, drops target-only base tables
 child-before-parent with normal foreign-key enforcement, and fails closed on
 cycles or source-table references to target-only parents. The final target table
 inventory must exactly match the attempt's source inventory. A separately

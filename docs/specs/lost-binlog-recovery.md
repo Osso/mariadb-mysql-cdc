@@ -20,11 +20,11 @@
 - [x] When configured with `--parallelism`, run independent full-scope tables concurrently within delete/insert/update/verify phase barriers, never crossing foreign-key dependency levels; each worker reads from the configured source endpoint.
 - [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
 - [x] Reconcile every current source-scope table, including target-only orphan rows; target-only target tables do not narrow the recovery data plan, and generic `repair-drift` remains strict about its source/target inventory contract.
-- [x] Before data reconciliation, converge only repair prerequisites: source tables, columns, primary keys, and indexes. Do not add foreign keys/check constraints or drop target-only tables in this phase.
+- [x] Before data reconciliation, converge only required repair prerequisites: add missing source tables, columns, primary keys, and indexes. This phase permits no `DROP`, target-only table removal, foreign-key convergence, or CHECK-constraint convergence.
 - [x] Run final recovery-only schema convergence after data reconciliation: drop target-only base tables child-before-parent with normal foreign-key enforcement, fail closed on cycles or source-table references to target-only parents, and converge remaining source tables and constraints.
 - [x] Require the final target base-table inventory to exactly match the source inventory before commit.
 - [x] Refuse checkpoint transition when any table is skipped, unsupported, unresolved, or the final target inventory differs from source.
-- [ ] Prove the complete live CLI path against the production-shaped full scope, including data repair before final schema/FK convergence.
+- [ ] Prove the complete live CLI path against the production-shaped full scope, including data repair before final destructive/foreign-key/CHECK convergence.
 
 ### Durable transition
 
