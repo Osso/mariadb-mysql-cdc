@@ -853,7 +853,7 @@ fn run_id_rejects_changed_immutable_specification() {
 }
 
 #[test]
-fn completed_run_id_is_terminal() {
+fn completed_run_id_resumes_idempotently() {
     let source = FakeReader::new(vec![row("1", "alpha")]);
     let target = FakeReader::new(vec![]);
     let mut repair_target = RecordingRepairTarget::default();
@@ -884,7 +884,7 @@ fn completed_run_id_is_terminal() {
         last_error: None,
     });
 
-    let error = sync_table_with_progress(
+    let report = sync_table_with_progress(
         &account_table(),
         10,
         SyncMode::Apply,
@@ -893,13 +893,10 @@ fn completed_run_id_is_terminal() {
         &mut repair_target,
         &mut progress_store,
     )
-    .expect_err("completed run id must be terminal");
+    .expect("completed run id resumes idempotently");
 
-    assert_eq!(
-        error.to_string(),
-        "sync progress failed: run id `ephemeral` is already complete; use a new run id"
-    );
-    assert!(source.requests.borrow().is_empty());
+    assert_eq!(report.table, "accounts");
+    assert!(!source.requests.borrow().is_empty());
     assert_eq!(
         progress_store.acquired_run_ids.borrow().as_slice(),
         &["ephemeral".to_string()]
