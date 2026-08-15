@@ -487,6 +487,11 @@ pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamRepo
     checkpoint_store.bootstrap(&start_checkpoint)?;
     let source_evidence = read_source_evidence(source.as_ref(), &config.source.database)?;
     validate_transactional_scope(&source_evidence.inventory)?;
+    let schema_report = run_schema_convergence_from_source_evidence(
+        source_evidence.clone(),
+        config.target.clone(),
+    )?;
+    require_converged_schema(&schema_report)?;
     let target_inventory = read_target_inventory(&config.target)?;
     let repair = run_consistent_snapshot_repair(
         &resync_repair_config(config),
@@ -495,11 +500,6 @@ pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamRepo
         target_inventory,
     )
     .map_err(|error| error.to_string())?;
-    let schema_report = run_schema_convergence_from_source_evidence(
-        source_evidence.clone(),
-        config.target.clone(),
-    )?;
-    require_converged_schema(&schema_report)?;
     let final_target_inventory = read_target_inventory(&config.target)?;
     require_exact_table_inventory(&source_evidence.inventory, &final_target_inventory)?;
     Ok(ResyncStreamReport {
