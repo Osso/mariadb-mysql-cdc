@@ -6,6 +6,7 @@ use crate::mysql_client::{PersistentMySqlSource, target_reader_opts};
 use crate::snapshot::{SnapshotError, SnapshotRow};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 pub(super) const GUEST_COLUMNS: [&str; 23] = [
     "guest_id",
@@ -67,6 +68,7 @@ pub(crate) struct MySqlSyncReader {
     config: crate::mysql_snapshot::MySqlConnectionConfig,
     tls_ca_file: Option<String>,
     source: RefCell<Option<PersistentMySqlSource>>,
+    shared_source: Option<Rc<PersistentMySqlSource>>,
     target_opts: Option<mysql::Opts>,
     replace_divergent_primary: bool,
     initialize_recovery_utc: bool,
@@ -85,6 +87,7 @@ impl MySqlSyncReader {
             config,
             tls_ca_file,
             source: RefCell::new(None),
+            shared_source: None,
             target_opts: None,
             replace_divergent_primary: false,
             initialize_recovery_utc: false,
@@ -99,11 +102,27 @@ impl MySqlSyncReader {
             config,
             tls_ca_file: None,
             source: RefCell::new(None),
+            shared_source: None,
             target_opts: Some(target_reader_opts(target)?),
             replace_divergent_primary: target.insert_conflict_policy
                 == crate::live::InsertConflictPolicy::ReplaceDivergentPk,
             initialize_recovery_utc: false,
         })
+    }
+
+    pub(crate) fn new_with_shared_source(
+        config: crate::mysql_snapshot::MySqlConnectionConfig,
+        source: Rc<PersistentMySqlSource>,
+    ) -> Self {
+        Self {
+            config,
+            tls_ca_file: None,
+            source: RefCell::new(None),
+            shared_source: Some(source),
+            target_opts: None,
+            replace_divergent_primary: false,
+            initialize_recovery_utc: false,
+        }
     }
 
     pub(crate) fn with_recovery_utc(mut self) -> Self {
@@ -218,6 +237,11 @@ impl MySqlSyncReader {
     }
 
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
+        if let Some(source) = &self.shared_source {
+            return source
+                .query_rows_as_strings(sql)
+                .map_err(snapshot_error_to_table_sync);
+        }
         self.connect_source_if_needed()?
             .query_rows_as_strings(sql)
             .map_err(snapshot_error_to_table_sync)

@@ -6,6 +6,8 @@ pub mod cutover;
 pub mod drift_check;
 pub mod inventory;
 pub mod live;
+mod lost_binlog_recovery;
+mod lost_binlog_recovery_store;
 pub mod mysql_client;
 pub mod mysql_snapshot;
 pub mod mysql_support;
@@ -44,6 +46,8 @@ Usage:
   mariadb-mysql-cdc sync-schema --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH [--table TABLE ... | --catalog FILE | --all-tables true]
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
+  mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
+  mariadb-mysql-cdc resync-stream --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity NEW_ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
   mariadb-mysql-cdc resolve-comics-releases-views-conflicts --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --run-id ID [--batch-size ROWS]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc stream-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -68,7 +72,9 @@ Commands:
   drift-check
           Read-only source/target COUNT(*) drift check for selected tables, or all source base tables when no --table is supplied.
   repair-drift
-          Inventory both endpoints, count-check source tables, and run bounded sync-table repairs only for drifted tables.
+          Inventory both endpoints, count-check source tables, and run bounded sync-table repairs only for drifted tables; --parallelism runs independent tables concurrently within FK-safe phase barriers.
+  recover-lost-binlog
+          Execute one authorization-file-scoped lost-binlog recovery with a source-consistent full-scope repair and immutable audit record.
   resolve-comics-releases-views-conflicts
           Verify exact unresolved child and referenced UTM rows, then resolve only equal conflicts.
   apply-binlog
@@ -184,28 +190,203 @@ fn main() {
         Some("catchup-snapshot") => run_catchup_snapshot_command(args.collect()),
         Some("catchup-progress") => run_catchup_progress_command(args.collect()),
         Some("sync-table") => sync_cli::run_sync_table_command(args.collect(), USAGE),
-        Some("sync-progress") => {
-            sync_progress_cli::run_sync_progress_command(args.collect(), USAGE)
-        }
+        Some("sync-progress") => run_sync_progress_command(args.collect()),
         Some("table-catalog") => table_catalog::run_table_catalog_command(args.collect(), USAGE),
         Some("sync-catalog") => table_catalog::run_sync_catalog_command(args.collect(), USAGE),
         Some("sync-schema") => sync_schema::run_sync_schema_command(args.collect(), USAGE),
         Some("drift-check") => run_drift_check_command(args.collect()),
         Some("repair-drift") => repair_drift::run_repair_drift_command(args.collect(), USAGE),
+        Some("recover-lost-binlog") => run_recover_lost_binlog_command(args.collect()),
+        Some("resync-stream") => run_resync_stream_command(args.collect()),
         Some("resolve-comics-releases-views-conflicts") => {
-            targeted_conflict_resolution::run_targeted_conflict_resolution_command(
-                args.collect(),
-                USAGE,
-            )
+            run_targeted_conflict_resolution_command(args.collect())
         }
         Some("apply-binlog") => run_apply_binlog_command(args.collect()),
         Some("stream-binlog") => run_stream_binlog_command(args.collect()),
         Some("-h" | "--help") | None => print!("{USAGE}"),
-        Some(other) => {
-            eprintln!("unknown command: {other}\n\n{USAGE}");
+        Some(other) => exit_unknown_command(other),
+    }
+}
+
+fn run_sync_progress_command(args: Vec<String>) {
+    sync_progress_cli::run_sync_progress_command(args, USAGE)
+}
+
+fn run_targeted_conflict_resolution_command(args: Vec<String>) {
+    targeted_conflict_resolution::run_targeted_conflict_resolution_command(args, USAGE)
+}
+
+fn exit_unknown_command(command: &str) {
+    eprintln!("unknown command: {command}\n\n{USAGE}");
+    std::process::exit(2);
+}
+
+fn run_resync_stream_command(mut args: Vec<String>) {
+    let parallelism = match take_optional_nonzero_usize(&mut args, "--parallelism", 1) {
+        Ok(parallelism) => parallelism,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
             std::process::exit(2);
         }
+    };
+    args.extend([
+        "--binlog-file".to_string(),
+        "resync-boundary".to_string(),
+        "--start-position".to_string(),
+        "4".to_string(),
+    ]);
+    let apply = match parse_apply_binlog_config(args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let source_database = apply
+        .source
+        .database
+        .clone()
+        .expect("validated source database");
+    let config = lost_binlog_recovery::ResyncStreamConfig {
+        source: mysql_snapshot::MySqlConnectionConfig {
+            host: apply.source.host,
+            port: apply.source.port,
+            user: apply.source.user,
+            password: apply.source.password,
+            database: source_database,
+        },
+        source_identity: apply.source_identity,
+        target: apply.target,
+        checkpoint_table: apply.checkpoint_table,
+        progress_table: "cdc.table_sync_runs".to_string(),
+        chunk_size: 10_000,
+        parallelism,
+    };
+    match lost_binlog_recovery::run_resync_stream(&config) {
+        Ok(report) => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("resync report JSON")
+        ),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
     }
+}
+
+fn run_recover_lost_binlog_command(args: Vec<String>) {
+    let config = match parse_recover_lost_binlog_config(args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    match lost_binlog_recovery::run_recover_lost_binlog(&config) {
+        Ok(report) => print_recovery_report(&report),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_recover_lost_binlog_config(
+    args: Vec<String>,
+) -> Result<lost_binlog_recovery::RecoverLostBinlogConfig, String> {
+    let (authorization_file, apply_args) = take_required_option(args, "--authorization-file")?;
+    let apply = parse_apply_binlog_config(apply_args)?;
+    let source_database = apply
+        .source
+        .database
+        .clone()
+        .ok_or_else(|| "source database is required".to_string())?;
+    Ok(recovery_config_from_apply(
+        apply,
+        authorization_file,
+        source_database,
+    ))
+}
+
+fn recovery_config_from_apply(
+    apply: live::ApplyBinlogConfig,
+    authorization_file: String,
+    source_database: String,
+) -> lost_binlog_recovery::RecoverLostBinlogConfig {
+    lost_binlog_recovery::RecoverLostBinlogConfig {
+        source: mysql_snapshot::MySqlConnectionConfig {
+            host: apply.source.host,
+            port: apply.source.port,
+            user: apply.source.user,
+            password: apply.source.password,
+            database: source_database,
+        },
+        source_identity: apply.source_identity,
+        target: apply.target,
+        authorization_file: authorization_file.into(),
+        checkpoint_table: apply.checkpoint_table,
+        journal_table: "cdc.ddl_replay_journal".to_string(),
+        recovery_table: lost_binlog_recovery_store::DEFAULT_RECOVERY_TABLE.to_string(),
+        progress_table: "cdc.table_sync_runs".to_string(),
+        chunk_size: 10_000,
+    }
+}
+
+fn print_recovery_report(report: &lost_binlog_recovery::RecoverLostBinlogReport) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report).expect("recovery report JSON")
+    );
+}
+
+fn take_optional_nonzero_usize(
+    args: &mut Vec<String>,
+    option: &str,
+    default: usize,
+) -> Result<usize, String> {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut value = default;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == option {
+            let raw = args
+                .get(index + 1)
+                .ok_or_else(|| format!("{option} needs a value"))?;
+            value = parse_nonzero_usize(option, raw)?;
+            index += 2;
+        } else {
+            remaining.push(args[index].clone());
+            index += 1;
+        }
+    }
+    *args = remaining;
+    Ok(value)
+}
+
+fn take_required_option(
+    args: Vec<String>,
+    required_flag: &str,
+) -> Result<(String, Vec<String>), String> {
+    let mut remaining = Vec::new();
+    let mut value = None;
+    let mut arguments = args.into_iter();
+    while let Some(argument) = arguments.next() {
+        if argument == required_flag {
+            if value.is_some() {
+                return Err(format!("{required_flag} may only be supplied once"));
+            }
+            value = Some(
+                arguments
+                    .next()
+                    .ok_or_else(|| format!("missing value for {required_flag}"))?,
+            );
+        } else {
+            remaining.push(argument);
+        }
+    }
+    value
+        .map(|value| (value, remaining))
+        .ok_or_else(|| format!("{required_flag} is required"))
 }
 
 fn run_stream_binlog_command(args: Vec<String>) {

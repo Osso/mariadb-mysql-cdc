@@ -102,6 +102,12 @@ identity matching stops immediately.
   succeeded.
 - [x] Make checkpoint writes atomic so pod eviction or node loss cannot leave a
   partially written checkpoint.
+- [ ] For purged-history incidents, use only the audited `recover-lost-binlog`
+  transition: exact JSON old-state/barrier authorization, per-attempt source/scope
+  validation, non-locking coordinate capture, committed-state full-scope
+  reconciliation, and atomic checkpoint plus exact-barrier commit. This is an
+  availability-first skip, not replay proof; production execution and
+  post-transition verification remain open.
 
 ### Replay safety
 
@@ -147,6 +153,8 @@ identity matching stops immediately.
 - `src/live/reconnect.rs` — reconnect policy and checkpoint resume semantics.
 - `src/table_sync/run.rs` and `src/table_sync/mysql.rs` — bounded exact parent
   recovery for sessions/guests and home-feed cards using canonical source images.
+- `src/lost_binlog_recovery.rs` and `src/lost_binlog_recovery_store.rs` — audited
+  purged-history checkpoint/barrier transition with anchored full-scope repair.
 - `src/stream_checkpoint.rs` — target-table checkpoint store.
 - `src/live/binlog_command.rs` — text-binlog helper retained for the legacy probe
   and fixture/debug paths, not the production stream.
@@ -161,6 +169,9 @@ identity matching stops immediately.
 
 - `src/live/tests.rs` — asserts startup prefers an existing stream checkpoint
   over static CLI coordinates.
+- `src/lost_binlog_recovery.rs` and `src/lost_binlog_recovery_store.rs` — asserts
+  exact old-state validation, duplicate/non-advancing refusal, proof gating,
+  atomic rollback, and exact historical-barrier exclusion.
 - `src/live/tests.rs` — asserts stream checkpoints are saved after successful
   target apply and not saved after failed target apply.
 - `src/live/tests.rs` — asserts ordinary transient TLS/connection-reset source

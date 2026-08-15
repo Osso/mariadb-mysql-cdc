@@ -3,6 +3,7 @@ use crate::inventory::{
     InventoryConfig, MariaDbInventoryReader, SourceMasterCoordinate, build_inventory,
 };
 use model::{DdlOperation, TableRuntimeState};
+use std::collections::BTreeSet;
 
 mod canonical;
 mod model;
@@ -33,10 +34,11 @@ pub(super) use tokenizer::tokenize_ddl;
 pub use transform::{
     DDL_TRANSFORMATION_VERSION, DdlTransformation, render_modeled_index_ddl,
     supports_assistant_reply_reports_create, supports_drop_columns_if_exists,
-    supports_drop_procedure, supports_fixture_create_table, supports_production_alter_table,
-    supports_rename_columns_if_exists, supports_source_only_release_move_procedure_create,
-    transform_assistant_reply_reports_create, transform_drop_columns_if_exists,
-    transform_drop_procedure, transform_generated_schema_ddl, transform_production_alter_table,
+    supports_drop_procedure, supports_drop_trigger_if_exists, supports_fixture_create_table,
+    supports_production_alter_table, supports_rename_columns_if_exists,
+    supports_source_only_release_move_procedure_create, transform_assistant_reply_reports_create,
+    transform_drop_columns_if_exists, transform_drop_procedure, transform_drop_trigger_if_exists,
+    transform_generated_schema_ddl, transform_production_alter_table,
     transform_rename_columns_if_exists, transform_source_only_release_move_procedure_create,
 };
 
@@ -127,6 +129,15 @@ impl LiveDdlSemanticInventory {
                     .collect()
             })
     }
+
+    fn read_target_trigger_names(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .read_target_inventory()?
+            .triggers
+            .into_iter()
+            .map(|trigger| trigger.name)
+            .collect())
+    }
 }
 
 fn read_affected_runtime(
@@ -182,39 +193,15 @@ fn translate_ddl_with_provenance(
     target_columns: &[String],
     provenance: DdlTranslationProvenance,
 ) -> Result<DdlTransformation, String> {
-    let parsed_index = match provenance {
-        DdlTranslationProvenance::Streamed => parser::parse_simple_index_ddl(sql),
-        DdlTranslationProvenance::ModeledPlanner => parse_modeled_index_ddl(sql),
-    };
-    if let Ok(index) = parsed_index {
-        if provenance == DdlTranslationProvenance::ModeledPlanner && index.unique {
-            return render_modeled_index_ddl(&index, sql);
-        }
-        return Ok(DdlTransformation {
-            version: transform::DDL_TRANSFORMATION_VERSION,
-            target_sql: Some(sql.trim().trim_end_matches(';').trim().to_string()),
-        });
+    if let Some(transformation) = translate_index_ddl(sql, provenance) {
+        return transformation;
     }
-    if supports_assistant_reply_reports_create(sql) {
-        return transform_assistant_reply_reports_create(sql);
+    let target_objects = target_columns.iter().cloned().collect();
+    if let Some(transformation) = translate_create_or_routine_ddl(sql, &target_objects) {
+        return transformation;
     }
-    if supports_fixture_create_table(sql) {
-        return transform::transform_fixture_create_table(sql);
-    }
-    if supports_source_only_release_move_procedure_create(sql) {
-        return transform_source_only_release_move_procedure_create(sql);
-    }
-    if supports_drop_procedure(sql) {
-        return transform_drop_procedure(sql, &target_columns.iter().cloned().collect());
-    }
-    if supports_production_alter_table(sql) {
-        return transform_production_alter_table(sql);
-    }
-    if supports_drop_columns_if_exists(sql) {
-        return transform_drop_columns_if_exists(sql, &target_columns.iter().cloned().collect());
-    }
-    if supports_rename_columns_if_exists(sql) {
-        return transform_rename_columns_if_exists(sql, &target_columns.iter().cloned().collect());
+    if let Some(transformation) = translate_alter_ddl(sql, &target_objects) {
+        return transformation;
     }
     match provenance {
         DdlTranslationProvenance::ModeledPlanner => transform_generated_schema_ddl(sql),
@@ -222,6 +209,60 @@ fn translate_ddl_with_provenance(
             Err("streamed DDL family is unsupported without an existing parsed model".to_string())
         }
     }
+}
+
+fn translate_index_ddl(
+    sql: &str,
+    provenance: DdlTranslationProvenance,
+) -> Option<Result<DdlTransformation, String>> {
+    let parsed = match provenance {
+        DdlTranslationProvenance::Streamed => parser::parse_simple_index_ddl(sql),
+        DdlTranslationProvenance::ModeledPlanner => parse_modeled_index_ddl(sql),
+    };
+    let Ok(index) = parsed else {
+        return None;
+    };
+    if provenance == DdlTranslationProvenance::ModeledPlanner && index.unique {
+        return Some(render_modeled_index_ddl(&index, sql));
+    }
+    Some(Ok(DdlTransformation {
+        version: transform::DDL_TRANSFORMATION_VERSION,
+        target_sql: Some(sql.trim().trim_end_matches(';').trim().to_string()),
+    }))
+}
+
+fn translate_create_or_routine_ddl(
+    sql: &str,
+    target_objects: &BTreeSet<String>,
+) -> Option<Result<DdlTransformation, String>> {
+    if supports_assistant_reply_reports_create(sql) {
+        return Some(transform_assistant_reply_reports_create(sql));
+    }
+    if supports_fixture_create_table(sql) {
+        return Some(transform::transform_fixture_create_table(sql));
+    }
+    if supports_source_only_release_move_procedure_create(sql) {
+        return Some(transform_source_only_release_move_procedure_create(sql));
+    }
+    if supports_drop_procedure(sql) {
+        return Some(transform_drop_procedure(sql, target_objects));
+    }
+    supports_drop_trigger_if_exists(sql)
+        .then(|| transform_drop_trigger_if_exists(sql, target_objects))
+}
+
+fn translate_alter_ddl(
+    sql: &str,
+    target_objects: &BTreeSet<String>,
+) -> Option<Result<DdlTransformation, String>> {
+    if supports_production_alter_table(sql) {
+        return Some(transform_production_alter_table(sql));
+    }
+    if supports_drop_columns_if_exists(sql) {
+        return Some(transform_drop_columns_if_exists(sql, target_objects));
+    }
+    supports_rename_columns_if_exists(sql)
+        .then(|| transform_rename_columns_if_exists(sql, target_objects))
 }
 
 fn parse_semantic_operation(sql: &str) -> Result<DdlOperation, String> {
@@ -250,10 +291,57 @@ fn parse_semantic_operation(sql: &str) -> Result<DdlOperation, String> {
     parse_ddl_operation(sql)
 }
 
+fn capture_specialized_evidence(
+    inventory: &LiveDdlSemanticInventory,
+    sql: &str,
+    operation: &DdlOperation,
+    target_before: &SemanticSchemaSnapshot,
+) -> Option<Result<DdlSemanticEvidence, String>> {
+    if supports_assistant_reply_reports_create(sql) {
+        return Some(capture_assistant_reply_reports_create_evidence(
+            inventory,
+            operation,
+            target_before,
+        ));
+    }
+    supports_source_only_release_move_procedure_create(sql)
+        .then(|| capture_source_only_procedure_create_evidence(inventory, operation, target_before))
+}
+
+fn capture_early_evidence(
+    inventory: &LiveDdlSemanticInventory,
+    sql: &str,
+    operation: &DdlOperation,
+    target_before: &SemanticSchemaSnapshot,
+    source_file: &str,
+    event_end_position: u64,
+) -> Option<Result<DdlSemanticEvidence, String>> {
+    if let Some(evidence) = capture_specialized_evidence(inventory, sql, operation, target_before) {
+        return Some(evidence);
+    }
+    operation.create_table_ast.as_ref()?;
+    Some(capture_fenced_create_table_evidence(
+        inventory,
+        operation,
+        target_before,
+        source_file,
+        event_end_position,
+    ))
+}
+
+fn requires_translated_evidence(sql: &str, operation: &DdlOperation) -> bool {
+    operation.object_kind == DdlObjectKind::Index
+        || operation.alter_table_ast.is_some()
+        || supports_drop_procedure(sql)
+        || supports_drop_trigger_if_exists(sql)
+}
+
 impl DdlSemanticInventory for LiveDdlSemanticInventory {
     fn transform_sql(&self, sql: &str) -> Result<DdlTransformation, String> {
         let target_objects = if supports_drop_procedure(sql) {
             self.read_target_procedure_names()?
+        } else if supports_drop_trigger_if_exists(sql) {
+            self.read_target_trigger_names()?
         } else if supports_drop_columns_if_exists(sql) || supports_rename_columns_if_exists(sql) {
             let operation = parse_ddl_operation(sql)?;
             self.read_target_column_names(&operation.primary_object)?
@@ -271,30 +359,17 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
     ) -> Result<DdlSemanticEvidence, String> {
         let operation = parse_semantic_operation(sql)?;
         let target_before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
-        if supports_assistant_reply_reports_create(sql) {
-            return capture_assistant_reply_reports_create_evidence(
-                self,
-                &operation,
-                &target_before,
-            );
+        if let Some(evidence) = capture_early_evidence(
+            self,
+            sql,
+            &operation,
+            &target_before,
+            source_file,
+            event_end_position,
+        ) {
+            return evidence;
         }
-        if supports_source_only_release_move_procedure_create(sql) {
-            return capture_source_only_procedure_create_evidence(self, &operation, &target_before);
-        }
-        if operation.create_table_ast.is_some() {
-            return capture_fenced_create_table_evidence(
-                self,
-                &operation,
-                &target_before,
-                source_file,
-                event_end_position,
-            );
-        }
-        if operation.object_kind == DdlObjectKind::Index
-            || operation.alter_table_ast.is_some()
-            || supports_drop_procedure(sql)
-            || supports_source_only_release_move_procedure_create(sql)
-        {
+        if requires_translated_evidence(sql, &operation) {
             return capture_translated_evidence(self, &operation, &target_before);
         }
         capture_source_evidence(

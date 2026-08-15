@@ -1,8 +1,8 @@
 use super::*;
 use crate::live::ddl_semantics::{
     DDL_TRANSFORMATION_VERSION, DdlTransformation, supports_drop_columns_if_exists,
-    supports_drop_procedure, supports_fixture_create_table, supports_rename_columns_if_exists,
-    supports_source_only_release_move_procedure_create,
+    supports_drop_procedure, supports_drop_trigger_if_exists, supports_fixture_create_table,
+    supports_rename_columns_if_exists, supports_source_only_release_move_procedure_create,
 };
 use crate::target::SqlStatement;
 
@@ -532,6 +532,7 @@ fn supports_ddl_transformation(source_sql: &str, supports_source_only_procedure:
         || supports_production_alter_table(source_sql)
         || supports_source_only_procedure
         || supports_drop_procedure(source_sql)
+        || supports_drop_trigger_if_exists(source_sql)
         || supports_drop_columns_if_exists(source_sql)
         || supports_rename_columns_if_exists(source_sql)
 }

@@ -75,7 +75,12 @@ generic exact unqualified, unquoted `DROP PROCEDURE IF EXISTS <identifier>` form
 and the additional exact unqualified, unquoted plain
 `DROP PROCEDURE apply_release_move_purchase_repair` form are admitted. Target
 inventory determines deterministic drop versus proven no-op; qualified, quoted,
-commented, and other plain-name forms remain blocked.
+commented, and other plain-name forms remain blocked. The exact raw,
+unqualified, unquoted, comment-free `DROP TRIGGER IF EXISTS
+prevent_deactivating_cloned_archives` form is also admitted, with an optional
+trailing semicolon. Stable target trigger inventory emits quoted MySQL `DROP
+TRIGGER` when present or records a proven no-op when absent; every other trigger
+form remains unsupported.
 The rename slice selects executable clauses from target pre-state and emits MySQL 8 SQL without `IF EXISTS`. Every other DDL uses the same
 `cdc.ddl_replay_journal` as `translation_pending` with sentinel/no evidence;
 translator availability promotes that same row once to `prepared`, after which
@@ -96,13 +101,51 @@ Static control-plane prerequisites are validated once during admin/bootstrap and
 startup, before source replication; see the [DDL Resolution Runbook](ddl-resolution.md#startupbootstrap-validation-boundary).
 That validation covers effective grants, control-plane schema, guards, triggers,
 procedures, and checkpoint plus single-writer `GET_LOCK` prerequisites as
-deployment-drift detection. There is no multi-writer fence, CAS, or fencing-token
-protocol.
+deployment-drift detection. The normal stream path has no multi-writer fence or
+fencing-token protocol; the separate lost-binlog recovery path uses exact
+transactional CAS checks for its authorized checkpoint/barrier transition.
 Binlog DDL remains untrusted input and is classified per event. After admission,
 CDC-generated SQL is trusted internal program behavior: event handling executes
 known operations directly, keeps only event-specific state/evidence checks, and
 surfaces database errors without rerunning grant policy validation or maintaining
 duplicate allowlists.
+
+## Lost-binlog recovery
+
+`recover-lost-binlog` is a narrowly authorized availability-first transition
+when the live checkpoint names purged MariaDB history. JSON authorization binds
+one recovery ID to the exact old checkpoint and exact journal barrier; source
+identity and checkpoint name must also match the configured stream. The command
+computes the current complete source scope hash and rejects non-InnoDB source
+tables. Recovery data repair covers every current source-scope table even when
+target-only base tables exist; generic `repair-drift` remains strict about its
+source/target inventory contract.
+
+The command acquires the stream lease and captures the current MariaDB binlog
+coordinate with ordinary non-locking reads. It does not execute `FLUSH TABLES
+WITH READ LOCK`, `UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and
+does not keep a cross-table repeatable-read transaction open. Source schema
+and row reconciliation use normally committed reads for the attempt's actual
+scope. Commits after the captured coordinate remain in the binlog and are
+replayed by the stream after recovery advances the checkpoint.
+
+A prepared immutable recovery record links old state, the captured coordinate,
+source, the attempt's actual scope, operator, reason, and evidence. After
+source-scoped data repair, recovery-only schema convergence drops target-only
+base tables child-before-parent with normal foreign-key enforcement; cycles and
+source-table references to target-only parents fail closed. The final target
+inventory must exactly match the attempt's source inventory before one target
+transaction revalidates the exact old state, updates the checkpoint, and commits
+only the exact historical barrier supersession. A separately authorized
+replacement may atomically mark the exact prepared owner `abandoned` with
+server-generated evidence and insert a new `prepared` owner for the same exact
+checkpoint, barrier, and source identity. The replacement records its own
+current scope; its scope hash need not equal the abandoned owner's. All old
+identity, scope, and prepared evidence remain durable. Abandoned history never
+suppresses the journal barrier. Only `committed` or `verified` ownership excludes
+that exact barrier, and both are terminal. This transition skips purged source
+history; it is not replay proof and does not claim production completion until
+restart health and subsequent zero-drift verification are recorded.
 
 ## Repair model
 

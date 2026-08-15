@@ -3,7 +3,10 @@
 `sync-table` reconciles one source table against one target table in primary-key
 chunks. It is the child operation used by the run-scoped `repair-drift`
 orchestration; live conflict observations persist in `cdc.row_conflicts` and
-are resolved only after verified equality. The current table-sync recovery contract is implemented by commits `fa018af..3fe8b17`.
+are resolved only after verified equality. Generic `repair-drift` remains strict
+about its source/target inventory contract; lost-binlog recovery uses a separate
+source-scoped data plan before recovery-only target schema cleanup. The current
+table-sync recovery contract is implemented by commits `fa018af..3fe8b17`.
 
 ## What it must do
 

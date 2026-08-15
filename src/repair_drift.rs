@@ -26,6 +26,7 @@ pub struct RepairDriftConfig {
     pub content_check: bool,
     pub mode: SyncMode,
     pub chunk_size: usize,
+    pub parallelism: usize,
     pub conflict_reconcile_limit: usize,
     pub progress_table: String,
     pub run_id: Option<String>,
@@ -98,6 +99,8 @@ impl std::error::Error for RepairDriftError {}
 pub fn run_repair_drift(config: &RepairDriftConfig) -> Result<RepairDriftReport, RepairDriftError> {
     run::run_repair_drift(config)
 }
+
+pub(crate) use run::run_consistent_snapshot_repair;
 
 pub fn run_repair_drift_command(args: Vec<String>, usage: &str) {
     run::run_repair_drift_command(args, usage);

@@ -365,7 +365,7 @@ pub fn build_prepare_sql(table: &str, event: &DdlEvent, evidence: &DdlSemanticEv
     )
 }
 
-pub fn build_barrier_select_sql(table: &str, source_identity: &str) -> String {
+pub fn build_barrier_select_sql(journal_table: &str, source_identity: &str) -> String {
     let escaped_identity = source_identity
         .replace('=', "==")
         .replace('%', "=%")
@@ -373,7 +373,7 @@ pub fn build_barrier_select_sql(table: &str, source_identity: &str) -> String {
     let pattern = format!("{escaped_identity}#server-id=%");
     format!(
         "SELECT binlog_file,event_start_position,status FROM {} WHERE source_identity LIKE {} ESCAPE '=' AND status IN ('translation_pending','prepared','blocked') ORDER BY binlog_file,event_start_position LIMIT 1",
-        quote_identifier_path(table),
+        quote_identifier_path(journal_table),
         quote_sql_literal(&pattern),
     )
 }

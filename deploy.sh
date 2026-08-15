@@ -1,14 +1,17 @@
 #!/bin/sh
 set -eu
 
-image_repo="registry.digitalocean.com/globalcomix/mariadb-mysql-cdc"
+image_repo="${IMAGE_REPO:?IMAGE_REPO is required}"
+base_image="${BASE_IMAGE:?BASE_IMAGE is required}"
+depot_project_id="${DEPOT_PROJECT_ID:-jnnl97r4s7}"
 tag="${1:-$(git rev-parse --short HEAD)}"
-ops_repo="${OPS_REPO:-/syncthing/Sync/Projects/globalcomix/ops}"
+ops_repo="${OPS_REPO:-../ops}"
 image="${image_repo}:${tag}"
 
 stream_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-stream.yaml"
 catchup_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-catchup-existing-tables.yaml"
 repair_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-repair-drift.yaml"
+resync_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-resync-stream.yaml"
 
 require_clean_tree() {
     repo="$1"
@@ -37,17 +40,21 @@ if [ "${SKIP_VERIFIED_CHECKS:-0}" != "1" ]; then
     cargo test
     cargo clippy --all-targets --all-features -- -D warnings
 fi
-cargo install --force --path .
-
-docker build -t "$image" .
-docker push "$image"
+depot build \
+    --project "$depot_project_id" \
+    --platform linux/amd64 \
+    --build-arg "BASE_IMAGE=$base_image" \
+    --tag "$image" \
+    --push \
+    .
 
 update_image_tag "$stream_manifest"
 update_image_tag "$catchup_manifest"
 update_image_tag "$repair_manifest"
+update_image_tag "$resync_manifest"
 remove_file_checkpoint_arg
 
-git -C "$ops_repo" add "$stream_manifest" "$catchup_manifest" "$repair_manifest"
+git -C "$ops_repo" add "$stream_manifest" "$catchup_manifest" "$repair_manifest" "$resync_manifest"
 if git -C "$ops_repo" diff --cached --quiet; then
     echo "ops manifests already use $image"
 else

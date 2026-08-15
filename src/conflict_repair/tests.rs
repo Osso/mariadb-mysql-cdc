@@ -30,6 +30,53 @@ fn canonical_fk_inventory_preserves_schema_columns_and_rules() {
 }
 
 #[test]
+fn canonical_fk_inventory_keeps_same_name_distinct_across_child_tables() {
+    let rows = vec![
+        CanonicalForeignKeyRow {
+            constraint_schema: "app".to_string(),
+            constraint_name: "parent_fk".to_string(),
+            child_schema: "app".to_string(),
+            child_table: "child_a".to_string(),
+            child_column: "parent_id".to_string(),
+            ordinal_position: 1,
+            parent_schema: "app".to_string(),
+            parent_table: "parents".to_string(),
+            parent_column: "id".to_string(),
+            update_rule: "RESTRICT".to_string(),
+            delete_rule: "CASCADE".to_string(),
+            match_option: "NONE".to_string(),
+            enforced: true,
+        },
+        CanonicalForeignKeyRow {
+            constraint_schema: "app".to_string(),
+            constraint_name: "parent_fk".to_string(),
+            child_schema: "app".to_string(),
+            child_table: "child_b".to_string(),
+            child_column: "parent_id".to_string(),
+            ordinal_position: 1,
+            parent_schema: "app".to_string(),
+            parent_table: "parents".to_string(),
+            parent_column: "id".to_string(),
+            update_rule: "RESTRICT".to_string(),
+            delete_rule: "CASCADE".to_string(),
+            match_option: "NONE".to_string(),
+            enforced: true,
+        },
+    ];
+
+    let inventory = canonicalize_foreign_keys(rows).expect("canonical inventory");
+
+    assert_eq!(inventory.len(), 2);
+    assert_eq!(
+        inventory
+            .iter()
+            .map(|foreign_key| foreign_key.child_table.as_str())
+            .collect::<Vec<_>>(),
+        vec!["child_a", "child_b"]
+    );
+}
+
+#[test]
 fn secondary_unique_conflict_keeps_owner_unchanged_and_records_source_debt() {
     let mut ledger = InMemoryConflictStore::default();
     ledger
@@ -130,6 +177,24 @@ fn planner_deletes_child_before_parent_and_inserts_parent_before_child() {
         build_repair_plan("run-1", "source", "target", &inventory, &inventory).expect("plan");
     assert_eq!(plan.insert_order, vec!["parents", "children"]);
     assert_eq!(plan.delete_order, vec!["children", "parents"]);
+}
+
+#[test]
+fn planner_ignores_comics_facets_groups_options_self_reference_for_dependency_ordering() {
+    let table = "comics_facets_groups_options";
+    let inventory = repair_inventory(&[table], &[fk(table, table)]);
+
+    let plan = build_repair_plan(
+        "run-self-reference",
+        "source",
+        "target",
+        &inventory,
+        &inventory,
+    )
+    .expect("self-referential foreign keys do not create inter-table cycles");
+
+    assert_eq!(plan.insert_order, vec![table]);
+    assert_eq!(plan.delete_order, vec![table]);
 }
 
 #[test]

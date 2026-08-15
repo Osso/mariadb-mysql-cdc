@@ -499,4 +499,5 @@ fn startup_barrier_query_is_source_scoped_and_ordered() {
     assert!(sql.contains("prod=%=_source#server-id=%"));
     assert!(sql.contains("ESCAPE '='"));
     assert!(sql.contains("ORDER BY binlog_file,event_start_position LIMIT 1"));
+    assert!(!sql.contains("stream_recovery_records"));
 }

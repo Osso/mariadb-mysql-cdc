@@ -1,10 +1,12 @@
-use crate::checkpoint::Checkpoint;
+use crate::checkpoint::{Checkpoint, LastEvent};
 use crate::live::{
     InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
     should_replace_divergent_primary,
 };
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::mysql_support::{apply_default_mysql_network_bounds, target_mysql_opts};
+use crate::mysql_support::{
+    apply_default_mysql_network_bounds, apply_mysql_connection_liveness, target_mysql_opts,
+};
 use crate::snapshot::{ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource};
 use crate::table_sync::progress::{
     build_add_total_rows_column_sql, build_create_progress_schema_sql,
@@ -106,6 +108,19 @@ impl PersistentMySqlSource {
         Self::new_with_opts(opts)
     }
 
+    pub(crate) fn new_without_operation_timeout(
+        config: &MySqlConnectionConfig,
+    ) -> Result<Self, SnapshotError> {
+        let builder = OptsBuilder::default()
+            .ip_or_hostname(Some(config.host.clone()))
+            .tcp_port(config.port)
+            .user(Some(config.user.clone()))
+            .pass(Some(config.password.clone()))
+            .db_name(Some(config.database.clone()))
+            .prefer_socket(false);
+        Self::new_with_opts(Opts::from(apply_mysql_connection_liveness(builder)))
+    }
+
     pub fn count_rows(&self, table: &str) -> Result<u64, SnapshotError> {
         let sql = format!(
             "SELECT COUNT(*) FROM {}",
@@ -190,6 +205,58 @@ impl PersistentMySqlSource {
             .map_err(snapshot_query_error)?;
         Ok(rows.into_iter().map(row_to_strings).collect())
     }
+
+    pub(crate) fn read_binlog_coordinate(&self) -> Result<Checkpoint, SnapshotError> {
+        let rows = self.query_rows_as_strings(binlog_coordinate_query())?;
+        parse_binlog_coordinate_checkpoint(rows)
+    }
+}
+
+fn binlog_coordinate_query() -> &'static str {
+    "SHOW MASTER STATUS"
+}
+
+fn parse_binlog_coordinate_checkpoint(
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<Checkpoint, SnapshotError> {
+    let row = rows.into_iter().next().ok_or_else(|| {
+        SnapshotError::InvalidTable("MariaDB binlog coordinate is missing".to_string())
+    })?;
+    let source_file = required_binlog_coordinate_value(&row, 0, "file")?;
+    let source_position = parse_binlog_coordinate_position(&row)?;
+    Ok(Checkpoint {
+        source_file,
+        source_position,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: LastEvent {
+            event_type: "LostBinlogRecoveryCoordinate".to_string(),
+            description: "MariaDB current committed binlog coordinate".to_string(),
+        },
+    })
+}
+
+fn parse_binlog_coordinate_position(row: &[Option<String>]) -> Result<u64, SnapshotError> {
+    required_binlog_coordinate_value(row, 1, "position")?
+        .parse::<u64>()
+        .map_err(|error| {
+            SnapshotError::InvalidTable(format!(
+                "invalid MariaDB binlog coordinate position: {error}"
+            ))
+        })
+}
+
+fn required_binlog_coordinate_value(
+    row: &[Option<String>],
+    index: usize,
+    field: &str,
+) -> Result<String, SnapshotError> {
+    row.get(index)
+        .and_then(Clone::clone)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            SnapshotError::InvalidTable(format!("MariaDB binlog coordinate {field} is missing"))
+        })
 }
 
 impl SnapshotSource for PersistentMySqlSource {

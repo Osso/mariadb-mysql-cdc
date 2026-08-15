@@ -19,7 +19,9 @@
 - [x] Converge the target to the source schema plus the unique parent indexes MySQL requires and MariaDB does not: when a source foreign key's referenced columns are not the leftmost prefix of a source primary key or unique index, expect a synthesized `uq_cdc_<parent>_<columns>` unique index on the parent. Create it when absent, keep it when present, and require it before adding the dependent foreign key.
 - [x] Translate `ENUM` columns, preserving the case of their values; `SET` columns are still rejected explicitly.
 - [x] Render a literal default as the source already spells it, quoting only a bare value, so a MariaDB string or bit literal is never quoted twice.
-- [x] Name check constraints so they are unique per schema as MySQL requires: a source name used by more than one table is qualified with its table, and a name already unique keeps its source spelling.
+- [x] Render every target `CHECK` constraint name as table-qualified for MySQL: prepend the owning table and an underscore unless the source name is already qualified with that table, so an already-qualified name is not doubled. If the rendered name exceeds MySQL's 64-character identifier limit, shorten it deterministically with a collision-resistant digest derived from the constraint kind, table, and canonical source name.
+- [x] Render every target `FOREIGN KEY` constraint name with its child table identity under the same no-double-qualification and deterministic collision-resistant shortening rules. The same source name on different child tables therefore remains distinct.
+- [x] Preserve canonical source constraint identity and source fingerprints as evidence; planning, target introspection, drift comparison, and final verification compare the rendered target constraint identity instead of raw source names.
 - [x] Reference a foreign-key parent in the converged schema without a database qualifier so it resolves in the target database; only a genuinely cross-schema parent keeps its qualifier.
 - [x] Maintain actual streamed-DDL parity: a mapping accepted by `sync-schema` must produce the same translated MySQL semantics as the corresponding streamed DDL operation.
 - [x] Have no alternate mapping, compatibility fallback, direct source-DDL execution path, or silent approximation.
@@ -52,6 +54,7 @@ Both engines describe an identical converged column differently, so comparison u
 - [x] Never truncate, coerce, discard, clamp, or silently rewrite existing target values to make an ALTER succeed.
 - [x] If data would be rejected, truncated, or coerced, fail that table's operation, report the blocking condition and representative primary-key sample values, and continue independent tables.
 - [x] Apply foreign keys and other dependency-sensitive objects only after their prerequisites converge; skip dependent operations when a prerequisite failed.
+- [x] Recreate CHECK constraints only after referenced columns converge and all planned same-table foreign-key drops complete; a failed foreign-key drop blocks CHECK re-add.
 
 ### Failure and verification
 
@@ -78,7 +81,7 @@ Both engines describe an identical converged column differently, so comparison u
 
 ## Tests asserting this spec
 
-- `src/sync_schema.rs` covers `--all-tables` selection, the canonical column comparison against every measured MariaDB/MySQL metadata disagreement, literal-default rendering, `ENUM` value case, synthesized parent unique indexes, relative parent schemas, check-name qualification and order-independent comparison, selection, exact convergence planning, destructive preflight with blocker counts/sample keys, safe conversions, dependency ordering/skips, best-effort continuation, re-inventory status, JSON/exit behavior, and translator parity.
+- `src/sync_schema.rs` covers `--all-tables` selection, the canonical column comparison against every measured MariaDB/MySQL metadata disagreement, literal-default rendering, `ENUM` value case, synthesized parent unique indexes, relative parent schemas, table-qualified CHECK/FOREIGN KEY target names, deterministic bounded shortening, rendered-identity comparison, selection, exact convergence planning, destructive preflight with blocker counts/sample keys, safe conversions, dependency ordering/skips, best-effort continuation, re-inventory status, JSON/exit behavior, and translator parity.
 - `src/live/ddl_semantics/tests.rs` covers shared translation acceptance including `ENUM`, parity, and rejection without a generic fallback.
 - `src/inventory/tests/parsing.rs` covers the table-scoped queries and the distinction between an empty-string default and no default.
 

@@ -1,6 +1,6 @@
 # Query preservation audit
 
-verified: 2026-07-30
+verified: 2026-08-09
 scope: live `stream-binlog` QueryEvent handling plus the shared `StatementApplier` used by `apply-binlog`
 
 This matrix records every current path that removes, ignores, normalizes, or rejects source query text. “Blocked” means no checkpoint advance. Durable automatic-DDL blocks persist a journal barrier and retry the same source coordinate in-process without consuming the ordinary transport retry budget. “Exit” means the error is not reconnect-eligible, reaches `run_stream_binlog_command`, and exits the process with status 1; generic non-DDL mapping/quarantine failures still use that fatal path.
@@ -57,6 +57,7 @@ This matrix records every current path that removes, ignores, normalizes, or rej
 | `DROP COLUMN IF EXISTS` ALTER | `ddl_semantics/transform.rs:transform_drop_columns_if_exists` | Leading comment behavior above; `IF EXISTS` removed; absent target columns and repeated case variants are omitted; entire target SQL becomes `None` when no target column remains | Mixed/unsupported clauses block |
 | `RENAME COLUMN IF EXISTS` ALTER | `ddl_semantics/transform.rs:transform_rename_columns_if_exists` | Exactly one leading ordinary MySQL `-- ` line comment is removed only for parsing and reattached verbatim to executable generated SQL, including its source prefix and line ending. Output removes `IF EXISTS`, formatting, and absent clauses; proven no-op emits no target SQL. | Any remaining or embedded comment form, ambiguous target state, or unsupported shape enters the durable DDL block path |
 | DROP PROCEDURE | `ddl_semantics/transform.rs:parse_supported_drop_procedure`, `transform_drop_procedure` | Output removes `IF EXISTS`, source formatting, and source spelling in favor of matched target spelling; becomes `None` if target procedure is absent | Any comment, double quote, qualification, extra token, or unsupported plain name blocks |
+| Exact DROP TRIGGER IF EXISTS | `ddl_semantics/transform.rs:parse_supported_drop_trigger_if_exists`, `transform_drop_trigger_if_exists` | Only raw unqualified, unquoted, comment-free `DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives` is admitted, with an optional trailing semicolon. Stable target trigger evidence matches case-insensitively; a present target emits quoted `DROP TRIGGER`, and an absent target emits `None` as a proven no-op | Any comment, double quote, quote-wrapped or qualified name, different name, extra token, or other trigger form blocks |
 | Exact source-only CREATE PROCEDURE | `ddl_semantics/transform.rs:transform_source_only_release_move_procedure_create` | Entire source statement intentionally emits no target SQL (`target_sql=None`) after exact raw hash admission | Any other hash/name/body blocks |
 | Automatic semantic no-op/recovery | `ddl_semantics/canonical.rs`, `structured_stream/ddl.rs:execute_transformed_ddl` | A proven `target_sql=None` executes no source text | Checkpoint occurs only after evidence/post-state proof |
 

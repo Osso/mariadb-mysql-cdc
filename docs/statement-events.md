@@ -76,7 +76,16 @@ Automatic DDL admission currently has these narrow slices:
 - the additional exact unqualified, unquoted plain
   `DROP PROCEDURE apply_release_move_purchase_repair` form. Both use target-local
   routine existence evidence: an existing target routine is dropped with
-  deterministic quoted MySQL SQL, while an absent routine is a proven no-op.
+  deterministic quoted MySQL SQL, while an absent routine is a proven no-op; and
+- the exact raw, unqualified, unquoted, comment-free
+  `DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives` form, with an
+  optional trailing semicolon. The source trigger name is admitted only in that
+  exact spelling. Stable target trigger evidence matches the name
+  case-insensitively; a present target emits deterministic quoted MySQL `DROP
+  TRIGGER`, while an absent target persists `generated_sql = NULL` as a proven
+  no-op and follows the normal journal/checkpoint sequence. Qualified, quoted,
+  commented, differently named, extra-token, and other trigger forms remain
+  unsupported.
 
 The index parser rejects comments, ambiguous/incomplete syntax, double-quoted
 identifiers when ANSI_QUOTES mode is not captured, qualified names (including
@@ -89,7 +98,7 @@ rename translator removes `IF EXISTS`; absent old columns become a proven no-op,
 while old/new coexistence fails closed.
 
 Other table DDL and unsupported `ALTER TABLE` forms, views, other routine DDL,
-events, triggers, `RENAME`, `TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
+events, unsupported trigger DDL, `RENAME`, `TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
 all other procedure bodies or names, plain drops for other names,
 qualified/cross-schema references, quoted forms, comments outside the exact leading
 ordinary-comment CREATE and ALTER admissions, other definer/security clauses,

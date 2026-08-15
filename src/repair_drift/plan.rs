@@ -205,6 +205,57 @@ pub(crate) fn collect_repair_table_inputs(
     (inputs, skipped)
 }
 
+pub(crate) fn collect_full_repair_table_inputs(
+    ordered_tables: &[String],
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> (RepairTableInputs, Vec<RepairDriftSkip>) {
+    let source_by_name = index_inventory_tables(source_inventory);
+    let target_by_name = index_inventory_tables(target_inventory);
+    let mut inputs = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for table_name in ordered_tables {
+        match full_repair_table_input(table_name, &source_by_name, &target_by_name) {
+            Ok(input) => {
+                inputs.insert(table_name.clone(), input);
+            }
+            Err(skip) => skipped.push(skip),
+        }
+    }
+    (inputs, skipped)
+}
+
+fn full_repair_table_input(
+    table_name: &str,
+    source_by_name: &BTreeMap<&str, &TableInventory>,
+    target_by_name: &BTreeMap<&str, &TableInventory>,
+) -> Result<(u64, u64, SyncTable), RepairDriftSkip> {
+    let source = full_repair_table(source_by_name, table_name, "source")?;
+    let target = full_repair_table(target_by_name, table_name, "target")?;
+    let mut skipped = Vec::new();
+    let table = compatible_sync_table(source, target, &mut skipped).ok_or_else(|| {
+        skipped.pop().unwrap_or_else(|| RepairDriftSkip {
+            table: table_name.to_string(),
+            reason: "table is not repairable".to_string(),
+        })
+    })?;
+    Ok((0, 0, table))
+}
+
+fn full_repair_table<'a>(
+    tables: &BTreeMap<&str, &'a TableInventory>,
+    table_name: &str,
+    side: &str,
+) -> Result<&'a TableInventory, RepairDriftSkip> {
+    tables
+        .get(table_name)
+        .copied()
+        .ok_or_else(|| RepairDriftSkip {
+            table: table_name.to_string(),
+            reason: format!("{side} table is missing from inventory"),
+        })
+}
+
 fn collect_repair_table(
     table_name: &str,
     comparisons: &[DriftComparison],
@@ -310,6 +361,41 @@ pub(crate) fn build_runtime_repair_plan(
     let source = build_source_repair_inventory(config, source_inventory)?;
     let target = build_target_repair_inventory(config, target_inventory)?;
     build_plan(config, run_id, source, target)
+}
+
+pub(crate) fn build_runtime_recovery_repair_plan(
+    config: &RepairDriftConfig,
+    run_id: &str,
+    source_inventory: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+) -> Result<RepairPlan, RepairDriftError> {
+    let source = build_source_repair_inventory(config, source_inventory)?;
+    let target = build_target_repair_inventory(config, target_inventory)?;
+    let target = DependencyRepairScopes {
+        insert_update: source_scoped_target_repair_inventory(
+            &source.insert_update,
+            &target.insert_update,
+        ),
+        delete: source_scoped_target_repair_inventory(&source.delete, &target.delete),
+    };
+    build_plan(config, run_id, source, target)
+}
+
+fn source_scoped_target_repair_inventory(
+    source: &RepairInventory,
+    target: &RepairInventory,
+) -> RepairInventory {
+    let source_tables = source.tables.iter().collect::<BTreeSet<_>>();
+    RepairInventory {
+        schema: target.schema.clone(),
+        tables: target
+            .tables
+            .iter()
+            .filter(|table| source_tables.contains(table))
+            .cloned()
+            .collect(),
+        foreign_keys: source.foreign_keys.clone(),
+    }
 }
 
 fn build_source_repair_inventory(
@@ -665,6 +751,26 @@ mod tests {
     }
 
     #[test]
+    fn full_snapshot_repair_inputs_include_every_compatible_table_without_precounts() {
+        let source = schema_inventory(&["customers", "orders"]);
+        let target = schema_inventory(&["customers", "orders"]);
+
+        let (inputs, skipped) = collect_full_repair_table_inputs(
+            &["customers".to_string(), "orders".to_string()],
+            &source,
+            &target,
+        );
+
+        assert!(skipped.is_empty());
+        assert_eq!(
+            inputs.keys().collect::<Vec<_>>(),
+            vec!["customers", "orders"]
+        );
+        assert_eq!(inputs["customers"].0, 0);
+        assert_eq!(inputs["customers"].1, 0);
+    }
+
+    #[test]
     fn selected_child_candidates_include_parentward_repairs_before_child() {
         let mut config = super::super::config::default_repair_drift_config();
         config.tables = vec!["orders".to_string()];
@@ -705,5 +811,27 @@ mod tests {
             plan.tables
         );
         assert!(!plan.tables.contains(&"unrelated".to_string()));
+    }
+
+    #[test]
+    fn recovery_repair_plan_ignores_target_only_tables_but_selects_every_source_table() {
+        let source = repair_inventory(
+            &["llm_conversations", "llm_messages"],
+            vec![fk("llm_messages", "llm_conversations")],
+        );
+        let target = repair_inventory(
+            &["llm_conversations", "llm_messages", "capy_conversations"],
+            vec![fk("llm_messages", "llm_conversations")],
+        );
+
+        assert!(build_repair_plan("generic", "source", "target", &source, &target).is_err());
+
+        let scoped_target = source_scoped_target_repair_inventory(&source, &target);
+        let plan = build_repair_plan("recovery", "source", "target", &source, &scoped_target)
+            .expect("target-only recovery tables must not block source repair");
+
+        assert_eq!(plan.tables, vec!["llm_conversations", "llm_messages"]);
+        assert_eq!(plan.insert_order, vec!["llm_conversations", "llm_messages"]);
+        assert_eq!(plan.delete_order, vec!["llm_messages", "llm_conversations"]);
     }
 }
