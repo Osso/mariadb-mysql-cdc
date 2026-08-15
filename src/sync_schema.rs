@@ -414,6 +414,33 @@ fn standard_parent_key_exists(
         })
 }
 
+fn plan_repair_prerequisite_convergence(
+    source: &SchemaInventory,
+    target: &SchemaInventory,
+    selected: &[String],
+    preflight: &dyn SchemaCoercionPreflight,
+) -> Result<SchemaConvergencePlan, String> {
+    let mut source_without_foreign_keys = source.clone();
+    source_without_foreign_keys.foreign_keys.clear();
+    let mut plan =
+        plan_schema_convergence(&source_without_foreign_keys, target, selected, preflight)?;
+    for table in &mut plan.tables {
+        table.statements.retain(is_repair_prerequisite_statement);
+        table.dependencies.clear();
+    }
+    Ok(plan)
+}
+
+fn is_repair_prerequisite_statement(statement: &PlannedSchemaStatement) -> bool {
+    let changes_table_options = statement
+        .objects
+        .iter()
+        .any(|object| object.ends_with(".options"));
+    statement.phase != SchemaPhase::Constraints
+        && !is_drop_statement(statement)
+        && !changes_table_options
+}
+
 pub(crate) fn plan_schema_convergence(
     source: &SchemaInventory,
     target: &SchemaInventory,
@@ -1167,6 +1194,23 @@ pub(crate) fn run_schema_convergence_from_source_evidence(
     })
 }
 
+pub(crate) fn run_schema_repair_prerequisite_convergence_from_source_evidence(
+    evidence: SchemaSourceEvidence,
+    target: crate::live::TargetMySqlConfig,
+) -> Result<SchemaConvergenceReport, String> {
+    let target_reader = MariaDbInventoryReader::new(inventory_config_target(&target));
+    let target_inventory = build_inventory(&target.database, &target_reader)
+        .map_err(|error| format!("target schema inventory failed: {error}"))?;
+    let selected =
+        resolve_schema_selection(&SchemaSelection::AllSourceTables, &evidence.inventory)?;
+    execute_schema_repair_prerequisite_convergence(
+        &evidence.inventory,
+        &target_inventory,
+        &selected,
+        &target,
+    )
+}
+
 pub(crate) fn target_only_table_drop_statements(
     source: &SchemaInventory,
     target: &SchemaInventory,
@@ -1316,6 +1360,50 @@ fn execute_schema_convergence(
     Ok(execute_schema_plan(plan, &mut executor, &|table| {
         verify_schema_table(&verification, table)
     }))
+}
+
+fn execute_schema_repair_prerequisite_convergence(
+    source: &SchemaInventory,
+    target_inventory: &SchemaInventory,
+    selected: &[String],
+    target: &crate::live::TargetMySqlConfig,
+) -> Result<SchemaConvergenceReport, String> {
+    let preflight = MySqlCoercionPreflight {
+        config: inventory_config_target(target),
+        schema: target.database.clone(),
+    };
+    let plan =
+        plan_repair_prerequisite_convergence(source, target_inventory, selected, &preflight)?;
+    let executor = crate::mysql_client::PersistentTargetExecutor::new(target)
+        .map_err(|error| error.to_string())?;
+    let mut executor = MySqlSchemaExecutor { executor };
+    let expected = expected_target_inventory(source);
+    let verification_reader = MariaDbInventoryReader::new(inventory_config_target(target));
+    let verification = RepairPrerequisiteVerificationContext {
+        expected: &expected,
+        verification_reader: &verification_reader,
+        target_database: &target.database,
+    };
+    Ok(execute_schema_plan(plan, &mut executor, &|table| {
+        verify_repair_prerequisite_schema_table(&verification, table)
+    }))
+}
+
+struct RepairPrerequisiteVerificationContext<'a> {
+    expected: &'a SchemaInventory,
+    verification_reader: &'a MariaDbInventoryReader,
+    target_database: &'a str,
+}
+
+fn verify_repair_prerequisite_schema_table(
+    context: &RepairPrerequisiteVerificationContext<'_>,
+    table: &str,
+) -> Vec<String> {
+    context.verification_reader.scope_to_table(table);
+    match build_inventory(context.target_database, context.verification_reader) {
+        Ok(target) => repair_prerequisite_schema_differences(context.expected, &target, table),
+        Err(error) => vec![format!("target re-inventory failed: {error}")],
+    }
 }
 
 struct SchemaVerificationContext<'a> {
@@ -2305,7 +2393,7 @@ fn is_drop_statement(statement: &PlannedSchemaStatement) -> bool {
     statement.sql.to_ascii_uppercase().contains(" DROP ")
 }
 
-fn schema_table_differences(
+fn repair_prerequisite_schema_differences(
     source: &SchemaInventory,
     target: &SchemaInventory,
     table: &str,
@@ -2343,26 +2431,46 @@ fn schema_table_differences(
     {
         differences.push("indexes differ".to_string());
     }
-    let source_foreign_keys = source
-        .foreign_keys
+    differences
+}
+
+fn schema_table_differences(
+    source: &SchemaInventory,
+    target: &SchemaInventory,
+    table: &str,
+) -> Vec<String> {
+    let mut differences = repair_prerequisite_schema_differences(source, target, table);
+    let source_has_table = source
+        .tables
         .iter()
-        .filter(|key| key.table == table)
-        .collect::<Vec<_>>();
-    let target_foreign_keys = target
-        .foreign_keys
+        .any(|candidate| candidate.name == table);
+    let target_has_table = target
+        .tables
         .iter()
-        .filter(|key| key.table == table)
-        .collect::<Vec<_>>();
-    if source_foreign_keys.len() != target_foreign_keys.len()
-        || source_foreign_keys.iter().any(|source_key| {
-            !target_foreign_keys.iter().any(|target_key| {
-                foreign_keys_equal(source_key, &source.schema, target_key, &target.schema)
-            })
-        })
-    {
+        .any(|candidate| candidate.name == table);
+    if source_has_table && target_has_table && foreign_keys_differ(source, target, table) {
         differences.push("foreign keys differ".to_string());
     }
     differences
+}
+
+fn foreign_keys_differ(source: &SchemaInventory, target: &SchemaInventory, table: &str) -> bool {
+    let source_keys = source
+        .foreign_keys
+        .iter()
+        .filter(|key| key.table == table)
+        .collect::<Vec<_>>();
+    let target_keys = target
+        .foreign_keys
+        .iter()
+        .filter(|key| key.table == table)
+        .collect::<Vec<_>>();
+    source_keys.len() != target_keys.len()
+        || source_keys.iter().any(|source_key| {
+            !target_keys.iter().any(|target_key| {
+                foreign_keys_equal(source_key, &source.schema, target_key, &target.schema)
+            })
+        })
 }
 
 /// Conversions no target row can violate, so no target-data check is required.
@@ -3746,6 +3854,69 @@ mod tests {
                 .prerequisites
                 .contains(&"index:items.uidx_items_id".to_string())
         );
+    }
+
+    #[test]
+    fn repair_prerequisite_plan_adds_missing_columns_without_foreign_keys() {
+        let source = inventory(
+            vec![
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("parent_id", "bigint", false),
+                    ],
+                    vec!["id"],
+                ),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![foreign_key("children", "parents")],
+        );
+        let target = inventory(
+            vec![
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("legacy", "bigint", true),
+                    ],
+                    vec!["id"],
+                ),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![],
+        );
+
+        let plan = plan_repair_prerequisite_convergence(
+            &source,
+            &target,
+            &["parents".to_string(), "children".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("repair prerequisite schema plan");
+        let statements = plan
+            .tables
+            .iter()
+            .flat_map(|table| table.statements.iter())
+            .collect::<Vec<_>>();
+
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.sql.contains("ADD COLUMN `parent_id`"))
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|statement| statement.phase != SchemaPhase::Constraints)
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|statement| !is_drop_statement(statement))
+        );
+        assert!(repair_prerequisite_schema_differences(&source, &source, "children").is_empty());
+        assert!(!repair_prerequisite_schema_differences(&source, &target, "children").is_empty());
     }
 
     #[test]

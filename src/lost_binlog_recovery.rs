@@ -11,6 +11,7 @@ use crate::repair_drift::{RepairDriftConfig, RepairDriftReport, run_consistent_s
 use crate::sync_schema::{
     SchemaSourceEvidence, read_snapshot_check_constraints,
     run_schema_convergence_from_source_evidence,
+    run_schema_repair_prerequisite_convergence_from_source_evidence,
 };
 use crate::table_sync::SyncMode;
 use serde::{Deserialize, Serialize};
@@ -487,19 +488,9 @@ pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamRepo
     checkpoint_store.bootstrap(&start_checkpoint)?;
     let source_evidence = read_source_evidence(source.as_ref(), &config.source.database)?;
     validate_transactional_scope(&source_evidence.inventory)?;
-    let schema_report = run_schema_convergence_from_source_evidence(
-        source_evidence.clone(),
-        config.target.clone(),
-    )?;
-    require_converged_schema(&schema_report)?;
-    let target_inventory = read_target_inventory(&config.target)?;
-    let repair = run_consistent_snapshot_repair(
-        &resync_repair_config(config),
-        Rc::clone(&source),
-        source_evidence.inventory.clone(),
-        target_inventory,
-    )
-    .map_err(|error| error.to_string())?;
+    prepare_resync_target_schema(&source_evidence, &config.target)?;
+    let repair = repair_resync_data(config, Rc::clone(&source), &source_evidence.inventory)?;
+    converge_resync_target_schema(&source_evidence, &config.target)?;
     let final_target_inventory = read_target_inventory(&config.target)?;
     require_exact_table_inventory(&source_evidence.inventory, &final_target_inventory)?;
     Ok(ResyncStreamReport {
@@ -508,6 +499,40 @@ pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamRepo
         repaired_tables: repair.repaired.len(),
         compared_tables: repair.compared_tables,
     })
+}
+
+fn prepare_resync_target_schema(
+    evidence: &SchemaSourceEvidence,
+    target: &TargetMySqlConfig,
+) -> Result<(), String> {
+    let report = run_schema_repair_prerequisite_convergence_from_source_evidence(
+        evidence.clone(),
+        target.clone(),
+    )?;
+    require_converged_schema(&report)
+}
+
+fn repair_resync_data(
+    config: &ResyncStreamConfig,
+    source: Rc<PersistentMySqlSource>,
+    source_inventory: &crate::inventory::SchemaInventory,
+) -> Result<RepairDriftReport, String> {
+    let target_inventory = read_target_inventory(&config.target)?;
+    run_consistent_snapshot_repair(
+        &resync_repair_config(config),
+        source,
+        source_inventory.clone(),
+        target_inventory,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn converge_resync_target_schema(
+    evidence: &SchemaSourceEvidence,
+    target: &TargetMySqlConfig,
+) -> Result<(), String> {
+    let report = run_schema_convergence_from_source_evidence(evidence.clone(), target.clone())?;
+    require_converged_schema(&report)
 }
 
 fn resync_repair_config(config: &ResyncStreamConfig) -> RepairDriftConfig {
