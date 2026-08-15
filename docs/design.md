@@ -130,8 +130,11 @@ scope. Commits after the captured coordinate remain in the binlog and are
 replayed by the stream after recovery advances the checkpoint.
 
 A prepared immutable recovery record links old state, the captured coordinate,
-source, the attempt's actual scope, operator, reason, and evidence. After
-source-scoped data repair, recovery-only schema convergence drops target-only
+source, the attempt's actual scope, operator, reason, and evidence. Before
+source-scoped data repair, pre-repair convergence may add only required source
+tables, columns, primary keys, and indexes; it performs no `DROP`, target-only
+table removal, foreign-key convergence, or CHECK-constraint convergence. After
+data repair, recovery-only schema convergence drops target-only
 base tables child-before-parent with normal foreign-key enforcement; cycles and
 source-table references to target-only parents fail closed. The final target
 inventory must exactly match the attempt's source inventory before one target
