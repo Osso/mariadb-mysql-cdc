@@ -173,7 +173,11 @@ requires complete source and active-target `FOR UPDATE` hashes for both the
 historical primary row and current unique owner. The comics proof requires full
 current primary-row equality, while the locked unique owner is accepted by
 exact primary-key plus slug identity despite unrelated mutable-field drift, and
-only that insert may be treated as a no-op. The releases proof is limited to
+only that insert may be treated as a no-op. If typed verification finds that the
+source primary still owns the historical identity, it records ordinary unresolved
+reconciliation debt, runs no superseded repair SQL, and commits the remaining
+transaction with its XID checkpoint; other proof or evidence failures still roll back.
+The releases proof is limited to
 `releases_ibfk_2` category transaction `mysqld-bin.002709:515816736–515824875`
 and `releases_ibfk_3` visibility transaction
 `mysqld-bin.002709:531921570–531929925` (candidate event
@@ -185,10 +189,11 @@ an existing target release must hash equal to current source. It preserves the
 current parent identity and never updates or deletes that parent. Before
 checkpointing, the target transaction must lock an existing same-file predecessor
 before the candidate and no later than the XID. Remaining rows still apply, and the observation/resolution evidence
-plus XID checkpoint commit atomically; any proof, predecessor, or commit failure
-rolls back, then persists all unresolved observations independently; rollback or
-persistence failures are surfaced. When superseded verification rejects a
-candidate, the structured error includes the exact parameterized source and
+plus XID checkpoint commit atomically; any other proof, predecessor, or commit
+failure rolls back, then persists all unresolved observations independently; rollback
+or persistence failures are surfaced. When superseded verification rejects a
+candidate for any reason other than the typed current-owner result, the structured
+error includes the exact parameterized source and
 locked-target evidence `SELECT` statements plus the historical primary-key and
 unique-identity query parameters; credentials and unrelated row values are never
 logged. Every non-`INSERT` `1062` unique conflict also persists evidence

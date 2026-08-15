@@ -48,7 +48,10 @@ transaction. The users proof requires complete source/target PK and unique-owner
 convergence from that snapshot plus active-transaction `SELECT ... FOR UPDATE`
 reads. The comics proof requires complete current primary-row equality, while
 accepting the locked unique owner by exact PK+slug identity despite unrelated
-mutable-field drift. The releases proof is limited to category
+mutable-field drift. If typed verification finds that the source primary still
+owns the historical identity, it records ordinary unresolved reconciliation debt,
+runs no superseded repair SQL, and commits the remaining transaction with its XID
+checkpoint; other proof or evidence failures still roll back. The releases proof is limited to category
 `mysqld-bin.002709:515816736–515824875` (`releases_ibfk_2`) and visibility
 `mysqld-bin.002709:531921570–531929925` (`releases_ibfk_3`, candidate event
 `531921789`) with exact FK identity. It retains the historical release image,
