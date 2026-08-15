@@ -2390,7 +2390,8 @@ fn target_column_drop_prerequisites(
 }
 
 fn is_drop_statement(statement: &PlannedSchemaStatement) -> bool {
-    statement.sql.to_ascii_uppercase().contains(" DROP ")
+    let normalized = statement.sql.trim_start().to_ascii_uppercase();
+    normalized.starts_with("DROP ") || normalized.contains(" DROP ")
 }
 
 fn repair_prerequisite_schema_differences(
@@ -3872,7 +3873,7 @@ mod tests {
             ],
             vec![foreign_key("children", "parents")],
         );
-        let target = inventory(
+        let mut target = inventory(
             vec![
                 table(
                     "children",
@@ -3886,6 +3887,21 @@ mod tests {
             ],
             vec![],
         );
+        target.indexes.push(IndexInventory {
+            table: "children".to_string(),
+            name: "idx_children_legacy".to_string(),
+            unique: false,
+            index_type: "BTREE".to_string(),
+            visible: true,
+            comment: None,
+            columns: vec![IndexColumnInventory {
+                name: "legacy".to_string(),
+                sequence: 1,
+                prefix_length: None,
+                collation: None,
+                order: "ASC".to_string(),
+            }],
+        });
 
         let plan = plan_repair_prerequisite_convergence(
             &source,
@@ -3914,6 +3930,11 @@ mod tests {
             statements
                 .iter()
                 .all(|statement| !is_drop_statement(statement))
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|statement| !statement.sql.trim_start().starts_with("DROP "))
         );
         assert!(repair_prerequisite_schema_differences(&source, &source, "children").is_empty());
         assert!(!repair_prerequisite_schema_differences(&source, &target, "children").is_empty());
