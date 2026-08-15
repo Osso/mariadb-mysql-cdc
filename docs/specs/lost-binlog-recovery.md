@@ -20,7 +20,8 @@
 - [x] When configured with `--parallelism`, run independent full-scope tables concurrently within delete/insert/update/verify phase barriers, never crossing foreign-key dependency levels; each worker reads from the configured source endpoint.
 - [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
 - [x] Reconcile every current source-scope table, including target-only orphan rows; target-only target tables do not narrow the recovery data plan, and generic `repair-drift` remains strict about its source/target inventory contract.
-- [x] Run recovery-only schema convergence after data reconciliation: drop target-only base tables child-before-parent with normal foreign-key enforcement, fail closed on cycles or source-table references to target-only parents, and converge remaining source tables and constraints.
+- [x] Before data reconciliation, converge only repair prerequisites: source tables, columns, primary keys, and indexes. Do not add foreign keys/check constraints or drop target-only tables in this phase.
+- [x] Run final recovery-only schema convergence after data reconciliation: drop target-only base tables child-before-parent with normal foreign-key enforcement, fail closed on cycles or source-table references to target-only parents, and converge remaining source tables and constraints.
 - [x] Require the final target base-table inventory to exactly match the source inventory before commit.
 - [x] Refuse checkpoint transition when any table is skipped, unsupported, unresolved, or the final target inventory differs from source.
 - [ ] Prove the complete live CLI path against the production-shaped full scope, including data repair before final schema/FK convergence.
@@ -58,13 +59,14 @@
 - `src/mysql_client.rs` — non-locking MariaDB coordinate capture.
 - `src/inventory/reader.rs` — committed source metadata reads.
 - `src/repair_drift/` — full-scope insert/update/delete and verification phases.
-- `src/sync_schema.rs` — final schema convergence and foreign-key creation after anchored data repair.
+- `src/sync_schema.rs` — repair-prerequisite table/column/key convergence before data repair, then final constraint convergence after repair.
 - `docs/stream-recovery-records-bootstrap.sql` — recovery-record table, active-barrier identity, guards, inventory procedure, and grants.
 - `docs/stream-recovery-records-abandoned-replacement-migration.sql` — target-only live-schema migration with duplicate-owner preflight and prepared-row postflight.
 
 ## Tests asserting this spec
 
-- `src/lost_binlog_recovery.rs` — phase ordering, target-orphan repair before schema/FK convergence, replacement owner abandonment, rollback/refusal cases, exact old-state validation, duplicate/non-advancing refusal, incomplete-proof refusal, atomic rollback, and exact historical-barrier supersession.
+- `src/lost_binlog_recovery.rs` — phase ordering, repair-prerequisite schema before data reconciliation, target-orphan repair before schema/FK convergence, replacement owner abandonment, rollback/refusal cases, exact old-state validation, duplicate/non-advancing refusal, incomplete-proof refusal, atomic rollback, and exact historical-barrier supersession.
+- `src/sync_schema.rs` — pre-repair plans add missing columns/keys without scheduling foreign-key constraints.
 - `src/lost_binlog_recovery_store.rs` — immutable prepared insert, locked CAS queries, abandoned parsing/replacement SQL, checkpoint update, committed transition, and exact barrier predicates.
 
 ## Known gaps (current cycle)
