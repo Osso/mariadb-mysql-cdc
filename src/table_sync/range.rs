@@ -604,11 +604,8 @@ pub(crate) fn validate_resumable_progress(
             "run id `{run_id}` already exists with a different immutable specification"
         )));
     }
-    if progress.status == SyncProgressStatus::Complete {
-        return Err(TableSyncError::Progress(format!(
-            "run id `{run_id}` is already complete; use a new run id"
-        )));
-    }
+    // Completed runs retain their terminal primary key and can be resumed idempotently.
+    // This lets interrupted multi-phase repairs reuse one deterministic run identity.
     Ok(progress)
 }
 
