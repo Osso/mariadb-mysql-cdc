@@ -44,7 +44,13 @@ pub(super) trait SupersededInsertVerifier {
         &mut self,
         candidate: &crate::row::DeferredSupersededInsertCandidate,
         xid_end_position: u64,
-    ) -> Result<DeferredRepair, String>;
+    ) -> Result<DeferredVerification, String>;
+}
+
+/// Whether a deferred conflict needs a proved repair or is ordinary reconciliation debt.
+pub(super) enum DeferredVerification {
+    Repair(DeferredRepair),
+    OrdinaryConflict,
 }
 
 /// What a deferred conflict resolved to, and the statements that carry it out inside the applying
@@ -85,7 +91,7 @@ pub(super) struct SupersededXidCommitContext<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct VerifiedSupersededInsert {
-    pub(super) resolution_evidence: String,
+    pub(super) resolution_evidence: Option<String>,
     pub(super) checkpoint: crate::checkpoint::Checkpoint,
 }
 
@@ -273,9 +279,11 @@ impl TargetTransaction {
             context,
         ) {
             Ok((verified, committed_resolutions)) => {
-                let resolution = conflict_resolution(&observation, &verified.resolution_evidence);
-                conflict_store.mark_observation_committed(observation);
-                conflict_store.mark_resolution_committed(resolution);
+                conflict_store.mark_observation_committed(observation.clone());
+                if let Some(evidence) = &verified.resolution_evidence {
+                    conflict_store
+                        .mark_resolution_committed(conflict_resolution(&observation, evidence));
+                }
                 for committed_resolution in committed_resolutions {
                     conflict_store.mark_resolution_committed(committed_resolution);
                 }
@@ -342,11 +350,20 @@ impl TargetTransaction {
             .ok_or_else(|| {
                 ApplyBinlogError::Target("missing deferred superseded insert".to_string())
             })?;
-        let proof = verifier
+        let verification = verifier
             .verify(&candidate, context.xid_end_position)
             .map_err(superseded_verification_error)?;
-        let evidence = proof.resolution_evidence();
-        for statement in proof.statements() {
+        let (evidence, statements, checkpoint_description) = match verification {
+            DeferredVerification::Repair(repair) => (
+                Some(repair.resolution_evidence()),
+                repair.statements(),
+                "verified superseded insert transaction",
+            ),
+            DeferredVerification::OrdinaryConflict => {
+                (None, Vec::new(), "deferred ordinary conflict transaction")
+            }
+        };
+        for statement in statements {
             executor
                 .execute(&statement)
                 .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
@@ -359,7 +376,7 @@ impl TargetTransaction {
             last_event: crate::checkpoint::LastEvent {
                 event_type: "XidEvent".to_string(),
                 description: format!(
-                    "verified superseded insert transaction at {}:{}",
+                    "{checkpoint_description} at {}:{}",
                     candidate.observation.coordinate.file, context.xid_end_position,
                 ),
             },
@@ -405,21 +422,23 @@ impl TargetTransaction {
                 .execute_transaction_sql(&conflict_store.resolution_sql(pending_resolution))
                 .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         }
-        let resolution = conflict_resolution(&candidate.observation, &evidence);
         executor
             .execute_transaction_sql(&crate::conflict_repair::build_conflict_observation_sql(
                 context.conflict_table,
                 &candidate.observation,
             ))
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        executor
-            .execute_transaction_sql(
-                &crate::conflict_repair::build_conflict_resolution_for_source_row_sql(
-                    context.conflict_table,
-                    &resolution,
-                ),
-            )
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        if let Some(evidence) = &evidence {
+            let resolution = conflict_resolution(&candidate.observation, evidence);
+            executor
+                .execute_transaction_sql(
+                    &crate::conflict_repair::build_conflict_resolution_for_source_row_sql(
+                        context.conflict_table,
+                        &resolution,
+                    ),
+                )
+                .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        }
         let committed_resolutions = self.commit_if_open(executor)?;
         Ok((
             VerifiedSupersededInsert {

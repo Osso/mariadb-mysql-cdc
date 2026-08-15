@@ -64,11 +64,16 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       snapshot beyond the candidate transaction, and complete current
       source/target equality for the historical primary row. The current source
       and locked target unique owner must have the same primary key and slug;
-      unrelated mutable owner-field drift does not reject the proof. The
-      observation/resolution evidence, remaining row effects, and XID checkpoint
-      commit atomically, while any failed predicate or commit failure rolls back
-      and leaves the conflict unresolved. The existing `globalcomix.users` /
-      `users.name` proof retains full owner-row equality and is unchanged.
+      unrelated mutable owner-field drift does not reject the proof. If typed
+      verification determines that the source primary still owns the historical
+      identity, classify the candidate as ordinary unresolved reconciliation
+      debt: record observation evidence, run no superseded repair SQL, and commit
+      remaining row effects with the XID checkpoint. The observation/resolution
+      evidence, remaining row effects, and XID checkpoint commit atomically for
+      a proved supersession, while any other failed predicate or commit failure
+      rolls back and leaves the conflict unresolved. The existing
+      `globalcomix.users` / `users.name` proof retains full owner-row equality
+      and is unchanged.
 - [x] The superseded historical `globalcomix.releases` `ROW INSERT` FK proof is
       limited to the exact approved category transaction
       `mysqld-bin.002709:515816736–515824875` (`releases_ibfk_2`) and visibility

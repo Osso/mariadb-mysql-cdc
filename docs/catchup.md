@@ -30,8 +30,11 @@ is a conservative lower bound and must be beyond the candidate transaction. The
 users proof requires consistent-source full-row and active-transaction target
 `FOR UPDATE` proof for both historical PK and current unique owner. The comics
 proof requires full current primary-row equality, while accepting the locked
-unique owner by exact PK+slug identity despite unrelated mutable-field drift.
-For releases, the exact FK child/parent identity must match the approved
+unique owner by exact PK+slug identity despite unrelated mutable-field drift. If
+typed verification finds that the source primary still owns the historical identity,
+it records ordinary unresolved reconciliation debt, runs no superseded repair SQL,
+and commits the remaining transaction with its XID checkpoint; other proof or
+evidence failures still roll back. For releases, the exact FK child/parent identity must match the approved
 transaction; the complete historical release image is retained, later source
 history must show a changed parent value, and exactly one current source release,
 source parent, and locked target parent identity must match. An absent target
@@ -40,8 +43,8 @@ release must hash equal to current source. The parent identity is preserved and
 never updated or deleted. Before writing the XID checkpoint, the target
 transaction requires an existing same-file predecessor before the candidate and
 no later than the XID. Remaining rows in that source
-transaction still apply; any proof, predecessor, or commit failure rolls back,
-then persists all unresolved observations independently, surfacing rollback or
+transaction still apply; any other proof, predecessor, or commit failure rolls
+back, then persists all unresolved observations independently, surfacing rollback or
 persistence failures. Success commits its exact observation/resolution evidence
 and XID checkpoint atomically. The accepted overwrite risk is explicit. If a later
 conflict rolls back the enclosing target transaction, the replacement rolls back
