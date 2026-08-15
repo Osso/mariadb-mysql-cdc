@@ -282,12 +282,13 @@ impl SupersededInsertVerifier for SupersededVerificationFixture {
         &mut self,
         _candidate: &DeferredSupersededInsertCandidate,
         _xid_end_position: u64,
-    ) -> Result<super::super::transaction::DeferredRepair, String> {
+    ) -> Result<super::super::transaction::DeferredVerification, String> {
         if !self.verified {
             return Err("target transactional re-read changed".to_string());
         }
-        Ok(super::super::transaction::DeferredRepair::Superseded(
-            super::super::superseded_insert::SupersededInsertProof {
+        Ok(super::super::transaction::DeferredVerification::Repair(
+            super::super::transaction::DeferredRepair::Superseded(
+                super::super::superseded_insert::SupersededInsertProof {
             source_snapshot: super::super::superseded_insert::BinlogCoordinate {
                 file: "mysqld-bin.002740".to_string(),
                 position: 1_004_163_590,
@@ -307,7 +308,8 @@ impl SupersededInsertVerifier for SupersededVerificationFixture {
                     ],
                 }
             }),
-            },
+                },
+            ),
         ))
     }
 }
@@ -477,7 +479,7 @@ impl SupersededInsertVerifier for ComicsPredicateVerifier {
         &mut self,
         _candidate: &DeferredSupersededInsertCandidate,
         _xid_end_position: u64,
-    ) -> Result<super::super::transaction::DeferredRepair, String> {
+    ) -> Result<super::super::transaction::DeferredVerification, String> {
         let input = super::super::superseded_insert::SupersededInsertVerificationInput {
             schema: "globalcomix".to_string(),
             table: "comics".to_string(),
@@ -509,7 +511,11 @@ impl SupersededInsertVerifier for ComicsPredicateVerifier {
             target_owner_hash: "lagged-mutable-owner-hash".to_string(),
         };
         super::super::superseded_insert::verify_superseded_insert(&input)
-            .map(super::super::transaction::DeferredRepair::Superseded)
+            .map(|proof| {
+                super::super::transaction::DeferredVerification::Repair(
+                    super::super::transaction::DeferredRepair::Superseded(proof),
+                )
+            })
             .map_err(|rejection| format!("superseded insert rejected: {rejection:?}"))
     }
 }
@@ -549,6 +555,54 @@ fn comics_slug_supersession_commits_resolution_and_checkpoint_atomically() {
             "CHECKPOINT",
             "OBSERVATION",
             "RESOLUTION",
+            "COMMIT"
+        ]
+    );
+}
+
+struct CurrentSourceOwnerVerifier;
+
+impl SupersededInsertVerifier for CurrentSourceOwnerVerifier {
+    fn verify(
+        &mut self,
+        _candidate: &DeferredSupersededInsertCandidate,
+        _xid_end_position: u64,
+    ) -> Result<super::super::transaction::DeferredVerification, String> {
+        Ok(super::super::transaction::DeferredVerification::OrdinaryConflict)
+    }
+}
+
+#[test]
+fn current_source_owner_conflict_commits_observation_and_checkpoint_without_superseded_resolution()
+{
+    let executor = TransactionRecordingExecutor::with_locked_checkpoint(checkpoint_at(
+        "mysqld-bin.002709",
+        531_240_959,
+    ));
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+    transaction.defer_superseded_insert(comics_slug_superseded_candidate());
+    let mut verifier = CurrentSourceOwnerVerifier;
+
+    let proof = transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            comics_xid_context(),
+        )
+        .expect("current source owner is ordinary reconciliation debt");
+
+    assert_eq!(proof.checkpoint.source_position, 531_241_781);
+    assert_eq!(conflicts.records().len(), 1);
+    assert_eq!(
+        executor.operations(),
+        [
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "OBSERVATION",
             "COMMIT"
         ]
     );
@@ -633,12 +687,12 @@ fn verified_superseded_insert_commits_later_rows_resolution_and_xid_checkpoint_a
         )
         .expect("verified candidate commits atomically");
 
-    assert!(
-        proof
-            .resolution_evidence
-            .contains("mysqld-bin.002740:1004163590")
-    );
-    assert!(proof.resolution_evidence.contains("source-pk-hash"));
+    let evidence = proof
+        .resolution_evidence
+        .as_deref()
+        .expect("superseded resolution evidence");
+    assert!(evidence.contains("mysqld-bin.002740:1004163590"));
+    assert!(evidence.contains("source-pk-hash"));
     assert_eq!(
         executor.operations(),
         [
@@ -746,13 +800,13 @@ fn production_404034840_superseded_users_insert_commits_all_followup_effects_at_
         )
         .expect("exact production transaction commits atomically");
 
-    assert!(
-        proof
-            .resolution_evidence
-            .contains("mysqld-bin.002740:1004163590")
-    );
+    let evidence = proof
+        .resolution_evidence
+        .as_deref()
+        .expect("superseded resolution evidence");
+    assert!(evidence.contains("mysqld-bin.002740:1004163590"));
     for full_row_hash in ["historical-hash", "source-pk-hash", "source-owner-hash"] {
-        assert!(proof.resolution_evidence.contains(full_row_hash));
+        assert!(evidence.contains(full_row_hash));
     }
     assert_eq!(proof.checkpoint.source_file, "mysqld-bin.002709");
     assert_eq!(proof.checkpoint.source_position, 404_038_011);

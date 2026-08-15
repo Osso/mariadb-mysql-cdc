@@ -1,5 +1,5 @@
 use super::superseded_insert::{
-    BinlogCoordinate, SupersededInsertProof, SupersededInsertVerificationInput,
+    BinlogCoordinate, SupersededInsertRejection, SupersededInsertVerificationInput,
     verify_superseded_insert,
 };
 use super::superseded_source::{
@@ -83,14 +83,18 @@ where
         &mut self,
         candidate: &DeferredSupersededInsertCandidate,
         xid_end_position: u64,
-    ) -> Result<super::transaction::DeferredRepair, String> {
+    ) -> Result<super::transaction::DeferredVerification, String> {
         // A foreign-key conflict is resolved from the locked parent, not from supersession hashes.
         if candidate.observation.error_code == FOREIGN_KEY_ERROR_CODE {
-            return resolve_foreign_key_conflict(&self.source, self.target, candidate)
-                .map(super::transaction::DeferredRepair::ForeignKey);
+            return resolve_foreign_key_conflict(&self.source, self.target, candidate).map(
+                |proof| {
+                    super::transaction::DeferredVerification::Repair(
+                        super::transaction::DeferredRepair::ForeignKey(proof),
+                    )
+                },
+            );
         }
         self.verify_superseded(candidate, xid_end_position)
-            .map(super::transaction::DeferredRepair::Superseded)
     }
 }
 
@@ -102,7 +106,7 @@ where
         &mut self,
         candidate: &DeferredSupersededInsertCandidate,
         xid_end_position: u64,
-    ) -> Result<SupersededInsertProof, String> {
+    ) -> Result<super::transaction::DeferredVerification, String> {
         let (source_table, source_identity_column) = superseded_source_identity(
             &candidate.observation.table,
             candidate.observation.duplicate_index.as_deref(),
@@ -407,7 +411,7 @@ fn verify_with_source_loader<E, L>(
     xid_end_position: u64,
     source_loader: &mut L,
     target: &E,
-) -> Result<SupersededInsertProof, String>
+) -> Result<super::transaction::DeferredVerification, String>
 where
     E: TransactionalTargetExecutor,
     L: FnMut(u64, &str) -> Result<SupersededSourceEvidence, String>,
@@ -446,11 +450,17 @@ where
         historical.primary_key, historical.name
     );
     let input = verification_input(candidate, xid_end_position, &historical, source, target)?;
-    verify_superseded_insert(&input).map_err(|rejection| {
-        format!(
+    match verify_superseded_insert(&input) {
+        Ok(proof) => Ok(super::transaction::DeferredVerification::Repair(
+            super::transaction::DeferredRepair::Superseded(proof),
+        )),
+        Err(SupersededInsertRejection::SourcePrimaryStillOwnsHistoricalName) => {
+            Ok(super::transaction::DeferredVerification::OrdinaryConflict)
+        }
+        Err(rejection) => Err(format!(
             "superseded insert rejected: {rejection:?}; evidence_params={evidence_params}; source_sql={source_sql}; target_sql={target_sql}"
-        )
-    })
+        )),
+    }
 }
 
 fn validate_exact_scope(candidate: &DeferredSupersededInsertCandidate) -> Result<(), String> {
@@ -855,12 +865,44 @@ mod tests {
         };
         let mut source = |_: u64, _: &str| Ok(source_evidence());
 
-        let proof = verify_with_source_loader(&candidate(), 404_038_011, &mut source, &target)
-            .expect("superseded proof");
+        let verification =
+            verify_with_source_loader(&candidate(), 404_038_011, &mut source, &target)
+                .expect("superseded proof");
+        let super::super::transaction::DeferredVerification::Repair(
+            super::super::transaction::DeferredRepair::Superseded(proof),
+        ) = verification
+        else {
+            panic!("expected superseded repair");
+        };
 
         assert_eq!(proof.source_snapshot.position, 1_004_163_590);
         assert_eq!(proof.source_primary_hash, proof.target_primary_hash);
         assert_eq!(proof.source_owner_hash, proof.target_owner_hash);
+    }
+
+    #[test]
+    fn source_primary_still_owning_the_identity_is_ordinary_conflict_debt() {
+        let target = FakeTarget {
+            evidence: RefCell::new(Some(Ok(target_evidence()))),
+        };
+        let mut evidence = source_evidence();
+        let primary = values(2_070_980, "-3572");
+        evidence.matching_rows = vec![super::super::superseded_source::CanonicalSourceRow {
+            columns: evidence.columns.clone(),
+            hash: super::super::superseded_source::hash_canonical_row(&evidence.columns, &primary)
+                .expect("primary hash"),
+            values: primary,
+        }];
+        let mut source = |_: u64, _: &str| Ok(evidence.clone());
+
+        let verification =
+            verify_with_source_loader(&candidate(), 404_038_011, &mut source, &target)
+                .expect("current source owner is not superseded");
+
+        assert!(matches!(
+            verification,
+            super::super::transaction::DeferredVerification::OrdinaryConflict
+        ));
     }
 
     #[test]
@@ -870,8 +912,11 @@ mod tests {
         };
         let mut source = |_: u64, _: &str| Err("source unavailable".to_string());
 
-        let error = verify_with_source_loader(&candidate(), 404_038_011, &mut source, &target)
-            .expect_err("source failure");
+        let error = match verify_with_source_loader(&candidate(), 404_038_011, &mut source, &target)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("source failure must not verify"),
+        };
 
         assert_eq!(
             error,
@@ -1004,8 +1049,10 @@ mod tests {
         };
         let mut source = |_primary_key: u64, _slug: &str| Ok(source_evidence.clone());
 
-        let error = verify_with_source_loader(&candidate, 531_241_781, &mut source, &target)
-            .expect_err("owner mismatch must include evidence queries");
+        let error = match verify_with_source_loader(&candidate, 531_241_781, &mut source, &target) {
+            Err(error) => error,
+            Ok(_) => panic!("owner mismatch must not verify"),
+        };
 
         assert!(error.contains("source_sql=SELECT `id`,`slug` FROM `globalcomix`.`comics` WHERE `id` = ? OR `slug` = ? ORDER BY `id`"));
         assert!(error.contains("target_sql=SELECT `id`, `slug` FROM `globalcomix`.`comics` WHERE `id` = ? OR `slug` = ? ORDER BY `id` FOR UPDATE"));
@@ -1208,8 +1255,11 @@ mod tests {
         };
         let mut source = |_: u64, _: &str| Ok(source_evidence());
 
-        let error = verify_with_source_loader(&candidate(), 404_038_011, &mut source, &target)
-            .expect_err("target failure");
+        let error = match verify_with_source_loader(&candidate(), 404_038_011, &mut source, &target)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("target failure must not verify"),
+        };
 
         assert_eq!(error, "superseded target evidence failed: lock read failed");
     }
