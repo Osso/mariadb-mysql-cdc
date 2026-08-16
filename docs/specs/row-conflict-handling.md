@@ -129,9 +129,11 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       the same rows cannot change the target, so the stream would never leave
       the position - unbounded under `--reconnect-forever`. Failure to persist
       the evidence aborts with the checkpoint unchanged, because advancing past a
-      divergence that was not recorded would lose it silently. Ordinary
-      transport reconnects default to 12 after the initial attempt (13 attempts
-      total); `--max-reconnects 0` disables them unless
+      divergence that was not recorded would lose it silently. Validate every
+      unresolved ledger identity once during stream startup; the per-conflict XID
+      path must not re-read the entire ledger before committing recorded debt and
+      its checkpoint. Ordinary transport reconnects default to 12 after the
+      initial attempt (13 attempts total); `--max-reconnects 0` disables them unless
       `--reconnect-forever true` is set. Exact-parent retries require a positive
       `max-reconnects` setting or reconnect-forever and preserve the ordinary
       transport budget, so

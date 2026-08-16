@@ -862,18 +862,13 @@ fn persist_deferred_conflicts(
             .observe(observation)
             .map_err(ApplyBinlogError::Target)?;
     }
-    let unresolved_count = conflict_store
-        .unresolved_count_result()
-        .map_err(ApplyBinlogError::Target)?;
     if parent_recovery.is_some() {
         return Err(ApplyBinlogError::RowConflictPersisted {
             message: error_text,
             parent_recovery,
         });
     }
-    println!(
-        "cdc_row_conflict_progress unresolved_count={unresolved_count} skipped_rows={skipped}"
-    );
+    println!("cdc_row_conflict_progress skipped_rows={skipped}");
     Ok(())
 }
 

@@ -31,6 +31,9 @@ pub(super) fn validate_startup_contract(
     conflict_store
         .ensure()
         .map_err(ApplyBinlogError::Checkpoint)?;
+    conflict_store
+        .unresolved_count_from_database()
+        .map_err(ApplyBinlogError::Checkpoint)?;
     executor
         .acquire_stream_lease(&format!("cdc-stream:{}", config.target.database))
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;

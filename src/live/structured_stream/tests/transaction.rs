@@ -1111,6 +1111,129 @@ fn successful_rollback_observes_conflict_without_discarding_connection() {
     assert_eq!(conflicts.records().len(), 1);
 }
 
+struct RecountRejectingConflictStore {
+    observations: Vec<crate::conflict_repair::ConflictObservation>,
+    existing_unresolved_count: usize,
+    recount_attempts: usize,
+}
+
+impl crate::conflict_repair::ConflictStore for RecountRejectingConflictStore {
+    fn observe(
+        &mut self,
+        observation: crate::conflict_repair::ConflictObservation,
+    ) -> Result<(), String> {
+        self.observations.push(observation);
+        Ok(())
+    }
+
+    fn resolve_existing(
+        &mut self,
+        _resolution: crate::conflict_repair::ConflictResolution,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resolution_sql(&self, _resolution: &crate::conflict_repair::ConflictResolution) -> String {
+        String::new()
+    }
+
+    fn mark_observation_committed(
+        &mut self,
+        observation: crate::conflict_repair::ConflictObservation,
+    ) {
+        self.observations.push(observation);
+    }
+
+    fn mark_resolution_committed(
+        &mut self,
+        _resolution: crate::conflict_repair::ConflictResolution,
+    ) {
+    }
+
+    fn has_unresolved(
+        &mut self,
+        _resolution: &crate::conflict_repair::ConflictResolution,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn resolve_if_equal(
+        &mut self,
+        _table: &str,
+        _primary_key: &[String],
+        _rows_equal: bool,
+        _repair_run_id: &str,
+        _evidence: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn unresolved_count(&self) -> usize {
+        self.existing_unresolved_count + self.observations.len()
+    }
+
+    fn unresolved_count_result(&mut self) -> Result<usize, String> {
+        self.recount_attempts += 1;
+        Err("full unresolved-ledger recount attempted".to_string())
+    }
+}
+
+#[test]
+fn conflict_xid_commits_without_recounting_152705_existing_rows() {
+    let executor = TransactionRecordingExecutor::with_divergent_duplicate_second_row_change();
+    let mut applier = crate::row::RowApplier::new(executor);
+    applier.apply_table_map(accounts_row_table_map());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.002858".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = RecountRejectingConflictStore {
+        observations: Vec::new(),
+        existing_unresolved_count: 152_705,
+        recount_attempts: 0,
+    };
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &event_header(30, 974_706_931),
+        &write_rows_event(18, 2, "beta"),
+        "test-source",
+        &mut conflicts,
+    )
+    .expect("row conflict is deferred until XID");
+    apply_stream_event_transactionally_with_conflicts(
+        &mut applier,
+        &mut context,
+        &event_header(16, 974_708_000),
+        &BinlogEvent::XidEvent(XidEvent { xid: 42 }),
+        "test-source",
+        &mut conflicts,
+    )
+    .expect("durable conflict persistence must not depend on a diagnostic full-ledger recount");
+
+    assert_eq!(conflicts.observations.len(), 1);
+    assert_eq!(
+        crate::conflict_repair::ConflictStore::unresolved_count(&conflicts),
+        152_706
+    );
+    assert_eq!(conflicts.recount_attempts, 0);
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        ["BEGIN", "EXEC", "LOCK_CHECKPOINT", "CHECKPOINT", "COMMIT"]
+    );
+}
+
 struct ConfiguredConflictTableExecutor {
     inner: TransactionRecordingExecutor,
     transaction_sql: std::cell::RefCell<Vec<String>>,
