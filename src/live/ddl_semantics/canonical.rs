@@ -484,23 +484,54 @@ fn apply_add_column(
         .iter_mut()
         .find(|table| table.name == table_name)
         .ok_or_else(|| format!("ALTER TABLE target `{table_name}` is missing"))?;
-    if table.columns.iter().any(|item| item.name == column.name) {
+    let existing_index = table
+        .columns
+        .iter()
+        .position(|item| item.name == column.name);
+    let insertion = add_column_insertion_index(table, table_name, column, existing_index)?;
+    let expected_column = expected_added_column(table, table_name, column, insertion)?;
+    if let Some(index) = existing_index {
+        if index == insertion && table.columns[index] == expected_column {
+            return Ok(());
+        }
         return Err(format!(
-            "ADD COLUMN target `{table_name}` already contains `{}`",
+            "ADD COLUMN target `{table_name}` already contains divergent `{}`",
             column.name
         ));
     }
-    let insertion = match &column.after {
+    table.columns.insert(insertion, expected_column);
+    for (index, item) in table.columns.iter_mut().enumerate() {
+        item.ordinal_position = (index + 1) as u32;
+    }
+    Ok(())
+}
+
+fn add_column_insertion_index(
+    table: &crate::inventory::TableInventory,
+    table_name: &str,
+    column: &ParsedAddColumnAst,
+    existing_index: Option<usize>,
+) -> Result<usize, String> {
+    match &column.after {
         Some(after) => table
             .columns
             .iter()
             .position(|item| item.name == *after)
             .map(|position| position + 1)
-            .ok_or_else(|| {
-                format!("ADD COLUMN AFTER target `{table_name}`.`{after}` is missing")
-            })?,
-        None => table.columns.len(),
-    };
+            .ok_or_else(|| format!("ADD COLUMN AFTER target `{table_name}`.`{after}` is missing")),
+        None => match existing_index {
+            Some(_) => Ok(table.columns.len() - 1),
+            None => Ok(table.columns.len()),
+        },
+    }
+}
+
+fn expected_added_column(
+    table: &crate::inventory::TableInventory,
+    table_name: &str,
+    column: &ParsedAddColumnAst,
+    insertion: usize,
+) -> Result<crate::inventory::ColumnInventory, String> {
     let table_collation = table
         .collation
         .as_deref()
@@ -508,26 +539,19 @@ fn apply_add_column(
     let table_character_set = table_collation.split('_').next().unwrap_or(table_collation);
     let (character_set, collation) =
         column_default_encoding(&column.data_type, table_character_set, table_collation);
-    table.columns.insert(
-        insertion,
-        crate::inventory::ColumnInventory {
-            name: column.name.clone(),
-            ordinal_position: 0,
-            column_type: column.column_type.clone(),
-            data_type: column.data_type.clone(),
-            is_nullable: column.nullable,
-            character_set,
-            collation,
-            default_value: column.default_value.clone(),
-            extra: String::new(),
-            comment: column.comment.clone(),
-            generated: None,
-        },
-    );
-    for (index, item) in table.columns.iter_mut().enumerate() {
-        item.ordinal_position = (index + 1) as u32;
-    }
-    Ok(())
+    Ok(crate::inventory::ColumnInventory {
+        name: column.name.clone(),
+        ordinal_position: (insertion + 1) as u32,
+        column_type: column.column_type.clone(),
+        data_type: column.data_type.clone(),
+        is_nullable: column.nullable,
+        character_set,
+        collation,
+        default_value: column.default_value.clone(),
+        extra: String::new(),
+        comment: column.comment.clone(),
+        generated: None,
+    })
 }
 
 fn column_default_encoding(

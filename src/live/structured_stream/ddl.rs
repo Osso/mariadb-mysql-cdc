@@ -233,6 +233,7 @@ where
         let evidence = capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event)?;
         (transformation, evidence)
     };
+    let transformation = suppress_target_sql_for_converged_state(transformation, &evidence);
     evidence.transformation_version = transformation.version.to_string();
     evidence.generated_sql = transformation.target_sql.clone();
     journal
@@ -267,6 +268,16 @@ where
     );
     finalize_automatic_ddl_checkpoint(applier.executor(), journal, context, event, ddl_event)?;
     Ok(outcome)
+}
+
+fn suppress_target_sql_for_converged_state(
+    mut transformation: DdlTransformation,
+    evidence: &DdlSemanticEvidence,
+) -> DdlTransformation {
+    if evidence.pre_state == evidence.expected_post_state {
+        transformation.target_sql = None;
+    }
+    transformation
 }
 
 fn execute_transformed_ddl(

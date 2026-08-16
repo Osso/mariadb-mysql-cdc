@@ -1727,7 +1727,7 @@ fn parse_observed_column_type(
     let data_type = require_identifier(tokens, index, "added column type")?.to_ascii_lowercase();
     if !matches!(
         data_type.as_str(),
-        "varchar" | "datetime" | "smallint" | "float"
+        "varchar" | "datetime" | "tinyint" | "smallint" | "float"
     ) {
         return Err(format!(
             "unsupported production ADD COLUMN type {data_type}"
@@ -1760,6 +1760,12 @@ fn parse_observed_column_type(
             }
             data_type.clone()
         }
+        "tinyint" => {
+            let (column_type, next_index) =
+                parse_tinyint_unsigned_type(tokens, quoted_flags, index)?;
+            index = next_index;
+            column_type
+        }
         "smallint" => {
             if tokens.get(index).map(String::as_str) == Some("(") {
                 return Err("SMALLINT display width is unsupported".to_string());
@@ -1789,6 +1795,25 @@ fn parse_observed_column_type(
     Ok((column_type, data_type, index))
 }
 
+fn parse_tinyint_unsigned_type(
+    tokens: &[String],
+    quoted_flags: &[bool],
+    mut index: usize,
+) -> Result<(String, usize), String> {
+    if tokens.get(index).map(String::as_str) == Some("(") {
+        require_unquoted_token(quoted_flags, index, "TINYINT opening parenthesis")?;
+        require_unquoted_token(quoted_flags, index + 1, "TINYINT display width")?;
+        require_unquoted_token(quoted_flags, index + 2, "TINYINT closing parenthesis")?;
+        require_keyword(tokens, index, "(")?;
+        require_keyword(tokens, index + 1, "1")?;
+        require_keyword(tokens, index + 2, ")")?;
+        index += 3;
+    }
+    require_unquoted_token(quoted_flags, index, "TINYINT UNSIGNED keyword")?;
+    require_keyword(tokens, index, "UNSIGNED")?;
+    Ok(("tinyint unsigned".to_string(), index + 1))
+}
+
 fn require_unquoted_token(
     quoted_flags: &[bool],
     index: usize,
@@ -1810,12 +1835,13 @@ fn parse_observed_column_options(
     let mut default_value = None;
     let mut comment = String::new();
     let mut after = None;
+    let supports_required_zero = matches!(data_type, "float" | "tinyint");
     while index < tokens.len() && tokens[index] != "," {
         if tokens[index].eq_ignore_ascii_case("NULL") {
             nullable = true;
             index += 1;
         } else if tokens[index].eq_ignore_ascii_case("NOT") {
-            if data_type != "float" {
+            if !supports_required_zero {
                 return Err(format!(
                     "unsupported production ADD COLUMN option {:?}",
                     tokens.get(index)
@@ -1830,7 +1856,7 @@ fn parse_observed_column_options(
                 .ok_or_else(|| "DEFAULT value is missing".to_string())?;
             if value.eq_ignore_ascii_case("NULL") {
                 default_value = None;
-            } else if data_type == "float" && value == "0" {
+            } else if supports_required_zero && value == "0" {
                 default_value = Some("0".to_string());
             } else {
                 return Err(format!("unsupported production ADD COLUMN default {value}"));

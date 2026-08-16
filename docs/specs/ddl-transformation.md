@@ -37,6 +37,7 @@ allowlist.
 - [x] Admit the source-only `CREATE PROCEDURE` form only when the complete statement matches one of two private exact hashes for the exact unqualified routine identity `apply_release_move_purchase_repair`. The exact admitted bodies are tracked as `fixtures/ddl/create-apply-release-move-purchase-repair.sql` and `fixtures/ddl/create-apply-release-move-purchase-repair-95.sql`; fixture tests exercise both bodies, and adding a comment or changing any body text remains rejected. Admission precedes generic qualified-identifier rejection because the admitted statements contain qualified tokens. Require the target routine to be absent before and after evidence capture, execute no target SQL, and record a proven no-op. The body is never executed; data effects may arrive only through subsequent source ROW/FULL events in source order. An existing `translation_pending` row promotes automatically after exact-hash admission. Every other body, name, and routine DDL remains a `translation_pending` barrier. Raw production procedure bodies, `DEFINER` hosts, and event coordinates are intentionally excluded from public documentation.
 - [x] Transform the production-observed unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form from target column pre-state into deterministic MySQL 8 SQL. Exactly one leading ordinary MySQL `-- ` line comment is removed only for parsing and reattached verbatim to executable generated SQL, including its source prefix and line ending. Any remaining or embedded comment form is rejected into the durable `translation_pending`/`blocked` DDL path. Absent rename clauses remain proven no-ops and emit no target SQL.
 - [x] Transform the observed `ADD COLUMN` forms only under the exact unquoted type grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or `FLOAT UNSIGNED`. The first three retain the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options; `FLOAT UNSIGNED` additionally admits the observed `NOT NULL DEFAULT 0` form. Expected post-state for added character columns records the table-inherited character set and collation so live inventory comparison matches MySQL metadata. Type keywords, `VARCHAR` parentheses and length, and `UNSIGNED` must be unquoted; `DATETIME` precision, `SMALLINT` display width, `FLOAT` parameters, and other numeric defaults remain unsupported.
+- [ ] Admit the production-observed `TINYINT(1) UNSIGNED NOT NULL DEFAULT 0` `ADD COLUMN` form and emit deterministic MySQL 8 `TINYINT UNSIGNED`. When the target already contains the exact column definition at the requested position, promote the same `translation_pending` journal row as a proven no-op with `generated_sql = NULL`; any definition or position mismatch remains blocked.
 - [x] Reject quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms as unsupported syntax. These variants remain `translation_pending` with no target DDL or checkpoint advance.
 - [x] Transform named composite `ADD KEY`, MariaDB-syntax `ADD INDEX`, and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; multiple admitted clauses remain ordered, source `ADD INDEX` emits as target `ADD KEY`, and broader index and clause options remain outside this slice.
 - [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
@@ -68,9 +69,10 @@ same source coordinate in-process indefinitely without consuming the ordinary
 transport retry budget. It never skips the statement or executes raw source SQL.
 When translator code later supports the exact syntax, the same row may promote
 once to `prepared`, fill immutable evidence, execute generated SQL, and
-checkpoint automatically. Target execution failures caused by preexisting target
-schema or data differences are execution/reconciliation failures, not
-translator-unavailable events.
+checkpoint automatically. An exact target pre-state that already equals the
+modeled post-state is a proven no-op; divergent preexisting target schema or
+data remains an execution/reconciliation failure, not a translator-unavailable
+event.
 The retired manual ledger is absent from runtime, configuration, bootstrap,
 grants, and harness behavior. This contract remains deployment-blocked by the
 broader DDL coverage and operational proof gaps listed below.
@@ -198,6 +200,11 @@ The current slice is covered by:
       fixtures; unsupported CREATE remains pending without target/checkpoint
       execution, and `unsupported_ddl_keeps_replicator_alive_at_unchanged_checkpoint`
       proves the durable block loop retries from the unchanged checkpoint.
+- [ ] `production_tinyint_unsigned_add_column_normalizes_display_width`,
+      `already_present_tinyint_add_column_has_equal_pre_and_post_state`, and
+      `existing_translation_pending_tinyint_add_column_is_proven_and_checkpointed`
+      assert the production DDL translation, exact converged-target proof, and
+      same-barrier checkpoint recovery.
 - [x] `scripts/cdc-integration-harness.py --scenario create-table-crash-restart` —
       real differing-default MariaDB/MySQL fixture admission, target-absence
       evidence, explicit charset/collation SQL, exact observed post-state,

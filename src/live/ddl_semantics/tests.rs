@@ -1961,6 +1961,70 @@ fn production_float_unsigned_add_column_preserves_required_options() {
 }
 
 #[test]
+fn production_tinyint_unsigned_add_column_normalizes_display_width() {
+    let source_sql = "ALTER TABLE `artists_settings`\n\
+        ADD COLUMN `disable_sam` TINYINT(1) UNSIGNED NOT NULL DEFAULT 0 AFTER `markup_before_transaction_fee`";
+    let transformation = transform_production_alter_table(source_sql)
+        .expect("production TINYINT(1) UNSIGNED ADD COLUMN");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `artists_settings` ADD COLUMN `disable_sam` TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER `markup_before_transaction_fee`"
+        )
+    );
+}
+
+#[test]
+fn already_present_tinyint_add_column_has_equal_pre_and_post_state() {
+    let mut target = semantic_snapshot(7, Some(8));
+    let table = &mut target.inventory.tables[0];
+    table.name = "artists_settings".to_string();
+    table.columns[1] = ColumnInventory {
+        name: "markup_before_transaction_fee".to_string(),
+        ordinal_position: 2,
+        column_type: "tinyint unsigned".to_string(),
+        data_type: "tinyint".to_string(),
+        is_nullable: false,
+        character_set: None,
+        collation: None,
+        default_value: Some("0".to_string()),
+        extra: String::new(),
+        comment: String::new(),
+        generated: None,
+    };
+    table.columns.push(ColumnInventory {
+        name: "disable_sam".to_string(),
+        ordinal_position: 3,
+        column_type: "tinyint unsigned".to_string(),
+        data_type: "tinyint".to_string(),
+        is_nullable: false,
+        character_set: None,
+        collation: None,
+        default_value: Some("0".to_string()),
+        extra: String::new(),
+        comment: String::new(),
+        generated: None,
+    });
+    target.inventory.indexes.clear();
+    target.table_runtime.clear();
+    let operation = parse_ddl_operation(
+        "ALTER TABLE `artists_settings` ADD COLUMN `disable_sam` TINYINT(1) UNSIGNED NOT NULL DEFAULT 0 AFTER `markup_before_transaction_fee`",
+    )
+    .expect("production ALTER");
+
+    let evidence = build_semantic_evidence(&operation, &target, &target)
+        .expect("already applied column must have deterministic evidence");
+
+    assert!(
+        evidence
+            .canonical_ast
+            .contains("\"parsed_alter_table\":{\"clauses\":[{\"column\":")
+    );
+    assert_eq!(evidence.pre_state, evidence.expected_post_state);
+}
+
+#[test]
 fn production_alter_rendering_depends_only_on_typed_ast() {
     let compact = transform_production_alter_table(
         "ALTER TABLE accounts ADD COLUMN handle VARCHAR(64) COMMENT 'user''s handle' AFTER id",
