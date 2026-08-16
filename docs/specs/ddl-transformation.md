@@ -201,10 +201,11 @@ The current slice is covered by:
       execution, and `unsupported_ddl_keeps_replicator_alive_at_unchanged_checkpoint`
       proves the durable block loop retries from the unchanged checkpoint.
 - [ ] `production_tinyint_unsigned_add_column_normalizes_display_width`,
-      `already_present_tinyint_add_column_has_equal_pre_and_post_state`, and
+      `already_present_tinyint_add_column_has_equal_pre_and_post_state`,
+      `divergent_existing_tinyint_add_column_remains_blocked`, and
       `existing_translation_pending_tinyint_add_column_is_proven_and_checkpointed`
-      assert the production DDL translation, exact converged-target proof, and
-      same-barrier checkpoint recovery.
+      assert production translation, exact converged-target proof, divergent
+      definition/position rejection, and same-barrier checkpoint recovery.
 - [x] `scripts/cdc-integration-harness.py --scenario create-table-crash-restart` —
       real differing-default MariaDB/MySQL fixture admission, target-absence
       evidence, explicit charset/collation SQL, exact observed post-state,
