@@ -18,6 +18,7 @@
 - [x] Reconcile normally committed source rows and schema evidence without a long-lived cross-table transaction or repeatable-read snapshot.
 - [x] Begin full-scope row synchronization directly from table inventories; do not run source or target `COUNT(*)` pre-scans.
 - [x] When configured with `--parallelism`, run independent full-scope tables concurrently within delete/insert/update/verify phase barriers, never crossing foreign-key dependency levels; each worker reads from the configured source endpoint.
+- [x] Keep deterministic per-phase table progress IDs within the target's 128-byte key limit while preserving every existing ID that already fits, so resumed runs reuse prior durable state.
 - [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
 - [x] Reconcile every current source-scope table, including target-only orphan rows; target-only target tables do not narrow the recovery data plan, and generic `repair-drift` remains strict about its source/target inventory contract.
 - [x] Before data reconciliation, converge only required repair prerequisites: add missing source tables, columns, primary keys, and indexes. This phase permits no `DROP`, target-only table removal, foreign-key convergence, or CHECK-constraint convergence.
@@ -66,6 +67,7 @@
 ## Tests asserting this spec
 
 - `src/lost_binlog_recovery.rs` — phase ordering, repair-prerequisite schema before data reconciliation, target-orphan repair before schema/FK convergence, replacement owner abandonment, rollback/refusal cases, exact old-state validation, duplicate/non-advancing refusal, incomplete-proof refusal, atomic rollback, and exact historical-barrier supersession.
+- `src/repair_drift/run.rs` — deterministic per-phase table progress IDs stay within the 128-byte target key while preserving compatible existing IDs.
 - `src/sync_schema.rs` — pre-repair plans add missing columns/keys without scheduling foreign-key constraints.
 - `src/lost_binlog_recovery_store.rs` — immutable prepared insert, locked CAS queries, abandoned parsing/replacement SQL, checkpoint update, committed transition, and exact barrier predicates.
 

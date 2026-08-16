@@ -13,10 +13,15 @@ use crate::drift_check::{self, DriftCheckConfig};
 use crate::inventory::{InventoryConfig, InventoryEndpointRole, SchemaInventory, build_inventory};
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::table_sync::{self, SyncMode, SyncPhase, SyncTable, SyncTableConfig};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const PROGRESS_RUN_ID_MAX_BYTES: usize = 128;
+const TRUNCATED_RUN_ID_HASH_CHARACTERS: usize = 32;
+const RUN_ID_HASH_SEPARATOR: &str = "-";
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn run_repair_drift(
@@ -1197,7 +1202,30 @@ fn child_run_id(run_id: &str, table: &str) -> String {
             }
         })
         .collect::<String>();
-    format!("{run_id}-{slug}")
+    limit_progress_run_id(format!("{run_id}-{slug}"))
+}
+
+fn limit_progress_run_id(candidate: String) -> String {
+    if candidate.len() <= PROGRESS_RUN_ID_MAX_BYTES {
+        return candidate;
+    }
+
+    let hash = format!("{:x}", Sha256::digest(candidate.as_bytes()));
+    let prefix_limit =
+        PROGRESS_RUN_ID_MAX_BYTES - TRUNCATED_RUN_ID_HASH_CHARACTERS - RUN_ID_HASH_SEPARATOR.len();
+    let prefix = utf8_prefix(&candidate, prefix_limit);
+    format!(
+        "{prefix}{RUN_ID_HASH_SEPARATOR}{}",
+        &hash[..TRUNCATED_RUN_ID_HASH_CHARACTERS]
+    )
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let end = (0..=max_bytes.min(value.len()))
+        .rev()
+        .find(|index| value.is_char_boundary(*index))
+        .unwrap_or_default();
+    &value[..end]
 }
 
 #[cfg(test)]
@@ -1361,5 +1389,35 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 16);
         assert_eq!(batches[1].len(), 4);
+    }
+
+    #[test]
+    fn child_run_id_bounds_the_failed_resync_table_without_losing_determinism() {
+        let phase_run_id = "resync-stream:globalcomix-prod-mariadb-resync-2026-08-13-delete-extras";
+        let failed_table = "paid_subscriptions_users_pages_2026_03_07_invalidation_backup";
+
+        let first = child_run_id(phase_run_id, failed_table);
+        let repeated = child_run_id(phase_run_id, failed_table);
+        let neighboring = child_run_id(
+            phase_run_id,
+            "paid_subscriptions_users_pages_2026_03_08_invalidation_backup",
+        );
+
+        assert!(
+            first.len() <= 128,
+            "run ID was {} bytes: {first}",
+            first.len()
+        );
+        assert_eq!(first, repeated);
+        assert_ne!(first, neighboring);
+    }
+
+    #[test]
+    fn child_run_id_preserves_existing_ids_that_fit_the_progress_schema() {
+        let phase_run_id = "x".repeat(125);
+        let expected = format!("{phase_run_id}-ab");
+
+        assert_eq!(expected.len(), 128);
+        assert_eq!(child_run_id(&phase_run_id, "ab"), expected);
     }
 }
