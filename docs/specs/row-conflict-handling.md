@@ -51,17 +51,16 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       must match. Only then is that insert treated as a no-op; later rows in
       the same source transaction still apply. The XID checkpoint, exact
       conflict observation/resolution evidence, and remaining row effects are
-      committed atomically. Any ordinary conflict coexisting with the candidate,
-      any second candidate, failed predicate, invalid checkpoint predecessor, or
-      commit failure fails closed: target effects and checkpoint advancement
-      roll back, then all unresolved observations are persisted through the
-      independent conflict store; rollback or evidence-persistence failures are
-      surfaced. Every other secondary-unique conflict keeps the ordinary abort
-      path.
+      committed atomically. Any second candidate, failed predicate, invalid
+      checkpoint predecessor, or commit failure fails closed: target effects and
+      checkpoint advancement roll back, then all unresolved observations are
+      persisted through the independent conflict store; rollback or
+      evidence-persistence failures are surfaced. Every other secondary-unique
+      conflict keeps the ordinary abort path.
 - [x] The superseded historical `globalcomix.comics` `ROW INSERT` exception is
-      limited to the exact `comics.slug` index. It requires one candidate and no
-      coexisting ordinary conflict, a complete historical image, a source
-      snapshot beyond the candidate transaction, and complete current
+      limited to the exact `comics.slug` index. It requires one candidate, a
+      complete historical image, a source snapshot beyond the candidate
+      transaction, and complete current
       source/target equality for the historical primary row. The current source
       and locked target unique owner must have the same primary key and slug;
       unrelated mutable owner-field drift does not reject the proof. If typed
@@ -74,6 +73,14 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       rolls back and leaves the conflict unresolved. The existing
       `globalcomix.users` / `users.name` proof retains full owner-row equality
       and is unchanged.
+- [x] When the sole deferred secondary-unique candidate verifies as ordinary
+      current-owner reconciliation debt, allow ordinary conflicts from the same
+      source transaction to remain skipped only when every observation and the
+      XID checkpoint commit atomically with no repair SQL. This covers the
+      production `mysqld-bin.002858:859898126–859901371` ordering where the
+      `users.name` conflict precedes dependent `users_profiles` FK debt. If the
+      deferred candidate requires repair, any coexisting ordinary conflict still
+      fails closed and all observations remain unresolved.
 - [x] The superseded historical `globalcomix.releases` `ROW INSERT` FK proof is
       limited to the exact approved category transaction
       `mysqld-bin.002709:515816736–515824875` (`releases_ibfk_2`) and visibility

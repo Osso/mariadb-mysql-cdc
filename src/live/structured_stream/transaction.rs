@@ -261,8 +261,17 @@ impl TargetTransaction {
         E: TransactionalTargetExecutor,
         V: SupersededInsertVerifier,
     {
-        let observations = self.finalized_superseded_observations(context.xid_end_position);
-        if let Some(error) = self.superseded_preflight_error(&observations) {
+        let ordinary_observations =
+            self.take_finalized_conflict_observations(context.xid_end_position);
+        self.finalize_deferred_superseded_inserts_at(context.xid_end_position);
+        let deferred_observations = self
+            .deferred_superseded_inserts
+            .iter()
+            .map(|candidate| candidate.observation.clone())
+            .collect::<Vec<_>>();
+        let mut observations = ordinary_observations.clone();
+        observations.extend(deferred_observations.iter().cloned());
+        if let Some(error) = self.superseded_preflight_error() {
             return fail_superseded_transaction(
                 self,
                 executor,
@@ -271,14 +280,18 @@ impl TargetTransaction {
                 observations,
             );
         }
-        let observation = observations[0].clone();
+        let observation = deferred_observations[0].clone();
         match self.verify_and_commit_deferred_superseded_inserts(
             executor,
             verifier,
             conflict_store,
+            &ordinary_observations,
             context,
         ) {
             Ok((verified, committed_resolutions)) => {
+                for ordinary_observation in ordinary_observations {
+                    conflict_store.mark_observation_committed(ordinary_observation);
+                }
                 conflict_store.mark_observation_committed(observation.clone());
                 if let Some(evidence) = &verified.resolution_evidence {
                     conflict_store
@@ -295,29 +308,7 @@ impl TargetTransaction {
         }
     }
 
-    fn finalized_superseded_observations(
-        &mut self,
-        xid_end_position: u64,
-    ) -> Vec<crate::conflict_repair::ConflictObservation> {
-        self.finalize_deferred_superseded_inserts_at(xid_end_position);
-        let mut observations = self.take_finalized_conflict_observations(xid_end_position);
-        observations.extend(
-            self.deferred_superseded_inserts
-                .iter()
-                .map(|candidate| candidate.observation.clone()),
-        );
-        observations
-    }
-
-    fn superseded_preflight_error(
-        &self,
-        observations: &[crate::conflict_repair::ConflictObservation],
-    ) -> Option<ApplyBinlogError> {
-        if observations.len() != self.deferred_superseded_inserts.len() {
-            return Some(ApplyBinlogError::Target(
-                "ordinary conflict coexists with deferred superseded insert".to_string(),
-            ));
-        }
+    fn superseded_preflight_error(&self) -> Option<ApplyBinlogError> {
         (self.deferred_superseded_inserts.len() != 1).then(|| {
             ApplyBinlogError::Target(format!(
                 "superseded recovery requires exactly one deferred superseded insert, found {}",
@@ -331,6 +322,7 @@ impl TargetTransaction {
         executor: &E,
         verifier: &mut V,
         conflict_store: &dyn crate::conflict_repair::ConflictStore,
+        ordinary_observations: &[crate::conflict_repair::ConflictObservation],
         context: SupersededXidCommitContext<'_>,
     ) -> Result<
         (
@@ -353,6 +345,13 @@ impl TargetTransaction {
         let verification = verifier
             .verify(&candidate, context.xid_end_position)
             .map_err(superseded_verification_error)?;
+        if !ordinary_observations.is_empty()
+            && matches!(&verification, DeferredVerification::Repair(_))
+        {
+            return Err(ApplyBinlogError::Target(
+                "ordinary conflict coexists with deferred superseded insert".to_string(),
+            ));
+        }
         let (evidence, statements, checkpoint_description) = match verification {
             DeferredVerification::Repair(repair) => (
                 Some(repair.resolution_evidence()),
@@ -420,6 +419,14 @@ impl TargetTransaction {
         for pending_resolution in self.pending_conflict_resolutions() {
             executor
                 .execute_transaction_sql(&conflict_store.resolution_sql(pending_resolution))
+                .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+        }
+        for observation in ordinary_observations {
+            executor
+                .execute_transaction_sql(&crate::conflict_repair::build_conflict_observation_sql(
+                    context.conflict_table,
+                    observation,
+                ))
                 .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         }
         executor

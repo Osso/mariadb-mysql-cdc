@@ -608,6 +608,76 @@ fn current_source_owner_conflict_commits_observation_and_checkpoint_without_supe
     );
 }
 
+#[test]
+fn production_859898126_current_owner_and_fk_conflicts_commit_as_debt() {
+    let executor = TransactionRecordingExecutor::with_locked_checkpoint(checkpoint_at(
+        "mysqld-bin.002858",
+        859_898_006,
+    ));
+    let mut transaction = TargetTransaction::default();
+    let mut conflicts = crate::conflict_repair::InMemoryConflictStore::default();
+    transaction.begin_if_needed(&executor).expect("begin");
+
+    let mut current_owner = users_name_superseded_candidate();
+    current_owner.observation.coordinate.file = "mysqld-bin.002858".to_string();
+    current_owner.observation.coordinate.start_position = 859_898_126;
+    current_owner.observation.source_primary_key = vec!["2138871".to_string()];
+    transaction.defer_superseded_insert(current_owner);
+
+    let mut missing_parent = ordinary_conflict_observation();
+    missing_parent.coordinate.file = "mysqld-bin.002858".to_string();
+    missing_parent.coordinate.start_position = 859_898_416;
+    missing_parent.table = "users_profiles".to_string();
+    missing_parent.source_primary_key = vec!["2138871".to_string()];
+    missing_parent.duplicate_index = None;
+    missing_parent.error_code = 1452;
+    missing_parent.error_text = "users_profiles parent is absent".to_string();
+    transaction.pending_conflicts_mut().1.push(missing_parent);
+
+    let mut verifier = CurrentSourceOwnerVerifier;
+    let proof = transaction
+        .verify_deferred_superseded_inserts_at_xid_with_conflicts(
+            &executor,
+            &mut verifier,
+            &mut conflicts,
+            SupersededXidCommitContext {
+                xid_end_position: 859_901_371,
+                checkpoint_table: "cdc.stream_checkpoint",
+                checkpoint_name: "stream-binlog:globalcomix-prod-mariadb-resync-2026-08-13",
+                conflict_table: "cdc.row_conflicts",
+                #[cfg(feature = "integration-failpoints")]
+                logical_checkpoint_predecessor: None,
+            },
+        )
+        .expect("current-owner and dependent FK conflicts commit as durable debt");
+
+    assert_eq!(proof.checkpoint.source_file, "mysqld-bin.002858");
+    assert_eq!(proof.checkpoint.source_position, 859_901_371);
+    let records = conflicts.records();
+    let mut tables = records
+        .iter()
+        .map(|record| record.key.table.as_str())
+        .collect::<Vec<_>>();
+    tables.sort_unstable();
+    assert_eq!(tables, ["users", "users_profiles"]);
+    assert!(
+        records
+            .iter()
+            .all(|record| { record.status == crate::conflict_repair::ConflictStatus::Unresolved })
+    );
+    assert_eq!(
+        executor.operations(),
+        [
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "OBSERVATION",
+            "OBSERVATION",
+            "COMMIT"
+        ]
+    );
+}
+
 fn assert_comics_owner_mismatch_rolls_back(mut verifier: ComicsPredicateVerifier) {
     let executor = TransactionRecordingExecutor::default();
     let mut transaction = TargetTransaction::default();
