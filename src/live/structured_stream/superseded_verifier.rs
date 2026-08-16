@@ -457,6 +457,11 @@ where
         Err(SupersededInsertRejection::SourcePrimaryStillOwnsHistoricalName) => {
             Ok(super::transaction::DeferredVerification::OrdinaryConflict)
         }
+        Err(SupersededInsertRejection::SourceOwnerRowNotUnique)
+            if input.source_owner_row_count == 0 =>
+        {
+            Ok(super::transaction::DeferredVerification::OrdinaryConflict)
+        }
         Err(rejection) => Err(format!(
             "superseded insert rejected: {rejection:?}; evidence_params={evidence_params}; source_sql={source_sql}; target_sql={target_sql}"
         )),
@@ -898,6 +903,56 @@ mod tests {
         let verification =
             verify_with_source_loader(&candidate(), 404_038_011, &mut source, &target)
                 .expect("current source owner is not superseded");
+
+        assert!(matches!(
+            verification,
+            super::super::transaction::DeferredVerification::OrdinaryConflict
+        ));
+    }
+
+    #[test]
+    fn production_55919597_missing_source_owner_is_ordinary_conflict_debt() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let primary = values(2_139_132, "emi-san8816");
+        let stale_target_owner = values(9_999_999, "ConqueringBarbarian");
+        let source_evidence = SupersededSourceEvidence {
+            snapshot: super::super::superseded_source::SourceSnapshotCoordinate {
+                file: "mysqld-bin.002867".to_string(),
+                position: 573_114_714,
+            },
+            columns: columns.clone(),
+            matching_rows: vec![super::super::superseded_source::CanonicalSourceRow {
+                columns: columns.clone(),
+                hash: super::super::superseded_source::hash_canonical_row(&columns, &primary)
+                    .expect("primary hash"),
+                values: primary.clone(),
+            }],
+        };
+        let target_rows = [primary, stale_target_owner]
+            .into_iter()
+            .map(|values| LockedUsersRowEvidence {
+                row_hash: crate::target::hash_ordered_mysql_row(&values),
+                values,
+            })
+            .collect();
+        let target = FakeTarget {
+            evidence: RefCell::new(Some(Ok(UsersActiveTransactionEvidence {
+                columns,
+                rows: target_rows,
+            }))),
+        };
+        let mut production_candidate = candidate();
+        production_candidate.observation.coordinate.file = "mysqld-bin.002859".to_string();
+        production_candidate.observation.coordinate.start_position = 55_919_597;
+        production_candidate.observation.source_primary_key = vec!["2139132".to_string()];
+        production_candidate.historical_change.primary_key_values = vec![Value::UInt(2_139_132)];
+        production_candidate.historical_change.source_values =
+            values(2_139_132, "ConqueringBarbarian");
+        let mut source = |_: u64, _: &str| Ok(source_evidence.clone());
+
+        let verification =
+            verify_with_source_loader(&production_candidate, 55_920_000, &mut source, &target)
+                .expect("an unowned historical identity is ordinary reconciliation debt");
 
         assert!(matches!(
             verification,

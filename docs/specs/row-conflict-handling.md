@@ -46,7 +46,10 @@ conflicting secondary key. Implementation detail for superseded release proofs:
       for the historical primary key and exactly one
       complete source row owning the historical name, with the historical
       primary key no longer owning that name and the owner having a different
-      primary key. The active target transaction re-reads both identities with
+      primary key. If the primary moved away and no current source row owns the
+      historical name, classify the candidate as ordinary unresolved debt and
+      perform no superseded repair; multiple matching source owners remain
+      fail-closed. The active target transaction re-reads both identities with
       `SELECT ... FOR UPDATE`; complete canonical source and target row hashes
       must match. Only then is that insert treated as a no-op; later rows in
       the same source transaction still apply. The XID checkpoint, exact
