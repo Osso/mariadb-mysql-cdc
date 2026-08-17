@@ -83,6 +83,14 @@ pub(crate) fn run_sync_orchestration(
 pub(crate) fn run_mysql_sync(config: SyncConfig) -> Result<Vec<SyncChunkProgress>, String> {
     validate_sync_config(&config)?;
     let evidence = read_sync_source_evidence(&config.source)?;
+    run_mysql_sync_with_evidence(config, evidence)
+}
+
+pub(crate) fn run_mysql_sync_with_evidence(
+    config: SyncConfig,
+    evidence: SchemaSourceEvidence,
+) -> Result<Vec<SyncChunkProgress>, String> {
+    validate_sync_config(&config)?;
     let tables = sync_tables_from_source_inventory(&evidence.inventory, &config.tables)?;
     let identity = build_sync_run_identity(&config, tables.clone())?;
     let mut progress = MySqlSyncProgressStore::new(&config.target, config.progress_table.clone())?;

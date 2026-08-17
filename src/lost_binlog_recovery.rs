@@ -11,7 +11,6 @@ use crate::repair_drift::{RepairDriftConfig, RepairDriftReport, run_consistent_s
 use crate::sync_schema::{
     SchemaSourceEvidence, read_snapshot_check_constraints,
     run_schema_convergence_from_source_evidence,
-    run_schema_repair_prerequisite_convergence_from_source_evidence,
 };
 use crate::table_sync::SyncMode;
 use serde::{Deserialize, Serialize};
@@ -473,10 +472,8 @@ pub struct ResyncStreamReport {
 
 pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamReport, String> {
     println!("resync_stream_parallelism={}", config.parallelism);
-    let source = Rc::new(
-        PersistentMySqlSource::new_without_operation_timeout(&config.source)
-            .map_err(|error| format!("connect resync source: {error}"))?,
-    );
+    let source = PersistentMySqlSource::new_without_operation_timeout(&config.source)
+        .map_err(|error| format!("connect resync source: {error}"))?;
     let start_checkpoint = source
         .read_binlog_coordinate()
         .map_err(|error| format!("read resync source coordinate: {error}"))?;
@@ -486,75 +483,45 @@ pub fn run_resync_stream(config: &ResyncStreamConfig) -> Result<ResyncStreamRepo
         &config.source_identity,
     );
     checkpoint_store.bootstrap(&start_checkpoint)?;
-    let source_evidence = read_source_evidence(source.as_ref(), &config.source.database)?;
+    let source_evidence = read_source_evidence(&source, &config.source.database)?;
     validate_transactional_scope(&source_evidence.inventory)?;
-    prepare_resync_target_schema(&source_evidence, &config.target)?;
-    let repair = repair_resync_data(config, Rc::clone(&source), &source_evidence.inventory)?;
-    converge_resync_target_schema(&source_evidence, &config.target)?;
-    let final_target_inventory = read_target_inventory(&config.target)?;
-    require_exact_table_inventory(&source_evidence.inventory, &final_target_inventory)?;
+    let sync_config = resync_sync_config(config, &source_evidence.inventory);
+    let rows = crate::sync::run_mysql_sync_with_evidence(sync_config, source_evidence)?;
+    let (repaired_tables, compared_tables) = resync_table_counts(&rows);
     Ok(ResyncStreamReport {
         source_identity: config.source_identity.clone(),
         start_checkpoint,
-        repaired_tables: repair.repaired.len(),
-        compared_tables: repair.compared_tables,
+        repaired_tables,
+        compared_tables,
     })
 }
 
-fn prepare_resync_target_schema(
-    evidence: &SchemaSourceEvidence,
-    target: &TargetMySqlConfig,
-) -> Result<(), String> {
-    let report = run_schema_repair_prerequisite_convergence_from_source_evidence(
-        evidence.clone(),
-        target.clone(),
-    )?;
-    require_converged_schema(&report)
-}
-
-fn repair_resync_data(
+pub(crate) fn resync_sync_config(
     config: &ResyncStreamConfig,
-    source: Rc<PersistentMySqlSource>,
-    source_inventory: &crate::inventory::SchemaInventory,
-) -> Result<RepairDriftReport, String> {
-    let target_inventory = read_target_inventory(&config.target)?;
-    run_consistent_snapshot_repair(
-        &resync_repair_config(config),
-        source,
-        source_inventory.clone(),
-        target_inventory,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn converge_resync_target_schema(
-    evidence: &SchemaSourceEvidence,
-    target: &TargetMySqlConfig,
-) -> Result<(), String> {
-    let report = run_schema_convergence_from_source_evidence(evidence.clone(), target.clone())?;
-    require_converged_schema(&report)
-}
-
-fn resync_repair_config(config: &ResyncStreamConfig) -> RepairDriftConfig {
-    RepairDriftConfig {
+    source_inventory: &SchemaInventory,
+) -> crate::sync::SyncConfig {
+    crate::sync::SyncConfig {
         source: config.source.clone(),
-        source_identity: config.source_identity.clone(),
         target: config.target.clone(),
-        tables: Vec::new(),
-        parent_first: Vec::new(),
-        start_after: None,
-        end_at: None,
-        content_check: true,
-        mode: SyncMode::Apply,
+        tables: source_inventory
+            .tables
+            .iter()
+            .map(|table| table.name.clone())
+            .collect(),
         chunk_size: config.chunk_size,
         parallelism: config.parallelism,
-        conflict_reconcile_limit: 0,
         progress_table: config.progress_table.clone(),
         run_id: Some(format!("resync-stream:{}", config.source_identity)),
-        run_id_prefix: "resync-stream".to_string(),
-        #[cfg(feature = "integration-failpoints")]
-        integration_failpoint: None,
+        run_id_prefix: None,
     }
+}
+
+pub(crate) fn resync_table_counts(rows: &[crate::sync::SyncChunkProgress]) -> (usize, usize) {
+    let repaired = rows
+        .iter()
+        .filter(|row| row.inserts > 0 || row.updates > 0 || row.deletes > 0)
+        .count();
+    (repaired, rows.len())
 }
 
 pub fn run_recover_lost_binlog(

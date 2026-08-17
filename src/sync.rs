@@ -24,7 +24,8 @@ pub(crate) use mysql::{
     sync_chunk_progress_from_row, sync_progress_row_from_chunk, validate_sync_target_lock_identity,
 };
 pub(crate) use orchestrate::{
-    SyncRunExecutor, run_mysql_sync, run_sync_orchestration, sync_tables_from_source_inventory,
+    SyncRunExecutor, run_mysql_sync, run_mysql_sync_with_evidence, run_sync_orchestration,
+    sync_tables_from_source_inventory,
 };
 pub(crate) use progress::{
     build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,

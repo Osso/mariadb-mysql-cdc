@@ -49,6 +49,13 @@ mod sync_catalog_unified {
     ));
 }
 
+mod resync_unified {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/resync_unified.rs"
+    ));
+}
+
 mod sync_runner {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
