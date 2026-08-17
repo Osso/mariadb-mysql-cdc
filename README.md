@@ -34,7 +34,9 @@ BASE_IMAGE=registry.example/mariadb:tag \
 ```
 
 `OPS_REPO` is optional and defaults to the sibling `../ops` checkout. The script
-passes `BASE_IMAGE` to Docker as a build argument for the runtime image.
+passes `BASE_IMAGE` to Docker as a build argument for the runtime image, then
+updates and commits only the live stream manifest. Unified sync Jobs are reviewed
+and managed separately; `deploy.sh` does not create or update them.
 
 ## Current status
 
