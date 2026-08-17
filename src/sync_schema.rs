@@ -1,10 +1,10 @@
+use crate::canonical_foreign_key::CanonicalForeignKey;
 use crate::inventory::{
     ColumnInventory, ForeignKeyInventory, IndexColumnInventory, IndexInventory, InventoryConfig,
     InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory, TableInventory,
     build_canonical_foreign_key_inventory, build_inventory,
 };
 use crate::live::ddl_semantics::{DDL_TRANSFORMATION_VERSION, translate_modeled_ddl};
-use crate::repair_drift::CanonicalForeignKey;
 use crate::target::{SqlStatement, TargetExecutor};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Params, Value};

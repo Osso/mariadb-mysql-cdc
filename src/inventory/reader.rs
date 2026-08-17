@@ -20,8 +20,8 @@ use super::retry::{
     log_inventory_connection_reset,
 };
 use super::values::row_to_inventory_fields;
+use crate::canonical_foreign_key::CanonicalForeignKeyRow;
 use crate::mysql_client::PersistentMySqlSource;
-use crate::repair_drift::CanonicalForeignKeyRow;
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Row};
 use std::cell::RefCell;

@@ -2,7 +2,7 @@ use super::model::{
     ColumnRow, EventRow, ForeignKeyRow, IndexRow, InventoryError, PrimaryKeyRow, RoutineRow,
     SchemaDefaults, SourceMasterCoordinate, TableRow, TableRuntimeMetadata, TriggerRow, ViewRow,
 };
-use crate::repair_drift::CanonicalForeignKeyRow;
+use crate::canonical_foreign_key::CanonicalForeignKeyRow;
 
 pub(crate) fn parse_schema_defaults(fields: &[String]) -> Result<SchemaDefaults, InventoryError> {
     require_len(fields, 2, "schema defaults")?;

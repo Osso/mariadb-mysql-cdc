@@ -1,3 +1,4 @@
+pub mod canonical_foreign_key;
 pub mod catchup;
 pub mod checkpoint;
 pub mod checksum;

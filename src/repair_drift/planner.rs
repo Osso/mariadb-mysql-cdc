@@ -1,4 +1,5 @@
 use super::model::*;
+use crate::canonical_foreign_key::CanonicalForeignKey;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
