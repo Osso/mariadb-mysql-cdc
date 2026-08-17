@@ -28,6 +28,13 @@ mod sync_mysql_adapter {
     ));
 }
 
+mod sync_config {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_config.rs"
+    ));
+}
+
 #[test]
 fn usage_documents_parallel_target_transaction_option() {
     assert!(USAGE.contains("--target-parallel-transactions COUNT"));

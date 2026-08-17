@@ -1,6 +1,7 @@
 use crate::snapshot::SnapshotRow;
+use serde::Serialize;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct SyncTable {
     pub(crate) name: String,
     pub(crate) primary_key: Vec<String>,
@@ -8,7 +9,8 @@ pub(crate) struct SyncTable {
     pub(crate) columns: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "labels")]
 pub(crate) enum SyncPrimaryKeyOrdering {
     Native,
     Enum(Vec<String>),

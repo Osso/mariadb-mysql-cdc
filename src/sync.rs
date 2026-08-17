@@ -1,10 +1,15 @@
 mod chunk;
+mod config;
 mod model;
 mod mysql;
 mod progress;
 mod sql;
 
 pub(crate) use chunk::sync_next_chunk;
+pub(crate) use config::{
+    SyncConfig, SyncEndpointSpec, SyncRunIdentity, SyncRunSpec, build_sync_run_identity,
+    sync_table_from_inventory, validate_sync_config,
+};
 pub(crate) use model::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
     SyncChunkSource, SyncChunkTargetSession, SyncPrimaryKeyOrdering, SyncProgressRow,
