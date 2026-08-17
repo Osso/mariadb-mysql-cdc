@@ -1,7 +1,7 @@
 use super::model::{SyncPrimaryKeyOrdering, SyncTable};
 use crate::inventory::TableInventory;
 use crate::live::TargetMySqlConfig;
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;

@@ -13,7 +13,7 @@ use super::sql::{
 };
 use crate::live::TargetMySqlConfig;
 use crate::mysql_client::{PersistentMySqlSource, sync_target_opts, value_to_string};
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::snapshot::SnapshotRow;
 use crate::target::SqlStatement;
 use mysql::prelude::Queryable;

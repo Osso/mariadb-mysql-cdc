@@ -1,6 +1,6 @@
+use crate::live;
 use crate::mysql_support::qualified_table_parts;
 use crate::stream_checkpoint::default_stream_checkpoint_table;
-use crate::{live, mysql_snapshot};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
 use serde::Deserialize;
@@ -36,7 +36,7 @@ pub fn run_sync_progress_command(args: Vec<String>, usage: &str) {
 #[derive(Clone, Debug)]
 struct SyncProgressConfig {
     target: live::TargetMySqlConfig,
-    source: mysql_snapshot::MySqlConnectionConfig,
+    source: crate::mysql_config::MySqlConnectionConfig,
     progress_table: String,
     checkpoint_table: String,
     source_identity: Option<String>,
@@ -102,7 +102,7 @@ struct FileSyncProgressConfig {
 fn default_sync_progress_config() -> SyncProgressConfig {
     SyncProgressConfig {
         target: live::TargetMySqlConfig::default(),
-        source: mysql_snapshot::MySqlConnectionConfig::default(),
+        source: crate::mysql_config::MySqlConnectionConfig::default(),
         progress_table: "cdc.table_sync_progress".to_string(),
         checkpoint_table: default_stream_checkpoint_table(),
         source_identity: None,
@@ -229,7 +229,7 @@ fn target_option(
 }
 
 fn source_option(
-    source: &mut mysql_snapshot::MySqlConnectionConfig,
+    source: &mut crate::mysql_config::MySqlConnectionConfig,
     flag: &str,
     value: &str,
 ) -> Result<bool, String> {
@@ -682,7 +682,7 @@ fn target_opts(target: &live::TargetMySqlConfig) -> Result<Opts, String> {
     )
 }
 
-fn source_opts(source: &mysql_snapshot::MySqlConnectionConfig) -> Result<Opts, String> {
+fn source_opts(source: &crate::mysql_config::MySqlConnectionConfig) -> Result<Opts, String> {
     let builder = OptsBuilder::default()
         .ip_or_hostname(Some(&source.host))
         .tcp_port(source.port)

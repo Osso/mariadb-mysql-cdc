@@ -5,7 +5,7 @@ use std::fmt;
 
 #[derive(Clone, Debug)]
 pub struct SyncTableConfig {
-    pub source: crate::mysql_snapshot::MySqlConnectionConfig,
+    pub source: crate::mysql_config::MySqlConnectionConfig,
     pub target: crate::live::TargetMySqlConfig,
     pub table: SyncTable,
     pub chunk_size: usize,
@@ -207,8 +207,8 @@ pub(crate) fn sync_insert_mode(config: &SyncTableConfig) -> crate::target::Snaps
 
 pub(crate) fn target_connection_config(
     config: &SyncTableConfig,
-) -> crate::mysql_snapshot::MySqlConnectionConfig {
-    crate::mysql_snapshot::MySqlConnectionConfig {
+) -> crate::mysql_config::MySqlConnectionConfig {
+    crate::mysql_config::MySqlConnectionConfig {
         host: config.target.host.clone(),
         port: config.target.port,
         user: config.target.user.clone(),

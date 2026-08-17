@@ -207,7 +207,7 @@ fn successful_sync_is_not_failed_by_lock_release_connection_loss() {
 #[test]
 fn target_connection_config_preserves_target_endpoint() {
     let config = SyncTableConfig {
-        source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
+        source: crate::mysql_config::MySqlConnectionConfig::default(),
         target: crate::live::TargetMySqlConfig {
             host: "target".to_string(),
             port: 25060,
@@ -238,7 +238,7 @@ fn target_connection_config_preserves_target_endpoint() {
 #[test]
 fn apply_uses_strict_inserts_so_constraint_failures_are_observable() {
     let config = SyncTableConfig {
-        source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
+        source: crate::mysql_config::MySqlConnectionConfig::default(),
         target: crate::live::TargetMySqlConfig {
             host: "target".to_string(),
             port: 25060,
@@ -1243,7 +1243,7 @@ fn recent_update_retry_restarts_from_beginning_to_catch_newly_eligible_rows() {
 #[test]
 fn core_config_accepts_plaintext_source_without_tls_ca() {
     let config = SyncTableConfig {
-        source: crate::mysql_snapshot::MySqlConnectionConfig::default(),
+        source: crate::mysql_config::MySqlConnectionConfig::default(),
         target: crate::live::TargetMySqlConfig::default(),
         table: account_table_with_updated_at(),
         chunk_size: 10,
@@ -1261,7 +1261,7 @@ fn core_config_accepts_plaintext_source_without_tls_ca() {
 
 #[test]
 fn core_config_rejects_updated_since_with_primary_key_bounds() {
-    let source = crate::mysql_snapshot::MySqlConnectionConfig::default();
+    let source = crate::mysql_config::MySqlConnectionConfig::default();
     let config = SyncTableConfig {
         source,
         target: crate::live::TargetMySqlConfig::default(),

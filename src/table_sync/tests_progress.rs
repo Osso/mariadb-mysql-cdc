@@ -715,7 +715,7 @@ fn target_extras_delete_chunk_by_chunk_and_persist_progress() {
 #[test]
 fn run_scope_changes_with_endpoints_and_write_policy() {
     let mut first = SyncTableConfig {
-        source: crate::mysql_snapshot::MySqlConnectionConfig {
+        source: crate::mysql_config::MySqlConnectionConfig {
             host: "source-a".to_string(),
             port: 3306,
             user: "reader".to_string(),

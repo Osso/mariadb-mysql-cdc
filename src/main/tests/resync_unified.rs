@@ -3,7 +3,7 @@ use crate::live::TargetMySqlConfig;
 use crate::lost_binlog_recovery::{
     ResyncStreamConfig, resync_sync_config, resync_table_counts,
 };
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::sync::SyncChunkProgress;
 
 #[test]

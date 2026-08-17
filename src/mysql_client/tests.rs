@@ -225,7 +225,7 @@ fn target_reader_opts_reject_missing_or_invalid_ca() {
 
 #[test]
 fn persistent_target_reader_connection_uses_configured_ca() {
-    let config = crate::mysql_snapshot::MySqlConnectionConfig {
+    let config = crate::mysql_config::MySqlConnectionConfig {
         host: "target-db.example".to_string(),
         port: 1,
         user: "reader".to_string(),

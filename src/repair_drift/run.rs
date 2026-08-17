@@ -12,7 +12,7 @@ use super::{
 use crate::conflict_ledger::MySqlConflictLedger;
 use crate::drift_check::{self, DriftCheckConfig};
 use crate::inventory::{InventoryConfig, InventoryEndpointRole, SchemaInventory, build_inventory};
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::table_sync::{self, SyncMode, SyncPhase, SyncTable, SyncTableConfig};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;

@@ -1428,7 +1428,7 @@ fn overall_schema_status(reports: &[TableSchemaReport]) -> OverallSchemaStatus {
 
 #[derive(Clone, Debug)]
 struct SyncSchemaConfig {
-    source: crate::mysql_snapshot::MySqlConnectionConfig,
+    source: crate::mysql_config::MySqlConnectionConfig,
     target: crate::live::TargetMySqlConfig,
     tables: Vec<String>,
     catalog: Option<PathBuf>,
@@ -1445,7 +1445,7 @@ pub(crate) fn run_sync_schema_command(args: Vec<String>, _usage: &str) {
 }
 
 pub(crate) fn read_sync_source_evidence(
-    source: &crate::mysql_snapshot::MySqlConnectionConfig,
+    source: &crate::mysql_config::MySqlConnectionConfig,
 ) -> Result<SchemaSourceEvidence, String> {
     let config = inventory_config_source(source);
     let reader = MariaDbInventoryReader::new(config.clone());
@@ -2089,7 +2089,7 @@ fn parse_sync_schema_config(args: Vec<String>) -> Result<SyncSchemaConfig, Strin
     let source_password_env = required(&values, "--source-password-env")?;
     let target_password_env = required(&values, "--target-password-env")?;
     Ok(SyncSchemaConfig {
-        source: crate::mysql_snapshot::MySqlConnectionConfig {
+        source: crate::mysql_config::MySqlConnectionConfig {
             host: required(&values, "--source-host")?,
             port: optional_u16(&values, "--source-port", 3306)?,
             user: required(&values, "--source-user")?,
@@ -2491,9 +2491,7 @@ fn render_canonical_foreign_key(key: &CanonicalForeignKey, schema: &str) -> Stri
     )
 }
 
-fn inventory_config_source(
-    config: &crate::mysql_snapshot::MySqlConnectionConfig,
-) -> InventoryConfig {
+fn inventory_config_source(config: &crate::mysql_config::MySqlConnectionConfig) -> InventoryConfig {
     InventoryConfig {
         host: config.host.clone(),
         port: config.port,

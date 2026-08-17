@@ -284,7 +284,7 @@ fn sync_table_conversion_rejects_invalid_primary_keys_and_duplicate_columns() {
 
 fn exact_run_config() -> SyncConfig {
     SyncConfig {
-        source: crate::mysql_snapshot::MySqlConnectionConfig {
+        source: crate::mysql_config::MySqlConnectionConfig {
             host: "source-host".to_string(),
             port: 3307,
             user: "source-user".to_string(),

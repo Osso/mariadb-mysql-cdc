@@ -1,6 +1,6 @@
 use crate::inventory::{ColumnInventory, ForeignKeyInventory, SchemaInventory, TableInventory};
 use crate::live::TargetMySqlConfig;
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::sync::{
     SyncChunkProgress, SyncConfig, SyncProgressRow, SyncProgressStatus, SyncRunExecutor,
     SyncRunIdentity, SyncRunProgressStore, SyncStage, SyncTable, build_sync_run_identity,

@@ -2,7 +2,7 @@ use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
     TableInventory, build_inventory,
 };
-use crate::{live, mysql_snapshot, sync, table_sync};
+use crate::{live, sync, table_sync};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ const RESERVATION_SESSION_WAIT_TIMEOUT_SECONDS: u64 = 86_400;
 
 #[derive(Clone, Debug)]
 pub struct CatalogConnectionConfig {
-    pub source: mysql_snapshot::MySqlConnectionConfig,
+    pub source: crate::mysql_config::MySqlConnectionConfig,
     pub target: live::TargetMySqlConfig,
 }
 
@@ -1111,7 +1111,7 @@ fn truncate_and_write_catalog(file: &mut File, path: &Path, bytes: &[u8]) -> Res
 }
 
 fn read_inventory_source(
-    source: &mysql_snapshot::MySqlConnectionConfig,
+    source: &crate::mysql_config::MySqlConnectionConfig,
 ) -> Result<SchemaInventory, String> {
     let reader = MariaDbInventoryReader::new(InventoryConfig {
         host: source.host.clone(),
@@ -1139,7 +1139,7 @@ fn read_inventory_target(target: &live::TargetMySqlConfig) -> Result<SchemaInven
 }
 
 fn read_estimated_rows(
-    source: &mysql_snapshot::MySqlConnectionConfig,
+    source: &crate::mysql_config::MySqlConnectionConfig,
 ) -> Result<BTreeMap<String, u64>, String> {
     let mut connection = source_connection(source)?;
     let sql = "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME";
@@ -1149,7 +1149,7 @@ fn read_estimated_rows(
         .map_err(|error| format!("failed to read estimated source row counts: {error}"))
 }
 
-fn source_connection(config: &mysql_snapshot::MySqlConnectionConfig) -> Result<Conn, String> {
+fn source_connection(config: &crate::mysql_config::MySqlConnectionConfig) -> Result<Conn, String> {
     let opts = Opts::from(
         OptsBuilder::default()
             .ip_or_hostname(Some(&config.host))
@@ -1270,7 +1270,7 @@ fn parse_common_options(
     }
     let source_password_env = required_value(&values, "--source-password-env")?;
     let target_password_env = required_value(&values, "--target-password-env")?;
-    let source = mysql_snapshot::MySqlConnectionConfig {
+    let source = crate::mysql_config::MySqlConnectionConfig {
         host: required_value(&values, "--source-host")?,
         port: parse_port(&values, "--source-port", 3306)?,
         user: required_value(&values, "--source-user")?,
@@ -2057,7 +2057,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         let config = TableCatalogConfig {
             connections: CatalogConnectionConfig {
-                source: mysql_snapshot::MySqlConnectionConfig {
+                source: crate::mysql_config::MySqlConnectionConfig {
                     host: "unreachable-source".to_string(),
                     port: 3306,
                     user: "reader".to_string(),

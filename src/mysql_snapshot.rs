@@ -3,6 +3,7 @@ use crate::inventory::{
 };
 use crate::live::TargetMySqlConfig;
 use crate::mysql_client::{PersistentMySqlSource, PersistentProgressWriter};
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::snapshot::{
     ChunkRequest, FileSnapshotProgressStore, SnapshotError, SnapshotProgress,
     SnapshotProgressStore, SnapshotTable, snapshot_table_with_observer,
@@ -28,27 +29,6 @@ use target_schema::snapshot_target_for_table;
 use target_schema::validate_target_table_columns;
 
 const MYSQL_PROGRESS_SAVE_INTERVAL: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Debug)]
-pub struct MySqlConnectionConfig {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub password: String,
-    pub database: String,
-}
-
-impl Default for MySqlConnectionConfig {
-    fn default() -> Self {
-        Self {
-            host: String::new(),
-            port: 3306,
-            user: String::new(),
-            password: String::new(),
-            database: String::new(),
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct CatchupSnapshotConfig {

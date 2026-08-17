@@ -2,7 +2,7 @@ use crate::checkpoint::{Checkpoint, LastEvent};
 use crate::live::{
     ApplyBinlogConfig, InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
 };
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::mysql_support::{
     apply_default_mysql_network_bounds, apply_mysql_connection_liveness, target_mysql_opts,
 };

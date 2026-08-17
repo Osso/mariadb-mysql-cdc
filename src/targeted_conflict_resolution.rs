@@ -1,6 +1,6 @@
 use crate::conflict_ledger::MySqlConflictLedger;
 use crate::live::TargetMySqlConfig;
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::snapshot::SnapshotRow;
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Row, Value};

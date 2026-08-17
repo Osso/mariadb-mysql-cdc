@@ -1,5 +1,5 @@
+use crate::live;
 use crate::sync::{DEFAULT_SYNC_PROGRESS_TABLE, SyncConfig, run_mysql_sync, validate_sync_config};
-use crate::{live, mysql_snapshot};
 
 pub(crate) fn run_sync_command(args: Vec<String>, usage: &str) {
     let config = match parse_sync_config(args) {
@@ -36,7 +36,7 @@ pub(crate) fn parse_sync_config(args: Vec<String>) -> Result<SyncConfig, String>
 
 fn default_sync_config() -> SyncConfig {
     SyncConfig {
-        source: mysql_snapshot::MySqlConnectionConfig::default(),
+        source: crate::mysql_config::MySqlConnectionConfig::default(),
         target: live::TargetMySqlConfig::default(),
         tables: Vec::new(),
         chunk_size: 1000,
@@ -67,7 +67,7 @@ fn apply_sync_option(config: &mut SyncConfig, flag: &str, value: &str) -> Result
 }
 
 fn apply_source_option(
-    source: &mut mysql_snapshot::MySqlConnectionConfig,
+    source: &mut crate::mysql_config::MySqlConnectionConfig,
     flag: &str,
     value: &str,
 ) -> Result<bool, String> {

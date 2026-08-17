@@ -9,6 +9,7 @@ pub mod live;
 mod lost_binlog_recovery;
 mod lost_binlog_recovery_store;
 pub mod mysql_client;
+pub mod mysql_config;
 pub mod mysql_snapshot;
 pub mod mysql_support;
 mod probe;
@@ -229,7 +230,7 @@ fn resync_config_from_apply(
     parallelism: usize,
 ) -> lost_binlog_recovery::ResyncStreamConfig {
     lost_binlog_recovery::ResyncStreamConfig {
-        source: mysql_snapshot::MySqlConnectionConfig {
+        source: crate::mysql_config::MySqlConnectionConfig {
             host: apply.source.host,
             port: apply.source.port,
             user: apply.source.user,
@@ -285,7 +286,7 @@ fn recovery_config_from_apply(
     source_database: String,
 ) -> lost_binlog_recovery::RecoverLostBinlogConfig {
     lost_binlog_recovery::RecoverLostBinlogConfig {
-        source: mysql_snapshot::MySqlConnectionConfig {
+        source: crate::mysql_config::MySqlConnectionConfig {
             host: apply.source.host,
             port: apply.source.port,
             user: apply.source.user,
@@ -480,7 +481,7 @@ fn parse_catchup_snapshot_config(
     args: Vec<String>,
 ) -> Result<mysql_snapshot::CatchupSnapshotConfig, String> {
     let mut config = mysql_snapshot::CatchupSnapshotConfig {
-        source: mysql_snapshot::MySqlConnectionConfig::default(),
+        source: crate::mysql_config::MySqlConnectionConfig::default(),
         target: live::TargetMySqlConfig::default(),
         progress_file: PathBuf::new(),
         progress_table: "cdc.table_sync_progress".to_string(),
@@ -541,7 +542,7 @@ fn catchup_snapshot_option(
 }
 
 fn catchup_source_option(
-    source: &mut mysql_snapshot::MySqlConnectionConfig,
+    source: &mut crate::mysql_config::MySqlConnectionConfig,
     flag: &str,
     value: &str,
 ) -> Result<bool, String> {
@@ -605,7 +606,7 @@ fn parse_probe_config(args: Vec<String>) -> Result<probe::ProbeConfig, String> {
 
 fn parse_drift_check_config(args: Vec<String>) -> Result<drift_check::DriftCheckConfig, String> {
     let mut config = drift_check::DriftCheckConfig {
-        source: mysql_snapshot::MySqlConnectionConfig::default(),
+        source: crate::mysql_config::MySqlConnectionConfig::default(),
         target: live::TargetMySqlConfig::default(),
         tables: Vec::new(),
         content_check: true,

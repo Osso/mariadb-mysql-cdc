@@ -5,7 +5,7 @@ use crate::lost_binlog_recovery::{
     LostBinlogBarrier, LostBinlogRecoveryRequest, RecoverLostBinlogConfig,
     recovery_reconciliation_proof, recovery_sync_config,
 };
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::sync::SyncChunkProgress;
 use std::path::PathBuf;
 

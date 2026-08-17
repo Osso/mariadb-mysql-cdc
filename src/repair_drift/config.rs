@@ -1,6 +1,6 @@
 use super::RepairDriftConfig;
 use crate::live::TargetMySqlConfig;
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::table_sync::SyncMode;
 
 pub(crate) fn parse_repair_drift_config(args: Vec<String>) -> Result<RepairDriftConfig, String> {

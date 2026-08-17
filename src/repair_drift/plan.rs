@@ -8,7 +8,7 @@ use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, SchemaInventory, TableInventory,
     build_canonical_foreign_key_inventory,
 };
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::table_sync::{SyncTable, primary_key_ordering_from_inventory};
 use std::collections::{BTreeMap, BTreeSet};
 

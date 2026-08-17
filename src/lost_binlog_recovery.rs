@@ -6,7 +6,7 @@ use crate::inventory::{
 use crate::live::TargetMySqlConfig;
 use crate::lost_binlog_recovery_store::MySqlLostBinlogRecoveryStore;
 use crate::mysql_client::PersistentMySqlSource;
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::sync_schema::{SchemaSourceEvidence, read_snapshot_check_constraints};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -552,7 +552,7 @@ fn rejects_unknown_apply_binlog_option() {
 fn rejects_unknown_catchup_snapshot_option() {
     let error = catchup_snapshot_option(
         &mut mysql_snapshot::CatchupSnapshotConfig {
-            source: mysql_snapshot::MySqlConnectionConfig::default(),
+            source: crate::mysql_config::MySqlConnectionConfig::default(),
             target: live::TargetMySqlConfig::default(),
             progress_file: PathBuf::new(),
             progress_table: "cdc.table_sync_progress".to_string(),
@@ -572,7 +572,7 @@ fn rejects_unknown_catchup_snapshot_option() {
 #[test]
 fn rejects_catchup_source_tls_ca_file_option() {
     let mut config = mysql_snapshot::CatchupSnapshotConfig {
-        source: mysql_snapshot::MySqlConnectionConfig::default(),
+        source: crate::mysql_config::MySqlConnectionConfig::default(),
         target: live::TargetMySqlConfig::default(),
         progress_file: PathBuf::new(),
         progress_table: "cdc.table_sync_progress".to_string(),

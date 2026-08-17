@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub(crate) struct MySqlSyncReader {
-    config: crate::mysql_snapshot::MySqlConnectionConfig,
+    config: crate::mysql_config::MySqlConnectionConfig,
     tls_ca_file: Option<String>,
     source: RefCell<Option<PersistentMySqlSource>>,
     shared_source: Option<Rc<PersistentMySqlSource>>,
@@ -18,12 +18,12 @@ pub(crate) struct MySqlSyncReader {
 }
 
 impl MySqlSyncReader {
-    pub fn new(config: crate::mysql_snapshot::MySqlConnectionConfig) -> Self {
+    pub fn new(config: crate::mysql_config::MySqlConnectionConfig) -> Self {
         Self::new_with_tls_ca(config, None)
     }
 
     pub(crate) fn new_with_tls_ca(
-        config: crate::mysql_snapshot::MySqlConnectionConfig,
+        config: crate::mysql_config::MySqlConnectionConfig,
         tls_ca_file: Option<String>,
     ) -> Self {
         Self {
@@ -37,7 +37,7 @@ impl MySqlSyncReader {
     }
 
     pub(crate) fn new_with_target(
-        config: crate::mysql_snapshot::MySqlConnectionConfig,
+        config: crate::mysql_config::MySqlConnectionConfig,
         target: &TargetMySqlConfig,
     ) -> Result<Self, String> {
         Ok(Self {
@@ -52,7 +52,7 @@ impl MySqlSyncReader {
     }
 
     pub(crate) fn new_with_shared_source(
-        config: crate::mysql_snapshot::MySqlConnectionConfig,
+        config: crate::mysql_config::MySqlConnectionConfig,
         source: Rc<PersistentMySqlSource>,
     ) -> Self {
         Self {

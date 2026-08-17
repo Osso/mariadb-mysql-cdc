@@ -1,5 +1,5 @@
 use crate::live::TargetMySqlConfig;
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use std::fmt;
 
 #[cfg(test)]

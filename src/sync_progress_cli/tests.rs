@@ -531,7 +531,7 @@ fn range_progress_row(table: &str, rows_scanned: u64, total_rows: u64) -> SyncPr
 
 #[test]
 fn source_progress_opts_use_plaintext_without_ca() {
-    let source = mysql_snapshot::MySqlConnectionConfig {
+    let source = crate::mysql_config::MySqlConnectionConfig {
         host: "source-db".to_string(),
         user: "reader".to_string(),
         password: "secret".to_string(),

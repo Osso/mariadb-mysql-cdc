@@ -9,7 +9,7 @@ mod run;
 mod tests;
 
 use crate::table_sync::{self, SyncMode};
-use crate::{live::TargetMySqlConfig, mysql_snapshot::MySqlConnectionConfig};
+use crate::{live::TargetMySqlConfig, mysql_config::MySqlConnectionConfig};
 pub use model::{
     CanonicalForeignKey, CanonicalForeignKeyRow, RepairInventory, RepairPlan, RepairPlanError,
     canonicalize_foreign_keys,
