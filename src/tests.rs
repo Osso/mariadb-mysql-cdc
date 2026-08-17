@@ -35,6 +35,13 @@ mod sync_config {
     ));
 }
 
+mod sync_cli_config {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_cli_config.rs"
+    ));
+}
+
 mod sync_runner {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

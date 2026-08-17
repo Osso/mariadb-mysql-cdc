@@ -38,15 +38,13 @@ mariadb-mysql-cdc
 Usage:
   mariadb-mysql-cdc plan
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
-  mariadb-mysql-cdc catchup-snapshot --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --progress-file PATH [options]
+  mariadb-mysql-cdc sync --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --table TABLE [--table TABLE ...] (--run-id ID | --run-id-prefix PREFIX) [options]
   mariadb-mysql-cdc catchup-progress --progress-file PATH
-  mariadb-mysql-cdc sync-table --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --table TABLE --primary-key COLUMNS --columns COLUMNS --run-id ID [options]
   mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
   mariadb-mysql-cdc sync-schema --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH [--table TABLE ... | --catalog FILE | --all-tables true]
   mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
-  mariadb-mysql-cdc repair-drift --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
   mariadb-mysql-cdc resync-stream --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity NEW_ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
   mariadb-mysql-cdc resolve-comics-releases-views-conflicts --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --run-id ID [--batch-size ROWS]
@@ -56,12 +54,9 @@ Usage:
 Commands:
   plan    Print the current migration tool design.
   probe   Read source binlog coordinates and classify MariaDB binlog events.
-  catchup-snapshot
-          Copy source rows into target in resumable primary-key chunks.
+  sync    Synchronize target schemas and table rows from source.
   catchup-progress
           Print catchup checkpoint progress.
-  sync-table
-          Compare one source/target table by primary-key chunks and optionally repair target gaps.
   sync-progress
           Print table sync progress, stream checkpoint, rates, and ETA when source counts are supplied.
   table-catalog
@@ -72,8 +67,6 @@ Commands:
           Converge selected target tables to the translated source schema; --all-tables true selects every source base table.
   drift-check
           Read-only source/target COUNT(*) drift check for selected tables, or all source base tables when no --table is supplied.
-  repair-drift
-          Inventory both endpoints, count-check source tables, and run bounded sync-table repairs only for drifted tables; --parallelism runs independent tables concurrently within FK-safe phase barriers.
   recover-lost-binlog
           Execute one authorization-file-scoped lost-binlog recovery with a source-consistent full-scope repair and immutable audit record.
   resolve-comics-releases-views-conflicts
@@ -91,6 +84,25 @@ Probe options:
   --binlog-file FILE          Override SHOW MASTER STATUS binlog file.
   --start-position POSITION   Override SHOW MASTER STATUS position.
   --stop-position POSITION    Stop reading at a binlog position.
+Sync options:
+  --source-host HOST              MariaDB source host.
+  --source-port PORT              MariaDB source port. Defaults to 3306.
+  --source-user USER              MariaDB source user.
+  --source-password-env ENV       Environment variable containing source password.
+  --source-database DB            MariaDB source database.
+  --target-host HOST              MySQL target host.
+  --target-port PORT              MySQL target port. Defaults to 3306.
+  --target-user USER              MySQL target user.
+  --target-password-env ENV       Environment variable containing target password.
+  --target-database DB            MySQL target database.
+  --target-tls-ca-file PATH       Target CA certificate bundle.
+  --table TABLE                   Source-authoritative table; repeat for multiple tables.
+  --chunk-size ROWS               Rows per locked chunk. Defaults to 1000.
+  --parallelism WORKERS           Concurrent table workers. Defaults to 1.
+  --progress-table TABLE          Staged progress table. Defaults to cdc.sync_runs.
+  --run-id ID                     Exact immutable run identity.
+  --run-id-prefix PREFIX          Deterministic immutable run identity namespace.
+
 Apply options:
   --source-host HOST              MariaDB source host.
   --source-port PORT              MariaDB source port. Defaults to 3306.
@@ -114,37 +126,9 @@ Apply options:
                                   Submit complete target transactions concurrently. Defaults to 1 (serial).
   --stop-never-slave-server-id ID MariaDB --stop-never slave server_id. Generated when omitted.
 
-Catchup snapshot options:
-  --source-host HOST              MariaDB source host.
-  --source-port PORT              MariaDB source port. Defaults to 3306.
-  --source-user USER              MariaDB source user.
-  --source-password-env ENV       Environment variable containing source password.
-  --source-database DB            MariaDB source database.
-  --target-host HOST              MySQL target host.
-  --target-port PORT              MySQL target port. Defaults to 3306.
-  --target-user USER              MySQL target user.
-  --target-password-env ENV       Environment variable containing target password.
-  --target-database DB            MySQL target database.
-  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
-  --progress-file PATH            Local fallback checkpoint file.
-  --progress-table TABLE          Target checkpoint table. Defaults to cdc.table_sync_progress.
-
-Sync table options:
-  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
-  --mode MODE                     apply (default), dry-run, or missing-primary-keys. dry-run reports the
-                                  same chunk and row counts as apply and writes nothing.
-  --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
-  --run-id ID                     Immutable repair run ID. Reuse only for interrupted runs; completed IDs are terminal.
-  --start-after CSV               Primary-key lower bound for targeted sync-table repair.
-  --end-at CSV                    Primary-key upper bound for targeted sync-table repair.
-  --start-after-json JSON         Primary-key lower bound as JSON string array; use for values containing commas.
-  --end-at-json JSON              Primary-key upper bound as JSON string array; use for values containing commas.
-  --updated-at-column COLUMN      Source update timestamp column for update_time accelerator.
-  --updated-since VALUE           Upsert source rows where updated-at column is >= VALUE. Does not delete orphans; run checksum validation after.
-
 Sync progress repair-run options:
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
-  --progress-table TABLE          Use cdc.table_sync_runs to inspect sync-table repair runs.
+  --progress-table TABLE          Select the target run-progress table to inspect.
   --run-id ID                     Filter the selected run-progress table by repair run ID.
 
   --chunk-size ROWS               Rows per chunk. Defaults to 10000.
@@ -158,27 +142,6 @@ Drift check options:
   --table TABLE                   Limit drift check to a source table; repeat for multiple tables.
   --content-check BOOL             Run bounded content checks. Defaults to true.
 
-Repair drift options:
-  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
-  --source-identity ID             Source incarnation ID for conflict resolution in apply mode.
-  --table TABLE                    Limit repair to a source table; repeat for multiple tables.
-  --parent-first TABLES            Comma-separated table order prefix; remaining tables sort lexically.
-  --start-after CSV                Lower primary-key bound for the selected repair window.
-  --end-at CSV                     Upper primary-key bound for the selected repair window.
-  --start-after-json JSON          Lower primary-key bound as a JSON string array.
-  --end-at-json JSON               Upper primary-key bound as a JSON string array.
-  --content-check BOOL             Run bounded content checks when counts match. Defaults to true.
-  --mode MODE                     dry-run (default) or apply.
-  --conflict-reconcile-limit ROWS  Apply-only bounded pass over at most this many unresolved rows
-                                  in the selected source/table scope. Read complete source and
-                                  target rows by primary key; resolve only one-row complete
-                                  equality with matching unresolved evidence. Missing, divergent,
-                                  malformed, or ambiguous rows remain unresolved. Writes no
-                                  target-table repairs and never reads or advances stream
-                                  checkpoints; repeated passes are idempotent. Defaults to 0.
-  --progress-table TABLE          Target run-progress table. Defaults to cdc.table_sync_runs.
-  --run-id ID                     Reuse an interrupted repair run; plan hash must match.
-  --run-id-prefix PREFIX          Prefix for the fresh run-scoped repair ID.
 ";
 
 fn main() {
@@ -189,15 +152,13 @@ fn main() {
     match command.as_deref() {
         Some("plan") => print_plan(),
         Some("probe") => run_probe_command(args.collect()),
-        Some("catchup-snapshot") => run_catchup_snapshot_command(args.collect()),
+        Some("sync") => sync_cli::run_sync_command(args.collect(), USAGE),
         Some("catchup-progress") => run_catchup_progress_command(args.collect()),
-        Some("sync-table") => sync_cli::run_sync_table_command(args.collect(), USAGE),
         Some("sync-progress") => run_sync_progress_command(args.collect()),
         Some("table-catalog") => table_catalog::run_table_catalog_command(args.collect(), USAGE),
         Some("sync-catalog") => table_catalog::run_sync_catalog_command(args.collect(), USAGE),
         Some("sync-schema") => sync_schema::run_sync_schema_command(args.collect(), USAGE),
         Some("drift-check") => run_drift_check_command(args.collect()),
-        Some("repair-drift") => repair_drift::run_repair_drift_command(args.collect(), USAGE),
         Some("recover-lost-binlog") => run_recover_lost_binlog_command(args.collect()),
         Some("resync-stream") => run_resync_stream_command(args.collect()),
         Some("resolve-comics-releases-views-conflicts") => {
