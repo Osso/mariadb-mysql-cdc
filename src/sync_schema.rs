@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1426,24 +1424,6 @@ fn overall_schema_status(reports: &[TableSchemaReport]) -> OverallSchemaStatus {
     }
 }
 
-#[derive(Clone, Debug)]
-struct SyncSchemaConfig {
-    source: crate::mysql_config::MySqlConnectionConfig,
-    target: crate::live::TargetMySqlConfig,
-    tables: Vec<String>,
-    catalog: Option<PathBuf>,
-    all_tables: bool,
-}
-
-pub(crate) fn run_sync_schema_command(args: Vec<String>, _usage: &str) {
-    let result = parse_sync_schema_config(args).and_then(run_sync_schema);
-    let (json, exit_code) = render_sync_schema_termination(result);
-    println!("{json}");
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
-}
-
 pub(crate) fn read_sync_source_evidence(
     source: &crate::mysql_config::MySqlConnectionConfig,
 ) -> Result<SchemaSourceEvidence, String> {
@@ -1881,69 +1861,6 @@ fn verify_table_foreign_keys(context: &SchemaVerificationContext<'_>, table: &st
     }
 }
 
-fn render_sync_schema_termination(
-    result: Result<SchemaConvergenceReport, String>,
-) -> (String, i32) {
-    let report = match result {
-        Ok(report) => report,
-        Err(error) => SchemaConvergenceReport {
-            transformation_version: DDL_TRANSFORMATION_VERSION.to_string(),
-            source_fingerprint: String::new(),
-            target_fingerprint: String::new(),
-            overall_status: OverallSchemaStatus::Failed,
-            error: Some(error),
-            tables: Vec::new(),
-        },
-    };
-    let exit_code = match report.overall_status {
-        OverallSchemaStatus::Converged => 0,
-        OverallSchemaStatus::Partial => 1,
-        OverallSchemaStatus::Failed if report.tables.is_empty() => 2,
-        OverallSchemaStatus::Failed => 1,
-    };
-    (
-        serde_json::to_string_pretty(&report).expect("schema report JSON"),
-        exit_code,
-    )
-}
-
-fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, String> {
-    let catalog = config
-        .catalog
-        .as_ref()
-        .map(fs::read)
-        .transpose()
-        .map_err(|error| format!("failed to read sync-schema catalog: {error}"))?;
-    let selection = schema_selection(&config.tables, catalog.as_deref(), config.all_tables)?;
-    let source_reader = MariaDbInventoryReader::new(inventory_config_source(&config.source));
-    let target_reader = MariaDbInventoryReader::new(inventory_config_target(&config.target));
-    let source = build_inventory(&config.source.database, &source_reader)
-        .map_err(|error| format!("source schema inventory failed: {error}"))?;
-    let target = build_inventory(&config.target.database, &target_reader)
-        .map_err(|error| format!("target schema inventory failed: {error}"))?;
-    let selected = resolve_schema_selection(&selection, &source)?;
-    let source_checks = CheckConstraintReader::new(inventory_config_source(&config.source))
-        .read(&config.source.database, None)?;
-    let target_checks = CheckConstraintReader::new(inventory_config_target(&config.target))
-        .read(&config.target.database, None)?;
-    let source_canonical_foreign_keys =
-        build_canonical_foreign_key_inventory(&config.source.database, &source_reader)
-            .map_err(|error| format!("source canonical foreign key inventory failed: {error}"))?;
-    let target_canonical_foreign_keys =
-        build_canonical_foreign_key_inventory(&config.target.database, &target_reader)
-            .map_err(|error| format!("target canonical foreign key inventory failed: {error}"))?;
-    execute_schema_convergence(SchemaConvergenceInputs {
-        source: &source,
-        target_inventory: &target,
-        selected: &selected,
-        source_checks: &source_checks,
-        target_checks: &target_checks,
-        source_canonical_foreign_keys: &source_canonical_foreign_keys,
-        target_canonical_foreign_keys: &target_canonical_foreign_keys,
-        target: &config.target,
-    })
-}
-
 struct MySqlSchemaExecutor {
     executor: crate::mysql_client::PersistentTargetExecutor,
 }
@@ -2068,50 +1985,6 @@ impl SchemaStatementExecutor for MySqlSchemaExecutor {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
-}
-
-fn parse_sync_schema_config(args: Vec<String>) -> Result<SyncSchemaConfig, String> {
-    let mut values = BTreeMap::<String, String>::new();
-    let mut tables = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let flag = args[index].as_str();
-        let value = args
-            .get(index + 1)
-            .ok_or_else(|| format!("{flag} requires a value"))?;
-        if flag == "--table" {
-            tables.push(value.clone());
-        } else {
-            values.insert(flag.to_string(), value.clone());
-        }
-        index += 2;
-    }
-    let source_password_env = required(&values, "--source-password-env")?;
-    let target_password_env = required(&values, "--target-password-env")?;
-    Ok(SyncSchemaConfig {
-        source: crate::mysql_config::MySqlConnectionConfig {
-            host: required(&values, "--source-host")?,
-            port: optional_u16(&values, "--source-port", 3306)?,
-            user: required(&values, "--source-user")?,
-            password: crate::read_env_password(&source_password_env)?,
-            database: required(&values, "--source-database")?,
-        },
-        target: crate::live::TargetMySqlConfig {
-            host: required(&values, "--target-host")?,
-            port: optional_u16(&values, "--target-port", 3306)?,
-            user: required(&values, "--target-user")?,
-            password: crate::read_env_password(&target_password_env)?,
-            database: required(&values, "--target-database")?,
-            tls_ca_file: required(&values, "--target-tls-ca-file")?,
-            insert_conflict_policy: crate::live::InsertConflictPolicy::Error,
-        },
-        tables,
-        catalog: values.get("--catalog").map(PathBuf::from),
-        all_tables: match values.get("--all-tables") {
-            Some(value) => crate::parse_bool("--all-tables", value)?,
-            None => false,
-        },
-    })
 }
 
 /// Holds one connection for repeated check-constraint reads, because a fresh TLS handshake per
@@ -3546,25 +3419,6 @@ fn valid_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-fn required(values: &BTreeMap<String, String>, flag: &str) -> Result<String, String> {
-    values
-        .get(flag)
-        .cloned()
-        .ok_or_else(|| format!("missing required option {flag}"))
-}
-
-fn optional_u16(
-    values: &BTreeMap<String, String>,
-    flag: &str,
-    default: u16,
-) -> Result<u16, String> {
-    values.get(flag).map_or(Ok(default), |value| {
-        value
-            .parse::<u16>()
-            .map_err(|_| format!("invalid {flag}: {value}"))
-    })
 }
 
 #[cfg(test)]
@@ -5589,32 +5443,6 @@ mod tests {
     }
 
     #[test]
-    fn every_command_termination_is_structured_json() {
-        let (failed_json, failed_exit) =
-            render_sync_schema_termination(Err("parse failed".to_string()));
-        let failed: serde_json::Value =
-            serde_json::from_str(&failed_json).expect("failed JSON report");
-        assert_eq!(failed_exit, 2);
-        assert_eq!(failed["overall_status"], "failed");
-        assert_eq!(failed["error"], "parse failed");
-
-        let report = SchemaConvergenceReport {
-            transformation_version: DDL_TRANSFORMATION_VERSION.to_string(),
-            source_fingerprint: "source".to_string(),
-            target_fingerprint: "target".to_string(),
-            overall_status: OverallSchemaStatus::Partial,
-            error: Some("one or more selected tables remain divergent".to_string()),
-            tables: Vec::new(),
-        };
-        let (partial_json, partial_exit) = render_sync_schema_termination(Ok(report));
-        let partial: serde_json::Value =
-            serde_json::from_str(&partial_json).expect("partial JSON report");
-        assert_eq!(partial_exit, 1);
-        assert_eq!(partial["overall_status"], "partial");
-        assert!(partial["error"].is_string());
-    }
-
-    #[test]
     fn catalog_and_repeated_tables_form_one_deduplicated_selection() {
         let catalog = r#"{"tables":[{"name":"alpha"},{"name":"beta"},{"name":"alpha"}]}"#;
         let selected = selected_tables(
@@ -5679,55 +5507,6 @@ mod tests {
             error,
             "sync-schema requires at least one --table, --catalog, or --all-tables true"
         );
-    }
-
-    #[test]
-    fn parses_all_tables_selection_from_the_command_line() {
-        let config = parse_sync_schema_config(sync_schema_args(&["--all-tables", "true"]))
-            .expect("all-tables config");
-        assert!(config.all_tables);
-        assert!(config.tables.is_empty());
-        assert!(config.catalog.is_none());
-
-        let default = parse_sync_schema_config(sync_schema_args(&["--table", "alpha"]))
-            .expect("named config");
-        assert!(!default.all_tables);
-
-        let invalid = parse_sync_schema_config(sync_schema_args(&["--all-tables", "yes"]))
-            .expect_err("invalid boolean");
-        assert_eq!(invalid, "--all-tables must be true or false");
-    }
-
-    fn sync_schema_args(extra: &[&str]) -> Vec<String> {
-        // SAFETY: single-threaded test setup for the password environment lookup.
-        unsafe {
-            std::env::set_var("SYNC_SCHEMA_TEST_PASSWORD", "secret");
-        }
-        let mut args = [
-            "--source-host",
-            "source.example",
-            "--source-user",
-            "reader",
-            "--source-password-env",
-            "SYNC_SCHEMA_TEST_PASSWORD",
-            "--source-database",
-            "globalcomix",
-            "--target-host",
-            "target.example",
-            "--target-user",
-            "writer",
-            "--target-password-env",
-            "SYNC_SCHEMA_TEST_PASSWORD",
-            "--target-database",
-            "globalcomix",
-            "--target-tls-ca-file",
-            "/etc/ca.pem",
-        ]
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>();
-        args.extend(extra.iter().map(|value| value.to_string()));
-        args
     }
 
     fn inventory(

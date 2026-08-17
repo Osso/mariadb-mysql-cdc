@@ -16,9 +16,17 @@ fn help_documents_one_unified_schema_and_table_sync_command() {
         .collect::<Vec<_>>();
     assert_eq!(sync_usage.len(), 1, "unexpected sync usage:\n{help}");
     assert!(help.contains("Synchronize target schemas and table rows from source."));
-    for obsolete in ["catchup-snapshot", "sync-table", "repair-drift"] {
+    for obsolete in [
+        "catchup-snapshot",
+        "catchup-progress",
+        "sync-table",
+        "sync-progress",
+        "sync-schema",
+        "drift-check",
+        "repair-drift",
+    ] {
         assert!(
-            !help.contains(&format!("mariadb-mysql-cdc {obsolete}")),
+            !help.contains(obsolete),
             "obsolete command remains documented: {obsolete}\n{help}"
         );
     }
@@ -26,7 +34,15 @@ fn help_documents_one_unified_schema_and_table_sync_command() {
 
 #[test]
 fn obsolete_sync_command_names_are_rejected_without_dispatch() {
-    for obsolete in ["catchup-snapshot", "sync-table", "repair-drift"] {
+    for obsolete in [
+        "catchup-snapshot",
+        "catchup-progress",
+        "sync-table",
+        "sync-progress",
+        "sync-schema",
+        "drift-check",
+        "repair-drift",
+    ] {
         let output = run(&[obsolete]);
 
         assert_eq!(output.status.code(), Some(2));

@@ -25,7 +25,6 @@ pub mod statement;
 pub mod stream_checkpoint;
 mod sync;
 mod sync_cli;
-mod sync_progress_cli;
 mod sync_schema;
 pub mod table_catalog;
 pub mod table_sync;
@@ -33,7 +32,7 @@ pub mod target;
 pub mod targeted_conflict_resolution;
 pub mod validation;
 
-use std::{env, path::PathBuf, time::Duration};
+use std::env;
 
 const USAGE: &str = "\
 mariadb-mysql-cdc
@@ -42,12 +41,8 @@ Usage:
   mariadb-mysql-cdc plan
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
   mariadb-mysql-cdc sync --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --table TABLE [--table TABLE ...] (--run-id ID | --run-id-prefix PREFIX) [options]
-  mariadb-mysql-cdc catchup-progress --progress-file PATH
-  mariadb-mysql-cdc sync-progress --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
   mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
-  mariadb-mysql-cdc sync-schema --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH [--table TABLE ... | --catalog FILE | --all-tables true]
-  mariadb-mysql-cdc drift-check --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--table TABLE ...] [--content-check BOOL] [--chunk-size ROWS]
   mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
   mariadb-mysql-cdc resync-stream --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity NEW_ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
   mariadb-mysql-cdc resolve-comics-releases-views-conflicts --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --run-id ID [--batch-size ROWS]
@@ -58,18 +53,10 @@ Commands:
   plan    Print the current migration tool design.
   probe   Read source binlog coordinates and classify MariaDB binlog events.
   sync    Synchronize target schemas and table rows from source.
-  catchup-progress
-          Print catchup checkpoint progress.
-  sync-progress
-          Print table sync progress, stream checkpoint, rates, and ETA when source counts are supplied.
   table-catalog
           Write deterministic syncable and non-syncable table catalogs ordered by estimated source rows.
   sync-catalog
-          Apply a syncable table catalog with dependency ordering and sixteen total sync slots.
-  sync-schema
-          Converge selected target tables to the translated source schema; --all-tables true selects every source base table.
-  drift-check
-          Read-only source/target COUNT(*) drift check for selected tables, or all source base tables when no --table is supplied.
+          Apply a syncable table catalog through unified staged synchronization.
   recover-lost-binlog
           Execute one authorization-file-scoped lost-binlog recovery with a source-consistent full-scope repair and immutable audit record.
   resolve-comics-releases-views-conflicts
@@ -129,21 +116,8 @@ Apply options:
                                   Submit complete target transactions concurrently. Defaults to 1 (serial).
   --stop-never-slave-server-id ID MariaDB --stop-never slave server_id. Generated when omitted.
 
-Sync progress repair-run options:
-  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
-  --progress-table TABLE          Select the target run-progress table to inspect.
-  --run-id ID                     Filter the selected run-progress table by repair run ID.
-
-  --chunk-size ROWS               Rows per chunk. Defaults to 10000.
-  --throttle-ms MS                Sleep after each copied chunk. Defaults to 0.
-
 Sync catalog options:
   --run-id-prefix PREFIX          Fresh immutable identity namespace for this catalog attempt.
-
-Drift check options:
-  --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
-  --table TABLE                   Limit drift check to a source table; repeat for multiple tables.
-  --content-check BOOL             Run bounded content checks. Defaults to true.
 
 ";
 
@@ -156,12 +130,8 @@ fn main() {
         Some("plan") => print_plan(),
         Some("probe") => run_probe_command(args.collect()),
         Some("sync") => sync_cli::run_sync_command(args.collect(), USAGE),
-        Some("catchup-progress") => run_catchup_progress_command(args.collect()),
-        Some("sync-progress") => run_sync_progress_command(args.collect()),
         Some("table-catalog") => table_catalog::run_table_catalog_command(args.collect(), USAGE),
         Some("sync-catalog") => table_catalog::run_sync_catalog_command(args.collect(), USAGE),
-        Some("sync-schema") => sync_schema::run_sync_schema_command(args.collect(), USAGE),
-        Some("drift-check") => run_drift_check_command(args.collect()),
         Some("recover-lost-binlog") => run_recover_lost_binlog_command(args.collect()),
         Some("resync-stream") => run_resync_stream_command(args.collect()),
         Some("resolve-comics-releases-views-conflicts") => {
@@ -172,10 +142,6 @@ fn main() {
         Some("-h" | "--help") | None => print!("{USAGE}"),
         Some(other) => exit_unknown_command(other),
     }
-}
-
-fn run_sync_progress_command(args: Vec<String>) {
-    sync_progress_cli::run_sync_progress_command(args, USAGE)
 }
 
 fn run_targeted_conflict_resolution_command(args: Vec<String>) {
@@ -378,30 +344,6 @@ fn run_stream_binlog_command(args: Vec<String>) {
     }
 }
 
-fn run_drift_check_command(args: Vec<String>) {
-    let config = match parse_drift_check_config(args) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("{error}\n\n{USAGE}");
-            std::process::exit(2);
-        }
-    };
-
-    let observer = drift_check::StderrDriftCheckObserver;
-    match drift_check::run_drift_check_with_observer(&config, &observer) {
-        Ok(report) => {
-            println!("{}", drift_check::format_drift_report(&report));
-            if report.has_mismatches() {
-                std::process::exit(3);
-            }
-        }
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-    }
-}
-
 fn run_apply_binlog_command(args: Vec<String>) {
     let config = match parse_apply_binlog_config(args) {
         Ok(config) => config,
@@ -425,40 +367,6 @@ fn run_apply_binlog_command(args: Vec<String>) {
     }
 }
 
-fn run_catchup_snapshot_command(args: Vec<String>) {
-    let config = match parse_catchup_snapshot_config(args) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("{error}\n\n{USAGE}");
-            std::process::exit(2);
-        }
-    };
-
-    if let Err(error) = mysql_snapshot::run_catchup_snapshot(&config) {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
-}
-
-fn run_catchup_progress_command(args: Vec<String>) {
-    let progress_file = match parse_progress_file(args) {
-        Ok(progress_file) => progress_file,
-        Err(error) => {
-            eprintln!("{error}\n\n{USAGE}");
-            std::process::exit(2);
-        }
-    };
-    let store = snapshot::FileSnapshotProgressStore::new(progress_file);
-
-    match snapshot::SnapshotProgressStore::load(&store) {
-        Ok(progress) => println!("{}", snapshot::format_progress(&progress)),
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-    }
-}
-
 fn print_plan() {
     println!(
         "\
@@ -469,95 +377,13 @@ Constraints:
 - Do not require DigitalOcean Managed MySQL to serve traffic before rehearsals pass.
 - Treat incompatible SQL as migration bugs to capture and fix before cutover.
 
-Initial phases:
-1. Snapshot source tables into target in primary-key chunks.
-2. Stream MariaDB binlog from a recorded start position.
-3. Apply supported row and statement events to the target.
-4. Quarantine unsupported events with exact binlog coordinates.
-5. Validate counts/checksums before cutover.
+Synchronization:
+1. Converge prerequisite target schema from source evidence.
+2. Synchronize source-authoritative rows in target-WRITE-locked chunks.
+3. Converge final constraints and persist durable stage progress.
+4. Stream source transactions with ordered target commits and checkpoints.
 "
     );
-}
-
-fn parse_catchup_snapshot_config(
-    args: Vec<String>,
-) -> Result<mysql_snapshot::CatchupSnapshotConfig, String> {
-    let mut config = mysql_snapshot::CatchupSnapshotConfig {
-        source: crate::mysql_config::MySqlConnectionConfig::default(),
-        target: live::TargetMySqlConfig::default(),
-        progress_file: PathBuf::new(),
-        progress_table: "cdc.table_sync_progress".to_string(),
-        chunk_size: 10_000,
-        throttle: Duration::ZERO,
-        parallel_workers: 1,
-        table: None,
-    };
-    let mut index = 0;
-
-    while index < args.len() {
-        let flag = &args[index];
-        let value = args
-            .get(index + 1)
-            .ok_or_else(|| format!("{flag} needs a value"))?;
-
-        catchup_snapshot_option(&mut config, flag, value)?;
-        index += 2;
-    }
-
-    Ok(config)
-}
-
-fn parse_progress_file(args: Vec<String>) -> Result<PathBuf, String> {
-    if args.len() != 2 {
-        return Err("catchup-progress needs --progress-file PATH".to_string());
-    }
-    if args[0] != "--progress-file" {
-        return Err(format!("unknown catchup-progress option: {}", args[0]));
-    }
-
-    Ok(PathBuf::from(&args[1]))
-}
-
-fn catchup_snapshot_option(
-    config: &mut mysql_snapshot::CatchupSnapshotConfig,
-    flag: &str,
-    value: &str,
-) -> Result<(), String> {
-    if catchup_source_option(&mut config.source, flag, value)? {
-        return Ok(());
-    }
-    if apply_target_option(&mut config.target, flag, value)? {
-        return Ok(());
-    }
-
-    match flag {
-        "--progress-file" => config.progress_file = PathBuf::from(value),
-        "--progress-table" => config.progress_table = value.to_string(),
-        "--chunk-size" => config.chunk_size = parse_usize(flag, value)?,
-        "--throttle-ms" => config.throttle = Duration::from_millis(parse_u64(flag, value)?),
-        "--parallel-workers" => config.parallel_workers = parse_usize(flag, value)?,
-        "--table" => config.table = Some(value.to_string()),
-        other => return Err(format!("unknown catchup-snapshot option: {other}")),
-    }
-
-    Ok(())
-}
-
-fn catchup_source_option(
-    source: &mut crate::mysql_config::MySqlConnectionConfig,
-    flag: &str,
-    value: &str,
-) -> Result<bool, String> {
-    match flag {
-        "--source-host" => source.host = value.to_string(),
-        "--source-port" => source.port = parse_u16(flag, value)?,
-        "--source-user" => source.user = value.to_string(),
-        "--source-password-env" => source.password = read_env_password(value)?,
-        "--source-database" => source.database = value.to_string(),
-        _ => return Ok(false),
-    }
-
-    Ok(true)
 }
 
 fn run_probe_command(args: Vec<String>) {
@@ -604,51 +430,6 @@ fn parse_probe_config(args: Vec<String>) -> Result<probe::ProbeConfig, String> {
     }
 
     Ok(config)
-}
-
-fn parse_drift_check_config(args: Vec<String>) -> Result<drift_check::DriftCheckConfig, String> {
-    let mut config = drift_check::DriftCheckConfig {
-        source: crate::mysql_config::MySqlConnectionConfig::default(),
-        target: live::TargetMySqlConfig::default(),
-        tables: Vec::new(),
-        content_check: true,
-        chunk_size: 10000,
-    };
-    let mut index = 0;
-
-    while index < args.len() {
-        let flag = &args[index];
-        let value = args
-            .get(index + 1)
-            .ok_or_else(|| format!("{flag} needs a value"))?;
-
-        drift_check_option(&mut config, flag, value)?;
-        index += 2;
-    }
-
-    Ok(config)
-}
-
-fn drift_check_option(
-    config: &mut drift_check::DriftCheckConfig,
-    flag: &str,
-    value: &str,
-) -> Result<(), String> {
-    if catchup_source_option(&mut config.source, flag, value)? {
-        return Ok(());
-    }
-    if apply_target_option(&mut config.target, flag, value)? {
-        return Ok(());
-    }
-
-    match flag {
-        "--table" => config.tables.push(value.to_string()),
-        "--content-check" => config.content_check = parse_bool(flag, value)?,
-        "--chunk-size" => config.chunk_size = parse_usize(flag, value)?,
-        other => return Err(format!("unknown drift-check option: {other}")),
-    }
-
-    Ok(())
 }
 
 fn parse_apply_binlog_config(args: Vec<String>) -> Result<live::ApplyBinlogConfig, String> {
