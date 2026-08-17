@@ -3,6 +3,7 @@ mod config;
 mod model;
 mod mysql;
 mod progress;
+mod run;
 mod sql;
 
 pub(crate) use chunk::sync_next_chunk;
@@ -24,6 +25,9 @@ pub(crate) use mysql::{
 pub(crate) use progress::{
     build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
     build_sync_progress_select_sql, build_sync_progress_upsert_sql, parse_sync_progress_row,
+};
+pub(crate) use run::{
+    run_mysql_sync_table, run_mysql_sync_tables, run_sync_tables_bounded, sync_table_to_completion,
 };
 pub(crate) use sql::{
     build_lock_table_write_sql, build_strict_delete_rows_statement, build_strict_delete_statement,
