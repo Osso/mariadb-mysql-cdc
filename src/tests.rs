@@ -56,6 +56,13 @@ mod resync_unified {
     ));
 }
 
+mod lost_binlog_unified {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/lost_binlog_unified.rs"
+    ));
+}
+
 mod sync_runner {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

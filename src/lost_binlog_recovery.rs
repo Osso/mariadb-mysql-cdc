@@ -1,18 +1,13 @@
 use crate::checkpoint::Checkpoint;
 use crate::inventory::{
-    InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
-    SnapshotInventoryReader, build_canonical_foreign_key_inventory, build_inventory,
+    InventoryEndpointRole, SchemaInventory, SnapshotInventoryReader,
+    build_canonical_foreign_key_inventory, build_inventory,
 };
 use crate::live::TargetMySqlConfig;
 use crate::lost_binlog_recovery_store::MySqlLostBinlogRecoveryStore;
 use crate::mysql_client::PersistentMySqlSource;
 use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::repair_drift::{RepairDriftConfig, RepairDriftReport, run_consistent_snapshot_repair};
-use crate::sync_schema::{
-    SchemaSourceEvidence, read_snapshot_check_constraints,
-    run_schema_convergence_from_source_evidence,
-};
-use crate::table_sync::SyncMode;
+use crate::sync_schema::{SchemaSourceEvidence, read_snapshot_check_constraints};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -500,20 +495,17 @@ pub(crate) fn resync_sync_config(
     config: &ResyncStreamConfig,
     source_inventory: &SchemaInventory,
 ) -> crate::sync::SyncConfig {
-    crate::sync::SyncConfig {
-        source: config.source.clone(),
-        target: config.target.clone(),
-        tables: source_inventory
-            .tables
-            .iter()
-            .map(|table| table.name.clone())
-            .collect(),
-        chunk_size: config.chunk_size,
-        parallelism: config.parallelism,
-        progress_table: config.progress_table.clone(),
-        run_id: Some(format!("resync-stream:{}", config.source_identity)),
-        run_id_prefix: None,
-    }
+    full_scope_sync_config(
+        &config.source,
+        &config.target,
+        source_inventory,
+        FullScopeSyncRun {
+            chunk_size: config.chunk_size,
+            parallelism: config.parallelism,
+            progress_table: &config.progress_table,
+            run_id: format!("resync-stream:{}", config.source_identity),
+        },
+    )
 }
 
 pub(crate) fn resync_table_counts(rows: &[crate::sync::SyncChunkProgress]) -> (usize, usize) {
@@ -561,15 +553,6 @@ fn prepare_recovery_context(
     })
 }
 
-fn require_converged_schema(
-    report: &crate::sync_schema::SchemaConvergenceReport,
-) -> Result<(), String> {
-    if report.overall_status == crate::sync_schema::OverallSchemaStatus::Converged {
-        return Ok(());
-    }
-    Err("full schema convergence did not complete".to_string())
-}
-
 fn authorize_current_scope(
     request: &mut LostBinlogRecoveryRequest,
     source_inventory: &SchemaInventory,
@@ -590,15 +573,12 @@ fn authorize_current_scope(
 
 fn prepared_evidence_json(
     source_inventory: &SchemaInventory,
-    target_inventory: &SchemaInventory,
     scope_hash: &str,
 ) -> Result<String, String> {
     let source_schema_fingerprint = inventory_scope_hash(source_inventory)?;
-    let target_schema_fingerprint = inventory_scope_hash(target_inventory)?;
     Ok(serde_json::json!({
         "scope_hash": scope_hash,
         "source_schema_fingerprint": source_schema_fingerprint,
-        "target_schema_fingerprint": target_schema_fingerprint,
         "source_tables": source_inventory.tables.len(),
     })
     .to_string())
@@ -608,7 +588,6 @@ struct PreparedRecoverySnapshot {
     request: LostBinlogRecoveryRequest,
     prepared: LostBinlogRecoveryRecord,
     source_evidence: SchemaSourceEvidence,
-    target_inventory: SchemaInventory,
     scope_hash: String,
 }
 
@@ -624,55 +603,37 @@ fn run_anchored_recovery(
     store.acquire_stream_lease(&request.checkpoint_name)?;
     let (new_checkpoint, source_evidence) =
         begin_committed_source_boundary(config, source.as_ref())?;
-    let prepared_snapshot = capture_prepared_recovery_snapshot(
-        config,
-        &store,
-        &mut request,
-        new_checkpoint,
-        source_evidence,
-    )?;
-    let repair = repair_consistent_snapshot(
+    let prepared_snapshot =
+        capture_prepared_recovery_snapshot(&store, &mut request, new_checkpoint, source_evidence)?;
+    let sync_config = recovery_sync_config(
         config,
         &prepared_snapshot.request,
-        Rc::clone(&source),
-        prepared_snapshot.source_evidence.inventory.clone(),
-        prepared_snapshot.target_inventory.clone(),
-    )?;
-    let schema_report = run_schema_convergence_from_source_evidence(
+        &prepared_snapshot.source_evidence.inventory,
+    );
+    let rows = crate::sync::run_mysql_sync_with_evidence(
+        sync_config,
         prepared_snapshot.source_evidence.clone(),
-        config.target.clone(),
     )?;
-    require_converged_schema(&schema_report)?;
-    commit_anchored_recovery(
-        config,
-        source.as_ref(),
-        &store,
-        prepared_snapshot,
-        repair,
-        schema_report,
-    )
+    commit_anchored_recovery(config, source.as_ref(), &store, prepared_snapshot, rows)
 }
 
 fn capture_prepared_recovery_snapshot(
-    config: &RecoverLostBinlogConfig,
     store: &MySqlLostBinlogRecoveryStore,
     request: &mut LostBinlogRecoveryRequest,
     new_checkpoint: Checkpoint,
     source_evidence: SchemaSourceEvidence,
 ) -> Result<PreparedRecoverySnapshot, String> {
-    let target_inventory = read_target_inventory(&config.target)?;
     validate_transactional_scope(&source_evidence.inventory)?;
     let scope_hash = authorize_current_scope(request, &source_evidence.inventory)?;
     if request.prepared_evidence_json.trim().is_empty() {
         request.prepared_evidence_json =
-            prepared_evidence_json(&source_evidence.inventory, &target_inventory, &scope_hash)?;
+            prepared_evidence_json(&source_evidence.inventory, &scope_hash)?;
     }
     let prepared = prepare_recovery_at_checkpoint(store, request, new_checkpoint)?;
     Ok(PreparedRecoverySnapshot {
         request: request.clone(),
         prepared,
         source_evidence,
-        target_inventory,
         scope_hash,
     })
 }
@@ -682,53 +643,22 @@ fn commit_anchored_recovery(
     source: &PersistentMySqlSource,
     store: &MySqlLostBinlogRecoveryStore,
     prepared: PreparedRecoverySnapshot,
-    repair: RepairDriftReport,
-    schema_report: crate::sync_schema::SchemaConvergenceReport,
+    rows: Vec<crate::sync::SyncChunkProgress>,
 ) -> Result<RecoverLostBinlogReport, String> {
     require_unchanged_source_scope(source, &config.source.database, &prepared.scope_hash)?;
-    let target_inventory = read_target_inventory(&config.target)?;
-    require_exact_table_inventory(&prepared.source_evidence.inventory, &target_inventory)?;
-    let proof = reconciliation_proof(
+    let proof = recovery_reconciliation_proof(
         &prepared.request,
-        &repair,
         &prepared.scope_hash,
-        &schema_report,
-    );
+        &prepared.source_evidence.inventory,
+        &rows,
+    )?;
     commit_lost_binlog_recovery(store, &prepared.request, &proof)?;
     Ok(recovery_report(
         &prepared.request,
         prepared.prepared,
-        repair,
+        &rows,
         prepared.scope_hash,
     ))
-}
-
-#[cfg(test)]
-fn run_recovery_phases<Snapshot, Repair, Schema, Output>(
-    begin_snapshot: impl FnOnce() -> Result<Snapshot, String>,
-    reconcile_data: impl FnOnce(&Snapshot) -> Result<Repair, String>,
-    converge_schema: impl FnOnce(&Snapshot, &Repair) -> Result<Schema, String>,
-    commit: impl FnOnce(Snapshot, Repair, Schema) -> Result<Output, String>,
-) -> Result<Output, String> {
-    let snapshot = begin_snapshot()?;
-    let repair = reconcile_data(&snapshot)?;
-    let schema = converge_schema(&snapshot, &repair)?;
-    commit(snapshot, repair, schema)
-}
-
-#[cfg(test)]
-fn run_recovery_phases_with_source_evidence<Snapshot, Evidence, Repair, Schema, Output>(
-    begin_snapshot: impl FnOnce() -> Result<Snapshot, String>,
-    capture_source_evidence: impl FnOnce(&Snapshot) -> Result<Evidence, String>,
-    reconcile_data: impl FnOnce(&Snapshot, &Evidence) -> Result<Repair, String>,
-    converge_schema: impl FnOnce(&Snapshot, &Evidence, &Repair) -> Result<Schema, String>,
-    commit: impl FnOnce(Snapshot, Evidence, Repair, Schema) -> Result<Output, String>,
-) -> Result<Output, String> {
-    let snapshot = begin_snapshot()?;
-    let evidence = capture_source_evidence(&snapshot)?;
-    let repair = reconcile_data(&snapshot, &evidence)?;
-    let schema = converge_schema(&snapshot, &evidence, &repair)?;
-    commit(snapshot, evidence, repair, schema)
 }
 
 fn begin_committed_source_boundary(
@@ -759,20 +689,51 @@ where
     Ok(prepared)
 }
 
-fn repair_consistent_snapshot(
+pub(crate) fn recovery_sync_config(
     config: &RecoverLostBinlogConfig,
     request: &LostBinlogRecoveryRequest,
-    source: Rc<PersistentMySqlSource>,
-    source_inventory: SchemaInventory,
-    target_inventory: SchemaInventory,
-) -> Result<RepairDriftReport, String> {
-    run_consistent_snapshot_repair(
-        &full_repair_config(config, request),
-        source,
+    source_inventory: &SchemaInventory,
+) -> crate::sync::SyncConfig {
+    full_scope_sync_config(
+        &config.source,
+        &config.target,
         source_inventory,
-        target_inventory,
+        FullScopeSyncRun {
+            chunk_size: config.chunk_size,
+            parallelism: 1,
+            progress_table: &config.progress_table,
+            run_id: request.recovery_id.clone(),
+        },
     )
-    .map_err(|error| error.to_string())
+}
+
+struct FullScopeSyncRun<'a> {
+    chunk_size: usize,
+    parallelism: usize,
+    progress_table: &'a str,
+    run_id: String,
+}
+
+fn full_scope_sync_config(
+    source: &MySqlConnectionConfig,
+    target: &TargetMySqlConfig,
+    source_inventory: &SchemaInventory,
+    run: FullScopeSyncRun<'_>,
+) -> crate::sync::SyncConfig {
+    crate::sync::SyncConfig {
+        source: source.clone(),
+        target: target.clone(),
+        tables: source_inventory
+            .tables
+            .iter()
+            .map(|table| table.name.clone())
+            .collect(),
+        chunk_size: run.chunk_size,
+        parallelism: run.parallelism,
+        progress_table: run.progress_table.to_string(),
+        run_id: Some(run.run_id),
+        run_id_prefix: None,
+    }
 }
 
 fn require_unchanged_source_scope(
@@ -785,78 +746,94 @@ fn require_unchanged_source_scope(
     if current_scope_hash == expected_scope_hash {
         return Ok(());
     }
-    Err("source schema changed during the consistent snapshot repair".to_string())
+    Err("source schema changed during unified lost-binlog recovery".to_string())
 }
 
-fn require_exact_table_inventory(
-    source: &SchemaInventory,
-    target: &SchemaInventory,
+pub(crate) fn recovery_reconciliation_proof(
+    request: &LostBinlogRecoveryRequest,
+    scope_hash: &str,
+    source_inventory: &SchemaInventory,
+    rows: &[crate::sync::SyncChunkProgress],
+) -> Result<LostBinlogReconciliationProof, String> {
+    if request.scope_hash != scope_hash {
+        return Err(format!(
+            "unified recovery scope hash mismatch: expected `{}`, found `{scope_hash}`",
+            request.scope_hash
+        ));
+    }
+    let observed_tables = validate_recovery_progress_rows(request, rows)?;
+    let expected_tables = source_inventory
+        .tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect::<BTreeSet<_>>();
+    require_exact_recovery_progress_scope(&expected_tables, &observed_tables)?;
+    let (repaired_tables, compared_tables) = resync_table_counts(rows);
+    Ok(LostBinlogReconciliationProof {
+        recovery_id: request.recovery_id.clone(),
+        source_identity: request.expected_barrier.source_identity.clone(),
+        scope_hash: scope_hash.to_string(),
+        schema_converged: true,
+        data_converged: true,
+        unsupported_scope: Vec::new(),
+        evidence_json: recovery_evidence_json(scope_hash, compared_tables, repaired_tables),
+    })
+}
+
+fn validate_recovery_progress_rows(
+    request: &LostBinlogRecoveryRequest,
+    rows: &[crate::sync::SyncChunkProgress],
+) -> Result<BTreeSet<String>, String> {
+    let mut observed_tables = BTreeSet::new();
+    for row in rows {
+        if row.run_id != request.recovery_id {
+            return Err(format!(
+                "unified recovery progress run id mismatch for table `{}`: expected `{}`, found `{}`",
+                row.table, request.recovery_id, row.run_id
+            ));
+        }
+        if !row.complete {
+            return Err(format!(
+                "unified recovery progress for table `{}` is incomplete",
+                row.table
+            ));
+        }
+        if !observed_tables.insert(row.table.clone()) {
+            return Err(format!(
+                "unified recovery progress contains duplicate table `{}`",
+                row.table
+            ));
+        }
+    }
+    Ok(observed_tables)
+}
+
+fn require_exact_recovery_progress_scope(
+    expected: &BTreeSet<String>,
+    observed: &BTreeSet<String>,
 ) -> Result<(), String> {
-    let (missing, extras) = table_inventory_difference(source, target);
-    if missing.is_empty() && extras.is_empty() {
+    let missing = expected.difference(observed).cloned().collect::<Vec<_>>();
+    let unexpected = observed.difference(expected).cloned().collect::<Vec<_>>();
+    if missing.is_empty() && unexpected.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "final target table inventory differs: missing={} target_only={}",
+        "unified recovery progress scope differs: missing={} unexpected={}",
         missing.join(","),
-        extras.join(",")
+        unexpected.join(",")
     ))
 }
 
-fn table_inventory_difference(
-    source: &SchemaInventory,
-    target: &SchemaInventory,
-) -> (Vec<String>, Vec<String>) {
-    let source_tables = source
-        .tables
-        .iter()
-        .map(|table| table.name.clone())
-        .collect::<BTreeSet<_>>();
-    let target_tables = target
-        .tables
-        .iter()
-        .map(|table| table.name.clone())
-        .collect::<BTreeSet<_>>();
-    let missing = source_tables.difference(&target_tables).cloned().collect();
-    let extras = target_tables.difference(&source_tables).cloned().collect();
-    (missing, extras)
-}
-
-fn reconciliation_proof(
-    request: &LostBinlogRecoveryRequest,
-    repair: &RepairDriftReport,
+fn recovery_evidence_json(
     scope_hash: &str,
-    schema_report: &crate::sync_schema::SchemaConvergenceReport,
-) -> LostBinlogReconciliationProof {
-    let unsupported_scope = repair
-        .skipped
-        .iter()
-        .map(|item| item.table.clone())
-        .collect::<Vec<_>>();
-    LostBinlogReconciliationProof {
-        recovery_id: request.recovery_id.clone(),
-        source_identity: request.expected_barrier.source_identity.clone(),
-        scope_hash: request.scope_hash.clone(),
-        schema_converged: schema_report.overall_status
-            == crate::sync_schema::OverallSchemaStatus::Converged,
-        data_converged: unsupported_scope.is_empty()
-            && repair.compared_tables == repair.source_tables,
-        evidence_json: reconciliation_evidence_json(repair, scope_hash),
-        unsupported_scope,
-    }
-}
-
-fn reconciliation_evidence_json(repair: &RepairDriftReport, scope_hash: &str) -> String {
-    let skipped_tables = repair
-        .skipped
-        .iter()
-        .map(|item| serde_json::json!({"table": item.table, "reason": item.reason}))
-        .collect::<Vec<_>>();
+    compared_tables: usize,
+    repaired_tables: usize,
+) -> String {
     serde_json::json!({
         "scope_hash": scope_hash,
-        "compared_tables": repair.compared_tables,
-        "repaired_tables": repair.repaired.len(),
-        "skipped_tables": skipped_tables,
+        "compared_tables": compared_tables,
+        "repaired_tables": repaired_tables,
+        "skipped_tables": [],
     })
     .to_string()
 }
@@ -864,15 +841,16 @@ fn reconciliation_evidence_json(repair: &RepairDriftReport, scope_hash: &str) ->
 fn recovery_report(
     request: &LostBinlogRecoveryRequest,
     prepared: LostBinlogRecoveryRecord,
-    repair: RepairDriftReport,
+    rows: &[crate::sync::SyncChunkProgress],
     scope_hash: String,
 ) -> RecoverLostBinlogReport {
+    let (repaired_tables, compared_tables) = resync_table_counts(rows);
     RecoverLostBinlogReport {
         recovery_id: request.recovery_id.clone(),
         new_checkpoint: prepared.new_checkpoint,
         scope_hash,
-        repaired_tables: repair.repaired.len(),
-        compared_tables: repair.compared_tables,
+        repaired_tables,
+        compared_tables,
     }
 }
 
@@ -918,7 +896,7 @@ fn validate_transactional_scope(inventory: &SchemaInventory) -> Result<(), Strin
         return Ok(());
     }
     Err(format!(
-        "consistent snapshot recovery does not support non-InnoDB tables: {}",
+        "lost-binlog recovery does not support non-InnoDB tables: {}",
         unsupported.join(", ")
     ))
 }
@@ -954,46 +932,6 @@ fn read_source_evidence(
         checks,
         canonical_foreign_keys,
     })
-}
-
-fn read_target_inventory(config: &TargetMySqlConfig) -> Result<SchemaInventory, String> {
-    let reader = MariaDbInventoryReader::new(InventoryConfig {
-        host: config.host.clone(),
-        port: config.port,
-        user: config.user.clone(),
-        password: config.password.clone(),
-        endpoint_role: InventoryEndpointRole::Target,
-        use_tls: true,
-        tls_ca_file: Some(config.tls_ca_file.clone()),
-        ..InventoryConfig::default()
-    });
-    build_inventory(&config.database, &reader)
-        .map_err(|error| format!("target recovery inventory failed: {error}"))
-}
-
-fn full_repair_config(
-    config: &RecoverLostBinlogConfig,
-    request: &LostBinlogRecoveryRequest,
-) -> RepairDriftConfig {
-    RepairDriftConfig {
-        source: config.source.clone(),
-        source_identity: config.source_identity.clone(),
-        target: config.target.clone(),
-        tables: Vec::new(),
-        parent_first: Vec::new(),
-        start_after: None,
-        end_at: None,
-        content_check: true,
-        mode: SyncMode::Apply,
-        chunk_size: config.chunk_size,
-        parallelism: 1,
-        conflict_reconcile_limit: 0,
-        progress_table: config.progress_table.clone(),
-        run_id: Some(request.recovery_id.clone()),
-        run_id_prefix: request.recovery_id.clone(),
-        #[cfg(feature = "integration-failpoints")]
-        integration_failpoint: None,
-    }
 }
 
 #[cfg(test)]
@@ -1329,220 +1267,6 @@ mod tests {
 
         assert_eq!(result, Err("coordinate failed".to_string()));
         assert_eq!(steps.borrow().as_slice(), ["coordinate"]);
-    }
-
-    #[test]
-    fn source_evidence_error_stops_repair_schema_and_commit_phases() {
-        let steps = Rc::new(RefCell::new(Vec::new()));
-        let result = run_recovery_phases_with_source_evidence(
-            {
-                let steps = Rc::clone(&steps);
-                move || {
-                    steps.borrow_mut().push("coordinate");
-                    Ok("coordinate-1".to_string())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_coordinate| {
-                    steps.borrow_mut().push("source_evidence");
-                    Err::<&str, String>("source evidence failed".to_string())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_coordinate, _evidence| {
-                    steps.borrow_mut().push("reconcile_data");
-                    Ok("repaired")
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_coordinate, _evidence, _repair| {
-                    steps.borrow_mut().push("converge_schema");
-                    Ok("converged")
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_coordinate, _evidence, _repair, _schema| {
-                    steps.borrow_mut().push("commit");
-                    Ok(())
-                }
-            },
-        );
-
-        assert_eq!(result, Err("source evidence failed".to_string()));
-        assert_eq!(steps.borrow().as_slice(), ["coordinate", "source_evidence"]);
-    }
-
-    #[test]
-    fn recovery_reuses_committed_source_evidence_for_schema() {
-        let steps = Rc::new(RefCell::new(Vec::new()));
-        let source_evidence = Rc::new(RefCell::new(None::<String>));
-
-        let result = run_recovery_phases_with_source_evidence(
-            {
-                let steps = Rc::clone(&steps);
-                move || {
-                    steps.borrow_mut().push("coordinate");
-                    Ok("coordinate-1".to_string())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                let source_evidence = Rc::clone(&source_evidence);
-                move |coordinate| {
-                    steps.borrow_mut().push("source_evidence");
-                    assert_eq!(coordinate.as_str(), "coordinate-1");
-                    source_evidence.replace(Some("schema-1".to_string()));
-                    Ok("schema-1".to_string())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |coordinate, evidence| {
-                    steps.borrow_mut().push("reconcile_data");
-                    assert_eq!(coordinate.as_str(), "coordinate-1");
-                    assert_eq!(evidence.as_str(), "schema-1");
-                    Ok("repaired".to_string())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_coordinate, evidence, _repair| {
-                    steps.borrow_mut().push("converge_schema");
-                    assert_eq!(evidence.as_str(), "schema-1");
-                    Ok("converged".to_string())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_coordinate, evidence, _repair, _schema| {
-                    steps.borrow_mut().push("commit");
-                    assert_eq!(evidence.as_str(), "schema-1");
-                    Ok(())
-                }
-            },
-        );
-
-        assert_eq!(result, Ok(()));
-        assert_eq!(source_evidence.borrow().as_deref(), Some("schema-1"));
-        assert_eq!(
-            steps.borrow().as_slice(),
-            [
-                "coordinate",
-                "source_evidence",
-                "reconcile_data",
-                "converge_schema",
-                "commit"
-            ]
-        );
-    }
-
-    #[test]
-    fn recovery_repairs_target_orphans_before_schema_fk_convergence() {
-        let steps = Rc::new(RefCell::new(Vec::new()));
-        let target_has_orphans = Rc::new(RefCell::new(true));
-
-        let result = run_recovery_phases(
-            {
-                let steps = Rc::clone(&steps);
-                move || {
-                    steps.borrow_mut().push("snapshot");
-                    Ok(())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                let target_has_orphans = Rc::clone(&target_has_orphans);
-                move |_snapshot| {
-                    steps.borrow_mut().push("reconcile_data");
-                    target_has_orphans.replace(false);
-                    Ok(())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                let target_has_orphans = Rc::clone(&target_has_orphans);
-                move |_snapshot, _repair| {
-                    steps.borrow_mut().push("converge_schema");
-                    if *target_has_orphans.borrow() {
-                        return Err("MySQL 1452: target FK has orphan rows".to_string());
-                    }
-                    Ok(())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_snapshot, _repair, _schema| {
-                    steps.borrow_mut().push("commit");
-                    Ok(())
-                }
-            },
-        );
-
-        assert_eq!(result, Ok(()));
-        assert_eq!(
-            steps.borrow().as_slice(),
-            ["snapshot", "reconcile_data", "converge_schema", "commit"]
-        );
-    }
-
-    #[test]
-    fn recovery_schema_failure_stops_before_commit() {
-        let steps = Rc::new(RefCell::new(Vec::new()));
-        let result = run_recovery_phases(
-            {
-                let steps = Rc::clone(&steps);
-                move || {
-                    steps.borrow_mut().push("snapshot");
-                    Ok(())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_snapshot| {
-                    steps.borrow_mut().push("reconcile_data");
-                    Ok(())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_snapshot, _repair| {
-                    steps.borrow_mut().push("converge_schema");
-                    Err::<(), String>("legacy table drop failed".to_string())
-                }
-            },
-            {
-                let steps = Rc::clone(&steps);
-                move |_snapshot, _repair, _schema| {
-                    steps.borrow_mut().push("commit");
-                    Ok(())
-                }
-            },
-        );
-
-        assert_eq!(result, Err("legacy table drop failed".to_string()));
-        assert_eq!(
-            steps.borrow().as_slice(),
-            ["snapshot", "reconcile_data", "converge_schema"]
-        );
-    }
-
-    #[test]
-    fn final_target_inventory_extras_block_recovery_proof() {
-        let source = inventory_with_table_names(&["llm_conversations", "llm_messages"]);
-        let target = inventory_with_table_names(&[
-            "llm_conversations",
-            "llm_messages",
-            "capy_conversations",
-        ]);
-
-        let error = require_exact_table_inventory(&source, &target)
-            .expect_err("target-only table must block recovery proof");
-
-        assert!(error.contains("capy_conversations"));
     }
 
     #[test]
@@ -2080,29 +1804,6 @@ mod tests {
         assert!(sql.contains("recovery.old_barrier_start_position = journal.event_start_position"));
         assert!(sql.contains("recovery.old_barrier_end_position = journal.event_end_position"));
         assert!(sql.contains("recovery.old_barrier_raw_sql_sha256 = SHA2(journal.raw_sql, 256)"));
-    }
-
-    fn inventory_with_table_names(names: &[&str]) -> SchemaInventory {
-        SchemaInventory {
-            schema: "globalcomix".to_string(),
-            tables: names
-                .iter()
-                .map(|name| crate::inventory::TableInventory {
-                    name: (*name).to_string(),
-                    table_type: "BASE TABLE".to_string(),
-                    engine: Some("InnoDB".to_string()),
-                    collation: None,
-                    primary_key: vec!["id".to_string()],
-                    columns: Vec::new(),
-                })
-                .collect(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            views: Vec::new(),
-            triggers: Vec::new(),
-            routines: Vec::new(),
-            events: Vec::new(),
-        }
     }
 
     fn checkpoint(file: &str, position: u64) -> Checkpoint {
