@@ -1,6 +1,6 @@
 # Unified source-authoritative synchronization
 
-The unified synchronization engine runs prerequisite schema convergence, source-authoritative row synchronization, and final constraint convergence under one immutable run identity. The production `sync` command and migration of existing callers remain in progress; operator usage belongs in the eventual sync runbook.
+The unified synchronization engine runs prerequisite schema convergence, source-authoritative row synchronization, and final constraint convergence under one immutable run identity. The production `sync` command exposes this orchestration for selected source tables; migration of existing callers remains in progress. Operator usage belongs in the sync runbook.
 
 ## What it must do
 
@@ -19,7 +19,8 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - [x] Convert the selected source inventory into deterministic sync-table definitions.
 - [x] Reject an empty or duplicated selection and reject a selected child whose same-schema source parent is outside the selection.
 - [x] Invoke bounded row workers between the two schema stages.
-- [ ] Wire the orchestration to the single `sync` CLI and remove the obsolete command names rather than aliasing them.
+- [x] Expose the orchestration through one `sync` CLI and reject `catchup-snapshot`, `sync-table`, and `repair-drift` as unknown commands rather than aliasing them.
+- [x] Require exactly one immutable `--run-id` or `--run-id-prefix`; default progress persistence to `cdc.sync_runs` and support repeated `--table`, `--chunk-size`, `--parallelism`, and `--progress-table` options.
 - [ ] Route lost-binlog recovery, resync, catalog, and other callers through unified sync.
 
 ### Schema and progress contracts
@@ -37,6 +38,8 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 
 ## Implementation inventory
 
+- `src/main.rs` — registers the unified `sync` command and excludes obsolete command names from dispatch/help.
+- `src/sync_cli.rs` — parses the unified sync endpoint, scope, runtime, progress, and immutable run-identity options.
 - `src/sync/orchestrate.rs` — stage ordering, immutable progress validation, resumable stage persistence, source-scope selection, and production executor wiring.
 - `src/sync/run.rs` — bounded deterministic row-table execution.
 - `src/sync/chunk.rs` — locked source/target chunk mutation and progress boundary.
@@ -46,6 +49,8 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 
 ## Tests asserting this spec
 
+- `tests/sync_cli.rs` — unified help/dispatch, obsolete-command rejection, accepted options, and obsolete-flag rejection.
+- `src/main/tests/sync_cli_config.rs` — endpoint, scope, defaults, runtime options, and exclusive immutable run identity parsing.
 - `src/main/tests/sync_orchestrator.rs` — stage order, resume behavior, immutable progress identity, table-selection validation, error persistence, and row-failure cutoff.
 - `src/main/tests/sync_runner.rs` — bounded deterministic table execution and completion behavior.
 - `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering and checkpoint boundary.
@@ -53,7 +58,6 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 
 ## Known gaps (current cycle)
 
-- [ ] Add the unified CLI parser, help, dispatch, and obsolete-command rejection.
 - [ ] Migrate recovery, resync, catalog, scripts, fixtures, grants, harnesses, and ops callers.
 - [ ] Delete legacy production engines and progress paths.
 - [ ] Run full-project tests, Clippy without warning suppression, and final integration verification.

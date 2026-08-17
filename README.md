@@ -193,13 +193,12 @@ cargo run -- stream-binlog --source-host 127.0.0.1 --source-user repl \
   --target-password-env TARGET_PASSWORD --target-database app \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem
 
-cargo run -- sync-table --source-host 127.0.0.1 --source-user reader \
+cargo run -- sync --source-host 127.0.0.1 --source-user reader \
   --source-password-env SOURCE_PASSWORD --source-database app \
   --target-host 127.0.0.1 --target-user writer \
   --target-password-env TARGET_PASSWORD --target-database app \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
-  --table accounts --primary-key id --columns id,email,updated_at \
-  --mode apply --run-id accounts-repair-20260710-01
+  --table accounts --run-id accounts-sync-20260817-01
 
 cargo run -- table-catalog \
   --source-host 127.0.0.1 --source-user reader \
@@ -218,6 +217,14 @@ cargo run -- sync-catalog \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
   --catalog syncable-tables.json --run-id-prefix catalog-20260722
 ```
+
+`sync` derives table columns and primary-key ordering from source inventory. Repeat
+`--table` for a closed source scope and provide exactly one immutable `--run-id`
+or `--run-id-prefix`; the progress table defaults to `cdc.sync_runs`. The command
+runs prerequisite schema convergence, source-authoritative locked row chunks, and
+final constraint convergence as one staged operation. The obsolete
+`catchup-snapshot`, `sync-table`, and `repair-drift` names are not aliases and are
+rejected as unknown commands.
 
 `stream-binlog --target-parallel-transactions N` enables bounded target
 transaction submission when `N > 1`; the default `1` preserves serial execution.
@@ -340,16 +347,6 @@ catalog comparison in dependency-safe chunks, verify each deletion, and persist
 progress only after verification. The same unconditional chunk reconciliation
 applies to direct `sync-table` and `repair-drift`; the non-syncable catalog is
 classification/operator input only; full-dump execution is out of scope.
-
-```bash
-cargo run -- catchup-snapshot \
-  --source-host 127.0.0.1 --source-user reader \
-  --source-password-env SOURCE_PASSWORD --source-database app \
-  --target-host 127.0.0.1 --target-user writer \
-  --target-password-env TARGET_PASSWORD --target-database app \
-  --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
-  --progress-file /var/lib/mariadb-mysql-cdc/snapshot-progress.json
-```
 
 ## TLS policy
 
