@@ -185,6 +185,13 @@ BEGIN
             AND NEW.pre_state <> ''
             AND NEW.expected_post_state <> '')
            OR
+           (OLD.status = 'blocked'
+            AND NEW.status = 'applied'
+            AND NEW.transformation_version <> ''
+            AND NEW.canonical_ast <> ''
+            AND NEW.pre_state <> ''
+            AND NEW.expected_post_state <> '')
+           OR
            ((OLD.transformation_version <=> NEW.transformation_version)
             AND (OLD.generated_sql <=> NEW.generated_sql)
             AND (OLD.canonical_ast <=> NEW.canonical_ast)

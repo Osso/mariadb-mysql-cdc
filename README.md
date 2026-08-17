@@ -283,6 +283,18 @@ The opt-in path fails closed before checkpoint advancement on a delayed target
 error. It is not ready for a workload that still depends on immediate per-row
 conflict classification.
 
+Run the disposable Connector/C/TLS proof with:
+
+```sh
+python3 scripts/cdc-integration-harness.py --scenario parallel-target-transactions
+```
+
+The scenario pauses the first worker after Connector/C accepts its body, pauses
+the second after its result is drained, verifies every target session uses
+`SSL/TLS`, and confirms rows plus the checkpoint remain invisible before ordered
+commit. Releasing both test-only barriers must produce exact row and checkpoint
+convergence.
+
 ### Table catalog JSON and execution contract
 
 `table-catalog` writes two pretty JSON objects, each with a top-level `tables`

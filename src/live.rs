@@ -76,6 +76,7 @@ pub enum IntegrationFailpoint {
     SourceConnectionLoss,
     TargetConnectionLoss,
     FailedRunClaimRevalidated,
+    ParallelTargetSubmission,
 }
 
 #[cfg(feature = "integration-failpoints")]
@@ -89,6 +90,7 @@ impl IntegrationFailpoint {
             "source-connection-loss" => Ok(Self::SourceConnectionLoss),
             "target-connection-loss" => Ok(Self::TargetConnectionLoss),
             "failed-run-claim-revalidated" => Ok(Self::FailedRunClaimRevalidated),
+            "parallel-target-submission" => Ok(Self::ParallelTargetSubmission),
             other => Err(format!("unknown integration failpoint: {other}")),
         }
     }
@@ -102,6 +104,7 @@ impl IntegrationFailpoint {
             Self::SourceConnectionLoss => 5,
             Self::TargetConnectionLoss => 6,
             Self::FailedRunClaimRevalidated => 7,
+            Self::ParallelTargetSubmission => 8,
         }
     }
 }

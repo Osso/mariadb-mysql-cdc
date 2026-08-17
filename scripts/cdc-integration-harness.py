@@ -65,6 +65,7 @@ SCENARIOS = (
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("catchup-snapshot-tls", True),
+    ScenarioSpec("parallel-target-transactions", True),
     ScenarioSpec("missing-checkpoint", True),
     ScenarioSpec("missing-trigger", True),
     ScenarioSpec("missing-conflict-trigger", True),
@@ -577,6 +578,7 @@ class Harness:
         logical_start: Coordinate | None = None,
         logical_checkpoint: Coordinate | None = None,
         logical_end: Coordinate | None = None,
+        target_parallel_transactions: int = 1,
     ) -> list[str]:
         assert self.source and self.target
         args = [
@@ -632,6 +634,8 @@ class Harness:
                     str(logical_end.position),
                 ]
             )
+        if target_parallel_transactions > 1:
+            args.extend(["--target-parallel-transactions", str(target_parallel_transactions)])
         return args
 
     def run_stream(
@@ -645,6 +649,7 @@ class Harness:
         logical_start: Coordinate | None = None,
         logical_checkpoint: Coordinate | None = None,
         logical_end: Coordinate | None = None,
+        target_parallel_transactions: int = 1,
     ) -> CommandResult:
         build_feature = integration_failpoint
         if logical_start is not None:
@@ -664,6 +669,7 @@ class Harness:
                 logical_start,
                 logical_checkpoint,
                 logical_end,
+                target_parallel_transactions,
             ),
             env=env,
             timeout=90,
@@ -926,6 +932,7 @@ class Harness:
         max_reconnects: int = 0,
         barrier_dir: Path | None = None,
         label: str = "stream",
+        target_parallel_transactions: int = 1,
     ) -> tuple[subprocess.Popen[str], Path]:
         binary = self._stream_binary(integration_failpoint)
         env = {**os.environ, "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD, "CDC_TARGET_PASSWORD": TARGET_PASSWORD}
@@ -934,7 +941,14 @@ class Harness:
         log_path = self.tempdir / f"{label}.log"
         log = log_path.open("w")
         process = subprocess.Popen(
-            self._stream_args(binary, start, stop, integration_failpoint, max_reconnects),
+            self._stream_args(
+                binary,
+                start,
+                stop,
+                integration_failpoint,
+                max_reconnects,
+                target_parallel_transactions=target_parallel_transactions,
+            ),
             cwd=self.repo,
             env=env,
             stdout=log,
@@ -1457,6 +1471,101 @@ class Harness:
             "sync_table_wrong_source_ca_rejected=true "
             "wrong_source_ca_rejected=true wrong_target_ca_rejected=true "
             "parallel_workers=2 completed_rerun_noop=true"
+        )
+
+    def assert_parallel_target_commit_barrier(self, start: Coordinate) -> None:
+        assert self.target
+        visible = self.query(
+            self.target,
+            "SELECT COUNT(*) FROM accounts;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if visible != "0":
+            raise HarnessError(f"parallel target exposed an uncommitted row: {visible}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != start.file or int(
+            checkpoint.get("source_position", 0)
+        ) != start.position:
+            raise HarnessError(
+                f"parallel target advanced checkpoint before ordered commit: {checkpoint}"
+            )
+
+    def run_parallel_target_transactions(self) -> None:
+        assert self.source and self.target
+        self.setup_accounts_table()
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');",
+        )
+        self.admin_sql(
+            self.source,
+            "INSERT INTO accounts VALUES (2, 'two@example.test', 'two');",
+        )
+        stop = self.coordinate()
+
+        first_boundary = "parallel-target-first-body-submitted"
+        second_boundary = "parallel-target-second-body-drained"
+        barrier_dir = self.tempdir / "parallel-target-transactions-barrier"
+        stream, _log = self.start_stream(
+            start,
+            stop,
+            integration_failpoint="parallel-target-submission",
+            barrier_dir=barrier_dir,
+            label="parallel-target-transactions",
+            target_parallel_transactions=2,
+        )
+        proof_ready = False
+        try:
+            self.wait_for_barrier(stream, barrier_dir, first_boundary)
+            self.wait_for_barrier(stream, barrier_dir, second_boundary)
+            tls_evidence = self.admin_query(
+                self.target,
+                "SELECT COUNT(*),"
+                "COALESCE(SUM(CONNECTION_TYPE='SSL/TLS'),0) "
+                "FROM performance_schema.threads "
+                "WHERE PROCESSLIST_USER='cdc_stream';",
+            ).strip()
+            total_connections, tls_connections = [
+                int(value) for value in tls_evidence.split("\t")
+            ]
+            if total_connections < 3 or tls_connections != total_connections:
+                raise HarnessError(
+                    "parallel target worker connections were not all TLS: "
+                    f"total={total_connections} tls={tls_connections}"
+                )
+            self.assert_parallel_target_commit_barrier(start)
+            proof_ready = True
+        finally:
+            for boundary in (second_boundary, first_boundary):
+                if (barrier_dir / f"{boundary}.ready").is_file():
+                    self.release_barrier(barrier_dir, boundary)
+            if not proof_ready and stream.poll() is None:
+                stream.terminate()
+                stream.wait(timeout=10)
+
+        result = self.finish_stream(stream)
+        require_success(result, "parallel target Connector/C stream")
+        rows = self.query(
+            self.target,
+            "SELECT id,email,payload FROM accounts ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        expected = "1\tone@example.test\tone\n2\ttwo@example.test\ttwo"
+        if rows != expected:
+            raise HarnessError(f"parallel target rows did not converge: {rows!r}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(
+            checkpoint.get("source_position", 0)
+        ) != stop.position:
+            raise HarnessError(f"parallel target checkpoint did not reach exact stop: {checkpoint}")
+        print(
+            "parallel_target_transactions_ok workers=2 connector=mariadb "
+            f"tls_connections={tls_connections} "
+            f"checkpoint={stop.file}:{stop.position}"
         )
 
     def run_strict_secondary_btree(self) -> None:
@@ -5231,6 +5340,8 @@ class Harness:
             self.run_bootstrap_contract()
         elif scenario == "catchup-snapshot-tls":
             self.run_catchup_snapshot_tls()
+        elif scenario == "parallel-target-transactions":
+            self.run_parallel_target_transactions()
         elif scenario in {
             "missing-checkpoint",
             "missing-trigger",

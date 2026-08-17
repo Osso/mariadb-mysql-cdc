@@ -105,6 +105,11 @@ identity matching stops immediately.
   and stream completion as barriers that wait for pending target transactions.
 - [x] Poison the parallel pool on body or commit failure. Do not dispatch later
   commits or advance past the last successfully committed checkpoint.
+- [x] Prove the Connector/C path against disposable real MariaDB/MySQL endpoints:
+  pause the first worker after client-side body submission, pause the second after
+  result draining, observe only `SSL/TLS` target sessions, prove no row or
+  checkpoint is visible before ordered commit, and converge both rows plus the
+  exact stop checkpoint after releasing the test-only barriers.
 - [ ] Carry delayed row errors through the existing per-row conflict classifier.
   The current parallel path fails closed before checkpoint advancement instead;
   this remains a deployment blocker for streams that depend on recoverable
@@ -219,6 +224,12 @@ identity matching stops immediately.
   source/target recovery proof.
 - `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
   selection remain source-identity scoped.
+- `scripts/cdc-integration-harness.py --scenario parallel-target-transactions` —
+  runs the production binary with `--target-parallel-transactions 2` against a
+  TLS-required MySQL target. Test-only barriers expose the first accepted body
+  before result reading and the later drained body before commit dispatch; the
+  scenario verifies all target sessions are `SSL/TLS`, checks the row/checkpoint
+  barrier, releases both workers, and verifies ordered convergence.
 
 ## Known gaps (current cycle)
 

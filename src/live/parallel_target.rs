@@ -507,7 +507,21 @@ where
     if submitted.send(Ok(())).is_err() {
         return false;
     }
+    #[cfg(feature = "integration-failpoints")]
+    if sequence == 0 {
+        super::wait_for_integration_barrier(
+            super::IntegrationFailpoint::ParallelTargetSubmission,
+            "parallel-target-first-body-submitted",
+        );
+    }
     let result = connection.read_query_result();
+    #[cfg(feature = "integration-failpoints")]
+    if sequence == 1 && result.is_ok() {
+        super::wait_for_integration_barrier(
+            super::IntegrationFailpoint::ParallelTargetSubmission,
+            "parallel-target-second-body-drained",
+        );
+    }
     events
         .send(WorkerEvent::Prepared {
             worker,
