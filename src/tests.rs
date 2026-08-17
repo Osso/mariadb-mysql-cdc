@@ -55,6 +55,8 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "25",
         "--target-transaction-group-timeout-ms",
         "500",
+        "--target-parallel-transactions",
+        "8",
         "--stop-never-slave-server-id",
         "4242",
     ]))
@@ -82,6 +84,7 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
     assert!(config.reconnect_forever);
     assert_eq!(config.target_transaction_group_size, 25);
     assert_eq!(config.target_transaction_group_timeout_ms, 500);
+    assert_eq!(config.target_parallel_transactions, 8);
     assert_eq!(config.source.stop_never_slave_server_id, Some(4242));
 }
 
@@ -96,6 +99,8 @@ fn parses_apply_binlog_runtime_options_individually() {
         .expect("transaction group size");
     apply_binlog_option(&mut config, "--target-transaction-group-timeout-ms", "500")
         .expect("transaction group timeout");
+    apply_binlog_option(&mut config, "--target-parallel-transactions", "8")
+        .expect("parallel transactions");
     apply_binlog_option(&mut config, "--stop-never-slave-server-id", "4242")
         .expect("slave server id");
 
@@ -104,6 +109,7 @@ fn parses_apply_binlog_runtime_options_individually() {
     assert!(config.reconnect_forever);
     assert_eq!(config.target_transaction_group_size, 25);
     assert_eq!(config.target_transaction_group_timeout_ms, 500);
+    assert_eq!(config.target_parallel_transactions, 8);
     assert_eq!(config.source.stop_never_slave_server_id, Some(4242));
 }
 
@@ -124,6 +130,11 @@ fn preserves_apply_binlog_option_parse_errors() {
             "--target-transaction-group-size",
             "0",
             "--target-transaction-group-size must be greater than zero",
+        ),
+        (
+            "--target-parallel-transactions",
+            "0",
+            "--target-parallel-transactions must be greater than zero",
         ),
         (
             "--stop-never-slave-server-id",

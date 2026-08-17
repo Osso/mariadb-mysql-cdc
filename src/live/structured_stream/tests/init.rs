@@ -105,6 +105,32 @@ fn bounded_completion_flushes_completed_grouped_target_work() {
 }
 
 #[test]
+fn parallel_progress_advances_only_from_committed_checkpoints() {
+    let mut progress = StreamProgress::new(BinlogCoordinate {
+        file: "mysqld-bin.000777".to_string(),
+        position: 4,
+    });
+    let checkpoints = [180, 260]
+        .into_iter()
+        .map(|position| crate::checkpoint::Checkpoint {
+            source_file: "mysqld-bin.000777".to_string(),
+            source_position: position,
+            gtid: None,
+            event_timestamp: 0,
+            last_event: crate::checkpoint::LastEvent {
+                event_type: "XidEvent".to_string(),
+                description: "committed parallel target transaction".to_string(),
+            },
+        })
+        .collect();
+
+    record_committed_target_progress(&mut progress, checkpoints);
+
+    assert_eq!(progress.applied_statements, 2);
+    assert_eq!(progress.last_coordinate.position, 260);
+}
+
+#[test]
 fn source_inventory_uses_explicit_plaintext_without_ca() {
     let config = ApplyBinlogConfig {
         source: SourceBinlogConfig {

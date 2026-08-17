@@ -86,15 +86,38 @@ pub(super) fn stream_once(
     if let Some(source_file) = &config.integration_logical_source_file {
         runtime.current_file.clone_from(source_file);
     }
-    while let Ok(result) = runtime.event_receiver.recv() {
+    loop {
+        let result = if runtime.durable_progress.is_some() {
+            match runtime
+                .event_receiver
+                .recv_timeout(PARALLEL_TARGET_RESULT_POLL_INTERVAL)
+            {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    reap_parallel_target_transactions(&mut runtime)?;
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match runtime.event_receiver.recv() {
+                Ok(result) => result,
+                Err(_) => break,
+            }
+        };
         let (header, event, source_position) = match result {
             Ok(event) => event,
             Err(error) => {
-                rollback_stream_transaction(&mut runtime)?;
+                let target_result = reap_parallel_target_transactions(&mut runtime);
+                let rollback_result = rollback_stream_transaction(&mut runtime);
+                target_result?;
+                rollback_result?;
+                wait_for_parallel_target_transactions(&mut runtime)?;
                 return Err(source_error(error));
             }
         };
-        let stop_decision = process_stream_event(
+        reap_parallel_target_transactions(&mut runtime)?;
+        let process_result = process_stream_event(
             config,
             &mut runtime,
             StreamCheckpointContext {
@@ -107,7 +130,9 @@ pub(super) fn stream_once(
                 event: &event,
                 source_position,
             },
-        )?;
+        );
+        reap_parallel_target_transactions(&mut runtime)?;
+        let stop_decision = process_result?;
         if stop_decision == StopPositionDecision::DispatchAndStop {
             return complete_bounded_stop(
                 &mut runtime,
@@ -137,6 +162,7 @@ pub(super) struct StreamRuntime {
     current_file: String,
     state: StructuredEventState,
     progress: StreamProgress,
+    durable_progress: Option<StreamProgress>,
     target_transaction: TargetTransaction,
     group_config: TargetTransactionGroupConfig,
     source_identity: String,
@@ -149,6 +175,14 @@ impl StreamRuntime {
         let semantic_inventory = initialize_semantic_inventory(config)?;
         let schema_resolver = TargetInventorySchemaResolver::new(config);
         let (event_receiver, current_file) = start_binlog_receiver(config)?;
+        let start_coordinate = BinlogCoordinate {
+            file: config.source.binlog_file.clone(),
+            position: config.source.start_position,
+        };
+        let durable_progress = applier
+            .executor()
+            .uses_parallel_transactions()
+            .then(|| StreamProgress::new(start_coordinate.clone()));
         Ok(Self {
             applier,
             conflict_store,
@@ -158,10 +192,8 @@ impl StreamRuntime {
             event_receiver,
             current_file,
             state: StructuredEventState::new(config.source.database.clone()),
-            progress: StreamProgress::new(BinlogCoordinate {
-                file: config.source.binlog_file.clone(),
-                position: config.source.start_position,
-            }),
+            progress: StreamProgress::new(start_coordinate),
+            durable_progress,
             target_transaction: TargetTransaction::default(),
             group_config: TargetTransactionGroupConfig::from_apply_config(config),
             source_identity: config.source_identity.clone(),
@@ -180,7 +212,7 @@ fn initialize_target_services(
     ),
     ApplyBinlogError,
 > {
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
+    let executor = crate::mysql_client::PersistentTargetExecutor::new_for_stream(config)
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
     let conflict_store = MySqlConflictStore::new(&config.target, config.conflict_table.clone())
         .map_err(ApplyBinlogError::Checkpoint)?;
@@ -324,12 +356,14 @@ where
     );
     let mut progress = runtime.progress.clone();
     let mut source_row_transaction_open = runtime.source_row_transaction_open;
+    let record_progress = runtime.durable_progress.is_none();
     let result = process_stream_event_core_after_stop_decision(
         &mut state,
         &mut progress,
         &mut source_row_transaction_open,
         input,
         stop_decision,
+        record_progress,
         |state, input| dispatch_stream_event(config, runtime, state, &checkpoint, input),
     );
     runtime.state = state;
@@ -375,6 +409,7 @@ where
         source_row_transaction_open,
         input,
         stop_decision,
+        true,
         dispatch,
     )
 }
@@ -385,6 +420,7 @@ fn process_stream_event_core_after_stop_decision<D>(
     source_row_transaction_open: &mut bool,
     input: SourceStreamEvent<'_>,
     stop_decision: StopPositionDecision,
+    record_progress: bool,
     mut dispatch: D,
 ) -> Result<(StopPositionDecision, StructuredEventOutcome), ApplyBinlogError>
 where
@@ -395,7 +431,9 @@ where
 {
     state.record_event_position(input.source_position);
     let outcome = dispatch(state, input)?;
-    log_stream_progress(progress, &outcome);
+    if record_progress {
+        log_stream_progress(progress, &outcome);
+    }
     update_source_row_transaction_state(source_row_transaction_open, input.event);
     Ok((stop_decision, outcome))
 }
@@ -524,6 +562,7 @@ where
 {
     if let Err(error) = bounded_stop_completion_error(runtime.source_row_transaction_open) {
         rollback_stream_transaction(runtime)?;
+        wait_for_parallel_target_transactions(runtime)?;
         return Err(error);
     }
     flush_stream_grouped_transaction(
@@ -532,7 +571,7 @@ where
         transaction_checkpoint_table,
         transaction_checkpoint_name,
     )?;
-    Ok(())
+    wait_for_parallel_target_transactions(runtime)
 }
 
 pub(super) fn finish_stream<C>(
@@ -547,6 +586,7 @@ where
 {
     if let Some(stop_position) = config.source.stop_position {
         rollback_stream_transaction(runtime)?;
+        wait_for_parallel_target_transactions(runtime)?;
         return Err(bounded_stop_not_reached_error(stop_position));
     }
     flush_stream_grouped_transaction(
@@ -555,6 +595,7 @@ where
         transaction_checkpoint_table,
         transaction_checkpoint_name,
     )?;
+    wait_for_parallel_target_transactions(runtime)?;
     Err(stream_ended_error())
 }
 
@@ -595,6 +636,46 @@ pub(super) fn rollback_stream_transaction(
     runtime
         .target_transaction
         .rollback_if_open(runtime.applier.executor())
+}
+
+fn wait_for_parallel_target_transactions(
+    runtime: &mut StreamRuntime,
+) -> Result<(), ApplyBinlogError> {
+    runtime
+        .applier
+        .executor()
+        .flush_pending_transactions()
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    reap_parallel_target_transactions(runtime)
+}
+
+fn reap_parallel_target_transactions(runtime: &mut StreamRuntime) -> Result<(), ApplyBinlogError> {
+    let checkpoints = runtime
+        .applier
+        .executor()
+        .take_committed_checkpoints()
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
+    let Some(progress) = runtime.durable_progress.as_mut() else {
+        debug_assert!(checkpoints.is_empty());
+        return Ok(());
+    };
+    record_committed_target_progress(progress, checkpoints);
+    Ok(())
+}
+
+pub(super) fn record_committed_target_progress(
+    progress: &mut StreamProgress,
+    checkpoints: Vec<crate::checkpoint::Checkpoint>,
+) {
+    for checkpoint in checkpoints {
+        let coordinate = BinlogCoordinate {
+            file: checkpoint.source_file,
+            position: checkpoint.source_position,
+        };
+        if progress.record_applied(&coordinate) {
+            println!("{}", format_stream_progress(progress));
+        }
+    }
 }
 
 type BinlogEventResult = Result<(EventHeader, BinlogEvent, u64), MysqlCdcError>;

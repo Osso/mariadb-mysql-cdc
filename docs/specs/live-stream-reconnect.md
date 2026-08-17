@@ -88,6 +88,28 @@ source uses explicit plaintext mode from the start. Target TLS configuration is
 separate; failed target CA loading, chain validation, or required DNS/hostname
 identity matching stops immediately.
 
+### Parallel target transactions
+
+- [x] Preserve serial target execution by default. Parallel submission requires
+  explicit `--target-parallel-transactions N` with `N > 1`.
+- [x] Bound concurrency to `N` leased target connections. One complete source
+  transaction stays on one connection from `BEGIN` through `COMMIT`; a connection
+  is not reusable until its final result is drained.
+- [x] Submit one `BEGIN` plus DML batch per source transaction and release the
+  ingestion path after the client send succeeds, without waiting for execution
+  completion.
+- [x] Drain transaction bodies concurrently, but dispatch checkpoint plus
+  `COMMIT` strictly in source order. A later transaction must never commit or
+  advance the durable checkpoint before every earlier transaction succeeds.
+- [x] Treat DDL, synchronous target reads, direct checkpoint writes, bounded stop,
+  and stream completion as barriers that wait for pending target transactions.
+- [x] Poison the parallel pool on body or commit failure. Do not dispatch later
+  commits or advance past the last successfully committed checkpoint.
+- [ ] Carry delayed row errors through the existing per-row conflict classifier.
+  The current parallel path fails closed before checkpoint advancement instead;
+  this remains a deployment blocker for streams that depend on recoverable
+  duplicate, supersession, or foreign-key conflict handling.
+
 ### Durable checkpointing
 
 - [x] Persist the last successfully applied binlog file and position outside the

@@ -546,6 +546,7 @@ struct TransactionRecordingExecutor {
     fail_execute: bool,
     fail_rollback: bool,
     fail_discard: bool,
+    record_pending_flush: bool,
     fail_row_change_number: Option<usize>,
     duplicate_row_change_number: Option<usize>,
     duplicate_mode: DuplicateMode,
@@ -560,6 +561,7 @@ impl Default for TransactionRecordingExecutor {
             fail_execute: false,
             fail_rollback: false,
             fail_discard: false,
+            record_pending_flush: false,
             fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::Equal,
@@ -585,6 +587,7 @@ impl TransactionRecordingExecutor {
             fail_execute: false,
             fail_rollback: false,
             fail_discard: false,
+            record_pending_flush: false,
             fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::Equal,
@@ -608,6 +611,7 @@ impl TransactionRecordingExecutor {
             fail_execute: true,
             fail_rollback: false,
             fail_discard: false,
+            record_pending_flush: false,
             fail_row_change_number: None,
             duplicate_row_change_number: None,
             duplicate_mode: DuplicateMode::DefaultError,
@@ -619,6 +623,13 @@ impl TransactionRecordingExecutor {
     fn with_locked_checkpoint(checkpoint: crate::checkpoint::Checkpoint) -> Self {
         Self {
             locked_checkpoint: Some(checkpoint),
+            ..Self::default()
+        }
+    }
+
+    fn with_pending_flush() -> Self {
+        Self {
+            record_pending_flush: true,
             ..Self::default()
         }
     }
@@ -875,6 +886,13 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
             return Err(crate::target::TargetExecuteError::new(
                 "forced discard failure",
             ));
+        }
+        Ok(())
+    }
+
+    fn flush_pending_transactions(&self) -> Result<(), crate::target::TargetExecuteError> {
+        if self.record_pending_flush {
+            self.operations.borrow_mut().push("FLUSH");
         }
         Ok(())
     }

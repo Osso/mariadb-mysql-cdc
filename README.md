@@ -15,6 +15,14 @@ target with minimal downtime.
 - Stop or quarantine unsupported data-changing events with exact coordinates.
 - Keep the target out of service until repeated reconciliation proves parity.
 
+## Build prerequisites
+
+Parallel target submission uses MariaDB Connector/C through `mysqlclient-sys` so
+query send and result completion remain separate operations. Local builds require
+`pkg-config` plus MariaDB client development files. The Docker builder installs
+`libmariadb-dev`; the selected runtime `BASE_IMAGE` must provide
+`libmariadb.so.3`.
+
 ## Deployment
 
 `deploy.sh` requires `IMAGE_REPO` and `BASE_IMAGE`:
@@ -268,6 +276,12 @@ cargo run -- sync-catalog \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
   --catalog syncable-tables.json --run-id-prefix catalog-20260722
 ```
+
+`stream-binlog --target-parallel-transactions N` enables bounded target
+transaction submission when `N > 1`; the default `1` preserves serial execution.
+The opt-in path fails closed before checkpoint advancement on a delayed target
+error. It is not ready for a workload that still depends on immediate per-row
+conflict classification.
 
 ### Table catalog JSON and execution contract
 

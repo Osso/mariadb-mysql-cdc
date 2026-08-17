@@ -2724,8 +2724,9 @@ fn query_dml_does_not_open_or_checkpoint_target_transaction() {
 }
 
 #[test]
-fn file_checkpoint_waits_until_after_target_commit() {
-    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+fn file_checkpoint_waits_until_after_pending_target_commits() {
+    let mut applier =
+        crate::row::RowApplier::new(TransactionRecordingExecutor::with_pending_flush());
     let checkpoint_store = RecordingCheckpointStore::new(applier.executor().shared_operations());
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -2763,8 +2764,41 @@ fn file_checkpoint_waits_until_after_target_commit() {
 
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "COMMIT", "CHECKPOINT"]
+        ["BEGIN", "EXEC", "COMMIT", "FLUSH", "CHECKPOINT"]
     );
+}
+
+#[test]
+fn direct_checkpoint_waits_for_pending_target_commits() {
+    let executor = TransactionRecordingExecutor::with_pending_flush();
+    let checkpoint_store = RecordingCheckpointStore::new(executor.shared_operations());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&checkpoint_store),
+        transaction_checkpoint_table: None,
+        transaction_checkpoint_name: None,
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    let event = BinlogEvent::XidEvent(XidEvent { xid: 42 });
+    let outcome = StructuredEventOutcome {
+        policy: EventPolicy::CommitTransaction,
+        resume_coordinate: Some(BinlogCoordinate {
+            file: "mysqld-bin.000777".to_string(),
+            position: 260,
+        }),
+    };
+
+    save_outcome_checkpoint(&executor, &mut context, &event, &outcome)
+        .expect("save direct checkpoint");
+
+    assert_eq!(executor.operations(), ["FLUSH", "CHECKPOINT"]);
 }
 
 #[test]

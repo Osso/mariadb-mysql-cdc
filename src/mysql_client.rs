@@ -1,6 +1,6 @@
 use crate::checkpoint::{Checkpoint, LastEvent};
 use crate::live::{
-    InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
+    ApplyBinlogConfig, InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
     should_replace_divergent_primary,
 };
 use crate::mysql_snapshot::MySqlConnectionConfig;
@@ -25,6 +25,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub(crate) type SharedTargetConnection = Rc<RefCell<Option<Conn>>>;
+type SharedParallelTargetWriter = Rc<
+    RefCell<
+        crate::live::parallel_writer::ParallelTargetWriter<
+            crate::live::submitted_mysql::MariaDbSubmittedQueryFactory,
+        >,
+    >,
+>;
 
 mod connection;
 mod query;
@@ -54,6 +61,7 @@ pub struct PersistentTargetExecutor {
     conn: SharedTargetConnection,
     connection_opts: Opts,
     insert_conflict_policy: InsertConflictPolicy,
+    parallel_writer: Option<SharedParallelTargetWriter>,
 }
 
 pub struct PersistentProgressWriter {
@@ -281,6 +289,20 @@ fn open_initialized_target_connection(opts: Opts) -> Result<Conn, TargetExecuteE
     Ok(conn)
 }
 
+fn parallel_initial_checkpoint(config: &ApplyBinlogConfig) -> Checkpoint {
+    Checkpoint {
+        source_file: config.source.binlog_file.clone(),
+        source_position: config.source.start_position,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: LastEvent {
+            event_type: "ParallelTargetStart".to_string(),
+            description: "source-scoped checkpoint loaded before parallel target dispatch"
+                .to_string(),
+        },
+    }
+}
+
 impl PersistentTargetExecutor {
     pub fn new(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
         Self::new_with_opts(
@@ -296,13 +318,63 @@ impl PersistentTargetExecutor {
         )
     }
 
+    pub(crate) fn new_for_stream(config: &ApplyBinlogConfig) -> Result<Self, TargetExecuteError> {
+        let mut executor = Self::new(&config.target)?;
+        if config.target_parallel_transactions <= 1 {
+            return Ok(executor);
+        }
+        let initial_checkpoint = parallel_initial_checkpoint(config);
+        let factory =
+            crate::live::submitted_mysql::MariaDbSubmittedQueryFactory::new(&config.target);
+        let writer = crate::live::parallel_writer::ParallelTargetWriter::new(
+            config.target_parallel_transactions,
+            factory,
+            initial_checkpoint,
+        )?;
+        executor.parallel_writer = Some(Rc::new(RefCell::new(writer)));
+        Ok(executor)
+    }
+
     fn new_with_opts(config: &TargetMySqlConfig, opts: Opts) -> Result<Self, TargetExecuteError> {
         let conn = open_initialized_target_connection(opts.clone())?;
         Ok(Self {
             conn: Rc::new(RefCell::new(Some(conn))),
             connection_opts: opts,
             insert_conflict_policy: config.insert_conflict_policy,
+            parallel_writer: None,
         })
+    }
+
+    fn parallel_transaction_active(&self) -> bool {
+        self.parallel_writer
+            .as_ref()
+            .is_some_and(|writer| writer.borrow().is_active())
+    }
+
+    fn with_parallel_writer<T>(
+        &self,
+        operation: impl FnOnce(
+            &mut crate::live::parallel_writer::ParallelTargetWriter<
+                crate::live::submitted_mysql::MariaDbSubmittedQueryFactory,
+            >,
+        ) -> Result<T, TargetExecuteError>,
+    ) -> Option<Result<T, TargetExecuteError>> {
+        self.parallel_writer
+            .as_ref()
+            .map(|writer| operation(&mut writer.borrow_mut()))
+    }
+
+    fn wait_for_parallel_transactions(&self) -> Result<(), TargetExecuteError> {
+        self.with_parallel_writer(|writer| writer.wait_for_all())
+            .unwrap_or(Ok(()))
+    }
+
+    fn with_serial_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Conn) -> Result<T, TargetExecuteError>,
+    ) -> Result<T, TargetExecuteError> {
+        self.wait_for_parallel_transactions()?;
+        self.with_connection(operation)
     }
 
     fn with_connection<T>(
@@ -641,7 +713,13 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         ensure_stream_lease_acquired(lease_name, acquired)
     }
 
+    fn begin_stream_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.with_parallel_writer(|writer| writer.begin())
+            .unwrap_or_else(|| self.begin_transaction())
+    }
+
     fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.wait_for_parallel_transactions()?;
         self.execute_transaction_control("BEGIN")
     }
 
@@ -650,11 +728,16 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         checkpoint_table: &str,
         checkpoint_name: &str,
     ) -> Result<Option<Checkpoint>, TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| Ok(Some(writer.logical_checkpoint())))
+                .expect("parallel writer exists while its transaction is active");
+        }
         let sql = crate::stream_checkpoint::build_checkpoint_select_for_update_sql(
             checkpoint_table,
             checkpoint_name,
         );
-        let checkpoint_json = self.with_connection(|conn| {
+        let checkpoint_json = self.with_serial_connection(|conn| {
             conn.query_first::<String, _>(sql)
                 .map_err(target_query_error)
         })?;
@@ -675,13 +758,20 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         checkpoint_name: &str,
         checkpoint: &Checkpoint,
     ) -> Result<(), TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| {
+                    writer.save_checkpoint(checkpoint_table, checkpoint_name, checkpoint)
+                })
+                .expect("parallel writer exists while its transaction is active");
+        }
         let sql = crate::stream_checkpoint::build_checkpoint_upsert_sql_for_checkpoint(
             checkpoint_table,
             checkpoint_name,
             checkpoint,
         )
         .map_err(TargetExecuteError::new)?;
-        self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
+        self.with_serial_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
     }
 
     fn read_locked_supersession_evidence(
@@ -692,12 +782,12 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         historical_identity: &mysql::Value,
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
         let columns_sql = supersession_columns_sql(table);
-        let columns = self.with_connection(|conn| {
+        let columns = self.with_serial_connection(|conn| {
             conn.query::<String, _>(&columns_sql)
                 .map_err(target_query_error)
         })?;
         let sql = build_locked_identity_evidence_sql(&columns, table, identity_column)?;
-        let rows = self.with_connection(|conn| {
+        let rows = self.with_serial_connection(|conn| {
             conn.exec::<mysql::Row, _, _>(
                 sql,
                 Params::Positional(vec![
@@ -718,13 +808,13 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         historical_primary_key: &mysql::Value,
         historical_slug: &mysql::Value,
     ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
-        let columns = self.with_connection(|conn| {
+        let columns = self.with_serial_connection(|conn| {
             conn.query::<String, _>(COMICS_COLUMNS_FOR_SUPERSESSION_SQL)
                 .map_err(target_query_error)
         })?;
         let sql = build_locked_comics_evidence_sql(&columns)?;
         let rows = self
-            .with_connection(|conn| {
+            .with_serial_connection(|conn| {
                 conn.exec::<mysql::Row, _, _>(
                     sql,
                     Params::Positional(vec![
@@ -761,7 +851,7 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
             .iter()
             .map(|(_, value)| value.clone())
             .collect::<Vec<_>>();
-        let rows = self.with_connection(|conn| {
+        let rows = self.with_serial_connection(|conn| {
             conn.exec::<mysql::Row, _, _>(&sql, Params::Positional(params.clone()))
                 .map_err(target_query_error)
         })?;
@@ -789,7 +879,7 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
             .iter()
             .map(|(_, value)| value.clone())
             .collect::<Vec<_>>();
-        let rows = self.with_connection(|conn| {
+        let rows = self.with_serial_connection(|conn| {
             conn.exec::<mysql::Row, _, _>(&sql, Params::Positional(params))
                 .map_err(target_query_error)
         })?;
@@ -797,10 +887,20 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| writer.commit())
+                .expect("parallel writer exists while its transaction is active");
+        }
         self.execute_transaction_control("COMMIT")
     }
 
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| writer.rollback())
+                .expect("parallel writer exists while its transaction is active");
+        }
         self.execute_transaction_control("ROLLBACK")
     }
 
@@ -810,6 +910,19 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         let replacement = open_initialized_target_connection(self.connection_opts.clone())?;
         *self.conn.borrow_mut() = Some(replacement);
         Ok(())
+    }
+
+    fn flush_pending_transactions(&self) -> Result<(), TargetExecuteError> {
+        self.wait_for_parallel_transactions()
+    }
+
+    fn take_committed_checkpoints(&self) -> Result<Vec<Checkpoint>, TargetExecuteError> {
+        self.with_parallel_writer(|writer| writer.take_committed_checkpoints())
+            .unwrap_or(Ok(Vec::new()))
+    }
+
+    fn uses_parallel_transactions(&self) -> bool {
+        self.parallel_writer.is_some()
     }
 }
 
@@ -858,8 +971,13 @@ impl PersistentTargetExecutor {
     }
 
     fn execute_statement(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| writer.execute(statement))
+                .expect("parallel writer exists while its transaction is active");
+        }
         let params = statement.params.clone();
-        self.with_connection(|conn| {
+        self.with_serial_connection(|conn| {
             conn.exec_drop(&statement.sql, Params::Positional(params))
                 .map_err(target_query_error)
         })
@@ -870,7 +988,7 @@ impl PersistentTargetExecutor {
         statement: &SqlStatement,
     ) -> Result<u64, TargetExecuteError> {
         let params = statement.params.clone();
-        self.with_connection(|connection| {
+        self.with_serial_connection(|connection| {
             connection
                 .exec_drop(&statement.sql, Params::Positional(params))
                 .map_err(target_query_error)?;
@@ -889,7 +1007,7 @@ impl PersistentTargetExecutor {
         let Some(retry_sql) = generated_column_retry_sql(statement, &error.to_string()) else {
             return Err(error);
         };
-        self.with_connection(|conn| conn.query_drop(retry_sql).map_err(target_query_error))
+        self.with_serial_connection(|conn| conn.query_drop(retry_sql).map_err(target_query_error))
     }
 
     fn can_ignore_duplicate_insert(&self, sql: &str, error: &str) -> bool {
@@ -916,7 +1034,7 @@ impl PersistentTargetExecutor {
             crate::mysql_support::quote_ident(&change.table),
             predicates.join(" AND ")
         );
-        let rows = self.with_connection(|conn| {
+        let rows = self.with_serial_connection(|conn| {
             conn.exec::<mysql::Row, _, _>(
                 sql,
                 Params::Positional(change.primary_key_values.clone()),

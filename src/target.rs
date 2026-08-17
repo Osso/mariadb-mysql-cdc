@@ -99,6 +99,9 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
     fn acquire_stream_lease(&self, _lease_name: &str) -> Result<(), TargetExecuteError> {
         Ok(())
     }
+    fn begin_stream_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.begin_transaction()
+    }
     fn begin_transaction(&self) -> Result<(), TargetExecuteError>;
     fn load_transaction_checkpoint_for_update(
         &self,
@@ -173,6 +176,15 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
         Err(TargetExecuteError::new(
             "discarding a failed transaction connection is unsupported by this target executor",
         ))
+    }
+    fn flush_pending_transactions(&self) -> Result<(), TargetExecuteError> {
+        Ok(())
+    }
+    fn take_committed_checkpoints(&self) -> Result<Vec<Checkpoint>, TargetExecuteError> {
+        Ok(Vec::new())
+    }
+    fn uses_parallel_transactions(&self) -> bool {
+        false
     }
 }
 
@@ -639,6 +651,10 @@ where
         (*self).acquire_stream_lease(lease_name)
     }
 
+    fn begin_stream_transaction(&self) -> Result<(), TargetExecuteError> {
+        (*self).begin_stream_transaction()
+    }
+
     fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
         (*self).begin_transaction()
     }
@@ -658,6 +674,10 @@ where
         checkpoint: &Checkpoint,
     ) -> Result<(), TargetExecuteError> {
         (*self).save_transaction_checkpoint(checkpoint_table, checkpoint_name, checkpoint)
+    }
+
+    fn execute_transaction_sql(&self, sql: &str) -> Result<(), TargetExecuteError> {
+        (*self).execute_transaction_sql(sql)
     }
 
     fn read_locked_supersession_evidence(
@@ -718,6 +738,18 @@ where
 
     fn discard_failed_transaction_connection(&self) -> Result<(), TargetExecuteError> {
         (*self).discard_failed_transaction_connection()
+    }
+
+    fn flush_pending_transactions(&self) -> Result<(), TargetExecuteError> {
+        (*self).flush_pending_transactions()
+    }
+
+    fn take_committed_checkpoints(&self) -> Result<Vec<Checkpoint>, TargetExecuteError> {
+        (*self).take_committed_checkpoints()
+    }
+
+    fn uses_parallel_transactions(&self) -> bool {
+        (*self).uses_parallel_transactions()
     }
 }
 
@@ -923,6 +955,19 @@ pub fn duplicate_index_from_error(error_text: &str) -> Option<String> {
 }
 
 pub fn render_sql_statement(statement: &SqlStatement) -> Result<String, TargetExecuteError> {
+    render_statement_params(statement, |value| Ok(quote_sql_value(value)))
+}
+
+pub(crate) fn render_submitted_sql_statement(
+    statement: &SqlStatement,
+) -> Result<String, TargetExecuteError> {
+    render_statement_params(statement, quote_submitted_sql_value)
+}
+
+fn render_statement_params(
+    statement: &SqlStatement,
+    quote: impl Fn(&Value) -> Result<String, TargetExecuteError>,
+) -> Result<String, TargetExecuteError> {
     if statement.params.is_empty() {
         return Ok(statement.sql.clone());
     }
@@ -940,7 +985,7 @@ pub fn render_sql_statement(statement: &SqlStatement) -> Result<String, TargetEx
     for segment in statement.sql.split('?') {
         rendered.push_str(segment);
         if let Some(param) = params.next() {
-            rendered.push_str(&quote_sql_value(param));
+            rendered.push_str(&quote(param)?);
         }
     }
 
@@ -1185,6 +1230,45 @@ fn quote_sql_value(value: &Value) -> String {
             ))
         }
     }
+}
+
+fn quote_submitted_sql_value(value: &Value) -> Result<String, TargetExecuteError> {
+    match value {
+        Value::NULL => Ok("NULL".to_string()),
+        Value::Bytes(bytes) => Ok(hex_sql_literal(bytes)),
+        Value::Int(value) => Ok(value.to_string()),
+        Value::UInt(value) => Ok(value.to_string()),
+        Value::Float(value) if value.is_finite() => Ok(value.to_string()),
+        Value::Float(_) => Err(TargetExecuteError::new(
+            "submitted SQL cannot encode a non-finite FLOAT",
+        )),
+        Value::Double(value) if value.is_finite() => Ok(value.to_string()),
+        Value::Double(_) => Err(TargetExecuteError::new(
+            "submitted SQL cannot encode a non-finite DOUBLE",
+        )),
+        Value::Date(year, month, day, hour, minute, second, micros) => Ok(quote_sql_literal(
+            &format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"),
+        )),
+        Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            let sign = if *negative { "-" } else { "" };
+            let hours = u32::from(*hours) + (*days * 24);
+            Ok(quote_sql_literal(&format!(
+                "{sign}{hours:02}:{minutes:02}:{seconds:02}.{micros:06}"
+            )))
+        }
+    }
+}
+
+fn hex_sql_literal(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut literal = String::with_capacity(bytes.len() * 2 + 3);
+    literal.push_str("X'");
+    for byte in bytes {
+        write!(literal, "{byte:02x}").expect("writing hexadecimal bytes to String cannot fail");
+    }
+    literal.push('\'');
+    literal
 }
 
 fn quote_sql_literal(value: &str) -> String {
@@ -1543,6 +1627,34 @@ mod tests {
         assert_eq!(
             rendered,
             "INSERT INTO `accounts` (`id`, `name`) VALUES ('1', 'O''Reilly\\\\Books')"
+        );
+    }
+
+    #[test]
+    fn renders_submitted_statement_bytes_without_utf8_loss() {
+        let rendered = render_submitted_sql_statement(&SqlStatement {
+            sql: "INSERT INTO `binary_values` (`payload`) VALUES (?)".to_string(),
+            params: vec![Value::Bytes(vec![0x00, 0xff, b'\'', b'\\'])],
+        })
+        .expect("render submitted statement");
+
+        assert_eq!(
+            rendered,
+            "INSERT INTO `binary_values` (`payload`) VALUES (X'00ff275c')"
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_submitted_statement_numbers() {
+        let error = render_submitted_sql_statement(&SqlStatement {
+            sql: "INSERT INTO `measurements` (`reading`) VALUES (?)".to_string(),
+            params: vec![Value::Double(f64::NAN)],
+        })
+        .expect_err("reject non-finite number");
+
+        assert_eq!(
+            error.to_string(),
+            "submitted SQL cannot encode a non-finite DOUBLE"
         );
     }
 

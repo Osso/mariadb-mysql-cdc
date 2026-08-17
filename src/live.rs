@@ -16,6 +16,8 @@ mod foreign_key_error;
 mod insert_conflict;
 mod missing_parent;
 mod mysql_cli;
+pub(crate) mod parallel_target;
+pub(crate) mod parallel_writer;
 mod progress;
 mod reconnect;
 mod recovery;
@@ -23,6 +25,7 @@ mod recovery;
 mod repair;
 mod schema_recovery;
 mod structured_stream;
+pub(crate) mod submitted_mysql;
 #[cfg(test)]
 use crate::target::{SqlStatement, TargetExecuteError};
 use binlog_command::read_remote_binlog;
@@ -159,6 +162,7 @@ pub struct ApplyBinlogConfig {
     pub reconnect_forever: bool,
     pub target_transaction_group_size: usize,
     pub target_transaction_group_timeout_ms: u64,
+    pub target_parallel_transactions: usize,
     #[cfg(feature = "integration-failpoints")]
     pub integration_failpoint: Option<IntegrationFailpoint>,
     #[cfg(feature = "integration-failpoints")]
@@ -183,6 +187,7 @@ impl Default for ApplyBinlogConfig {
             reconnect_forever: false,
             target_transaction_group_size: 1,
             target_transaction_group_timeout_ms: 0,
+            target_parallel_transactions: 1,
             #[cfg(feature = "integration-failpoints")]
             integration_failpoint: None,
             #[cfg(feature = "integration-failpoints")]
@@ -262,6 +267,11 @@ fn validate_apply_runtime_settings(config: &ApplyBinlogConfig) -> Result<(), App
     if config.target_transaction_group_size == 0 {
         return Err(config_error(
             "target transaction group size must be greater than zero",
+        ));
+    }
+    if config.target_parallel_transactions == 0 {
+        return Err(config_error(
+            "target parallel transactions must be greater than zero",
         ));
     }
     Ok(())

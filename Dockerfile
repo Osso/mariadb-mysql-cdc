@@ -2,6 +2,10 @@
 ARG BASE_IMAGE
 FROM rust:1.92-bookworm AS builder
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libmariadb-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY vendor ./vendor

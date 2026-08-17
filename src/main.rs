@@ -775,6 +775,9 @@ fn apply_binlog_transaction_option(
         "--target-transaction-group-timeout-ms" => {
             config.target_transaction_group_timeout_ms = parse_u64(flag, value)?;
         }
+        "--target-parallel-transactions" => {
+            config.target_parallel_transactions = parse_nonzero_usize(flag, value)?;
+        }
         #[cfg(feature = "integration-failpoints")]
         "--integration-failpoint" => {
             config.integration_failpoint = Some(live::IntegrationFailpoint::parse(value)?);
