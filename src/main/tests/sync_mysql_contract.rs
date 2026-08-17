@@ -2,8 +2,10 @@ use crate::snapshot::SnapshotRow;
 use crate::sync::{
     SyncChunkReadRequest, SyncPrimaryKeyOrdering, SyncProgressRow, SyncProgressStatus, SyncStage,
     SyncTable, build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
-    build_lock_table_write_sql, build_strict_delete_statement, build_strict_insert_statement,
-    build_strict_update_statement, build_sync_progress_select_sql,
+    build_lock_table_write_sql, build_strict_delete_rows_statement,
+    build_strict_delete_statement, build_strict_insert_statement,
+    build_strict_update_rows_statement, build_strict_update_statement,
+    build_sync_progress_select_sql,
     build_sync_progress_upsert_sql, build_sync_select_sql, parse_sync_progress_row,
 };
 use mysql::Value;
@@ -78,6 +80,55 @@ fn sync_mysql_contract_builds_strict_bound_row_mutations() {
         assert!(
             !mutation_sql.contains(forbidden),
             "strict mutation SQL contained `{forbidden}`:\n{mutation_sql}"
+        );
+    }
+}
+
+#[test]
+fn sync_mysql_contract_builds_bounded_batched_strict_updates_and_deletes() {
+    let table = mutation_table();
+    let rows = [row("7", "live", "Now"), row("8", "archived", "Later")];
+
+    let update = build_strict_update_rows_statement(&table, &rows);
+    assert_eq!(
+        update.sql,
+        "UPDATE `episodes` SET `status` = CASE WHEN `id` = ? THEN ? WHEN `id` = ? THEN ? ELSE `status` END, `title` = CASE WHEN `id` = ? THEN ? WHEN `id` = ? THEN ? ELSE `title` END WHERE `id` IN (?, ?) ORDER BY `id`"
+    );
+    assert_eq!(
+        update.params,
+        vec![
+            bytes("7"),
+            bytes("live"),
+            bytes("8"),
+            bytes("archived"),
+            bytes("7"),
+            bytes("Now"),
+            bytes("8"),
+            bytes("Later"),
+            bytes("7"),
+            bytes("8"),
+        ]
+    );
+
+    let delete_table = composite_delete_table();
+    let delete = build_strict_delete_rows_statement(
+        &delete_table,
+        &[strings(["7", "2"]), strings(["8", "1"])],
+    );
+    assert_eq!(
+        delete.sql,
+        "DELETE FROM `episode_revisions` WHERE (`series_id`, `revision`) IN ((?, ?), (?, ?))"
+    );
+    assert_eq!(
+        delete.params,
+        vec![bytes("7"), bytes("2"), bytes("8"), bytes("1")]
+    );
+
+    let mutation_sql = [update.sql, delete.sql].join("\n").to_ascii_uppercase();
+    for forbidden in ["INSERT IGNORE", "ON DUPLICATE KEY UPDATE", "REPLACE"] {
+        assert!(
+            !mutation_sql.contains(forbidden),
+            "strict batched mutation SQL contained `{forbidden}`:\n{mutation_sql}"
         );
     }
 }
@@ -198,6 +249,18 @@ fn mutation_table() -> SyncTable {
         primary_key: strings(["id"]),
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "status", "title"]),
+    }
+}
+
+fn composite_delete_table() -> SyncTable {
+    SyncTable {
+        name: "episode_revisions".to_string(),
+        primary_key: strings(["series_id", "revision"]),
+        primary_key_ordering: vec![
+            SyncPrimaryKeyOrdering::Native,
+            SyncPrimaryKeyOrdering::Native,
+        ],
+        columns: strings(["series_id", "revision", "title"]),
     }
 }
 

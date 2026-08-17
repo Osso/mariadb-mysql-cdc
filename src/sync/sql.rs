@@ -66,6 +66,28 @@ pub(crate) fn build_strict_update_statement(table: &SyncTable, row: &SnapshotRow
     }
 }
 
+pub(crate) fn build_strict_update_rows_statement(
+    table: &SyncTable,
+    rows: &[SnapshotRow],
+) -> SqlStatement {
+    let changed_columns = non_primary_columns(table);
+    let assignments = changed_columns
+        .iter()
+        .map(|column| strict_case_assignment(column, &table.primary_key, rows.len()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let row_filter = primary_key_row_filter(&table.primary_key, rows.len());
+    let order_by = quote_ident_list(&table.primary_key);
+    let params = ordered_update_params(&changed_columns, rows);
+    SqlStatement {
+        sql: format!(
+            "UPDATE {} SET {assignments} WHERE {row_filter} ORDER BY {order_by}",
+            quote_ident(&table.name)
+        ),
+        params,
+    }
+}
+
 pub(crate) fn build_strict_delete_statement(
     table: &SyncTable,
     primary_key: &[String],
@@ -78,6 +100,70 @@ pub(crate) fn build_strict_delete_statement(
         ),
         params: primary_key.iter().cloned().map(string_param).collect(),
     }
+}
+
+pub(crate) fn build_strict_delete_rows_statement(
+    table: &SyncTable,
+    primary_keys: &[Vec<String>],
+) -> SqlStatement {
+    SqlStatement {
+        sql: format!(
+            "DELETE FROM {} WHERE {}",
+            quote_ident(&table.name),
+            primary_key_row_filter(&table.primary_key, primary_keys.len())
+        ),
+        params: primary_keys
+            .iter()
+            .flatten()
+            .cloned()
+            .map(string_param)
+            .collect(),
+    }
+}
+
+fn strict_case_assignment(column: &str, primary_key: &[String], row_count: usize) -> String {
+    let predicate = primary_key_predicates(primary_key).join(" AND ");
+    let cases = std::iter::repeat_n(format!("WHEN {predicate} THEN ?"), row_count)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{} = CASE {cases} ELSE {} END",
+        quote_ident(column),
+        quote_ident(column)
+    )
+}
+
+fn primary_key_row_filter(primary_key: &[String], row_count: usize) -> String {
+    if primary_key.len() == 1 {
+        let values = std::iter::repeat_n("?", row_count)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{} IN ({values})", quote_ident(&primary_key[0]));
+    }
+    let columns = quote_ident_list(primary_key);
+    format!(
+        "({columns}) IN ({})",
+        row_placeholders(primary_key.len(), row_count)
+    )
+}
+
+fn ordered_update_params(changed_columns: &[String], rows: &[SnapshotRow]) -> Vec<Value> {
+    let changed_values = changed_columns.iter().flat_map(|column| {
+        rows.iter().flat_map(|row| {
+            let mut params = row
+                .primary_key
+                .iter()
+                .cloned()
+                .map(string_param)
+                .collect::<Vec<_>>();
+            params.extend(ordered_values(row, std::slice::from_ref(column)));
+            params
+        })
+    });
+    let filter_values = rows
+        .iter()
+        .flat_map(|row| row.primary_key.iter().cloned().map(string_param));
+    changed_values.chain(filter_values).collect()
 }
 
 fn sync_bound_predicates(table: &SyncTable, request: &SyncChunkReadRequest) -> Vec<String> {
