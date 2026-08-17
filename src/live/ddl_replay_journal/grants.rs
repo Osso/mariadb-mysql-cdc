@@ -167,7 +167,7 @@ impl RuntimeGrantPolicy {
             scope if scope == self.checkpoint_scope => CHECKPOINT_PRIVILEGES,
             scope if scope == self.journal_scope => JOURNAL_PRIVILEGES,
             scope if scope == self.inventory_scope => EXECUTE_PRIVILEGES,
-            "CDC.TABLE_SYNC_RUNS" => CHECKPOINT_PRIVILEGES,
+            "CDC.SYNC_RUNS" => CHECKPOINT_PRIVILEGES,
             _ => return None,
         };
         Some(RuntimeGrantScope::Control(privileges))
