@@ -33,6 +33,7 @@ enum Event {
     Insert(Vec<Vec<String>>),
     Commit,
     ProgressSave {
+        run_spec_json: String,
         last_primary_key: Option<Vec<String>>,
         complete: bool,
         chunks: u64,
@@ -272,6 +273,7 @@ impl SyncChunkProgressStore for RecordingProgressStore {
 
     fn save(&mut self, progress: &SyncChunkProgress) -> Result<(), String> {
         self.events.borrow_mut().push(Event::ProgressSave {
+            run_spec_json: progress.run_spec_json.clone(),
             last_primary_key: progress.last_primary_key.clone(),
             complete: progress.complete,
             chunks: progress.chunks,
@@ -334,6 +336,7 @@ fn locks_before_reads_and_saves_progress_after_commit_before_unlock() {
             Event::Insert(vec![keys(["4"])]),
             Event::Commit,
             Event::ProgressSave {
+                run_spec_json: run_spec_json(10),
                 last_primary_key: Some(keys(["4"])),
                 complete: false,
                 chunks: 1,
@@ -413,6 +416,7 @@ fn a_short_source_chunk_requires_a_later_locked_empty_source_tail_chunk() {
             Event::Delete(vec![keys(["10"]), keys(["11"])]),
             Event::Commit,
             Event::ProgressSave {
+                run_spec_json: run_spec_json(10),
                 last_primary_key: Some(keys(["4"])),
                 complete: true,
                 chunks: 2,
@@ -698,6 +702,77 @@ fn unlock_failure_returns_error_after_durable_progress_without_reporting_complet
 }
 
 #[test]
+fn fresh_progress_records_the_configured_run_spec_json() {
+    let events = events();
+    let config = config(10);
+    let mut source = RecordingSource::new(Vec::new(), Rc::clone(&events));
+    let mut target = RecordingTargetSession::new(Vec::new(), Rc::clone(&events));
+    let mut progress = RecordingProgressStore::new(Rc::clone(&events));
+
+    let outcome = sync_next_chunk(&config, &mut source, &mut target, &mut progress)
+        .expect("create fresh progress");
+
+    assert_eq!(outcome.run_spec_json, config.run_spec_json);
+    assert_eq!(
+        progress
+            .durable
+            .as_ref()
+            .expect("fresh progress is durable")
+            .run_spec_json,
+        config.run_spec_json
+    );
+}
+
+#[test]
+fn loaded_progress_run_id_mismatch_fails_before_the_chunk_boundary() {
+    let mut loaded = loaded_progress();
+    loaded.run_id = "different-run".to_string();
+
+    assert_progress_identity_mismatch(loaded);
+}
+
+#[test]
+fn loaded_progress_table_mismatch_fails_before_the_chunk_boundary() {
+    let mut loaded = loaded_progress();
+    loaded.table = "different_table".to_string();
+
+    assert_progress_identity_mismatch(loaded);
+}
+
+#[test]
+fn loaded_progress_run_spec_mismatch_fails_before_the_chunk_boundary() {
+    let mut loaded = loaded_progress();
+    loaded.run_spec_json = r#"{"chunk_size":20,"scope":"all-source-tables"}"#.to_string();
+
+    assert_progress_identity_mismatch(loaded);
+}
+
+fn assert_progress_identity_mismatch(loaded: SyncChunkProgress) {
+    let events = events();
+    let mut source = RecordingSource::new(source_rows(), Rc::clone(&events));
+    let mut target = RecordingTargetSession::new(target_rows(), Rc::clone(&events));
+    let mut progress = RecordingProgressStore::new(Rc::clone(&events));
+    progress.durable = Some(loaded.clone());
+
+    let result = sync_next_chunk(
+        &config(10),
+        &mut source,
+        &mut target,
+        &mut progress,
+    );
+
+    assert!(result.is_err(), "loaded progress identity mismatch must fail");
+    assert_eq!(progress.durable, Some(loaded));
+    assert_eq!(
+        events.borrow().as_slice(),
+        [Event::ProgressLoad {
+            run_id: "sync-run-1".to_string(),
+            table: "widgets".to_string(),
+        }]
+    );
+}
+
+#[test]
 fn restart_reads_from_the_saved_cursor() {
     let events = events();
     let mut source = RecordingSource::new(
@@ -709,6 +784,7 @@ fn restart_reads_from_the_saved_cursor() {
     progress.durable = Some(SyncChunkProgress {
         run_id: "sync-run-1".to_string(),
         table: "widgets".to_string(),
+        run_spec_json: run_spec_json(10),
         last_primary_key: Some(keys(["20"])),
         complete: false,
         chunks: 2,
@@ -746,6 +822,7 @@ fn completed_progress_returns_without_reopening_a_chunk() {
     let completed = SyncChunkProgress {
         run_id: "sync-run-1".to_string(),
         table: "widgets".to_string(),
+        run_spec_json: run_spec_json(10),
         last_primary_key: Some(keys(["99"])),
         complete: true,
         chunks: 7,
@@ -789,6 +866,7 @@ fn completed_progress_returns_without_reopening_a_chunk() {
 fn config(chunk_size: usize) -> SyncChunkConfig {
     SyncChunkConfig {
         run_id: "sync-run-1".to_string(),
+        run_spec_json: run_spec_json(chunk_size),
         target_database: "target_db".to_string(),
         table: SyncTable {
             name: "widgets".to_string(),
@@ -797,6 +875,25 @@ fn config(chunk_size: usize) -> SyncChunkConfig {
         },
         chunk_size,
     }
+}
+
+fn loaded_progress() -> SyncChunkProgress {
+    SyncChunkProgress {
+        run_id: "sync-run-1".to_string(),
+        table: "widgets".to_string(),
+        run_spec_json: run_spec_json(10),
+        last_primary_key: Some(keys(["20"])),
+        complete: false,
+        chunks: 2,
+        rows_scanned: 20,
+        inserts: 4,
+        updates: 3,
+        deletes: 2,
+    }
+}
+
+fn run_spec_json(chunk_size: usize) -> String {
+    format!(r#"{{"chunk_size":{chunk_size},"scope":"all-source-tables"}}"#)
 }
 
 fn source_rows() -> Vec<SnapshotRow> {

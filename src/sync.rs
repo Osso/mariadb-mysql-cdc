@@ -11,6 +11,7 @@ pub(crate) struct SyncTable {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SyncChunkConfig {
     pub(crate) run_id: String,
+    pub(crate) run_spec_json: String,
     pub(crate) target_database: String,
     pub(crate) table: SyncTable,
     pub(crate) chunk_size: usize,
@@ -27,6 +28,7 @@ pub(crate) struct SyncChunkReadRequest {
 pub(crate) struct SyncChunkProgress {
     pub(crate) run_id: String,
     pub(crate) table: String,
+    pub(crate) run_spec_json: String,
     pub(crate) last_primary_key: Option<Vec<String>>,
     pub(crate) complete: bool,
     pub(crate) chunks: u64,
@@ -131,17 +133,49 @@ fn load_progress(
                 config.run_id, config.table.name
             )
         })?;
-    Ok(loaded.unwrap_or_else(|| SyncChunkProgress {
-        run_id: config.run_id.clone(),
-        table: config.table.name.clone(),
-        last_primary_key: None,
-        complete: false,
-        chunks: 0,
-        rows_scanned: 0,
-        inserts: 0,
-        updates: 0,
-        deletes: 0,
-    }))
+    match loaded {
+        Some(progress) => {
+            validate_progress_identity(config, &progress)?;
+            Ok(progress)
+        }
+        None => Ok(SyncChunkProgress {
+            run_id: config.run_id.clone(),
+            table: config.table.name.clone(),
+            run_spec_json: config.run_spec_json.clone(),
+            last_primary_key: None,
+            complete: false,
+            chunks: 0,
+            rows_scanned: 0,
+            inserts: 0,
+            updates: 0,
+            deletes: 0,
+        }),
+    }
+}
+
+fn validate_progress_identity(
+    config: &SyncChunkConfig,
+    progress: &SyncChunkProgress,
+) -> Result<(), String> {
+    if progress.run_id != config.run_id {
+        return Err(format!(
+            "loaded sync progress run ID mismatch for table `{}`: expected `{}`, found `{}`",
+            config.table.name, config.run_id, progress.run_id
+        ));
+    }
+    if progress.table != config.table.name {
+        return Err(format!(
+            "loaded sync progress table mismatch for run `{}`: expected `{}`, found `{}`",
+            config.run_id, config.table.name, progress.table
+        ));
+    }
+    if progress.run_spec_json != config.run_spec_json {
+        return Err(format!(
+            "loaded sync progress run specification mismatch for run `{}` table `{}`: expected `{}`, found `{}`",
+            config.run_id, config.table.name, config.run_spec_json, progress.run_spec_json
+        ));
+    }
+    Ok(())
 }
 
 fn apply_locked_chunk(
