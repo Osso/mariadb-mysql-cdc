@@ -6,7 +6,7 @@ target with minimal downtime.
 ## Design constraints
 
 - Consume production `binlog_format=ROW` with `binlog_row_image=FULL`.
-- Snapshot table data first, then stream from a recorded binlog position.
+- Use staged `sync` for source-authoritative convergence while the live ROW stream handles ongoing changes.
 - Apply row changes by source primary key; a secondary-unique conflict never
   mutates another target primary key. For a primary-key-changing ROW update,
   assign every writable, non-generated after-image column and predicate on every
@@ -14,6 +14,14 @@ target with minimal downtime.
 - Keep skipped row changes observable and validate resulting parity before cutover.
 - Stop or quarantine unsupported data-changing events with exact coordinates.
 - Keep the target out of service until repeated reconciliation proves parity.
+
+## Build prerequisites
+
+Parallel target submission uses MariaDB Connector/C through `mysqlclient-sys` so
+query send and result completion remain separate operations. Local builds require
+`pkg-config` plus MariaDB client development files. The Docker builder installs
+`libmariadb-dev`; the selected runtime `BASE_IMAGE` must provide
+`libmariadb.so.3`.
 
 ## Deployment
 
@@ -26,7 +34,9 @@ BASE_IMAGE=registry.example/mariadb:tag \
 ```
 
 `OPS_REPO` is optional and defaults to the sibling `../ops` checkout. The script
-passes `BASE_IMAGE` to Docker as a build argument for the runtime image.
+passes `BASE_IMAGE` to Docker as a build argument for the runtime image, then
+updates and commits only the live stream manifest. Unified sync Jobs are reviewed
+and managed separately; `deploy.sh` does not create or update them.
 
 ## Current status
 
@@ -108,128 +118,64 @@ receipt is unavailable, so this is semantic proof only.
 No operator-authored target SQL or manual status transition is a supported DDL
 resolution path. Fresh bootstrap remains the pre-production schema contract.
 Existing populated `cdc.row_conflicts` tables use
-`docs/row-conflicts-source-row-identity-migration.sql` once while stream and
-repair writers are stopped; runtime never performs this migration. Obsolete
+`docs/row-conflicts-source-row-identity-migration.sql` once while out-of-band repair
+writers are stopped; runtime never performs this migration. Obsolete
 development migrations are not maintained as upgrade paths.
 
-The code contains a durable row-conflict ledger wired into the live stream and
-an FK-aware phased repair planner. Supported constraint conflicts persist
-evidence through an independent control-plane connection before the row failure
-rolls back the target transaction. Under `ignore-duplicate`, only an equal native
-ROW `INSERT` duplicate may be logged and committed without ledger persistence;
-divergent inserts and every non-`INSERT` `1062` unique conflict persist evidence,
-roll back, and leave the target transaction/checkpoint uncommitted. Durable row
-conflicts retry in-process from that unchanged checkpoint with bounded backoff.
-Ordinary transport reconnects default to 12 after the initial attempt (13 attempts
-total); `--max-reconnects 0` disables them unless `--reconnect-forever true` is
-set. Exact-parent retries require a positive `max-reconnects` setting or
-`--reconnect-forever true`, and preserve the ordinary transport budget, so repeated
-parent-recovery failures can exceed `max-reconnects`. `reconnect-forever` removes
-the ordinary transport cap and admits exact-parent retries when the max is zero.
-Successful replay resolves the matching evidence. Two narrow automatic parent-first recoveries run for persisted
-`1452`s: the exact `globalcomix.sessions` composite `fk_sessions_guest`
-(`guest_id`, `guest_hash`) parent in `guests`, and the exact
-`globalcomix.home_feed_card_slides` `fk_hfcs_card` (`card_id`) parent in
-`home_feed_cards`. The failed transaction is rolled back and recorded first.
-Recovery is evaluated only when exact-parent retry is enabled and the error is
-retryable. A failed recovery is retried on later loops without consuming the
-ordinary transport budget; a successful recovery mutates each distinct
-`ExactParentRecovery` value at most once per process reconnect loop. Each request is
-reconstructed deterministically during replay from the row image and conflict
-context; it is not stored in `cdc.row_conflicts`. Both paths require a complete,
-temporally valid source parent image, accept no matching target identity or one
-exact existing row, insert only on no match, and fail closed on unsupported,
-missing, colliding, divergent, unavailable, or write-failure state. Recovery never
-advances the checkpoint; normal child replay commit/checkpoint resolves ledger
-evidence. Structured logs carry source coordinates, child identity, action, and
-outcome. This is not generic FK repair and performs no historical binlog
-reconstruction.
+Native ROW streaming is source-authoritative and target-disposable. It emits plain
+INSERT statements and treats MySQL `1062` from INSERT as idempotent success,
+without target inspection, equality checks, replacement, conflict evidence, or
+repair. A skipped duplicate may leave divergent target contents; explicit
+source-authoritative convergence uses the staged `sync` operation. Every other
+row error rolls back the complete source transaction and blocks checkpoint
+advancement.
+`--target-parallel-transactions N` preserves the
+same rule by sending and draining each statement individually, leasing one target
+connection per complete source transaction, and committing checkpoints in source
+order.
 
-A separate superseded historical `globalcomix.releases` `ROW INSERT` proof is
-approved only for the exact production category transaction
-`mysqld-bin.002709:515816736–515824875` (`releases_ibfk_2`) and visibility
-transaction `mysqld-bin.002709:531921570–531929925` (`releases_ibfk_3`, child
-`(comic_id,comic_is_visible)` to parent `(id,is_visible)`, candidate event
-`531921789`). It retains the complete historical release image, requires later
-source history showing the same release now has a different parent value, and
-requires exactly one current source release, one matching source parent, and
-locked target release/parent identities. If the target release is absent, the
-verifier installs the complete current source row; an existing target release
-must already hash equal to it. The current parent identity is preserved: recovery
-never updates or deletes the parent. Remaining transaction effects, conflict
-resolution evidence, and the XID checkpoint commit atomically; failed proof,
-coordinate/FK scope, predecessor, or commit checks roll back target effects and
-checkpoint advancement, while unresolved evidence is persisted independently.
-Guarded observation upserts
-are idempotent. The admin-bootstrapped
-`cdc.row_conflicts` schema, guards, constraints, stored generated
-`source_row_identity`, `(source_row_identity, status)` index, definer-safe trigger
-inventory procedure, and exact table/procedure grants must validate at startup;
-runtime never creates or migrates the table. Different source primary keys remain
-different conflict identities. `repair-drift` now invokes the planner for child-first deletes,
-parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
-windows, a non-mutating full-scope Verify equality phase, and evidence-backed
-conflict resolution. In apply mode, `--conflict-reconcile-limit N` also runs a
-bounded reconciliation-only pass over unresolved evidence: it reads complete
-source and target rows by primary key, resolves only one-row exact equality,
-writes no target-table repairs, never reads or advances stream checkpoints, and
-is idempotent across repeated passes. The disposable MariaDB 11.4/MySQL 8.0
-harness defines 45 executable scenarios.
-Its `row-conflict-source-row-migration` and `row-conflict-indexed-resolution`
-scenarios prove populated-ledger migration, index selection, collision defense,
-and post-commit resolution. Earlier TLS harness coverage used a disposable TLS-enabled source, but the live
-GlobalComix source MariaDB (`source-mariadb.example` / `192.0.2.10`) is
-plaintext-only by accepted operational policy. Current production safety is:
-source plaintext only, target DigitalOcean MySQL with configured CA and hostname
-verification. The harness proves a valid four-row copy and a completed-run
-no-op; it does not prove interrupted parallel-range resume. The
-remaining scenarios cover bootstrap/grants, DDL journal crash recovery,
-reconnect/GET_LOCK behavior, FK-aware repair/conflict resolution, and a real
-`replace-divergent-pk` XID/commit/checkpoint plus replay-evidence scenario. Its
-`create-table-crash-restart` scenario passes the differing-default MariaDB/MySQL
-fixture through post-DDL/pre-applied
-crash recovery, prepared-state restart, exact checkpointing, and idempotent replay;
-its `production-alter-table` scenario passes five checkpointed ALTER events; checks column, comment,
-non-unique and unique-index metadata, duplicate rejection parity, translated
-`DROP COLUMN IF EXISTS`, and its absent-column no-op; then proves
-an unsupported unique-prefix option remains `translation_pending` without target
-mutation or checkpoint advancement. These are local Docker proofs, not live cutover
-proof;
-recurring conflict scheduling and full cutover proof remain unchecked.
+Conflict data remains out-of-band. Targeted conflict resolution connects to
+source and target as a separate workflow from the live stream. The live stream
+neither reads nor writes the conflict ledger and
+does not validate its schema, procedures, or grants. Historical ledger
+persistence is owned by concrete `MySqlConflictLedger` in
+`src/conflict_ledger.rs` and `src/conflict_ledger/`; shared foreign-key
+canonicalization is owned by `src/canonical_foreign_key.rs`. Retired live
+supersession, target-replacement, and automatic parent-repair paths are absent
+from runtime and harness code.
+
+The disposable MariaDB/MySQL harness covers DDL journal recovery,
+reconnect/GET_LOCK behavior, and parallel target transactions. These are local
+proofs, not live cutover proof.
 
 Deployment remains blocked pending real-MySQL/live proof, exact grant/bootstrap
-review, bounded repair convergence, and ops rollout gates. Ops proof still needs
-fresh immutable image tags, suspended repair/catchup rollout review, replacement
-or justification of privileged catchup credentials, unique recurring run IDs,
-exact chunk verification, FK-safe ordering, CA/config-map verification, journal
-arguments, and single-writer `GET_LOCK` proof. No ops or deployment action is
-part of this worktree. The legacy `probe` text-binlog path is not a supported
-health check.
+review, staged-sync convergence proof, and ops rollout gates. Ops proof still
+needs fresh immutable image tags, unique recurring run IDs, exact chunk
+verification, FK-safe ordering, CA/config-map verification, journal arguments,
+and single-writer `GET_LOCK` proof. No ops or deployment action is part of this
+worktree. The legacy `probe` text-binlog path is not a supported health check.
 
 ## DDL resolution
 
 - [Authoritative DDL transformation spec](docs/specs/ddl-transformation.md)
 - [DDL Resolution Runbook](docs/ddl-resolution.md) for journal barriers,
   translation-pending promotion, evidence inspection, and restart procedure.
-- [Schema synchronization spec](docs/specs/sync-schema.md) for selected-table
-  full convergence through the shared streamed-DDL translator.
+- [Schema synchronization details](docs/specs/sync-schema.md) for source-to-target
+  convergence through the shared streamed-DDL translator.
 
 ## Schema synchronization
 
-The implemented `sync-schema` command applies by default and converges only explicitly
-selected tables to the source-authoritative MySQL 8-compatible schema. It runs one
-table at a time, permits destructive changes within selected tables, and never
-drops unselected target tables. Every mapping must use the same DDL translator as
-streamed DDL replay; there is no direct-source-DDL fallback or second compatibility
-mapping.
+The staged `sync` command is the only standalone synchronization entry point. It
+runs prerequisite schema convergence, source-authoritative locked row chunks, and
+final constraint convergence under one immutable run identity. Schema work is not
+available as a separate `sync-schema` command; `sync-catalog`, `resync-stream`, and
+`recover-lost-binlog` route through the same staged engine.
 
-Before a potentially lossy column change, it checks actual target data. Values that
-would truncate, coerce, or fail block that table and produce representative primary
-keys; independent tables continue, while dependent operations are skipped. The
-command re-inventories every selected table and emits structured JSON for every
-statement, preflight, skip, error, and verification result. It exits nonzero if
-anything remains divergent. It has no persistent schema journal or rollback claim
-for implicitly committed MySQL DDL.
+Before a potentially lossy column change, the prerequisite schema stage checks
+actual target data. Values that would truncate, coerce, or fail block that table
+and produce representative primary keys; independent tables continue, while
+dependent operations are skipped. The staged run persists progress in
+`cdc.sync_runs` and fails closed if final structural convergence is not achieved.
 
 ## Commands
 
@@ -243,13 +189,12 @@ cargo run -- stream-binlog --source-host 127.0.0.1 --source-user repl \
   --target-password-env TARGET_PASSWORD --target-database app \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem
 
-cargo run -- sync-table --source-host 127.0.0.1 --source-user reader \
+cargo run -- sync --source-host 127.0.0.1 --source-user reader \
   --source-password-env SOURCE_PASSWORD --source-database app \
   --target-host 127.0.0.1 --target-user writer \
   --target-password-env TARGET_PASSWORD --target-database app \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
-  --table accounts --primary-key id --columns id,email,updated_at \
-  --mode apply --run-id accounts-repair-20260710-01
+  --table accounts --run-id accounts-sync-20260817-01
 
 cargo run -- table-catalog \
   --source-host 127.0.0.1 --source-user reader \
@@ -268,6 +213,36 @@ cargo run -- sync-catalog \
   --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
   --catalog syncable-tables.json --run-id-prefix catalog-20260722
 ```
+
+`sync` derives table columns and primary-key ordering from source inventory. Repeat
+`--table` for a closed source scope and provide exactly one immutable `--run-id`
+or `--run-id-prefix`; the progress table defaults to `cdc.sync_runs`. The command
+runs prerequisite schema convergence, source-authoritative locked row chunks, and
+final constraint convergence as one staged operation. The removed
+`catchup-progress`, `sync-progress`, standalone `sync-schema`, and `drift-check`
+commands are not available; their work is either part of `sync` stages or removed
+from the CLI. Legacy `catchup-snapshot`, `sync-table`, and `repair-drift` names are
+also rejected as unknown commands.
+
+`stream-binlog --target-parallel-transactions N` enables bounded target
+transaction submission when `N > 1`; the default `1` preserves serial execution.
+The parallel path sends and drains body statements individually, ignores delayed
+`1062` only for INSERT statements, and fails closed before checkpoint advancement
+on every other delayed target error.
+
+Run the disposable source-authoritative proofs with:
+
+```sh
+python3 scripts/cdc-integration-harness.py --scenario insert-duplicate-idempotent
+python3 scripts/cdc-integration-harness.py --scenario parallel-target-transactions
+```
+
+The serial scenario preloads a divergent target row, removes the conflict ledger
+and inventory procedure, and proves the duplicate leaves that row untouched while
+a later same-transaction row and exact checkpoint advance. The parallel scenario
+adds ordered-commit barriers, verifies every target session uses `SSL/TLS`, and
+proves both transactions converge only after release. Out-of-band repair scenarios
+retain the separate ledger, comparison, and FK-repair identities.
 
 ### Table catalog JSON and execution contract
 
@@ -331,55 +306,33 @@ the second write over the first. If both destinations were nonexistent, a failed
 final identity check may leave an empty newly created file, but never overwrites
 existing content.
 
-`sync-catalog` reads only the syncable catalog and starts apply mode immediately;
+`sync-catalog` reads only the syncable catalog and invokes one unified sync run;
 there is no dry-run/plan mode and `table-catalog` does not launch it. The command
-waits until all entries complete or a failure is returned. Each table uses a
-fixed-length `catalog-v2-<SHA-256 hex>` run ID. The digest input is the
-injective length-framed byte tuple `(run-id prefix, target database, table)`, so
-prefix, database, and table changes produce distinct deterministic IDs while
-long valid names still fit the 128-byte progress column. The prefix is required
-and non-empty. Interrupted exact IDs resume; a matching `status='complete'` row
-is terminal only when its immutable run specification exactly matches the current
-catalog child; a different stored specification fails closed instead of being
-treated as terminal. Direct `sync-table` and
-`sync-catalog` workers share one admission lock and four slot reservations keyed
-by the lower-cased target host plus port, so databases on the same host and port
-share capacity. Each worker also holds a database/table-specific reservation,
-preventing same-table overlap. Database and table components are length-framed
-and hexadecimal-encoded, so delimiters inside identifiers cannot alias another
-reservation. These admission and slot locks are scoped to the
-target server host and port. Legacy run-lock accounting and same-table detection
-inspect only the configured progress table. Within that table, identity is
-derived from the immutable run specification's `scope.target_database` and
-`table.name`, not from `table_name` alone, so same-named tables in different target
-databases remain distinct and cannot satisfy each other's dependencies. A held
-legacy run-ID advisory lock for the requested same database/table excludes that
-table even without a table reservation. Rows in `running`, `complete`, or
-`error` with a held legacy run-ID advisory lock but no table reservation count
-toward the same four-worker limit, including rows for tables outside the supplied
-catalog. Unlocked stale `running` or `error` rows are ignored before parsing their
-immutable specifications. Lock-active rows fail closed when malformed. An
-expected completed child is always parsed and must exactly match its immutable
-specification before it is treated as terminal. Reservation sessions set MySQL `wait_timeout` to
-86,400 seconds so an idle lock connection can span long table runs; this does not
-provide recovery from network disconnects. Children start only after all listed FK parents complete. Missing
-dependencies are rejected before workers start; owned failures return after owned
-work settles, and dependency cycles fail closed without waiting for unrelated
-external syncs. Catalog children reconcile every target-only row planned by
-catalog comparison in dependency-safe chunks, verify each deletion, and persist
-progress only after verification. The same unconditional chunk reconciliation
-applies to direct `sync-table` and `repair-drift`; the non-syncable catalog is
-classification/operator input only; full-dump execution is out of scope.
+waits until the unified staged run completes or fails. Every catalog table is
+mapped into one `SyncConfig` with the configured source and target, ordered table
+scope, chunk size, bounded catalog parallelism, progress table, and shared
+non-empty `--run-id-prefix`. Unless `--progress-table` overrides it,
+sync-catalog uses `cdc.sync_runs`. Unified sync derives one immutable run identity
+and persists schema-stage, row-stage, and final-constraint progress there.
 
-```bash
-cargo run -- catchup-snapshot \
-  --source-host 127.0.0.1 --source-user reader \
-  --source-password-env SOURCE_PASSWORD --source-database app \
-  --target-host 127.0.0.1 --target-user writer \
-  --target-password-env TARGET_PASSWORD --target-database app \
-  --target-tls-ca-file /etc/mariadb-mysql-cdc/do-ca.pem \
-  --progress-file /var/lib/mariadb-mysql-cdc/snapshot-progress.json
-```
+The unified run owns prerequisite schema convergence, locked source-authoritative
+row chunks, bounded row workers, and final constraint convergence. The removed
+catalog-specific dependency scheduler, admission locks, deterministic child run
+IDs, target-only repair verification, and per-table progress handling are not
+used. Catalog FK metadata still classifies syncable scope; it does not create
+separate child runs. `resync-stream` now uses this unified path with one captured
+source evidence set, a fixed `resync-stream:<source_identity>` run identity, and
+`cdc.sync_runs` progress. It has no legacy repair phases or post-write
+target-inventory drift scan.
+`recover-lost-binlog` now uses the same staged engine with one captured source
+evidence set, exact `recovery_id` progress across every source table, and
+`cdc.sync_runs` progress. Prepared evidence is source-only. Recovery proof
+requires complete exact run/table progress plus an unchanged source scope; it
+does not capture a target final inventory or run a post-write drift scan. The stream lease, authorization,
+checkpoint/barrier revalidation, and atomic recovery transaction remain in
+place. This documents code behavior only; deployment and production execution
+are not claimed. The non-syncable catalog is classification/operator input only;
+full-dump execution is out of scope.
 
 ## TLS policy
 
@@ -397,60 +350,17 @@ verification when changing source transport. See [connection policy](docs/schema
 
 ## Insert conflict policy
 
-`--insert-conflict-policy` is path-specific, not a global “keep CDC running past
-duplicates” switch. Values are `error`, `ignore-duplicate`, and the explicit
-`replace-divergent-pk` policy:
+`--insert-conflict-policy` applies to statement replay. Values are `error`,
+`ignore-duplicate`, and `replace-divergent-pk`:
 
-- Generic target execution treats a MySQL `1062` as success only for statements
-  beginning with `INSERT INTO` under `ignore-duplicate`. Other statements and
-  errors still fail; `replace-divergent-pk` does not add a generic SQL fallback.
-- Native ROW events under `ignore-duplicate` continue only when a duplicate
-  `INSERT` target row fetched by source primary key exactly equals the source row.
-- Native ROW events under `replace-divergent-pk` read the target row by source
-  primary key and replace an unequal row only when the duplicate index is
-  `PRIMARY`, using a safe primary-key UPDATE of the source image. The accepted
-  risk is overwriting the divergent target row. Successful replacements and
-  equal no-ops never create ledger rows; they resolve only an already-recorded
-  matching source identity/schema/table/PK record after target commit and
-  checkpoint. Secondary-unique, foreign-key, CHECK, and replacement-update
-  conflicts persist evidence and abort. If a later conflict rolls back the
-  target transaction, the replacement rolls back and the existing ledger record
-  remains unresolved.
-- With the default `error` policy, native row duplicates fail, roll back the
-  target transaction, and leave the checkpoint unchanged.
-- `catchup-snapshot` and normal range `sync-table` repairs use explicit
-  `INSERT IGNORE` independently of this flag, except
-  `sync-table --mode missing-primary-keys`, which uses strict `INSERT`.
-  `sync-table --updated-since` uses its own upsert path.
-
-`sync-table --mode missing-primary-keys` is apply-only: it compares source and
-target rows by primary key, inserts source rows whose primary keys are absent,
-and never deletes dependent rows. With `replace-divergent-pk`, an exact one-hop
-displacement is repaired transactionally: the displaced target owner is restored
-from the same source chunk, the missing owner is inserted, affected child rows
-are verified unchanged, and run progress commits on the same target connection.
-Ambiguous chains, absent source owners, verification failures, and constraint
-failures roll back parents and progress. Other conflicts remain errors. The
-sync-table source, target, and progress connections use a 10-second TCP connect
-timeout and 30-second read/write operation timeouts. All MySQL connections
-share TCP liveness bounds; live CDC/DDL connections do not use the sync
-operation timeouts. Transient connection failures retry up to five attempts
-total (the initial attempt plus four retries), with each retry resuming from
-durable `cdc.table_sync_runs` progress; non-transient errors and exhausted
-retries fail.
+- Generic target execution treats MySQL `1062` as success only for statements
+  beginning with `INSERT INTO` under `ignore-duplicate`.
+- Native ROW streaming does not use this policy. Its fixed rule accepts INSERT
+  `1062` and fails every other row error.
+- Unified sync is source-authoritative and uses strict insert/update/delete
+  mutations; its staged progress defaults to `cdc.sync_runs`.
 
 The default policy is `error`.
-
-`sync-table` requires `--run-id` and stores resumable state in
-`cdc.table_sync_runs` by default. A new recurrence needs a new ID; direct
-`sync-table` reuse is allowed only for the exact interrupted run. In apply mode,
-`repair-drift` may reclaim exactly one failed `missing-primary-keys` child whose
-full immutable specification matches the current insert phase. The claim uses a
-per-transaction `REPEATABLE READ` transaction with `FOR UPDATE` candidate
-locking; ambiguity fails closed. `repair-drift` otherwise creates a fresh
-orchestration ID, derives FK-safe phase order, and accepts bounded
-`--start-after`/`--end-at` windows. Each completed chunk is verified before
-its cursor and counters are persisted.
 
 `--stop-position` is an inclusive event-end boundary: the event whose
 `end_log_pos` equals the requested position is applied and durably checkpointed,
@@ -462,4 +372,4 @@ MariaDB compatibility. That value is not proof that a MySQL target index is
 visible; inspect target-native visibility before admitting affected index DDL, or
 leave it in the journal's translation-pending barrier.
 
-See [Catchup Workflow](docs/catchup.md) for bounded repair rules.
+See [Unified sync](docs/specs/unified-sync.md) for staged synchronization rules.

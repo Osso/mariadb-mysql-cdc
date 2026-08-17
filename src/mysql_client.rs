@@ -1,23 +1,14 @@
 use crate::checkpoint::{Checkpoint, LastEvent};
 use crate::live::{
-    InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
-    should_replace_divergent_primary,
+    ApplyBinlogConfig, InsertConflictPolicy, TargetMySqlConfig, should_ignore_duplicate_insert,
 };
-use crate::mysql_snapshot::MySqlConnectionConfig;
+use crate::mysql_config::MySqlConnectionConfig;
 use crate::mysql_support::{
     apply_default_mysql_network_bounds, apply_mysql_connection_liveness, target_mysql_opts,
 };
-use crate::snapshot::{ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource};
-use crate::table_sync::progress::{
-    build_add_total_rows_column_sql, build_create_progress_schema_sql,
-    build_create_progress_table_sql, build_progress_upsert_sql,
-};
-use crate::table_sync::{SyncTableProgress, TableSyncError};
 use crate::target::{
-    DuplicateConflict, SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor,
-    TargetRowChange, TargetRowChangeKind, TransactionalTargetExecutor,
-    UsersActiveTransactionEvidence, build_primary_key_replacement_statement, locked_users_evidence,
-    primary_key_replacement_outcome,
+    SqlStatement, TargetExecuteError, TargetExecutor, TargetRowChange, TargetRowChangeKind,
+    TransactionalTargetExecutor,
 };
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Params};
@@ -25,6 +16,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub(crate) type SharedTargetConnection = Rc<RefCell<Option<Conn>>>;
+type SharedParallelTargetWriter = Rc<
+    RefCell<
+        crate::live::parallel_writer::ParallelTargetWriter<
+            crate::live::submitted_mysql::MariaDbSubmittedQueryFactory,
+        >,
+    >,
+>;
 
 mod connection;
 mod query;
@@ -33,17 +31,33 @@ mod tests;
 
 #[cfg(test)]
 use connection::{NetworkTimeouts, apply_network_timeouts};
-use connection::{
-    base_opts, open_conn, progress_connect_error, snapshot_connect_error, target_connect_error,
-};
+use connection::{base_opts, open_conn, source_connect_error, target_connect_error};
 pub(crate) use query::value_to_string;
 use query::{
-    build_progress_error_message_sql, build_snapshot_boundary_select_sql,
-    build_snapshot_progress_select_sql, build_stream_lease_sql, build_target_column_select_sql,
-    ensure_stream_lease_acquired, generated_column_retry_sql, progress_query_error, row_to_strings,
-    rows_to_tsv, snapshot_boundary_offsets, snapshot_progress_from_rows, snapshot_query_error,
-    snapshot_row_from_mysql_row, target_query_error,
+    build_stream_lease_sql, build_target_column_select_sql, ensure_stream_lease_acquired,
+    generated_column_retry_sql, row_to_strings, source_query_error, target_query_error,
 };
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct MySqlSourceError {
+    message: String,
+}
+
+impl MySqlSourceError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for MySqlSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MySqlSourceError {}
 
 pub struct PersistentMySqlSource {
     conn: RefCell<Conn>,
@@ -52,14 +66,8 @@ pub struct PersistentMySqlSource {
 #[derive(Clone)]
 pub struct PersistentTargetExecutor {
     conn: SharedTargetConnection,
-    connection_opts: Opts,
     insert_conflict_policy: InsertConflictPolicy,
-}
-
-pub struct PersistentProgressWriter {
-    conn: RefCell<Conn>,
-    default_database: String,
-    progress_table: String,
+    parallel_writer: Option<SharedParallelTargetWriter>,
 }
 
 pub(crate) fn sync_target_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
@@ -67,25 +75,13 @@ pub(crate) fn sync_target_opts(target: &TargetMySqlConfig) -> Result<Opts, Strin
     Ok(Opts::from(apply_default_mysql_network_bounds(builder)))
 }
 
-pub(crate) fn target_reader_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
-    base_opts(
-        &target.host,
-        target.port,
-        &target.user,
-        &target.password,
-        &target.database,
-        Some(&target.tls_ca_file),
-        &format!("target `{}`:{}", target.host, target.port),
-    )
-}
-
 impl PersistentMySqlSource {
-    pub fn new(config: &MySqlConnectionConfig) -> Result<Self, SnapshotError> {
+    pub fn new(config: &MySqlConnectionConfig) -> Result<Self, MySqlSourceError> {
         Self::new_with_tls_ca(config, None)
     }
 
-    pub(crate) fn new_with_opts(opts: Opts) -> Result<Self, SnapshotError> {
-        let conn = open_conn(opts).map_err(snapshot_connect_error)?;
+    pub(crate) fn new_with_opts(opts: Opts) -> Result<Self, MySqlSourceError> {
+        let conn = open_conn(opts).map_err(source_connect_error)?;
         Ok(Self {
             conn: RefCell::new(conn),
         })
@@ -94,7 +90,7 @@ impl PersistentMySqlSource {
     pub(crate) fn new_with_tls_ca(
         config: &MySqlConnectionConfig,
         tls_ca_file: Option<&str>,
-    ) -> Result<Self, SnapshotError> {
+    ) -> Result<Self, MySqlSourceError> {
         let opts = base_opts(
             &config.host,
             config.port,
@@ -104,13 +100,13 @@ impl PersistentMySqlSource {
             tls_ca_file,
             &format!("source `{}`:{}", config.host, config.port),
         )
-        .map_err(SnapshotError::InvalidTable)?;
+        .map_err(MySqlSourceError::new)?;
         Self::new_with_opts(opts)
     }
 
     pub(crate) fn new_without_operation_timeout(
         config: &MySqlConnectionConfig,
-    ) -> Result<Self, SnapshotError> {
+    ) -> Result<Self, MySqlSourceError> {
         let builder = OptsBuilder::default()
             .ip_or_hostname(Some(config.host.clone()))
             .tcp_port(config.port)
@@ -121,92 +117,19 @@ impl PersistentMySqlSource {
         Self::new_with_opts(Opts::from(apply_mysql_connection_liveness(builder)))
     }
 
-    pub fn count_rows(&self, table: &str) -> Result<u64, SnapshotError> {
-        let sql = format!(
-            "SELECT COUNT(*) FROM {}",
-            crate::mysql_support::quote_ident(table)
-        );
-        self.conn
-            .borrow_mut()
-            .query_first::<u64, _>(sql)
-            .map_err(snapshot_query_error)?
-            .ok_or_else(|| SnapshotError::InvalidTable(format!("{table} row count was empty")))
-    }
-
-    pub fn read_range_boundaries(
-        &self,
-        table: &crate::snapshot::SnapshotTable,
-        workers: usize,
-        total_rows: u64,
-    ) -> Result<Vec<Vec<String>>, SnapshotError> {
-        snapshot_boundary_offsets(total_rows, workers)
-            .into_iter()
-            .map(|offset| self.read_range_boundary(table, offset))
-            .collect()
-    }
-
-    fn read_range_boundary(
-        &self,
-        table: &crate::snapshot::SnapshotTable,
-        offset: u64,
-    ) -> Result<Vec<String>, SnapshotError> {
-        let sql = build_snapshot_boundary_select_sql(table, offset);
-        let row = self
-            .conn
-            .borrow_mut()
-            .query_first::<mysql::Row, _>(sql)
-            .map_err(snapshot_query_error)?
-            .ok_or_else(|| {
-                SnapshotError::InvalidTable(format!("{} boundary was empty", table.name))
-            })?;
-        row.unwrap()
-            .into_iter()
-            .map(value_to_string)
-            .enumerate()
-            .map(|(index, value)| {
-                value.ok_or_else(|| {
-                    SnapshotError::InvalidTable(format!(
-                        "primary-key column {} was NULL",
-                        table.primary_key[index]
-                    ))
-                })
-            })
-            .collect()
-    }
-
-    pub fn read_create_table(&self, table: &str) -> Result<String, SnapshotError> {
-        let sql = format!(
-            "SHOW CREATE TABLE {}",
-            crate::mysql_support::quote_ident(table)
-        );
-        self.conn
-            .borrow_mut()
-            .query_first::<(String, String), _>(sql)
-            .map_err(snapshot_query_error)?
-            .map(|(_, ddl)| ddl)
-            .ok_or_else(|| SnapshotError::InvalidTable(format!("{table} DDL was empty")))
-    }
-
-    pub(crate) fn execute_session_sql(&self, sql: &str) -> Result<(), SnapshotError> {
-        self.conn
-            .borrow_mut()
-            .query_drop(sql)
-            .map_err(snapshot_query_error)
-    }
-
     pub(crate) fn query_rows_as_strings(
         &self,
         sql: &str,
-    ) -> Result<Vec<Vec<Option<String>>>, SnapshotError> {
+    ) -> Result<Vec<Vec<Option<String>>>, MySqlSourceError> {
         let rows = self
             .conn
             .borrow_mut()
             .query::<mysql::Row, _>(sql)
-            .map_err(snapshot_query_error)?;
+            .map_err(source_query_error)?;
         Ok(rows.into_iter().map(row_to_strings).collect())
     }
 
-    pub(crate) fn read_binlog_coordinate(&self) -> Result<Checkpoint, SnapshotError> {
+    pub(crate) fn read_binlog_coordinate(&self) -> Result<Checkpoint, MySqlSourceError> {
         let rows = self.query_rows_as_strings(binlog_coordinate_query())?;
         parse_binlog_coordinate_checkpoint(rows)
     }
@@ -218,10 +141,11 @@ fn binlog_coordinate_query() -> &'static str {
 
 fn parse_binlog_coordinate_checkpoint(
     rows: Vec<Vec<Option<String>>>,
-) -> Result<Checkpoint, SnapshotError> {
-    let row = rows.into_iter().next().ok_or_else(|| {
-        SnapshotError::InvalidTable("MariaDB binlog coordinate is missing".to_string())
-    })?;
+) -> Result<Checkpoint, MySqlSourceError> {
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| MySqlSourceError::new("MariaDB binlog coordinate is missing".to_string()))?;
     let source_file = required_binlog_coordinate_value(&row, 0, "file")?;
     let source_position = parse_binlog_coordinate_position(&row)?;
     Ok(Checkpoint {
@@ -236,11 +160,11 @@ fn parse_binlog_coordinate_checkpoint(
     })
 }
 
-fn parse_binlog_coordinate_position(row: &[Option<String>]) -> Result<u64, SnapshotError> {
+fn parse_binlog_coordinate_position(row: &[Option<String>]) -> Result<u64, MySqlSourceError> {
     required_binlog_coordinate_value(row, 1, "position")?
         .parse::<u64>()
         .map_err(|error| {
-            SnapshotError::InvalidTable(format!(
+            MySqlSourceError::new(format!(
                 "invalid MariaDB binlog coordinate position: {error}"
             ))
         })
@@ -250,28 +174,13 @@ fn required_binlog_coordinate_value(
     row: &[Option<String>],
     index: usize,
     field: &str,
-) -> Result<String, SnapshotError> {
+) -> Result<String, MySqlSourceError> {
     row.get(index)
         .and_then(Clone::clone)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            SnapshotError::InvalidTable(format!("MariaDB binlog coordinate {field} is missing"))
+            MySqlSourceError::new(format!("MariaDB binlog coordinate {field} is missing"))
         })
-}
-
-impl SnapshotSource for PersistentMySqlSource {
-    fn read_chunk(&self, request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError> {
-        let sql = crate::mysql_snapshot::build_select_chunk_sql(request);
-        let rows = self
-            .conn
-            .borrow_mut()
-            .query::<mysql::Row, _>(sql)
-            .map_err(snapshot_query_error)?;
-
-        rows.into_iter()
-            .map(|row| snapshot_row_from_mysql_row(request, row))
-            .collect()
-    }
 }
 
 fn open_initialized_target_connection(opts: Opts) -> Result<Conn, TargetExecuteError> {
@@ -281,28 +190,90 @@ fn open_initialized_target_connection(opts: Opts) -> Result<Conn, TargetExecuteE
     Ok(conn)
 }
 
+fn parallel_initial_checkpoint(config: &ApplyBinlogConfig) -> Checkpoint {
+    Checkpoint {
+        source_file: config.source.binlog_file.clone(),
+        source_position: config.source.start_position,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: LastEvent {
+            event_type: "ParallelTargetStart".to_string(),
+            description: "source-scoped checkpoint loaded before parallel target dispatch"
+                .to_string(),
+        },
+    }
+}
+
 impl PersistentTargetExecutor {
     pub fn new(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
         Self::new_with_opts(
-            config,
             target_mysql_opts(config).map_err(TargetExecuteError::new)?,
+            config.insert_conflict_policy,
         )
     }
 
-    pub(crate) fn new_for_sync(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
-        Self::new_with_opts(
-            config,
-            sync_target_opts(config).map_err(TargetExecuteError::new)?,
-        )
+    pub(crate) fn new_for_stream(config: &ApplyBinlogConfig) -> Result<Self, TargetExecuteError> {
+        let mut executor = Self::new_with_opts(
+            target_mysql_opts(&config.target).map_err(TargetExecuteError::new)?,
+            InsertConflictPolicy::Error,
+        )?;
+        if config.target_parallel_transactions <= 1 {
+            return Ok(executor);
+        }
+        let initial_checkpoint = parallel_initial_checkpoint(config);
+        let factory =
+            crate::live::submitted_mysql::MariaDbSubmittedQueryFactory::new(&config.target);
+        let writer = crate::live::parallel_writer::ParallelTargetWriter::new(
+            config.target_parallel_transactions,
+            factory,
+            initial_checkpoint,
+        )?;
+        executor.parallel_writer = Some(Rc::new(RefCell::new(writer)));
+        Ok(executor)
     }
 
-    fn new_with_opts(config: &TargetMySqlConfig, opts: Opts) -> Result<Self, TargetExecuteError> {
+    fn new_with_opts(
+        opts: Opts,
+        insert_conflict_policy: InsertConflictPolicy,
+    ) -> Result<Self, TargetExecuteError> {
         let conn = open_initialized_target_connection(opts.clone())?;
         Ok(Self {
             conn: Rc::new(RefCell::new(Some(conn))),
-            connection_opts: opts,
-            insert_conflict_policy: config.insert_conflict_policy,
+            insert_conflict_policy,
+            parallel_writer: None,
         })
+    }
+
+    fn parallel_transaction_active(&self) -> bool {
+        self.parallel_writer
+            .as_ref()
+            .is_some_and(|writer| writer.borrow().is_active())
+    }
+
+    fn with_parallel_writer<T>(
+        &self,
+        operation: impl FnOnce(
+            &mut crate::live::parallel_writer::ParallelTargetWriter<
+                crate::live::submitted_mysql::MariaDbSubmittedQueryFactory,
+            >,
+        ) -> Result<T, TargetExecuteError>,
+    ) -> Option<Result<T, TargetExecuteError>> {
+        self.parallel_writer
+            .as_ref()
+            .map(|writer| operation(&mut writer.borrow_mut()))
+    }
+
+    fn wait_for_parallel_transactions(&self) -> Result<(), TargetExecuteError> {
+        self.with_parallel_writer(|writer| writer.wait_for_all())
+            .unwrap_or(Ok(()))
+    }
+
+    fn with_serial_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Conn) -> Result<T, TargetExecuteError>,
+    ) -> Result<T, TargetExecuteError> {
+        self.wait_for_parallel_transactions()?;
+        self.with_connection(operation)
     }
 
     fn with_connection<T>(
@@ -335,18 +306,6 @@ impl PersistentTargetExecutor {
     pub(crate) fn execute_raw_sql(&self, sql: &str) -> Result<(), TargetExecuteError> {
         self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
     }
-
-    pub(crate) fn begin_sync_transaction(&self) -> Result<(), TargetExecuteError> {
-        self.execute_transaction_control("BEGIN")
-    }
-
-    pub(crate) fn commit_sync_transaction(&self) -> Result<(), TargetExecuteError> {
-        self.execute_transaction_control("COMMIT")
-    }
-
-    pub(crate) fn rollback_sync_transaction(&self) -> Result<(), TargetExecuteError> {
-        self.execute_transaction_control("ROLLBACK")
-    }
 }
 
 impl TargetExecutor for PersistentTargetExecutor {
@@ -358,278 +317,14 @@ impl TargetExecutor for PersistentTargetExecutor {
         }
     }
 
-    fn execute_row_change(
-        &self,
-        change: &TargetRowChange,
-    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
-        match self.execute_statement(&change.statement) {
-            Ok(()) => Ok(TargetExecutionOutcome::Applied),
-            Err(error)
-                if error.mysql_code() == Some(1062)
-                    && change.kind == TargetRowChangeKind::Insert =>
-            {
-                let error_text = error.to_string();
-                let conflict = DuplicateConflict {
-                    error_code: 1062,
-                    error_text,
-                    duplicate_index: crate::target::duplicate_index_from_error(&error.to_string()),
-                };
-                if self.insert_conflict_policy == InsertConflictPolicy::Error {
-                    return Err(error);
-                }
-                let existing_rows = self.read_existing_rows(change)?;
-                let rows_equal = existing_rows.len() == 1
-                    && crate::target::duplicate_insert_outcome(
-                        conflict.clone(),
-                        Some(&existing_rows[0]),
-                        &change.source_values,
-                        &change.set_columns,
-                    ) == TargetExecutionOutcome::DuplicateIgnored(conflict.clone());
-                if rows_equal
-                    && matches!(
-                        self.insert_conflict_policy,
-                        InsertConflictPolicy::IgnoreDuplicate
-                            | InsertConflictPolicy::ReplaceDivergentPk
-                    )
-                {
-                    return Ok(TargetExecutionOutcome::DuplicateIgnored(conflict));
-                }
-                if should_replace_divergent_primary(
-                    self.insert_conflict_policy,
-                    conflict.duplicate_index.as_deref(),
-                    rows_equal,
-                ) {
-                    return self.replace_divergent_primary_key_row(
-                        change,
-                        conflict,
-                        existing_rows.len(),
-                    );
-                }
-                Ok(TargetExecutionOutcome::ConstraintConflict(conflict))
-            }
-            Err(error) => {
-                if let Some(conflict) = duplicate_conflict_for_row_change(change.kind, &error) {
-                    return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
-                }
-                if let Some(conflict) =
-                    duplicate_payment_trigger_conflict(change.kind, &change.table, &error)
-                {
-                    let existing_rows = self.read_existing_rows(change)?;
-                    return Ok(duplicate_payment_trigger_outcome(
-                        conflict,
-                        &change.writable_columns,
-                        &change.source_values,
-                        &existing_rows,
-                    ));
-                }
-                if let Some(conflict) = constraint_conflict_from_error(&error) {
-                    return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
-                }
-                self.retry_or_return_error(&change.statement, error)?;
-                Ok(TargetExecutionOutcome::Applied)
-            }
+    fn execute_row_change(&self, change: &TargetRowChange) -> Result<(), TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| writer.execute_row_change(change))
+                .expect("parallel writer exists while its transaction is active");
         }
+        live_row_change_result(change.kind, self.execute_statement(&change.statement))
     }
-}
-
-fn duplicate_conflict_for_row_change(
-    kind: TargetRowChangeKind,
-    error: &TargetExecuteError,
-) -> Option<DuplicateConflict> {
-    if kind == TargetRowChangeKind::Insert || error.mysql_code() != Some(1062) {
-        return None;
-    }
-    let error_text = error.to_string();
-    Some(DuplicateConflict {
-        error_code: 1062,
-        error_text: error_text.clone(),
-        duplicate_index: crate::target::duplicate_index_from_error(&error_text),
-    })
-}
-
-fn constraint_conflict_for_row_change(
-    kind: TargetRowChangeKind,
-    table: &str,
-    error: &TargetExecuteError,
-) -> Option<DuplicateConflict> {
-    constraint_conflict_from_error(error)
-        .or_else(|| duplicate_payment_trigger_conflict(kind, table, error))
-}
-
-fn duplicate_payment_trigger_conflict(
-    kind: TargetRowChangeKind,
-    table: &str,
-    error: &TargetExecuteError,
-) -> Option<DuplicateConflict> {
-    let is_duplicate_payment = kind == TargetRowChangeKind::Insert
-        && table == "payments"
-        && error.mysql_code() == Some(1644)
-        && error.to_string()
-            == "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order }";
-    is_duplicate_payment.then(|| duplicate_conflict(error, 1644))
-}
-
-fn duplicate_payment_trigger_outcome<T: AsRef<str>>(
-    conflict: DuplicateConflict,
-    columns: &[T],
-    source_values: &[mysql::Value],
-    existing_rows: &[Vec<mysql::Value>],
-) -> TargetExecutionOutcome {
-    const IDENTITY_COLUMNS: [&str; 6] = [
-        "id",
-        "order_id",
-        "payment_service_id",
-        "transaction_id",
-        "original_transaction_id",
-        "authorization_id",
-    ];
-    let identity_matches = existing_rows.len() == 1
-        && IDENTITY_COLUMNS.iter().all(|identity_column| {
-            columns
-                .iter()
-                .position(|column| column.as_ref() == *identity_column)
-                .is_some_and(|index| {
-                    let source_value = source_values.get(index).cloned().and_then(value_to_string);
-                    let existing_value = existing_rows[0]
-                        .get(index)
-                        .cloned()
-                        .and_then(value_to_string);
-                    source_value == existing_value
-                })
-        });
-    if identity_matches {
-        TargetExecutionOutcome::DuplicateIgnored(conflict)
-    } else {
-        TargetExecutionOutcome::ConstraintConflict(conflict)
-    }
-}
-
-fn constraint_conflict_from_error(error: &TargetExecuteError) -> Option<DuplicateConflict> {
-    let code = error.mysql_code()?;
-    matches!(code, 1048 | 1451 | 1452 | 3819 | 4025).then(|| duplicate_conflict(error, code))
-}
-
-fn duplicate_conflict(error: &TargetExecuteError, error_code: u16) -> DuplicateConflict {
-    DuplicateConflict {
-        error_code,
-        error_text: error.to_string(),
-        duplicate_index: None,
-    }
-}
-
-/// Column list for any table whose supersession identity is a single unique column.
-fn supersession_columns_sql(table: &str) -> String {
-    format!(
-        "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='{}' ORDER BY ordinal_position",
-        table.replace('\'', "''")
-    )
-}
-
-const COMICS_COLUMNS_FOR_SUPERSESSION_SQL: &str = "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='comics' ORDER BY ordinal_position";
-
-fn build_locked_comics_evidence_sql(columns: &[String]) -> Result<String, TargetExecuteError> {
-    build_locked_identity_evidence_sql(columns, "comics", "slug")
-}
-
-pub(crate) fn build_locked_identity_evidence_sql(
-    columns: &[String],
-    table: &str,
-    identity_column: &str,
-) -> Result<String, TargetExecuteError> {
-    if columns.is_empty() {
-        return Err(TargetExecuteError::new(format!(
-            "globalcomix.{table} metadata returned no columns"
-        )));
-    }
-    if !table
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        || !identity_column
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return Err(TargetExecuteError::new(
-            "invalid supersession evidence identifier",
-        ));
-    }
-    let columns = columns
-        .iter()
-        .map(|column| crate::mysql_support::quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!(
-        "SELECT {columns} FROM `globalcomix`.`{table}` WHERE `id` = ? OR `{identity_column}` = ? ORDER BY `id` FOR UPDATE"
-    ))
-}
-
-/// Builds the locked read that both foreign-key recovery classes decide on.
-///
-/// The predicate uses only the parent's primary key columns, never the full referenced tuple: a
-/// superseded parent attribute means the historical tuple matches nothing, and selecting by it could
-/// not tell that case apart from a parent that is genuinely absent. `FOR UPDATE` holds the parent
-/// still so the decision and the write that follows see one image.
-pub(crate) fn build_locked_parent_identity_sql(
-    schema: &str,
-    parent_table: &str,
-    referenced_columns: &[String],
-    predicate_columns: &[String],
-) -> Result<String, TargetExecuteError> {
-    if referenced_columns.is_empty() {
-        return Err(TargetExecuteError::new(format!(
-            "{schema}.{parent_table} foreign key names no referenced columns"
-        )));
-    }
-    if predicate_columns.is_empty() {
-        return Err(TargetExecuteError::new(format!(
-            "{schema}.{parent_table} has no primary key to lock a parent by"
-        )));
-    }
-    for identifier in [schema, parent_table] {
-        validate_locked_parent_identifier(identifier)?;
-    }
-    for identifier in referenced_columns.iter().chain(predicate_columns) {
-        validate_locked_parent_identifier(identifier)?;
-    }
-    let selected = referenced_columns
-        .iter()
-        .map(|column| crate::mysql_support::quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let predicates = predicate_columns
-        .iter()
-        .map(|column| format!("{} = ?", crate::mysql_support::quote_ident(column)))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let order_by = predicate_columns
-        .iter()
-        .map(|column| crate::mysql_support::quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!(
-        "SELECT {selected} FROM {}.{} WHERE {predicates} ORDER BY {order_by} LIMIT 2 FOR UPDATE",
-        crate::mysql_support::quote_ident(schema),
-        crate::mysql_support::quote_ident(parent_table),
-    ))
-}
-
-fn validate_locked_parent_identifier(identifier: &str) -> Result<(), TargetExecuteError> {
-    let valid = !identifier.is_empty()
-        && identifier
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-    if valid {
-        return Ok(());
-    }
-    Err(TargetExecuteError::new(format!(
-        "invalid locked parent identifier: {identifier}"
-    )))
-}
-
-fn build_locked_users_evidence(
-    columns: Vec<String>,
-    rows: Result<Vec<Vec<mysql::Value>>, TargetExecuteError>,
-) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
-    locked_users_evidence(columns, rows?)
 }
 
 impl TransactionalTargetExecutor for PersistentTargetExecutor {
@@ -641,7 +336,13 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         ensure_stream_lease_acquired(lease_name, acquired)
     }
 
+    fn begin_stream_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.with_parallel_writer(|writer| writer.begin())
+            .unwrap_or_else(|| self.begin_transaction())
+    }
+
     fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
+        self.wait_for_parallel_transactions()?;
         self.execute_transaction_control("BEGIN")
     }
 
@@ -650,11 +351,16 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         checkpoint_table: &str,
         checkpoint_name: &str,
     ) -> Result<Option<Checkpoint>, TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| Ok(Some(writer.logical_checkpoint())))
+                .expect("parallel writer exists while its transaction is active");
+        }
         let sql = crate::stream_checkpoint::build_checkpoint_select_for_update_sql(
             checkpoint_table,
             checkpoint_name,
         );
-        let checkpoint_json = self.with_connection(|conn| {
+        let checkpoint_json = self.with_serial_connection(|conn| {
             conn.query_first::<String, _>(sql)
                 .map_err(target_query_error)
         })?;
@@ -675,206 +381,81 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
         checkpoint_name: &str,
         checkpoint: &Checkpoint,
     ) -> Result<(), TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| {
+                    writer.save_checkpoint(checkpoint_table, checkpoint_name, checkpoint)
+                })
+                .expect("parallel writer exists while its transaction is active");
+        }
         let sql = crate::stream_checkpoint::build_checkpoint_upsert_sql_for_checkpoint(
             checkpoint_table,
             checkpoint_name,
             checkpoint,
         )
         .map_err(TargetExecuteError::new)?;
-        self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
-    }
-
-    fn read_locked_supersession_evidence(
-        &self,
-        table: &str,
-        identity_column: &str,
-        historical_primary_key: &mysql::Value,
-        historical_identity: &mysql::Value,
-    ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
-        let columns_sql = supersession_columns_sql(table);
-        let columns = self.with_connection(|conn| {
-            conn.query::<String, _>(&columns_sql)
-                .map_err(target_query_error)
-        })?;
-        let sql = build_locked_identity_evidence_sql(&columns, table, identity_column)?;
-        let rows = self.with_connection(|conn| {
-            conn.exec::<mysql::Row, _, _>(
-                sql,
-                Params::Positional(vec![
-                    historical_primary_key.clone(),
-                    historical_identity.clone(),
-                ]),
-            )
-            .map_err(target_query_error)
-        })?;
-        build_locked_users_evidence(
-            columns,
-            Ok(rows.into_iter().map(mysql::Row::unwrap).collect()),
-        )
-    }
-
-    fn read_locked_comics_supersession_evidence(
-        &self,
-        historical_primary_key: &mysql::Value,
-        historical_slug: &mysql::Value,
-    ) -> Result<UsersActiveTransactionEvidence, TargetExecuteError> {
-        let columns = self.with_connection(|conn| {
-            conn.query::<String, _>(COMICS_COLUMNS_FOR_SUPERSESSION_SQL)
-                .map_err(target_query_error)
-        })?;
-        let sql = build_locked_comics_evidence_sql(&columns)?;
-        let rows = self
-            .with_connection(|conn| {
-                conn.exec::<mysql::Row, _, _>(
-                    sql,
-                    Params::Positional(vec![
-                        historical_primary_key.clone(),
-                        historical_slug.clone(),
-                    ]),
-                )
-                .map_err(target_query_error)
-            })?
-            .into_iter()
-            .map(mysql::Row::unwrap)
-            .collect();
-        build_locked_users_evidence(columns, Ok(rows))
-    }
-
-    fn read_locked_parent_identity(
-        &self,
-        schema: &str,
-        parent_table: &str,
-        referenced_columns: &[String],
-        parent_primary_key: &[(String, mysql::Value)],
-    ) -> Result<Vec<Vec<mysql::Value>>, TargetExecuteError> {
-        let predicate_columns = parent_primary_key
-            .iter()
-            .map(|(column, _)| column.clone())
-            .collect::<Vec<_>>();
-        let sql = build_locked_parent_identity_sql(
-            schema,
-            parent_table,
-            referenced_columns,
-            &predicate_columns,
-        )?;
-        let params = parent_primary_key
-            .iter()
-            .map(|(_, value)| value.clone())
-            .collect::<Vec<_>>();
-        let rows = self.with_connection(|conn| {
-            conn.exec::<mysql::Row, _, _>(&sql, Params::Positional(params.clone()))
-                .map_err(target_query_error)
-        })?;
-        Ok(rows.into_iter().map(mysql::Row::unwrap).collect())
-    }
-
-    fn read_locked_child_identity(
-        &self,
-        schema: &str,
-        child_table: &str,
-        selected_columns: &[String],
-        primary_key: &[(String, mysql::Value)],
-    ) -> Result<Vec<Vec<mysql::Value>>, TargetExecuteError> {
-        let predicate_columns = primary_key
-            .iter()
-            .map(|(column, _)| column.clone())
-            .collect::<Vec<_>>();
-        let sql = build_locked_parent_identity_sql(
-            schema,
-            child_table,
-            selected_columns,
-            &predicate_columns,
-        )?;
-        let params = primary_key
-            .iter()
-            .map(|(_, value)| value.clone())
-            .collect::<Vec<_>>();
-        let rows = self.with_connection(|conn| {
-            conn.exec::<mysql::Row, _, _>(&sql, Params::Positional(params))
-                .map_err(target_query_error)
-        })?;
-        Ok(rows.into_iter().map(mysql::Row::unwrap).collect())
+        self.with_serial_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
     }
 
     fn commit_transaction(&self) -> Result<(), TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| writer.commit())
+                .expect("parallel writer exists while its transaction is active");
+        }
         self.execute_transaction_control("COMMIT")
     }
 
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| writer.rollback())
+                .expect("parallel writer exists while its transaction is active");
+        }
         self.execute_transaction_control("ROLLBACK")
     }
 
-    fn discard_failed_transaction_connection(&self) -> Result<(), TargetExecuteError> {
-        let failed_connection = self.conn.borrow_mut().take();
-        drop(failed_connection);
-        let replacement = open_initialized_target_connection(self.connection_opts.clone())?;
-        *self.conn.borrow_mut() = Some(replacement);
-        Ok(())
+    fn flush_pending_transactions(&self) -> Result<(), TargetExecuteError> {
+        self.wait_for_parallel_transactions()
+    }
+
+    fn take_committed_checkpoints(&self) -> Result<Vec<Checkpoint>, TargetExecuteError> {
+        self.with_parallel_writer(|writer| writer.take_committed_checkpoints())
+            .unwrap_or(Ok(Vec::new()))
+    }
+
+    fn uses_parallel_transactions(&self) -> bool {
+        self.parallel_writer.is_some()
+    }
+}
+
+fn live_row_change_result(
+    kind: TargetRowChangeKind,
+    result: Result<(), TargetExecuteError>,
+) -> Result<(), TargetExecuteError> {
+    match result {
+        Err(error) if error.mysql_code() == Some(1062) && kind == TargetRowChangeKind::Insert => {
+            Ok(())
+        }
+        result => result,
     }
 }
 
 impl PersistentTargetExecutor {
-    fn replace_divergent_primary_key_row(
-        &self,
-        change: &TargetRowChange,
-        conflict: DuplicateConflict,
-        existing_row_count: usize,
-    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
-        if existing_row_count != 1 {
-            return Ok(primary_key_replacement_outcome(
-                conflict,
-                existing_row_count,
-                0,
-            ));
-        }
-
-        let statement = build_primary_key_replacement_statement(change);
-        match self.execute_primary_key_replacement_statement(&statement) {
-            Ok(affected_rows) => Ok(primary_key_replacement_outcome(
-                conflict,
-                existing_row_count,
-                affected_rows,
-            )),
-            Err(error) => {
-                if let Some(conflict) =
-                    duplicate_conflict_for_row_change(TargetRowChangeKind::Update, &error)
-                {
-                    return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
-                }
-                if let Some(conflict) = constraint_conflict_for_row_change(
-                    TargetRowChangeKind::Update,
-                    &change.table,
-                    &error,
-                ) {
-                    return Ok(TargetExecutionOutcome::ConstraintConflict(conflict));
-                }
-                Err(error)
-            }
-        }
-    }
-
     fn execute_transaction_control(&self, sql: &str) -> Result<(), TargetExecuteError> {
         self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
     }
 
     fn execute_statement(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
+        if self.parallel_transaction_active() {
+            return self
+                .with_parallel_writer(|writer| writer.execute(statement))
+                .expect("parallel writer exists while its transaction is active");
+        }
         let params = statement.params.clone();
-        self.with_connection(|conn| {
+        self.with_serial_connection(|conn| {
             conn.exec_drop(&statement.sql, Params::Positional(params))
                 .map_err(target_query_error)
-        })
-    }
-
-    fn execute_primary_key_replacement_statement(
-        &self,
-        statement: &SqlStatement,
-    ) -> Result<u64, TargetExecuteError> {
-        let params = statement.params.clone();
-        self.with_connection(|connection| {
-            connection
-                .exec_drop(&statement.sql, Params::Positional(params))
-                .map_err(target_query_error)?;
-            Ok(connection.affected_rows())
         })
     }
 
@@ -886,123 +467,21 @@ impl PersistentTargetExecutor {
         if self.can_ignore_duplicate_insert(&statement.sql, &error.to_string()) {
             return Ok(());
         }
+        self.retry_generated_column_or_return_error(statement, error)
+    }
+
+    fn retry_generated_column_or_return_error(
+        &self,
+        statement: &SqlStatement,
+        error: TargetExecuteError,
+    ) -> Result<(), TargetExecuteError> {
         let Some(retry_sql) = generated_column_retry_sql(statement, &error.to_string()) else {
             return Err(error);
         };
-        self.with_connection(|conn| conn.query_drop(retry_sql).map_err(target_query_error))
+        self.with_serial_connection(|conn| conn.query_drop(retry_sql).map_err(target_query_error))
     }
 
     fn can_ignore_duplicate_insert(&self, sql: &str, error: &str) -> bool {
         should_ignore_duplicate_insert(self.insert_conflict_policy, sql, error)
-    }
-
-    fn read_existing_rows(
-        &self,
-        change: &TargetRowChange,
-    ) -> Result<Vec<Vec<mysql::Value>>, TargetExecuteError> {
-        let columns = change
-            .writable_columns
-            .iter()
-            .map(|column| crate::mysql_support::quote_ident(column))
-            .collect::<Vec<_>>();
-        let predicates = change
-            .primary_key_columns
-            .iter()
-            .map(|column| format!("{} = ?", crate::mysql_support::quote_ident(column)))
-            .collect::<Vec<_>>();
-        let sql = format!(
-            "SELECT {} FROM {} WHERE {}",
-            columns.join(", "),
-            crate::mysql_support::quote_ident(&change.table),
-            predicates.join(" AND ")
-        );
-        let rows = self.with_connection(|conn| {
-            conn.exec::<mysql::Row, _, _>(
-                sql,
-                Params::Positional(change.primary_key_values.clone()),
-            )
-            .map_err(target_query_error)
-        })?;
-        rows.into_iter()
-            .map(|row| {
-                let values = row.unwrap();
-                if values.len() != change.writable_columns.len() {
-                    return Err(TargetExecuteError::new(format!(
-                        "target row for `{}` returned {} values, expected {}",
-                        change.table,
-                        values.len(),
-                        change.writable_columns.len()
-                    )));
-                }
-                Ok(values)
-            })
-            .collect()
-    }
-}
-
-impl PersistentProgressWriter {
-    pub fn new(config: &TargetMySqlConfig, progress_table: String) -> Result<Self, TableSyncError> {
-        let opts = sync_target_opts(config).map_err(TableSyncError::Progress)?;
-        let mut conn = open_conn(opts).map_err(progress_connect_error)?;
-        conn.query_drop(crate::live::target_session_init_command())
-            .map_err(progress_query_error)?;
-        Ok(Self {
-            conn: RefCell::new(conn),
-            default_database: config.database.clone(),
-            progress_table,
-        })
-    }
-
-    pub fn ensure(&self) -> Result<(), TableSyncError> {
-        if let Some(sql) = build_create_progress_schema_sql(&self.progress_table) {
-            self.execute_progress_sql(sql)?;
-        }
-        self.execute_progress_sql(build_create_progress_table_sql(&self.progress_table))?;
-        self.execute_progress_sql(build_add_total_rows_column_sql(
-            &self.default_database,
-            &self.progress_table,
-        ))
-    }
-
-    pub fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
-        self.execute_progress_sql(build_progress_upsert_sql(&self.progress_table, progress))
-    }
-
-    pub fn save_error_message(&self, table: &str, error: &str) -> Result<(), TableSyncError> {
-        self.execute_progress_sql(build_progress_error_message_sql(
-            &self.progress_table,
-            table,
-            error,
-        ))
-    }
-
-    pub fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError> {
-        let sql = build_snapshot_progress_select_sql(&self.progress_table);
-        let rows = self
-            .conn
-            .borrow_mut()
-            .query::<(String, String, u64, String), _>(sql)
-            .map_err(progress_query_error)?;
-        snapshot_progress_from_rows(rows)
-    }
-
-    pub fn execute_table_sync_progress_sql(&self, sql: String) -> Result<(), TableSyncError> {
-        self.execute_progress_sql(sql)
-    }
-
-    pub fn query_table_sync_progress_tsv(&self, sql: String) -> Result<String, TableSyncError> {
-        let rows = self
-            .conn
-            .borrow_mut()
-            .query::<mysql::Row, _>(sql)
-            .map_err(progress_query_error)?;
-        Ok(rows_to_tsv(rows))
-    }
-
-    fn execute_progress_sql(&self, sql: String) -> Result<(), TableSyncError> {
-        self.conn
-            .borrow_mut()
-            .query_drop(sql)
-            .map_err(progress_query_error)
     }
 }

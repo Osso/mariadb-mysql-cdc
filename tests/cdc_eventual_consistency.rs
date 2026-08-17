@@ -48,92 +48,50 @@ fn real_strict_secondary_btree_harness_smoke() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_sync_table_fk_parent_repair_converges_after_1452() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("sync-table-fk-parent-repair")
-        .output()
-        .expect("run sync-table FK parent repair harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn real_unified_sync_tls_harness_smoke() {
+    run_harness_scenario("sync-tls");
 }
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_sync_table_composite_enum_primary_key_uses_enum_order() {
-    run_harness_scenario("sync-table-composite-enum-primary-key");
+fn real_unified_sync_composite_enum_primary_key_uses_enum_order() {
+    run_harness_scenario("sync-composite-enum-primary-key");
 }
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_exact_equivalent_conflict_reconciliation_is_bounded_and_checkpoint_independent() {
-    run_harness_scenario("exact-equivalent-conflict-reconciliation");
+fn real_unified_sync_fk_parent_insert_converges() {
+    run_harness_scenario("sync-fk-parent-insert");
 }
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_sync_table_fk_parent_reconciles_stale_unique_owner() {
-    run_harness_scenario("sync-table-fk-parent-stale-unique-owner");
+fn real_unified_sync_fk_parent_update_converges() {
+    run_harness_scenario("sync-fk-parent-update");
 }
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_sync_table_update_repairs_fk_parent_after_1452() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("sync-table-update-fk-parent-repair")
-        .output()
-        .expect("run sync-table update FK parent repair harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn real_unified_sync_reconciles_stale_unique_owner() {
+    run_harness_scenario("sync-fk-parent-stale-unique-owner");
 }
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_fk_parent_repair_reconciles_concurrent_child_duplicate() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("sync-table-fk-parent-concurrent-duplicate")
-        .output()
-        .expect("run FK parent concurrent duplicate harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn real_unified_sync_wide_update_converges() {
+    run_harness_scenario("sync-wide-update");
 }
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_wide_update_retries_only_failed_fk_statement() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("sync-table-wide-update-fk-retry")
-        .output()
-        .expect("run wide update FK retry harness");
+fn real_unified_sync_resumes_durable_progress() {
+    run_harness_scenario("sync-resume");
+}
 
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_unified_sync_progress_uses_least_privilege_identity() {
+    run_harness_scenario("sync-progress-least-privilege");
 }
 
 #[test]
@@ -145,260 +103,6 @@ fn real_writable_metadata_keeps_default_generated_columns() {
         .arg("writable-column-generated-metadata")
         .output()
         .expect("run writable-column metadata harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_superseded_users_recovery_commits_remaining_effects_and_rejects_mismatch() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("superseded-users-recovery")
-        .output()
-        .expect("run superseded users recovery harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_home_feed_card_parent_recovery_replays_child_and_checkpoints() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("home-feed-card-parent-recovery")
-        .output()
-        .expect("run exact home-feed parent recovery harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_superseded_release_parent_recovery_preserves_current_rows_and_commits_remaining_effects() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("superseded-release-parent-recovery")
-        .output()
-        .expect("run superseded release parent recovery harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// An unenumerated constraint recovers with no coordinate pinned anywhere.
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_generic_fk_missing_parent_installs_parent_and_replays_child() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("generic-fk-missing-parent")
-        .output()
-        .expect("run generic fk missing parent harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// The target parent moved on while the stream replays, so only the child's derived column moves.
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_generic_fk_superseded_attribute_fast_forwards_only_derived_columns() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("generic-fk-superseded-attribute")
-        .output()
-        .expect("run generic fk superseded attribute harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_generic_fk_source_parent_mismatch_fails_closed() {
-    run_harness_scenario("generic-fk-source-parent-mismatch");
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_generic_fk_restrict_rule_fails_closed() {
-    run_harness_scenario("generic-fk-restrict-rejected");
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_generic_fk_missing_parent_preserves_binary_bytes() {
-    run_harness_scenario("generic-fk-missing-parent-binary");
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_superseded_release_visibility_recovery_installs_current_row_atomically() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("superseded-release-visibility-recovery")
-        .output()
-        .expect("run superseded release visibility recovery harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_missing_pk_two_parent_collision_rolls_back_atomically() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("missing-pk-two-parent-collision")
-        .output()
-        .expect("run missing-PK two-parent collision harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_fk_unrelated_cycle_is_ignored_for_selected_guests() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("fk-unrelated-cycle-ignored")
-        .output()
-        .expect("run unrelated FK cycle repair harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_fk_selected_dependency_cycle_blocks_selected_guests() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("fk-selected-dependency-cycle-block")
-        .output()
-        .expect("run selected dependency FK cycle harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_global_delete_limit_preflights_all_tables_before_mutation() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("global-delete-limit")
-        .output()
-        .expect("run global delete limit harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_delete_only_descendants_are_preflighted_deleted_and_verified() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("delete-only-descendants")
-        .output()
-        .expect("run delete-only descendants harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_reconciliation_owner_should_resume_durable_missing_guest_run() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("reconciliation-owner-missing-guest")
-        .output()
-        .expect("run reconciliation owner missing guest harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_failed_run_claim_post_revalidation_race_is_serialized() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("failed-run-claim-post-revalidation-race")
-        .output()
-        .expect("run failed-run claim post-revalidation race harness");
 
     assert!(
         output.status.success(),
@@ -445,24 +149,6 @@ fn real_production_alter_table_harness_smoke() {
 }
 
 #[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_catchup_snapshot_tls_harness_smoke() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("catchup-snapshot-tls")
-        .output()
-        .expect("run catchup snapshot TLS harness");
-
-    assert!(
-        output.status.success(),
-        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
 fn source_harness_stream_account_allows_plaintext_transport() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cdc-harness-source-bootstrap.sql");
@@ -471,10 +157,10 @@ fn source_harness_stream_account_allows_plaintext_transport() {
 }
 
 #[test]
-fn catchup_harness_omits_source_ca_and_preserves_target_ca() {
+fn sync_harness_uses_current_cli_flags_and_target_ca() {
     let script = harness_script();
     let code = format!(
-        r#"""
+        r#"
 import importlib.util
 import pathlib
 import sys
@@ -489,62 +175,32 @@ harness = module.Harness.__new__(module.Harness)
 harness.source = module.Endpoint('source', 3307)
 harness.target = module.Endpoint('target', 3308)
 harness.ca_file = pathlib.Path('/tmp/shared-ca.pem')
-args = harness._catchup_args(
+args = harness._sync_args(
     pathlib.Path('/tmp/cdc'),
-    pathlib.Path('/tmp/progress.json'),
+    tables=['parents', 'children'],
+    run_id='sync-test',
+    chunk_size=500,
+    parallelism=4,
     target_ca_file=pathlib.Path('/tmp/target-ca.pem'),
 )
+assert args[1] == 'sync'
 assert '--source-tls-ca-file' not in args
-target_index = args.index('--target-tls-ca-file')
-assert args[target_index + 1] == '/tmp/target-ca.pem'
-"""#,
+assert args[args.index('--target-tls-ca-file') + 1] == '/tmp/target-ca.pem'
+assert args[args.index('--progress-table') + 1] == 'cdc.sync_runs'
+assert args[args.index('--run-id') + 1] == 'sync-test'
+assert args[args.index('--chunk-size') + 1] == '500'
+assert args[args.index('--parallelism') + 1] == '4'
+assert [args[index + 1] for index, value in enumerate(args) if value == '--table'] == ['parents', 'children']
+"#,
         script = script.display()
     );
     let output = Command::new("python3")
         .args(["-c", &code])
         .output()
-        .expect("check catchup CA policy");
+        .expect("check unified sync CLI arguments");
     assert!(
         output.status.success(),
-        "catchup CA policy failed:
-{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn sync_table_harness_omits_source_ca_and_preserves_target_ca() {
-    let script = harness_script();
-    let code = format!(
-        r#"""
-import importlib.util
-import pathlib
-import sys
-
-script = pathlib.Path(r'{script}')
-spec = importlib.util.spec_from_file_location('cdc_harness', script)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-
-harness = module.Harness.__new__(module.Harness)
-harness.source = module.Endpoint('source', 3307)
-harness.target = module.Endpoint('target', 3308)
-harness.ca_file = pathlib.Path('/tmp/target-ca.pem')
-args = harness._sync_table_args(pathlib.Path('/tmp/cdc'))
-assert '--source-tls-ca-file' not in args
-target_index = args.index('--target-tls-ca-file')
-assert args[target_index + 1] == '/tmp/target-ca.pem'
-"""#,
-        script = script.display()
-    );
-    let output = Command::new("python3")
-        .args(["-c", &code])
-        .output()
-        .expect("check sync-table CA policy");
-    assert!(
-        output.status.success(),
-        "sync-table CA policy failed:
+        "unified sync arguments failed:
 {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -652,52 +308,58 @@ else:
 }
 
 #[test]
-fn repair_scenarios_are_executable_and_in_repair_scope() {
-    let script = fs::read_to_string(harness_script()).expect("read integration harness");
-    for scenario in [
-        "pre-state-drift",
-        "coordinate-reuse",
-        "raw-sql-reuse",
-        "end-position-reuse",
-        "checkpoint-mismatch",
-    ] {
-        assert!(script.contains(&format!("ScenarioSpec(\"{scenario}\", True)")));
-        assert!(script.contains(&format!(
-            "self.run_journal_mismatch_scenario(\"{scenario}\")"
-        )));
-    }
-    for scenario in [
-        "fk-child-first-delete",
-        "fk-parent-first-insert",
-        "fk-cycle-block",
-        "fk-unrelated-cycle-ignored",
-        "fk-selected-dependency-cycle-block",
-        "repair-resume",
-        "conflict-resolution-zero-debt",
-    ] {
-        assert!(script.contains(&format!("ScenarioSpec(\"{scenario}\", True)")));
-    }
-}
+fn unified_sync_scenarios_are_executable_and_dispatched() {
+    let script = harness_script();
+    let code = format!(
+        r#"
+import importlib.util
+import pathlib
+import sys
 
-#[test]
-fn repair_scenarios_have_real_cli_orchestration_dispatch() {
-    let script = fs::read_to_string(harness_script()).expect("read integration harness");
-    assert!(script.contains("def run_repair_scenario"));
-    assert!(!script.contains("--source-tls-ca-file"));
-    for scenario in [
-        "fk-child-first-delete",
-        "fk-parent-first-insert",
-        "fk-cycle-block",
-        "fk-unrelated-cycle-ignored",
-        "fk-selected-dependency-cycle-block",
-        "repair-resume",
-        "conflict-resolution-zero-debt",
-    ] {
-        assert!(
-            script.contains(&format!("self.run_repair_scenario(\"{scenario}\")")),
-            "missing real repair dispatch for {scenario}"
-        );
-    }
+script = pathlib.Path(r'{script}')
+spec = importlib.util.spec_from_file_location('cdc_harness_dispatch', script)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+harness = module.Harness.__new__(module.Harness)
+calls = []
+harness.prepare = lambda: calls.append('prepare')
+harness.run_sync_tls = lambda: calls.append('sync-tls')
+harness.run_sync_composite_enum_primary_key = lambda: calls.append('sync-composite-enum-primary-key')
+harness.run_sync_fk_parent_convergence = lambda update_existing_child=False: calls.append(
+    'sync-fk-parent-update' if update_existing_child else 'sync-fk-parent-insert'
+)
+harness.run_sync_fk_parent_stale_unique_owner = lambda: calls.append('sync-fk-parent-stale-unique-owner')
+harness.run_sync_wide_update = lambda: calls.append('sync-wide-update')
+harness.run_sync_resume = lambda: calls.append('sync-resume')
+harness.run_sync_progress_least_privilege = lambda: calls.append('sync-progress-least-privilege')
+
+for scenario in (
+    'sync-tls',
+    'sync-composite-enum-primary-key',
+    'sync-fk-parent-insert',
+    'sync-fk-parent-update',
+    'sync-fk-parent-stale-unique-owner',
+    'sync-wide-update',
+    'sync-resume',
+    'sync-progress-least-privilege',
+):
+    calls.clear()
+    harness.run_scenario(scenario)
+    assert calls == ['prepare', scenario], (scenario, calls)
+"#,
+        script = script.display()
+    );
+    let output = Command::new("python3")
+        .args(["-c", &code])
+        .output()
+        .expect("exercise unified sync scenario dispatch");
+    assert!(
+        output.status.success(),
+        "unified sync dispatch failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -749,26 +411,29 @@ fn harness_scenario_listing_has_behavior_or_explicit_prerequisite() {
             .any(|line| line == "strict-secondary-btree\texecutable")
     );
     for scenario in [
+        "sync-tls",
+        "sync-composite-enum-primary-key",
+        "sync-fk-parent-insert",
+        "sync-fk-parent-update",
+        "sync-fk-parent-stale-unique-owner",
+        "sync-wide-update",
+        "sync-resume",
+        "sync-progress-least-privilege",
         "prepare-failure",
         "post-ddl-pre-applied",
         "applied-pre-checkpoint",
         "checkpoint-transaction",
         "source-connection-loss",
         "target-connection-loss",
-        "superseded-release-parent-recovery",
-        "fk-child-first-delete",
-        "fk-parent-first-insert",
-        "fk-cycle-block",
-        "fk-unrelated-cycle-ignored",
-        "fk-selected-dependency-cycle-block",
-        "repair-resume",
-        "conflict-resolution-zero-debt",
     ] {
         assert!(
             listed
                 .lines()
                 .any(|line| line == format!("{scenario}\texecutable"))
         );
+    }
+    for removed_prefix in ["catchup-snapshot", "sync-table", "repair-"] {
+        assert!(!listed.lines().any(|line| line.starts_with(removed_prefix)));
     }
 }
 
@@ -952,11 +617,7 @@ for grant in (
 #[test]
 fn harness_has_no_unsafe_runtime_sql_or_tls_flags() {
     let script = fs::read_to_string(harness_script()).expect("read harness script");
-    let runtime = section(
-        &script,
-        "    def _stream_args",
-        "    def setup_accounts_table",
-    );
+    let runtime = section(&script, "    def _stream_args", "    def run_stream");
     for forbidden in [
         "GRANT ALL",
         "--force",
@@ -972,56 +633,97 @@ fn harness_has_no_unsafe_runtime_sql_or_tls_flags() {
         !runtime.contains("root"),
         "CDC runtime path must not use root"
     );
-    assert!(runtime.contains("TARGET_USER"));
+    assert!(runtime.contains("LIVE_TARGET_USER"));
+    assert!(!runtime.contains("SYNC_TARGET_USER"));
     assert!(runtime.contains("SOURCE_USER"));
     assert!(!runtime.contains("--source-tls-ca-file"));
     assert!(runtime.contains("--target-tls-ca-file"));
+    assert!(!runtime.contains("--insert-conflict-policy"));
+    assert!(!runtime.contains("--integration-logical-"));
     assert!(!runtime.contains("/etc/mariadb-mysql-cdc/do-ca.pem"));
 }
 
 #[test]
-fn conflict_startup_rejection_scenarios_fail_before_source_mutation() {
+fn harness_separates_live_and_sync_target_identities() {
+    let script = harness_script();
+    let code = format!(
+        r#"
+import importlib.util
+import pathlib
+import sys
+
+script = pathlib.Path(r'{script}')
+spec = importlib.util.spec_from_file_location('cdc_harness_identity', script)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+harness = module.Harness.__new__(module.Harness)
+harness.source = module.Endpoint('source', 3307)
+harness.target = module.Endpoint('target', 3308)
+harness.ca_file = pathlib.Path('/tmp/target-ca.pem')
+live = harness._stream_args(
+    pathlib.Path('/tmp/cdc'),
+    module.Coordinate('mysql-bin.000001', 4),
+    None,
+    None,
+    0,
+)
+sync = harness._sync_args(
+    pathlib.Path('/tmp/cdc'),
+    tables=['accounts'],
+    run_id='identity-test',
+)
+assert live[live.index('--target-user') + 1] == module.LIVE_TARGET_USER
+assert sync[sync.index('--target-user') + 1] == module.SYNC_TARGET_USER
+assert module.LIVE_TARGET_USER != module.SYNC_TARGET_USER
+"#,
+        script = script.display()
+    );
+    let output = Command::new("python3")
+        .args(["-c", &code])
+        .output()
+        .expect("check live and sync target identities");
+    assert!(
+        output.status.success(),
+        "target identity separation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn live_harness_covers_source_authoritative_duplicate_inserts() {
+    let script = fs::read_to_string(harness_script()).expect("read integration harness");
+
+    assert!(script.contains("ScenarioSpec(\"insert-duplicate-idempotent\", True)"));
+    assert!(script.contains("self.run_insert_duplicate_idempotent()"));
+    assert!(script.contains("self.run_parallel_target_transactions()"));
+}
+
+#[test]
+fn live_harness_excludes_retired_conflict_paths() {
     let script = fs::read_to_string(harness_script()).expect("read integration harness");
     for scenario in [
+        "home-feed-card-parent-recovery",
+        "superseded-release-visibility-recovery",
+        "generic-fk-missing-parent",
+        "generic-fk-missing-parent-binary",
+        "generic-fk-superseded-attribute",
+        "generic-fk-source-parent-mismatch",
+        "generic-fk-restrict-rejected",
+        "superseded-users-recovery",
         "missing-conflict-trigger",
         "missing-conflict-table",
         "wrong-conflict-schema",
         "missing-conflict-grant",
         "broad-conflict-grant",
+        "replace-divergent-pk",
+        "row-conflict-rollback",
+        "row-conflict-indexed-resolution",
+        "durable-row-conflict-retry",
     ] {
-        assert!(script.contains(&format!("ScenarioSpec(\"{scenario}\", True)")));
+        assert!(!script.contains(&format!("ScenarioSpec(\"{scenario}\", True)")));
     }
-    assert!(script.contains("DROP TRIGGER cdc.row_conflicts_update_guard"));
-    assert!(script.contains("DROP TABLE cdc.row_conflicts"));
-    assert!(script.contains("ALTER TABLE cdc.row_conflicts MODIFY status VARCHAR(32)"));
-    assert!(script.contains("REVOKE UPDATE ON cdc.row_conflicts"));
-    assert!(script.contains("GRANT DELETE ON cdc.row_conflicts"));
-    assert!(script.contains("SELECT COUNT(*) FROM globalcomix.accounts"));
-}
-
-#[test]
-#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn conflict_runtime_uses_definer_inventory_procedure() {
-    let output = Command::new("python3")
-        .arg(harness_script())
-        .arg("--scenario")
-        .arg("missing-conflict-trigger")
-        .arg("--binary")
-        .arg(env!("CARGO_BIN_EXE_mariadb-mysql-cdc"))
-        .output()
-        .expect("run missing conflict trigger harness");
-
-    assert!(
-        output.status.success(),
-        "conflict runtime harness failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("missing-conflict-trigger_rejected boundary=trigger"),
-        "conflict runtime harness did not report the startup rejection boundary"
-    );
 }
 
 #[test]
@@ -1045,7 +747,7 @@ fn bootstrap_fixtures_provision_exact_conflict_inventory_procedure() {
     ] {
         assert!(target.contains(field), "target procedure missing {field}");
     }
-    assert!(target.contains("GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory"));
+    assert!(!target.contains("GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory"));
 }
 
 #[test]
@@ -1061,14 +763,23 @@ fn bootstrap_fixtures_use_exact_restricted_accounts() {
     assert!(source.contains("cdc_reader"));
     assert!(source.contains("REPLICATION SLAVE, REPLICATION CLIENT ON *.*"));
     let target = fs::read_to_string(&fixture_paths()[1]).expect("read target fixture");
-    assert!(target.contains("cdc_stream"));
-    assert!(target.contains("ON globalcomix.* TO 'cdc_stream'@'%'"));
+    for user in ["cdc_stream", "cdc_sync"] {
+        assert!(target.contains(user));
+        assert!(target.contains(&format!("ON globalcomix.* TO '{user}'@'%'")));
+    }
     assert!(target.contains("ON cdc.stream_checkpoint TO 'cdc_stream'@'%'"));
-    assert!(target.contains("ON cdc.row_conflicts TO 'cdc_stream'@'%'"));
-    assert!(target.contains(
+    assert!(target.contains("ON cdc.ddl_replay_journal TO 'cdc_stream'@'%'"));
+    assert!(target.contains("GRANT CREATE ON cdc.* TO 'cdc_sync'@'%'"));
+    assert!(target.contains("ON cdc.sync_runs TO 'cdc_sync'@'%'"));
+    assert!(!target.contains("cdc_repair"));
+    assert!(!target.contains("ON cdc.row_conflicts TO 'cdc_stream'@'%'"));
+    assert!(!target.contains("ON cdc.row_conflicts TO 'cdc_sync'@'%'"));
+    assert!(!target.contains(
         "GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory TO 'cdc_stream'@'%'"
     ));
-    assert!(target.contains("ON cdc.ddl_replay_journal TO 'cdc_stream'@'%'"));
+    assert!(!target.contains(
+        "GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory TO 'cdc_sync'@'%'"
+    ));
     assert!(!target.contains("source_primary_key_json("));
     for field in [
         "conflict_identity CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
@@ -1111,8 +822,12 @@ source_harness = module.Harness(repo, None)
 assert source_harness._stream_binary(None) == binary
 assert calls == [(['cargo', 'build', '--bin', 'mariadb-mysql-cdc'], repo)]
 calls.clear()
+assert source_harness._sync_binary() == binary
+assert calls == [(['cargo', 'build', '--bin', 'mariadb-mysql-cdc'], repo)]
+calls.clear()
 explicit_harness = module.Harness(repo, binary)
 assert explicit_harness._stream_binary(None) == binary
+assert explicit_harness._sync_binary() == binary
 assert calls == []
 "#,
         script = script.display()
@@ -1145,10 +860,6 @@ fn recovery_scenarios_are_executable_and_use_failpoint_binary() {
     }
     assert!(script.contains("self.run_recovery_scenario(scenario)"));
     assert!(script.contains("self.run_connection_loss_scenario(scenario)"));
-    assert!(script.contains("ScenarioSpec(\"replace-divergent-pk\", True)"));
-    assert!(script.contains("self.run_replace_divergent_pk()"));
-    assert!(script.contains("ScenarioSpec(\"row-conflict-rollback\", True)"));
-    assert!(script.contains("self.run_row_conflict_rollback()"));
     assert!(script.contains("--features"));
     assert!(script.contains("integration-failpoints"));
     assert!(script.contains("--integration-failpoint"));
@@ -1208,6 +919,49 @@ fn recovery_specs_assert_state_evidence_not_only_process_exit() {
                 .to_ascii_lowercase()
                 .contains(&marker.to_ascii_lowercase()),
             "missing recovery assertion marker: {marker}"
+        );
+    }
+}
+
+#[test]
+fn target_bootstrap_uses_exact_unified_sync_progress_contract() {
+    let target = fs::read_to_string(&fixture_paths()[1]).expect("read target bootstrap fixture");
+    let sync_application_grant = target
+        .split(';')
+        .find(|statement| statement.contains("ON globalcomix.* TO 'cdc_sync'@'%'"))
+        .expect("cdc_sync application grant");
+    assert!(sync_application_grant.contains("LOCK TABLES"));
+
+    for required in [
+        "CREATE USER IF NOT EXISTS 'cdc_sync'@'%'",
+        "CREATE TABLE IF NOT EXISTS cdc.sync_runs",
+        "run_id VARCHAR(128) NOT NULL",
+        "stage VARCHAR(32) NOT NULL",
+        "table_name VARCHAR(255) NOT NULL",
+        "run_spec_json LONGTEXT NOT NULL",
+        "last_primary_key_json TEXT NULL",
+        "chunks BIGINT UNSIGNED NOT NULL DEFAULT 0",
+        "rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0",
+        "inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0",
+        "updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0",
+        "deletes_applied BIGINT UNSIGNED NOT NULL DEFAULT 0",
+        "status VARCHAR(16) NOT NULL",
+        "last_error TEXT NULL",
+        "created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+        "updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+        "completed_at TIMESTAMP(6) NULL",
+        "CHECK (stage IN ('prerequisite_schema', 'rows', 'final_constraints'))",
+        "CHECK (status IN ('running', 'complete', 'error'))",
+        "CHECK (JSON_VALID(run_spec_json))",
+        "CHECK (last_primary_key_json IS NULL OR JSON_VALID(last_primary_key_json))",
+        "PRIMARY KEY (run_id, stage, table_name)",
+        "GRANT CREATE ON cdc.* TO 'cdc_sync'@'%'",
+        "GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_sync'@'%'",
+        "GRANT SELECT, INSERT, UPDATE ON cdc.sync_runs TO 'cdc_sync'@'%'",
+    ] {
+        assert!(
+            target.contains(required),
+            "target fixture missing {required}"
         );
     }
 }

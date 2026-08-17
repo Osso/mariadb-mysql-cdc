@@ -75,14 +75,13 @@ impl StreamProgress {
 #[cfg(test)]
 pub(super) fn format_stream_start(config: &ApplyBinlogConfig) -> String {
     format!(
-        "cdc_stream_start source_host={} source_database={} start_file={} start_position={} target_host={} target_database={} insert_conflict_policy={:?}",
+        "cdc_stream_start source_host={} source_database={} start_file={} start_position={} target_host={} target_database={}",
         config.source.host,
         optional_database_name(&config.source.database),
         config.source.binlog_file,
         config.source.start_position,
         config.target.host,
         config.target.database,
-        config.target.insert_conflict_policy,
     )
 }
 

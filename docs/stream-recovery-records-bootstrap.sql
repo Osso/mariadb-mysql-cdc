@@ -50,11 +50,15 @@ CREATE TABLE IF NOT EXISTS cdc.stream_recovery_records (
                 ELSE NULL
             END
         ) STORED,
-    CHECK (JSON_VALID(old_checkpoint_json)),
-    CHECK (JSON_VALID(new_checkpoint_json)),
-    CHECK (JSON_VALID(prepared_evidence_json)),
-    CHECK (committed_evidence_json IS NULL OR JSON_VALID(committed_evidence_json)),
-    CHECK (verified_evidence_json IS NULL OR JSON_VALID(verified_evidence_json)),
+    CONSTRAINT stream_recovery_records_chk_1 CHECK (JSON_VALID(old_checkpoint_json)),
+    CONSTRAINT stream_recovery_records_chk_2 CHECK (JSON_VALID(new_checkpoint_json)),
+    CONSTRAINT stream_recovery_records_chk_3 CHECK (JSON_VALID(prepared_evidence_json)),
+    CONSTRAINT stream_recovery_records_chk_4 CHECK (
+        committed_evidence_json IS NULL OR JSON_VALID(committed_evidence_json)
+    ),
+    CONSTRAINT stream_recovery_records_chk_5 CHECK (
+        verified_evidence_json IS NULL OR JSON_VALID(verified_evidence_json)
+    ),
     CONSTRAINT stream_recovery_records_chk_6 CHECK (
         status IN ('prepared', 'committed', 'verified', 'abandoned')
         AND (
@@ -72,7 +76,9 @@ CREATE TABLE IF NOT EXISTS cdc.stream_recovery_records (
             )
         )
     ),
-    CHECK (old_barrier_end_position > old_barrier_start_position),
+    CONSTRAINT stream_recovery_records_chk_7 CHECK (
+        old_barrier_end_position > old_barrier_start_position
+    ),
     PRIMARY KEY (recovery_id),
     UNIQUE KEY stream_recovery_active_barrier (active_barrier_identity),
     KEY stream_recovery_checkpoint_status (checkpoint_name, status)

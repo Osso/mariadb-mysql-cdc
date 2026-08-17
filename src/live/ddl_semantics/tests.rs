@@ -1960,6 +1960,83 @@ fn production_float_unsigned_add_column_preserves_required_options() {
     ));
 }
 
+const DISABLE_SAM_DDL: &str = "ALTER TABLE `artists_settings`\n\
+    ADD COLUMN `disable_sam` TINYINT(1) UNSIGNED NOT NULL DEFAULT 0 AFTER `markup_before_transaction_fee`";
+
+#[test]
+fn production_tinyint_unsigned_add_column_normalizes_display_width() {
+    let transformation = transform_production_alter_table(DISABLE_SAM_DDL)
+        .expect("production TINYINT(1) UNSIGNED ADD COLUMN");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `artists_settings` ADD COLUMN `disable_sam` TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER `markup_before_transaction_fee`"
+        )
+    );
+}
+
+#[test]
+fn already_present_tinyint_add_column_has_equal_pre_and_post_state() {
+    let target = artists_settings_with_disable_sam("0");
+    let operation = parse_ddl_operation(DISABLE_SAM_DDL).expect("production ALTER");
+
+    let evidence = build_semantic_evidence(&operation, &target, &target)
+        .expect("already applied column must have deterministic evidence");
+
+    assert_eq!(evidence.pre_state, evidence.expected_post_state);
+}
+
+#[test]
+fn divergent_existing_tinyint_add_column_remains_blocked() {
+    let divergent_definition = artists_settings_with_disable_sam("1");
+    let mut divergent_position = artists_settings_with_disable_sam("0");
+    divergent_position.inventory.tables[0].columns.swap(1, 2);
+    for (index, column) in divergent_position.inventory.tables[0]
+        .columns
+        .iter_mut()
+        .enumerate()
+    {
+        column.ordinal_position = (index + 1) as u32;
+    }
+    let operation = parse_ddl_operation(DISABLE_SAM_DDL).expect("production ALTER");
+
+    for (case, target) in [
+        ("definition", divergent_definition),
+        ("position", divergent_position),
+    ] {
+        let error = build_semantic_evidence(&operation, &target, &target)
+            .expect_err("divergent existing column must remain blocked");
+        assert!(
+            error.contains("already contains divergent"),
+            "{case}: {error}"
+        );
+    }
+}
+
+fn artists_settings_with_disable_sam(default_value: &str) -> SemanticSchemaSnapshot {
+    let mut target = semantic_snapshot(7, Some(8));
+    let table = &mut target.inventory.tables[0];
+    table.name = "artists_settings".to_string();
+    let mut markup_column = table.columns[1].clone();
+    markup_column.name = "markup_before_transaction_fee".to_string();
+    markup_column.column_type = "tinyint unsigned".to_string();
+    markup_column.data_type = "tinyint".to_string();
+    markup_column.is_nullable = false;
+    markup_column.character_set = None;
+    markup_column.collation = None;
+    markup_column.default_value = Some("0".to_string());
+    markup_column.comment.clear();
+    table.columns[1] = markup_column.clone();
+    markup_column.name = "disable_sam".to_string();
+    markup_column.ordinal_position = 3;
+    markup_column.default_value = Some(default_value.to_string());
+    table.columns.push(markup_column);
+    target.inventory.indexes.clear();
+    target.table_runtime.clear();
+    target
+}
+
 #[test]
 fn production_alter_rendering_depends_only_on_typed_ast() {
     let compact = transform_production_alter_table(

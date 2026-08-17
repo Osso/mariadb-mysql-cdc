@@ -1,0 +1,263 @@
+use crate::database_row::DatabaseRow;
+use crate::sync::{
+    SyncChunkProgress, SyncPrimaryKeyOrdering, SyncProgressStatus, SyncStage, SyncTable,
+    build_strict_delete_batches, build_strict_insert_batches, build_strict_update_batches,
+    decode_sync_rows, strict_delete_batch_capacity, strict_insert_batch_capacity,
+    strict_update_batch_capacity, sync_chunk_progress_from_row, sync_progress_row_from_chunk,
+    validate_sync_target_lock_identity,
+};
+use std::collections::BTreeMap;
+
+#[test]
+fn sync_mysql_adapter_decodes_exact_selected_columns_and_rejects_invalid_rows() {
+    let table = mutation_table();
+    let decoded = decode_sync_rows(
+        &table,
+        vec![vec![
+            Some("7".to_string()),
+            Some("live".to_string()),
+            None,
+        ]],
+    )
+    .expect("valid sync row");
+
+    assert_eq!(
+        decoded,
+        vec![DatabaseRow {
+            primary_key: vec!["7".to_string()],
+            values: BTreeMap::from([
+                ("id".to_string(), Some("7".to_string())),
+                ("status".to_string(), Some("live".to_string())),
+                ("title".to_string(), None),
+            ]),
+        }]
+    );
+
+    let field_count_error = decode_sync_rows(
+        &table,
+        vec![vec![Some("7".to_string()), Some("live".to_string())]],
+    )
+    .expect_err("short sync row");
+    assert_eq!(
+        field_count_error,
+        "sync row has 2 fields for 3 selected columns"
+    );
+
+    let null_primary_key_error = decode_sync_rows(
+        &table,
+        vec![vec![None, Some("live".to_string()), Some("Now".to_string())]],
+    )
+    .expect_err("NULL primary key");
+    assert_eq!(
+        null_primary_key_error,
+        "primary-key column `id` was NULL"
+    );
+
+    let mut missing_primary_key_table = table;
+    missing_primary_key_table.columns = strings(["status", "title"]);
+    let missing_primary_key_error = decode_sync_rows(
+        &missing_primary_key_table,
+        vec![vec![Some("live".to_string()), Some("Now".to_string())]],
+    )
+    .expect_err("missing primary key");
+    assert_eq!(
+        missing_primary_key_error,
+        "primary-key column `id` was not selected"
+    );
+}
+
+#[test]
+fn sync_mysql_adapter_batches_strict_mutations_within_placeholder_limits() {
+    let table = mutation_table();
+    let rows = (0..129)
+        .map(|index| row(&index.to_string(), "live", "Now"))
+        .collect::<Vec<_>>();
+    let primary_keys = rows
+        .iter()
+        .map(|row| row.primary_key.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(strict_insert_batch_capacity(&table), 128);
+    assert_eq!(strict_update_batch_capacity(&table), 128);
+    assert_eq!(strict_delete_batch_capacity(&table), 128);
+
+    let inserts = build_strict_insert_batches(&table, &rows);
+    let updates = build_strict_update_batches(&table, &rows);
+    let deletes = build_strict_delete_batches(&table, &primary_keys);
+
+    assert_eq!(inserts.len(), 2);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(deletes.len(), 2);
+    assert_eq!(inserts[0].params.len(), 128 * 3);
+    assert_eq!(updates[0].params.len(), 128 * 5);
+    assert_eq!(deletes[0].params.len(), 128);
+
+    let mutation_sql = inserts
+        .iter()
+        .chain(&updates)
+        .chain(&deletes)
+        .map(|statement| statement.sql.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_uppercase();
+    for forbidden in ["INSERT IGNORE", "ON DUPLICATE KEY UPDATE", "REPLACE"] {
+        assert!(
+            !mutation_sql.contains(forbidden),
+            "strict adapter mutation SQL contained `{forbidden}`:\n{mutation_sql}"
+        );
+    }
+
+    assert!(build_strict_insert_batches(&table, &[]).is_empty());
+    assert!(build_strict_update_batches(&table, &[]).is_empty());
+    assert!(build_strict_delete_batches(&table, &[]).is_empty());
+
+    let wide_table = wide_mutation_table(1_000);
+    assert_eq!(strict_insert_batch_capacity(&wide_table), 65);
+    assert_eq!(strict_update_batch_capacity(&wide_table), 32);
+
+    let wide_primary_key_table = wide_primary_key_table(1_000);
+    assert_eq!(strict_delete_batch_capacity(&wide_primary_key_table), 65);
+}
+
+#[test]
+fn sync_mysql_adapter_locks_only_its_bound_target_table() {
+    assert_eq!(
+        validate_sync_target_lock_identity(
+            "target_database",
+            "episodes",
+            "target_database",
+            "episodes",
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        validate_sync_target_lock_identity(
+            "target_database",
+            "episodes",
+            "other_database",
+            "episodes",
+        ),
+        Err(
+            "sync target lock identity mismatch: expected `target_database`.`episodes`, found `other_database`.`episodes`"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        validate_sync_target_lock_identity(
+            "target_database",
+            "episodes",
+            "target_database",
+            "other_table",
+        ),
+        Err(
+            "sync target lock identity mismatch: expected `target_database`.`episodes`, found `target_database`.`other_table`"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn sync_mysql_adapter_maps_rows_progress_without_changing_identity() {
+    let running = chunk_progress(false);
+    let running_row = sync_progress_row_from_chunk(&running);
+
+    assert_eq!(running_row.run_id, running.run_id);
+    assert_eq!(running_row.stage, SyncStage::Rows);
+    assert_eq!(running_row.table_name, running.table);
+    assert_eq!(running_row.run_spec_json, running.run_spec_json);
+    assert_eq!(running_row.last_primary_key, running.last_primary_key);
+    assert_eq!(running_row.status, SyncProgressStatus::Running);
+    assert_eq!(running_row.last_error, None);
+    assert_eq!(
+        sync_chunk_progress_from_row(running_row).expect("running rows progress"),
+        running
+    );
+
+    let complete = chunk_progress(true);
+    let complete_row = sync_progress_row_from_chunk(&complete);
+    assert_eq!(complete_row.status, SyncProgressStatus::Complete);
+    assert_eq!(
+        sync_chunk_progress_from_row(complete_row).expect("complete rows progress"),
+        complete
+    );
+}
+
+#[test]
+fn sync_mysql_adapter_rejects_non_row_and_error_progress() {
+    let mut non_row = sync_progress_row_from_chunk(&chunk_progress(false));
+    non_row.stage = SyncStage::PrerequisiteSchema;
+    assert_eq!(
+        sync_chunk_progress_from_row(non_row).expect_err("non-row progress"),
+        "sync chunk progress requires `rows` stage, found `prerequisite_schema`"
+    );
+
+    let mut failed = sync_progress_row_from_chunk(&chunk_progress(false));
+    failed.status = SyncProgressStatus::Error;
+    failed.last_error = Some("write failed".to_string());
+    assert_eq!(
+        sync_chunk_progress_from_row(failed).expect_err("failed progress"),
+        "sync progress for run `sync-run-42` table `episodes` is in error: write failed"
+    );
+}
+
+fn mutation_table() -> SyncTable {
+    SyncTable {
+        name: "episodes".to_string(),
+        primary_key: strings(["id"]),
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
+        columns: strings(["id", "status", "title"]),
+    }
+}
+
+fn wide_mutation_table(column_count: usize) -> SyncTable {
+    let mut columns = vec!["id".to_string()];
+    columns.extend((1..column_count).map(|index| format!("column_{index}")));
+    SyncTable {
+        name: "wide_rows".to_string(),
+        primary_key: strings(["id"]),
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
+        columns,
+    }
+}
+
+fn wide_primary_key_table(column_count: usize) -> SyncTable {
+    let primary_key = (0..column_count)
+        .map(|index| format!("key_{index}"))
+        .collect::<Vec<_>>();
+    SyncTable {
+        name: "wide_keys".to_string(),
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native; column_count],
+        columns: primary_key.clone(),
+        primary_key,
+    }
+}
+
+fn row(id: &str, status: &str, title: &str) -> DatabaseRow {
+    DatabaseRow {
+        primary_key: vec![id.to_string()],
+        values: BTreeMap::from([
+            ("id".to_string(), Some(id.to_string())),
+            ("status".to_string(), Some(status.to_string())),
+            ("title".to_string(), Some(title.to_string())),
+        ]),
+    }
+}
+
+fn chunk_progress(complete: bool) -> SyncChunkProgress {
+    SyncChunkProgress {
+        run_id: "sync-run-42".to_string(),
+        table: "episodes".to_string(),
+        run_spec_json: r#"{"chunk_size":250,"tables":["episodes"]}"#.to_string(),
+        last_primary_key: Some(strings(["7"])),
+        complete,
+        chunks: 3,
+        rows_scanned: 750,
+        inserts: 4,
+        updates: 5,
+        deletes: 6,
+    }
+}
+
+fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
+    values.into_iter().map(str::to_string).collect()
+}

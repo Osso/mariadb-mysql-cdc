@@ -1,4 +1,4 @@
-use crate::conflict_repair::CanonicalForeignKey;
+use crate::canonical_foreign_key::CanonicalForeignKey;
 use crate::inventory::{
     ColumnInventory, ForeignKeyInventory, IndexColumnInventory, IndexInventory, InventoryConfig,
     InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory, TableInventory,
@@ -8,12 +8,9 @@ use crate::live::ddl_semantics::{DDL_TRANSFORMATION_VERSION, translate_modeled_d
 use crate::target::{SqlStatement, TargetExecutor};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Params, Value};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,7 +102,6 @@ pub(crate) struct TableSchemaReport {
     pub(crate) skipped_dependencies: Vec<String>,
     pub(crate) planned_statements: Vec<PlannedSchemaStatement>,
     pub(crate) executions: Vec<StatementExecution>,
-    pub(crate) final_differences: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -183,90 +179,6 @@ pub(crate) trait SchemaCoercionPreflight {
         source: &ColumnInventory,
         target: &ColumnInventory,
     ) -> Result<CoercionBlockers, String>;
-}
-
-/// How the selected-table set is determined before the source inventory is read.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SchemaSelection {
-    /// Exactly the named tables, from `--table` and `--catalog`.
-    Named(Vec<String>),
-    /// Every source base table, resolved from the source inventory.
-    AllSourceTables,
-}
-
-pub(crate) fn schema_selection(
-    repeated: &[String],
-    catalog: Option<&[u8]>,
-    all_tables: bool,
-) -> Result<SchemaSelection, String> {
-    if all_tables {
-        if !repeated.is_empty() || catalog.is_some() {
-            return Err(
-                "sync-schema --all-tables cannot be combined with --table or --catalog".to_string(),
-            );
-        }
-        return Ok(SchemaSelection::AllSourceTables);
-    }
-    Ok(SchemaSelection::Named(selected_tables(repeated, catalog)?))
-}
-
-pub(crate) fn resolve_schema_selection(
-    selection: &SchemaSelection,
-    source: &SchemaInventory,
-) -> Result<Vec<String>, String> {
-    match selection {
-        SchemaSelection::Named(tables) => Ok(tables.clone()),
-        SchemaSelection::AllSourceTables => all_source_tables(source),
-    }
-}
-
-/// The schema inventory holds base tables only, so every inventoried table is selectable.
-fn all_source_tables(source: &SchemaInventory) -> Result<Vec<String>, String> {
-    let selected = source
-        .tables
-        .iter()
-        .map(|table| table.name.clone())
-        .collect::<BTreeSet<_>>();
-    if selected.is_empty() {
-        return Err("sync-schema --all-tables found no source base tables".to_string());
-    }
-    if let Some(invalid) = selected.iter().find(|table| !valid_identifier(table)) {
-        return Err(format!(
-            "sync-schema --all-tables found invalid source table identifier `{invalid}`"
-        ));
-    }
-    Ok(selected.into_iter().collect())
-}
-
-pub(crate) fn selected_tables(
-    repeated: &[String],
-    catalog: Option<&[u8]>,
-) -> Result<Vec<String>, String> {
-    #[derive(Deserialize)]
-    struct Catalog {
-        tables: Vec<CatalogTable>,
-    }
-    #[derive(Deserialize)]
-    struct CatalogTable {
-        name: String,
-    }
-
-    let mut selected = repeated.iter().cloned().collect::<BTreeSet<_>>();
-    if let Some(bytes) = catalog {
-        let catalog: Catalog = serde_json::from_slice(bytes)
-            .map_err(|error| format!("invalid sync-schema catalog: {error}"))?;
-        selected.extend(catalog.tables.into_iter().map(|table| table.name));
-    }
-    if selected.is_empty() {
-        return Err(
-            "sync-schema requires at least one --table, --catalog, or --all-tables true"
-                .to_string(),
-        );
-    }
-    if selected.iter().any(|table| !valid_identifier(table)) {
-        return Err("sync-schema selection contains invalid table identifier".to_string());
-    }
-    Ok(selected.into_iter().collect())
 }
 
 const MYSQL_IDENTIFIER_MAX_CHARACTERS: usize = 64;
@@ -414,31 +326,162 @@ fn standard_parent_key_exists(
         })
 }
 
-fn plan_repair_prerequisite_convergence(
-    source: &SchemaInventory,
+pub(crate) fn plan_sync_prerequisite_schema(
+    evidence: &SchemaSourceEvidence,
     target: &SchemaInventory,
+    target_checks: &[CheckConstraint],
+    target_canonical_foreign_keys: &[CanonicalForeignKey],
     selected: &[String],
     preflight: &dyn SchemaCoercionPreflight,
 ) -> Result<SchemaConvergencePlan, String> {
-    let mut source_without_foreign_keys = source.clone();
-    source_without_foreign_keys.foreign_keys.clear();
-    let mut plan =
-        plan_schema_convergence(&source_without_foreign_keys, target, selected, preflight)?;
+    validate_sync_stage_selection(&evidence.inventory, selected)?;
+    let mut plan = plan_schema_convergence(&evidence.inventory, target, selected, preflight)?;
     for table in &mut plan.tables {
-        table.statements.retain(is_repair_prerequisite_statement);
-        table.dependencies.clear();
+        table
+            .statements
+            .retain(|statement| statement.phase != SchemaPhase::Constraints);
+        let drops = prerequisite_constraint_drops(
+            &table.table,
+            target,
+            target_checks,
+            target_canonical_foreign_keys,
+        )?;
+        table.statements.splice(0..0, drops);
     }
     Ok(plan)
 }
 
-fn is_repair_prerequisite_statement(statement: &PlannedSchemaStatement) -> bool {
-    let changes_table_options = statement
-        .objects
+pub(crate) fn plan_sync_final_constraints(
+    evidence: &SchemaSourceEvidence,
+    target: &SchemaInventory,
+    target_checks: &[CheckConstraint],
+    target_canonical_foreign_keys: &[CanonicalForeignKey],
+    selected: &[String],
+    preflight: &dyn SchemaCoercionPreflight,
+) -> Result<SchemaConvergencePlan, String> {
+    validate_sync_stage_selection(&evidence.inventory, selected)?;
+    let mut plan = plan_schema_convergence(&evidence.inventory, target, selected, preflight)?;
+    append_check_constraint_plan(
+        &mut plan,
+        &evidence.inventory,
+        &evidence.checks,
+        target_checks,
+    );
+    append_canonical_foreign_key_plan(
+        &mut plan,
+        &evidence.inventory,
+        &evidence.canonical_foreign_keys,
+        target_canonical_foreign_keys,
+        &target.schema,
+    );
+    reject_final_nonconstraint_drift(&plan)?;
+    for table in &mut plan.tables {
+        table
+            .statements
+            .retain(|statement| statement.phase == SchemaPhase::Constraints);
+    }
+    Ok(plan)
+}
+
+fn validate_sync_stage_selection(
+    source: &SchemaInventory,
+    selected: &[String],
+) -> Result<(), String> {
+    if selected.is_empty() {
+        return Err("unified sync schema stage requires at least one selected table".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    for table in selected {
+        if !seen.insert(table.as_str()) {
+            return Err(format!(
+                "unified sync selected table `{table}` is duplicated"
+            ));
+        }
+        if !source.tables.iter().any(|source| source.name == *table) {
+            return Err(format!(
+                "unified sync selected source table `{table}` is missing"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prerequisite_constraint_drops(
+    table: &str,
+    target: &SchemaInventory,
+    target_checks: &[CheckConstraint],
+    target_canonical_foreign_keys: &[CanonicalForeignKey],
+) -> Result<Vec<PlannedSchemaStatement>, String> {
+    let foreign_key_drops = target_foreign_key_names(table, target, target_canonical_foreign_keys)
+        .into_iter()
+        .map(|name| foreign_key_drop_statement(table, &name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let check_drops = target_checks
         .iter()
-        .any(|object| object.ends_with(".options"));
-    statement.phase != SchemaPhase::Constraints
-        && !is_drop_statement(statement)
-        && !changes_table_options
+        .filter(|check| check.table == table)
+        .map(|check| check_drop_statement(table, &check.name))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(foreign_key_drops.into_iter().chain(check_drops).collect())
+}
+
+fn target_foreign_key_names(
+    table: &str,
+    target: &SchemaInventory,
+    target_canonical_foreign_keys: &[CanonicalForeignKey],
+) -> BTreeSet<String> {
+    let mut names = target
+        .foreign_keys
+        .iter()
+        .filter(|key| key.table == table)
+        .map(|key| key.name.clone())
+        .collect::<BTreeSet<_>>();
+    names.extend(
+        target_canonical_foreign_keys
+            .iter()
+            .filter(|key| key.child_table == table)
+            .map(|key| key.constraint_name.clone()),
+    );
+    names
+}
+
+fn foreign_key_drop_statement(table: &str, name: &str) -> Result<PlannedSchemaStatement, String> {
+    translate_statement(
+        SchemaPhase::Constraints,
+        format!("ALTER TABLE `{table}` DROP FOREIGN KEY `{name}`"),
+        vec![format!("foreign_key:{table}.{name}")],
+        &[],
+    )
+}
+
+fn check_drop_statement(table: &str, name: &str) -> Result<PlannedSchemaStatement, String> {
+    translate_statement(
+        SchemaPhase::Constraints,
+        format!("ALTER TABLE `{table}` DROP CHECK `{name}`"),
+        vec![format!("check:{table}.{name}")],
+        &[],
+    )
+}
+
+fn reject_final_nonconstraint_drift(plan: &SchemaConvergencePlan) -> Result<(), String> {
+    for table in &plan.tables {
+        if let Some(blocker) = table.blockers.first() {
+            return Err(format!(
+                "final constraints require prerequisite schema convergence for `{}`: {blocker}",
+                table.table
+            ));
+        }
+        if let Some(statement) = table
+            .statements
+            .iter()
+            .find(|statement| statement.phase != SchemaPhase::Constraints)
+        {
+            return Err(format!(
+                "final constraints require prerequisite schema convergence for `{}` before `{}`",
+                table.table, statement.sql
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn plan_schema_convergence(
@@ -918,17 +961,122 @@ fn index_prerequisites(
     prerequisites
 }
 
-pub(crate) fn execute_schema_plan(
+pub(crate) fn execute_sync_schema_stage_plan(
     plan: SchemaConvergencePlan,
     executor: &mut dyn SchemaStatementExecutor,
-    final_differences: &dyn Fn(&str) -> Vec<String>,
+) -> SchemaConvergenceReport {
+    let (constraint_drops, mut remaining) = split_constraint_drop_plan(plan);
+    let drop_report = execute_schema_plan_statements(constraint_drops, executor);
+    apply_constraint_drop_failures(&drop_report, &mut remaining);
+    let remaining_report = execute_schema_plan_statements(remaining, executor);
+    let report = merge_sync_schema_stage_reports(drop_report, remaining_report);
+    let total = report.tables.len();
+    for (position, table) in report.tables.iter().enumerate() {
+        log_table_progress(position + 1, total, table);
+    }
+    report
+}
+
+fn split_constraint_drop_plan(
+    plan: SchemaConvergencePlan,
+) -> (SchemaConvergencePlan, SchemaConvergencePlan) {
+    let mut constraint_drop_tables = Vec::with_capacity(plan.tables.len());
+    let mut remaining_tables = Vec::with_capacity(plan.tables.len());
+    for mut table in plan.tables {
+        let mut constraint_drops = table.clone();
+        constraint_drops.dependencies.clear();
+        constraint_drops
+            .statements
+            .retain(is_constraint_drop_statement);
+        table
+            .statements
+            .retain(|statement| !is_constraint_drop_statement(statement));
+        constraint_drop_tables.push(constraint_drops);
+        remaining_tables.push(table);
+    }
+    let constraint_drops = SchemaConvergencePlan {
+        source_fingerprint: plan.source_fingerprint.clone(),
+        target_fingerprint: plan.target_fingerprint.clone(),
+        tables: constraint_drop_tables,
+    };
+    let remaining = SchemaConvergencePlan {
+        source_fingerprint: plan.source_fingerprint,
+        target_fingerprint: plan.target_fingerprint,
+        tables: remaining_tables,
+    };
+    (constraint_drops, remaining)
+}
+
+fn is_constraint_drop_statement(statement: &PlannedSchemaStatement) -> bool {
+    statement.phase == SchemaPhase::Constraints && is_drop_statement(statement)
+}
+
+fn apply_constraint_drop_failures(
+    drop_report: &SchemaConvergenceReport,
+    remaining: &mut SchemaConvergencePlan,
+) {
+    let statuses = drop_report
+        .tables
+        .iter()
+        .map(|table| (table.table.as_str(), table.status))
+        .collect::<BTreeMap<_, _>>();
+    for table in &mut remaining.tables {
+        let drop_failed = statuses
+            .get(table.table.as_str())
+            .is_some_and(|status| *status != TableSchemaStatus::Converged);
+        if drop_failed && table.status != TableSchemaStatus::Failed {
+            table.status = TableSchemaStatus::Failed;
+            table
+                .blockers
+                .push("constraint drop stage failed".to_string());
+        }
+    }
+}
+
+fn merge_sync_schema_stage_reports(
+    drop_report: SchemaConvergenceReport,
+    remaining_report: SchemaConvergenceReport,
+) -> SchemaConvergenceReport {
+    let mut drops_by_table = drop_report
+        .tables
+        .into_iter()
+        .map(|table| (table.table.clone(), table))
+        .collect::<BTreeMap<_, _>>();
+    let tables = remaining_report
+        .tables
+        .into_iter()
+        .map(|mut table| {
+            if let Some(drop_table) = drops_by_table.remove(&table.table) {
+                let mut planned = drop_table.planned_statements;
+                planned.extend(table.planned_statements);
+                table.planned_statements = planned;
+                let mut executions = drop_table.executions;
+                executions.extend(table.executions);
+                table.executions = executions;
+            }
+            table
+        })
+        .collect::<Vec<_>>();
+    let overall_status = overall_schema_status(&tables);
+    SchemaConvergenceReport {
+        transformation_version: remaining_report.transformation_version,
+        source_fingerprint: remaining_report.source_fingerprint,
+        target_fingerprint: remaining_report.target_fingerprint,
+        overall_status,
+        error: (overall_status != OverallSchemaStatus::Converged)
+            .then(|| "one or more selected tables remain divergent".to_string()),
+        tables,
+    }
+}
+
+fn execute_schema_plan_statements(
+    plan: SchemaConvergencePlan,
+    executor: &mut dyn SchemaStatementExecutor,
 ) -> SchemaConvergenceReport {
     let mut table_status = BTreeMap::new();
     let mut reports = Vec::new();
-    let total = plan.tables.len();
-    for (position, table) in plan.tables.into_iter().enumerate() {
-        let report = execute_table_plan(table, &table_status, executor, final_differences);
-        log_table_progress(position + 1, total, &report);
+    for table in plan.tables {
+        let report = execute_table_plan(table, &table_status, executor);
         table_status.insert(report.table.clone(), report.status);
         reports.push(report);
     }
@@ -963,13 +1111,12 @@ fn log_table_progress(position: usize, total: usize, report: &TableSchemaReport)
         .filter(|execution| execution.status == "skipped")
         .count();
     eprintln!(
-        "cdc_sync_schema_table table={} progress={position}/{total} status={} executed={executed} failed={failed} skipped={skipped} differences={} blockers={}",
+        "cdc_sync_schema_table table={} progress={position}/{total} status={} executed={executed} failed={failed} skipped={skipped} blockers={}",
         report.table,
         serde_json::to_value(report.status)
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
             .unwrap_or_else(|| "unknown".to_string()),
-        report.final_differences.len(),
         report.blockers.len(),
     );
 }
@@ -978,7 +1125,6 @@ fn execute_table_plan(
     table: TableSchemaPlan,
     table_status: &BTreeMap<String, TableSchemaStatus>,
     executor: &mut dyn SchemaStatementExecutor,
-    final_differences: &dyn Fn(&str) -> Vec<String>,
 ) -> TableSchemaReport {
     let failed_dependencies = failed_dependencies(&table, table_status);
     let mut report = table_report(&table, failed_dependencies.clone());
@@ -989,18 +1135,8 @@ fn execute_table_plan(
     if may_execute {
         execute_table_statements(&table, executor, &mut report);
     }
-    report.final_differences = final_differences(&table.table);
-    if !failed_dependencies.is_empty() && report.final_differences.is_empty() {
-        report
-            .final_differences
-            .push("dependency prerequisite failed".to_string());
-    }
     if report.status == TableSchemaStatus::Planned {
-        report.status = if report.final_differences.is_empty() {
-            TableSchemaStatus::Converged
-        } else {
-            TableSchemaStatus::Failed
-        };
+        report.status = TableSchemaStatus::Converged;
     }
     report
 }
@@ -1032,7 +1168,6 @@ fn table_report(table: &TableSchemaPlan, skipped_dependencies: Vec<String>) -> T
         skipped_dependencies,
         planned_statements: table.statements.clone(),
         executions: Vec::new(),
-        final_differences: Vec::new(),
     }
 }
 
@@ -1146,404 +1281,122 @@ fn overall_schema_status(reports: &[TableSchemaReport]) -> OverallSchemaStatus {
     }
 }
 
-#[derive(Clone, Debug)]
-struct SyncSchemaConfig {
-    source: crate::mysql_snapshot::MySqlConnectionConfig,
-    target: crate::live::TargetMySqlConfig,
-    tables: Vec<String>,
-    catalog: Option<PathBuf>,
-    all_tables: bool,
-}
-
-pub(crate) fn run_sync_schema_command(args: Vec<String>, _usage: &str) {
-    let result = parse_sync_schema_config(args).and_then(run_sync_schema);
-    let (json, exit_code) = render_sync_schema_termination(result);
-    println!("{json}");
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
-}
-
-pub(crate) fn run_schema_convergence_from_source_evidence(
-    evidence: SchemaSourceEvidence,
-    target: crate::live::TargetMySqlConfig,
-) -> Result<SchemaConvergenceReport, String> {
-    let target_reader = MariaDbInventoryReader::new(inventory_config_target(&target));
-    let initial_target_inventory = build_inventory(&target.database, &target_reader)
-        .map_err(|error| format!("target schema inventory failed: {error}"))?;
-    drop_target_only_tables(&target, &evidence.inventory, &initial_target_inventory)?;
-    let target_inventory = build_inventory(&target.database, &target_reader).map_err(|error| {
-        format!("target schema inventory after stale-table removal failed: {error}")
-    })?;
-    let target_checks = CheckConstraintReader::new(inventory_config_target(&target))
-        .read(&target.database, None)?;
-    let target_canonical_foreign_keys =
-        build_canonical_foreign_key_inventory(&target.database, &target_reader)
-            .map_err(|error| format!("target canonical foreign key inventory failed: {error}"))?;
-    let selected =
-        resolve_schema_selection(&SchemaSelection::AllSourceTables, &evidence.inventory)?;
-    execute_schema_convergence(SchemaConvergenceInputs {
-        source: &evidence.inventory,
-        target_inventory: &target_inventory,
-        selected: &selected,
-        source_checks: &evidence.checks,
-        target_checks: &target_checks,
-        source_canonical_foreign_keys: &evidence.canonical_foreign_keys,
-        target_canonical_foreign_keys: &target_canonical_foreign_keys,
-        target: &target,
-    })
-}
-
-pub(crate) fn run_schema_repair_prerequisite_convergence_from_source_evidence(
-    evidence: SchemaSourceEvidence,
-    target: crate::live::TargetMySqlConfig,
-) -> Result<SchemaConvergenceReport, String> {
-    let target_reader = MariaDbInventoryReader::new(inventory_config_target(&target));
-    let target_inventory = build_inventory(&target.database, &target_reader)
-        .map_err(|error| format!("target schema inventory failed: {error}"))?;
-    let selected =
-        resolve_schema_selection(&SchemaSelection::AllSourceTables, &evidence.inventory)?;
-    execute_schema_repair_prerequisite_convergence(
-        &evidence.inventory,
-        &target_inventory,
-        &selected,
-        &target,
-    )
-}
-
-pub(crate) fn target_only_table_drop_statements(
-    source: &SchemaInventory,
-    target: &SchemaInventory,
-) -> Result<Vec<String>, String> {
-    let source_tables = source_table_names(source);
-    let extra_tables = target_only_table_names(target, &source_tables);
-    if extra_tables.is_empty() {
-        return Ok(Vec::new());
-    }
-    let extra_set = extra_tables.iter().map(String::as_str).collect();
-    reject_source_child_of_target_only_parent(target, &source_tables, &extra_set)?;
-    let ordered = target_only_table_drop_order(target, &extra_tables)?;
-    Ok(ordered
-        .into_iter()
-        .map(|table| format!("DROP TABLE {}", crate::mysql_support::quote_ident(&table)))
-        .collect())
-}
-
-fn source_table_names(source: &SchemaInventory) -> BTreeSet<&str> {
-    source
-        .tables
-        .iter()
-        .map(|table| table.name.as_str())
-        .collect()
-}
-
-fn target_only_table_names(
-    target: &SchemaInventory,
-    source_tables: &BTreeSet<&str>,
-) -> Vec<String> {
-    target
-        .tables
-        .iter()
-        .map(|table| table.name.clone())
-        .filter(|table| !source_tables.contains(table.as_str()))
-        .collect()
-}
-
-fn reject_source_child_of_target_only_parent(
-    target: &SchemaInventory,
-    source_tables: &BTreeSet<&str>,
-    extra_tables: &BTreeSet<&str>,
-) -> Result<(), String> {
-    let Some(foreign_key) = target.foreign_keys.iter().find(|foreign_key| {
-        extra_tables.contains(foreign_key.referenced_table.as_str())
-            && source_tables.contains(foreign_key.table.as_str())
-    }) else {
-        return Ok(());
-    };
-    Err(format!(
-        "target-only parent table `{}` is referenced by source table `{}` through foreign key `{}`",
-        foreign_key.referenced_table, foreign_key.table, foreign_key.name
-    ))
-}
-
-fn target_only_table_drop_order(
-    target: &SchemaInventory,
-    extra_tables: &[String],
-) -> Result<Vec<String>, String> {
-    let (mut ordered, cyclic) = dependency_order(target, extra_tables);
-    if !cyclic.is_empty() {
-        return Err(format!(
-            "target-only table dependency cycle blocks removal: {}",
-            cyclic.join(", ")
-        ));
-    }
-    ordered.reverse();
-    Ok(ordered)
-}
-
-fn drop_target_only_tables(
-    target: &crate::live::TargetMySqlConfig,
-    source: &SchemaInventory,
-    target_inventory: &SchemaInventory,
-) -> Result<(), String> {
-    let statements = target_only_table_drop_statements(source, target_inventory)?;
-    if statements.is_empty() {
-        return Ok(());
-    }
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(target)
-        .map_err(|error| format!("connect target for stale-table removal: {error}"))?;
-    for sql in statements {
-        executor
-            .execute(&SqlStatement {
-                sql: sql.clone(),
-                params: Vec::new(),
-            })
-            .map_err(|error| format!("drop target-only table with `{sql}`: {error}"))?;
-    }
-    Ok(())
-}
-
-struct SchemaConvergenceInputs<'a> {
-    source: &'a SchemaInventory,
-    target_inventory: &'a SchemaInventory,
-    selected: &'a [String],
-    source_checks: &'a [CheckConstraint],
-    target_checks: &'a [CheckConstraint],
-    source_canonical_foreign_keys: &'a [CanonicalForeignKey],
-    target_canonical_foreign_keys: &'a [CanonicalForeignKey],
-    target: &'a crate::live::TargetMySqlConfig,
-}
-
-fn execute_schema_convergence(
-    inputs: SchemaConvergenceInputs<'_>,
-) -> Result<SchemaConvergenceReport, String> {
-    let SchemaConvergenceInputs {
-        source,
-        target_inventory,
-        selected,
-        source_checks,
-        target_checks,
-        source_canonical_foreign_keys,
-        target_canonical_foreign_keys,
-        target,
-    } = inputs;
-    let preflight = MySqlCoercionPreflight {
-        config: inventory_config_target(target),
-        schema: target.database.clone(),
-    };
-    let mut plan = plan_schema_convergence(source, target_inventory, selected, &preflight)?;
-    append_check_constraint_plan(&mut plan, source, source_checks, target_checks);
-    append_canonical_foreign_key_plan(
-        &mut plan,
-        source,
-        source_canonical_foreign_keys,
-        target_canonical_foreign_keys,
-        &target.database,
-    );
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(target)
-        .map_err(|error| error.to_string())?;
-    let mut executor = MySqlSchemaExecutor { executor };
-    let target_config = inventory_config_target(target);
-    let source_checks_by_table = checks_by_table(&target_check_constraints(source_checks));
-    let expected = expected_target_inventory(source);
-    let verification_reader = MariaDbInventoryReader::new(target_config.clone());
-    let check_reader = RefCell::new(CheckConstraintReader::new(target_config));
-    let verification = SchemaVerificationContext {
-        source,
-        expected: &expected,
-        source_checks_by_table: &source_checks_by_table,
-        source_canonical_foreign_keys,
-        verification_reader: &verification_reader,
-        check_reader: &check_reader,
-        target_database: &target.database,
-    };
-    Ok(execute_schema_plan(plan, &mut executor, &|table| {
-        verify_schema_table(&verification, table)
-    }))
-}
-
-fn execute_schema_repair_prerequisite_convergence(
-    source: &SchemaInventory,
-    target_inventory: &SchemaInventory,
-    selected: &[String],
-    target: &crate::live::TargetMySqlConfig,
-) -> Result<SchemaConvergenceReport, String> {
-    let preflight = MySqlCoercionPreflight {
-        config: inventory_config_target(target),
-        schema: target.database.clone(),
-    };
-    let plan =
-        plan_repair_prerequisite_convergence(source, target_inventory, selected, &preflight)?;
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(target)
-        .map_err(|error| error.to_string())?;
-    let mut executor = MySqlSchemaExecutor { executor };
-    let expected = expected_target_inventory(source);
-    let verification_reader = MariaDbInventoryReader::new(inventory_config_target(target));
-    let verification = RepairPrerequisiteVerificationContext {
-        expected: &expected,
-        verification_reader: &verification_reader,
-        target_database: &target.database,
-    };
-    Ok(execute_schema_plan(plan, &mut executor, &|table| {
-        verify_repair_prerequisite_schema_table(&verification, table)
-    }))
-}
-
-struct RepairPrerequisiteVerificationContext<'a> {
-    expected: &'a SchemaInventory,
-    verification_reader: &'a MariaDbInventoryReader,
-    target_database: &'a str,
-}
-
-fn verify_repair_prerequisite_schema_table(
-    context: &RepairPrerequisiteVerificationContext<'_>,
-    table: &str,
-) -> Vec<String> {
-    context.verification_reader.scope_to_table(table);
-    match build_inventory(context.target_database, context.verification_reader) {
-        Ok(target) => repair_prerequisite_schema_differences(context.expected, &target, table),
-        Err(error) => vec![format!("target re-inventory failed: {error}")],
-    }
-}
-
-struct SchemaVerificationContext<'a> {
-    source: &'a SchemaInventory,
-    expected: &'a SchemaInventory,
-    source_checks_by_table: &'a BTreeMap<String, Vec<CheckConstraint>>,
-    source_canonical_foreign_keys: &'a [CanonicalForeignKey],
-    verification_reader: &'a MariaDbInventoryReader,
-    check_reader: &'a RefCell<CheckConstraintReader>,
-    target_database: &'a str,
-}
-
-fn verify_schema_table(context: &SchemaVerificationContext<'_>, table: &str) -> Vec<String> {
-    context.verification_reader.scope_to_table(table);
-    let target_inventory =
-        match build_inventory(context.target_database, context.verification_reader) {
-            Ok(inventory) => inventory,
-            Err(error) => return vec![format!("target re-inventory failed: {error}")],
-        };
-    if !context.source.tables.iter().any(|item| item.name == table) {
-        return vec!["source table disappeared during verification".to_string()];
-    }
-    let mut differences = schema_table_differences(context.expected, &target_inventory, table);
-    differences.extend(verify_table_checks(context, table));
-    differences.extend(verify_table_foreign_keys(context, table));
-    differences
-}
-
-fn verify_table_checks(context: &SchemaVerificationContext<'_>, table: &str) -> Vec<String> {
-    let target_checks = context
-        .check_reader
-        .borrow_mut()
-        .read(context.target_database, Some(table))
-        .map(|checks| {
-            checks_by_table(&checks)
-                .get(table)
-                .cloned()
-                .unwrap_or_default()
-        });
-    match target_checks {
-        Ok(target_checks)
-            if target_checks
-                == context
-                    .source_checks_by_table
-                    .get(table)
-                    .cloned()
-                    .unwrap_or_default() =>
-        {
-            Vec::new()
-        }
-        Ok(_) => vec!["check constraints differ".to_string()],
-        Err(error) => vec![format!("check verification failed: {error}")],
-    }
-}
-
-fn verify_table_foreign_keys(context: &SchemaVerificationContext<'_>, table: &str) -> Vec<String> {
-    let target_canonical =
-        build_canonical_foreign_key_inventory(context.target_database, context.verification_reader);
-    let source_table_foreign_keys = relative_canonical_foreign_keys(
-        &canonical_foreign_keys_for(context.source_canonical_foreign_keys, table)
-            .iter()
-            .map(target_canonical_foreign_key)
-            .collect::<Vec<_>>(),
-        &context.source.schema,
-    );
-    match target_canonical {
-        Ok(target_keys)
-            if relative_canonical_foreign_keys(
-                &canonical_foreign_keys_for(&target_keys, table),
-                context.target_database,
-            ) == source_table_foreign_keys =>
-        {
-            Vec::new()
-        }
-        Ok(_) => vec!["foreign key rules differ".to_string()],
-        Err(error) => vec![format!("foreign key verification failed: {error}")],
-    }
-}
-
-fn render_sync_schema_termination(
-    result: Result<SchemaConvergenceReport, String>,
-) -> (String, i32) {
-    let report = match result {
-        Ok(report) => report,
-        Err(error) => SchemaConvergenceReport {
-            transformation_version: DDL_TRANSFORMATION_VERSION.to_string(),
-            source_fingerprint: String::new(),
-            target_fingerprint: String::new(),
-            overall_status: OverallSchemaStatus::Failed,
-            error: Some(error),
-            tables: Vec::new(),
-        },
-    };
-    let exit_code = match report.overall_status {
-        OverallSchemaStatus::Converged => 0,
-        OverallSchemaStatus::Partial => 1,
-        OverallSchemaStatus::Failed if report.tables.is_empty() => 2,
-        OverallSchemaStatus::Failed => 1,
-    };
-    (
-        serde_json::to_string_pretty(&report).expect("schema report JSON"),
-        exit_code,
-    )
-}
-
-fn run_sync_schema(config: SyncSchemaConfig) -> Result<SchemaConvergenceReport, String> {
-    let catalog = config
-        .catalog
-        .as_ref()
-        .map(fs::read)
-        .transpose()
-        .map_err(|error| format!("failed to read sync-schema catalog: {error}"))?;
-    let selection = schema_selection(&config.tables, catalog.as_deref(), config.all_tables)?;
-    let source_reader = MariaDbInventoryReader::new(inventory_config_source(&config.source));
-    let target_reader = MariaDbInventoryReader::new(inventory_config_target(&config.target));
-    let source = build_inventory(&config.source.database, &source_reader)
+pub(crate) fn read_sync_source_evidence(
+    source: &crate::mysql_config::MySqlConnectionConfig,
+) -> Result<SchemaSourceEvidence, String> {
+    let config = inventory_config_source(source);
+    let reader = MariaDbInventoryReader::new(config.clone());
+    let inventory = build_inventory(&source.database, &reader)
         .map_err(|error| format!("source schema inventory failed: {error}"))?;
-    let target = build_inventory(&config.target.database, &target_reader)
-        .map_err(|error| format!("target schema inventory failed: {error}"))?;
-    let selected = resolve_schema_selection(&selection, &source)?;
-    let source_checks = CheckConstraintReader::new(inventory_config_source(&config.source))
-        .read(&config.source.database, None)?;
-    let target_checks = CheckConstraintReader::new(inventory_config_target(&config.target))
-        .read(&config.target.database, None)?;
-    let source_canonical_foreign_keys =
-        build_canonical_foreign_key_inventory(&config.source.database, &source_reader)
+    let checks = CheckConstraintReader::new(config)
+        .read(&source.database, None)
+        .map_err(|error| format!("source check constraint inventory failed: {error}"))?;
+    let canonical_foreign_keys =
+        build_canonical_foreign_key_inventory(&source.database, &reader)
             .map_err(|error| format!("source canonical foreign key inventory failed: {error}"))?;
-    let target_canonical_foreign_keys =
-        build_canonical_foreign_key_inventory(&config.target.database, &target_reader)
-            .map_err(|error| format!("target canonical foreign key inventory failed: {error}"))?;
-    execute_schema_convergence(SchemaConvergenceInputs {
-        source: &source,
-        target_inventory: &target,
-        selected: &selected,
-        source_checks: &source_checks,
-        target_checks: &target_checks,
-        source_canonical_foreign_keys: &source_canonical_foreign_keys,
-        target_canonical_foreign_keys: &target_canonical_foreign_keys,
-        target: &config.target,
+    Ok(SchemaSourceEvidence {
+        inventory,
+        checks,
+        canonical_foreign_keys,
     })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SyncSchemaStageKind {
+    Prerequisite,
+    FinalConstraints,
+}
+
+impl SyncSchemaStageKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Prerequisite => "prerequisite schema",
+            Self::FinalConstraints => "final constraints",
+        }
+    }
+
+    fn plan(
+        self,
+        evidence: &SchemaSourceEvidence,
+        current: &SyncStageTargetEvidence,
+        selected: &[String],
+        preflight: &dyn SchemaCoercionPreflight,
+    ) -> Result<SchemaConvergencePlan, String> {
+        match self {
+            Self::Prerequisite => plan_sync_prerequisite_schema(
+                evidence,
+                &current.inventory,
+                &current.checks,
+                &current.canonical_foreign_keys,
+                selected,
+                preflight,
+            ),
+            Self::FinalConstraints => plan_sync_final_constraints(
+                evidence,
+                &current.inventory,
+                &current.checks,
+                &current.canonical_foreign_keys,
+                selected,
+                preflight,
+            ),
+        }
+    }
+}
+
+pub(crate) fn run_sync_schema_stage(
+    evidence: &SchemaSourceEvidence,
+    target: &crate::live::TargetMySqlConfig,
+    selected: &[String],
+    stage: SyncSchemaStageKind,
+) -> Result<SchemaConvergenceReport, String> {
+    let current = read_sync_stage_target_evidence(target)?;
+    let preflight = MySqlCoercionPreflight {
+        config: inventory_config_target(target),
+        schema: target.database.clone(),
+    };
+    let plan = stage.plan(evidence, &current, selected, &preflight)?;
+    execute_sync_schema_stage(target, plan, stage.label())
+}
+
+struct SyncStageTargetEvidence {
+    inventory: SchemaInventory,
+    checks: Vec<CheckConstraint>,
+    canonical_foreign_keys: Vec<CanonicalForeignKey>,
+}
+
+fn read_sync_stage_target_evidence(
+    target: &crate::live::TargetMySqlConfig,
+) -> Result<SyncStageTargetEvidence, String> {
+    let config = inventory_config_target(target);
+    let reader = MariaDbInventoryReader::new(config.clone());
+    let inventory = build_inventory(&target.database, &reader)
+        .map_err(|error| format!("target schema inventory failed: {error}"))?;
+    let checks = CheckConstraintReader::new(config)
+        .read(&target.database, None)
+        .map_err(|error| format!("target check constraint inventory failed: {error}"))?;
+    let canonical_foreign_keys =
+        build_canonical_foreign_key_inventory(&target.database, &reader)
+            .map_err(|error| format!("target canonical foreign key inventory failed: {error}"))?;
+    Ok(SyncStageTargetEvidence {
+        inventory,
+        checks,
+        canonical_foreign_keys,
+    })
+}
+
+fn execute_sync_schema_stage(
+    target: &crate::live::TargetMySqlConfig,
+    plan: SchemaConvergencePlan,
+    stage: &str,
+) -> Result<SchemaConvergenceReport, String> {
+    let executor = crate::mysql_client::PersistentTargetExecutor::new(target)
+        .map_err(|error| format!("connect target for unified sync {stage}: {error}"))?;
+    let mut executor = MySqlSchemaExecutor { executor };
+    let report = execute_sync_schema_stage_plan(plan, &mut executor);
+    if report.overall_status != OverallSchemaStatus::Converged {
+        return Err(format!("unified sync {stage} stage did not converge"));
+    }
+    Ok(report)
 }
 
 struct MySqlSchemaExecutor {
@@ -1670,50 +1523,6 @@ impl SchemaStatementExecutor for MySqlSchemaExecutor {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
-}
-
-fn parse_sync_schema_config(args: Vec<String>) -> Result<SyncSchemaConfig, String> {
-    let mut values = BTreeMap::<String, String>::new();
-    let mut tables = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let flag = args[index].as_str();
-        let value = args
-            .get(index + 1)
-            .ok_or_else(|| format!("{flag} requires a value"))?;
-        if flag == "--table" {
-            tables.push(value.clone());
-        } else {
-            values.insert(flag.to_string(), value.clone());
-        }
-        index += 2;
-    }
-    let source_password_env = required(&values, "--source-password-env")?;
-    let target_password_env = required(&values, "--target-password-env")?;
-    Ok(SyncSchemaConfig {
-        source: crate::mysql_snapshot::MySqlConnectionConfig {
-            host: required(&values, "--source-host")?,
-            port: optional_u16(&values, "--source-port", 3306)?,
-            user: required(&values, "--source-user")?,
-            password: crate::read_env_password(&source_password_env)?,
-            database: required(&values, "--source-database")?,
-        },
-        target: crate::live::TargetMySqlConfig {
-            host: required(&values, "--target-host")?,
-            port: optional_u16(&values, "--target-port", 3306)?,
-            user: required(&values, "--target-user")?,
-            password: crate::read_env_password(&target_password_env)?,
-            database: required(&values, "--target-database")?,
-            tls_ca_file: required(&values, "--target-tls-ca-file")?,
-            insert_conflict_policy: crate::live::InsertConflictPolicy::Error,
-        },
-        tables,
-        catalog: values.get("--catalog").map(PathBuf::from),
-        all_tables: match values.get("--all-tables") {
-            Some(value) => crate::parse_bool("--all-tables", value)?,
-            None => false,
-        },
-    })
 }
 
 /// Holds one connection for repeated check-constraint reads, because a fresh TLS handshake per
@@ -2093,9 +1902,7 @@ fn render_canonical_foreign_key(key: &CanonicalForeignKey, schema: &str) -> Stri
     )
 }
 
-fn inventory_config_source(
-    config: &crate::mysql_snapshot::MySqlConnectionConfig,
-) -> InventoryConfig {
+fn inventory_config_source(config: &crate::mysql_config::MySqlConnectionConfig) -> InventoryConfig {
     InventoryConfig {
         host: config.host.clone(),
         port: config.port,
@@ -2392,86 +2199,6 @@ fn target_column_drop_prerequisites(
 fn is_drop_statement(statement: &PlannedSchemaStatement) -> bool {
     let normalized = statement.sql.trim_start().to_ascii_uppercase();
     normalized.starts_with("DROP ") || normalized.contains(" DROP ")
-}
-
-fn repair_prerequisite_schema_differences(
-    source: &SchemaInventory,
-    target: &SchemaInventory,
-    table: &str,
-) -> Vec<String> {
-    let Some(source_table) = source
-        .tables
-        .iter()
-        .find(|candidate| candidate.name == table)
-    else {
-        return vec!["source table missing".to_string()];
-    };
-    let Some(target_table) = target
-        .tables
-        .iter()
-        .find(|candidate| candidate.name == table)
-    else {
-        return vec!["target table missing".to_string()];
-    };
-    let mut differences = Vec::new();
-    if expected_target_table_fingerprint(source_table).ok()
-        != observed_target_table_fingerprint(target_table).ok()
-    {
-        differences.push(
-            "columns, generated expressions, primary key, engine, or collation differ".to_string(),
-        );
-    }
-    let source_indexes = indexes_for(source, table);
-    let target_indexes = indexes_for(target, table);
-    if source_indexes.len() != target_indexes.len()
-        || source_indexes.iter().any(|source_index| {
-            !target_indexes
-                .iter()
-                .any(|target_index| indexes_equal(source_index, target_index))
-        })
-    {
-        differences.push("indexes differ".to_string());
-    }
-    differences
-}
-
-fn schema_table_differences(
-    source: &SchemaInventory,
-    target: &SchemaInventory,
-    table: &str,
-) -> Vec<String> {
-    let mut differences = repair_prerequisite_schema_differences(source, target, table);
-    let source_has_table = source
-        .tables
-        .iter()
-        .any(|candidate| candidate.name == table);
-    let target_has_table = target
-        .tables
-        .iter()
-        .any(|candidate| candidate.name == table);
-    if source_has_table && target_has_table && foreign_keys_differ(source, target, table) {
-        differences.push("foreign keys differ".to_string());
-    }
-    differences
-}
-
-fn foreign_keys_differ(source: &SchemaInventory, target: &SchemaInventory, table: &str) -> bool {
-    let source_keys = source
-        .foreign_keys
-        .iter()
-        .filter(|key| key.table == table)
-        .collect::<Vec<_>>();
-    let target_keys = target
-        .foreign_keys
-        .iter()
-        .filter(|key| key.table == table)
-        .collect::<Vec<_>>();
-    source_keys.len() != target_keys.len()
-        || source_keys.iter().any(|source_key| {
-            !target_keys.iter().any(|target_key| {
-                foreign_keys_equal(source_key, &source.schema, target_key, &target.schema)
-            })
-        })
 }
 
 /// Conversions no target row can violate, so no target-data check is required.
@@ -3152,25 +2879,6 @@ fn valid_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn required(values: &BTreeMap<String, String>, flag: &str) -> Result<String, String> {
-    values
-        .get(flag)
-        .cloned()
-        .ok_or_else(|| format!("missing required option {flag}"))
-}
-
-fn optional_u16(
-    values: &BTreeMap<String, String>,
-    flag: &str,
-    default: u16,
-) -> Result<u16, String> {
-    values.get(flag).map_or(Ok(default), |value| {
-        value
-            .parse::<u16>()
-            .map_err(|_| format!("invalid {flag}: {value}"))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3408,86 +3116,6 @@ mod tests {
         assert_eq!(plan.tables[0].status, TableSchemaStatus::Planned);
         assert!(plan.tables[0].blockers[0].contains("coercion preflight"));
         assert_eq!(plan.tables[1].status, TableSchemaStatus::Planned);
-    }
-
-    #[test]
-    fn recovery_drops_legacy_tables_in_child_before_parent_order() {
-        let source = inventory(
-            vec![
-                table("llm_conversations", vec![], vec![]),
-                table("llm_messages", vec![], vec![]),
-            ],
-            vec![],
-        );
-        let target = inventory(
-            vec![
-                table("llm_conversations", vec![], vec![]),
-                table("llm_messages", vec![], vec![]),
-                table("capy_conversations", vec![], vec![]),
-                table("capy_messages", vec![], vec![]),
-                table("capy_message_attachments", vec![], vec![]),
-            ],
-            vec![
-                foreign_key("capy_messages", "capy_conversations"),
-                foreign_key("capy_message_attachments", "capy_messages"),
-            ],
-        );
-
-        let statements =
-            target_only_table_drop_statements(&source, &target).expect("legacy table drop plan");
-
-        assert_eq!(
-            statements,
-            vec![
-                "DROP TABLE `capy_message_attachments`",
-                "DROP TABLE `capy_messages`",
-                "DROP TABLE `capy_conversations`",
-            ]
-        );
-        assert!(
-            statements
-                .iter()
-                .all(|statement| !statement.contains("FOREIGN_KEY_CHECKS"))
-        );
-    }
-
-    #[test]
-    fn target_only_table_cycle_fails_closed_without_drop_statements() {
-        let source = inventory(vec![table("current", vec![], vec![])], vec![]);
-        let target = inventory(
-            vec![
-                table("current", vec![], vec![]),
-                table("legacy_a", vec![], vec![]),
-                table("legacy_b", vec![], vec![]),
-            ],
-            vec![
-                foreign_key("legacy_a", "legacy_b"),
-                foreign_key("legacy_b", "legacy_a"),
-            ],
-        );
-
-        let result = target_only_table_drop_statements(&source, &target);
-        let expected_error =
-            "target-only table dependency cycle blocks removal: legacy_a, legacy_b";
-
-        assert_eq!(result, Err(expected_error.to_string()));
-    }
-
-    #[test]
-    fn source_table_referencing_target_only_parent_fails_closed_without_drop_statements() {
-        let source = inventory(vec![table("current_child", vec![], vec![])], vec![]);
-        let target = inventory(
-            vec![
-                table("current_child", vec![], vec![]),
-                table("legacy_parent", vec![], vec![]),
-            ],
-            vec![foreign_key("current_child", "legacy_parent")],
-        );
-
-        let result = target_only_table_drop_statements(&source, &target);
-        let expected_error = "target-only parent table `legacy_parent` is referenced by source table `current_child` through foreign key `fk_current_child_legacy_parent`";
-
-        assert_eq!(result, Err(expected_error.to_string()));
     }
 
     #[test]
@@ -3855,89 +3483,6 @@ mod tests {
                 .prerequisites
                 .contains(&"index:items.uidx_items_id".to_string())
         );
-    }
-
-    #[test]
-    fn repair_prerequisite_plan_adds_missing_columns_without_foreign_keys() {
-        let source = inventory(
-            vec![
-                table(
-                    "children",
-                    vec![
-                        column("id", "bigint", false),
-                        column("parent_id", "bigint", false),
-                    ],
-                    vec!["id"],
-                ),
-                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
-            ],
-            vec![foreign_key("children", "parents")],
-        );
-        let mut target = inventory(
-            vec![
-                table(
-                    "children",
-                    vec![
-                        column("id", "bigint", false),
-                        column("legacy", "bigint", true),
-                    ],
-                    vec!["id"],
-                ),
-                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
-            ],
-            vec![],
-        );
-        target.indexes.push(IndexInventory {
-            table: "children".to_string(),
-            name: "idx_children_legacy".to_string(),
-            unique: false,
-            index_type: "BTREE".to_string(),
-            visible: true,
-            comment: None,
-            columns: vec![IndexColumnInventory {
-                name: "legacy".to_string(),
-                sequence: 1,
-                prefix_length: None,
-                collation: None,
-                order: "ASC".to_string(),
-            }],
-        });
-
-        let plan = plan_repair_prerequisite_convergence(
-            &source,
-            &target,
-            &["parents".to_string(), "children".to_string()],
-            &FixtureCoercionPreflight::default(),
-        )
-        .expect("repair prerequisite schema plan");
-        let statements = plan
-            .tables
-            .iter()
-            .flat_map(|table| table.statements.iter())
-            .collect::<Vec<_>>();
-
-        assert!(
-            statements
-                .iter()
-                .any(|statement| statement.sql.contains("ADD COLUMN `parent_id`"))
-        );
-        assert!(
-            statements
-                .iter()
-                .all(|statement| statement.phase != SchemaPhase::Constraints)
-        );
-        assert!(
-            statements
-                .iter()
-                .all(|statement| !is_drop_statement(statement))
-        );
-        assert!(
-            statements
-                .iter()
-                .all(|statement| !statement.sql.trim_start().starts_with("DROP "))
-        );
-        assert!(repair_prerequisite_schema_differences(&source, &source, "children").is_empty());
-        assert!(!repair_prerequisite_schema_differences(&source, &target, "children").is_empty());
     }
 
     #[test]
@@ -4891,9 +4436,7 @@ mod tests {
         };
         let mut executor = RecordingExecutor::failing_sql("ADD COLUMN `broken`");
 
-        let report = execute_schema_plan(plan, &mut executor, &|_| {
-            vec!["schema remains divergent".to_string()]
-        });
+        let report = execute_schema_plan_statements(plan, &mut executor);
 
         assert_eq!(executor.executed.len(), 2);
         assert!(executor.executed[1].contains("independent"));
@@ -4927,7 +4470,7 @@ mod tests {
         };
         let mut executor = RecordingExecutor::failing("parents");
 
-        let report = execute_schema_plan(plan, &mut executor, &|_| Vec::new());
+        let report = execute_schema_plan_statements(plan, &mut executor);
 
         assert_eq!(report.tables[0].status, TableSchemaStatus::Failed);
         assert_eq!(report.tables[1].status, TableSchemaStatus::Skipped);
@@ -5057,9 +4600,7 @@ mod tests {
         assert_eq!(check.prerequisites, vec!["column:accounts.balance"]);
 
         let mut executor = RecordingExecutor::failing_sql("MODIFY COLUMN `balance`");
-        let report = execute_schema_plan(plan, &mut executor, &|_| {
-            vec!["schema remains divergent".to_string()]
-        });
+        let report = execute_schema_plan_statements(plan, &mut executor);
         assert!(report.tables[0].executions.iter().any(|execution| {
             execution
                 .sql
@@ -5133,7 +4674,7 @@ mod tests {
         );
 
         let mut executor = RecordingExecutor::failing_sql("DROP FOREIGN KEY");
-        let report = execute_schema_plan(plan, &mut executor, &|_| Vec::new());
+        let report = execute_schema_plan_statements(plan, &mut executor);
         let check_execution = report.tables[0]
             .executions
             .iter()
@@ -5190,148 +4731,6 @@ mod tests {
                 .sql
                 .contains("ADD CONSTRAINT `accounts_positive_balance` CHECK")
         );
-    }
-
-    #[test]
-    fn every_command_termination_is_structured_json() {
-        let (failed_json, failed_exit) =
-            render_sync_schema_termination(Err("parse failed".to_string()));
-        let failed: serde_json::Value =
-            serde_json::from_str(&failed_json).expect("failed JSON report");
-        assert_eq!(failed_exit, 2);
-        assert_eq!(failed["overall_status"], "failed");
-        assert_eq!(failed["error"], "parse failed");
-
-        let report = SchemaConvergenceReport {
-            transformation_version: DDL_TRANSFORMATION_VERSION.to_string(),
-            source_fingerprint: "source".to_string(),
-            target_fingerprint: "target".to_string(),
-            overall_status: OverallSchemaStatus::Partial,
-            error: Some("one or more selected tables remain divergent".to_string()),
-            tables: Vec::new(),
-        };
-        let (partial_json, partial_exit) = render_sync_schema_termination(Ok(report));
-        let partial: serde_json::Value =
-            serde_json::from_str(&partial_json).expect("partial JSON report");
-        assert_eq!(partial_exit, 1);
-        assert_eq!(partial["overall_status"], "partial");
-        assert!(partial["error"].is_string());
-    }
-
-    #[test]
-    fn catalog_and_repeated_tables_form_one_deduplicated_selection() {
-        let catalog = r#"{"tables":[{"name":"alpha"},{"name":"beta"},{"name":"alpha"}]}"#;
-        let selected = selected_tables(
-            &["beta".to_string(), "gamma".to_string()],
-            Some(catalog.as_bytes()),
-        )
-        .expect("selected tables");
-
-        assert_eq!(selected, vec!["alpha", "beta", "gamma"]);
-    }
-
-    #[test]
-    fn all_tables_selection_resolves_every_source_table_from_the_inventory() {
-        let selection = schema_selection(&[], None, true).expect("all-tables selection");
-        assert_eq!(selection, SchemaSelection::AllSourceTables);
-
-        let source = inventory(
-            vec![
-                table("zeta", vec![column("id", "int", false)], vec!["id"]),
-                table("alpha", vec![column("id", "int", false)], vec!["id"]),
-            ],
-            vec![],
-        );
-        let selected =
-            resolve_schema_selection(&selection, &source).expect("resolved all-tables selection");
-
-        assert_eq!(selected, vec!["alpha", "zeta"]);
-    }
-
-    #[test]
-    fn all_tables_selection_rejects_named_tables_and_an_empty_source() {
-        let combined_table = schema_selection(&["alpha".to_string()], None, true)
-            .expect_err("--table with --all-tables");
-        assert_eq!(
-            combined_table,
-            "sync-schema --all-tables cannot be combined with --table or --catalog"
-        );
-
-        let combined_catalog =
-            schema_selection(&[], Some(br#"{"tables":[{"name":"alpha"}]}"#), true)
-                .expect_err("--catalog with --all-tables");
-        assert_eq!(
-            combined_catalog,
-            "sync-schema --all-tables cannot be combined with --table or --catalog"
-        );
-
-        let empty = resolve_schema_selection(
-            &SchemaSelection::AllSourceTables,
-            &inventory(vec![], vec![]),
-        )
-        .expect_err("empty source inventory");
-        assert_eq!(
-            empty,
-            "sync-schema --all-tables found no source base tables"
-        );
-    }
-
-    #[test]
-    fn named_selection_requires_a_table_catalog_or_all_tables() {
-        let error = schema_selection(&[], None, false).expect_err("empty selection");
-        assert_eq!(
-            error,
-            "sync-schema requires at least one --table, --catalog, or --all-tables true"
-        );
-    }
-
-    #[test]
-    fn parses_all_tables_selection_from_the_command_line() {
-        let config = parse_sync_schema_config(sync_schema_args(&["--all-tables", "true"]))
-            .expect("all-tables config");
-        assert!(config.all_tables);
-        assert!(config.tables.is_empty());
-        assert!(config.catalog.is_none());
-
-        let default = parse_sync_schema_config(sync_schema_args(&["--table", "alpha"]))
-            .expect("named config");
-        assert!(!default.all_tables);
-
-        let invalid = parse_sync_schema_config(sync_schema_args(&["--all-tables", "yes"]))
-            .expect_err("invalid boolean");
-        assert_eq!(invalid, "--all-tables must be true or false");
-    }
-
-    fn sync_schema_args(extra: &[&str]) -> Vec<String> {
-        // SAFETY: single-threaded test setup for the password environment lookup.
-        unsafe {
-            std::env::set_var("SYNC_SCHEMA_TEST_PASSWORD", "secret");
-        }
-        let mut args = [
-            "--source-host",
-            "source.example",
-            "--source-user",
-            "reader",
-            "--source-password-env",
-            "SYNC_SCHEMA_TEST_PASSWORD",
-            "--source-database",
-            "globalcomix",
-            "--target-host",
-            "target.example",
-            "--target-user",
-            "writer",
-            "--target-password-env",
-            "SYNC_SCHEMA_TEST_PASSWORD",
-            "--target-database",
-            "globalcomix",
-            "--target-tls-ca-file",
-            "/etc/ca.pem",
-        ]
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>();
-        args.extend(extra.iter().map(|value| value.to_string()));
-        args
     }
 
     fn inventory(
@@ -5546,38 +4945,6 @@ mod tests {
     }
 
     #[test]
-    fn blocked_and_dependency_skipped_tables_are_always_reinventoried() {
-        let mut blocked = table_plan("blocked", vec![]);
-        blocked.status = TableSchemaStatus::Failed;
-        let skipped = dependent_table_plan("children", "blocked");
-        let calls = std::cell::RefCell::new(Vec::new());
-        let mut executor = RecordingExecutor::failing_sql("never");
-
-        let report = execute_schema_plan(
-            SchemaConvergencePlan {
-                source_fingerprint: "source".to_string(),
-                target_fingerprint: "target".to_string(),
-                tables: vec![blocked, skipped],
-            },
-            &mut executor,
-            &|table| {
-                calls.borrow_mut().push(table.to_string());
-                vec![format!("{table} remains divergent")]
-            },
-        );
-
-        assert_eq!(&*calls.borrow(), &["blocked", "children"]);
-        assert_eq!(
-            report.tables[0].final_differences,
-            vec!["blocked remains divergent"]
-        );
-        assert_eq!(
-            report.tables[1].final_differences,
-            vec!["children remains divergent"]
-        );
-    }
-
-    #[test]
     fn preflight_sampling_uses_actual_target_primary_key_inventory() {
         let source = inventory(
             vec![table(
@@ -5684,6 +5051,303 @@ mod tests {
         assert_eq!(json[1]["status"], "passed");
     }
 
+    #[test]
+    fn unified_prerequisite_schema_keeps_structure_and_drops_all_target_constraints() {
+        let mut source = inventory(
+            vec![
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("parent_id", "bigint", false),
+                    ],
+                    vec!["id"],
+                ),
+                table("new_items", vec![column("id", "bigint", false)], vec!["id"]),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![foreign_key("children", "parents")],
+        );
+        source
+            .indexes
+            .push(index("children", "idx_children_parent", "parent_id"));
+        let mut target = inventory(
+            vec![
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("legacy", "bigint", true),
+                    ],
+                    vec!["id"],
+                ),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![foreign_key("children", "parents")],
+        );
+        target
+            .indexes
+            .push(index("children", "idx_children_legacy", "legacy"));
+        target.foreign_keys[0].name = "children_fk_children_parents".to_string();
+        let evidence = SchemaSourceEvidence {
+            inventory: source,
+            checks: vec![check("children", "positive_parent", "`parent_id` > 0")],
+            canonical_foreign_keys: vec![canonical_foreign_key("fk_children_parents")],
+        };
+        let target_checks = target_check_constraints(&evidence.checks);
+        let target_foreign_keys = vec![canonical_foreign_key("children_fk_children_parents")];
+
+        let plan = plan_sync_prerequisite_schema(
+            &evidence,
+            &target,
+            &target_checks,
+            &target_foreign_keys,
+            &[
+                "parents".to_string(),
+                "children".to_string(),
+                "new_items".to_string(),
+            ],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("unified prerequisite plan");
+        let child = plan
+            .tables
+            .iter()
+            .find(|table| table.table == "children")
+            .expect("children plan");
+        let sql = child
+            .statements
+            .iter()
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let all_sql = plan
+            .tables
+            .iter()
+            .flat_map(|table| table.statements.iter())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(child.dependencies, vec!["parents"]);
+        assert!(all_sql.contains("CREATE TABLE `new_items`"));
+        assert!(sql.contains("DROP FOREIGN KEY `children_fk_children_parents`"));
+        assert!(sql.contains("DROP CHECK `children_positive_parent`"));
+        assert!(sql.contains("DROP INDEX `idx_children_legacy`"));
+        assert!(sql.contains("DROP COLUMN `legacy`"));
+        assert!(sql.contains("ADD COLUMN `parent_id`"));
+        assert!(sql.contains("CREATE INDEX `idx_children_parent`"));
+        assert!(!sql.contains("ADD CONSTRAINT"));
+    }
+
+    #[test]
+    fn unified_final_constraints_only_converges_constraints() {
+        let source = inventory(
+            vec![
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("parent_id", "bigint", false),
+                    ],
+                    vec!["id"],
+                ),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![foreign_key("children", "parents")],
+        );
+        let target = inventory(source.tables.clone(), vec![]);
+        let evidence = SchemaSourceEvidence {
+            inventory: source,
+            checks: vec![check("children", "positive_parent", "`parent_id` > 0")],
+            canonical_foreign_keys: vec![canonical_foreign_key("fk_children_parents")],
+        };
+        let target_checks = vec![check("children", "obsolete_check", "`id` > 0")];
+        let target_foreign_keys = vec![canonical_foreign_key("obsolete_fk")];
+
+        let plan = plan_sync_final_constraints(
+            &evidence,
+            &target,
+            &target_checks,
+            &target_foreign_keys,
+            &["parents".to_string(), "children".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("unified final constraint plan");
+        let statements = plan
+            .tables
+            .iter()
+            .flat_map(|table| table.statements.iter())
+            .collect::<Vec<_>>();
+        let sql = statements
+            .iter()
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            statements
+                .iter()
+                .all(|statement| statement.phase == SchemaPhase::Constraints)
+        );
+        assert!(sql.contains("DROP FOREIGN KEY `obsolete_fk`"));
+        assert!(sql.contains("DROP CHECK `obsolete_check`"));
+        assert!(sql.contains("ADD CONSTRAINT `children_fk_children_parents` FOREIGN KEY"));
+        assert!(sql.contains("ADD CONSTRAINT `children_positive_parent` CHECK"));
+        assert!(!sql.contains("CREATE TABLE"));
+        assert!(!sql.contains("ADD COLUMN"));
+        assert!(!sql.contains("CREATE INDEX"));
+    }
+
+    #[test]
+    fn unified_final_constraints_fail_when_prerequisite_schema_drift_remains() {
+        let source = inventory(
+            vec![table(
+                "items",
+                vec![
+                    column("id", "bigint", false),
+                    column("label", "varchar(64)", false),
+                ],
+                vec!["id"],
+            )],
+            vec![],
+        );
+        let target = inventory(
+            vec![table(
+                "items",
+                vec![column("id", "bigint", false)],
+                vec!["id"],
+            )],
+            vec![],
+        );
+        let evidence = SchemaSourceEvidence {
+            inventory: source,
+            checks: vec![],
+            canonical_foreign_keys: vec![],
+        };
+
+        let error = plan_sync_final_constraints(
+            &evidence,
+            &target,
+            &[],
+            &[],
+            &["items".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect_err("nonconstraint drift must block final constraints");
+
+        assert!(error.contains("final constraints require prerequisite schema convergence"));
+        assert!(error.contains("ADD COLUMN `label`"));
+    }
+
+    #[test]
+    fn unified_schema_stage_rejects_duplicate_and_missing_selected_tables() {
+        let evidence = SchemaSourceEvidence {
+            inventory: inventory(
+                vec![table(
+                    "items",
+                    vec![column("id", "bigint", false)],
+                    vec!["id"],
+                )],
+                vec![],
+            ),
+            checks: vec![],
+            canonical_foreign_keys: vec![],
+        };
+        let target = evidence.inventory.clone();
+
+        let duplicate = plan_sync_prerequisite_schema(
+            &evidence,
+            &target,
+            &[],
+            &[],
+            &["items".to_string(), "items".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect_err("duplicate selected table");
+        assert_eq!(
+            duplicate,
+            "unified sync selected table `items` is duplicated"
+        );
+
+        let missing = plan_sync_prerequisite_schema(
+            &evidence,
+            &target,
+            &[],
+            &[],
+            &["missing".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect_err("missing selected table");
+        assert_eq!(
+            missing,
+            "unified sync selected source table `missing` is missing"
+        );
+    }
+
+    #[test]
+    fn unified_schema_stage_execution_uses_statement_results_without_verification() {
+        let plan = SchemaConvergencePlan {
+            source_fingerprint: "source".to_string(),
+            target_fingerprint: "target".to_string(),
+            tables: vec![table_plan(
+                "items",
+                vec!["ALTER TABLE `items` ADD COLUMN `label` VARCHAR(64)"],
+            )],
+        };
+        let mut executor = RecordingExecutor {
+            fail_table: None,
+            fail_sql: None,
+            executed: vec![],
+        };
+
+        let report = execute_sync_schema_stage_plan(plan, &mut executor);
+
+        assert_eq!(
+            executor.executed,
+            vec!["ALTER TABLE `items` ADD COLUMN `label` VARCHAR(64)"]
+        );
+        assert_eq!(report.overall_status, OverallSchemaStatus::Converged);
+    }
+
+    #[test]
+    fn unified_schema_stage_executes_constraint_drops_before_structure() {
+        let mut parent = table_plan(
+            "parents",
+            vec!["ALTER TABLE `parents` ADD COLUMN `label` VARCHAR(64)"],
+        );
+        parent.statements[0].objects = vec!["column:parents.label".to_string()];
+        let mut child = table_plan("children", vec![]);
+        child.dependencies.push("parents".to_string());
+        child.statements.push(PlannedSchemaStatement {
+            phase: SchemaPhase::Constraints,
+            sql: "ALTER TABLE `children` DROP FOREIGN KEY `fk_children_parents`".to_string(),
+            objects: vec!["foreign_key:children.fk_children_parents".to_string()],
+            prerequisites: vec![],
+        });
+        let plan = SchemaConvergencePlan {
+            source_fingerprint: "source".to_string(),
+            target_fingerprint: "target".to_string(),
+            tables: vec![parent, child],
+        };
+        let mut executor = RecordingExecutor {
+            fail_table: None,
+            fail_sql: None,
+            executed: vec![],
+        };
+
+        let report = execute_sync_schema_stage_plan(plan, &mut executor);
+
+        assert_eq!(
+            executor.executed,
+            vec![
+                "ALTER TABLE `children` DROP FOREIGN KEY `fk_children_parents`",
+                "ALTER TABLE `parents` ADD COLUMN `label` VARCHAR(64)",
+            ]
+        );
+        assert_eq!(report.overall_status, OverallSchemaStatus::Converged);
+    }
+
     #[derive(Default)]
     struct CapturingTargetPrimaryKeyPreflight {
         primary_keys: std::cell::RefCell<Vec<Vec<String>>>,
@@ -5743,6 +5407,32 @@ mod tests {
             extra: String::new(),
             comment: String::new(),
             generated: None,
+        }
+    }
+
+    fn index(table: &str, name: &str, column: &str) -> IndexInventory {
+        IndexInventory {
+            table: table.to_string(),
+            name: name.to_string(),
+            unique: false,
+            index_type: "BTREE".to_string(),
+            visible: true,
+            comment: None,
+            columns: vec![IndexColumnInventory {
+                name: column.to_string(),
+                sequence: 1,
+                prefix_length: None,
+                collation: None,
+                order: "ASC".to_string(),
+            }],
+        }
+    }
+
+    fn check(table: &str, name: &str, clause: &str) -> CheckConstraint {
+        CheckConstraint {
+            table: table.to_string(),
+            name: name.to_string(),
+            clause: clause.to_string(),
         }
     }
 

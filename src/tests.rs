@@ -7,6 +7,88 @@ mod checkpoint_config {
     ));
 }
 
+mod sync_chunk_boundary {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_chunk_boundary.rs"
+    ));
+}
+
+mod sync_mysql_contract {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_mysql_contract.rs"
+    ));
+}
+
+mod sync_mysql_adapter {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_mysql_adapter.rs"
+    ));
+}
+
+mod sync_config {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_config.rs"
+    ));
+}
+
+mod sync_cli_config {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_cli_config.rs"
+    ));
+}
+
+mod sync_catalog_unified {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_catalog_unified.rs"
+    ));
+}
+
+mod resync_unified {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/resync_unified.rs"
+    ));
+}
+
+mod lost_binlog_unified {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/lost_binlog_unified.rs"
+    ));
+}
+
+mod sync_progress_defaults {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_progress_defaults.rs"
+    ));
+}
+
+mod sync_runner {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_runner.rs"
+    ));
+}
+
+mod sync_orchestrator {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_orchestrator.rs"
+    ));
+}
+
+#[test]
+fn usage_documents_parallel_target_transaction_option() {
+    assert!(USAGE.contains("--target-parallel-transactions COUNT"));
+}
+
 #[test]
 fn parses_apply_binlog_config_with_all_source_and_target_options() {
     set_env("SRC_PASSWORD", "source-secret");
@@ -55,6 +137,8 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
         "25",
         "--target-transaction-group-timeout-ms",
         "500",
+        "--target-parallel-transactions",
+        "8",
         "--stop-never-slave-server-id",
         "4242",
     ]))
@@ -82,6 +166,7 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
     assert!(config.reconnect_forever);
     assert_eq!(config.target_transaction_group_size, 25);
     assert_eq!(config.target_transaction_group_timeout_ms, 500);
+    assert_eq!(config.target_parallel_transactions, 8);
     assert_eq!(config.source.stop_never_slave_server_id, Some(4242));
 }
 
@@ -89,21 +174,22 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
 fn parses_apply_binlog_runtime_options_individually() {
     let mut config = live::ApplyBinlogConfig::default();
 
-    apply_binlog_option(&mut config, "--conflict-table", "cdc.conflicts").expect("conflict table");
     apply_binlog_option(&mut config, "--max-reconnects", "3").expect("max reconnects");
     apply_binlog_option(&mut config, "--reconnect-forever", "true").expect("reconnect forever");
     apply_binlog_option(&mut config, "--target-transaction-group-size", "25")
         .expect("transaction group size");
     apply_binlog_option(&mut config, "--target-transaction-group-timeout-ms", "500")
         .expect("transaction group timeout");
+    apply_binlog_option(&mut config, "--target-parallel-transactions", "8")
+        .expect("parallel transactions");
     apply_binlog_option(&mut config, "--stop-never-slave-server-id", "4242")
         .expect("slave server id");
 
-    assert_eq!(config.conflict_table, "cdc.conflicts");
     assert_eq!(config.max_reconnects, 3);
     assert!(config.reconnect_forever);
     assert_eq!(config.target_transaction_group_size, 25);
     assert_eq!(config.target_transaction_group_timeout_ms, 500);
+    assert_eq!(config.target_parallel_transactions, 8);
     assert_eq!(config.source.stop_never_slave_server_id, Some(4242));
 }
 
@@ -124,6 +210,11 @@ fn preserves_apply_binlog_option_parse_errors() {
             "--target-transaction-group-size",
             "0",
             "--target-transaction-group-size must be greater than zero",
+        ),
+        (
+            "--target-parallel-transactions",
+            "0",
+            "--target-parallel-transactions must be greater than zero",
         ),
         (
             "--stop-never-slave-server-id",
@@ -293,142 +384,6 @@ fn parses_probe_config_with_optional_coordinates_and_tools() {
 }
 
 #[test]
-fn parses_catchup_snapshot_config() {
-    set_env("SRC_PASSWORD", "source-secret");
-    set_env("TARGET_PASSWORD", "target-secret");
-
-    let config = parse_catchup_snapshot_config(args([
-        "--source-host",
-        "10.0.0.2",
-        "--source-port",
-        "3307",
-        "--source-user",
-        "cdc",
-        "--source-password-env",
-        "SRC_PASSWORD",
-        "--source-database",
-        "globalcomix",
-        "--target-host",
-        "target.db",
-        "--target-port",
-        "25060",
-        "--target-user",
-        "target_user",
-        "--target-password-env",
-        "TARGET_PASSWORD",
-        "--target-database",
-        "globalcomix",
-        "--progress-file",
-        "/var/lib/cdc/snapshot-progress.json",
-        "--chunk-size",
-        "5000",
-        "--throttle-ms",
-        "250",
-        "--parallel-workers",
-        "4",
-        "--table",
-        "activity_tracking",
-    ]))
-    .expect("catchup config");
-
-    assert_eq!(config.source.host, "10.0.0.2");
-    assert_eq!(config.source.port, 3307);
-    assert_eq!(config.source.password, "source-secret");
-    assert_eq!(config.source.database, "globalcomix");
-    assert_eq!(config.target.host, "target.db");
-    assert_eq!(config.target.port, 25060);
-    assert_eq!(config.target.password, "target-secret");
-    assert_eq!(config.target.database, "globalcomix");
-    assert_eq!(
-        config.progress_file,
-        PathBuf::from("/var/lib/cdc/snapshot-progress.json")
-    );
-    assert_eq!(config.progress_table, "cdc.table_sync_progress");
-    assert_eq!(config.chunk_size, 5000);
-    assert_eq!(config.throttle, Duration::from_millis(250));
-    assert_eq!(config.parallel_workers, 4);
-    assert_eq!(config.table.as_deref(), Some("activity_tracking"));
-}
-
-#[test]
-fn parses_drift_check_config_with_selected_tables() {
-    set_env("DRIFT_SOURCE_PASSWORD", "source-secret");
-    set_env("DRIFT_TARGET_PASSWORD", "target-secret");
-
-    let config = parse_drift_check_config(args([
-        "--source-host",
-        "10.0.0.2",
-        "--source-port",
-        "3307",
-        "--source-user",
-        "cdc",
-        "--source-password-env",
-        "DRIFT_SOURCE_PASSWORD",
-        "--source-database",
-        "globalcomix",
-        "--target-host",
-        "target.db",
-        "--target-port",
-        "25060",
-        "--target-user",
-        "target_user",
-        "--target-password-env",
-        "DRIFT_TARGET_PASSWORD",
-        "--target-database",
-        "globalcomix",
-        "--table",
-        "accounts",
-        "--table",
-        "releases",
-        "--content-check",
-        "true",
-        "--chunk-size",
-        "2500",
-    ]))
-    .expect("drift config");
-
-    assert_eq!(config.source.host, "10.0.0.2");
-    assert_eq!(config.source.port, 3307);
-    assert_eq!(config.source.password, "source-secret");
-    assert_eq!(config.source.database, "globalcomix");
-    assert_eq!(config.target.host, "target.db");
-    assert_eq!(config.target.port, 25060);
-    assert_eq!(config.target.password, "target-secret");
-    assert_eq!(config.target.database, "globalcomix");
-    assert_eq!(config.tables, vec!["accounts", "releases"]);
-    assert!(config.content_check);
-    assert_eq!(config.chunk_size, 2500);
-}
-
-#[test]
-fn drift_check_content_check_defaults_enabled() {
-    set_env("DRIFT_DEFAULT_SOURCE_PASSWORD", "source-secret");
-    set_env("DRIFT_DEFAULT_TARGET_PASSWORD", "target-secret");
-
-    let config = parse_drift_check_config(args([
-        "--source-host",
-        "source.db",
-        "--source-user",
-        "reader",
-        "--source-password-env",
-        "DRIFT_DEFAULT_SOURCE_PASSWORD",
-        "--source-database",
-        "app",
-        "--target-host",
-        "target.db",
-        "--target-user",
-        "writer",
-        "--target-password-env",
-        "DRIFT_DEFAULT_TARGET_PASSWORD",
-        "--target-database",
-        "app",
-    ]))
-    .expect("drift config");
-
-    assert!(config.content_check);
-}
-
-#[test]
 fn rejects_apply_binlog_options_without_values() {
     let error = parse_apply_binlog_config(args(["--source-host"])).expect_err("missing value");
 
@@ -458,54 +413,7 @@ fn rejects_unknown_apply_binlog_option() {
 }
 
 #[test]
-fn rejects_unknown_catchup_snapshot_option() {
-    let error = catchup_snapshot_option(
-        &mut mysql_snapshot::CatchupSnapshotConfig {
-            source: mysql_snapshot::MySqlConnectionConfig::default(),
-            target: live::TargetMySqlConfig::default(),
-            progress_file: PathBuf::new(),
-            progress_table: "cdc.table_sync_progress".to_string(),
-            chunk_size: 10_000,
-            throttle: Duration::ZERO,
-            parallel_workers: 1,
-            table: None,
-        },
-        "--bogus",
-        "x",
-    )
-    .expect_err("unknown option");
-
-    assert_eq!(error, "unknown catchup-snapshot option: --bogus");
-}
-
-#[test]
-fn rejects_catchup_source_tls_ca_file_option() {
-    let mut config = mysql_snapshot::CatchupSnapshotConfig {
-        source: mysql_snapshot::MySqlConnectionConfig::default(),
-        target: live::TargetMySqlConfig::default(),
-        progress_file: PathBuf::new(),
-        progress_table: "cdc.table_sync_progress".to_string(),
-        chunk_size: 10_000,
-        throttle: Duration::ZERO,
-        parallel_workers: 1,
-        table: None,
-    };
-
-    let error = catchup_snapshot_option(
-        &mut config,
-        "--source-tls-ca-file",
-        "/etc/mariadb-mysql-cdc/source-ca.pem",
-    )
-    .expect_err("source TLS CA option");
-
-    assert_eq!(
-        error,
-        "unknown catchup-snapshot option: --source-tls-ca-file"
-    );
-}
-
-#[test]
-fn catchup_target_dns_keeps_hostname_verification() {
+fn target_dns_keeps_hostname_verification() {
     let target = live::TargetMySqlConfig {
         host: "target-db.example".to_string(),
         tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
@@ -517,27 +425,6 @@ fn catchup_target_dns_keeps_hostname_verification() {
 
     assert!(!ssl.skip_domain_validation());
     assert!(!ssl.accept_invalid_certs());
-}
-
-#[test]
-fn parses_catchup_progress_file() {
-    let progress_file = parse_progress_file(args([
-        "--progress-file",
-        "/var/lib/cdc/snapshot-progress.json",
-    ]))
-    .expect("progress file");
-
-    assert_eq!(
-        progress_file,
-        PathBuf::from("/var/lib/cdc/snapshot-progress.json")
-    );
-}
-
-#[test]
-fn rejects_unknown_catchup_progress_option() {
-    let error = parse_progress_file(args(["--bogus", "/tmp/progress.json"])).expect_err("unknown");
-
-    assert_eq!(error, "unknown catchup-progress option: --bogus");
 }
 
 #[test]

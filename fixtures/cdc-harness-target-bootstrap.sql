@@ -2,6 +2,7 @@ CREATE DATABASE IF NOT EXISTS globalcomix;
 CREATE DATABASE IF NOT EXISTS cdc;
 
 CREATE USER IF NOT EXISTS 'cdc_stream'@'%' IDENTIFIED BY 'cdc-stream-password' REQUIRE SSL;
+CREATE USER IF NOT EXISTS 'cdc_sync'@'%' IDENTIFIED BY 'cdc-sync-password' REQUIRE SSL;
 
 CREATE TABLE IF NOT EXISTS cdc.row_conflicts (
     conflict_identity CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -47,6 +48,30 @@ CREATE TABLE IF NOT EXISTS cdc.stream_checkpoint (
     checkpoint_json LONGTEXT NOT NULL,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS cdc.sync_runs (
+    run_id VARCHAR(128) NOT NULL,
+    stage VARCHAR(32) NOT NULL,
+    table_name VARCHAR(255) NOT NULL,
+    run_spec_json LONGTEXT NOT NULL,
+    last_primary_key_json TEXT NULL,
+    chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    inserts_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    updates_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    deletes_applied BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    status VARCHAR(16) NOT NULL,
+    last_error TEXT NULL,
+    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    completed_at TIMESTAMP(6) NULL,
+    CHECK (stage IN ('prerequisite_schema', 'rows', 'final_constraints')),
+    CHECK (status IN ('running', 'complete', 'error')),
+    CHECK (JSON_VALID(run_spec_json)),
+    CHECK (last_primary_key_json IS NULL OR JSON_VALID(last_primary_key_json)),
+    PRIMARY KEY (run_id, stage, table_name)
+) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS cdc.ddl_replay_journal (
     source_identity VARCHAR(384) NOT NULL,
@@ -185,6 +210,13 @@ BEGIN
             AND NEW.pre_state <> ''
             AND NEW.expected_post_state <> '')
            OR
+           (OLD.status = 'blocked'
+            AND NEW.status = 'applied'
+            AND NEW.transformation_version <> ''
+            AND NEW.canonical_ast <> ''
+            AND NEW.pre_state <> ''
+            AND NEW.expected_post_state <> '')
+           OR
            ((OLD.transformation_version <=> NEW.transformation_version)
             AND (OLD.generated_sql <=> NEW.generated_sql)
             AND (OLD.canonical_ast <=> NEW.canonical_ast)
@@ -227,8 +259,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES,
       CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, EVENT, TRIGGER
       ON globalcomix.* TO 'cdc_stream'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_stream'@'%';
-GRANT SELECT, INSERT, UPDATE ON cdc.row_conflicts TO 'cdc_stream'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.ddl_replay_journal TO 'cdc_stream'@'%';
-GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory TO 'cdc_stream'@'%';
 GRANT EXECUTE ON PROCEDURE cdc.ddl_replay_journal_trigger_inventory TO 'cdc_stream'@'%';
+
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, LOCK TABLES,
+      CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, EVENT, TRIGGER
+      ON globalcomix.* TO 'cdc_sync'@'%';
+GRANT CREATE ON cdc.* TO 'cdc_sync'@'%';
+GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_sync'@'%';
+GRANT SELECT, INSERT, UPDATE ON cdc.sync_runs TO 'cdc_sync'@'%';
 FLUSH PRIVILEGES;

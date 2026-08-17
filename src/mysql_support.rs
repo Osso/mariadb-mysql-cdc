@@ -319,12 +319,12 @@ mod tests {
     #[test]
     fn splits_qualified_table_paths() {
         assert_eq!(
-            qualified_table_parts("globalcomix", "cdc.table_sync_progress"),
-            ("cdc".to_string(), "table_sync_progress".to_string())
+            qualified_table_parts("globalcomix", "cdc.sync_runs"),
+            ("cdc".to_string(), "sync_runs".to_string())
         );
         assert_eq!(
-            qualified_table_parts("globalcomix", "table_sync_progress"),
-            ("globalcomix".to_string(), "table_sync_progress".to_string())
+            qualified_table_parts("globalcomix", "sync_runs"),
+            ("globalcomix".to_string(), "sync_runs".to_string())
         );
     }
 

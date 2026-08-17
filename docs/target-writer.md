@@ -5,16 +5,12 @@ execution to a `TargetExecutor`.
 
 Supported operations:
 
-- batched insert for snapshot rows, with either upsert or duplicate-ignore mode
-- strict batched insert for table-sync range repairs
+- strict batched insert for unified source-authoritative sync chunks
 - update by primary key
 - delete by primary key
 
-The snapshot writer emits either a plain multi-row `INSERT`, an upsert, or an
-ignore-duplicate insert according to its configured mode. Table-sync apply and
-missing-primary-key repairs select plain multi-row `INSERT`; only the explicit
-`--updated-since` path selects upsert. The native ROW applier uses a separate
-plain `INSERT` path and emits:
+Unified sync emits strict plain multi-row `INSERT` statements. The native ROW
+applier uses a separate plain `INSERT` path and emits:
 
 - `UPDATE ... SET ... WHERE <primary-key predicates>`
 - `DELETE FROM ... WHERE <primary-key predicates>`
@@ -23,83 +19,26 @@ For a ROW update that changes its primary key, the assignments cover every
 writable, non-generated after-image column and the predicates cover every
 before-image primary-key column.
 
-## Insert conflict policy boundary
+## Live row-error boundary
 
-`--insert-conflict-policy` accepts `error`, `ignore-duplicate`, and
-`replace-divergent-pk`. Generic target execution only ignores `1062` INSERT
-errors under `ignore-duplicate`; it never performs replacement. Native ROW
-`INSERT` duplicates under `ignore-duplicate` continue only after exact source/target
-primary-key row equality. Under `replace-divergent-pk`, an unequal row is
-replaced only for a `PRIMARY` duplicate when the source-PK lookup returns exactly
-one row and the in-place primary-key UPDATE matches exactly one target row. Missing
-or multiple lookup rows, zero/multiple matched rows, and update failures persist
-evidence and abort without checkpoint advancement. The accepted overwrite risk is
-explicit; replacement evidence is durable and a successful replacement can
-checkpoint. Foreign-key, CHECK, and replacement-update conflicts persist evidence
-and abort, rolling back the target transaction/checkpoint. Secondary-unique
-conflicts follow that same path except the narrow superseded historical
-`globalcomix.users`/`users.name`, `globalcomix.comics`/`comics.slug`, and the
-approved `globalcomix.releases` FK `ROW INSERT` proofs: exactly one candidate
-is allowed, and any ordinary conflict mixed into the source transaction fails
-closed. The live stream reads `SHOW
-MASTER STATUS` before one source consistent snapshot; that pre-snapshot
-coordinate is a conservative lower bound and must be beyond the candidate
-transaction. The users proof requires complete source/target PK and unique-owner
-convergence from that snapshot plus active-transaction `SELECT ... FOR UPDATE`
-reads. The comics proof requires complete current primary-row equality, while
-accepting the locked unique owner by exact PK+slug identity despite unrelated
-mutable-field drift. If typed verification finds that the source primary still
-owns the historical identity, it records ordinary unresolved reconciliation debt,
-runs no superseded repair SQL, and commits the remaining transaction with its XID
-checkpoint; other proof or evidence failures still roll back. The releases proof is limited to category
-`mysqld-bin.002709:515816736–515824875` (`releases_ibfk_2`) and visibility
-`mysqld-bin.002709:531921570–531929925` (`releases_ibfk_3`, candidate event
-`531921789`) with exact FK identity. It retains the historical release image,
-requires later source history and exact current source/target release and parent
-identities, installs the complete current release row only when the target row is
-absent, and otherwise requires target equality; the parent identity is preserved
-without parent updates or deletes. All approved paths then require an existing
-same-file checkpoint predecessor before the candidate and no later than the XID. Only then does it commit
-remaining source-transaction rows, exact observation/resolution evidence, and
-the XID checkpoint atomically. Any failed proof, predecessor, or commit rolls
-back, then persists all unresolved observations independently; rollback or
-persistence failures are surfaced. If a later conflict rolls back the enclosing
-transaction, the replacement rolls back but the independent ledger evidence
-remains. The default `error` policy fails native
-row duplicates.
+Native ROW streaming always emits a plain `INSERT`. MySQL `1062` from that
+INSERT is idempotent success without a target read, equality proof, replacement,
+ledger write, or repair attempt. The stream continues with later statements in
+the same source transaction.
 
-Snapshot/catchup writes may still use `INSERT IGNORE` where their configured
-snapshot mode requests duplicate-ignore. Normal table-sync range repairs do
-not: they use strict batched `INSERT` and surface constraint failures.
+Every other native row error is returned to the transaction layer. Non-INSERT
+`1062`, foreign-key, CHECK, schema, generated-column, and connection failures
+roll back the complete source transaction and block its checkpoint.
 
-When table-sync insert or divergent-update batches receive a foreign-key error,
-the repair target uses source/target schema-inventory FK metadata to discover
-exact parent identities from the affected child rows. It recursively reads
-source parents, compares target parents, inserts missing parents or updates
-divergent parents, verifies each parent exactly, then retries only the failed
-schema-dependent writer subbatch (capped at 128 rows and reduced by prepared-statement placeholder capacity). Nullable FK values are skipped. A concurrent
-`1062` is reconciled by rereading the affected target rows: complete equality
-with the source is accepted, while a divergent owner fails closed. When an
-absent parent insert hits a secondary-unique owner under another primary key,
-table-sync may restore that owner to its exact source row, reread the restored
-owner, and retry the parent insert. This requires exactly one target owner, a
-different primary key, one source row at that owner identity, and a different
-source unique value; primary, unknown, absent, ambiguous, rightful, or
-unverifiable owners fail closed, and retries are bounded by the table's unique
-index count. After a child insert, parent-retry, or update batch, every affected
-child row is reread by primary key and compared exactly; only then may the
-caller checkpoint the source chunk.
+`--insert-conflict-policy` is not part of unified `sync` and does not select a
+native ROW live-stream policy. Unified sync never uses `INSERT IGNORE`, upsert,
+`REPLACE`, post-write rereads, or final drift scans. Strict mutation errors fail
+the locked chunk and leave its durable progress unchanged.
 
-The `sync-table --updated-since` path uses an upsert.
-
-Table-sync parent-repair errors are explicit for missing source parents,
-malformed or ambiguous identities, dependency cycles, source/target reads,
-parent writes, child-batch retry, and post-write verification. Other insert
-constraints remain ordinary repair errors and are not silently converted into
-success. Apply and missing-primary-key runs retry bounded recoverable read,
-duplicate, verification, progress, network, deadlock, and lock-timeout errors
-without advancing unchanged durable progress. FK-aware apply runs require a
-final zero-drift scan before durable completion.
+Schema constraints are prepared and restored by the staged schema phases. Row
+chunks hold the target-table `WRITE` lock through source read, target read,
+strict mutations, target commit, separate-session progress persistence, and
+unlock. A lock or progress failure fails closed.
 
 Errors include:
 

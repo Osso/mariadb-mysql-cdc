@@ -12,28 +12,21 @@ mod binlog_command;
 mod ddl_event;
 mod ddl_replay_journal;
 pub(crate) mod ddl_semantics;
-mod foreign_key_error;
 mod insert_conflict;
-mod missing_parent;
 mod mysql_cli;
+pub(crate) mod parallel_target;
+pub(crate) mod parallel_writer;
 mod progress;
 mod reconnect;
-mod recovery;
 #[cfg(test)]
 mod repair;
 mod schema_recovery;
 mod structured_stream;
+pub(crate) mod submitted_mysql;
 #[cfg(test)]
 use crate::target::{SqlStatement, TargetExecuteError};
 use binlog_command::read_remote_binlog;
-pub(crate) use foreign_key_error::{ForeignKeyViolation, parse_foreign_key_violation};
-pub(crate) use insert_conflict::should_replace_divergent_primary;
-pub use insert_conflict::{
-    InsertConflictPolicy, should_ignore_duplicate_insert, should_ignore_duplicate_row_change,
-};
-pub(crate) use missing_parent::{
-    MissingParentInput, MissingParentPlan, plan_missing_parent_recovery,
-};
+pub use insert_conflict::{InsertConflictPolicy, should_ignore_duplicate_insert};
 pub use mysql_cli::MysqlCliExecutor;
 #[cfg(test)]
 use mysql_cli::{
@@ -46,22 +39,9 @@ use progress::{StreamProgress, format_stream_progress, format_stream_quarantine}
 use reconnect::{StreamCheckpointStore, run_stream_reconnect_loop, save_stream_checkpoint};
 #[cfg(test)]
 use reconnect::{is_stale_or_missing_binlog_error, resume_from_checkpoint, should_reconnect};
-pub use recovery::{
-    ExactParentRecovery, HomeFeedCardRecovery, RecoveryAttemptError, SessionsGuestRecovery,
-};
-pub(crate) use recovery::{
-    HOME_FEED_CARD_PARENT_PRIMARY_KEY, HOME_FEED_CARD_PARENT_TABLE, HOME_FEED_SLIDE_CHILD_SCHEMA,
-    HOME_FEED_SLIDE_CHILD_TABLE, HOME_FEED_SLIDE_CONSTRAINT, HOME_FEED_SLIDE_FK_ERROR_CODE,
-    HOME_FEED_SLIDE_FK_SIGNATURE, HOME_FEED_SLIDE_PARENT_REFERENCE, SESSIONS_GUEST_CHILD_SCHEMA,
-    SESSIONS_GUEST_CHILD_TABLE, SESSIONS_GUEST_CONSTRAINT, SESSIONS_GUEST_FK_ERROR_CODE,
-    SESSIONS_GUEST_FK_SIGNATURE, SESSIONS_GUEST_PARENT_PRIMARY_KEY,
-    SESSIONS_GUEST_PARENT_REFERENCE, SESSIONS_GUEST_PARENT_TABLE,
-};
 #[cfg(test)]
 use repair::{FailedStatementRepairer, repair_failed_statement};
-pub(crate) use schema_recovery::mysql_compatible_create_table;
 use schema_recovery::mysql_executor_with_recovery;
-pub(crate) use structured_stream::is_superseded_identity_scope;
 
 #[cfg(feature = "integration-failpoints")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +53,7 @@ pub enum IntegrationFailpoint {
     SourceConnectionLoss,
     TargetConnectionLoss,
     FailedRunClaimRevalidated,
+    ParallelTargetSubmission,
 }
 
 #[cfg(feature = "integration-failpoints")]
@@ -86,6 +67,7 @@ impl IntegrationFailpoint {
             "source-connection-loss" => Ok(Self::SourceConnectionLoss),
             "target-connection-loss" => Ok(Self::TargetConnectionLoss),
             "failed-run-claim-revalidated" => Ok(Self::FailedRunClaimRevalidated),
+            "parallel-target-submission" => Ok(Self::ParallelTargetSubmission),
             other => Err(format!("unknown integration failpoint: {other}")),
         }
     }
@@ -99,6 +81,7 @@ impl IntegrationFailpoint {
             Self::SourceConnectionLoss => 5,
             Self::TargetConnectionLoss => 6,
             Self::FailedRunClaimRevalidated => 7,
+            Self::ParallelTargetSubmission => 8,
         }
     }
 }
@@ -154,21 +137,13 @@ pub struct ApplyBinlogConfig {
     pub source_identity: String,
     pub target: TargetMySqlConfig,
     pub checkpoint_table: String,
-    pub conflict_table: String,
     pub max_reconnects: u32,
     pub reconnect_forever: bool,
     pub target_transaction_group_size: usize,
     pub target_transaction_group_timeout_ms: u64,
+    pub target_parallel_transactions: usize,
     #[cfg(feature = "integration-failpoints")]
     pub integration_failpoint: Option<IntegrationFailpoint>,
-    #[cfg(feature = "integration-failpoints")]
-    pub integration_logical_source_file: Option<String>,
-    #[cfg(feature = "integration-failpoints")]
-    pub integration_logical_start_position: Option<u64>,
-    #[cfg(feature = "integration-failpoints")]
-    pub integration_logical_checkpoint_position: Option<u64>,
-    #[cfg(feature = "integration-failpoints")]
-    pub integration_logical_end_position: Option<u64>,
 }
 
 impl Default for ApplyBinlogConfig {
@@ -178,21 +153,13 @@ impl Default for ApplyBinlogConfig {
             source_identity: String::new(),
             target: TargetMySqlConfig::default(),
             checkpoint_table: default_stream_checkpoint_table(),
-            conflict_table: "cdc.row_conflicts".to_string(),
             max_reconnects: 12,
             reconnect_forever: false,
             target_transaction_group_size: 1,
             target_transaction_group_timeout_ms: 0,
+            target_parallel_transactions: 1,
             #[cfg(feature = "integration-failpoints")]
             integration_failpoint: None,
-            #[cfg(feature = "integration-failpoints")]
-            integration_logical_source_file: None,
-            #[cfg(feature = "integration-failpoints")]
-            integration_logical_start_position: None,
-            #[cfg(feature = "integration-failpoints")]
-            integration_logical_checkpoint_position: None,
-            #[cfg(feature = "integration-failpoints")]
-            integration_logical_end_position: None,
         }
     }
 }
@@ -235,11 +202,6 @@ fn validate_apply_table_paths(config: &ApplyBinlogConfig) -> Result<(), ApplyBin
         &config.checkpoint_table,
         "checkpoint table is required",
         "checkpoint table must be a schema-qualified schema.table path",
-    )?;
-    validate_schema_qualified_table(
-        &config.conflict_table,
-        "conflict table is required",
-        "conflict table must be a schema-qualified schema.table path",
     )
 }
 
@@ -262,6 +224,11 @@ fn validate_apply_runtime_settings(config: &ApplyBinlogConfig) -> Result<(), App
     if config.target_transaction_group_size == 0 {
         return Err(config_error(
             "target transaction group size must be greater than zero",
+        ));
+    }
+    if config.target_parallel_transactions == 0 {
+        return Err(config_error(
+            "target parallel transactions must be greater than zero",
         ));
     }
     Ok(())
@@ -378,15 +345,6 @@ pub enum ApplyBinlogError {
     Config(String),
     SourceCommand(String),
     Target(String),
-    SupersededRecoveryFailed(String),
-    RowConflictPersisted {
-        message: String,
-        parent_recovery: Option<Box<ExactParentRecovery>>,
-    },
-    ParentRecoveryFailed {
-        conflict: Box<ExactParentRecovery>,
-        source: RecoveryAttemptError,
-    },
     DdlBlocked(String),
     Statement(String),
     Quarantined(Vec<QuarantinedStatement>),
@@ -401,20 +359,6 @@ impl fmt::Display for ApplyBinlogError {
                 write!(formatter, "source binlog command failed: {message}")
             }
             Self::Target(message) => write!(formatter, "target apply failed: {message}"),
-            Self::SupersededRecoveryFailed(message) => {
-                write!(formatter, "superseded recovery failed: {message}")
-            }
-            Self::RowConflictPersisted { message, .. } => {
-                write!(formatter, "row conflict persisted for repair: {message}")
-            }
-            Self::ParentRecoveryFailed { conflict, source } => write!(
-                formatter,
-                "{} recovery failed for {}:{} child_pk={}: {source}",
-                conflict.recovery_kind(),
-                conflict.source_file(),
-                conflict.source_start_position(),
-                conflict.child_primary_key()
-            ),
             Self::DdlBlocked(message) => write!(formatter, "DDL blocked: {message}"),
             Self::Statement(message) => write!(formatter, "statement apply failed: {message}"),
             Self::Quarantined(statements) => write!(
@@ -424,25 +368,6 @@ impl fmt::Display for ApplyBinlogError {
                 format_quarantined_statements(statements)
             ),
             Self::Checkpoint(message) => write!(formatter, "checkpoint failed: {message}"),
-        }
-    }
-}
-
-impl ApplyBinlogError {
-    pub(super) fn parent_recovery(&self) -> Option<&ExactParentRecovery> {
-        match self {
-            Self::RowConflictPersisted {
-                parent_recovery, ..
-            } => parent_recovery.as_deref(),
-            _ => None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn sessions_guest_recovery(&self) -> Option<&SessionsGuestRecovery> {
-        match self.parent_recovery() {
-            Some(ExactParentRecovery::SessionsGuest(request)) => Some(request),
-            _ => None,
         }
     }
 }

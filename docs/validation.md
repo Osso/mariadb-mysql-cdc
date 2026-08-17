@@ -31,27 +31,27 @@ optional `start_after` primary key, and limit so row-level reports can be paged.
 
 `recover-lost-binlog` requires two evidence phases:
 
-1. **Preparation:** exact JSON authorization, source/checkpoint identity,
-   the current source scope hash for this attempt, and an all-InnoDB scope. The
-   source boundary is captured with ordinary non-locking MariaDB reads; recovery
-   requires no `FLUSH TABLES WITH READ LOCK`, `UNLOCK TABLES`, `LOCK TABLES`, or
-   `RELOAD`. Recovery data repair covers every current source-scope table even
-   when target-only base tables exist; the generic `repair-drift` contract
-   remains strict.
-2. **Reconciliation and commit:** committed source reads supply the full-scope
-   insert/update/delete/verify comparison without a long-lived cross-table
-   repeatable-read snapshot. Recovery-only schema convergence then drops
-   target-only base tables child-before-parent with normal foreign-key
-   enforcement; cycles and source-table references to target-only parents fail
-   closed. The captured coordinate is the replay boundary: source commits after
-   it remain eligible for stream replay after checkpoint advancement. The final
-   target table inventory must exactly equal this attempt's source inventory.
-   Any skipped table, unsupported engine, unresolved conflict, schema
-   difference, count/content mismatch, inventory mismatch, or failed
-   attempt-scope proof blocks the checkpoint transition.
+1. **Preparation:** exact JSON authorization, source/checkpoint identity, the
+   current source scope hash, and an all-InnoDB scope. The source boundary is
+   captured as one coordinate plus one committed `SchemaSourceEvidence` set
+   with ordinary non-locking MariaDB reads; recovery requires no `FLUSH TABLES
+   WITH READ LOCK`, `UNLOCK TABLES`, `LOCK TABLES`, or `RELOAD`. Prepared
+   evidence is source-only: scope hash, source schema fingerprint, and source
+   table count.
+2. **Unified reconciliation and commit:** the captured evidence drives one
+   staged sync over every source table under the exact recovery ID. Unified
+   prerequisite schema convergence, locked source-authoritative row chunks,
+   durable `cdc.sync_runs` stage/table progress, and final constraints define
+   successful reconciliation. Proof requires exactly one complete progress
+   result for every expected source table, with no missing, unexpected,
+   duplicate, incomplete, or wrong-run rows. The source scope hash is rechecked
+   before commit. The target is not re-inventoried and no post-write drift scan
+   is performed. The captured coordinate remains the replay boundary: source
+   commits after it remain eligible for stream replay after checkpoint
+   advancement.
 
 Every recovery record retains its immutable old checkpoint, exact historical
-barrier, source identity, its own scope hash, operator, reason, and phase
+barrier, source identity, its own scope hash, operator, reason, and preparation
 evidence. A separately authorized replacement atomically marks the exact
 prepared owner `abandoned` with server-generated evidence and inserts a new
 `prepared` owner for the same exact checkpoint, barrier, and source identity;
@@ -60,9 +60,8 @@ scope, and prepared evidence remain durable. The historical journal row is
 preserved. Abandoned history does not suppress the barrier; active-barrier
 selection excludes it only after exact `committed` or `verified` ownership, and
 those statuses are terminal. `committed` is an availability-first skip over
-purged history, not proof that the skipped interval was replayed. The recovery
-may be marked `verified` only after post-transition full schema/data validation
-reports zero unresolved drift.
+purged history, not proof that the skipped interval was replayed.
 
-Production execution, restart health, and `verified` evidence remain open until
-measured and recorded; this document does not claim recovery completion.
+Production execution, restart health, and post-transition `verified` evidence
+remain open until measured and recorded; this document does not claim recovery
+completion.

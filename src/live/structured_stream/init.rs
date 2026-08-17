@@ -1,5 +1,6 @@
 use super::*;
-use crate::live::RecoveryAttemptError;
+mod completion;
+pub(super) use completion::*;
 
 pub(crate) fn stream_remote_binlog(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
     verify_source_binlog_contract(config)?;
@@ -26,11 +27,6 @@ pub(super) fn validate_startup_contract(
 ) -> Result<(), ApplyBinlogError> {
     let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    let conflict_store = MySqlConflictStore::new(&config.target, config.conflict_table.clone())
-        .map_err(ApplyBinlogError::Checkpoint)?;
-    conflict_store
-        .ensure()
-        .map_err(ApplyBinlogError::Checkpoint)?;
     executor
         .acquire_stream_lease(&format!("cdc-stream:{}", config.target.database))
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
@@ -50,7 +46,7 @@ pub(super) fn stream_with_checkpoint_store<C>(
 where
     C: StreamCheckpointStore,
 {
-    run_stream_reconnect_loop_with_recovery(
+    run_stream_reconnect_loop(
         config,
         checkpoint_store,
         |attempt_config| {
@@ -60,10 +56,6 @@ where
                 transaction_checkpoint_table,
                 transaction_checkpoint_name,
             )
-        },
-        |request| {
-            crate::table_sync::reconcile_exact_parent_live(config, request)
-                .map_err(RecoveryAttemptError::from)
         },
         thread::sleep,
     )
@@ -79,19 +71,38 @@ pub(super) fn stream_once(
     super::super::configure_integration_failpoint(config.integration_failpoint);
 
     let mut runtime = StreamRuntime::initialize(config)?;
-    #[cfg(feature = "integration-failpoints")]
-    if let Some(source_file) = &config.integration_logical_source_file {
-        runtime.current_file.clone_from(source_file);
-    }
-    while let Ok(result) = runtime.event_receiver.recv() {
+    loop {
+        let result = if runtime.durable_progress.is_some() {
+            match runtime
+                .event_receiver
+                .recv_timeout(PARALLEL_TARGET_RESULT_POLL_INTERVAL)
+            {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    reap_parallel_target_transactions(&mut runtime)?;
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match runtime.event_receiver.recv() {
+                Ok(result) => result,
+                Err(_) => break,
+            }
+        };
         let (header, event, source_position) = match result {
             Ok(event) => event,
             Err(error) => {
-                rollback_stream_transaction(&mut runtime)?;
+                let target_result = reap_parallel_target_transactions(&mut runtime);
+                let rollback_result = rollback_stream_transaction(&mut runtime);
+                target_result?;
+                rollback_result?;
+                wait_for_parallel_target_transactions(&mut runtime)?;
                 return Err(source_error(error));
             }
         };
-        let stop_decision = process_stream_event(
+        reap_parallel_target_transactions(&mut runtime)?;
+        let process_result = process_stream_event(
             config,
             &mut runtime,
             StreamCheckpointContext {
@@ -104,7 +115,9 @@ pub(super) fn stream_once(
                 event: &event,
                 source_position,
             },
-        )?;
+        );
+        reap_parallel_target_transactions(&mut runtime)?;
+        let stop_decision = process_result?;
         if stop_decision == StopPositionDecision::DispatchAndStop {
             return complete_bounded_stop(
                 &mut runtime,
@@ -126,7 +139,6 @@ pub(super) fn stream_once(
 
 pub(super) struct StreamRuntime {
     applier: RowApplier<crate::mysql_client::PersistentTargetExecutor>,
-    conflict_store: MySqlConflictStore,
     ddl_replay_journal: MySqlDdlReplayJournal,
     semantic_inventory: LiveDdlSemanticInventory,
     schema_resolver: TargetInventorySchemaResolver,
@@ -134,6 +146,7 @@ pub(super) struct StreamRuntime {
     current_file: String,
     state: StructuredEventState,
     progress: StreamProgress,
+    durable_progress: Option<StreamProgress>,
     target_transaction: TargetTransaction,
     group_config: TargetTransactionGroupConfig,
     source_identity: String,
@@ -142,23 +155,28 @@ pub(super) struct StreamRuntime {
 
 impl StreamRuntime {
     pub(super) fn initialize(config: &ApplyBinlogConfig) -> Result<Self, ApplyBinlogError> {
-        let (applier, conflict_store, ddl_replay_journal) = initialize_target_services(config)?;
+        let (applier, ddl_replay_journal) = initialize_target_services(config)?;
         let semantic_inventory = initialize_semantic_inventory(config)?;
         let schema_resolver = TargetInventorySchemaResolver::new(config);
         let (event_receiver, current_file) = start_binlog_receiver(config)?;
+        let start_coordinate = BinlogCoordinate {
+            file: config.source.binlog_file.clone(),
+            position: config.source.start_position,
+        };
+        let durable_progress = applier
+            .executor()
+            .uses_parallel_transactions()
+            .then(|| StreamProgress::new(start_coordinate.clone()));
         Ok(Self {
             applier,
-            conflict_store,
             ddl_replay_journal,
             semantic_inventory,
             schema_resolver,
             event_receiver,
             current_file,
             state: StructuredEventState::new(config.source.database.clone()),
-            progress: StreamProgress::new(BinlogCoordinate {
-                file: config.source.binlog_file.clone(),
-                position: config.source.start_position,
-            }),
+            progress: StreamProgress::new(start_coordinate),
+            durable_progress,
             target_transaction: TargetTransaction::default(),
             group_config: TargetTransactionGroupConfig::from_apply_config(config),
             source_identity: config.source_identity.clone(),
@@ -172,15 +190,12 @@ fn initialize_target_services(
 ) -> Result<
     (
         RowApplier<crate::mysql_client::PersistentTargetExecutor>,
-        MySqlConflictStore,
         MySqlDdlReplayJournal,
     ),
     ApplyBinlogError,
 > {
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(&config.target)
+    let executor = crate::mysql_client::PersistentTargetExecutor::new_for_stream(config)
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    let conflict_store = MySqlConflictStore::new(&config.target, config.conflict_table.clone())
-        .map_err(ApplyBinlogError::Checkpoint)?;
     executor
         .acquire_stream_lease(&format!("cdc-stream:{}", config.target.database))
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
@@ -188,7 +203,7 @@ fn initialize_target_services(
     let ddl_replay_journal =
         MySqlDdlReplayJournal::new(&config.target, "cdc.ddl_replay_journal".to_string());
     validate_ddl_replay_barrier(&ddl_replay_journal, config)?;
-    Ok((applier, conflict_store, ddl_replay_journal))
+    Ok((applier, ddl_replay_journal))
 }
 
 fn validate_ddl_replay_barrier(
@@ -246,42 +261,6 @@ pub(super) struct SourceStreamEvent<'a> {
     pub(super) source_position: u64,
 }
 
-#[cfg(feature = "integration-failpoints")]
-fn logical_integration_coordinate(
-    config: &ApplyBinlogConfig,
-    header: &EventHeader,
-    event: &BinlogEvent,
-    source_position: u64,
-) -> (EventHeader, u64) {
-    let mut logical_header = EventHeader {
-        timestamp: header.timestamp,
-        event_type: header.event_type,
-        server_id: header.server_id,
-        event_length: header.event_length,
-        next_event_position: header.next_event_position,
-        event_flags: header.event_flags,
-    };
-    let logical_source_position = if matches!(
-        event,
-        BinlogEvent::WriteRowsEvent(_)
-            | BinlogEvent::UpdateRowsEvent(_)
-            | BinlogEvent::DeleteRowsEvent(_)
-    ) {
-        config
-            .integration_logical_start_position
-            .unwrap_or(source_position)
-    } else {
-        source_position
-    };
-    if matches!(event, BinlogEvent::XidEvent(_))
-        && let Some(end_position) = config.integration_logical_end_position
-    {
-        logical_header.next_event_position = u32::try_from(end_position)
-            .expect("integration logical end position must fit a binlog header");
-    }
-    (logical_header, logical_source_position)
-}
-
 pub(super) fn process_stream_event<C>(
     config: &ApplyBinlogConfig,
     runtime: &mut StreamRuntime,
@@ -302,32 +281,21 @@ where
             return Err(error);
         }
     };
-    #[cfg(feature = "integration-failpoints")]
-    if let Some(source_file) = &config.integration_logical_source_file {
-        runtime.current_file.clone_from(source_file);
-    }
-    #[cfg(feature = "integration-failpoints")]
-    let (logical_header, logical_source_position) =
-        logical_integration_coordinate(config, input.header, input.event, input.source_position);
-    #[cfg(feature = "integration-failpoints")]
-    let input = SourceStreamEvent {
-        header: &logical_header,
-        event: input.event,
-        source_position: logical_source_position,
-    };
     let mut state = std::mem::replace(
         &mut runtime.state,
         StructuredEventState::new(config.source.database.clone()),
     );
     let mut progress = runtime.progress.clone();
     let mut source_row_transaction_open = runtime.source_row_transaction_open;
+    let record_progress = runtime.durable_progress.is_none();
     let result = process_stream_event_core_after_stop_decision(
         &mut state,
         &mut progress,
         &mut source_row_transaction_open,
         input,
         stop_decision,
-        |state, input| dispatch_stream_event(config, runtime, state, &checkpoint, input),
+        record_progress,
+        |state, input| dispatch_stream_event(runtime, state, &checkpoint, input),
     );
     runtime.state = state;
     runtime.progress = progress;
@@ -346,42 +314,13 @@ where
     result.map(|(stop_decision, _)| stop_decision)
 }
 
-#[cfg(test)]
-pub(super) fn process_stream_event_core<D>(
-    config: &ApplyBinlogConfig,
-    state: &mut StructuredEventState,
-    progress: &mut StreamProgress,
-    source_row_transaction_open: &mut bool,
-    input: SourceStreamEvent<'_>,
-    dispatch: D,
-) -> Result<(StopPositionDecision, StructuredEventOutcome), ApplyBinlogError>
-where
-    D: FnMut(
-        &mut StructuredEventState,
-        SourceStreamEvent<'_>,
-    ) -> Result<StructuredEventOutcome, ApplyBinlogError>,
-{
-    let stop_decision = stop_position_decision(
-        config.source.stop_position,
-        input.header,
-        *source_row_transaction_open,
-    )?;
-    process_stream_event_core_after_stop_decision(
-        state,
-        progress,
-        source_row_transaction_open,
-        input,
-        stop_decision,
-        dispatch,
-    )
-}
-
 fn process_stream_event_core_after_stop_decision<D>(
     state: &mut StructuredEventState,
     progress: &mut StreamProgress,
     source_row_transaction_open: &mut bool,
     input: SourceStreamEvent<'_>,
     stop_decision: StopPositionDecision,
+    record_progress: bool,
     mut dispatch: D,
 ) -> Result<(StopPositionDecision, StructuredEventOutcome), ApplyBinlogError>
 where
@@ -392,13 +331,14 @@ where
 {
     state.record_event_position(input.source_position);
     let outcome = dispatch(state, input)?;
-    log_stream_progress(progress, &outcome);
+    if record_progress {
+        log_stream_progress(progress, &outcome);
+    }
     update_source_row_transaction_state(source_row_transaction_open, input.event);
     Ok((stop_decision, outcome))
 }
 
 fn dispatch_stream_event<C>(
-    config: &ApplyBinlogConfig,
     runtime: &mut StreamRuntime,
     state: &mut StructuredEventState,
     checkpoint: &StreamCheckpointContext<'_, C>,
@@ -409,7 +349,6 @@ where
 {
     let StreamRuntime {
         applier,
-        conflict_store,
         ddl_replay_journal,
         semantic_inventory,
         schema_resolver,
@@ -419,66 +358,6 @@ where
         source_identity,
         ..
     } = runtime;
-    if matches!(input.event, BinlogEvent::XidEvent(_))
-        && target_transaction.has_deferred_superseded_inserts()
-    {
-        let source = superseded_source_connection_config(config)?;
-        let checkpoint_table = checkpoint.table.ok_or_else(|| {
-            ApplyBinlogError::Checkpoint(
-                "superseded insert recovery requires transactional checkpoint table".to_string(),
-            )
-        })?;
-        let checkpoint_name = checkpoint.name.ok_or_else(|| {
-            ApplyBinlogError::Checkpoint(
-                "superseded insert recovery requires checkpoint name".to_string(),
-            )
-        })?;
-        let xid_end_position = u64::from(input.header.next_event_position);
-        target_transaction.finalize_deferred_superseded_inserts_at(xid_end_position);
-        let mut verifier = super::superseded_verifier::ProductionSupersededInsertVerifier::new(
-            &source,
-            applier.executor(),
-        );
-        #[cfg(feature = "integration-failpoints")]
-        if let (Some(file), Some(end_position)) = (
-            config.integration_logical_source_file.as_ref(),
-            config.integration_logical_end_position,
-        ) {
-            verifier.set_logical_snapshot(super::superseded_source::SourceSnapshotCoordinate {
-                file: file.clone(),
-                position: end_position.saturating_add(1),
-            });
-        }
-        target_transaction.verify_deferred_superseded_inserts_at_xid_with_conflicts(
-            applier.executor(),
-            &mut verifier,
-            conflict_store,
-            SupersededXidCommitContext {
-                xid_end_position,
-                checkpoint_table,
-                checkpoint_name,
-                conflict_table: &config.conflict_table,
-                #[cfg(feature = "integration-failpoints")]
-                logical_checkpoint_predecessor: config
-                    .integration_logical_source_file
-                    .as_ref()
-                    .zip(config.integration_logical_checkpoint_position)
-                    .map(
-                        |(file, position)| super::superseded_insert::BinlogCoordinate {
-                            file: file.clone(),
-                            position,
-                        },
-                    ),
-            },
-        )?;
-        return Ok(StructuredEventOutcome {
-            policy: EventPolicy::CommitTransaction,
-            resume_coordinate: Some(BinlogCoordinate {
-                file: current_file.clone(),
-                position: xid_end_position,
-            }),
-        });
-    }
     let mut context = StreamEventContext {
         schema_resolver,
         state,
@@ -499,99 +378,10 @@ where
         input.event,
     )? {
         Some(outcome) => Ok(outcome),
-        None => apply_stream_event_transactionally_with_conflicts(
-            applier,
-            &mut context,
-            input.header,
-            input.event,
-            source_identity,
-            conflict_store,
-        ),
+        None => {
+            apply_stream_event_transactionally(applier, &mut context, input.header, input.event)
+        }
     }
-}
-
-pub(super) fn complete_bounded_stop<C>(
-    runtime: &mut StreamRuntime,
-    checkpoint_store: Option<&C>,
-    transaction_checkpoint_table: Option<&str>,
-    transaction_checkpoint_name: Option<&str>,
-) -> Result<(), ApplyBinlogError>
-where
-    C: StreamCheckpointStore,
-{
-    if let Err(error) = bounded_stop_completion_error(runtime.source_row_transaction_open) {
-        rollback_stream_transaction(runtime)?;
-        return Err(error);
-    }
-    flush_stream_grouped_transaction(
-        runtime,
-        checkpoint_store,
-        transaction_checkpoint_table,
-        transaction_checkpoint_name,
-    )?;
-    Ok(())
-}
-
-pub(super) fn finish_stream<C>(
-    config: &ApplyBinlogConfig,
-    runtime: &mut StreamRuntime,
-    checkpoint_store: Option<&C>,
-    transaction_checkpoint_table: Option<&str>,
-    transaction_checkpoint_name: Option<&str>,
-) -> Result<(), ApplyBinlogError>
-where
-    C: StreamCheckpointStore,
-{
-    if let Some(stop_position) = config.source.stop_position {
-        rollback_stream_transaction(runtime)?;
-        return Err(bounded_stop_not_reached_error(stop_position));
-    }
-    flush_stream_grouped_transaction(
-        runtime,
-        checkpoint_store,
-        transaction_checkpoint_table,
-        transaction_checkpoint_name,
-    )?;
-    Err(stream_ended_error())
-}
-
-pub(super) fn flush_stream_grouped_transaction<C>(
-    runtime: &mut StreamRuntime,
-    checkpoint_store: Option<&C>,
-    transaction_checkpoint_table: Option<&str>,
-    transaction_checkpoint_name: Option<&str>,
-) -> Result<(), ApplyBinlogError>
-where
-    C: StreamCheckpointStore,
-{
-    let StreamRuntime {
-        applier,
-        schema_resolver,
-        state,
-        target_transaction,
-        current_file,
-        group_config,
-        ..
-    } = runtime;
-    let mut context = StreamEventContext {
-        schema_resolver,
-        state,
-        target_transaction,
-        checkpoint_store,
-        transaction_checkpoint_table,
-        transaction_checkpoint_name,
-        current_file,
-        group_config: *group_config,
-    };
-    flush_grouped_transaction(applier.executor(), &mut context)
-}
-
-pub(super) fn rollback_stream_transaction(
-    runtime: &mut StreamRuntime,
-) -> Result<(), ApplyBinlogError> {
-    runtime
-        .target_transaction
-        .rollback_if_open(runtime.applier.executor())
 }
 
 type BinlogEventResult = Result<(EventHeader, BinlogEvent, u64), MysqlCdcError>;
@@ -689,23 +479,6 @@ pub(super) fn validate_source_binlog_settings(
         "stream-binlog requires source binlog_format=ROW and binlog_row_image=FULL; found format={} row_image={}",
         settings.format, settings.row_image
     )))
-}
-
-fn superseded_source_connection_config(
-    config: &ApplyBinlogConfig,
-) -> Result<crate::mysql_snapshot::MySqlConnectionConfig, ApplyBinlogError> {
-    let database = config.source.database.clone().ok_or_else(|| {
-        ApplyBinlogError::Target(
-            "superseded insert recovery requires a source database".to_string(),
-        )
-    })?;
-    Ok(crate::mysql_snapshot::MySqlConnectionConfig {
-        host: config.source.host.clone(),
-        port: config.source.port,
-        user: config.source.user.clone(),
-        password: config.source.password.clone(),
-        database,
-    })
 }
 
 pub(super) fn source_inventory_config(config: &ApplyBinlogConfig) -> InventoryConfig {

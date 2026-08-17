@@ -1,7 +1,7 @@
-use crate::conflict_repair::{ConflictStore, MySqlConflictStore};
+use crate::conflict_ledger::MySqlConflictLedger;
+use crate::database_row::DatabaseRow;
 use crate::live::TargetMySqlConfig;
-use crate::mysql_snapshot::MySqlConnectionConfig;
-use crate::snapshot::SnapshotRow;
+use crate::mysql_config::MySqlConnectionConfig;
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Row, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,12 +23,12 @@ pub trait ConflictEvidenceReader {
         &mut self,
         side: EvidenceSide,
         primary_keys: &[Vec<String>],
-    ) -> Result<Vec<SnapshotRow>, String>;
+    ) -> Result<Vec<DatabaseRow>, String>;
     fn read_parent_rows(
         &mut self,
         side: EvidenceSide,
         primary_keys: &[Vec<String>],
-    ) -> Result<Vec<SnapshotRow>, String>;
+    ) -> Result<Vec<DatabaseRow>, String>;
 }
 
 pub trait ConflictResolutionWriter {
@@ -42,7 +42,7 @@ pub trait ConflictResolutionWriter {
     ) -> Result<(), String>;
 }
 
-impl<T: ConflictStore> ConflictResolutionWriter for T {
+impl ConflictResolutionWriter for MySqlConflictLedger {
     fn resolve_if_equal(
         &mut self,
         table: &str,
@@ -51,7 +51,7 @@ impl<T: ConflictStore> ConflictResolutionWriter for T {
         repair_run_id: &str,
         evidence: &str,
     ) -> Result<(), String> {
-        ConflictStore::resolve_if_equal(
+        MySqlConflictLedger::resolve_if_equal(
             self,
             table,
             primary_key,
@@ -203,11 +203,11 @@ pub fn run_mysql_targeted_conflict_resolution(
 ) -> Result<(TargetedConflictResolutionReport, u128), String> {
     let started = Instant::now();
     let mut reader = MySqlConflictEvidenceReader::new(config)?;
-    let mut store = MySqlConflictStore::new(&config.target, "cdc.row_conflicts")?;
-    store.ensure()?;
+    let mut ledger = MySqlConflictLedger::new(&config.target, "cdc.row_conflicts")?;
+    ledger.ensure()?;
     let report = resolve_comics_releases_views_conflicts(
         &mut reader,
-        &mut store,
+        &mut ledger,
         &config.run_id,
         config.batch_size,
     )?;
@@ -237,7 +237,7 @@ impl MySqlConflictEvidenceReader {
         table: &str,
         primary_key: &str,
         primary_keys: &[Vec<String>],
-    ) -> Result<Vec<SnapshotRow>, String> {
+    ) -> Result<Vec<DatabaseRow>, String> {
         let ids = primary_keys
             .iter()
             .map(|key| key[0].as_str())
@@ -254,7 +254,7 @@ impl MySqlConflictEvidenceReader {
             .query::<Row, _>(sql)
             .map_err(|error| format!("{side:?} {table} evidence query failed: {error}"))?;
         rows.into_iter()
-            .map(|row| snapshot_row(row, primary_key))
+            .map(|row| decode_evidence_row(row, primary_key))
             .collect()
     }
 }
@@ -281,7 +281,7 @@ impl ConflictEvidenceReader for MySqlConflictEvidenceReader {
         &mut self,
         side: EvidenceSide,
         primary_keys: &[Vec<String>],
-    ) -> Result<Vec<SnapshotRow>, String> {
+    ) -> Result<Vec<DatabaseRow>, String> {
         self.query_rows(side, TABLE, "view_id", primary_keys)
     }
 
@@ -289,7 +289,7 @@ impl ConflictEvidenceReader for MySqlConflictEvidenceReader {
         &mut self,
         side: EvidenceSide,
         primary_keys: &[Vec<String>],
-    ) -> Result<Vec<SnapshotRow>, String> {
+    ) -> Result<Vec<DatabaseRow>, String> {
         self.query_rows(side, "utms", "id", primary_keys)
     }
 }
@@ -306,7 +306,7 @@ fn source_opts(source: &MySqlConnectionConfig) -> Opts {
     ))
 }
 
-fn snapshot_row(row: Row, primary_key: &str) -> Result<SnapshotRow, String> {
+fn decode_evidence_row(row: Row, primary_key: &str) -> Result<DatabaseRow, String> {
     let columns = row
         .columns_ref()
         .iter()
@@ -322,7 +322,7 @@ fn snapshot_row(row: Row, primary_key: &str) -> Result<SnapshotRow, String> {
         .get(primary_key)
         .and_then(Clone::clone)
         .ok_or_else(|| format!("evidence row is missing primary key `{primary_key}`"))?;
-    Ok(SnapshotRow {
+    Ok(DatabaseRow {
         primary_key: vec![primary_key],
         values,
     })
@@ -409,7 +409,7 @@ fn read_batched_children<R: ConflictEvidenceReader>(
     side: EvidenceSide,
     primary_keys: &[Vec<String>],
     batch_size: usize,
-) -> Result<Vec<SnapshotRow>, String> {
+) -> Result<Vec<DatabaseRow>, String> {
     primary_keys
         .chunks(batch_size)
         .try_fold(Vec::new(), |mut rows, batch| {
@@ -423,7 +423,7 @@ fn read_batched_parents<R: ConflictEvidenceReader>(
     side: EvidenceSide,
     primary_keys: &[Vec<String>],
     batch_size: usize,
-) -> Result<Vec<SnapshotRow>, String> {
+) -> Result<Vec<DatabaseRow>, String> {
     primary_keys
         .chunks(batch_size)
         .try_fold(Vec::new(), |mut rows, batch| {
@@ -446,8 +446,8 @@ fn validate_primary_keys(primary_keys: &[Vec<String>]) -> Result<(), String> {
 fn validate_equal_rows(
     label: &str,
     expected_keys: &[Vec<String>],
-    source_rows: &[SnapshotRow],
-    target_rows: &[SnapshotRow],
+    source_rows: &[DatabaseRow],
+    target_rows: &[DatabaseRow],
 ) -> Result<(), String> {
     let source = canonical_rows_by_key(source_rows)?;
     let target = canonical_rows_by_key(target_rows)?;
@@ -463,7 +463,7 @@ fn validate_equal_rows(
     Ok(())
 }
 
-fn canonical_rows_by_key(rows: &[SnapshotRow]) -> Result<CanonicalRowsByKey, String> {
+fn canonical_rows_by_key(rows: &[DatabaseRow]) -> Result<CanonicalRowsByKey, String> {
     let mut indexed = BTreeMap::new();
     for row in rows {
         let values = row
@@ -482,7 +482,7 @@ fn canonical_value(value: &str) -> String {
     value.strip_suffix(".000000").unwrap_or(value).to_string()
 }
 
-fn referenced_parent_keys(children: &[SnapshotRow]) -> Result<Vec<Vec<String>>, String> {
+fn referenced_parent_keys(children: &[DatabaseRow]) -> Result<Vec<Vec<String>>, String> {
     let mut parent_ids = BTreeSet::new();
     for child in children {
         let utm_id = child
@@ -502,16 +502,16 @@ mod tests {
         ConflictEvidenceReader, ConflictResolutionWriter, EvidenceSide,
         parse_targeted_conflict_resolution_config, resolve_comics_releases_views_conflicts,
     };
-    use crate::snapshot::SnapshotRow;
+    use crate::database_row::DatabaseRow;
     use std::collections::BTreeMap;
 
     #[derive(Default)]
     struct FakeEvidence {
         unresolved: Vec<Vec<String>>,
-        source_children: Vec<SnapshotRow>,
-        target_children: Vec<SnapshotRow>,
-        source_parents: Vec<SnapshotRow>,
-        target_parents: Vec<SnapshotRow>,
+        source_children: Vec<DatabaseRow>,
+        target_children: Vec<DatabaseRow>,
+        source_parents: Vec<DatabaseRow>,
+        target_parents: Vec<DatabaseRow>,
         child_batches: Vec<Vec<Vec<String>>>,
         parent_batches: Vec<Vec<Vec<String>>>,
     }
@@ -525,7 +525,7 @@ mod tests {
             &mut self,
             side: EvidenceSide,
             primary_keys: &[Vec<String>],
-        ) -> Result<Vec<SnapshotRow>, String> {
+        ) -> Result<Vec<DatabaseRow>, String> {
             self.child_batches.push(primary_keys.to_vec());
             let rows = match side {
                 EvidenceSide::Source => &self.source_children,
@@ -538,7 +538,7 @@ mod tests {
             &mut self,
             side: EvidenceSide,
             primary_keys: &[Vec<String>],
-        ) -> Result<Vec<SnapshotRow>, String> {
+        ) -> Result<Vec<DatabaseRow>, String> {
             self.parent_batches.push(primary_keys.to_vec());
             let rows = match side {
                 EvidenceSide::Source => &self.source_parents,
@@ -688,7 +688,7 @@ mod tests {
         }
     }
 
-    fn select_rows(rows: &[SnapshotRow], primary_keys: &[Vec<String>]) -> Vec<SnapshotRow> {
+    fn select_rows(rows: &[DatabaseRow], primary_keys: &[Vec<String>]) -> Vec<DatabaseRow> {
         rows.iter()
             .filter(|row| primary_keys.contains(&row.primary_key))
             .cloned()
@@ -699,7 +699,7 @@ mod tests {
         vec![value.to_string()]
     }
 
-    fn child(view_id: &str, utm_id: &str, post_date: &str) -> SnapshotRow {
+    fn child(view_id: &str, utm_id: &str, post_date: &str) -> DatabaseRow {
         row(
             view_id,
             [
@@ -710,12 +710,12 @@ mod tests {
         )
     }
 
-    fn parent(id: &str, value: &str) -> SnapshotRow {
+    fn parent(id: &str, value: &str) -> DatabaseRow {
         row(id, [("id", Some(id)), ("utm_source", Some(value))])
     }
 
-    fn row<const N: usize>(primary_key: &str, values: [(&str, Option<&str>); N]) -> SnapshotRow {
-        SnapshotRow {
+    fn row<const N: usize>(primary_key: &str, values: [(&str, Option<&str>); N]) -> DatabaseRow {
+        DatabaseRow {
             primary_key: pk(primary_key),
             values: values
                 .into_iter()

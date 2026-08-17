@@ -15,78 +15,58 @@ source connection loss without replaying from static startup coordinates.
   manifest's original `--binlog-file` and `--start-position` arguments.
 - [x] Apply bounded retry backoff with clear logs for attempt count, delay, and
   last durable coordinate.
-- [x] After a durably persisted row conflict, roll back, keep the checkpoint
-  unchanged, and retry the same transaction in-process with bounded backoff.
 - [x] After unsupported or semantically blocked automatic DDL persists its
   journal barrier, keep the checkpoint unchanged and retry the same source
   coordinate in-process indefinitely without consuming the ordinary transport
   retry budget. Never skip the DDL or execute its raw source SQL.
-- [x] For an `INSERT` into `globalcomix.payments` that returns MySQL `1644` with
-      the exact message `This external payment has already been applied to a
-      previous order`, roll back and inspect the target row selected by source
-      primary key. Exactly one row matching `id`, `order_id`,
-      `payment_service_id`, `transaction_id`, `original_transaction_id`, and
-      `authorization_id` is treated as already applied; stage resolution and
-      allow replay/checkpoint commit. Missing, ambiguous, or divergent identity
-      remains durable conflict evidence and retries from the unchanged
-      checkpoint. Other trigger errors remain fatal.
-- [x] For the exact `globalcomix.sessions` foreign-key error `1452` naming
-  `fk_sessions_guest`, persist the conflict first, then validate the source and
-  target `guests` identity before retrying. Insert one complete canonical
-  23-column source parent only when the target lookup finds no row; accept an
-  existing row only when exactly one complete row matches the source image,
-  including `guest_id` and `guest_hash`.
-- [x] For the exact `globalcomix.home_feed_card_slides` foreign-key error `1452`
-  naming `fk_hfcs_card` (`card_id` → `home_feed_cards.id`), persist the conflict
-  first, then validate positive child IDs and the complete source parent image
-  before retrying. Insert the canonical parent only when the target has no
-  matching identity; accept one exact existing row and fail closed otherwise.
-  Both paths compare parent/child ordering using the dedicated
-  `UNIX_TIMESTAMP(create_time)` query epoch, never rendered timestamp text;
-  recovery connections set `time_zone='+00:00'`, and the helper epoch is excluded
-  from insert and equality. Recovery values are reconstructed deterministically
-  from replay input and conflict context, not stored in `cdc.row_conflicts`.
-  Recovery failure returns a contextual typed error; when exact-parent retry is
-  enabled, the reconnect loop retries it while preserving the ordinary transport
-  budget and unchanged checkpoint for another attempt. The failed recovery
-  performs no replay or checkpoint advance. Successful child replay writes matching
-  conflict resolution after child DML/checkpoint and before the same target
-  COMMIT; post-commit work only updates process-local cache. Disposable
-  real-database proof remains a separate unchecked gap below.
+- [x] Treat native ROW INSERT `1062` as success in place; do not reconnect, read
+  target state, write conflict evidence, or run repair.
+- [x] For every other target row error, roll back the complete source transaction,
+  keep the checkpoint unchanged, and return the failure without classifying it as
+  transient source loss.
 - [x] Stop and fail explicitly on other non-transient errors such as authentication
-  failure, missing binlog file, unsupported event type, quarantine, or target
-  write failure without durable row-conflict evidence. Durable automatic-DDL
-  barriers are the explicit exception: they remain process-live and retry at the
-  unchanged coordinate.
+  failure, missing binlog file, unsupported event type, quarantine, or target row
+  failure. Durable automatic-DDL barriers are the explicit exception: they remain
+  process-live and retry at the unchanged coordinate.
 
-Reconnect/backoff applies after transient source loss and after a durable row
-conflict. Durable automatic-DDL barriers use a separate process-live retry loop:
-they retry indefinitely from the unchanged checkpoint without consuming the
-ordinary transport retry budget, and they never skip or raw-execute the source
-statement. Generic non-DDL quarantine and mapping errors remain fatal. Ordinary
-transport reconnects use a default budget of 12 after the initial attempt (13
-attempts total). `--max-reconnects 0` disables reconnects
-unless `--reconnect-forever true` is set; the latter removes the ordinary
-transport cap and admits exact-parent retries even when the max is zero. An
-exact-parent retry is admitted only with a positive `max-reconnects` setting or
-reconnect-forever, and its recovery success or failure preserves the ordinary
-transport budget.
-Thus repeated exact-parent/recovery failures can exceed `max-reconnects`.
-Purged or missing source binlogs and other non-transient failures never use that
-unbounded path. For either admitted exact parent-recovery case, recovery runs after
-the failed transaction has rolled back and ledger evidence is durable, before the
-unchanged checkpoint is replayed. Failed recovery attempts remain eligible on later
-loops; after one succeeds, a later retry of the same request skips parent mutation
-but still replays from the unchanged checkpoint. The parent repair itself does not
-advance the stream checkpoint; only successful replay advances it. Recovery requires
-a durable checkpoint store and fails closed on unsupported scope, missing/colliding/divergent
-source or target identity, incomplete source image, connection failure, or target
-insert failure. Once strict reconciliation starts, any such failure returns the
-recovery error rather than the original persisted-conflict error. Retry eligibility is checked before the recovery callback. With both ordinary reconnects disabled and reconnect-forever false, the persisted conflict returns without reading or mutating the recovery target. This is not generic FK repair or live proof.
+Reconnect/backoff applies only to transient source loss. Durable automatic-DDL
+barriers use a separate process-live retry loop: they retry indefinitely from the
+unchanged checkpoint without consuming the ordinary transport retry budget, and
+they never skip or raw-execute the source statement. Generic non-DDL quarantine,
+mapping, and target row errors remain fatal. Ordinary transport reconnects use a
+default budget of 12 after the initial attempt (13 attempts total).
+`--max-reconnects 0` disables reconnects unless `--reconnect-forever true` is
+set; the latter removes the ordinary transport cap. Purged or missing source
+binlogs and other non-transient failures never use that unbounded path.
+
 It is not an opportunistic TLS-to-plaintext fallback: the current GlobalComix
 source uses explicit plaintext mode from the start. Target TLS configuration is
 separate; failed target CA loading, chain validation, or required DNS/hostname
 identity matching stops immediately.
+
+### Parallel target transactions
+
+- [x] Preserve serial target execution by default. Parallel submission requires
+  explicit `--target-parallel-transactions N` with `N > 1`.
+- [x] Bound concurrency to `N` leased target connections. One complete source
+  transaction stays on one connection from `BEGIN` through `COMMIT`; a connection
+  is not reusable until its final result is drained.
+- [x] Send each body statement separately with its row-operation metadata, then
+  submit the checkpoint and `COMMIT` only after the body drains successfully.
+- [x] Drain transaction bodies concurrently, but dispatch checkpoint plus
+  `COMMIT` strictly in source order. A later transaction must never commit or
+  advance the durable checkpoint before every earlier transaction succeeds.
+- [x] Treat DDL, synchronous target reads, direct checkpoint writes, bounded stop,
+  and stream completion as barriers that wait for pending target transactions.
+- [x] Poison the parallel pool on body or commit failure. Do not dispatch later
+  commits or advance past the last successfully committed checkpoint.
+- [x] Prove the Connector/C path against disposable real MariaDB/MySQL endpoints:
+  pause the first worker after client-side body submission, pause the second after
+  result draining, observe only `SSL/TLS` target sessions, prove no row or
+  checkpoint is visible before ordered commit, and converge both rows plus the
+  exact stop checkpoint after releasing the test-only barriers.
+- [x] Ignore delayed MySQL `1062` only for INSERT statements, continue draining
+  later body statements, and fail the transaction for every other delayed error.
 
 ### Durable checkpointing
 
@@ -115,8 +95,8 @@ identity matching stops immediately.
   checkpoint boundary.
 - [ ] Reconnect replay must be idempotent for statements already applied before
   the checkpoint boundary.
-- [ ] Duplicate-key handling may be used only as a secondary safety net; it must
-  not be the primary recovery mechanism.
+- [x] INSERT `1062` handling is an explicit idempotence rule, not a reconnect or
+  target-reconciliation mechanism.
 - [x] Preserve binlog order across reconnects.
 - [ ] Log every reconnect boundary with previous coordinate, resume coordinate,
   and first applied coordinate after reconnect.
@@ -151,8 +131,8 @@ identity matching stops immediately.
 - `src/live/structured_stream/` — production native `mysql_cdc` row/DDL stream,
   transaction boundaries, and event-end checkpoint decisions.
 - `src/live/reconnect.rs` — reconnect policy and checkpoint resume semantics.
-- `src/table_sync/run.rs` and `src/table_sync/mysql.rs` — bounded exact parent
-  recovery for sessions/guests and home-feed cards using canonical source images.
+- `src/live/parallel_target.rs` and `src/live/parallel_writer.rs` — per-statement
+  delayed-error handling and source-ordered parallel commits.
 - `src/lost_binlog_recovery.rs` and `src/lost_binlog_recovery_store.rs` — audited
   purged-history checkpoint/barrier transition with anchored full-scope repair.
 - `src/stream_checkpoint.rs` — target-table checkpoint store.
@@ -177,26 +157,30 @@ identity matching stops immediately.
 - `src/live/tests.rs` — asserts ordinary transient TLS/connection-reset source
   failures reconnect only while positive transport attempts remain,
   `--reconnect-forever true` allows unlimited retryable stream failures, and
-  non-transient or purged-binlog failures do not reconnect. Exact-parent retry
-  budget behavior is covered separately below.
+  non-transient, target, or purged-binlog failures do not reconnect.
 - `src/live/structured_stream/tests/ddl_replay.rs` — asserts an unsupported DDL
   barrier keeps the process-live reconnect loop at the unchanged checkpoint,
   with no target execution or checkpoint write.
-- `src/live/tests/reconnect.rs` — asserts exact parent recovery is admitted only
-  after its retry gate, observes the unchanged checkpoint, retries failed
-  recoveries beyond the ordinary transport budget, and mutates each distinct
-  `ExactParentRecovery` value at most once after success; this is not
-  ledger-identity deduplication. The same file proves the zero-budget and
-  repeated-request boundaries, but not real database reads, inserts, or the
-  production reconnect process.
-- `src/table_sync/run.rs` — asserts partial parent images are rejected, the
-  absolute create-time epoch controls ordering independently of rendered TIMESTAMP
-  text, canonical guest and home-feed-card images preserve required and nullable
-  fields on insert, the helper epoch is excluded, and an existing target parent
-  must match the complete source image. These are unit tests, not a real
-  source/target recovery proof.
+- `src/live/tests/reconnect.rs` — asserts transient checkpoint reload, stale
+  binlog refusal, bounded retry, and non-retryable target failure.
+- `src/live/structured_stream/tests/transaction.rs` — asserts row failures roll
+  back without checkpoint advancement and preserve source transaction boundaries.
+- `src/live/parallel_target_tests.rs` — asserts delayed INSERT `1062` continues
+  while non-INSERT `1062` stops before later statements and commit.
 - `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
   selection remain source-identity scoped.
+- `scripts/cdc-integration-harness.py --scenario insert-duplicate-idempotent` —
+  runs serial native ROW replay against disposable MariaDB/MySQL endpoints with
+  a divergent preexisting target row and no `cdc.row_conflicts` table or
+  inventory procedure. It verifies the duplicate leaves that row untouched,
+  applies a later same-transaction row, and advances the exact checkpoint.
+- `scripts/cdc-integration-harness.py --scenario parallel-target-transactions` —
+  runs the production binary with `--target-parallel-transactions 2` against a
+  TLS-required MySQL target. Test-only barriers expose the first accepted body
+  before result reading and the later drained body before commit dispatch; the
+  scenario verifies all target sessions are `SSL/TLS`, checks the row/checkpoint
+  barrier, releases both workers, and verifies ordered convergence after an
+  INSERT `1062` plus later statements.
 
 ## Known gaps (current cycle)
 
@@ -206,11 +190,9 @@ identity matching stops immediately.
   next stream resumes from the saved checkpoint.
 - [x] Add a failing test where process startup reads an existing checkpoint and
   overrides static startup coordinates.
-- [ ] Prove both exact parent recoveries against disposable real MariaDB/MySQL,
-  including source/target identity collisions, recovery failure, parent insert,
-  and successful replay/checkpoint advancement. The existing real FK harness
-  scenario proves conflict rollback/evidence and manual repair boundaries, not
-  these automatic reconnect callbacks.
+- [x] Prove serial and parallel INSERT `1062` continuation against disposable
+  real MariaDB/MySQL endpoints; keep the conflict ledger and repair paths
+  out-of-band only.
 - [x] Add a failing test that checkpoint is written only after successful target
   apply.
 - [x] Production streaming uses the native client/reconnect loop; the

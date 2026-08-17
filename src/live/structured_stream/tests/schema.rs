@@ -84,75 +84,7 @@ fn metadata_table_map_uses_inventory_enum_values_when_metadata_omits_them() {
 }
 
 #[test]
-fn production_string_set_metadata_drives_equality_and_preserves_divergence() {
-    let resolver = EmptySchemaResolver;
-    let table_map = MysqlCdcTableMapEvent {
-        table_id: 80,
-        database_name: "app".to_string(),
-        table_name: "labels".to_string(),
-        column_types: vec![3, 254],
-        column_metadata: vec![0, (MYSQL_COLUMN_TYPE_SET as u16) << 8 | 1],
-        null_bitmap: vec![false, true],
-        table_metadata: Some(TableMetadata {
-            signedness: None,
-            default_charset: None,
-            column_charsets: None,
-            column_names: Some(vec!["id".to_string(), "labels".to_string()]),
-            set_string_values: Some(vec![vec![
-                "red".to_string(),
-                "green".to_string(),
-                "blue".to_string(),
-            ]]),
-            enum_string_values: None,
-            geometry_types: None,
-            simple_primary_keys: Some(vec![0]),
-            primary_keys_with_prefix: None,
-            enum_and_set_default_charset: None,
-            enum_and_set_column_charsets: None,
-            column_visibility: None,
-        }),
-    };
-
-    let mapped = map_table_map_event(&stream_coordinate(100), &table_map, &resolver)
-        .expect("map production-shaped SET metadata")
-        .expect("column counts agree, so the table map is mapped rather than skipped");
-    let set_columns = mapped
-        .table
-        .columns
-        .iter()
-        .map(|column| mapped.table.set_columns.get(column).cloned())
-        .collect::<Vec<_>>();
-    let conflict = crate::target::DuplicateConflict {
-        error_code: 1062,
-        error_text: "duplicate".to_string(),
-        duplicate_index: Some("PRIMARY".to_string()),
-    };
-    let source_values = vec![Value::UInt(1), Value::UInt(0b101)];
-    let equal_target_values = vec![Value::UInt(1), Value::Bytes(b"red,blue".to_vec())];
-    let divergent_target_values = vec![Value::UInt(1), Value::Bytes(b"red,green".to_vec())];
-
-    assert_eq!(
-        crate::target::duplicate_insert_outcome(
-            conflict.clone(),
-            Some(&equal_target_values),
-            &source_values,
-            &set_columns,
-        ),
-        crate::target::TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
-    );
-    assert_eq!(
-        crate::target::duplicate_insert_outcome(
-            conflict.clone(),
-            Some(&divergent_target_values),
-            &source_values,
-            &set_columns,
-        ),
-        crate::target::TargetExecutionOutcome::ConstraintConflict(conflict)
-    );
-}
-
-#[test]
-fn metadata_table_map_supplies_set_member_names_for_duplicate_comparison() {
+fn metadata_table_map_supplies_set_member_names() {
     let resolver = EmptySchemaResolver;
     let table_map = MysqlCdcTableMapEvent {
         table_id: 79,

@@ -1,15 +1,18 @@
-# Schema synchronization
+# Staged schema synchronization
 
-`sync-schema` converges explicitly selected target tables to a MySQL 8-compatible semantic translation of the authoritative source MariaDB schema. It is a schema operation, not a row-data synchronization command.
+The prerequisite and final-constraint stages of `sync` converge selected target
+tables to a MySQL 8-compatible semantic translation of the authoritative source
+MariaDB schema. Schema convergence is part of the staged run, not a standalone
+command or separate row-data operation.
 
 ## What it must do
 
 ### Selection and authority
 
-- [x] Accept repeated `--table TABLE` arguments, a catalog input, or `--all-tables true` defining the selected tables. `--all-tables true` selects every source base table read from the source inventory, and is rejected when combined with `--table` or `--catalog`.
+- [x] Derive selected tables from the unified `sync` configuration and source inventory.
 - [x] Treat the source schema as authoritative only within the selected-table set.
-- [x] Converge each selected table exactly: target-only columns, indexes, foreign keys, checks, and generated expressions are removed; unselected target tables are never dropped.
-- [x] Apply selected tables sequentially, one table at a time.
+- [x] Converge each selected table exactly: target-only columns, indexes, foreign keys, checks, and generated expressions are removed. Tables outside the selected source set are not dropped.
+- [x] Apply prerequisite and final-constraint stages in durable run order.
 
 ### Shared DDL translation
 
@@ -23,7 +26,7 @@
 - [x] Render every target `FOREIGN KEY` constraint name with its child table identity under the same no-double-qualification and deterministic collision-resistant shortening rules. The same source name on different child tables therefore remains distinct.
 - [x] Preserve canonical source constraint identity and source fingerprints as evidence; planning, target introspection, drift comparison, and final verification compare the rendered target constraint identity instead of raw source names.
 - [x] Reference a foreign-key parent in the converged schema without a database qualifier so it resolves in the target database; only a genuinely cross-schema parent keeps its qualifier.
-- [x] Maintain actual streamed-DDL parity: a mapping accepted by `sync-schema` must produce the same translated MySQL semantics as the corresponding streamed DDL operation.
+- [x] Maintain actual streamed-DDL parity: a mapping accepted by a staged `sync` schema phase must produce the same translated MySQL semantics as the corresponding streamed DDL operation.
 - [x] Have no alternate mapping, compatibility fallback, direct source-DDL execution path, or silent approximation.
 - [x] Fail explicitly on unsupported or ambiguous source constructs.
 
@@ -59,12 +62,9 @@ Both engines describe an identical converged column differently, so comparison u
 ### Failure and verification
 
 - [x] Continue independent table operations after a statement or table failure; dependency-blocked operations are reported as skipped rather than attempted.
-- [x] Re-inventory every selected table after its operations finish, reading only that table's metadata and fetching it in one round-trip.
-- [x] Plan nothing on a second run against a converged target.
-- [x] Log each table's position, status, and statement counts to stderr as it completes, and log every applied statement to stderr both before and after execution with its table, phase, SQL, outcome, and error, so a statement that hangs or kills the process is still attributable. The JSON report stays the sole stdout output.
-- [x] Report remaining semantic differences after re-inventory.
-- [x] Emit structured JSON for every table, statement, preflight, skip, error, and final verification outcome, including source/target fingerprints and representative blocker keys.
-- [x] Exit nonzero when any selected table is divergent, blocked, skipped due to a failed prerequisite, or otherwise not converged.
+- [x] Execute planned schema statements and fail closed on statement or prerequisite errors.
+- [x] Persist stage status in `cdc.sync_runs`; stage completion follows successful execution, not a separate verification command.
+- [x] Log schema-stage failures with table and statement context.
 - [x] Do not persist a schema journal or claim transactional rollback for MySQL DDL's implicit commits.
 
 ## How it works
@@ -74,14 +74,14 @@ Both engines describe an identical converged column differently, so comparison u
 
 ## Implementation inventory
 
-- `src/sync_schema.rs` — selection, schema planning, canonical MariaDB/MySQL metadata comparison, target-data preflight, sequential execution, re-inventory, structured reporting, and CLI parsing.
+- `src/sync_schema.rs` — source-evidence reads, schema planning, canonical MariaDB/MySQL metadata comparison, target-data preflight, statement execution, and reusable prerequisite/final-constraint stages for unified sync.
 - `src/inventory/reader.rs` and `src/inventory/query.rs` — optional table scope and the batched single-round-trip scoped read.
 - `src/live/ddl_semantics.rs` and `src/live/ddl_semantics/transform.rs` — sole shared MariaDB-to-MySQL DDL translation contract used by streamed replay and schema convergence.
-- `src/main.rs` — `sync-schema` command dispatch.
+- `src/sync/orchestrate.rs` — durable invocation of prerequisite and final-constraint schema stages.
 
 ## Tests asserting this spec
 
-- `src/sync_schema.rs` covers `--all-tables` selection, the canonical column comparison against every measured MariaDB/MySQL metadata disagreement, literal-default rendering, `ENUM` value case, synthesized parent unique indexes, relative parent schemas, table-qualified CHECK/FOREIGN KEY target names, deterministic bounded shortening, rendered-identity comparison, selection, exact convergence planning, destructive preflight with blocker counts/sample keys, safe conversions, dependency ordering/skips, best-effort continuation, re-inventory status, JSON/exit behavior, and translator parity.
+- `src/sync_schema.rs` covers source-evidence planning, canonical column comparison against every measured MariaDB/MySQL metadata disagreement, literal-default rendering, `ENUM` value case, synthesized parent unique indexes, relative parent schemas, table-qualified CHECK/FOREIGN KEY target names, deterministic bounded shortening, rendered-identity comparison, exact convergence planning, destructive preflight with blocker counts/sample keys, safe conversions, dependency ordering/skips, failure handling, and translator parity.
 - `src/live/ddl_semantics/tests.rs` covers shared translation acceptance including `ENUM`, parity, and rejection without a generic fallback.
 - `src/inventory/tests/parsing.rs` covers the table-scoped queries and the distinction between an empty-string default and no default.
 
@@ -102,6 +102,6 @@ Applying this to the live target is a heavy operation, not a metadata change: 82
 ## Out of scope
 
 - Dropping target tables that were not selected.
-- Row-data synchronization, repair, or deletion of target rows to satisfy schema convergence.
+- Row-data mutation; unified `sync` owns that staged operation separately.
 - A persistent schema journal, resume protocol, or rollback abstraction over implicitly committed DDL.
 - A second or fallback MariaDB-to-MySQL mapping implementation.

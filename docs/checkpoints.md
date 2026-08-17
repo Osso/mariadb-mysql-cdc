@@ -20,8 +20,8 @@ The CLI reads operator JSON containing the exact old checkpoint and exact
 positions, and raw SQL. It rejects a configured source/checkpoint identity
 mismatch. Before preparing recovery it computes and records the current complete source
 scope hash for that attempt and rejects any non-InnoDB source table. Recovery
-data repair covers every current source-scope table even when target-only base
-tables exist; the generic `repair-drift` contract remains strict. An explicitly
+synchronization covers every current source-scope table even when target-only
+base tables exist. An explicitly
 supplied scope hash must match that attempt's current source inventory; an omitted
 hash is filled from the current source inventory and recorded as evidence.
 
@@ -34,27 +34,28 @@ coordinate remain eligible for stream replay after the checkpoint advances.
 
 A prepared immutable row is inserted into `cdc.stream_recovery_records` with the
 old state, captured coordinate, source identity, that attempt's scope hash,
-operator, reason, and preparation evidence. Before source-scoped data repair,
-pre-repair convergence may add only required source tables, columns, primary
-keys, and indexes; it performs no `DROP`, target-only table removal,
-foreign-key convergence, or CHECK-constraint convergence. Recovery-only schema
-convergence then runs after source-scoped data repair, drops target-only base tables
-child-before-parent with normal foreign-key enforcement, and fails closed on
-cycles or source-table references to target-only parents. The final target table
-inventory must exactly match the attempt's source inventory. A separately
-authorized replacement may, in the same target transaction, lock the exact
-prepared owner, mark it `abandoned` with server-generated timestamp/evidence, and
-insert the replacement `prepared` row for the same exact checkpoint, barrier,
-and source identity. The replacement records its own scope hash; it need not
-equal the abandoned scope. All old identity, scope, and prepared evidence remain
-intact. Only after zero skipped/unsupported tables and successful schema/data
-proof does one target transaction revalidate the exact checkpoint, barrier,
-source identity, and prepared recovery row, update `cdc.stream_checkpoint`, and
-mark the recovery `committed`. Abandoned history remains durable and does not
-suppress the journal barrier; active-barrier selection excludes only exact
-`committed` or `verified` ownership, which is terminal. Any failed validation or
-commit rolls back both replacement steps. Duplicate recovery IDs and
-non-advancing coordinates are refused.
+operator, reason, and source-only preparation evidence. The captured source
+evidence drives one unified staged sync over every source table under the exact
+recovery ID. Unified prerequisite schema convergence, target-WRITE-locked
+source-authoritative chunks, durable `cdc.sync_runs` stage/table progress, and
+final constraints define successful reconciliation. Proof requires exactly one
+complete progress result for every expected source table, with no missing,
+unexpected, duplicate, incomplete, or wrong-run rows. Before the final target
+transaction, recovery rechecks only the captured source scope hash; it does not
+re-inventory the target or run a post-write drift scan. A separately authorized
+replacement may, in the same target transaction, lock the exact prepared owner,
+mark it `abandoned` with server-generated timestamp/evidence, and insert the
+replacement `prepared` row for the same exact checkpoint, barrier, and source
+identity. The replacement records its own scope hash; it need not equal the
+abandoned scope. All old identity, scope, and prepared evidence remain intact.
+Only after exact unified progress proof and unchanged source scope does one
+target transaction revalidate the exact checkpoint, barrier, source identity,
+and prepared recovery row, update `cdc.stream_checkpoint`, and mark the recovery
+`committed`. Abandoned history remains durable and does not suppress the journal
+barrier; active-barrier selection excludes only exact `committed` or `verified`
+ownership, which is terminal. Any failed validation or commit rolls back both
+replacement steps. Duplicate recovery IDs and non-advancing coordinates are
+refused.
 
 Bootstrap `cdc.stream_recovery_records` and its immutability guards with
 `docs/stream-recovery-records-bootstrap.sql` while stream writers are stopped.

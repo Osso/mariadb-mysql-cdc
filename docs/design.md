@@ -7,10 +7,11 @@ MariaDB and MySQL differ in SQL, metadata, and binlog behavior.
 
 ## Approach
 
-1. Snapshot existing data in deterministic primary-key chunks.
-2. Consume MariaDB ROW/FULL binlog events from the snapshot boundary.
-3. Reconcile target drift before cutover; do not serve traffic from an unproven
-   target.
+1. Converge target schema from committed source evidence.
+2. Synchronize source-authoritative rows in target-WRITE-locked primary-key
+   chunks under one immutable run identity.
+3. Consume MariaDB ROW/FULL binlog events with ordered target commits and
+   checkpoints; do not serve traffic from an unproven target.
 
 ## Event handling
 
@@ -116,129 +117,78 @@ duplicate allowlists.
 when the live checkpoint names purged MariaDB history. JSON authorization binds
 one recovery ID to the exact old checkpoint and exact journal barrier; source
 identity and checkpoint name must also match the configured stream. The command
-computes the current complete source scope hash and rejects non-InnoDB source
-tables. Recovery data repair covers every current source-scope table even when
-target-only base tables exist; generic `repair-drift` remains strict about its
-source/target inventory contract.
+captures one complete source scope hash and rejects non-InnoDB source tables.
 
 The command acquires the stream lease and captures the current MariaDB binlog
-coordinate with ordinary non-locking reads. It does not execute `FLUSH TABLES
-WITH READ LOCK`, `UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and
-does not keep a cross-table repeatable-read transaction open. Source schema
-and row reconciliation use normally committed reads for the attempt's actual
-scope. Commits after the captured coordinate remain in the binlog and are
-replayed by the stream after recovery advances the checkpoint.
+coordinate plus one committed `SchemaSourceEvidence` set with ordinary
+non-locking reads. It does not execute `FLUSH TABLES WITH READ LOCK`,
+`UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and does not keep
+a cross-table repeatable-read transaction open. The captured evidence is reused
+by one unified staged sync for every source table with run ID `recovery_id`,
+parallelism `1`, and `cdc.sync_runs` progress. Unified sync owns prerequisite
+schema convergence, target-WRITE-locked source-authoritative row chunks, durable
+stage/table progress, and final constraint convergence. Commits after the
+captured coordinate remain in the binlog and are replayed by the stream after
+recovery advances the checkpoint.
 
-A prepared immutable recovery record links old state, the captured coordinate,
-source, the attempt's actual scope, operator, reason, and evidence. Before
-source-scoped data repair, pre-repair convergence may add only required source
-tables, columns, primary keys, and indexes; it performs no `DROP`, target-only
-table removal, foreign-key convergence, or CHECK-constraint convergence. After
-data repair, recovery-only schema convergence drops target-only
-base tables child-before-parent with normal foreign-key enforcement; cycles and
-source-table references to target-only parents fail closed. The final target
-inventory must exactly match the attempt's source inventory before one target
-transaction revalidates the exact old state, updates the checkpoint, and commits
-only the exact historical barrier supersession. A separately authorized
-replacement may atomically mark the exact prepared owner `abandoned` with
-server-generated evidence and insert a new `prepared` owner for the same exact
-checkpoint, barrier, and source identity. The replacement records its own
-current scope; its scope hash need not equal the abandoned owner's. All old
-identity, scope, and prepared evidence remain durable. Abandoned history never
-suppresses the journal barrier. Only `committed` or `verified` ownership excludes
-that exact barrier, and both are terminal. This transition skips purged source
-history; it is not replay proof and does not claim production completion until
-restart health and subsequent zero-drift verification are recorded.
+The prepared immutable recovery record retains old state, the captured
+coordinate, source scope, operator, reason, and source-only preparation
+evidence. Recovery proof requires exactly one complete progress result for each
+captured source table under the exact recovery ID, with no missing, unexpected,
+duplicate, incomplete, or mismatched rows. Before the final target transaction,
+recovery rechecks only the source scope hash; target final inventory and
+post-write drift scans are not used. A separately authorized replacement may
+atomically mark the exact prepared owner `abandoned` with server-generated
+evidence and insert a new `prepared` owner for the same exact checkpoint,
+barrier, and source identity. The replacement records its own current scope;
+its scope hash need not equal the abandoned owner's. All old identity, scope,
+and prepared evidence remain durable. Abandoned history never suppresses the
+journal barrier. Only `committed` or `verified` ownership excludes that exact
+barrier, and both are terminal. This transition skips purged source history; it
+is not replay proof and does not claim production completion until restart
+health and subsequent verification are recorded.
 
-## Repair model
+## Resync stream
 
-The code contains a durable conflict schema contract wired into live row-event
-handling and an FK-aware phased planner. `cdc.row_conflicts` retains every source
-field and uses two lowercase ASCII SHA-256 identities: `conflict_identity`
-includes source coordinates and operation, while `source_row_identity` covers
-source identity, schema, table, and complete source primary-key JSON for indexed
-unresolved-row lookup. The lookup retains every unhashed predicate as a collision
-defense. These SHA-256 identities are limited to row conflicts; they do not claim
-that FNV-based sync-progress IDs migrated. Supported constraint-conflict evidence is
-persisted on an independent connection before the target transaction rolls back,
-and the live target checkpoint does not advance. For native ROW `INSERT` changes,
-`--insert-conflict-policy ignore-duplicate` skips a `1062` only after the target
-row fetched by source primary key exactly equals the source row. A divergent or
-otherwise non-equal `ROW INSERT` persists conflict evidence and aborts, rolling
-back the target transaction/checkpoint, except for the explicit superseded
-historical `globalcomix.users`/`users.name`, `globalcomix.comics`/`comics.slug`,
-and approved `globalcomix.releases` FK `ROW INSERT` proofs. Exactly one
-candidate is allowed and no ordinary conflict may coexist with it. Each candidate retains its complete historical image; at
-XID, `SHOW MASTER STATUS` is read before one source `START TRANSACTION WITH
-CONSISTENT SNAPSHOT`, and that pre-snapshot coordinate is only a conservative
-lower bound that must be beyond the candidate transaction. The users proof
-requires complete source and active-target `FOR UPDATE` hashes for both the
-historical primary row and current unique owner. The comics proof requires full
-current primary-row equality, while the locked unique owner is accepted by
-exact primary-key plus slug identity despite unrelated mutable-field drift, and
-only that insert may be treated as a no-op. If typed verification finds that the
-source primary still owns the historical identity, it records ordinary unresolved
-reconciliation debt, runs no superseded repair SQL, and commits the remaining
-transaction with its XID checkpoint; other proof or evidence failures still roll back.
-The releases proof is limited to
-`releases_ibfk_2` category transaction `mysqld-bin.002709:515816736–515824875`
-and `releases_ibfk_3` visibility transaction
-`mysqld-bin.002709:531921570–531929925` (candidate event
-`531921789`), with the exact child/parent FK identity required. It retains the
-complete historical release image, requires one later current source release and
-one matching source parent, locks the target release and parent identities, and
-installs the complete current release row only when the target release is absent;
-an existing target release must hash equal to current source. It preserves the
-current parent identity and never updates or deletes that parent. Before
-checkpointing, the target transaction must lock an existing same-file predecessor
-before the candidate and no later than the XID. Remaining rows still apply, and the observation/resolution evidence
-plus XID checkpoint commit atomically; any other proof, predecessor, or commit
-failure rolls back, then persists all unresolved observations independently; rollback
-or persistence failures are surfaced. When superseded verification rejects a
-candidate for any reason other than the typed current-owner result, the structured
-error includes the exact parameterized source and
-locked-target evidence `SELECT` statements plus the historical primary-key and
-unique-identity query parameters; credentials and unrelated row values are never
-logged. Every non-`INSERT` `1062` unique conflict also persists evidence
-and aborts; all other secondary-unique conflicts remain on that path.
-Startup validates the admin-bootstrap schema, guards, constraints, stored
-generated `source_row_identity` expression, `(source_row_identity, status)`
-index, and exact table/application grants before opening the source stream;
-runtime never creates or migrates the table. Existing populated ledgers require
-the one-time source-row-identity migration before streaming. `repair-drift` now invokes FK-aware
-phases with immutable child runs, cycle/schema blocking, exact chunk verification,
-selected PK windows, and a full-scope Verify equality phase before evidence-backed
-conflict resolution. In apply mode, `--conflict-reconcile-limit N` also runs a
-bounded reconciliation-only pass over unresolved evidence: it reads complete
-source and target rows by primary key, resolves only one-row exact equality,
-writes no target-table repairs, never reads or advances stream checkpoints, and
-is idempotent across repeated passes. The disposable MariaDB 11.4/MySQL 8.0
-harness exposes 45 executable scenarios,
-including catchup, repair, conflict, DDL, and reconnect boundaries, plus a real
-`replace-divergent-pk` XID/commit/checkpoint and replay-evidence scenario. The live
-GlobalComix source MariaDB is plaintext-only by accepted operational policy;
-target MySQL remains CA- and hostname-verified. The catchup scenario proves a
-valid four-row copy and a completed-run no-op. It does not prove interrupted
-parallel-range resume. Its
-`create-table-crash-restart` scenario passes the differing-default fixture
-through post-DDL/pre-applied crash recovery, prepared-state restart, exact
-checkpointing, and idempotent replay; its `production-alter-table` scenario passes
-five checkpointed ALTER events,
-checks column/comment/non-unique and unique-index metadata, duplicate rejection
-parity, translated `DROP COLUMN IF EXISTS`, and its absent-column no-op, and proves an unsupported unique-prefix option remains pending
-without target mutation or checkpoint advancement. These are local proofs for implemented
-boundaries. Broader ALTER coverage, the full compatibility matrix, live recurring
-scheduling, deployment, and cutover gates remain unchecked.
+`resync-stream` is a separate checkpoint-bootstrap path. It reads the source
+binlog coordinate and one committed `SchemaSourceEvidence` set, validates the
+transactional source scope, then invokes unified sync for every source table with
+run ID `resync-stream:<source_identity>`. Unified sync owns prerequisite schema
+convergence, locked source-authoritative row chunks, durable `cdc.sync_runs`
+progress, and final constraint convergence. Recovery uses the same staged engine
+with its exact authorized recovery ID; neither path runs a separate repair engine
+or post-write drift scan.
+
+## Convergence and conflict evidence
+
+Live ROW streaming and staged synchronization are separate systems. The live
+stream writes source DML directly, accepts only INSERT `1062` as idempotent
+success, and never reads target rows or writes conflict evidence. A skipped
+duplicate may leave divergent target contents; explicit convergence uses the
+source-authoritative staged `sync` operation. Every other row error rolls back
+the source transaction and blocks its checkpoint.
+
+`cdc.row_conflicts` remains historical out-of-band data. Targeted conflict
+resolution connects to source and target separately from live streaming and
+staged synchronization. Historical ledger persistence is owned by concrete
+`MySqlConflictLedger` in `src/conflict_ledger.rs` and `src/conflict_ledger/`;
+canonical foreign-key metadata is owned by `src/canonical_foreign_key.rs`. The
+live stream does not validate the conflict table, its triggers, its procedure,
+or its grants.
+
+The disposable MariaDB/MySQL harness covers DDL, reconnect, and parallel
+transaction boundaries. Retired conflict and repair scenarios are not runtime
+paths.
 
 ## Safety and validation
 
 - Checkpoint grouped target DML transactions.
-- Validate journal/ledger schema, guards, routines, exact grants, and the
-  single-writer `GET_LOCK` state once before source replication; do not repeat
-  this static policy per event.
-- Use stable primary-key windows for count/content checks.
-- Treat unresolved conflicts, quarantine, journal barriers, schema drift, and
-  CA/grant gaps as blockers. `translation_pending` is cleared only by translator
+- Validate checkpoint and DDL-journal schema, guards, routines, exact grants,
+  and the single-writer `GET_LOCK` state once before source replication; do not
+  repeat this static policy per event.
+- Treat live row errors, quarantine, journal barriers, schema-stage failures,
+  and CA/grant gaps as blockers. Historical unresolved conflicts remain
+  out-of-band evidence. `translation_pending` is cleared only by translator
   code and automatic promotion in the event path; config/bootstrap/grant/harness
   dependencies and migration safety remain open.
 - Keep the target out of service through repeated validation and cutover review.

@@ -1,7 +1,5 @@
 use super::{ApplyBinlogConfig, MysqlCliExecutor, SourceBinlogConfig};
-use crate::target::{
-    SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor, TargetRowChange,
-};
+use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor, TargetRowChange};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
 use std::cell::RefCell;
@@ -41,12 +39,9 @@ where
         }
     }
 
-    fn execute_row_change(
-        &self,
-        change: &TargetRowChange,
-    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+    fn execute_row_change(&self, change: &TargetRowChange) -> Result<(), TargetExecuteError> {
         match self.target.execute_row_change(change) {
-            Ok(outcome) => Ok(outcome),
+            Ok(()) => Ok(()),
             Err(error) => self.create_missing_table_and_retry_row_change(change, error),
         }
     }
@@ -101,7 +96,7 @@ where
         &self,
         change: &TargetRowChange,
         error: TargetExecuteError,
-    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+    ) -> Result<(), TargetExecuteError> {
         let Some(table) = missing_target_table_name(&error.to_string()) else {
             return Err(error);
         };

@@ -2,34 +2,25 @@ use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
     TableInventory, build_inventory,
 };
-use crate::table_sync::{MySqlSyncRunProgressStore, SyncProgressStore};
-use crate::{live, mysql_snapshot, table_sync};
+use crate::primary_key_ordering::{PrimaryKeyOrdering, primary_key_ordering_from_inventory};
+use crate::{live, sync};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
-/// Table-sync slots per target server.
-///
-/// Workers are latency-bound, not resource-bound: each sustains roughly 139 rows/s against a
-/// 10,000-row chunk, while both endpoints sit idle - source and target `Threads_running` of 4 and 2
-/// with no query older than a second. Raising the cap buys throughput from round-trip time that was
-/// otherwise spent waiting, and the queue is long enough that every slot fills immediately.
+/// Maximum table workers in one unified catalog sync run.
 const MAX_CATALOG_CONCURRENCY: usize = 16;
 const DEFAULT_CHUNK_SIZE: usize = 10_000;
 const DB_TIMEOUT: Duration = Duration::from_secs(30);
-const RESERVATION_SESSION_WAIT_TIMEOUT_SECONDS: u64 = 86_400;
 
 #[derive(Clone, Debug)]
 pub struct CatalogConnectionConfig {
-    pub source: mysql_snapshot::MySqlConnectionConfig,
+    pub source: crate::mysql_config::MySqlConnectionConfig,
     pub target: live::TargetMySqlConfig,
 }
 
@@ -64,7 +55,7 @@ pub struct SyncableTableEntry {
     pub name: String,
     pub primary_key: Vec<String>,
     #[serde(default)]
-    pub primary_key_ordering: Vec<table_sync::SyncPrimaryKeyOrdering>,
+    pub primary_key_ordering: Vec<PrimaryKeyOrdering>,
     pub columns: Vec<String>,
     pub estimated_source_rows: u64,
     pub parent_dependencies: Vec<String>,
@@ -92,129 +83,6 @@ pub struct NonSyncableTableEntry {
 pub struct Catalogs {
     pub syncable: Vec<SyncableTableEntry>,
     pub non_syncable: Vec<NonSyncableTableEntry>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CatalogTableFailure {
-    pub table: String,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct CatalogRunState {
-    catalog: SyncableCatalog,
-    max_concurrency: usize,
-    external_active: BTreeSet<String>,
-    external_active_count: usize,
-    running: BTreeSet<String>,
-    completed: BTreeSet<String>,
-    failures: BTreeMap<String, String>,
-}
-
-impl CatalogRunState {
-    pub fn new(
-        catalog: SyncableCatalog,
-        max_concurrency: usize,
-        external_active: BTreeSet<String>,
-        external_active_count: usize,
-    ) -> Self {
-        Self {
-            catalog,
-            max_concurrency,
-            external_active,
-            external_active_count,
-            running: BTreeSet::new(),
-            completed: BTreeSet::new(),
-            failures: BTreeMap::new(),
-        }
-    }
-
-    pub fn available_slots(&self) -> usize {
-        self.max_concurrency
-            .saturating_sub(self.external_active_count + self.running.len())
-    }
-
-    pub fn ready_tables(&self) -> Vec<&str> {
-        self.catalog
-            .tables
-            .iter()
-            .filter(|entry| !self.is_accounted_for(&entry.name))
-            .filter(|entry| !self.external_active.contains(&entry.name))
-            .filter(|entry| {
-                entry
-                    .parent_dependencies
-                    .iter()
-                    .all(|parent| self.completed.contains(parent))
-            })
-            .map(|entry| entry.name.as_str())
-            .collect()
-    }
-
-    pub fn mark_running(&mut self, table: &str) {
-        self.running.insert(table.to_string());
-    }
-
-    pub fn mark_completed(&mut self, table: &str) {
-        self.running.remove(table);
-        self.failures.remove(table);
-        self.completed.insert(table.to_string());
-    }
-
-    pub fn mark_failed(&mut self, table: &str, reason: &str) {
-        self.running.remove(table);
-        self.failures.insert(table.to_string(), reason.to_string());
-    }
-
-    pub fn all_failures(&self) -> Vec<CatalogTableFailure> {
-        let mut failures = self
-            .failures
-            .iter()
-            .map(|(table, reason)| CatalogTableFailure {
-                table: table.clone(),
-                reason: reason.clone(),
-            })
-            .collect::<Vec<_>>();
-        failures.extend(self.blocked_failures());
-        failures
-    }
-
-    pub fn blocked_failures(&self) -> Vec<CatalogTableFailure> {
-        let mut blocked = BTreeMap::<String, String>::new();
-        loop {
-            let mut changed = false;
-            for entry in &self.catalog.tables {
-                if self.is_accounted_for(&entry.name) || blocked.contains_key(&entry.name) {
-                    continue;
-                }
-                if let Some((parent, reason)) =
-                    entry.parent_dependencies.iter().find_map(|parent| {
-                        self.failures
-                            .get(parent)
-                            .or_else(|| blocked.get(parent))
-                            .map(|reason| (parent, reason))
-                    })
-                {
-                    blocked.insert(
-                        entry.name.clone(),
-                        format!("parent `{parent}` failed: {reason}"),
-                    );
-                    changed = true;
-                }
-            }
-            if !changed {
-                return blocked
-                    .into_iter()
-                    .map(|(table, reason)| CatalogTableFailure { table, reason })
-                    .collect();
-            }
-        }
-    }
-
-    fn is_accounted_for(&self, table: &str) -> bool {
-        self.running.contains(table)
-            || self.completed.contains(table)
-            || self.failures.contains_key(table)
-    }
 }
 
 pub fn build_catalogs(
@@ -337,7 +205,7 @@ fn syncable_entry(
     SyncableTableEntry {
         name: table.name.clone(),
         primary_key: table.primary_key.clone(),
-        primary_key_ordering: table_sync::primary_key_ordering_from_inventory(table)
+        primary_key_ordering: primary_key_ordering_from_inventory(table)
             .expect("catalog primary-key columns exist in source inventory"),
         columns: writable_columns(table),
         estimated_source_rows: estimated_rows.get(&table.name).copied().unwrap_or(0),
@@ -479,30 +347,26 @@ fn write_table_catalogs(config: &TableCatalogConfig) -> Result<(), String> {
 fn run_sync_catalog(config: &SyncCatalogConfig) -> Result<(), String> {
     let catalog = read_syncable_catalog(&config.catalog)?;
     validate_catalog(&catalog)?;
-    validate_catalog_run_ids(
-        &catalog,
-        &config.run_id_prefix,
-        &config.connections.target.database,
-    )?;
-    ensure_progress_table(config)?;
-    let mut state =
-        CatalogRunState::new(catalog.clone(), MAX_CATALOG_CONCURRENCY, BTreeSet::new(), 0);
-    let (sender, receiver) = mpsc::channel::<(String, Result<(), String>)>();
+    sync::run_mysql_sync(sync_config_from_catalog(config, &catalog)).map(|_| ())
+}
 
-    loop {
-        refresh_run_state(config, &catalog, &receiver, &mut state)?;
-        let failures = state.all_failures();
-        if !failures.is_empty() && owned_catalog_work_has_settled(&state) {
-            return Err(format_catalog_failures(&failures));
-        }
-        if state.completed.len() == catalog.tables.len() {
-            return Ok(());
-        }
-        spawn_ready_tables(config, &catalog, &sender, &mut state)?;
-        if catalog_dependencies_are_stuck(&state) {
-            return Err("catalog has unresolved or cyclic dependencies".to_string());
-        }
-        thread::sleep(Duration::from_secs(2));
+pub(crate) fn sync_config_from_catalog(
+    config: &SyncCatalogConfig,
+    catalog: &SyncableCatalog,
+) -> sync::SyncConfig {
+    sync::SyncConfig {
+        source: config.connections.source.clone(),
+        target: config.connections.target.clone(),
+        tables: catalog
+            .tables
+            .iter()
+            .map(|table| table.name.clone())
+            .collect(),
+        chunk_size: config.chunk_size,
+        parallelism: MAX_CATALOG_CONCURRENCY,
+        progress_table: config.progress_table.clone(),
+        run_id: None,
+        run_id_prefix: Some(config.run_id_prefix.clone()),
     }
 }
 
@@ -522,620 +386,6 @@ fn read_syncable_catalog(path: &Path) -> Result<SyncableCatalog, String> {
         }
     }
     Ok(catalog)
-}
-
-fn ensure_progress_table(config: &SyncCatalogConfig) -> Result<(), String> {
-    MySqlSyncRunProgressStore::new(
-        config.connections.target.clone(),
-        config.progress_table.clone(),
-    )
-    .ensure()
-    .map_err(|error| error.to_string())
-}
-
-fn refresh_run_state(
-    config: &SyncCatalogConfig,
-    catalog: &SyncableCatalog,
-    receiver: &mpsc::Receiver<(String, Result<(), String>)>,
-    state: &mut CatalogRunState,
-) -> Result<(), String> {
-    let statuses = read_run_statuses(config, catalog)?;
-    let visible_catalog_workers = state
-        .running
-        .intersection(&statuses.external_active)
-        .count();
-    state.external_active = statuses.external_active;
-    state.external_active_count = statuses
-        .external_active_count
-        .saturating_sub(visible_catalog_workers);
-    for table in statuses.completed {
-        state.mark_completed(&table);
-    }
-    while let Ok((table, result)) = receiver.try_recv() {
-        match result {
-            Ok(()) => state.mark_completed(&table),
-            Err(error) => state.mark_failed(&table, &error),
-        }
-    }
-    Ok(())
-}
-
-fn spawn_ready_tables(
-    config: &SyncCatalogConfig,
-    catalog: &SyncableCatalog,
-    sender: &mpsc::Sender<(String, Result<(), String>)>,
-    state: &mut CatalogRunState,
-) -> Result<(), String> {
-    let table_names = state
-        .ready_tables()
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    for table_name in table_names {
-        if state.available_slots() == 0 {
-            return Ok(());
-        }
-        let active_count = state.external_active_count + state.running.len();
-        let Some(reservation) = reserve_catalog_worker(config, &table_name, active_count)? else {
-            continue;
-        };
-        let entry = catalog
-            .tables
-            .iter()
-            .find(|entry| entry.name == table_name)
-            .cloned()
-            .expect("ready catalog entry");
-        state.mark_running(&table_name);
-        let worker_config = config.clone();
-        let worker_sender = sender.clone();
-        thread::spawn(move || {
-            let _reservation = reservation;
-            let result = run_catalog_table_reserved(&worker_config, &entry);
-            let _ = worker_sender.send((entry.name, result));
-        });
-    }
-    Ok(())
-}
-
-pub(crate) struct SyncWorkerReservation {
-    _connection: Conn,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ActiveRunRow {
-    run_id: String,
-    table: String,
-    run_spec_json: String,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ActiveRunInspection {
-    legacy_active_count: usize,
-    requested_table_active: bool,
-}
-
-fn inspect_active_run_rows<F>(
-    rows: &[ActiveRunRow],
-    requested_database: &str,
-    requested_table: &str,
-    mut table_reservation_is_held: F,
-) -> Result<ActiveRunInspection, String>
-where
-    F: FnMut(&str, &str) -> Result<bool, String>,
-{
-    let mut inspection = ActiveRunInspection::default();
-    for row in rows {
-        let (database, table) = active_run_identity(row)?;
-        if database == requested_database && table == requested_table {
-            inspection.requested_table_active = true;
-        }
-        if !table_reservation_is_held(&database, &table)? {
-            inspection.legacy_active_count += 1;
-        }
-    }
-    Ok(inspection)
-}
-
-fn active_run_identity(row: &ActiveRunRow) -> Result<(String, String), String> {
-    let spec = serde_json::from_str::<serde_json::Value>(&row.run_spec_json)
-        .map_err(|error| malformed_active_run_spec(row, error))?;
-    let scope_json = spec
-        .get("scope")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| malformed_active_run_spec(row, "missing string scope"))?;
-    let scope = serde_json::from_str::<serde_json::Value>(scope_json)
-        .map_err(|error| malformed_active_run_spec(row, error))?;
-    let database = scope
-        .get("target_database")
-        .and_then(serde_json::Value::as_str)
-        .filter(|database| !database.is_empty())
-        .ok_or_else(|| malformed_active_run_spec(row, "missing target_database"))?;
-    let spec_table = spec
-        .pointer("/table/name")
-        .and_then(serde_json::Value::as_str)
-        .filter(|table| !table.is_empty())
-        .ok_or_else(|| malformed_active_run_spec(row, "missing table name"))?;
-    if spec_table != row.table {
-        return Err(malformed_active_run_spec(
-            row,
-            format!(
-                "table_name `{}` differs from spec table `{spec_table}`",
-                row.table
-            ),
-        ));
-    }
-    Ok((database.to_string(), spec_table.to_string()))
-}
-
-fn malformed_active_run_spec(row: &ActiveRunRow, detail: impl std::fmt::Display) -> String {
-    format!(
-        "active run `{}` has malformed immutable specification: {detail}",
-        row.run_id
-    )
-}
-
-#[cfg(test)]
-trait NamedLockSet {
-    type Reservation;
-
-    fn try_reserve(&mut self, names: &[String]) -> Result<Option<Self::Reservation>, String>;
-}
-
-#[cfg(test)]
-fn acquire_sync_reservation<L: NamedLockSet>(
-    locks: &mut L,
-    server_namespace: &str,
-    database: &str,
-    table: &str,
-) -> Result<Option<L::Reservation>, String> {
-    for slot in 0..MAX_CATALOG_CONCURRENCY {
-        let names = vec![
-            sync_table_lock_name(server_namespace, database, table),
-            catalog_slot_lock_name(server_namespace, slot),
-        ];
-        if let Some(reservation) = locks.try_reserve(&names)? {
-            return Ok(Some(reservation));
-        }
-    }
-    Ok(None)
-}
-
-pub(crate) fn reserve_sync_worker(
-    target: &live::TargetMySqlConfig,
-    progress_table: &str,
-    table: &str,
-) -> Result<Option<SyncWorkerReservation>, String> {
-    reserve_sync_worker_with_active_count(target, progress_table, table, 0)
-}
-
-fn reserve_sync_worker_with_active_count(
-    target: &live::TargetMySqlConfig,
-    progress_table: &str,
-    table: &str,
-    active_count: usize,
-) -> Result<Option<SyncWorkerReservation>, String> {
-    if active_count >= MAX_CATALOG_CONCURRENCY {
-        return Ok(None);
-    }
-    let mut connection = target_connection(target)?;
-    configure_reservation_session(&mut connection)?;
-    let server_namespace = sync_server_lock_namespace(&target.host, target.port);
-    let admission_lock = catalog_admission_lock_name(&server_namespace);
-    if !acquire_named_lock(&mut connection, &admission_lock)? {
-        return Ok(None);
-    }
-    let result = reserve_under_admission_lock(
-        &mut connection,
-        &server_namespace,
-        &target.database,
-        progress_table,
-        table,
-        active_count,
-    );
-    release_named_lock(&mut connection, &admission_lock)?;
-    result.map(|reserved| {
-        reserved.then_some(SyncWorkerReservation {
-            _connection: connection,
-        })
-    })
-}
-
-fn reserve_under_admission_lock(
-    connection: &mut Conn,
-    server_namespace: &str,
-    database: &str,
-    progress_table: &str,
-    table: &str,
-    active_count: usize,
-) -> Result<bool, String> {
-    reap_abandoned_runs(connection, progress_table)?;
-    let occupied_slots = count_occupied_slots(connection, server_namespace)?;
-    let active_runs = inspect_active_runs(
-        connection,
-        server_namespace,
-        database,
-        progress_table,
-        table,
-    )?;
-    if active_runs.requested_table_active
-        || !admission_has_capacity(
-            active_runs.legacy_active_count,
-            occupied_slots,
-            active_count,
-        )
-    {
-        return Ok(false);
-    }
-    let table_lock = sync_table_lock_name(server_namespace, database, table);
-    if !acquire_named_lock(connection, &table_lock)? {
-        return Ok(false);
-    }
-    for slot in 0..MAX_CATALOG_CONCURRENCY {
-        let slot_lock = catalog_slot_lock_name(server_namespace, slot);
-        if acquire_named_lock(connection, &slot_lock)? {
-            return Ok(true);
-        }
-    }
-    release_named_lock(connection, &table_lock)?;
-    Ok(false)
-}
-
-/// The `last_error` recorded on a `running` row whose worker died without releasing its run lock.
-pub(crate) const ABANDONED_RUN_ERROR: &str =
-    "run abandoned: worker exited without releasing its run lock";
-
-/// Marks `running` rows whose worker is gone as `error` so the table stops claiming to be live.
-///
-/// A run acquires `GET_LOCK(SHA2(run_id,256))` before it writes its row and holds it for the
-/// process lifetime, so a `running` row without that lock cannot be a starting worker - it is a
-/// dead one. Admission already ignored these for capacity, which left them `running` forever and
-/// made the table unreadable as status. Recording them as errors keeps the resume path intact: a
-/// later run with the same identity claims the failed row and continues from its stored key.
-///
-/// Runs under the admission lock, so two workers cannot reap concurrently.
-fn reap_abandoned_runs(connection: &mut Conn, progress_table: &str) -> Result<usize, String> {
-    let table_path = quote_identifier_path(progress_table);
-    let sql = format!(
-        "UPDATE {table_path} SET status = 'error', last_error = ? \
-         WHERE status = 'running' AND IS_USED_LOCK(SHA2(run_id, 256)) IS NULL"
-    );
-    connection
-        .exec_drop(&sql, (ABANDONED_RUN_ERROR,))
-        .map_err(|error| format!("failed to reap abandoned table sync runs: {error}"))?;
-    let reaped = usize::try_from(connection.affected_rows()).unwrap_or(usize::MAX);
-    if reaped > 0 {
-        println!("cdc_table_sync_runs_reaped abandoned_runs={reaped}");
-    }
-    Ok(reaped)
-}
-
-fn count_occupied_slots(connection: &mut Conn, server_namespace: &str) -> Result<usize, String> {
-    let mut occupied = 0;
-    for slot in 0..MAX_CATALOG_CONCURRENCY {
-        let name = catalog_slot_lock_name(server_namespace, slot);
-        if named_lock_owner(connection, &name)?.is_some() {
-            occupied += 1;
-        }
-    }
-    Ok(occupied)
-}
-
-fn inspect_active_runs(
-    connection: &mut Conn,
-    server_namespace: &str,
-    database: &str,
-    progress_table: &str,
-    table: &str,
-) -> Result<ActiveRunInspection, String> {
-    let table_path = quote_identifier_path(progress_table);
-    let sql = format!(
-        "SELECT run_id, table_name, run_spec_json, IS_USED_LOCK(SHA2(run_id,256)) FROM {table_path} WHERE status IN ('running','complete','error')"
-    );
-    let rows = connection
-        .query::<(String, String, String, Option<u64>), _>(sql)
-        .map_err(|error| format!("failed to inspect active table sync runs: {error}"))?
-        .into_iter()
-        .filter_map(|(run_id, table, run_spec_json, owner)| {
-            owner.map(|_| ActiveRunRow {
-                run_id,
-                table,
-                run_spec_json,
-            })
-        })
-        .collect::<Vec<_>>();
-    inspect_active_run_rows(&rows, database, table, |active_database, active_table| {
-        let table_lock = sync_table_lock_name(server_namespace, active_database, active_table);
-        named_lock_owner(connection, &table_lock).map(|owner| owner.is_some())
-    })
-}
-
-fn admission_has_capacity(
-    legacy_active_runs: usize,
-    occupied_slots: usize,
-    observed_active_count: usize,
-) -> bool {
-    legacy_active_runs + occupied_slots < MAX_CATALOG_CONCURRENCY
-        && observed_active_count < MAX_CATALOG_CONCURRENCY
-}
-
-fn reserve_catalog_worker(
-    config: &SyncCatalogConfig,
-    table: &str,
-    active_count: usize,
-) -> Result<Option<SyncWorkerReservation>, String> {
-    reserve_sync_worker_with_active_count(
-        &config.connections.target,
-        &config.progress_table,
-        table,
-        active_count,
-    )
-}
-
-fn sync_server_lock_namespace(host: &str, port: u16) -> String {
-    format!("{}:{port}", host.to_ascii_lowercase())
-}
-
-fn sync_table_lock_name(server_namespace: &str, database: &str, table: &str) -> String {
-    format!(
-        "\0mariadb-mysql-cdc:table-reservation:{server_namespace}:{}:{}",
-        framed_lock_component(database),
-        framed_lock_component(table)
-    )
-}
-
-fn framed_lock_component(value: &str) -> String {
-    encode_run_id_component(value)
-}
-
-fn catalog_slot_lock_name(server_namespace: &str, slot: usize) -> String {
-    format!("\0mariadb-mysql-cdc:sync-slot:{server_namespace}:{slot}")
-}
-
-fn catalog_admission_lock_name(server_namespace: &str) -> String {
-    format!("\0mariadb-mysql-cdc:sync-admission:{server_namespace}")
-}
-
-fn acquire_named_lock(connection: &mut Conn, name: &str) -> Result<bool, String> {
-    connection
-        .exec_first::<u8, _, _>("SELECT GET_LOCK(SHA2(?,256),0)", (name,))
-        .map(|value| value == Some(1))
-        .map_err(|error| format!("failed to reserve catalog lock `{name}`: {error}"))
-}
-
-fn release_named_lock(connection: &mut Conn, name: &str) -> Result<(), String> {
-    connection
-        .exec_drop("SELECT RELEASE_LOCK(SHA2(?,256))", (name,))
-        .map_err(|error| format!("failed to release catalog lock `{name}`: {error}"))
-}
-
-fn named_lock_owner(connection: &mut Conn, name: &str) -> Result<Option<u64>, String> {
-    connection
-        .exec_first::<Option<u64>, _, _>("SELECT IS_USED_LOCK(SHA2(?,256))", (name,))
-        .map(decode_named_lock_owner)
-        .map_err(|error| format!("failed to inspect catalog lock `{name}`: {error}"))
-}
-
-fn decode_named_lock_owner(owner: Option<Option<u64>>) -> Option<u64> {
-    owner.flatten()
-}
-
-fn owned_catalog_work_has_settled(state: &CatalogRunState) -> bool {
-    state.running.is_empty() && state.ready_tables().is_empty()
-}
-
-fn catalog_dependencies_are_stuck(state: &CatalogRunState) -> bool {
-    let waiting_for_catalog_table = state.catalog.tables.iter().any(|entry| {
-        !state.is_accounted_for(&entry.name) && state.external_active.contains(&entry.name)
-    });
-    state.running.is_empty()
-        && !waiting_for_catalog_table
-        && state.ready_tables().is_empty()
-        && state.all_failures().is_empty()
-}
-
-#[derive(Debug, Default)]
-struct RunStatuses {
-    external_active: BTreeSet<String>,
-    completed: Vec<String>,
-    external_active_count: usize,
-}
-
-fn read_run_statuses(
-    config: &SyncCatalogConfig,
-    catalog: &SyncableCatalog,
-) -> Result<RunStatuses, String> {
-    let mut connection = target_connection(&config.connections.target)?;
-    let table_path = quote_identifier_path(&config.progress_table);
-    let sql = format!(
-        "SELECT run_id, table_name, run_spec_json, status, COALESCE(last_error, ''), IS_USED_LOCK(SHA2(run_id, 256)) FROM {table_path} WHERE status IN ('running','complete','error')"
-    );
-    let rows = connection
-        .query::<(String, String, String, String, String, Option<u64>), _>(sql)
-        .map_err(|error| format!("failed to read catalog run status: {error}"))?;
-    let expected_specs = expected_catalog_run_specs(config, catalog)?;
-    classify_run_statuses(
-        catalog,
-        &config.run_id_prefix,
-        &config.connections.target.database,
-        &expected_specs,
-        rows,
-    )
-}
-
-fn expected_catalog_run_specs(
-    config: &SyncCatalogConfig,
-    catalog: &SyncableCatalog,
-) -> Result<BTreeMap<String, String>, String> {
-    catalog
-        .tables
-        .iter()
-        .map(|entry| {
-            let sync_config = catalog_table_sync_config(config, entry);
-            table_sync::expected_sync_run_spec_json(&sync_config)
-                .map(|spec| (entry.name.clone(), spec))
-                .map_err(|error| error.to_string())
-        })
-        .collect()
-}
-
-fn classify_run_statuses(
-    catalog: &SyncableCatalog,
-    run_id_prefix: &str,
-    target_database: &str,
-    expected_specs: &BTreeMap<String, String>,
-    rows: Vec<(String, String, String, String, String, Option<u64>)>,
-) -> Result<RunStatuses, String> {
-    let expected_run_ids = catalog
-        .tables
-        .iter()
-        .map(|entry| {
-            (
-                deterministic_run_id(run_id_prefix, target_database, &entry.name),
-                entry.name.as_str(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut statuses = RunStatuses::default();
-    for (run_id, table, run_spec_json, status, _error, lock_owner) in rows {
-        let expected_table = expected_run_ids.get(&run_id).copied();
-        let expected_catalog_child = expected_table.is_some();
-        let active = lock_owner.is_some();
-        let relevant = active || (status == "complete" && expected_catalog_child);
-        if !relevant {
-            continue;
-        }
-
-        let row = ActiveRunRow {
-            run_id: run_id.clone(),
-            table: table.clone(),
-            run_spec_json: run_spec_json.clone(),
-        };
-        let (database, spec_table) = active_run_identity(&row)?;
-        if active {
-            statuses.external_active_count += 1;
-            if database == target_database {
-                statuses.external_active.insert(spec_table.clone());
-            }
-        }
-        if status == "complete" && expected_catalog_child {
-            validate_completed_catalog_child(
-                &row,
-                target_database,
-                expected_table.expect("expected catalog child"),
-                (&database, &spec_table),
-                expected_specs,
-            )?;
-            statuses.completed.push(spec_table);
-        }
-    }
-    Ok(statuses)
-}
-
-fn validate_completed_catalog_child(
-    row: &ActiveRunRow,
-    target_database: &str,
-    expected_table: &str,
-    spec_identity: (&str, &str),
-    expected_specs: &BTreeMap<String, String>,
-) -> Result<(), String> {
-    if row.table != expected_table {
-        return Err(format!(
-            "run id `{}` mutable table_name `{}` disagrees with expected table `{expected_table}`",
-            row.run_id, row.table
-        ));
-    }
-    let (spec_database, spec_table) = spec_identity;
-    if spec_database != target_database
-        || spec_table != expected_table
-        || expected_specs.get(expected_table).map(String::as_str) != Some(&row.run_spec_json)
-    {
-        return Err(format!(
-            "run id `{}` already exists with a different immutable specification",
-            row.run_id
-        ));
-    }
-    Ok(())
-}
-
-fn run_catalog_table_reserved(
-    config: &SyncCatalogConfig,
-    entry: &SyncableTableEntry,
-) -> Result<(), String> {
-    let sync_config = catalog_table_sync_config(config, entry);
-    table_sync::run_sync_table_reserved(&sync_config)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn catalog_table_sync_config(
-    config: &SyncCatalogConfig,
-    entry: &SyncableTableEntry,
-) -> table_sync::SyncTableConfig {
-    table_sync::SyncTableConfig {
-        source: config.connections.source.clone(),
-        target: config.connections.target.clone(),
-        table: table_sync::SyncTable {
-            name: entry.name.clone(),
-            primary_key: entry.primary_key.clone(),
-            primary_key_ordering: entry.primary_key_ordering.clone(),
-            columns: entry.columns.clone(),
-        },
-        chunk_size: config.chunk_size,
-        mode: table_sync::SyncMode::Apply,
-        progress_table: config.progress_table.clone(),
-        run_id: deterministic_run_id(
-            &config.run_id_prefix,
-            &config.connections.target.database,
-            &entry.name,
-        ),
-        start_after: None,
-        end_at: None,
-        updated_since: None,
-        plan_hash: None,
-    }
-}
-
-const CATALOG_RUN_ID_V2_DOMAIN: &[u8] = b"mariadb-mysql-cdc:catalog-run-id:v2\0";
-
-fn deterministic_run_id(prefix: &str, target_database: &str, table: &str) -> String {
-    let tuple = format!(
-        "{}:{}:{}",
-        encode_run_id_component(prefix),
-        encode_run_id_component(target_database),
-        encode_run_id_component(table)
-    );
-    let mut hasher = Sha256::new();
-    hasher.update(CATALOG_RUN_ID_V2_DOMAIN);
-    hasher.update(tuple.as_bytes());
-    let digest = hasher.finalize();
-    format!("catalog-v2-{digest:x}")
-}
-
-fn encode_run_id_component(value: &str) -> String {
-    let encoded = value
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("{}:{encoded}", value.len())
-}
-
-fn validate_catalog_run_ids(
-    catalog: &SyncableCatalog,
-    prefix: &str,
-    target_database: &str,
-) -> Result<(), String> {
-    for entry in &catalog.tables {
-        let run_id = deterministic_run_id(prefix, target_database, &entry.name);
-        if run_id.len() > 128 {
-            return Err(format!(
-                "generated run id for table `{}` is {} bytes; cdc.table_sync_runs.run_id allows at most 128",
-                entry.name,
-                run_id.len()
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn validate_catalog(catalog: &SyncableCatalog) -> Result<(), String> {
@@ -1260,8 +510,9 @@ fn column_type_is_compatible(
 /// Whether two column collations name the same converged collation.
 ///
 /// MariaDB 11.8 defaults new tables to the UCA-1400 collations, which MySQL 8 does not have, and
-/// `sync-schema` converges each to its MySQL equivalent rather than rewriting the column. Comparing
-/// the raw names here classified every recently created table as `incompatible_schema` even though
+/// the prerequisite schema stage converges each to its MySQL equivalent rather than rewriting the
+/// column. Comparing the raw names here classified every recently created table as
+/// `incompatible_schema` even though
 /// its schema had already converged, which silently excluded 40 tables from every catalog sync.
 fn collations_are_equivalent(source: Option<&str>, target: Option<&str>) -> bool {
     match (source, target) {
@@ -1538,7 +789,7 @@ fn truncate_and_write_catalog(file: &mut File, path: &Path, bytes: &[u8]) -> Res
 }
 
 fn read_inventory_source(
-    source: &mysql_snapshot::MySqlConnectionConfig,
+    source: &crate::mysql_config::MySqlConnectionConfig,
 ) -> Result<SchemaInventory, String> {
     let reader = MariaDbInventoryReader::new(InventoryConfig {
         host: source.host.clone(),
@@ -1566,7 +817,7 @@ fn read_inventory_target(target: &live::TargetMySqlConfig) -> Result<SchemaInven
 }
 
 fn read_estimated_rows(
-    source: &mysql_snapshot::MySqlConnectionConfig,
+    source: &crate::mysql_config::MySqlConnectionConfig,
 ) -> Result<BTreeMap<String, u64>, String> {
     let mut connection = source_connection(source)?;
     let sql = "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME";
@@ -1576,7 +827,7 @@ fn read_estimated_rows(
         .map_err(|error| format!("failed to read estimated source row counts: {error}"))
 }
 
-fn source_connection(config: &mysql_snapshot::MySqlConnectionConfig) -> Result<Conn, String> {
+fn source_connection(config: &crate::mysql_config::MySqlConnectionConfig) -> Result<Conn, String> {
     let opts = Opts::from(
         OptsBuilder::default()
             .ip_or_hostname(Some(&config.host))
@@ -1590,47 +841,6 @@ fn source_connection(config: &mysql_snapshot::MySqlConnectionConfig) -> Result<C
             .write_timeout(Some(DB_TIMEOUT)),
     );
     Conn::new(opts).map_err(|error| format!("source connection failed: {error}"))
-}
-
-trait ReservationSession {
-    fn execute_session_setup(&mut self, sql: &str) -> Result<(), String>;
-}
-
-impl ReservationSession for Conn {
-    fn execute_session_setup(&mut self, sql: &str) -> Result<(), String> {
-        self.query_drop(sql)
-            .map_err(|error| format!("failed to configure reservation session: {error}"))
-    }
-}
-
-fn reservation_session_setup_sql() -> String {
-    format!("SET SESSION wait_timeout = {RESERVATION_SESSION_WAIT_TIMEOUT_SECONDS}")
-}
-
-fn configure_reservation_session(connection: &mut impl ReservationSession) -> Result<(), String> {
-    connection.execute_session_setup(&reservation_session_setup_sql())
-}
-
-fn target_connection(config: &live::TargetMySqlConfig) -> Result<Conn, String> {
-    let endpoint = format!("target `{}`:{}", config.host, config.port);
-    let opts = Opts::from(
-        OptsBuilder::default()
-            .ip_or_hostname(Some(&config.host))
-            .tcp_port(config.port)
-            .user(Some(&config.user))
-            .pass(Some(&config.password))
-            .db_name(Some(&config.database))
-            .prefer_socket(false)
-            .tcp_connect_timeout(Some(DB_TIMEOUT))
-            .read_timeout(Some(DB_TIMEOUT))
-            .write_timeout(Some(DB_TIMEOUT))
-            .ssl_opts(crate::mysql_support::ssl_opts_from_ca(
-                &endpoint,
-                &config.host,
-                &config.tls_ca_file,
-            )?),
-    );
-    Conn::new(opts).map_err(|error| format!("target connection failed: {error}"))
 }
 
 fn parse_table_catalog_config(args: Vec<String>) -> Result<TableCatalogConfig, String> {
@@ -1672,7 +882,7 @@ fn parse_sync_catalog_config(args: Vec<String>) -> Result<SyncCatalogConfig, Str
         progress_table: values
             .get("--progress-table")
             .cloned()
-            .unwrap_or_else(|| "cdc.table_sync_runs".to_string()),
+            .unwrap_or_else(|| sync::DEFAULT_SYNC_PROGRESS_TABLE.to_string()),
         run_id_prefix,
         chunk_size,
     })
@@ -1697,7 +907,7 @@ fn parse_common_options(
     }
     let source_password_env = required_value(&values, "--source-password-env")?;
     let target_password_env = required_value(&values, "--target-password-env")?;
-    let source = mysql_snapshot::MySqlConnectionConfig {
+    let source = crate::mysql_config::MySqlConnectionConfig {
         host: required_value(&values, "--source-host")?,
         port: parse_port(&values, "--source-port", 3306)?,
         user: required_value(&values, "--source-user")?,
@@ -1753,22 +963,6 @@ fn parse_port(values: &BTreeMap<String, String>, flag: &str, default: u16) -> Re
         .map(|value| value.unwrap_or(default))
 }
 
-fn quote_identifier_path(identifier: &str) -> String {
-    identifier
-        .split('.')
-        .map(crate::mysql_support::quote_ident)
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-fn format_catalog_failures(failures: &[CatalogTableFailure]) -> String {
-    failures
-        .iter()
-        .map(|failure| format!("{}: {}", failure.table, failure.reason))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 fn cli_error(error: String, usage: &str) -> ! {
     eprintln!("{error}\n\n{usage}");
     std::process::exit(2)
@@ -1778,6 +972,45 @@ fn cli_error(error: String, usage: &str) -> ! {
 mod tests {
     use super::*;
     use crate::inventory::{ColumnInventory, ForeignKeyInventory, SchemaInventory, TableInventory};
+
+    #[test]
+    fn sync_progress_defaults_catalog_to_unified_table() {
+        unsafe {
+            std::env::set_var("CDC_CATALOG_SOURCE_PASSWORD", "source-password");
+            std::env::set_var("CDC_CATALOG_TARGET_PASSWORD", "target-password");
+        }
+        let args = [
+            "--source-host",
+            "source",
+            "--source-user",
+            "reader",
+            "--source-password-env",
+            "CDC_CATALOG_SOURCE_PASSWORD",
+            "--source-database",
+            "source-db",
+            "--target-host",
+            "target",
+            "--target-user",
+            "writer",
+            "--target-password-env",
+            "CDC_CATALOG_TARGET_PASSWORD",
+            "--target-database",
+            "target-db",
+            "--target-tls-ca-file",
+            "/tmp/ca.pem",
+            "--catalog",
+            "catalog.json",
+            "--run-id-prefix",
+            "nightly",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        let config = parse_sync_catalog_config(args).expect("sync catalog config");
+
+        assert_eq!(config.progress_table, "cdc.sync_runs");
+    }
 
     #[test]
     fn excluded_child_keeps_own_reason_and_dependency_reason() {
@@ -1807,51 +1040,6 @@ mod tests {
                 NonSyncableReason::DependencyOnNonSyncable,
             ]
         );
-    }
-
-    #[test]
-    fn legacy_run_lock_rejects_different_run_for_same_database_and_table() {
-        let rows = vec![active_run_row(
-            "guests-full-apply-20260721",
-            "guests",
-            "globalcomix",
-        )];
-        let inspection = inspect_active_run_rows(&rows, "globalcomix", "guests", |_, _| Ok(false))
-            .expect("legacy active run inspection");
-
-        assert!(inspection.requested_table_active);
-        assert_eq!(inspection.legacy_active_count, 1);
-    }
-
-    #[test]
-    fn active_reserved_run_uses_stored_database_for_table_reservation() {
-        let rows = vec![active_run_row("run-a", "items", "database_a")];
-        let mut inspected = Vec::new();
-        let inspection =
-            inspect_active_run_rows(&rows, "database_b", "items", |database, table| {
-                inspected.push((database.to_string(), table.to_string()));
-                Ok(database == "database_a" && table == "items")
-            })
-            .expect("cross-database active run inspection");
-
-        assert_eq!(inspected, vec![("database_a".into(), "items".into())]);
-        assert!(!inspection.requested_table_active);
-        assert_eq!(inspection.legacy_active_count, 0);
-    }
-
-    #[test]
-    fn malformed_active_run_spec_fails_closed() {
-        let rows = vec![ActiveRunRow {
-            run_id: "broken".into(),
-            table: "items".into(),
-            run_spec_json: "not-json".into(),
-        }];
-
-        let error = inspect_active_run_rows(&rows, "database_b", "items", |_, _| Ok(false))
-            .expect_err("malformed active spec");
-
-        assert!(error.contains("broken"));
-        assert!(error.contains("malformed"));
     }
 
     #[test]
@@ -1904,73 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_status_clears_prior_worker_failure() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::new(), 0);
-        state.mark_failed("a", "temporary");
-        state.mark_completed("a");
-        assert!(state.all_failures().is_empty());
-    }
-
-    #[test]
-    fn unrelated_tables_remain_ready_after_failure() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("failed", 1, &[]), entry("independent", 2, &[])],
-        };
-        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::new(), 0);
-        state.mark_failed("failed", "boom");
-        assert_eq!(state.ready_tables(), vec!["independent"]);
-    }
-
-    #[test]
-    fn external_activity_is_waiting_not_dependency_deadlock() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let state = CatalogRunState::new(catalog, 4, BTreeSet::from(["a".into()]), 1);
-        assert!(!catalog_dependencies_are_stuck(&state));
-    }
-
-    #[test]
-    fn unrelated_external_sync_does_not_delay_owned_failure_return() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("parent", 1, &[]), entry("child", 2, &["parent"])],
-        };
-        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::from(["unrelated".into()]), 1);
-        state.mark_failed("parent", "boom");
-
-        assert!(owned_catalog_work_has_settled(&state));
-    }
-
-    #[test]
-    fn unrelated_external_sync_does_not_hide_dependency_cycle() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &["b"]), entry("b", 2, &["a"])],
-        };
-        let state = CatalogRunState::new(catalog, 4, BTreeSet::from(["unrelated".into()]), 1);
-
-        assert!(catalog_dependencies_are_stuck(&state));
-    }
-
-    #[test]
-    fn four_external_slots_do_not_hide_owned_dependency_cycle() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &["b"]), entry("b", 2, &["a"])],
-        };
-        let external = BTreeSet::from([
-            "external_a".into(),
-            "external_b".into(),
-            "external_c".into(),
-            "external_d".into(),
-        ]);
-        let state = CatalogRunState::new(catalog, 4, external, 4);
-
-        assert!(catalog_dependencies_are_stuck(&state));
-    }
-
-    #[test]
     fn nullable_source_requires_nullable_target() {
         let source_table = table(
             "items",
@@ -2018,8 +1139,8 @@ mod tests {
         );
     }
 
-    /// MariaDB 11.8 defaults new tables to UCA-1400, which `sync-schema` converges to the MySQL
-    /// spelling. Such a table is fully synced and must stay syncable.
+    /// MariaDB 11.8 defaults new tables to UCA-1400, which the prerequisite schema stage converges
+    /// to the MySQL spelling. Such a table is fully synced and must stay syncable.
     #[test]
     fn converged_uca1400_column_collations_stay_syncable() {
         let mut source_name = typed_column("name", "varchar(32)", false);
@@ -2383,482 +1504,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_reserves_external_slots_and_orders_ready_tables_by_size() {
-        let catalog = SyncableCatalog {
-            tables: vec![
-                entry("tiny", 1, &[]),
-                entry("child", 2, &["parent"]),
-                entry("parent", 3, &[]),
-                entry("large", 9, &[]),
-            ],
-        };
-        let state = CatalogRunState::new(catalog, 4, BTreeSet::from(["guests".to_string()]), 1);
-        assert_eq!(state.ready_tables(), vec!["tiny", "parent", "large"]);
-        assert_eq!(state.available_slots(), 3);
-    }
-
-    #[test]
-    fn external_run_count_reserves_slots_even_when_tables_repeat() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("tiny", 1, &[])],
-        };
-        let state = CatalogRunState::new(catalog, 4, BTreeSet::from(["guests".to_string()]), 3);
-        assert_eq!(state.available_slots(), 1);
-    }
-
-    #[test]
-    fn direct_failure_is_reported_with_blocked_dependents() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("parent", 1, &[]), entry("child", 2, &["parent"])],
-        };
-        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::new(), 0);
-        state.mark_failed("parent", "boom");
-        assert_eq!(
-            state.all_failures(),
-            vec![
-                CatalogTableFailure {
-                    table: "parent".into(),
-                    reason: "boom".into()
-                },
-                CatalogTableFailure {
-                    table: "child".into(),
-                    reason: "parent `parent` failed: boom".into()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn blocked_failure_reporting_is_transitive() {
-        let catalog = SyncableCatalog {
-            tables: vec![
-                entry("a", 1, &[]),
-                entry("b", 2, &["a"]),
-                entry("c", 3, &["b"]),
-            ],
-        };
-        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::new(), 0);
-        state.mark_failed("a", "boom");
-        assert_eq!(
-            state
-                .all_failures()
-                .iter()
-                .map(|failure| failure.table.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a", "b", "c"]
-        );
-    }
-
-    #[test]
-    fn failed_parent_blocks_child_explicitly() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("parent", 1, &[]), entry("child", 2, &["parent"])],
-        };
-        let mut state = CatalogRunState::new(catalog, 4, BTreeSet::new(), 0);
-        state.mark_failed("parent", "boom");
-        assert_eq!(
-            state.blocked_failures(),
-            vec![CatalogTableFailure {
-                table: "child".into(),
-                reason: "parent `parent` failed: boom".into()
-            }]
-        );
-    }
-
-    #[test]
-    fn lock_active_error_rows_consume_slots() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let run_spec_json = active_run_row("batch-a", "a", "db").run_spec_json;
-        let statuses = classify_run_statuses(
-            &catalog,
-            "batch",
-            "db",
-            &BTreeMap::new(),
-            vec![(
-                "batch-a".into(),
-                "a".into(),
-                run_spec_json,
-                "error".into(),
-                "temporary".into(),
-                Some(7),
-            )],
-        )
-        .expect("active error run");
-        assert_eq!(statuses.external_active_count, 1);
-        assert!(statuses.external_active.contains("a"));
-    }
-
-    #[test]
-    fn complete_catalog_children_remain_terminal_after_restart() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let run_id = deterministic_run_id("batch", "db", "a");
-        let run_spec_json = active_run_row(&run_id, "a", "db").run_spec_json;
-        let expected_specs = BTreeMap::from([("a".to_string(), run_spec_json.clone())]);
-        let statuses = classify_run_statuses(
-            &catalog,
-            "batch",
-            "db",
-            &expected_specs,
-            vec![(
-                run_id,
-                "a".into(),
-                run_spec_json,
-                "complete".into(),
-                String::new(),
-                None,
-            )],
-        )
-        .expect("matching complete run");
-        assert_eq!(statuses.completed, vec!["a"]);
-    }
-
-    #[test]
-    fn same_table_in_another_database_neither_blocks_nor_completes_catalog_entry() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let expected_specs = BTreeMap::from([("a".to_string(), "expected".to_string())]);
-        let other_database_spec = active_run_row("batch-a", "a", "other_database").run_spec_json;
-        let statuses = classify_run_statuses(
-            &catalog,
-            "batch",
-            "catalog_database",
-            &expected_specs,
-            vec![(
-                "batch-a".into(),
-                "a".into(),
-                other_database_spec,
-                "complete".into(),
-                String::new(),
-                Some(7),
-            )],
-        )
-        .expect("cross-database status");
-
-        assert!(statuses.external_active.is_empty());
-        assert!(statuses.completed.is_empty());
-        assert_eq!(statuses.external_active_count, 1);
-    }
-
-    #[test]
-    fn same_table_error_in_another_database_does_not_block_dependency() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("parent", 1, &[]), entry("child", 2, &["parent"])],
-        };
-        let expected_specs = BTreeMap::new();
-        let other_database_spec =
-            active_run_row("batch-parent", "parent", "other_database").run_spec_json;
-        let statuses = classify_run_statuses(
-            &catalog,
-            "batch",
-            "catalog_database",
-            &expected_specs,
-            vec![(
-                "batch-parent".into(),
-                "parent".into(),
-                other_database_spec,
-                "error".into(),
-                "boom".into(),
-                None,
-            )],
-        )
-        .expect("cross-database error");
-
-        assert!(statuses.completed.is_empty());
-        assert!(statuses.external_active.is_empty());
-    }
-
-    #[test]
-    fn expected_complete_child_with_mutable_table_mismatch_fails_closed() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let run_id = deterministic_run_id("batch", "db", "a");
-        let run_spec_json = active_run_row(&run_id, "a", "db").run_spec_json;
-        let expected_specs = BTreeMap::from([("a".to_string(), run_spec_json.clone())]);
-        let error = classify_run_statuses(
-            &catalog,
-            "batch",
-            "db",
-            &expected_specs,
-            vec![(
-                run_id,
-                "mutable-table-disagrees".into(),
-                run_spec_json,
-                "complete".into(),
-                String::new(),
-                None,
-            )],
-        )
-        .expect_err("mutable table mismatch");
-
-        assert!(error.contains("table_name"), "{error}");
-        assert!(error.contains("differs from spec table"), "{error}");
-    }
-
-    #[test]
-    fn unrelated_completed_rows_remain_ignored() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let statuses = classify_run_statuses(
-            &catalog,
-            "batch",
-            "db",
-            &BTreeMap::new(),
-            vec![(
-                "unrelated-run".into(),
-                "a".into(),
-                "malformed".into(),
-                "complete".into(),
-                String::new(),
-                None,
-            )],
-        )
-        .expect("unrelated complete row");
-
-        assert!(statuses.completed.is_empty());
-        assert_eq!(statuses.external_active_count, 0);
-    }
-
-    #[test]
-    fn complete_catalog_child_with_changed_spec_fails_closed() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let run_id = deterministic_run_id("batch", "db", "a");
-        let run_spec_json = active_run_row(&run_id, "a", "db").run_spec_json;
-        let expected_specs = BTreeMap::from([("a".to_string(), "different".to_string())]);
-        let error = classify_run_statuses(
-            &catalog,
-            "batch",
-            "db",
-            &expected_specs,
-            vec![(
-                run_id,
-                "a".into(),
-                run_spec_json,
-                "complete".into(),
-                String::new(),
-                None,
-            )],
-        )
-        .expect_err("mismatched completed spec");
-
-        assert!(error.contains("different immutable specification"));
-    }
-
-    #[test]
-    fn stale_running_rows_without_advisory_locks_do_not_consume_slots() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let statuses = classify_run_statuses(
-            &catalog,
-            "batch",
-            "db",
-            &BTreeMap::new(),
-            vec![(
-                "other-a".into(),
-                "a".into(),
-                "not json".into(),
-                "running".into(),
-                String::new(),
-                None,
-            )],
-        )
-        .expect("stale malformed run is irrelevant");
-        assert_eq!(statuses.external_active_count, 0);
-        assert!(statuses.external_active.is_empty());
-    }
-
-    #[test]
-    fn stale_error_rows_without_advisory_locks_ignore_malformed_specs() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let statuses = classify_run_statuses(
-            &catalog,
-            "batch",
-            "db",
-            &BTreeMap::new(),
-            vec![(
-                "other-a".into(),
-                "a".into(),
-                "not json".into(),
-                "error".into(),
-                "old failure".into(),
-                None,
-            )],
-        )
-        .expect("stale malformed error is irrelevant");
-        assert!(statuses.completed.is_empty());
-        assert_eq!(statuses.external_active_count, 0);
-    }
-
-    #[test]
-    fn malformed_locked_rows_fail_closed() {
-        let catalog = SyncableCatalog {
-            tables: vec![entry("a", 1, &[])],
-        };
-        let error = classify_run_statuses(
-            &catalog,
-            "batch",
-            "db",
-            &BTreeMap::new(),
-            vec![(
-                "active-a".into(),
-                "a".into(),
-                "not json".into(),
-                "running".into(),
-                String::new(),
-                Some(7),
-            )],
-        )
-        .expect_err("active malformed run must fail closed");
-        assert!(error.contains("malformed immutable specification"));
-    }
-
-    #[test]
-    fn slot_lock_namespace_is_shared_across_databases_on_one_server() {
-        let first = sync_server_lock_namespace("mysql.example.com", 25060);
-        let second = sync_server_lock_namespace("mysql.example.com", 25060);
-
-        assert_eq!(
-            catalog_slot_lock_name(&first, 2),
-            catalog_slot_lock_name(&second, 2)
-        );
-        assert_eq!(
-            catalog_admission_lock_name(&first),
-            catalog_admission_lock_name(&second)
-        );
-    }
-
-    #[test]
-    /// Expressed against the configured cap so raising it does not silently invalidate the test.
-    fn admission_counts_legacy_run_locks_and_new_slot_reservations() {
-        let cap = MAX_CATALOG_CONCURRENCY;
-        // Legacy run locks and slot reservations share one budget.
-        assert!(!admission_has_capacity(1, cap - 1, 0));
-        assert!(!admission_has_capacity(cap, 0, 0));
-        // An externally observed active run consumes capacity on its own.
-        assert!(!admission_has_capacity(0, 0, cap));
-        // One below the cap on every counter still admits.
-        assert!(admission_has_capacity(1, cap - 2, cap - 1));
-    }
-
-    #[test]
-    fn direct_and_catalog_reservations_cannot_overlap_the_same_table() {
-        let mut locks = TestNamedLocks::default();
-        let direct = acquire_sync_reservation(&mut locks, "server:25060", "db", "items")
-            .expect("direct reservation")
-            .expect("direct acquired");
-        assert!(
-            acquire_sync_reservation(&mut locks, "server:25060", "db", "items")
-                .expect("catalog reservation")
-                .is_none()
-        );
-        locks.release(direct);
-        assert!(
-            acquire_sync_reservation(&mut locks, "server:25060", "db", "items")
-                .expect("catalog retry")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn absent_named_lock_owner_decodes_as_unheld() {
-        assert_eq!(decode_named_lock_owner(Some(None)), None);
-        assert_eq!(decode_named_lock_owner(Some(Some(42))), Some(42));
-        assert_eq!(decode_named_lock_owner(None), None);
-    }
-
-    #[test]
-    fn table_reservation_components_are_injective() {
-        assert_ne!(
-            sync_table_lock_name("db:3306", "a:b", "c"),
-            sync_table_lock_name("db:3306", "a", "b:c")
-        );
-    }
-
-    #[test]
-    fn user_run_id_cannot_collide_with_table_reservation_key() {
-        let run_id = "sync-table:db:3306:app:users";
-        let table_reservation = sync_table_lock_name("db:3306", "app", "users");
-        let admission = catalog_admission_lock_name("db:3306");
-        let slot = catalog_slot_lock_name("db:3306", 0);
-
-        assert!(table_reservation.starts_with('\0'));
-        assert!(admission.starts_with('\0'));
-        assert!(slot.starts_with('\0'));
-        assert_ne!(run_id, table_reservation);
-        assert_ne!(run_id, admission);
-        assert_ne!(run_id, slot);
-        assert_ne!(table_reservation, admission);
-        assert_ne!(table_reservation, slot);
-        assert_ne!(admission, slot);
-    }
-
-    #[test]
-    fn long_production_table_name_fits_progress_run_id() {
-        let table = "income_content_summary_2026_03_06_invalidation_backup";
-        let catalog = SyncableCatalog {
-            tables: vec![entry(table, 1, &[])],
-        };
-
-        validate_catalog_run_ids(&catalog, "j", "globalcomix").expect("valid run id");
-        let run_id = deterministic_run_id("j", "globalcomix", table);
-
-        assert!(run_id.starts_with("catalog-v2-"));
-        assert_eq!(run_id.len(), "catalog-v2-".len() + 64);
-        assert!(run_id.len() <= 128);
-    }
-
-    #[test]
-    fn reservation_connection_sets_long_session_idle_timeout() {
-        #[derive(Default)]
-        struct RecordingSession {
-            statements: Vec<String>,
-        }
-
-        impl ReservationSession for RecordingSession {
-            fn execute_session_setup(&mut self, sql: &str) -> Result<(), String> {
-                self.statements.push(sql.to_string());
-                Ok(())
-            }
-        }
-
-        let mut session = RecordingSession::default();
-        configure_reservation_session(&mut session).expect("reservation session setup");
-
-        assert_eq!(session.statements, vec!["SET SESSION wait_timeout = 86400"]);
-    }
-
-    #[test]
-    fn catalog_run_id_hashes_a_domain_tagged_framed_tuple() {
-        let tuple = format!(
-            "{}:{}:{}",
-            encode_run_id_component("j"),
-            encode_run_id_component("globalcomix"),
-            encode_run_id_component("items")
-        );
-        let domain_tag = b"mariadb-mysql-cdc:catalog-run-id:v2\0";
-        let mut tagged_preimage = domain_tag.to_vec();
-        tagged_preimage.extend_from_slice(tuple.as_bytes());
-        let tagged_digest = Sha256::digest(&tagged_preimage);
-        let untagged_digest = Sha256::digest(tuple.as_bytes());
-        let run_id = deterministic_run_id("j", "globalcomix", "items");
-
-        assert_eq!(run_id, format!("catalog-v2-{tagged_digest:x}"));
-        assert_ne!(run_id, format!("catalog-v2-{untagged_digest:x}"));
-        assert_eq!(run_id.len(), 75);
-    }
-
-    #[test]
     fn legacy_catalog_without_primary_key_ordering_is_rejected() {
         let directory = unique_catalog_test_directory("legacy-ordering");
         fs::create_dir_all(&directory).expect("create catalog test directory");
@@ -2877,30 +1522,13 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_json_and_run_ids_are_stable() {
+    fn deterministic_catalog_json_is_stable() {
         let catalog = SyncableCatalog {
             tables: vec![entry("a", 1, &[])],
         };
         let first = serde_json::to_string_pretty(&catalog).expect("json");
         let second = serde_json::to_string_pretty(&catalog).expect("json");
         assert_eq!(first, second);
-        assert_eq!(
-            deterministic_run_id("full-20260722", "globalcomix", "a"),
-            "catalog-v2-49302b7889e4d58992c95bb4fc390331327fa95b9d9207ebc01c28ff7e789dd2"
-        );
-        assert_ne!(
-            deterministic_run_id("full-20260722", "globalcomix", "a"),
-            deterministic_run_id("full-20260722", "external2_env", "a")
-        );
-        assert!(deterministic_run_id("full-20260722", "tenant/db", "a").starts_with("catalog-v2-"));
-        assert_ne!(
-            deterministic_run_id("full-20260722", "a b", "items"),
-            deterministic_run_id("full-20260722", "a_20b", "items")
-        );
-        assert_ne!(
-            deterministic_run_id("a-b", "c", "d"),
-            deterministic_run_id("a", "b", "c-d")
-        );
     }
 
     #[test]
@@ -2913,7 +1541,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         let config = TableCatalogConfig {
             connections: CatalogConnectionConfig {
-                source: mysql_snapshot::MySqlConnectionConfig {
+                source: crate::mysql_config::MySqlConnectionConfig {
                     host: "unreachable-source".to_string(),
                     port: 3306,
                     user: "reader".to_string(),
@@ -3107,110 +1735,6 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
-    #[derive(Default)]
-    struct TestNamedLocks {
-        held: BTreeSet<String>,
-    }
-
-    impl NamedLockSet for TestNamedLocks {
-        type Reservation = Vec<String>;
-
-        fn try_reserve(&mut self, names: &[String]) -> Result<Option<Self::Reservation>, String> {
-            if names.iter().any(|name| self.held.contains(name)) {
-                return Ok(None);
-            }
-            self.held.extend(names.iter().cloned());
-            Ok(Some(names.to_vec()))
-        }
-    }
-
-    impl TestNamedLocks {
-        fn release(&mut self, names: Vec<String>) {
-            for name in names {
-                self.held.remove(&name);
-            }
-        }
-    }
-
-    #[test]
-    fn catalog_retry_uses_fresh_immutable_run_identity() {
-        let mut original = catalog_sync_test_config();
-        original.run_id_prefix = "catalog-original".to_string();
-        let mut retry = original.clone();
-        retry.run_id_prefix = "catalog-retry-20260724".to_string();
-        let entry = SyncableTableEntry {
-            name: "orphaned_rows".to_string(),
-            primary_key: vec!["id".to_string()],
-            primary_key_ordering: vec![table_sync::SyncPrimaryKeyOrdering::Native],
-            columns: vec!["id".to_string()],
-            estimated_source_rows: 1,
-            parent_dependencies: vec![],
-        };
-
-        let original_sync = catalog_table_sync_config(&original, &entry);
-        let retry_sync = catalog_table_sync_config(&retry, &entry);
-
-        assert_ne!(original_sync.run_id, retry_sync.run_id);
-    }
-
-    fn catalog_sync_test_config() -> SyncCatalogConfig {
-        SyncCatalogConfig {
-            connections: CatalogConnectionConfig {
-                source: mysql_snapshot::MySqlConnectionConfig {
-                    host: "source".to_string(),
-                    port: 3306,
-                    user: "reader".to_string(),
-                    password: "secret".to_string(),
-                    database: "source_db".to_string(),
-                },
-                target: live::TargetMySqlConfig {
-                    host: "target".to_string(),
-                    port: 25060,
-                    user: "writer".to_string(),
-                    password: "secret".to_string(),
-                    database: "target_db".to_string(),
-                    tls_ca_file: "/ca.pem".to_string(),
-                    insert_conflict_policy: live::InsertConflictPolicy::Error,
-                },
-            },
-            catalog: PathBuf::from("catalog.json"),
-            progress_table: "cdc.table_sync_runs".to_string(),
-            run_id_prefix: "catalog".to_string(),
-            chunk_size: 10_000,
-        }
-    }
-
-    fn active_run_row(run_id: &str, table: &str, target_database: &str) -> ActiveRunRow {
-        let scope = serde_json::json!({
-            "source_host": "source",
-            "source_port": 3306,
-            "source_database": "source_db",
-            "target_host": "target",
-            "target_port": 25060,
-            "target_database": target_database,
-            "insert_conflict_policy": "error",
-            "plan_hash": null,
-        });
-        ActiveRunRow {
-            run_id: run_id.into(),
-            table: table.into(),
-            run_spec_json: serde_json::json!({
-                "scope": scope.to_string(),
-                "table": {
-                    "name": table,
-                    "primary_key": ["id"],
-                    "columns": ["id"],
-                },
-                "chunk_size": 10000,
-                "mode": "apply",
-                "start_after": null,
-                "end_at": null,
-                "updated_since": null,
-            })
-            .to_string(),
-        }
-    }
-
     fn unique_catalog_test_directory(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "cdc-table-catalog-{label}-{}-{:?}",
@@ -3288,7 +1812,7 @@ mod tests {
         SyncableTableEntry {
             name: name.into(),
             primary_key: vec!["id".into()],
-            primary_key_ordering: vec![table_sync::SyncPrimaryKeyOrdering::Native],
+            primary_key_ordering: vec![PrimaryKeyOrdering::Native],
             columns: vec!["id".into()],
             estimated_source_rows: rows,
             parent_dependencies: parents.iter().map(|v| (*v).into()).collect(),

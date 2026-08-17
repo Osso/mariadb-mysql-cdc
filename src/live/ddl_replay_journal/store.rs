@@ -91,7 +91,6 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
             application_schema: &self.target.database,
             checkpoint_table: "cdc.stream_checkpoint",
             journal_table: &self.table,
-            conflict_table: "cdc.row_conflicts",
             inventory_procedure: &inventory_procedure,
         })
     }

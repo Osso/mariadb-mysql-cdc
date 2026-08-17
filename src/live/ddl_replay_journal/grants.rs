@@ -90,14 +90,12 @@ pub(crate) fn validate_runtime_grants(
     application_schema: &str,
     checkpoint_table: &str,
     journal_table: &str,
-    conflict_table: &str,
     inventory_procedure: &str,
 ) -> Result<(), String> {
     let policy = RuntimeGrantPolicy::new(
         application_schema,
         checkpoint_table,
         journal_table,
-        conflict_table,
         inventory_procedure,
     );
     let by_scope = collect_grants(grants, &policy)?;
@@ -125,7 +123,6 @@ struct RuntimeGrantPolicy {
     application_scope: String,
     checkpoint_scope: String,
     journal_scope: String,
-    conflict_scope: String,
     inventory_scope: String,
 }
 
@@ -134,14 +131,12 @@ impl RuntimeGrantPolicy {
         application_schema: &str,
         checkpoint_table: &str,
         journal_table: &str,
-        conflict_table: &str,
         inventory_procedure: &str,
     ) -> Self {
         Self {
             application_scope: format!("{application_schema}.*").to_ascii_uppercase(),
             checkpoint_scope: checkpoint_table.to_ascii_uppercase(),
             journal_scope: journal_table.to_ascii_uppercase(),
-            conflict_scope: conflict_table.to_ascii_uppercase(),
             inventory_scope: exact_procedure_scope(inventory_procedure),
         }
     }
@@ -171,10 +166,8 @@ impl RuntimeGrantPolicy {
         let privileges = match scope {
             scope if scope == self.checkpoint_scope => CHECKPOINT_PRIVILEGES,
             scope if scope == self.journal_scope => JOURNAL_PRIVILEGES,
-            scope if scope == self.conflict_scope => JOURNAL_PRIVILEGES,
             scope if scope == self.inventory_scope => EXECUTE_PRIVILEGES,
-            "CDC.TABLE_SYNC_RUNS" => CHECKPOINT_PRIVILEGES,
-            "PROCEDURE CDC.ROW_CONFLICTS_TRIGGER_INVENTORY" => EXECUTE_PRIVILEGES,
+            "CDC.SYNC_RUNS" => CHECKPOINT_PRIVILEGES,
             _ => return None,
         };
         Some(RuntimeGrantScope::Control(privileges))
@@ -245,7 +238,6 @@ fn validate_required_runtime_scopes(
     let required = [
         (&policy.checkpoint_scope, CHECKPOINT_PRIVILEGES),
         (&policy.journal_scope, JOURNAL_PRIVILEGES),
-        (&policy.conflict_scope, JOURNAL_PRIVILEGES),
         (&policy.inventory_scope, EXECUTE_PRIVILEGES),
         (&policy.application_scope, APPLICATION_DML_PRIVILEGES),
         (&policy.application_scope, APPLICATION_DDL_PRIVILEGES),

@@ -1,4 +1,5 @@
-use crate::snapshot::SnapshotRow;
+use crate::database_row::DatabaseRow;
+use crate::inventory::TableInventory;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -9,12 +10,17 @@ pub struct ValidationTable {
     pub columns: Vec<String>,
 }
 
-impl From<&crate::snapshot::SnapshotTable> for ValidationTable {
-    fn from(table: &crate::snapshot::SnapshotTable) -> Self {
+impl From<&TableInventory> for ValidationTable {
+    fn from(table: &TableInventory) -> Self {
         Self {
             name: table.name.clone(),
             primary_key: table.primary_key.clone(),
-            columns: table.columns.clone(),
+            columns: table
+                .columns
+                .iter()
+                .filter(|column| column.generated.is_none())
+                .map(|column| column.name.clone())
+                .collect(),
         }
     }
 }
@@ -87,7 +93,7 @@ pub trait ValidationReader {
         &self,
         request: &ChecksumRequest,
     ) -> Result<Vec<ChecksumSample>, ValidationError>;
-    fn read_rows(&self, request: &DivergenceRequest) -> Result<Vec<SnapshotRow>, ValidationError>;
+    fn read_rows(&self, request: &DivergenceRequest) -> Result<Vec<DatabaseRow>, ValidationError>;
 }
 
 #[derive(Debug)]
@@ -279,8 +285,8 @@ fn sample_keys(
 }
 
 fn compare_rows(
-    source_rows: Vec<SnapshotRow>,
-    target_rows: Vec<SnapshotRow>,
+    source_rows: Vec<DatabaseRow>,
+    target_rows: Vec<DatabaseRow>,
 ) -> Vec<RowDivergence> {
     let source_by_key = rows_by_key(source_rows);
     let target_by_key = rows_by_key(target_rows);
@@ -293,8 +299,8 @@ fn compare_rows(
 
 fn build_row_divergence(
     primary_key: Vec<String>,
-    source_by_key: &BTreeMap<Vec<String>, SnapshotRow>,
-    target_by_key: &BTreeMap<Vec<String>, SnapshotRow>,
+    source_by_key: &BTreeMap<Vec<String>, DatabaseRow>,
+    target_by_key: &BTreeMap<Vec<String>, DatabaseRow>,
 ) -> Option<RowDivergence> {
     match (
         source_by_key.get(&primary_key),
@@ -315,8 +321,8 @@ fn build_row_divergence(
 
 fn value_mismatch(
     primary_key: Vec<String>,
-    source: &SnapshotRow,
-    target: &SnapshotRow,
+    source: &DatabaseRow,
+    target: &DatabaseRow,
 ) -> Option<RowDivergence> {
     let differing_columns = differing_columns(&source.values, &target.values);
 
@@ -352,15 +358,15 @@ fn row_divergence(primary_key: Vec<String>, kind: RowDivergenceKind) -> RowDiver
     RowDivergence { primary_key, kind }
 }
 
-fn rows_by_key(rows: Vec<SnapshotRow>) -> BTreeMap<Vec<String>, SnapshotRow> {
+fn rows_by_key(rows: Vec<DatabaseRow>) -> BTreeMap<Vec<String>, DatabaseRow> {
     rows.into_iter()
         .map(|row| (row.primary_key.clone(), row))
         .collect()
 }
 
 fn row_keys(
-    source: &BTreeMap<Vec<String>, SnapshotRow>,
-    target: &BTreeMap<Vec<String>, SnapshotRow>,
+    source: &BTreeMap<Vec<String>, DatabaseRow>,
+    target: &BTreeMap<Vec<String>, DatabaseRow>,
 ) -> BTreeSet<Vec<String>> {
     source.keys().chain(target.keys()).cloned().collect()
 }
@@ -505,8 +511,8 @@ mod tests {
         }
     }
 
-    fn row(id: &str, name: &str) -> SnapshotRow {
-        SnapshotRow {
+    fn row(id: &str, name: &str) -> DatabaseRow {
+        DatabaseRow {
             primary_key: vec![id.to_string()],
             values: BTreeMap::from([
                 ("id".to_string(), Some(id.to_string())),
@@ -519,7 +525,7 @@ mod tests {
     struct FakeReader {
         count: u64,
         checksums: Vec<ChecksumSample>,
-        rows: Vec<SnapshotRow>,
+        rows: Vec<DatabaseRow>,
         last_request: RefCell<Option<DivergenceRequest>>,
     }
 
@@ -540,7 +546,7 @@ mod tests {
             }
         }
 
-        fn with_rows(rows: Vec<SnapshotRow>) -> Self {
+        fn with_rows(rows: Vec<DatabaseRow>) -> Self {
             Self {
                 rows,
                 ..Self::default()
@@ -563,7 +569,7 @@ mod tests {
         fn read_rows(
             &self,
             request: &DivergenceRequest,
-        ) -> Result<Vec<SnapshotRow>, ValidationError> {
+        ) -> Result<Vec<DatabaseRow>, ValidationError> {
             self.last_request.replace(Some(request.clone()));
             Ok(self.rows.clone())
         }

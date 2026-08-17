@@ -1,7 +1,7 @@
 # Schema Inventory
 
-Schema inventory captures the source database metadata needed before snapshot
-and CDC apply work begins.
+Schema inventory captures the source database metadata needed before staged
+`sync` and CDC apply work begins.
 
 Captured objects:
 
@@ -20,15 +20,15 @@ The inventory module exposes:
 
 - `SchemaInventory`: normalized metadata model, including foreign-key edges.
 - `ForeignKeyInventory`: ordered child and referenced column mappings used by
-  table-catalog scheduling and table-sync parent repair.
+  table-catalog classification and unified-sync dependency ordering.
 - `InventoryReader`: trait for reading source metadata.
 - `MariaDbInventoryReader`: `mariadb` CLI backed reader using
   `information_schema`.
 
 The CLI reader uses read-only `SELECT` statements against `information_schema`.
-Table-sync merges local FK edges from source and target inventories; target-only
-local constraints therefore participate in exact parent discovery, while
-cross-schema edges are excluded from this runtime repair path.
+Unified sync merges local FK edges from source and target inventories; target-only
+local constraints therefore participate in dependency ordering, while
+cross-schema edges are excluded from unified-sync dependency ordering.
 
 ## Cross-engine visibility compatibility
 
@@ -45,8 +45,8 @@ paths have been removed.
 
 The live GlobalComix source MariaDB (`source-mariadb.example` /
 `192.0.2.10`) is plaintext-only by accepted operational policy. CDC source
-inventory, snapshot, stream, repair, and sync-table connections must use an
-explicit plaintext source mode for this endpoint. Do not require a source CA,
+inventory, staged sync, and stream connections must use an explicit plaintext
+source mode for this endpoint. Do not require a source CA,
 do not attempt opportunistic TLS-to-plaintext fallback, and do not treat
 source CA absence as an error for the current source.
 

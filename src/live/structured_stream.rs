@@ -13,16 +13,12 @@ use super::{
     ApplyBinlogConfig, ApplyBinlogError, QuarantineRecorder, RecordingQuarantine,
     SourceBinlogConfig,
 };
-use crate::conflict_repair::MySqlConflictStore;
 use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
     SourceBinlogSettings, build_inventory,
 };
 use crate::probe::BinlogCoordinate;
-use crate::row::{
-    DeleteRowsEvent, RowApplier, RowConflictContext, RowImage, RowTableMap, RowUpdate,
-    TableMapEvent,
-};
+use crate::row::{DeleteRowsEvent, RowApplier, RowImage, RowTableMap, RowUpdate, TableMapEvent};
 use crate::statement::{StatementApplier, StatementEvent, StatementOutcome};
 use crate::target::{TargetExecutor, TransactionalTargetExecutor};
 use mysql::Value;
@@ -45,29 +41,24 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::progress::{StreamProgress, format_stream_progress};
-use super::reconnect::{StreamCheckpointStore, run_stream_reconnect_loop_with_recovery};
+use super::reconnect::{StreamCheckpointStore, run_stream_reconnect_loop};
 
 const DEFAULT_REPLICA_SERVER_ID: u32 = 65_535;
 const MYSQL_CDC_HEARTBEAT_SECONDS: u64 = 30;
 // Bounds read-ahead memory while keeping the source socket drained during slow
 // applies, so the server's net_write_timeout does not kill the dump connection.
 const READ_AHEAD_EVENT_BUFFER: usize = 1024;
+const PARALLEL_TARGET_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MYSQL_COLUMN_TYPE_ENUM: u8 = 247;
 const MYSQL_COLUMN_TYPE_SET: u8 = 248;
 const MYSQL_COLUMN_TYPE_STRING: u8 = 254;
 const MILLIS_PER_SECOND: u64 = 1_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 mod ddl;
-mod derived_fk_fastforward;
 mod event;
-mod foreign_key_repair;
 mod init;
 mod rows;
 mod schema;
-mod superseded_insert;
-mod superseded_source;
-mod superseded_verifier;
-pub(crate) use superseded_verifier::is_superseded_identity_scope;
 mod token;
 mod transaction;
 mod value;
