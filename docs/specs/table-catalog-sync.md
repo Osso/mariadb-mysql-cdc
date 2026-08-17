@@ -20,7 +20,7 @@ in [the table catalog sync wiki](../wiki/systems/table-catalog-sync.md).
 ### Catalog execution
 
 - [x] `sync-catalog` reads the supplied syncable JSON and invokes one unified `sync` run, blocking until the staged operation completes or fails; `table-catalog` only writes catalogs and does not start sync or dump work.
-- [x] Map every catalog table into one unified `SyncConfig` with the catalog source/target, ordered table names, configured chunk size, bounded catalog parallelism, configured progress table, and shared `--run-id-prefix` identity.
+- [x] Map every catalog table into one unified `SyncConfig` with the catalog source/target, ordered table names, configured chunk size, bounded catalog parallelism, `cdc.sync_runs` by default (overridable with `--progress-table`), and shared `--run-id-prefix` identity.
 - [x] Persist one immutable run identity and staged progress in `cdc.sync_runs`; schema prerequisites, locked source-authoritative row chunks, and final constraints are owned by unified sync.
 - [x] Do not run the removed per-table catalog scheduler, admission locks, child run IDs, dependency gating, target-only repair verification, or per-table progress handling. The unified prerequisite schema stage removes blocking target constraints before row execution; unified bounded row workers then execute the selected scope.
 - [x] Read catalog JSON without mutating it and never execute full dumps; the non-syncable catalog is classification/operator input only.

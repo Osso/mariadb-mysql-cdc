@@ -313,9 +313,9 @@ there is no dry-run/plan mode and `table-catalog` does not launch it. The comman
 waits until the unified staged run completes or fails. Every catalog table is
 mapped into one `SyncConfig` with the configured source and target, ordered table
 scope, chunk size, bounded catalog parallelism, progress table, and shared
-non-empty `--run-id-prefix`. Unified sync derives one immutable run identity and
-persists schema-stage, row-stage, and final-constraint progress in
-`cdc.sync_runs`.
+non-empty `--run-id-prefix`. Unless `--progress-table` overrides it,
+sync-catalog uses `cdc.sync_runs`. Unified sync derives one immutable run identity
+and persists schema-stage, row-stage, and final-constraint progress there.
 
 The unified run owns prerequisite schema convergence, locked source-authoritative
 row chunks, bounded row workers, and final constraint convergence. The removed
@@ -324,12 +324,13 @@ IDs, target-only repair verification, and per-table progress handling are not
 used. Catalog FK metadata still classifies syncable scope; it does not create
 separate child runs. `resync-stream` now uses this unified path with one captured
 source evidence set, a fixed `resync-stream:<source_identity>` run identity, and
-no legacy repair phases or post-write target-inventory drift scan.
+`cdc.sync_runs` progress. It has no legacy repair phases or post-write
+target-inventory drift scan.
 `recover-lost-binlog` now uses the same staged engine with one captured source
-evidence set and exact `recovery_id` progress across every source table. Prepared
-evidence is source-only. Recovery proof requires complete exact run/table
-progress plus an unchanged source scope; it does not capture a target final
-inventory or run a post-write drift scan. The stream lease, authorization,
+evidence set, exact `recovery_id` progress across every source table, and
+`cdc.sync_runs` progress. Prepared evidence is source-only. Recovery proof
+requires complete exact run/table progress plus an unchanged source scope; it
+does not capture a target final inventory or run a post-write drift scan. The stream lease, authorization,
 checkpoint/barrier revalidation, and atomic recovery transaction remain in
 place. This documents code behavior only; deployment and production execution
 are not claimed. The non-syncable catalog is classification/operator input only;
@@ -351,46 +352,17 @@ verification when changing source transport. See [connection policy](docs/schema
 
 ## Insert conflict policy
 
-`--insert-conflict-policy` applies to statement replay and out-of-band
-snapshot/table-sync paths. Values are `error`, `ignore-duplicate`, and
-`replace-divergent-pk`:
+`--insert-conflict-policy` applies to statement replay. Values are `error`,
+`ignore-duplicate`, and `replace-divergent-pk`:
 
 - Generic target execution treats MySQL `1062` as success only for statements
   beginning with `INSERT INTO` under `ignore-duplicate`.
 - Native ROW streaming does not use this policy. Its fixed rule accepts INSERT
   `1062` and fails every other row error.
-- Snapshot modes may explicitly select upsert or duplicate-ignore behavior.
-- Table-sync missing-row and displaced-owner repair retains its bounded,
-  verified `replace-divergent-pk` behavior.
-
-`sync-table --mode missing-primary-keys` is apply-only: it compares source and
-target rows by primary key, inserts source rows whose primary keys are absent,
-and never deletes dependent rows. With `replace-divergent-pk`, an exact one-hop
-displacement is repaired transactionally: the displaced target owner is restored
-from the same source chunk, the missing owner is inserted, affected child rows
-are verified unchanged, and run progress commits on the same target connection.
-Ambiguous chains, absent source owners, verification failures, and constraint
-failures roll back parents and progress. Other conflicts remain errors. The
-sync-table source, target, and progress connections use a 10-second TCP connect
-timeout and 30-second read/write operation timeouts. All MySQL connections
-share TCP liveness bounds; live CDC/DDL connections do not use the sync
-operation timeouts. Transient connection failures retry up to five attempts
-total (the initial attempt plus four retries), with each retry resuming from
-durable `cdc.table_sync_runs` progress; non-transient errors and exhausted
-retries fail.
+- Unified sync is source-authoritative and uses strict insert/update/delete
+  mutations; its staged progress defaults to `cdc.sync_runs`.
 
 The default policy is `error`.
-
-`sync-table` requires `--run-id` and stores resumable state in
-`cdc.table_sync_runs` by default. A new recurrence needs a new ID; direct
-`sync-table` reuse is allowed only for the exact interrupted run. In apply mode,
-`repair-drift` may reclaim exactly one failed `missing-primary-keys` child whose
-full immutable specification matches the current insert phase. The claim uses a
-per-transaction `REPEATABLE READ` transaction with `FOR UPDATE` candidate
-locking; ambiguity fails closed. `repair-drift` otherwise creates a fresh
-orchestration ID, derives FK-safe phase order, and accepts bounded
-`--start-after`/`--end-at` windows. Each completed chunk is verified before
-its cursor and counters are persisted.
 
 `--stop-position` is an inclusive event-end boundary: the event whose
 `end_log_pos` equals the requested position is applied and durably checkpointed,
@@ -402,4 +374,4 @@ MariaDB compatibility. That value is not proof that a MySQL target index is
 visible; inspect target-native visibility before admitting affected index DDL, or
 leave it in the journal's translation-pending barrier.
 
-See [Catchup Workflow](docs/catchup.md) for bounded repair rules.
+See [Unified sync](docs/specs/unified-sync.md) for staged synchronization rules.

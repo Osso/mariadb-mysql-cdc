@@ -21,9 +21,9 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - [x] Invoke bounded row workers between the two schema stages.
 - [x] Expose the orchestration through one `sync` CLI and reject `catchup-snapshot`, `sync-table`, and `repair-drift` as unknown commands rather than aliasing them.
 - [x] Require exactly one immutable `--run-id` or `--run-id-prefix`; default progress persistence to `cdc.sync_runs` and support repeated `--table`, `--chunk-size`, `--parallelism`, and `--progress-table` options.
-- [x] Route `sync-catalog` through one unified run with shared immutable identity and `cdc.sync_runs` progress.
-- [x] Route `resync-stream` through one unified run with the fixed `resync-stream:<source_identity>` run identity.
-- [x] Route `recover-lost-binlog` through one unified run with exact `recovery_id`, captured source evidence, and exact source-table progress proof.
+- [x] Route `sync-catalog` through one unified run with shared immutable identity and `cdc.sync_runs` progress; `--progress-table` may override this default.
+- [x] Route `resync-stream` through one unified run with the fixed `resync-stream:<source_identity>` run identity and `cdc.sync_runs` progress.
+- [x] Route `recover-lost-binlog` through one unified run with exact `recovery_id`, captured source evidence, exact source-table progress proof, and `cdc.sync_runs` progress.
 - [ ] Prove resync/recovery source-evidence capture and complete staged execution through disposable production-shaped endpoints.
 
 ### Schema and progress contracts
