@@ -308,45 +308,23 @@ the second write over the first. If both destinations were nonexistent, a failed
 final identity check may leave an empty newly created file, but never overwrites
 existing content.
 
-`sync-catalog` reads only the syncable catalog and starts apply mode immediately;
+`sync-catalog` reads only the syncable catalog and invokes one unified sync run;
 there is no dry-run/plan mode and `table-catalog` does not launch it. The command
-waits until all entries complete or a failure is returned. Each table uses a
-fixed-length `catalog-v2-<SHA-256 hex>` run ID. The digest input is the
-injective length-framed byte tuple `(run-id prefix, target database, table)`, so
-prefix, database, and table changes produce distinct deterministic IDs while
-long valid names still fit the 128-byte progress column. The prefix is required
-and non-empty. Interrupted exact IDs resume; a matching `status='complete'` row
-is terminal only when its immutable run specification exactly matches the current
-catalog child; a different stored specification fails closed instead of being
-treated as terminal. Direct `sync-table` and
-`sync-catalog` workers share one admission lock and four slot reservations keyed
-by the lower-cased target host plus port, so databases on the same host and port
-share capacity. Each worker also holds a database/table-specific reservation,
-preventing same-table overlap. Database and table components are length-framed
-and hexadecimal-encoded, so delimiters inside identifiers cannot alias another
-reservation. These admission and slot locks are scoped to the
-target server host and port. Legacy run-lock accounting and same-table detection
-inspect only the configured progress table. Within that table, identity is
-derived from the immutable run specification's `scope.target_database` and
-`table.name`, not from `table_name` alone, so same-named tables in different target
-databases remain distinct and cannot satisfy each other's dependencies. A held
-legacy run-ID advisory lock for the requested same database/table excludes that
-table even without a table reservation. Rows in `running`, `complete`, or
-`error` with a held legacy run-ID advisory lock but no table reservation count
-toward the same four-worker limit, including rows for tables outside the supplied
-catalog. Unlocked stale `running` or `error` rows are ignored before parsing their
-immutable specifications. Lock-active rows fail closed when malformed. An
-expected completed child is always parsed and must exactly match its immutable
-specification before it is treated as terminal. Reservation sessions set MySQL `wait_timeout` to
-86,400 seconds so an idle lock connection can span long table runs; this does not
-provide recovery from network disconnects. Children start only after all listed FK parents complete. Missing
-dependencies are rejected before workers start; owned failures return after owned
-work settles, and dependency cycles fail closed without waiting for unrelated
-external syncs. Catalog children reconcile every target-only row planned by
-catalog comparison in dependency-safe chunks, verify each deletion, and persist
-progress only after verification. The same unconditional chunk reconciliation
-applies to direct `sync-table` and `repair-drift`; the non-syncable catalog is
-classification/operator input only; full-dump execution is out of scope.
+waits until the unified staged run completes or fails. Every catalog table is
+mapped into one `SyncConfig` with the configured source and target, ordered table
+scope, chunk size, bounded catalog parallelism, progress table, and shared
+non-empty `--run-id-prefix`. Unified sync derives one immutable run identity and
+persists schema-stage, row-stage, and final-constraint progress in
+`cdc.sync_runs`.
+
+The unified run owns prerequisite schema convergence, locked source-authoritative
+row chunks, bounded row workers, and final constraint convergence. The removed
+catalog-specific dependency scheduler, admission locks, deterministic child run
+IDs, target-only repair verification, and per-table progress handling are not
+used. Catalog FK metadata still classifies syncable scope; it does not create
+separate child runs. Recovery and resync callers remain separate migration work.
+The non-syncable catalog is classification/operator input only; full-dump
+execution is out of scope.
 
 ## TLS policy
 

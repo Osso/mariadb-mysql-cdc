@@ -21,7 +21,8 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - [x] Invoke bounded row workers between the two schema stages.
 - [x] Expose the orchestration through one `sync` CLI and reject `catchup-snapshot`, `sync-table`, and `repair-drift` as unknown commands rather than aliasing them.
 - [x] Require exactly one immutable `--run-id` or `--run-id-prefix`; default progress persistence to `cdc.sync_runs` and support repeated `--table`, `--chunk-size`, `--parallelism`, and `--progress-table` options.
-- [ ] Route lost-binlog recovery, resync, catalog, and other callers through unified sync.
+- [x] Route `sync-catalog` through one unified run with shared immutable identity and `cdc.sync_runs` progress.
+- [ ] Route lost-binlog recovery, resync, and other callers through unified sync.
 
 ### Schema and progress contracts
 
@@ -46,6 +47,7 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - `src/sync/mysql.rs` — source, locked target-session, and separate progress-store adapters.
 - `src/sync/progress.rs` — `cdc.sync_runs` SQL and progress serialization.
 - `src/sync_schema.rs` — source evidence reads plus prerequisite and final schema-stage planning/execution.
+- `src/table_catalog.rs` — catalog validation and one-run `SyncConfig` mapping for `sync-catalog`.
 
 ## Tests asserting this spec
 
@@ -58,7 +60,8 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 
 ## Known gaps (current cycle)
 
-- [ ] Migrate recovery, resync, catalog, scripts, fixtures, grants, harnesses, and ops callers.
+- [ ] Migrate recovery, resync, scripts, fixtures, grants, harnesses, and ops callers.
+- [ ] Prove the complete catalog-to-unified MySQL path against disposable endpoints.
 - [ ] Delete legacy production engines and progress paths.
 - [ ] Run full-project tests, Clippy without warning suppression, and final integration verification.
 
