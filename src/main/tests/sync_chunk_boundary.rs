@@ -1,7 +1,7 @@
 use crate::snapshot::SnapshotRow;
 use crate::sync::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
-    SyncChunkSource, SyncChunkTargetSession, SyncTable, sync_next_chunk,
+    SyncChunkSource, SyncChunkTargetSession, SyncPrimaryKeyOrdering, SyncTable, sync_next_chunk,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -871,6 +871,7 @@ fn config(chunk_size: usize) -> SyncChunkConfig {
         table: SyncTable {
             name: "widgets".to_string(),
             primary_key: vec!["id".to_string()],
+            primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
             columns: vec!["id".to_string(), "name".to_string()],
         },
         chunk_size,

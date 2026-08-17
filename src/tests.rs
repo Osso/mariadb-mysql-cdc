@@ -14,6 +14,13 @@ mod sync_chunk_boundary {
     ));
 }
 
+mod sync_mysql_contract {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_mysql_contract.rs"
+    ));
+}
+
 #[test]
 fn usage_documents_parallel_target_transaction_option() {
     assert!(USAGE.contains("--target-parallel-transactions COUNT"));
