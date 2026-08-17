@@ -152,3 +152,72 @@ fn normalize_fk_rule(rule: &str) -> String {
         rule.to_ascii_uppercase()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_inventory_preserves_schema_columns_and_rules() {
+        let inventory =
+            canonicalize_foreign_keys(vec![foreign_key_row("children", "RESTRICT", "CASCADE")])
+                .expect("canonical inventory");
+
+        assert_eq!(inventory[0].child_schema, "app");
+        assert_eq!(inventory[0].parent_schema, "app");
+        assert_eq!(inventory[0].child_columns, vec!["parent_id"]);
+        assert_eq!(inventory[0].parent_columns, vec!["id"]);
+        assert_eq!(inventory[0].delete_rule, "CASCADE");
+        assert!(inventory[0].enforced);
+    }
+
+    #[test]
+    fn same_constraint_name_remains_distinct_across_child_tables() {
+        let inventory = canonicalize_foreign_keys(vec![
+            foreign_key_row("child_a", "RESTRICT", "CASCADE"),
+            foreign_key_row("child_b", "RESTRICT", "CASCADE"),
+        ])
+        .expect("canonical inventory");
+
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|foreign_key| foreign_key.child_table.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child_a", "child_b"]
+        );
+    }
+
+    #[test]
+    fn no_action_rules_normalize_to_restrict() {
+        let canonical =
+            canonicalize_foreign_keys(vec![foreign_key_row("children", "NO ACTION", "NO ACTION")])
+                .expect("canonical foreign key");
+
+        assert_eq!(canonical[0].update_rule, "RESTRICT");
+        assert_eq!(canonical[0].delete_rule, "RESTRICT");
+    }
+
+    fn foreign_key_row(
+        child_table: &str,
+        update_rule: &str,
+        delete_rule: &str,
+    ) -> CanonicalForeignKeyRow {
+        CanonicalForeignKeyRow {
+            constraint_schema: "app".to_string(),
+            constraint_name: "parent_fk".to_string(),
+            child_schema: "app".to_string(),
+            child_table: child_table.to_string(),
+            child_column: "parent_id".to_string(),
+            ordinal_position: 1,
+            parent_schema: "app".to_string(),
+            parent_table: "parents".to_string(),
+            parent_column: "id".to_string(),
+            update_rule: update_rule.to_string(),
+            delete_rule: delete_rule.to_string(),
+            match_option: "NONE".to_string(),
+            enforced: true,
+        }
+    }
+}
