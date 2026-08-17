@@ -23,50 +23,20 @@ For a ROW update that changes its primary key, the assignments cover every
 writable, non-generated after-image column and the predicates cover every
 before-image primary-key column.
 
-## Insert conflict policy boundary
+## Live row-error boundary
 
-`--insert-conflict-policy` accepts `error`, `ignore-duplicate`, and
-`replace-divergent-pk`. Generic target execution only ignores `1062` INSERT
-errors under `ignore-duplicate`; it never performs replacement. Native ROW
-`INSERT` duplicates under `ignore-duplicate` continue only after exact source/target
-primary-key row equality. Under `replace-divergent-pk`, an unequal row is
-replaced only for a `PRIMARY` duplicate when the source-PK lookup returns exactly
-one row and the in-place primary-key UPDATE matches exactly one target row. Missing
-or multiple lookup rows, zero/multiple matched rows, and update failures persist
-evidence and abort without checkpoint advancement. The accepted overwrite risk is
-explicit; replacement evidence is durable and a successful replacement can
-checkpoint. Foreign-key, CHECK, and replacement-update conflicts persist evidence
-and abort, rolling back the target transaction/checkpoint. Secondary-unique
-conflicts follow that same path except the narrow superseded historical
-`globalcomix.users`/`users.name`, `globalcomix.comics`/`comics.slug`, and the
-approved `globalcomix.releases` FK `ROW INSERT` proofs: exactly one candidate
-is allowed, and any ordinary conflict mixed into the source transaction fails
-closed. The live stream reads `SHOW
-MASTER STATUS` before one source consistent snapshot; that pre-snapshot
-coordinate is a conservative lower bound and must be beyond the candidate
-transaction. The users proof requires complete source/target PK and unique-owner
-convergence from that snapshot plus active-transaction `SELECT ... FOR UPDATE`
-reads. The comics proof requires complete current primary-row equality, while
-accepting the locked unique owner by exact PK+slug identity despite unrelated
-mutable-field drift. If typed verification finds that the source primary still
-owns the historical identity, it records ordinary unresolved reconciliation debt,
-runs no superseded repair SQL, and commits the remaining transaction with its XID
-checkpoint; other proof or evidence failures still roll back. The releases proof is limited to category
-`mysqld-bin.002709:515816736–515824875` (`releases_ibfk_2`) and visibility
-`mysqld-bin.002709:531921570–531929925` (`releases_ibfk_3`, candidate event
-`531921789`) with exact FK identity. It retains the historical release image,
-requires later source history and exact current source/target release and parent
-identities, installs the complete current release row only when the target row is
-absent, and otherwise requires target equality; the parent identity is preserved
-without parent updates or deletes. All approved paths then require an existing
-same-file checkpoint predecessor before the candidate and no later than the XID. Only then does it commit
-remaining source-transaction rows, exact observation/resolution evidence, and
-the XID checkpoint atomically. Any failed proof, predecessor, or commit rolls
-back, then persists all unresolved observations independently; rollback or
-persistence failures are surfaced. If a later conflict rolls back the enclosing
-transaction, the replacement rolls back but the independent ledger evidence
-remains. The default `error` policy fails native
-row duplicates.
+Native ROW streaming always emits a plain `INSERT`. MySQL `1062` from that
+INSERT is idempotent success without a target read, equality proof, replacement,
+ledger write, or repair attempt. The stream continues with later statements in
+the same source transaction.
+
+Every other native row error is returned to the transaction layer. Non-INSERT
+`1062`, foreign-key, CHECK, schema, generated-column, and connection failures
+roll back the complete source transaction and block its checkpoint.
+
+`--insert-conflict-policy` controls generic statement execution and offline
+snapshot/table-sync behavior only. It does not select a native ROW live-stream
+policy.
 
 Snapshot/catchup writes may still use `INSERT IGNORE` where their configured
 snapshot mode requests duplicate-ignore. Normal table-sync range repairs do

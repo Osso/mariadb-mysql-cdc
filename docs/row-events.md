@@ -21,57 +21,20 @@ The applier translates full row images into target DML:
   not change, only changed writable columns need assignment.
 - `DeleteRowsEvent` uses every before-image primary-key column for `DELETE`.
 
-Each row statement runs inside the target transaction. Supported constraint
-conflicts are recorded in the independent conflict ledger, then returned as row
-failures; the target transaction and its live checkpoint are not advanced.
-Repeating the same source event updates the same conflict record, while a
-different source primary key gets a different record.
+Each row statement runs inside the target transaction. A native ROW `INSERT` that
+returns MySQL `1062` is treated as idempotent success. The stream does not read,
+compare, replace, or repair the target row and does not write conflict-ledger
+evidence. Later statements in the same source transaction continue.
 
-`--insert-conflict-policy` accepts `error`, `ignore-duplicate`, and
-`replace-divergent-pk`. For a ROW `INSERT`, `ignore-duplicate` continues without
-ledger evidence only when the target row fetched by source primary key exactly
-equals the source row. `replace-divergent-pk` replaces an unequal row only when
-MySQL reports `PRIMARY`, using a primary-key UPDATE of the source image; it
-records durable replacement evidence and allows checkpoint advancement. The
-accepted risk is overwriting the divergent target row. Foreign-key, CHECK, and
-replacement-update conflicts persist evidence and abort. Secondary-unique
-conflicts do too, except the narrow superseded historical
-`globalcomix.users`/`users.name`, `globalcomix.comics`/`comics.slug`, and
-approved `globalcomix.releases` FK `ROW INSERT` proofs: exactly one candidate is
-allowed, and any ordinary conflict mixed into the source transaction fails
-closed. The stream reads `SHOW MASTER
-STATUS` before one source consistent snapshot; that pre-snapshot coordinate is a
-conservative lower bound and must be beyond the candidate transaction. The users
-proof requires complete source/target convergence for the historical PK and
-current unique owner using active-transaction `SELECT ... FOR UPDATE`. The
-comics proof requires complete current primary-row equality, while accepting the
-locked unique owner by exact PK+slug identity despite unrelated mutable-field
-drift. If typed verification finds that the source primary still owns the historical
-identity, it records ordinary unresolved reconciliation debt, runs no superseded repair
-SQL, and commits the remaining transaction with its XID checkpoint; other proof or
-evidence failures still roll back. The releases proof accepts only `releases_ibfk_2` at
-`mysqld-bin.002709:515816736–515824875` or `releases_ibfk_3` at
-`mysqld-bin.002709:531921570–531929925` (visibility candidate event
-`531921789`) with exact FK child/parent identity. It retains the complete
-historical release image, requires changed later source parent history plus
-exact current source/target release and parent identities, installs the complete
-current release row only when absent, and otherwise requires target equality;
-the parent is never updated or deleted. All approved paths then require an
-existing same-file checkpoint predecessor before the candidate and no later than
-the XID. Only then does it commit the remaining
-source-transaction rows, exact observation/resolution evidence, and XID
-checkpoint atomically. Any proof, predecessor, or commit failure rolls back,
-then persists all unresolved observations independently; rollback or persistence
-failures are surfaced. If a later conflict rolls back the target transaction,
-the replacement rolls back but its independent ledger observation survives. Supported non-duplicate constraint
-conflicts remain durable repair debt regardless of this policy.
+Every other row error is transaction-fatal. This includes non-`INSERT` `1062`,
+foreign-key and CHECK failures, schema mismatches that reach execution, connection
+errors, and generated-column failures. The target transaction rolls back and its
+checkpoint does not advance.
 
-`--insert-conflict-policy ignore-duplicate` applies to this native ROW path.
-A MySQL `1062` from either a ROW `INSERT` or `UPDATE` is logged as skipped,
-without durable conflict evidence, so the target transaction and checkpoint can
-advance. With the default `error` policy, the duplicate fails the row event and
-blocks checkpoint advancement. Supported non-duplicate constraint conflicts
-remain durable repair debt regardless of this policy.
+`--insert-conflict-policy` remains an offline statement/snapshot and table-sync
+setting. It does not change native ROW streaming behavior. Live supersession,
+conflict-ledger, target-equality, row-replacement, and automatic parent-recovery
+paths do not exist.
 
 Primary-key values are extracted from the table map's primary-key columns. A row
 event with no table map, no primary key, or a missing primary-key value fails

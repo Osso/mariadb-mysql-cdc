@@ -1,8 +1,11 @@
 use super::parallel_target::{
-    ParallelTargetTransaction, ParallelTransactionPool, SubmittedQueryConnectionFactory,
+    ParallelTargetStatement, ParallelTargetStatementKind, ParallelTargetTransaction,
+    ParallelTransactionPool, SubmittedQueryConnectionFactory,
 };
 use crate::checkpoint::Checkpoint;
-use crate::target::{SqlStatement, TargetExecuteError, render_submitted_sql_statement};
+use crate::target::{
+    SqlStatement, TargetExecuteError, TargetRowChange, render_submitted_sql_statement,
+};
 
 pub(crate) struct ParallelTargetWriter<F>
 where
@@ -15,7 +18,7 @@ where
 
 #[derive(Default)]
 struct BufferedTargetTransaction {
-    statements: Vec<String>,
+    statements: Vec<ParallelTargetStatement>,
     checkpoint_sql: Option<String>,
     checkpoint: Option<Checkpoint>,
 }
@@ -48,16 +51,18 @@ where
     }
 
     pub(crate) fn execute(&mut self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
-        let rendered = render_submitted_sql_statement(statement)?;
-        self.active_mut()?.statements.push(rendered);
-        Ok(())
+        self.buffer_statement(statement, ParallelTargetStatementKind::Other)
+    }
+
+    pub(crate) fn execute_row_change(
+        &mut self,
+        change: &TargetRowChange,
+    ) -> Result<(), TargetExecuteError> {
+        self.buffer_statement(&change.statement, change.kind.into())
     }
 
     pub(crate) fn logical_checkpoint(&self) -> Checkpoint {
-        self.active
-            .as_ref()
-            .and_then(|transaction| transaction.checkpoint.clone())
-            .unwrap_or_else(|| self.logical_checkpoint.clone())
+        self.logical_checkpoint.clone()
     }
 
     pub(crate) fn save_checkpoint(
@@ -90,12 +95,11 @@ where
             TargetExecuteError::new("parallel target transaction has no checkpoint")
         })?;
         let submitted = ParallelTargetTransaction {
-            body_sql: transaction_body_sql(&transaction.statements),
+            statements: transaction.statements,
             commit_sql: transaction_commit_sql(&checkpoint_sql),
             checkpoint: checkpoint.clone(),
         };
         self.pool.submit(submitted)?;
-        self.logical_checkpoint = checkpoint;
         Ok(())
     }
 
@@ -120,16 +124,32 @@ where
     pub(crate) fn take_committed_checkpoints(
         &mut self,
     ) -> Result<Vec<Checkpoint>, TargetExecuteError> {
-        Ok(self
+        let checkpoints = self
             .pool
             .take_committed()?
             .into_iter()
             .map(|transaction| transaction.checkpoint)
-            .collect())
+            .collect::<Vec<_>>();
+        if let Some(checkpoint) = checkpoints.last() {
+            self.logical_checkpoint.clone_from(checkpoint);
+        }
+        Ok(checkpoints)
     }
 
     pub(crate) fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    fn buffer_statement(
+        &mut self,
+        statement: &SqlStatement,
+        kind: ParallelTargetStatementKind,
+    ) -> Result<(), TargetExecuteError> {
+        let sql = render_submitted_sql_statement(statement)?;
+        self.active_mut()?
+            .statements
+            .push(ParallelTargetStatement { sql, kind });
+        Ok(())
     }
 
     fn active_mut(&mut self) -> Result<&mut BufferedTargetTransaction, TargetExecuteError> {
@@ -137,15 +157,6 @@ where
             .as_mut()
             .ok_or_else(|| TargetExecuteError::new("parallel target transaction is not active"))
     }
-}
-
-fn transaction_body_sql(statements: &[String]) -> String {
-    let mut sql = String::from("BEGIN");
-    for statement in statements {
-        sql.push_str(";\n");
-        sql.push_str(statement);
-    }
-    sql
 }
 
 fn transaction_commit_sql(checkpoint_sql: &str) -> String {
@@ -157,7 +168,7 @@ mod tests {
     use super::ParallelTargetWriter;
     use crate::checkpoint::{Checkpoint, LastEvent};
     use crate::live::parallel_target::{SubmittedQueryConnection, SubmittedQueryConnectionFactory};
-    use crate::target::{SqlStatement, TargetExecuteError};
+    use crate::target::{SqlStatement, TargetExecuteError, TargetRowChange, TargetRowChangeKind};
     use mysql::Value;
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::time::Duration;
@@ -204,15 +215,19 @@ mod tests {
     }
 
     #[test]
-    fn submits_one_body_batch_and_one_ordered_commit_batch() {
+    fn submits_individual_body_statements_and_one_ordered_commit_batch() {
         let (sent, submitted) = mpsc::channel();
         let initial = checkpoint(4);
         let mut writer = ParallelTargetWriter::new(1, RecordingFactory { sent }, initial)
             .expect("create writer");
 
         writer.begin().expect("begin transaction");
-        writer.execute(&insert(1)).expect("buffer first insert");
-        writer.execute(&insert(2)).expect("buffer second insert");
+        writer
+            .execute_row_change(&insert_change(1))
+            .expect("buffer first insert");
+        writer
+            .execute_row_change(&insert_change(2))
+            .expect("buffer second insert");
         writer
             .save_checkpoint(
                 "cdc.stream_checkpoint",
@@ -223,9 +238,14 @@ mod tests {
         writer.commit().expect("submit transaction");
         writer.wait_for_all().expect("finish transaction");
 
+        assert_eq!(receive(&submitted), "BEGIN");
         assert_eq!(
             receive(&submitted),
-            "BEGIN;\nINSERT INTO `events` (`id`) VALUES (1);\nINSERT INTO `events` (`id`) VALUES (2)"
+            "INSERT INTO `events` (`id`) VALUES (1)"
+        );
+        assert_eq!(
+            receive(&submitted),
+            "INSERT INTO `events` (`id`) VALUES (2)"
         );
         let commit = receive(&submitted);
         assert!(commit.starts_with(
@@ -236,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_checkpoint_advances_after_accepted_body_send() {
+    fn logical_checkpoint_advances_only_after_ordered_commit_completion() {
         let (sent, _submitted) = mpsc::channel();
         let initial = checkpoint(4);
         let mut writer = ParallelTargetWriter::new(1, RecordingFactory { sent }, initial)
@@ -251,10 +271,19 @@ mod tests {
                 &checkpoint(200),
             )
             .expect("buffer checkpoint");
-        assert_eq!(writer.logical_checkpoint().source_position, 200);
+        assert_eq!(writer.logical_checkpoint().source_position, 4);
         writer.commit().expect("submit transaction");
-        assert_eq!(writer.logical_checkpoint().source_position, 200);
+        assert_eq!(writer.logical_checkpoint().source_position, 4);
         writer.wait_for_all().expect("finish transaction");
+        assert_eq!(writer.logical_checkpoint().source_position, 4);
+        assert_eq!(
+            writer
+                .take_committed_checkpoints()
+                .expect("drain commits")
+                .len(),
+            1
+        );
+        assert_eq!(writer.logical_checkpoint().source_position, 200);
     }
 
     fn receive(submitted: &Receiver<String>) -> String {
@@ -267,6 +296,14 @@ mod tests {
         SqlStatement {
             sql: "INSERT INTO `events` (`id`) VALUES (?)".to_string(),
             params: vec![Value::UInt(id)],
+        }
+    }
+
+    fn insert_change(id: u64) -> TargetRowChange {
+        TargetRowChange {
+            statement: insert(id),
+            kind: TargetRowChangeKind::Insert,
+            table: "events".to_string(),
         }
     }
 

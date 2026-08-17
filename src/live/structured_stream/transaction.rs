@@ -24,86 +24,12 @@ impl Default for TargetTransactionGroupConfig {
     }
 }
 
-/// A verifier rejection means the no-op could not be proven, which is the ordinary durable-conflict
-/// path: roll back, persist evidence, retry from the unchanged checkpoint. Only an infrastructure
-/// failure inside the verifier is fatal. Every scope and predicate rejection must therefore carry
-/// the `rejected:` marker, or it is misclassified as fatal and crash-loops the stream.
-pub(super) fn superseded_verification_error(message: String) -> ApplyBinlogError {
-    if message.starts_with("superseded release insert rejected:")
-        || message.starts_with("superseded insert rejected:")
-        || message.starts_with("superseded foreign key insert rejected:")
-    {
-        ApplyBinlogError::SupersededRecoveryFailed(message)
-    } else {
-        ApplyBinlogError::Target(message)
-    }
-}
-
-pub(super) trait SupersededInsertVerifier {
-    fn verify(
-        &mut self,
-        candidate: &crate::row::DeferredSupersededInsertCandidate,
-        xid_end_position: u64,
-    ) -> Result<DeferredVerification, String>;
-}
-
-/// Whether a deferred conflict needs a proved repair or is ordinary reconciliation debt.
-pub(super) enum DeferredVerification {
-    Repair(DeferredRepair),
-    OrdinaryConflict,
-}
-
-/// What a deferred conflict resolved to, and the statements that carry it out inside the applying
-/// transaction.
-pub(super) enum DeferredRepair {
-    /// A duplicate-key conflict whose historical row was superseded on the source.
-    Superseded(super::superseded_insert::SupersededInsertProof),
-    /// A foreign-key conflict resolved from the locked parent image.
-    ForeignKey(super::foreign_key_repair::ForeignKeyRepairProof),
-}
-
-impl DeferredRepair {
-    pub(super) fn resolution_evidence(&self) -> String {
-        match self {
-            Self::Superseded(proof) => proof.resolution_evidence(),
-            Self::ForeignKey(proof) => proof.evidence.clone(),
-        }
-    }
-
-    /// Statements to apply before the transaction commits, in order.
-    pub(super) fn statements(&self) -> Vec<crate::target::SqlStatement> {
-        match self {
-            Self::Superseded(proof) => proof.current_row_install.clone().into_iter().collect(),
-            Self::ForeignKey(proof) => proof.statements.clone(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct SupersededXidCommitContext<'a> {
-    pub(super) xid_end_position: u64,
-    pub(super) checkpoint_table: &'a str,
-    pub(super) checkpoint_name: &'a str,
-    pub(super) conflict_table: &'a str,
-    #[cfg(feature = "integration-failpoints")]
-    pub(super) logical_checkpoint_predecessor: Option<super::superseded_insert::BinlogCoordinate>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct VerifiedSupersededInsert {
-    pub(super) resolution_evidence: Option<String>,
-    pub(super) checkpoint: crate::checkpoint::Checkpoint,
-}
-
 #[derive(Default)]
 pub(super) struct TargetTransaction {
     open: bool,
     source_transactions: usize,
     opened_at: Option<Instant>,
     pending_file_checkpoint: Option<crate::checkpoint::Checkpoint>,
-    pending_conflict_resolutions: Vec<crate::conflict_repair::ConflictResolution>,
-    pending_conflict_observations: Vec<crate::conflict_repair::ConflictObservation>,
-    deferred_superseded_inserts: Vec<crate::row::DeferredSupersededInsertCandidate>,
 }
 
 impl TargetTransaction {
@@ -122,10 +48,7 @@ impl TargetTransaction {
         Ok(())
     }
 
-    pub(super) fn commit_if_open<E>(
-        &mut self,
-        executor: &E,
-    ) -> Result<Vec<crate::conflict_repair::ConflictResolution>, ApplyBinlogError>
+    pub(super) fn commit_if_open<E>(&mut self, executor: &E) -> Result<(), ApplyBinlogError>
     where
         E: TransactionalTargetExecutor,
     {
@@ -137,25 +60,19 @@ impl TargetTransaction {
         E: TransactionalTargetExecutor,
     {
         self.finish_if_open(executor, |executor| executor.rollback_transaction())
-            .map(|_| ())
     }
 
-    fn finish_if_open<E, F>(
-        &mut self,
-        executor: &E,
-        finish: F,
-    ) -> Result<Vec<crate::conflict_repair::ConflictResolution>, ApplyBinlogError>
+    fn finish_if_open<E, F>(&mut self, executor: &E, finish: F) -> Result<(), ApplyBinlogError>
     where
         E: TransactionalTargetExecutor,
         F: FnOnce(&E) -> Result<(), crate::target::TargetExecuteError>,
     {
         if !self.open {
-            return Ok(Vec::new());
+            return Ok(());
         }
         finish(executor).map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        let resolutions = std::mem::take(&mut self.pending_conflict_resolutions);
         self.reset();
-        Ok(resolutions)
+        Ok(())
     }
 
     pub(super) fn record_source_transaction(&mut self) {
@@ -191,314 +108,11 @@ impl TargetTransaction {
                 .is_some_and(|opened_at| opened_at.elapsed() >= config.timeout)
     }
 
-    #[cfg(test)]
-    pub(super) fn pending_conflict_resolutions_mut(
-        &mut self,
-    ) -> &mut Vec<crate::conflict_repair::ConflictResolution> {
-        &mut self.pending_conflict_resolutions
-    }
-
-    pub(super) fn pending_conflicts_mut(
-        &mut self,
-    ) -> (
-        &mut Vec<crate::conflict_repair::ConflictResolution>,
-        &mut Vec<crate::conflict_repair::ConflictObservation>,
-        &mut Vec<crate::row::DeferredSupersededInsertCandidate>,
-    ) {
-        (
-            &mut self.pending_conflict_resolutions,
-            &mut self.pending_conflict_observations,
-            &mut self.deferred_superseded_inserts,
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn defer_superseded_insert(
-        &mut self,
-        candidate: crate::row::DeferredSupersededInsertCandidate,
-    ) {
-        self.deferred_superseded_inserts.push(candidate);
-    }
-
-    pub(super) fn has_deferred_superseded_inserts(&self) -> bool {
-        !self.deferred_superseded_inserts.is_empty()
-    }
-
-    pub(super) fn finalize_deferred_superseded_inserts_at(&mut self, end_position: u64) {
-        for candidate in &mut self.deferred_superseded_inserts {
-            candidate.observation.coordinate.end_position = end_position;
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn verify_deferred_superseded_inserts_at_xid<E, V>(
-        &mut self,
-        executor: &E,
-        verifier: &mut V,
-        context: SupersededXidCommitContext<'_>,
-    ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
-    where
-        E: TransactionalTargetExecutor,
-        V: SupersededInsertVerifier,
-    {
-        let mut conflict_store = crate::conflict_repair::InMemoryConflictStore::default();
-        self.verify_deferred_superseded_inserts_at_xid_with_conflicts(
-            executor,
-            verifier,
-            &mut conflict_store,
-            context,
-        )
-    }
-
-    pub(super) fn verify_deferred_superseded_inserts_at_xid_with_conflicts<E, V>(
-        &mut self,
-        executor: &E,
-        verifier: &mut V,
-        conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
-        context: SupersededXidCommitContext<'_>,
-    ) -> Result<VerifiedSupersededInsert, ApplyBinlogError>
-    where
-        E: TransactionalTargetExecutor,
-        V: SupersededInsertVerifier,
-    {
-        let ordinary_observations =
-            self.take_finalized_conflict_observations(context.xid_end_position);
-        self.finalize_deferred_superseded_inserts_at(context.xid_end_position);
-        let deferred_observations = self
-            .deferred_superseded_inserts
-            .iter()
-            .map(|candidate| candidate.observation.clone())
-            .collect::<Vec<_>>();
-        let mut observations = ordinary_observations.clone();
-        observations.extend(deferred_observations.iter().cloned());
-        if let Some(error) = self.superseded_preflight_error() {
-            return fail_superseded_transaction(
-                self,
-                executor,
-                conflict_store,
-                error,
-                observations,
-            );
-        }
-        let observation = deferred_observations[0].clone();
-        match self.verify_and_commit_deferred_superseded_inserts(
-            executor,
-            verifier,
-            conflict_store,
-            &ordinary_observations,
-            context,
-        ) {
-            Ok((verified, committed_resolutions)) => {
-                for ordinary_observation in ordinary_observations {
-                    conflict_store.mark_observation_committed(ordinary_observation);
-                }
-                conflict_store.mark_observation_committed(observation.clone());
-                if let Some(evidence) = &verified.resolution_evidence {
-                    conflict_store
-                        .mark_resolution_committed(conflict_resolution(&observation, evidence));
-                }
-                for committed_resolution in committed_resolutions {
-                    conflict_store.mark_resolution_committed(committed_resolution);
-                }
-                Ok(verified)
-            }
-            Err(error) => {
-                fail_superseded_transaction(self, executor, conflict_store, error, observations)
-            }
-        }
-    }
-
-    fn superseded_preflight_error(&self) -> Option<ApplyBinlogError> {
-        (self.deferred_superseded_inserts.len() != 1).then(|| {
-            ApplyBinlogError::Target(format!(
-                "superseded recovery requires exactly one deferred superseded insert, found {}",
-                self.deferred_superseded_inserts.len()
-            ))
-        })
-    }
-
-    fn verify_and_commit_deferred_superseded_inserts<E, V>(
-        &mut self,
-        executor: &E,
-        verifier: &mut V,
-        conflict_store: &dyn crate::conflict_repair::ConflictStore,
-        ordinary_observations: &[crate::conflict_repair::ConflictObservation],
-        context: SupersededXidCommitContext<'_>,
-    ) -> Result<
-        (
-            VerifiedSupersededInsert,
-            Vec<crate::conflict_repair::ConflictResolution>,
-        ),
-        ApplyBinlogError,
-    >
-    where
-        E: TransactionalTargetExecutor,
-        V: SupersededInsertVerifier,
-    {
-        let candidate = self
-            .deferred_superseded_inserts
-            .first()
-            .cloned()
-            .ok_or_else(|| {
-                ApplyBinlogError::Target("missing deferred superseded insert".to_string())
-            })?;
-        let verification = verifier
-            .verify(&candidate, context.xid_end_position)
-            .map_err(superseded_verification_error)?;
-        if !ordinary_observations.is_empty()
-            && matches!(&verification, DeferredVerification::Repair(_))
-        {
-            return Err(ApplyBinlogError::Target(
-                "ordinary conflict coexists with deferred superseded insert".to_string(),
-            ));
-        }
-        let (evidence, statements, checkpoint_description) = match verification {
-            DeferredVerification::Repair(repair) => (
-                Some(repair.resolution_evidence()),
-                repair.statements(),
-                "verified superseded insert transaction",
-            ),
-            DeferredVerification::OrdinaryConflict => {
-                (None, Vec::new(), "deferred ordinary conflict transaction")
-            }
-        };
-        for statement in statements {
-            executor
-                .execute(&statement)
-                .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        }
-        let checkpoint = crate::checkpoint::Checkpoint {
-            source_file: candidate.observation.coordinate.file.clone(),
-            source_position: context.xid_end_position,
-            gtid: None,
-            event_timestamp: 0,
-            last_event: crate::checkpoint::LastEvent {
-                event_type: "XidEvent".to_string(),
-                description: format!(
-                    "{checkpoint_description} at {}:{}",
-                    candidate.observation.coordinate.file, context.xid_end_position,
-                ),
-            },
-        };
-        let current = executor
-            .load_transaction_checkpoint_for_update(
-                context.checkpoint_table,
-                context.checkpoint_name,
-            )
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        #[cfg(feature = "integration-failpoints")]
-        let current = context
-            .logical_checkpoint_predecessor
-            .as_ref()
-            .map(|coordinate| crate::checkpoint::Checkpoint {
-                source_file: coordinate.file.clone(),
-                source_position: coordinate.position,
-                gtid: None,
-                event_timestamp: 0,
-                last_event: crate::checkpoint::LastEvent {
-                    event_type: "IntegrationLogicalCheckpoint".to_string(),
-                    description: "mapped disposable checkpoint to production fixture coordinate"
-                        .to_string(),
-                },
-            })
-            .or(current);
-        validate_superseded_checkpoint_predecessor(
-            current.as_ref(),
-            &candidate,
-            context.xid_end_position,
-            context.checkpoint_name,
-        )?;
-        executor
-            .save_transaction_checkpoint(
-                context.checkpoint_table,
-                context.checkpoint_name,
-                &checkpoint,
-            )
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        self.finalize_conflict_resolutions_at(context.xid_end_position);
-        for pending_resolution in self.pending_conflict_resolutions() {
-            executor
-                .execute_transaction_sql(&conflict_store.resolution_sql(pending_resolution))
-                .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        }
-        for observation in ordinary_observations {
-            executor
-                .execute_transaction_sql(&crate::conflict_repair::build_conflict_observation_sql(
-                    context.conflict_table,
-                    observation,
-                ))
-                .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        }
-        executor
-            .execute_transaction_sql(&crate::conflict_repair::build_conflict_observation_sql(
-                context.conflict_table,
-                &candidate.observation,
-            ))
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        if let Some(evidence) = &evidence {
-            let resolution = conflict_resolution(&candidate.observation, evidence);
-            executor
-                .execute_transaction_sql(
-                    &crate::conflict_repair::build_conflict_resolution_for_source_row_sql(
-                        context.conflict_table,
-                        &resolution,
-                    ),
-                )
-                .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-        }
-        let committed_resolutions = self.commit_if_open(executor)?;
-        Ok((
-            VerifiedSupersededInsert {
-                resolution_evidence: evidence,
-                checkpoint,
-            },
-            committed_resolutions,
-        ))
-    }
-
-    pub(super) fn has_pending_conflict_resolutions(&self) -> bool {
-        !self.pending_conflict_resolutions.is_empty()
-    }
-
-    fn pending_conflict_resolutions(&self) -> &[crate::conflict_repair::ConflictResolution] {
-        &self.pending_conflict_resolutions
-    }
-
-    pub(super) fn has_pending_conflict_observations(&self) -> bool {
-        !self.pending_conflict_observations.is_empty()
-    }
-
-    pub(super) fn take_finalized_conflict_observations(
-        &mut self,
-        end_position: u64,
-    ) -> Vec<crate::conflict_repair::ConflictObservation> {
-        let mut observations = std::mem::take(&mut self.pending_conflict_observations);
-        for observation in &mut observations {
-            observation.coordinate.end_position = end_position;
-            if let Some(request) = &mut observation.parent_recovery {
-                request.set_source_end_position(end_position);
-            }
-        }
-        observations
-    }
-
-    pub(super) fn finalize_conflict_resolutions_at(&mut self, end_position: u64) {
-        for resolution in &mut self.pending_conflict_resolutions {
-            resolution.evidence = format!(
-                "{}; source transaction end position {end_position}",
-                resolution.evidence
-            );
-        }
-    }
-
     pub(super) fn reset(&mut self) {
         self.open = false;
         self.source_transactions = 0;
         self.opened_at = None;
         self.pending_file_checkpoint = None;
-        self.pending_conflict_resolutions.clear();
-        self.pending_conflict_observations.clear();
-        self.deferred_superseded_inserts.clear();
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -506,128 +120,11 @@ impl TargetTransaction {
     }
 }
 
-fn fail_superseded_transaction<T, E>(
-    transaction: &mut TargetTransaction,
-    executor: &E,
-    conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
-    error: ApplyBinlogError,
-    observations: Vec<crate::conflict_repair::ConflictObservation>,
-) -> Result<T, ApplyBinlogError>
-where
-    E: TransactionalTargetExecutor,
-{
-    let rollback_error = transaction.rollback_if_open(executor).err();
-    let discard_error = rollback_error
-        .as_ref()
-        .and_then(|_| executor.discard_failed_transaction_connection().err());
-    let persistence_error = if discard_error.is_none() {
-        observations
-            .into_iter()
-            .try_for_each(|observation| conflict_store.observe(observation))
-            .err()
-    } else {
-        None
-    };
-    if rollback_error.is_none() && persistence_error.is_none() {
-        return Err(error);
-    }
-    let mut context = error.to_string();
-    if let Some(rollback_error) = rollback_error {
-        context.push_str(&format!("; rollback failed: {rollback_error}"));
-    }
-    if let Some(discard_error) = discard_error {
-        context.push_str(&format!(
-            "; failed transaction connection discard failed: {discard_error}"
-        ));
-    }
-    if let Some(persistence_error) = persistence_error {
-        context.push_str(&format!(
-            "; conflict evidence persistence failed: {persistence_error}"
-        ));
-    }
-    Err(ApplyBinlogError::Target(context))
-}
-
-fn validate_superseded_checkpoint_predecessor(
-    current: Option<&crate::checkpoint::Checkpoint>,
-    candidate: &crate::row::DeferredSupersededInsertCandidate,
-    xid_end_position: u64,
-    checkpoint_name: &str,
-) -> Result<(), ApplyBinlogError> {
-    let current = current.ok_or_else(|| {
-        ApplyBinlogError::Checkpoint(format!(
-            "required source-scoped checkpoint `{checkpoint_name}` disappeared during target transaction"
-        ))
-    })?;
-    let expected_file = &candidate.observation.coordinate.file;
-    if current.source_file != *expected_file {
-        return Err(ApplyBinlogError::Checkpoint(format!(
-            "superseded checkpoint predecessor file mismatch: expected {expected_file}, locked {}",
-            current.source_file
-        )));
-    }
-    if current.source_position > xid_end_position {
-        return Err(ApplyBinlogError::Checkpoint(format!(
-            "refusing checkpoint regression from {}:{} to {}:{xid_end_position}",
-            current.source_file, current.source_position, expected_file
-        )));
-    }
-    if current.source_position >= candidate.observation.coordinate.start_position {
-        return Err(ApplyBinlogError::Checkpoint(format!(
-            "superseded checkpoint concurrently advanced to {}:{} at or beyond candidate {}:{}",
-            current.source_file,
-            current.source_position,
-            expected_file,
-            candidate.observation.coordinate.start_position
-        )));
-    }
-    Ok(())
-}
-
-fn conflict_resolution(
-    observation: &crate::conflict_repair::ConflictObservation,
-    evidence: &str,
-) -> crate::conflict_repair::ConflictResolution {
-    crate::conflict_repair::ConflictResolution {
-        source_identity: observation.source_identity.clone(),
-        schema: observation.schema.clone(),
-        table: observation.table.clone(),
-        source_primary_key: observation.source_primary_key.clone(),
-        repair_run_id: format!(
-            "stream-superseded-{}-{}-{}",
-            observation.coordinate.file.replace('/', "_"),
-            observation.coordinate.start_position,
-            observation.table,
-        ),
-        evidence: evidence.to_string(),
-    }
-}
-
-#[cfg(test)]
-pub(super) fn apply_stream_event_transactionally(
-    applier: &mut RowApplier<impl TransactionalTargetExecutor>,
-    context: &mut StreamEventContext<'_, impl TableSchemaResolver, impl StreamCheckpointStore>,
-    header: &EventHeader,
-    event: &BinlogEvent,
-) -> Result<StructuredEventOutcome, ApplyBinlogError> {
-    let mut conflict_store = crate::conflict_repair::InMemoryConflictStore::default();
-    apply_stream_event_transactionally_with_conflicts(
-        applier,
-        context,
-        header,
-        event,
-        "test-source",
-        &mut conflict_store,
-    )
-}
-
-pub(super) fn apply_stream_event_transactionally_with_conflicts<E, R, C>(
+pub(super) fn apply_stream_event_transactionally<E, R, C>(
     applier: &mut RowApplier<E>,
     context: &mut StreamEventContext<'_, R, C>,
     header: &EventHeader,
     event: &BinlogEvent,
-    source_identity: &str,
-    conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
 ) -> Result<StructuredEventOutcome, ApplyBinlogError>
 where
     E: TransactionalTargetExecutor,
@@ -642,49 +139,19 @@ where
         flush_grouped_transaction(applier.executor(), context)?;
     }
 
-    if context
-        .target_transaction
-        .has_pending_conflict_observations()
-        && matches!(
-            event,
-            BinlogEvent::WriteRowsEvent(_)
-                | BinlogEvent::UpdateRowsEvent(_)
-                | BinlogEvent::DeleteRowsEvent(_)
-        )
-    {
-        return Ok(StructuredEventOutcome {
-            policy: EventPolicy::ApplyRows,
-            resume_coordinate: None,
-        });
-    }
-
     if event_can_write_target(event, context.state) {
         context
             .target_transaction
             .begin_if_needed(applier.executor())?;
     }
 
-    let (pending_resolutions, pending_observations, deferred_superseded_inserts) =
-        context.target_transaction.pending_conflicts_mut();
-    let mut conflict_context = RowConflictContext {
-        store: conflict_store,
-        pending_resolutions,
-        pending_observations,
-        deferred_superseded_inserts,
-        source_identity,
-        source_server_id: u64::from(header.server_id),
-        end_position: u64::from(header.next_event_position),
-        child_event_timestamp: u64::from(header.timestamp),
-        observed_at_ms: current_time_ms(),
-    };
-    let outcome = match handle_structured_event_with_conflicts(
+    let outcome = match handle_structured_event(
         applier,
         context.schema_resolver,
         context.state,
         context.current_file,
         header,
         event,
-        Some(&mut conflict_context),
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -696,38 +163,8 @@ where
     };
 
     if outcome.policy == EventPolicy::CommitTransaction {
-        if matches!(event, BinlogEvent::XidEvent(_))
-            && context
-                .target_transaction
-                .has_pending_conflict_observations()
-        {
-            let end_position = outcome
-                .resume_coordinate
-                .as_ref()
-                .map_or(0, |coordinate| coordinate.position);
-            let observations = context
-                .target_transaction
-                .take_finalized_conflict_observations(end_position);
-            // Record the divergence before advancing past it. A retry from the unchanged
-            // checkpoint cannot succeed for a conflict with no recovery plan, because replaying
-            // the same rows cannot change the target; the ledger owns that divergence. A
-            // recovery-carrying conflict still aborts so recovery can run and replay can succeed.
-            if let Err(error) = persist_deferred_conflicts(conflict_store, observations) {
-                context
-                    .target_transaction
-                    .rollback_if_open(applier.executor())?;
-                return Err(error);
-            }
-        }
         let force_flush = matches!(event, BinlogEvent::QueryEvent(_) | BinlogEvent::XidEvent(_));
-        finish_source_transaction(
-            applier.executor(),
-            context,
-            event,
-            &outcome,
-            force_flush,
-            conflict_store,
-        )?;
+        finish_source_transaction(applier.executor(), context, event, &outcome, force_flush)?;
         return Ok(outcome);
     }
 
@@ -741,7 +178,6 @@ pub(super) fn finish_source_transaction<E, R, C>(
     event: &BinlogEvent,
     outcome: &StructuredEventOutcome,
     force_flush: bool,
-    conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
 ) -> Result<(), ApplyBinlogError>
 where
     E: TransactionalTargetExecutor,
@@ -749,26 +185,13 @@ where
 {
     context.target_transaction.record_source_transaction();
 
-    if matches!(event, BinlogEvent::XidEvent(_))
-        && let Some(coordinate) = &outcome.resume_coordinate
-    {
-        context
-            .target_transaction
-            .finalize_conflict_resolutions_at(coordinate.position);
-    }
-
     if context.transaction_checkpoint_table.is_some() {
         save_outcome_checkpoint(executor, context, event, outcome)?;
         if context
             .target_transaction
             .should_flush(context.group_config, force_flush)
-            || context
-                .target_transaction
-                .has_pending_conflict_resolutions()
         {
-            execute_conflict_resolutions_in_target_transaction(executor, context, conflict_store)?;
-            let resolutions = context.target_transaction.commit_if_open(executor)?;
-            finalize_conflict_resolution_cache(conflict_store, resolutions);
+            context.target_transaction.commit_if_open(executor)?;
         }
         return Ok(());
     }
@@ -777,11 +200,8 @@ where
     if context
         .target_transaction
         .should_flush(context.group_config, force_flush)
-        || context
-            .target_transaction
-            .has_pending_conflict_resolutions()
     {
-        flush_grouped_transaction_with_conflicts(executor, context, Some(conflict_store))?;
+        flush_grouped_transaction(executor, context)?;
     }
     Ok(())
 }
@@ -794,18 +214,6 @@ where
     E: TransactionalTargetExecutor,
     C: StreamCheckpointStore,
 {
-    flush_grouped_transaction_with_conflicts(executor, context, None)
-}
-
-fn flush_grouped_transaction_with_conflicts<E, R, C>(
-    executor: &E,
-    context: &mut StreamEventContext<'_, R, C>,
-    mut conflict_store: Option<&mut dyn crate::conflict_repair::ConflictStore>,
-) -> Result<(), ApplyBinlogError>
-where
-    E: TransactionalTargetExecutor,
-    C: StreamCheckpointStore,
-{
     if !context
         .target_transaction
         .has_completed_source_transactions()
@@ -813,20 +221,14 @@ where
         return Ok(());
     }
     let checkpoint = context.target_transaction.take_file_checkpoint();
-    if let Some(conflict_store) = conflict_store.as_deref_mut() {
-        execute_conflict_resolutions_in_target_transaction(executor, context, conflict_store)?;
-    }
-    let resolutions = match context.target_transaction.commit_if_open(executor) {
-        Ok(resolutions) => resolutions,
-        Err(error) => {
-            if let Some(checkpoint) = checkpoint {
-                context
-                    .target_transaction
-                    .remember_file_checkpoint(checkpoint);
-            }
-            return Err(error);
+    if let Err(error) = context.target_transaction.commit_if_open(executor) {
+        if let Some(checkpoint) = checkpoint {
+            context
+                .target_transaction
+                .remember_file_checkpoint(checkpoint);
         }
-    };
+        return Err(error);
+    }
     if let Some(checkpoint) = checkpoint
         && let Some(store) = context.checkpoint_store
     {
@@ -835,72 +237,7 @@ where
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         store.save_checkpoint(&checkpoint)?;
     }
-    if let Some(conflict_store) = conflict_store {
-        finalize_conflict_resolution_cache(conflict_store, resolutions);
-    }
     Ok(())
-}
-
-/// Persists the transaction's unresolved conflict evidence.
-///
-/// A conflict carrying a recovery plan still aborts: recovery changes the target, so replaying the
-/// same position can then succeed. A conflict without one is skipped, because replay cannot change
-/// anything and the stream would never leave the position. Persistence failure always aborts,
-/// because advancing past a divergence that was not recorded would lose it silently.
-fn persist_deferred_conflicts(
-    conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
-    observations: Vec<crate::conflict_repair::ConflictObservation>,
-) -> Result<(), ApplyBinlogError> {
-    let skipped = observations.len();
-    let error_text = observations
-        .first()
-        .map(|observation| observation.error_text.clone())
-        .unwrap_or_else(|| "unknown row conflict".to_string());
-    let parent_recovery = observations
-        .iter()
-        .find_map(|observation| observation.parent_recovery.clone())
-        .map(Box::new);
-    for observation in observations {
-        conflict_store
-            .observe(observation)
-            .map_err(ApplyBinlogError::Target)?;
-    }
-    if parent_recovery.is_some() {
-        return Err(ApplyBinlogError::RowConflictPersisted {
-            message: error_text,
-            parent_recovery,
-        });
-    }
-    println!("cdc_row_conflict_progress skipped_rows={skipped}");
-    Ok(())
-}
-
-fn execute_conflict_resolutions_in_target_transaction<E, R, C>(
-    executor: &E,
-    context: &mut StreamEventContext<'_, R, C>,
-    conflict_store: &dyn crate::conflict_repair::ConflictStore,
-) -> Result<(), ApplyBinlogError>
-where
-    E: TransactionalTargetExecutor,
-    C: StreamCheckpointStore,
-{
-    for resolution in context.target_transaction.pending_conflict_resolutions() {
-        let sql = conflict_store.resolution_sql(resolution);
-        if let Err(error) = executor.execute_transaction_sql(&sql) {
-            context.target_transaction.rollback_if_open(executor)?;
-            return Err(ApplyBinlogError::Target(error.to_string()));
-        }
-    }
-    Ok(())
-}
-
-fn finalize_conflict_resolution_cache(
-    conflict_store: &mut dyn crate::conflict_repair::ConflictStore,
-    resolutions: Vec<crate::conflict_repair::ConflictResolution>,
-) {
-    for resolution in resolutions {
-        conflict_store.mark_resolution_committed(resolution);
-    }
 }
 
 pub(super) fn remember_file_checkpoint<R, C>(
@@ -929,13 +266,6 @@ pub(super) fn event_can_write_target(event: &BinlogEvent, state: &StructuredEven
         }
         _ => false,
     }
-}
-
-pub(super) fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 pub(super) fn save_outcome_checkpoint<E, R, C>(

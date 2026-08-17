@@ -33,7 +33,6 @@ pub(super) fn apply_write_rows_event<E>(
     state: &StructuredEventState,
     coordinate: &BinlogCoordinate,
     rows: &mysql_cdc::events::row_events::write_rows_event::WriteRowsEvent,
-    conflict_context: Option<&mut RowConflictContext<'_>>,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
@@ -48,15 +47,9 @@ where
         table_id: rows.table_id,
         rows: map_row_data_list(&rows.rows, &table)?,
     };
-    if let Some(context) = conflict_context {
-        applier
-            .apply_write_rows_with_conflicts(&event, context)
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    } else {
-        applier
-            .apply_write_rows(&event)
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    }
+    applier
+        .apply_write_rows(&event)
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
     Ok(EventPolicy::ApplyRows)
 }
 
@@ -65,7 +58,6 @@ pub(super) fn apply_update_rows_event<E>(
     state: &StructuredEventState,
     coordinate: &BinlogCoordinate,
     rows: &mysql_cdc::events::row_events::update_rows_event::UpdateRowsEvent,
-    conflict_context: Option<&mut RowConflictContext<'_>>,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
@@ -85,15 +77,9 @@ where
             .map(|row| map_update_row_data(row, &table))
             .collect::<Result<Vec<_>, _>>()?,
     };
-    if let Some(context) = conflict_context {
-        applier
-            .apply_update_rows_with_conflicts(&event, context)
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    } else {
-        applier
-            .apply_update_rows(&event)
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    }
+    applier
+        .apply_update_rows(&event)
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
     Ok(EventPolicy::ApplyRows)
 }
 
@@ -102,7 +88,6 @@ pub(super) fn apply_delete_rows_event<E>(
     state: &StructuredEventState,
     coordinate: &BinlogCoordinate,
     rows: &mysql_cdc::events::row_events::delete_rows_event::DeleteRowsEvent,
-    conflict_context: Option<&mut RowConflictContext<'_>>,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
@@ -117,15 +102,9 @@ where
         table_id: rows.table_id,
         rows: map_row_data_list(&rows.rows, &table)?,
     };
-    if let Some(context) = conflict_context {
-        applier
-            .apply_delete_rows_with_conflicts(&event, context)
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    } else {
-        applier
-            .apply_delete_rows(&event)
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    }
+    applier
+        .apply_delete_rows(&event)
+        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
     Ok(EventPolicy::ApplyRows)
 }
 

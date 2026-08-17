@@ -81,44 +81,6 @@ fn accounts_row_table_map() -> crate::row::TableMapEvent {
     }
 }
 
-fn sessions_row_table_map() -> crate::row::TableMapEvent {
-    crate::row::TableMapEvent {
-        coordinate: stream_coordinate(224_141_039),
-        table: crate::row::RowTableMap {
-            table_id: 20,
-            schema: "globalcomix".to_string(),
-            table: "sessions".to_string(),
-            columns: vec![
-                "session_id".to_string(),
-                "guest_id".to_string(),
-                "guest_hash".to_string(),
-            ],
-            primary_key: vec!["session_id".to_string()],
-            generated_columns: Vec::new(),
-            signed_columns: Vec::new(),
-            enum_columns: BTreeMap::new(),
-            set_columns: BTreeMap::new(),
-        },
-    }
-}
-
-fn home_feed_card_slides_row_table_map() -> crate::row::TableMapEvent {
-    crate::row::TableMapEvent {
-        coordinate: stream_coordinate(308_259_855),
-        table: crate::row::RowTableMap {
-            table_id: 21,
-            schema: "globalcomix".to_string(),
-            table: "home_feed_card_slides".to_string(),
-            columns: vec!["id".to_string(), "card_id".to_string()],
-            primary_key: vec!["id".to_string()],
-            generated_columns: Vec::new(),
-            signed_columns: Vec::new(),
-            enum_columns: BTreeMap::new(),
-            set_columns: BTreeMap::new(),
-        },
-    }
-}
-
 fn accounts_table_map_event(column_count: usize) -> MysqlCdcTableMapEvent {
     MysqlCdcTableMapEvent {
         table_id: 18,
@@ -529,28 +491,11 @@ impl DdlReplayJournal for RecordingDdlReplayJournal {
     }
 }
 
-#[derive(Clone, Copy)]
-enum DuplicateMode {
-    Equal,
-    Divergent,
-    Replaced,
-    DefaultError,
-    ForeignKey,
-    HomeFeedCardForeignKey,
-    Check,
-    UpdateUnique,
-}
-
 struct TransactionRecordingExecutor {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     fail_execute: bool,
-    fail_rollback: bool,
-    fail_discard: bool,
+    fail_update_with_duplicate: bool,
     record_pending_flush: bool,
-    fail_row_change_number: Option<usize>,
-    duplicate_row_change_number: Option<usize>,
-    duplicate_mode: DuplicateMode,
-    row_change_count: std::cell::Cell<usize>,
     locked_checkpoint: Option<crate::checkpoint::Checkpoint>,
 }
 
@@ -559,23 +504,9 @@ impl Default for TransactionRecordingExecutor {
         Self {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: false,
-            fail_rollback: false,
-            fail_discard: false,
+            fail_update_with_duplicate: false,
             record_pending_flush: false,
-            fail_row_change_number: None,
-            duplicate_row_change_number: None,
-            duplicate_mode: DuplicateMode::Equal,
-            row_change_count: std::cell::Cell::new(0),
-            locked_checkpoint: Some(crate::checkpoint::Checkpoint {
-                source_file: "mysqld-bin.000000".to_string(),
-                source_position: 4,
-                gtid: None,
-                event_timestamp: 0,
-                last_event: crate::checkpoint::LastEvent {
-                    event_type: "Bootstrap".to_string(),
-                    description: "test checkpoint".to_string(),
-                },
-            }),
+            locked_checkpoint: Some(test_checkpoint("mysqld-bin.000000", 4)),
         }
     }
 }
@@ -584,39 +515,16 @@ impl TransactionRecordingExecutor {
     fn with_operations(operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>) -> Self {
         Self {
             operations,
-            fail_execute: false,
-            fail_rollback: false,
-            fail_discard: false,
-            record_pending_flush: false,
-            fail_row_change_number: None,
-            duplicate_row_change_number: None,
-            duplicate_mode: DuplicateMode::Equal,
-            row_change_count: std::cell::Cell::new(0),
-            locked_checkpoint: Some(crate::checkpoint::Checkpoint {
-                source_file: "mysqld-bin.000777".to_string(),
-                source_position: 161,
-                gtid: None,
-                event_timestamp: 0,
-                last_event: crate::checkpoint::LastEvent {
-                    event_type: "Bootstrap".to_string(),
-                    description: "automatic DDL predecessor".to_string(),
-                },
-            }),
+            locked_checkpoint: Some(test_checkpoint("mysqld-bin.000777", 161)),
+            ..Self::default()
         }
     }
 
     fn failing() -> Self {
         Self {
-            operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: true,
-            fail_rollback: false,
-            fail_discard: false,
-            record_pending_flush: false,
-            fail_row_change_number: None,
-            duplicate_row_change_number: None,
-            duplicate_mode: DuplicateMode::DefaultError,
-            row_change_count: std::cell::Cell::new(0),
             locked_checkpoint: None,
+            ..Self::default()
         }
     }
 
@@ -634,81 +542,9 @@ impl TransactionRecordingExecutor {
         }
     }
 
-    fn with_rollback_failure() -> Self {
+    fn with_update_duplicate() -> Self {
         Self {
-            fail_rollback: true,
-            ..Self::default()
-        }
-    }
-
-    fn with_rollback_and_discard_failure() -> Self {
-        Self {
-            fail_rollback: true,
-            fail_discard: true,
-            ..Self::default()
-        }
-    }
-
-    fn with_equal_duplicate_second_row_change() -> Self {
-        Self {
-            duplicate_row_change_number: Some(2),
-            duplicate_mode: DuplicateMode::Equal,
-            ..Self::default()
-        }
-    }
-
-    fn with_divergent_duplicate_second_row_change() -> Self {
-        Self {
-            duplicate_row_change_number: Some(1),
-            duplicate_mode: DuplicateMode::Divergent,
-            ..Self::default()
-        }
-    }
-
-    fn with_replaced_duplicate_second_row_change() -> Self {
-        Self {
-            duplicate_row_change_number: Some(1),
-            duplicate_mode: DuplicateMode::Replaced,
-            ..Self::default()
-        }
-    }
-
-    fn with_default_duplicate_second_row_change() -> Self {
-        Self {
-            duplicate_row_change_number: Some(1),
-            duplicate_mode: DuplicateMode::DefaultError,
-            ..Self::default()
-        }
-    }
-
-    fn with_foreign_key_conflict_second_row_change() -> Self {
-        Self {
-            duplicate_row_change_number: Some(1),
-            duplicate_mode: DuplicateMode::ForeignKey,
-            ..Self::default()
-        }
-    }
-
-    fn with_home_feed_card_foreign_key_conflict() -> Self {
-        Self {
-            duplicate_row_change_number: Some(1),
-            duplicate_mode: DuplicateMode::HomeFeedCardForeignKey,
-            ..Self::default()
-        }
-    }
-
-    fn with_check_conflict_second_row_change() -> Self {
-        Self {
-            duplicate_row_change_number: Some(1),
-            duplicate_mode: DuplicateMode::Check,
-            ..Self::default()
-        }
-    }
-
-    fn with_update_unique_conflict() -> Self {
-        Self {
-            duplicate_row_change_number: Some(1),
-            duplicate_mode: DuplicateMode::UpdateUnique,
+            fail_update_with_duplicate: true,
             ..Self::default()
         }
     }
@@ -719,6 +555,19 @@ impl TransactionRecordingExecutor {
 
     fn shared_operations(&self) -> std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> {
         std::rc::Rc::clone(&self.operations)
+    }
+}
+
+fn test_checkpoint(file: &str, position: u64) -> crate::checkpoint::Checkpoint {
+    crate::checkpoint::Checkpoint {
+        source_file: file.to_string(),
+        source_position: position,
+        gtid: None,
+        event_timestamp: 0,
+        last_event: crate::checkpoint::LastEvent {
+            event_type: "Bootstrap".to_string(),
+            description: "test checkpoint".to_string(),
+        },
     }
 }
 
@@ -737,87 +586,17 @@ impl TargetExecutor for TransactionRecordingExecutor {
     fn execute_row_change(
         &self,
         change: &crate::target::TargetRowChange,
-    ) -> Result<crate::target::TargetExecutionOutcome, crate::target::TargetExecuteError> {
+    ) -> Result<(), crate::target::TargetExecuteError> {
         self.execute(&change.statement)?;
-        let row_change_number = self.row_change_count.get() + 1;
-        self.row_change_count.set(row_change_number);
-        if self.fail_row_change_number == Some(row_change_number) {
-            return Err(crate::target::TargetExecuteError::new(
-                "forced post-conflict target failure",
+        if self.fail_update_with_duplicate
+            && change.kind == crate::target::TargetRowChangeKind::Update
+        {
+            return Err(crate::target::TargetExecuteError::from_mysql(
+                1062,
+                "ERROR 1062 duplicate entry 'beta' for key 'uq_accounts_name'",
             ));
         }
-        if self
-            .duplicate_row_change_number
-            .is_some_and(|interval| row_change_number.is_multiple_of(interval))
-        {
-            let conflict = crate::target::DuplicateConflict {
-                error_code: 1062,
-                error_text: "Duplicate entry for key 'PRIMARY'".to_string(),
-                duplicate_index: Some("PRIMARY".to_string()),
-            };
-            return match self.duplicate_mode {
-                DuplicateMode::Equal => Ok(crate::target::duplicate_insert_outcome(
-                    conflict,
-                    Some(&change.source_values),
-                    &change.source_values,
-                    &change.set_columns,
-                )),
-                DuplicateMode::Divergent => Ok(crate::target::duplicate_insert_outcome(
-                    conflict,
-                    Some(&[Value::Bytes(b"different".to_vec())]),
-                    &change.source_values,
-                    &change.set_columns,
-                )),
-                DuplicateMode::Replaced => Ok(
-                    crate::target::TargetExecutionOutcome::PrimaryKeyReplaced(conflict),
-                ),
-                DuplicateMode::DefaultError => Err(crate::target::TargetExecuteError::from_mysql(
-                    1062,
-                    "ERROR 1062 duplicate entry for key 'PRIMARY'",
-                )),
-                DuplicateMode::ForeignKey => {
-                    Ok(crate::target::TargetExecutionOutcome::ConstraintConflict(
-                        crate::target::DuplicateConflict {
-                            error_code: 1452,
-                            error_text: "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` (`guest_id`, `guest_hash`))"
-                                .to_string(),
-                            duplicate_index: None,
-                        },
-                    ))
-                }
-                DuplicateMode::HomeFeedCardForeignKey => {
-                    Ok(crate::target::TargetExecutionOutcome::ConstraintConflict(
-                        crate::target::DuplicateConflict {
-                            error_code: 1452,
-                            error_text: "Cannot add or update a child row: a foreign key constraint fails (`globalcomix`.`home_feed_card_slides`, CONSTRAINT `fk_hfcs_card` FOREIGN KEY (`card_id`) REFERENCES `home_feed_cards` (`id`))"
-                                .to_string(),
-                            duplicate_index: None,
-                        },
-                    ))
-                }
-                DuplicateMode::Check => {
-                    Ok(crate::target::TargetExecutionOutcome::ConstraintConflict(
-                        crate::target::DuplicateConflict {
-                            error_code: 3819,
-                            error_text: "Check constraint 'accounts_status_chk' is violated"
-                                .to_string(),
-                            duplicate_index: None,
-                        },
-                    ))
-                }
-                DuplicateMode::UpdateUnique => {
-                    Ok(crate::target::TargetExecutionOutcome::ConstraintConflict(
-                        crate::target::DuplicateConflict {
-                            error_code: 1062,
-                            error_text: "Duplicate entry 'beta' for key 'uq_accounts_name'"
-                                .to_string(),
-                            duplicate_index: Some("uq_accounts_name".to_string()),
-                        },
-                    ))
-                }
-            };
-        }
-        Ok(crate::target::TargetExecutionOutcome::Applied)
+        Ok(())
     }
 }
 
@@ -853,16 +632,6 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
         Ok(())
     }
 
-    fn execute_transaction_sql(&self, sql: &str) -> Result<(), crate::target::TargetExecuteError> {
-        let operation = if sql.starts_with("INSERT INTO cdc.row_conflicts") {
-            "OBSERVATION"
-        } else {
-            "RESOLUTION"
-        };
-        self.operations.borrow_mut().push(operation);
-        Ok(())
-    }
-
     fn commit_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
         self.operations.borrow_mut().push("COMMIT");
         Ok(())
@@ -870,23 +639,6 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
 
     fn rollback_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
         self.operations.borrow_mut().push("ROLLBACK");
-        if self.fail_rollback {
-            return Err(crate::target::TargetExecuteError::new(
-                "forced rollback failure",
-            ));
-        }
-        Ok(())
-    }
-
-    fn discard_failed_transaction_connection(
-        &self,
-    ) -> Result<(), crate::target::TargetExecuteError> {
-        self.operations.borrow_mut().push("DISCARD");
-        if self.fail_discard {
-            return Err(crate::target::TargetExecuteError::new(
-                "forced discard failure",
-            ));
-        }
         Ok(())
     }
 

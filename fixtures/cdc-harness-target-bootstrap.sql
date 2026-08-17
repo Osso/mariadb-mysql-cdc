@@ -2,6 +2,7 @@ CREATE DATABASE IF NOT EXISTS globalcomix;
 CREATE DATABASE IF NOT EXISTS cdc;
 
 CREATE USER IF NOT EXISTS 'cdc_stream'@'%' IDENTIFIED BY 'cdc-stream-password' REQUIRE SSL;
+CREATE USER IF NOT EXISTS 'cdc_repair'@'%' IDENTIFIED BY 'cdc-repair-password' REQUIRE SSL;
 
 CREATE TABLE IF NOT EXISTS cdc.row_conflicts (
     conflict_identity CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -234,8 +235,15 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES,
       CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, EVENT, TRIGGER
       ON globalcomix.* TO 'cdc_stream'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_stream'@'%';
-GRANT SELECT, INSERT, UPDATE ON cdc.row_conflicts TO 'cdc_stream'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.ddl_replay_journal TO 'cdc_stream'@'%';
-GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory TO 'cdc_stream'@'%';
 GRANT EXECUTE ON PROCEDURE cdc.ddl_replay_journal_trigger_inventory TO 'cdc_stream'@'%';
+
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES,
+      CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, EVENT, TRIGGER
+      ON globalcomix.* TO 'cdc_repair'@'%';
+GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_repair'@'%';
+GRANT SELECT, INSERT, UPDATE ON cdc.row_conflicts TO 'cdc_repair'@'%';
+GRANT SELECT, INSERT, UPDATE ON cdc.ddl_replay_journal TO 'cdc_repair'@'%';
+GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory TO 'cdc_repair'@'%';
+GRANT EXECUTE ON PROCEDURE cdc.ddl_replay_journal_trigger_inventory TO 'cdc_repair'@'%';
 FLUSH PRIVILEGES;

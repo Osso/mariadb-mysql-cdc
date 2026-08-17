@@ -2,8 +2,9 @@
 
 `sync-table` reconciles one source table against one target table in primary-key
 chunks. It is the child operation used by the run-scoped `repair-drift`
-orchestration; live conflict observations persist in `cdc.row_conflicts` and
-are resolved only after verified equality. Generic `repair-drift` remains strict
+orchestration; historical `cdc.row_conflicts` records are offline repair inputs
+and are resolved only after verified equality. Native live ROW streaming does not
+create or resolve those records. Generic `repair-drift` remains strict
 about its source/target inventory contract; lost-binlog recovery uses a separate
 source-scoped data plan before recovery-only target schema cleanup. The current
 table-sync recovery contract is implemented by commits `fa018af..3fe8b17`.
@@ -160,14 +161,9 @@ table-sync recovery contract is implemented by commits `fa018af..3fe8b17`.
 
 ## Remaining boundaries
 
-- [x] The live stream writes supported constraint conflicts to the durable
-      ledger through the row-event conflict context; only equal native ROW
-      `INSERT` duplicates under `ignore-duplicate` continue without ledger
-      records. The explicit `replace-divergent-pk` policy may replace only
-      divergent `PRIMARY` duplicates using a source-image primary-key UPDATE and
-      durable audit evidence; secondary-unique, foreign-key, CHECK, and
-      replacement-update conflicts persist evidence and abort. The accepted
-      overwrite risk is documented in the row-conflict spec.
+- [x] Historical durable conflict records remain valid offline repair inputs.
+      Native live ROW streaming does not create or resolve ledger records;
+      `replace-divergent-pk` remains limited to explicit table-sync repair paths.
 - [x] `repair-drift` creates a fresh orchestration ID, derives FK-safe phases, and
       passes immutable child run IDs to `sync-table`.
 - [ ] No recurring conflict-to-repair scheduler exists; operators must invoke a

@@ -159,51 +159,6 @@ fn converts_every_mysql_value_variant_without_enum_metadata() {
 }
 
 #[test]
-fn duplicate_insert_compares_binlog_set_bitmask_to_target_text_semantically() {
-    let source_value = mysql_value_to_target_value(&Some(MySqlValue::Set(0b101)), false, None)
-        .expect("decode source SET value");
-    let source_values = vec![source_value];
-    let target_values = vec![Value::Bytes(b"red,blue".to_vec())];
-    let set_columns = vec![Some(vec![
-        "red".to_string(),
-        "green".to_string(),
-        "blue".to_string(),
-    ])];
-    let conflict = crate::target::DuplicateConflict {
-        error_code: 1062,
-        error_text: "duplicate".to_string(),
-        duplicate_index: Some("PRIMARY".to_string()),
-    };
-
-    assert_eq!(
-        crate::target::duplicate_insert_outcome(
-            conflict.clone(),
-            Some(&target_values),
-            &source_values,
-            &set_columns,
-        ),
-        crate::target::TargetExecutionOutcome::DuplicateIgnored(conflict.clone())
-    );
-
-    let divergent_target_values = vec![Value::Bytes(b"red,green".to_vec())];
-    assert_eq!(
-        crate::target::duplicate_insert_outcome(
-            conflict,
-            Some(&divergent_target_values),
-            &source_values,
-            &set_columns,
-        ),
-        crate::target::TargetExecutionOutcome::ConstraintConflict(
-            crate::target::DuplicateConflict {
-                error_code: 1062,
-                error_text: "duplicate".to_string(),
-                duplicate_index: Some("PRIMARY".to_string()),
-            },
-        )
-    );
-}
-
-#[test]
 fn converts_enum_ordinals_to_metadata_strings() {
     let enum_values = vec!["1".to_string(), "2".to_string(), "14".to_string()];
 

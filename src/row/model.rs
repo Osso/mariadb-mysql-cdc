@@ -1,4 +1,3 @@
-use crate::conflict_repair::{ConflictOperation, ConflictResolution, ConflictStore};
 use crate::probe::BinlogCoordinate;
 use crate::target::TargetExecuteError;
 use mysql::Value;
@@ -53,40 +52,6 @@ pub struct RowUpdate {
     pub after: RowImage,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct DeferredSupersededInsertCandidate {
-    pub observation: crate::conflict_repair::ConflictObservation,
-    pub historical_change: crate::target::TargetRowChange,
-}
-
-pub struct RowConflictContext<'a> {
-    pub store: &'a mut dyn ConflictStore,
-    pub pending_resolutions: &'a mut Vec<ConflictResolution>,
-    pub pending_observations: &'a mut Vec<crate::conflict_repair::ConflictObservation>,
-    pub deferred_superseded_inserts: &'a mut Vec<DeferredSupersededInsertCandidate>,
-    pub source_identity: &'a str,
-    pub source_server_id: u64,
-    pub end_position: u64,
-    pub child_event_timestamp: u64,
-    pub observed_at_ms: u64,
-}
-
-pub struct DuplicateConflictInput<'a> {
-    pub source_identity: &'a str,
-    pub source_server_id: u64,
-    pub coordinate: &'a BinlogCoordinate,
-    pub end_position: u64,
-    pub schema: &'a str,
-    pub table: &'a str,
-    pub operation: RowOperation,
-    pub primary_key: &'a [Value],
-    pub duplicate_index: Option<String>,
-    pub duplicate_owner_primary_key: Option<Vec<String>>,
-    pub error_code: u16,
-    pub error_text: &'a str,
-    pub observed_at_ms: u64,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TableMapRegistry {
     tables: BTreeMap<u64, RowTableMap>,
@@ -136,13 +101,6 @@ pub enum RowApplyError {
         table: String,
         column: String,
     },
-    PrimaryKeyChanged {
-        coordinate: BinlogCoordinate,
-        schema: String,
-        table: String,
-        before_primary_key: Vec<String>,
-        after_primary_key: Vec<String>,
-    },
     Target {
         coordinate: BinlogCoordinate,
         schema: String,
@@ -170,20 +128,6 @@ impl fmt::Display for RowApplyError {
                 table,
                 column,
             } => write_missing_primary_key_value(formatter, coordinate, schema, table, column),
-            Self::PrimaryKeyChanged {
-                coordinate,
-                schema,
-                table,
-                before_primary_key,
-                after_primary_key,
-            } => write_primary_key_changed(
-                formatter,
-                coordinate,
-                schema,
-                table,
-                before_primary_key,
-                after_primary_key,
-            ),
             Self::Target {
                 coordinate,
                 schema,
@@ -242,21 +186,6 @@ fn write_missing_primary_key_value(
     )
 }
 
-fn write_primary_key_changed(
-    formatter: &mut fmt::Formatter<'_>,
-    coordinate: &BinlogCoordinate,
-    schema: &str,
-    table: &str,
-    before_primary_key: &[String],
-    after_primary_key: &[String],
-) -> fmt::Result {
-    write!(
-        formatter,
-        "row update for {schema}.{table} changes primary key: before primary key {before_primary_key:?}; after primary key {after_primary_key:?} at {}:{}",
-        coordinate.file, coordinate.position,
-    )
-}
-
 fn write_target_error(
     formatter: &mut fmt::Formatter<'_>,
     coordinate: &BinlogCoordinate,
@@ -270,12 +199,4 @@ fn write_target_error(
         "failed to apply {operation} row event for {schema}.{table} at {}:{}: {source}",
         coordinate.file, coordinate.position
     )
-}
-
-pub(crate) fn conflict_operation(operation: RowOperation) -> ConflictOperation {
-    match operation {
-        RowOperation::Insert => ConflictOperation::Insert,
-        RowOperation::Update => ConflictOperation::Update,
-        RowOperation::Delete => ConflictOperation::Delete,
-    }
 }

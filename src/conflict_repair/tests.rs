@@ -804,6 +804,5 @@ fn test_conflict(table: &str, id: &str) -> ConflictObservation {
         error_code: 1062,
         error_text: "duplicate".to_string(),
         observed_at_ms: 1,
-        parent_recovery: None,
     }
 }

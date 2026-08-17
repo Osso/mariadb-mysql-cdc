@@ -1,38 +1,9 @@
-use super::conflict::format_row_conflict_skipped;
 use super::*;
 use crate::probe::BinlogCoordinate;
-use crate::target::{
-    SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor, TargetRowChange,
-};
+use crate::target::{SqlStatement, TargetExecuteError, TargetExecutor, TargetRowChange};
 use mysql::Value;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
-
-#[test]
-fn successful_resolution_uses_temporal_pk_canonicalization_from_observation() {
-    let primary_key = [Value::Date(2026, 7, 18, 12, 34, 56, 789_000)];
-    let observation =
-        super::conflict::build_duplicate_conflict_observation(DuplicateConflictInput {
-            source_identity: "source-a",
-            source_server_id: 7,
-            coordinate: &coordinate(120),
-            end_position: 121,
-            schema: "app",
-            table: "accounts",
-            operation: RowOperation::Insert,
-            primary_key: &primary_key,
-            duplicate_index: Some("PRIMARY".to_string()),
-            duplicate_owner_primary_key: None,
-            error_code: 1062,
-            error_text: "duplicate",
-            observed_at_ms: 1,
-        });
-
-    assert_eq!(
-        observation.source_primary_key,
-        vec!["2026-07-18 12:34:56.789000".to_string()]
-    );
-}
+use std::collections::BTreeMap;
 
 #[test]
 fn applies_write_rows_as_independent_plain_inserts() {
@@ -60,229 +31,6 @@ fn applies_write_rows_as_independent_plain_inserts() {
             sql: "INSERT INTO `accounts` (`id`, `name`) VALUES (?, ?)".to_string(),
             params: values(["2", "beta"]),
         }
-    );
-}
-
-#[test]
-fn continues_after_one_duplicate_insert_is_ignored() {
-    let executor = RecordingExecutor {
-        row_outcomes: RefCell::new(VecDeque::from([
-            TargetExecutionOutcome::DuplicateIgnored(crate::target::DuplicateConflict {
-                error_code: 1062,
-                error_text: "Duplicate entry '1' for key 'PRIMARY'".to_string(),
-                duplicate_index: Some("PRIMARY".to_string()),
-            }),
-            TargetExecutionOutcome::Applied,
-        ])),
-        ..RecordingExecutor::default()
-    };
-    let mut applier = RowApplier::new(executor);
-    applier.apply_table_map(accounts_table_map());
-    let event = WriteRowsEvent {
-        coordinate: coordinate(130),
-        table_id: 7,
-        rows: vec![row("1", "conflict"), row("2", "applied")],
-    };
-
-    applier.apply_write_rows(&event).expect("apply write rows");
-
-    let statements = applier.executor().statements.borrow();
-    assert_eq!(statements.len(), 2);
-    assert_eq!(statements[0].params, values(["1", "conflict"]));
-    assert_eq!(statements[1].params, values(["2", "applied"]));
-}
-
-#[test]
-fn replaced_divergent_primary_continues_and_records_durable_evidence() {
-    let executor = RecordingExecutor {
-        row_outcomes: RefCell::new(VecDeque::from([
-            TargetExecutionOutcome::PrimaryKeyReplaced(crate::target::DuplicateConflict {
-                error_code: 1062,
-                error_text: "Duplicate entry '1' for key 'PRIMARY'".to_string(),
-                duplicate_index: Some("PRIMARY".to_string()),
-            }),
-            TargetExecutionOutcome::Applied,
-        ])),
-        ..RecordingExecutor::default()
-    };
-    let mut applier = RowApplier::new(executor);
-    applier.apply_table_map(accounts_table_map());
-    let event = WriteRowsEvent {
-        coordinate: coordinate(155),
-        table_id: 7,
-        rows: vec![row("1", "source"), row("2", "next")],
-    };
-    let mut ledger = crate::conflict_repair::InMemoryConflictStore::default();
-    applier
-        .record_duplicate_conflict(
-            &mut ledger,
-            DuplicateConflictInput {
-                source_identity: "source-a",
-                source_server_id: 7,
-                coordinate: &coordinate(155),
-                end_position: 200,
-                schema: "app",
-                table: "accounts",
-                operation: RowOperation::Insert,
-                primary_key: &[value("1")],
-                duplicate_index: Some("PRIMARY".to_string()),
-                duplicate_owner_primary_key: None,
-                error_code: 1062,
-                error_text: "Duplicate entry '1' for key 'PRIMARY'",
-                observed_at_ms: 100,
-            },
-        )
-        .expect("seed conflict");
-    let mut pending_resolutions = Vec::new();
-    let mut pending_observations = Vec::new();
-    let mut deferred_superseded_inserts = Vec::new();
-    let mut context = RowConflictContext {
-        store: &mut ledger,
-        pending_resolutions: &mut pending_resolutions,
-        pending_observations: &mut pending_observations,
-        deferred_superseded_inserts: &mut deferred_superseded_inserts,
-        source_identity: "source-a",
-        source_server_id: 7,
-        end_position: 200,
-        child_event_timestamp: 0,
-        observed_at_ms: 100,
-    };
-
-    applier
-        .apply_write_rows_with_conflicts(&event, &mut context)
-        .expect("replacement should continue the source transaction");
-
-    assert_eq!(applier.executor().statements.borrow().len(), 2);
-    let record = &ledger.records()[0];
-    assert_eq!(
-        record.status,
-        crate::conflict_repair::ConflictStatus::Unresolved
-    );
-    assert!(record.repair_run_id.is_none());
-    assert!(record.resolution_evidence.is_none());
-    assert_eq!(pending_resolutions.len(), 1);
-}
-
-#[test]
-fn ignored_duplicate_row_continues_without_persisting_conflict() {
-    let executor = RecordingExecutor {
-        row_outcomes: RefCell::new(VecDeque::from([TargetExecutionOutcome::DuplicateIgnored(
-            crate::target::DuplicateConflict {
-                error_code: 1062,
-                error_text: "Duplicate entry 'x' for key 'uq_accounts_email'".to_string(),
-                duplicate_index: Some("uq_accounts_email".to_string()),
-            },
-        )])),
-        ..RecordingExecutor::default()
-    };
-    let mut applier = RowApplier::new(executor);
-    applier.apply_table_map(accounts_table_map());
-    let event = WriteRowsEvent {
-        coordinate: coordinate(160),
-        table_id: 7,
-        rows: vec![row("A", "conflict")],
-    };
-    let mut ledger = crate::conflict_repair::InMemoryConflictStore::default();
-    crate::conflict_repair::ConflictStore::observe(
-        &mut ledger,
-        crate::conflict_repair::ConflictObservation {
-            source_identity: "source-a".to_string(),
-            source_server_id: 7,
-            coordinate: crate::conflict_repair::ConflictCoordinate {
-                file: "prior-binlog".to_string(),
-                start_position: 1,
-                end_position: 2,
-            },
-            schema: "app".to_string(),
-            table: "accounts".to_string(),
-            operation: crate::conflict_repair::ConflictOperation::Insert,
-            source_primary_key: vec!["1".to_string()],
-            duplicate_index: Some("PRIMARY".to_string()),
-            duplicate_owner_primary_key: None,
-            error_code: 1062,
-            error_text: "prior replacement conflict".to_string(),
-            observed_at_ms: 1,
-            parent_recovery: None,
-        },
-    )
-    .expect("prior conflict");
-    let mut pending_resolutions = Vec::new();
-    let mut pending_observations = Vec::new();
-    let mut deferred_superseded_inserts = Vec::new();
-    let mut context = RowConflictContext {
-        store: &mut ledger,
-        pending_resolutions: &mut pending_resolutions,
-        pending_observations: &mut pending_observations,
-        deferred_superseded_inserts: &mut deferred_superseded_inserts,
-        source_identity: "source-a",
-        source_server_id: 7,
-        end_position: 200,
-        child_event_timestamp: 0,
-        observed_at_ms: 100,
-    };
-
-    applier
-        .apply_write_rows_with_conflicts(&event, &mut context)
-        .expect("ignored duplicate should not abort the target transaction");
-    assert_eq!(ledger.records().len(), 1);
-    assert_eq!(
-        ledger.records()[0].status,
-        crate::conflict_repair::ConflictStatus::Unresolved
-    );
-}
-
-#[test]
-fn records_skipped_duplicate_with_coordinate_primary_key_index_and_error() {
-    let applier = applier_with_accounts_table();
-    let mut ledger = crate::conflict_repair::InMemoryConflictStore::default();
-    applier
-        .record_duplicate_conflict(
-            &mut ledger,
-            DuplicateConflictInput {
-                source_identity: "source-a",
-                source_server_id: 7,
-                coordinate: &coordinate(160),
-                end_position: 200,
-                schema: "fixture_cdc",
-                table: "accounts",
-                operation: RowOperation::Insert,
-                primary_key: &[value("A")],
-                duplicate_index: Some("uq_accounts_email".to_string()),
-                duplicate_owner_primary_key: Some(vec!["B".to_string()]),
-                error_code: 1062,
-                error_text: "ERROR 1062 duplicate email",
-                observed_at_ms: 100,
-            },
-        )
-        .expect("record conflict");
-    let record = &ledger.records()[0];
-    assert_eq!(record.key.coordinate.start_position, 160);
-    assert_eq!(record.key.coordinate.end_position, 200);
-    assert_eq!(record.key.source_primary_key, vec!["A"]);
-    assert_eq!(record.duplicate_index.as_deref(), Some("uq_accounts_email"));
-    assert_eq!(
-        record.duplicate_owner_primary_key,
-        Some(vec!["B".to_string()])
-    );
-    assert_eq!(record.error_code, 1062);
-    assert_eq!(
-        record.status,
-        crate::conflict_repair::ConflictStatus::Unresolved
-    );
-}
-
-#[test]
-fn formats_ignored_conflict_with_table_coordinate_and_primary_key() {
-    let message = format_row_conflict_skipped(
-        RowOperation::Insert,
-        &accounts_table_map().table,
-        &coordinate(130),
-        &[value("1")],
-    );
-
-    assert_eq!(
-        message,
-        "cdc_row_conflict_skipped operation=insert schema=app table=accounts source_file=mysql-bin.000001 source_position=130 primary_key=[\"1\"]"
     );
 }
 
@@ -659,7 +407,6 @@ fn coordinate(position: u64) -> BinlogCoordinate {
 #[derive(Default)]
 struct RecordingExecutor {
     statements: RefCell<Vec<SqlStatement>>,
-    row_outcomes: RefCell<VecDeque<TargetExecutionOutcome>>,
     error: Option<TargetExecuteError>,
 }
 
@@ -673,18 +420,11 @@ impl TargetExecutor for RecordingExecutor {
         }
     }
 
-    fn execute_row_change(
-        &self,
-        change: &TargetRowChange,
-    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+    fn execute_row_change(&self, change: &TargetRowChange) -> Result<(), TargetExecuteError> {
         self.statements.borrow_mut().push(change.statement.clone());
-        if let Some(error) = &self.error {
-            return Err(error.clone());
+        match &self.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
         }
-        Ok(self
-            .row_outcomes
-            .borrow_mut()
-            .pop_front()
-            .unwrap_or(TargetExecutionOutcome::Applied))
     }
 }

@@ -380,7 +380,6 @@ pub(crate) struct JournalRuntimeContract<'a> {
     pub(crate) application_schema: &'a str,
     pub(crate) checkpoint_table: &'a str,
     pub(crate) journal_table: &'a str,
-    pub(crate) conflict_table: &'a str,
     pub(crate) inventory_procedure: &'a str,
 }
 
@@ -410,7 +409,6 @@ fn validate_runtime_access(contract: &JournalRuntimeContract<'_>) -> Result<(), 
         contract.application_schema,
         contract.checkpoint_table,
         contract.journal_table,
-        contract.conflict_table,
         contract.inventory_procedure,
     )
 }

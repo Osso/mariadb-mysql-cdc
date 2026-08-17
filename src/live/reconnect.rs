@@ -1,10 +1,9 @@
-use super::{ApplyBinlogConfig, ApplyBinlogError, RecoveryAttemptError};
+use super::{ApplyBinlogConfig, ApplyBinlogError};
 use crate::checkpoint::{Checkpoint, CheckpointError, FileCheckpointStore, LastEvent};
 use crate::probe::BinlogCoordinate;
 #[cfg(test)]
 use crate::statement::StatementEvent;
 use crate::stream_checkpoint::MySqlStreamCheckpointStore;
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 const MAX_RECONNECT_DELAY_SECONDS: u64 = 5;
@@ -120,42 +119,15 @@ pub(super) fn coordinate_checkpoint(coordinate: &BinlogCoordinate, event_type: &
     }
 }
 
-#[cfg(test)]
 pub(super) fn run_stream_reconnect_loop<C, F, S>(
     config: &ApplyBinlogConfig,
     checkpoint_store: Option<&C>,
-    run_attempt: F,
-    sleep: S,
-) -> Result<(), ApplyBinlogError>
-where
-    C: StreamCheckpointStore,
-    F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
-    S: Fn(std::time::Duration),
-{
-    run_stream_reconnect_loop_with_recovery(
-        config,
-        checkpoint_store,
-        run_attempt,
-        |_request| {
-            Err(RecoveryAttemptError::ReconciliationFailed(
-                "exact parent recovery service unavailable".to_string(),
-            ))
-        },
-        sleep,
-    )
-}
-
-pub(super) fn run_stream_reconnect_loop_with_recovery<C, F, R, S>(
-    config: &ApplyBinlogConfig,
-    checkpoint_store: Option<&C>,
     mut run_attempt: F,
-    mut recover: R,
     sleep: S,
 ) -> Result<(), ApplyBinlogError>
 where
     C: StreamCheckpointStore,
     F: FnMut(&ApplyBinlogConfig) -> Result<(), ApplyBinlogError>,
-    R: FnMut(&crate::live::ExactParentRecovery) -> Result<(), RecoveryAttemptError>,
     S: Fn(std::time::Duration),
 {
     let mut attempt_config = config.clone();
@@ -163,34 +135,29 @@ where
     attempt_config.source.validate_start_coordinate()?;
     let mut reconnect_attempt = 0;
     let mut transport_reconnects = 0;
-    let mut attempted_recoveries = BTreeSet::new();
 
     loop {
         let error = match run_attempt(&attempt_config) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
-        let error = match retry_or_stop_after_failed_attempt(
-            error,
-            checkpoint_store.is_some(),
-            transport_reconnects,
-            config,
-            &mut attempted_recoveries,
-            &mut recover,
-        )? {
-            FailedAttemptOutcome::Retry {
-                error,
-                budget: RetryBudget::ConsumeTransport,
-            } => {
-                transport_reconnects += 1;
-                error
-            }
-            FailedAttemptOutcome::Retry {
-                error,
-                budget: RetryBudget::PreserveTransport,
-            } => error,
-            FailedAttemptOutcome::Stop(error) => return Err(error),
-        };
+        if let Some(stale_error) = stale_binlog_error(&error) {
+            return Err(stale_error);
+        }
+        let durable_ddl_block = matches!(error, ApplyBinlogError::DdlBlocked(_));
+        let reconnect_eligible = durable_ddl_block
+            || should_reconnect(
+                &error,
+                transport_reconnects,
+                config.max_reconnects,
+                config.reconnect_forever,
+            );
+        if checkpoint_store.is_none() || !reconnect_eligible {
+            return Err(error);
+        }
+        if !durable_ddl_block {
+            transport_reconnects += 1;
+        }
 
         reconnect_attempt += 1;
         let checkpoint = load_checkpoint_for_resume(checkpoint_store)?;
@@ -198,72 +165,6 @@ where
         validate_reconnect_start_coordinate(&attempt_config)?;
         log_reconnect_start(&attempt_config, reconnect_attempt, &error);
         sleep(reconnect_delay(reconnect_attempt));
-    }
-}
-
-enum FailedAttemptOutcome {
-    Retry {
-        error: ApplyBinlogError,
-        budget: RetryBudget,
-    },
-    Stop(ApplyBinlogError),
-}
-
-enum RetryBudget {
-    ConsumeTransport,
-    PreserveTransport,
-}
-
-fn retry_or_stop_after_failed_attempt<R>(
-    error: ApplyBinlogError,
-    has_checkpoint_store: bool,
-    transport_reconnects: u32,
-    config: &ApplyBinlogConfig,
-    attempted_recoveries: &mut BTreeSet<crate::live::ExactParentRecovery>,
-    recover: &mut R,
-) -> Result<FailedAttemptOutcome, ApplyBinlogError>
-where
-    R: FnMut(&crate::live::ExactParentRecovery) -> Result<(), RecoveryAttemptError>,
-{
-    if let Some(stale_error) = stale_binlog_error(&error) {
-        return Ok(FailedAttemptOutcome::Stop(stale_error));
-    }
-    let exact_parent_retry = error.parent_recovery().is_some();
-    let durable_ddl_block = matches!(error, ApplyBinlogError::DdlBlocked(_));
-    let exact_parent_retry_enabled = config.reconnect_forever || config.max_reconnects > 0;
-    let reconnect_eligible = if durable_ddl_block {
-        true
-    } else if exact_parent_retry {
-        exact_parent_retry_enabled && is_retryable_stream_error(&error)
-    } else {
-        should_reconnect(
-            &error,
-            transport_reconnects,
-            config.max_reconnects,
-            config.reconnect_forever,
-        )
-    };
-    if !has_checkpoint_store || !reconnect_eligible {
-        log_skipped_recovery(&error);
-        return Ok(FailedAttemptOutcome::Stop(error));
-    }
-    match attempt_exact_parent_recovery(&error, attempted_recoveries, recover) {
-        Ok(()) => Ok(FailedAttemptOutcome::Retry {
-            error,
-            budget: retry_budget(exact_parent_retry || durable_ddl_block),
-        }),
-        Err(source) => Ok(FailedAttemptOutcome::Retry {
-            error: parent_recovery_error(&error, source),
-            budget: RetryBudget::PreserveTransport,
-        }),
-    }
-}
-
-fn retry_budget(preserve_transport_budget: bool) -> RetryBudget {
-    if preserve_transport_budget {
-        RetryBudget::PreserveTransport
-    } else {
-        RetryBudget::ConsumeTransport
     }
 }
 
@@ -275,88 +176,12 @@ fn stale_binlog_error(error: &ApplyBinlogError) -> Option<ApplyBinlogError> {
     })
 }
 
-fn parent_recovery_error(
-    error: &ApplyBinlogError,
-    source: RecoveryAttemptError,
-) -> ApplyBinlogError {
-    let conflict = error
-        .parent_recovery()
-        .expect("recovery error requires conflict identity")
-        .clone();
-    ApplyBinlogError::ParentRecoveryFailed {
-        conflict: Box::new(conflict),
-        source,
-    }
-}
-
-fn log_skipped_recovery(error: &ApplyBinlogError) {
-    if let Some(request) = error.parent_recovery() {
-        println!(
-            "{}",
-            format_recovery_log("skipped", request, "retry_ineligible")
-        );
-    }
-}
-
-fn attempt_exact_parent_recovery<R>(
-    error: &ApplyBinlogError,
-    attempted_recoveries: &mut BTreeSet<crate::live::ExactParentRecovery>,
-    recover: &mut R,
-) -> Result<(), RecoveryAttemptError>
-where
-    R: FnMut(&crate::live::ExactParentRecovery) -> Result<(), RecoveryAttemptError>,
-{
-    let Some(request) = error.parent_recovery() else {
-        return Ok(());
-    };
-    if attempted_recoveries.contains(request) {
-        println!(
-            "{}",
-            format_recovery_log("skipped", request, "already_attempted")
-        );
-        return Ok(());
-    }
-    println!("{}", format_recovery_log("attempted", request, "started"));
-    if let Err(error) = recover(request) {
-        eprintln!(
-            "{} error={}",
-            format_recovery_log("failed", request, "error"),
-            shell_word(&error.to_string())
-        );
-        return Err(error);
-    }
-    attempted_recoveries.insert(request.clone());
-    println!(
-        "{}",
-        format_recovery_log("succeeded", request, "parent_reconciled")
-    );
-    Ok(())
-}
-
 fn validate_reconnect_start_coordinate(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
     config.source.validate_start_coordinate()
 }
 
 fn log_reconnect_start(config: &ApplyBinlogConfig, attempt: u32, error: &ApplyBinlogError) {
     println!("{}", format_reconnect_start(config, attempt, error));
-}
-
-fn format_recovery_log(
-    action: &str,
-    request: &crate::live::ExactParentRecovery,
-    outcome: &str,
-) -> String {
-    format!(
-        "cdc_exact_parent_recovery kind={} action={} source_file={} source_start_position={} source_end_position={} child_pk={} parent_identity={} outcome={}",
-        request.recovery_kind(),
-        action,
-        shell_word(request.source_file()),
-        request.source_start_position(),
-        request.source_end_position(),
-        shell_word(&request.child_primary_key()),
-        shell_word(&request.parent_identity()),
-        outcome,
-    )
 }
 
 pub(super) fn resume_from_checkpoint(
@@ -436,17 +261,6 @@ pub(super) fn reconnect_delay(attempt: u32) -> Duration {
 }
 
 fn is_retryable_stream_error(error: &ApplyBinlogError) -> bool {
-    // A persisted conflict is only retried when it carries a recovery plan: recovery changes the
-    // target, so the same position can then succeed. A conflict with no plan is skipped at the
-    // XID instead of reaching here.
-    if matches!(
-        error,
-        ApplyBinlogError::RowConflictPersisted { .. }
-            | ApplyBinlogError::ParentRecoveryFailed { .. }
-            | ApplyBinlogError::SupersededRecoveryFailed(_)
-    ) {
-        return true;
-    }
     let ApplyBinlogError::SourceCommand(message) = error else {
         return false;
     };

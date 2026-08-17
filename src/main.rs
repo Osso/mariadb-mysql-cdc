@@ -106,8 +106,7 @@ Apply options:
   --target-password-env ENV       Environment variable containing target password.
   --target-database DB            MySQL target database.
   --target-tls-ca-file PATH        Target CA certificate bundle. Defaults to /etc/mariadb-mysql-cdc/do-ca.pem.
-  --conflict-table TABLE           Durable row-conflict store. Defaults to cdc.row_conflicts.
-  --insert-conflict-policy POLICY Replay INSERT conflict policy: error, ignore-duplicate, or replace-divergent-pk.
+  --insert-conflict-policy POLICY Statement/snapshot INSERT policy: error, ignore-duplicate, or replace-divergent-pk. Native ROW streaming is fixed.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
   --reconnect-forever BOOL        Ignore reconnect cap for transient source loss. Defaults to false.
   --target-parallel-transactions COUNT
@@ -744,7 +743,6 @@ fn apply_binlog_identity_option(
     match flag {
         "--source-identity" => config.source_identity = value.to_string(),
         "--checkpoint-table" => config.checkpoint_table = value.to_string(),
-        "--conflict-table" => config.conflict_table = value.to_string(),
         _ => return Ok(false),
     }
 
@@ -783,22 +781,6 @@ fn apply_binlog_transaction_option(
         #[cfg(feature = "integration-failpoints")]
         "--integration-failpoint" => {
             config.integration_failpoint = Some(live::IntegrationFailpoint::parse(value)?);
-        }
-        #[cfg(feature = "integration-failpoints")]
-        "--integration-logical-source-file" => {
-            config.integration_logical_source_file = Some(value.to_string());
-        }
-        #[cfg(feature = "integration-failpoints")]
-        "--integration-logical-start-position" => {
-            config.integration_logical_start_position = Some(parse_u64(flag, value)?);
-        }
-        #[cfg(feature = "integration-failpoints")]
-        "--integration-logical-checkpoint-position" => {
-            config.integration_logical_checkpoint_position = Some(parse_u64(flag, value)?);
-        }
-        #[cfg(feature = "integration-failpoints")]
-        "--integration-logical-end-position" => {
-            config.integration_logical_end_position = Some(parse_u64(flag, value)?);
         }
         _ => return Ok(false),
     }

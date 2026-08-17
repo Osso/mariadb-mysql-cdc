@@ -308,115 +308,6 @@ fn connection_opts_use_explicit_ca_for_tls() {
     std::fs::remove_file(ca_path).expect("remove CA fixture");
 }
 
-fn build_locked_identity_evidence_sql_for_users(
-    columns: &[String],
-) -> Result<String, crate::target::TargetExecuteError> {
-    build_locked_identity_evidence_sql(columns, "users", "name")
-}
-
-#[test]
-fn locked_users_evidence_sql_uses_complete_ordered_columns_parameters_and_row_locks() {
-    assert_eq!(
-        supersession_columns_sql("users"),
-        "SELECT column_name FROM information_schema.columns WHERE table_schema='globalcomix' AND table_name='users' ORDER BY ordinal_position"
-    );
-    let sql = build_locked_identity_evidence_sql_for_users(&[
-        "id".to_string(),
-        "email".to_string(),
-        "name".to_string(),
-    ])
-    .expect("metadata columns");
-
-    assert_eq!(
-        sql,
-        "SELECT `id`, `email`, `name` FROM `globalcomix`.`users` WHERE `id` = ? OR `name` = ? ORDER BY `id` FOR UPDATE"
-    );
-    assert_eq!(sql.matches('?').count(), 2);
-}
-
-/// A multi-column foreign key on `comics -> artists(id, name)`: the lock must select by `id` alone,
-/// because the superseded `name` is exactly what no longer matches.
-#[test]
-fn locked_parent_identity_sql_selects_referenced_columns_by_primary_key_only() {
-    let sql = build_locked_parent_identity_sql(
-        "globalcomix",
-        "artists",
-        &["id".to_string(), "name".to_string()],
-        &["id".to_string()],
-    )
-    .expect("locked parent identity SQL");
-
-    assert_eq!(
-        sql,
-        "SELECT `id`, `name` FROM `globalcomix`.`artists` WHERE `id` = ? ORDER BY `id` LIMIT 2 FOR UPDATE"
-    );
-    assert_eq!(sql.matches('?').count(), 1);
-}
-
-#[test]
-fn locked_parent_identity_sql_supports_a_composite_primary_key() {
-    let sql = build_locked_parent_identity_sql(
-        "globalcomix",
-        "guests",
-        &["guest_id".to_string(), "guest_hash".to_string()],
-        &["guest_id".to_string(), "guest_hash".to_string()],
-    )
-    .expect("locked parent identity SQL");
-
-    assert!(
-        sql.contains("WHERE `guest_id` = ? AND `guest_hash` = ?"),
-        "{sql}"
-    );
-    assert!(sql.ends_with("FOR UPDATE"), "{sql}");
-}
-
-#[test]
-fn locked_parent_identity_sql_rejects_an_unsafe_identifier() {
-    let error = build_locked_parent_identity_sql(
-        "globalcomix",
-        "artists`; DROP TABLE users; --",
-        &["id".to_string()],
-        &["id".to_string()],
-    )
-    .expect_err("unsafe identifier must fail");
-
-    assert!(
-        error.to_string().contains("invalid locked parent"),
-        "{error}"
-    );
-}
-
-#[test]
-fn locked_parent_identity_sql_rejects_missing_columns_or_primary_key() {
-    let no_columns =
-        build_locked_parent_identity_sql("globalcomix", "artists", &[], &["id".to_string()])
-            .expect_err("no referenced columns must fail");
-    assert!(no_columns.to_string().contains("no referenced columns"));
-
-    let no_primary_key =
-        build_locked_parent_identity_sql("globalcomix", "artists", &["id".to_string()], &[])
-            .expect_err("no primary key must fail");
-    assert!(no_primary_key.to_string().contains("no primary key"));
-}
-
-#[test]
-fn locked_users_evidence_query_failure_is_explicit() {
-    let error = build_locked_users_evidence(
-        vec!["id".to_string()],
-        Err(TargetExecuteError::new("locked users query failed")),
-    )
-    .expect_err("query failure must propagate");
-
-    assert_eq!(error.to_string(), "locked users query failed");
-}
-
-#[test]
-fn locked_users_evidence_rejects_missing_metadata() {
-    let error =
-        build_locked_identity_evidence_sql_for_users(&[]).expect_err("empty metadata must fail");
-    assert!(error.to_string().contains("no columns"));
-}
-
 #[test]
 fn stream_lease_uses_nonblocking_hashed_mysql_lock() {
     assert_eq!(
@@ -433,175 +324,24 @@ fn stream_lease_rejects_missing_or_unacquired_lock() {
 }
 
 #[test]
-fn classifies_non_insert_duplicate_as_durable_conflict() {
-    let error = TargetExecuteError::from_mysql(
-        1062,
-        "ERROR 1062 (23000): Duplicate entry 'x' for key 'uq_accounts_name'",
+fn live_insert_duplicate_is_idempotent_success() {
+    let result = live_row_change_result(
+        TargetRowChangeKind::Insert,
+        Err(TargetExecuteError::from_mysql(1062, "duplicate")),
     );
 
-    let conflict = duplicate_conflict_for_row_change(TargetRowChangeKind::Update, &error)
-        .expect("update duplicate conflict");
-
-    assert_eq!(conflict.error_code, 1062);
-    assert_eq!(
-        conflict.duplicate_index.as_deref(),
-        Some("uq_accounts_name")
-    );
+    assert_eq!(result, Ok(()));
 }
 
 #[test]
-fn does_not_classify_insert_duplicate_as_non_insert_conflict() {
-    let error = TargetExecuteError::from_mysql(
-        1062,
-        "ERROR 1062 (23000): Duplicate entry 'x' for key 'PRIMARY'",
-    );
+fn live_update_duplicate_remains_fatal() {
+    let error = live_row_change_result(
+        TargetRowChangeKind::Update,
+        Err(TargetExecuteError::from_mysql(1062, "duplicate")),
+    )
+    .expect_err("UPDATE 1062 must fail");
 
-    assert_eq!(
-        duplicate_conflict_for_row_change(TargetRowChangeKind::Insert, &error),
-        None
-    );
-}
-
-#[test]
-fn classifies_supported_mysql_constraint_errors_for_durable_evidence() {
-    for code in [1048, 1451, 1452, 3819, 4025] {
-        let error = TargetExecuteError::from_mysql(code, format!("constraint failure {code}"));
-        let conflict = constraint_conflict_from_error(&error).expect("constraint conflict");
-        assert_eq!(conflict.error_code, code);
-        assert_eq!(conflict.duplicate_index, None);
-    }
-}
-
-#[test]
-fn classifies_duplicate_external_payment_trigger_as_durable_conflict() {
-    let error = TargetExecuteError::from_mysql(
-        1644,
-        "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order }",
-    );
-
-    let conflict =
-        constraint_conflict_for_row_change(TargetRowChangeKind::Insert, "payments", &error)
-            .expect("payments trigger conflict");
-
-    assert_eq!(conflict.error_code, 1644);
-    assert_eq!(conflict.duplicate_index, None);
-}
-
-#[test]
-fn treats_matching_existing_payment_identity_as_already_applied() {
-    let conflict = DuplicateConflict {
-        error_code: 1644,
-        error_text: "duplicate external payment".to_string(),
-        duplicate_index: None,
-    };
-    let columns = [
-        "id",
-        "order_id",
-        "payment_service_id",
-        "payment_status_id",
-        "transaction_id",
-        "original_transaction_id",
-        "authorization_id",
-    ];
-    let source = [
-        Value::Int(420054),
-        Value::Int(427524),
-        Value::Int(8),
-        Value::Int(6),
-        Value::Bytes(b"tx".to_vec()),
-        Value::Bytes(b"original".to_vec()),
-        Value::Bytes(b"authorization".to_vec()),
-    ];
-    let existing = [
-        Value::UInt(420054),
-        Value::UInt(427524),
-        Value::UInt(8),
-        Value::UInt(3),
-        Value::Bytes(b"tx".to_vec()),
-        Value::Bytes(b"original".to_vec()),
-        Value::Bytes(b"authorization".to_vec()),
-    ];
-
-    assert_eq!(
-        duplicate_payment_trigger_outcome(
-            conflict.clone(),
-            &columns,
-            &source,
-            &[existing.to_vec()]
-        ),
-        TargetExecutionOutcome::DuplicateIgnored(conflict)
-    );
-}
-
-#[test]
-fn keeps_divergent_payment_order_as_durable_conflict() {
-    let conflict = DuplicateConflict {
-        error_code: 1644,
-        error_text: "duplicate external payment".to_string(),
-        duplicate_index: None,
-    };
-    let columns = [
-        "id",
-        "order_id",
-        "payment_service_id",
-        "transaction_id",
-        "original_transaction_id",
-        "authorization_id",
-    ];
-    let source = ["420054", "427524", "8", "tx", "original", "authorization"]
-        .map(|value| Value::Bytes(value.as_bytes().to_vec()));
-    let existing = ["420054", "999999", "8", "tx", "original", "authorization"]
-        .map(|value| Value::Bytes(value.as_bytes().to_vec()));
-
-    assert_eq!(
-        duplicate_payment_trigger_outcome(
-            conflict.clone(),
-            &columns,
-            &source,
-            &[existing.to_vec()]
-        ),
-        TargetExecutionOutcome::ConstraintConflict(conflict)
-    );
-}
-
-#[test]
-fn rejects_unrelated_trigger_errors_as_conflict_evidence() {
-    let duplicate_payment = TargetExecuteError::from_mysql(
-        1644,
-        "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order }",
-    );
-    let other_trigger = TargetExecuteError::from_mysql(
-        1644,
-        "target mysql query failed: MySqlError { ERROR 1644 (45000): This external payment has already been applied to a previous order } additional context",
-    );
-
-    assert_eq!(
-        constraint_conflict_for_row_change(
-            TargetRowChangeKind::Insert,
-            "orders",
-            &duplicate_payment,
-        ),
-        None
-    );
-    assert_eq!(
-        constraint_conflict_for_row_change(
-            TargetRowChangeKind::Update,
-            "payments",
-            &duplicate_payment,
-        ),
-        None
-    );
-    assert_eq!(
-        constraint_conflict_for_row_change(TargetRowChangeKind::Insert, "payments", &other_trigger,),
-        None
-    );
-}
-
-#[test]
-fn rejects_non_constraint_mysql_errors_as_conflict_evidence() {
-    let error = TargetExecuteError::from_mysql(1142, "permission denied");
-
-    assert_eq!(constraint_conflict_from_error(&error), None);
+    assert_eq!(error.mysql_code(), Some(1062));
 }
 
 #[test]

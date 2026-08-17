@@ -48,15 +48,13 @@ pub(crate) use range::{
 #[cfg(test)]
 pub(crate) use recent::{RecentUpdateSyncContext, sync_recent_updates_with_progress};
 pub(crate) use repair::{apply_recent_update_chunk, repair_chunk};
-#[allow(unused_imports)]
-pub(crate) use run::read_exact_source_parent_row;
 #[cfg(test)]
 pub(crate) use run::{
-    ExactParentReader, build_sync_run_scope, is_retryable_sync_error, reconcile_exact_parent,
-    retry_sync_table_operation, should_record_terminal_sync_run_error,
+    build_sync_run_scope, is_retryable_sync_error, retry_sync_table_operation,
+    should_record_terminal_sync_run_error,
 };
 pub(crate) use run::{
-    expected_sync_run_spec_json, find_compatible_failed_run, read_parent_table_inventory,
-    reconcile_exact_parent_live, run_sync_table_phase_with_consistent_source,
-    run_sync_table_phase_with_run_spec, should_record_sync_run_error,
+    expected_sync_run_spec_json, find_compatible_failed_run,
+    run_sync_table_phase_with_consistent_source, run_sync_table_phase_with_run_spec,
+    should_record_sync_run_error,
 };

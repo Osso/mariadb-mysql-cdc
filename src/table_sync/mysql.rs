@@ -8,62 +8,6 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-pub(super) const GUEST_COLUMNS: [&str; 23] = [
-    "guest_id",
-    "guest_hash",
-    "country",
-    "original_ref",
-    "original_uri",
-    "first_user_id",
-    "geo_region_id",
-    "ui_lang",
-    "device_type",
-    "et_id",
-    "utm_medium",
-    "utm_source",
-    "utm_campaign",
-    "utm_term",
-    "utm_id",
-    "http_user_agent",
-    "create_time",
-    "is_bot",
-    "params",
-    "application_user_access_token_id",
-    "application_id",
-    "supports_cookies",
-    "reason",
-];
-pub(super) const HOME_FEED_CARD_COLUMNS: [&str; 20] = [
-    "id",
-    "card_type_id",
-    "status",
-    "reading_direction",
-    "comic_id",
-    "release_id",
-    "caption",
-    "hook_image_url",
-    "source_id",
-    "filter_reason",
-    "retired_reason",
-    "first_published",
-    "last_active_time",
-    "view_count",
-    "reaction_count",
-    "click_count",
-    "curator_user_id",
-    "curated_score",
-    "facets_json",
-    "create_time",
-];
-pub(super) const RECOVERY_CREATE_TIME_EPOCH_ALIAS: &str = "__recovery_create_time_epoch";
-const GUEST_IDENTITY_COLLISION_LIMIT: usize = 3;
-/// Two rows are enough to prove a referenced identity is ambiguous, which the planner rejects.
-// Unwired with generic missing-parent deferral (see live::missing_parent); kept for re-enable.
-#[allow(dead_code)]
-const PARENT_IDENTITY_COLLISION_LIMIT: usize = 2;
-const HOME_FEED_CARD_IDENTITY_COLLISION_LIMIT: usize = 3;
-pub(super) const RECOVERY_UTC_SESSION_SQL: &str = "SET SESSION time_zone='+00:00'";
-
 pub(crate) struct MySqlSyncReader {
     config: crate::mysql_snapshot::MySqlConnectionConfig,
     tls_ca_file: Option<String>,
@@ -71,7 +15,6 @@ pub(crate) struct MySqlSyncReader {
     shared_source: Option<Rc<PersistentMySqlSource>>,
     target_opts: Option<mysql::Opts>,
     replace_divergent_primary: bool,
-    initialize_recovery_utc: bool,
 }
 
 impl MySqlSyncReader {
@@ -90,7 +33,6 @@ impl MySqlSyncReader {
             shared_source: None,
             target_opts: None,
             replace_divergent_primary: false,
-            initialize_recovery_utc: false,
         }
     }
 
@@ -106,7 +48,6 @@ impl MySqlSyncReader {
             target_opts: Some(target_reader_opts(target)?),
             replace_divergent_primary: target.insert_conflict_policy
                 == crate::live::InsertConflictPolicy::ReplaceDivergentPk,
-            initialize_recovery_utc: false,
         })
     }
 
@@ -121,46 +62,7 @@ impl MySqlSyncReader {
             shared_source: Some(source),
             target_opts: None,
             replace_divergent_primary: false,
-            initialize_recovery_utc: false,
         }
-    }
-
-    pub(crate) fn with_recovery_utc(mut self) -> Self {
-        self.initialize_recovery_utc = true;
-        self
-    }
-
-    pub(crate) fn read_guest_identity_rows(
-        &self,
-        guest_id: &str,
-        guest_hash: &str,
-    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
-        let mut query_columns = guest_columns();
-        query_columns.push(RECOVERY_CREATE_TIME_EPOCH_ALIAS.to_string());
-        let sql = build_guest_identity_sql(guest_id, guest_hash);
-        parse_sync_rows(
-            &query_columns,
-            &["guest_id".to_string()],
-            self.query_rows(&sql)?,
-        )
-    }
-
-    pub(crate) fn read_home_feed_card_rows_by_id(
-        &self,
-        card_id: &str,
-    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
-        let sql = build_home_feed_card_id_sql(card_id);
-        parse_home_feed_card_rows(self.query_rows(&sql)?)
-    }
-
-    pub(crate) fn read_home_feed_card_identity_rows(
-        &self,
-        card_id: &str,
-        card_type_id: &str,
-        source_id: Option<&str>,
-    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
-        let sql = build_home_feed_card_identity_sql(card_id, card_type_id, source_id);
-        parse_home_feed_card_rows(self.query_rows(&sql)?)
     }
 
     pub(crate) fn read_exact_inventory_rows(
@@ -212,30 +114,6 @@ impl MySqlSyncReader {
         parse_sync_rows(&columns, &table.primary_key, self.query_rows(&sql)?)
     }
 
-    /// Reads the rows owning a referenced foreign-key identity in any parent table.
-    ///
-    /// Cardinality is preserved up to the collision limit so the planner can reject an ambiguous
-    /// identity instead of picking a row.
-    // Unwired with generic missing-parent deferral (see live::missing_parent); kept for re-enable.
-    #[allow(dead_code)]
-    pub(crate) fn read_parent_identity_rows(
-        &self,
-        table: &crate::inventory::TableInventory,
-        columns: &[String],
-        values: &[Option<String>],
-    ) -> Result<Vec<SnapshotRow>, TableSyncError> {
-        let query_columns = inventory_stored_columns(table);
-        let sql = format!(
-            "SELECT {} FROM {} WHERE {} ORDER BY {} LIMIT {}",
-            quote_ident_list(&query_columns),
-            quote_ident(&table.name),
-            parent_identity_predicates(columns, values),
-            quote_ident_list(&table.primary_key),
-            PARENT_IDENTITY_COLLISION_LIMIT,
-        );
-        parse_sync_rows(&query_columns, &table.primary_key, self.query_rows(&sql)?)
-    }
-
     fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, TableSyncError> {
         if let Some(source) = &self.shared_source {
             return source
@@ -259,11 +137,6 @@ impl MySqlSyncReader {
                 ),
             }
             .map_err(snapshot_error_to_table_sync)?;
-            initialize_recovery_session(self.initialize_recovery_utc, || {
-                source
-                    .execute_session_sql(RECOVERY_UTC_SESSION_SQL)
-                    .map_err(snapshot_error_to_table_sync)
-            })?;
             self.source.replace(Some(source));
         }
         Ok(std::cell::RefMut::map(self.source.borrow_mut(), |source| {
@@ -284,16 +157,6 @@ impl SyncTableReader for MySqlSyncReader {
     }
 }
 
-fn initialize_recovery_session<F>(enabled: bool, initialize: F) -> Result<(), TableSyncError>
-where
-    F: FnOnce() -> Result<(), TableSyncError>,
-{
-    if enabled {
-        initialize()?;
-    }
-    Ok(())
-}
-
 /// Columns an insert can carry, which excludes generated columns the target computes itself.
 pub(super) fn inventory_stored_columns(table: &crate::inventory::TableInventory) -> Vec<String> {
     table
@@ -301,87 +164,6 @@ pub(super) fn inventory_stored_columns(table: &crate::inventory::TableInventory)
         .iter()
         .filter(|column| column.generated.is_none())
         .map(|column| column.name.clone())
-        .collect()
-}
-
-/// A NULL foreign-key value never violates the constraint, so it cannot select a parent by
-/// equality. `IS NULL` keeps the read honest and the planner rejects the case outright.
-// Unwired with generic missing-parent deferral (see live::missing_parent); kept for re-enable.
-#[allow(dead_code)]
-fn parent_identity_predicates(columns: &[String], values: &[Option<String>]) -> String {
-    columns
-        .iter()
-        .zip(values)
-        .map(|(column, value)| match value {
-            Some(value) => format!("{} = {}", quote_ident(column), quote_sql_literal(value)),
-            None => format!("{} IS NULL", quote_ident(column)),
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ")
-}
-
-fn build_guest_identity_sql(guest_id: &str, guest_hash: &str) -> String {
-    format!(
-        "SELECT {}, UNIX_TIMESTAMP(`create_time`) AS {} FROM `guests` WHERE `guest_id` = {} OR `guest_hash` = {} ORDER BY `guest_id` LIMIT {}",
-        quote_ident_list(&guest_columns()),
-        quote_ident(RECOVERY_CREATE_TIME_EPOCH_ALIAS),
-        quote_sql_literal(guest_id),
-        quote_sql_literal(guest_hash),
-        GUEST_IDENTITY_COLLISION_LIMIT,
-    )
-}
-
-fn build_home_feed_card_id_sql(card_id: &str) -> String {
-    format!(
-        "SELECT {}, UNIX_TIMESTAMP(`create_time`) AS {} FROM `home_feed_cards` WHERE `id` = {} ORDER BY `id` LIMIT {}",
-        quote_ident_list(&home_feed_card_columns()),
-        quote_ident(RECOVERY_CREATE_TIME_EPOCH_ALIAS),
-        quote_sql_literal(card_id),
-        HOME_FEED_CARD_IDENTITY_COLLISION_LIMIT,
-    )
-}
-
-fn build_home_feed_card_identity_sql(
-    card_id: &str,
-    card_type_id: &str,
-    source_id: Option<&str>,
-) -> String {
-    let unique_collision = source_id.map(|source_id| {
-        format!(
-            " OR (`card_type_id` = {} AND `source_id` = {})",
-            quote_sql_literal(card_type_id),
-            quote_sql_literal(source_id),
-        )
-    });
-    format!(
-        "SELECT {}, UNIX_TIMESTAMP(`create_time`) AS {} FROM `home_feed_cards` WHERE `id` = {}{} ORDER BY `id` LIMIT {}",
-        quote_ident_list(&home_feed_card_columns()),
-        quote_ident(RECOVERY_CREATE_TIME_EPOCH_ALIAS),
-        quote_sql_literal(card_id),
-        unique_collision.unwrap_or_default(),
-        HOME_FEED_CARD_IDENTITY_COLLISION_LIMIT,
-    )
-}
-
-fn parse_home_feed_card_rows(
-    rows: Vec<Vec<Option<String>>>,
-) -> Result<Vec<SnapshotRow>, TableSyncError> {
-    let mut query_columns = home_feed_card_columns();
-    query_columns.push(RECOVERY_CREATE_TIME_EPOCH_ALIAS.to_string());
-    parse_sync_rows(&query_columns, &["id".to_string()], rows)
-}
-
-pub(super) fn home_feed_card_columns() -> Vec<String> {
-    HOME_FEED_CARD_COLUMNS
-        .iter()
-        .map(|column| (*column).to_string())
-        .collect()
-}
-
-pub(super) fn guest_columns() -> Vec<String> {
-    GUEST_COLUMNS
-        .iter()
-        .map(|column| (*column).to_string())
         .collect()
 }
 
@@ -721,43 +503,6 @@ mod tests {
         let error = batch_identity_predicate(&[]).expect_err("empty batch has no predicate");
 
         assert!(error.to_string().contains("at least one identity"));
-    }
-
-    #[test]
-    fn recovery_session_initialization_runs_once_per_connection() {
-        let initialization_count = RefCell::new(0);
-        initialize_recovery_session(true, || {
-            *initialization_count.borrow_mut() += 1;
-            Ok(())
-        })
-        .expect("initialize recovery connection");
-
-        let guest_query = build_guest_identity_sql("1", "hash");
-        let generic_queries = ["SELECT 1", guest_query.as_str()];
-        assert_eq!(generic_queries.len(), 2);
-        assert_eq!(*initialization_count.borrow(), 1);
-    }
-
-    #[test]
-    fn guest_identity_query_returns_canonical_columns_with_absolute_epoch_helper() {
-        let sql = build_guest_identity_sql("78011674", "guest-hash");
-
-        assert!(sql.contains("UNIX_TIMESTAMP(`create_time`) AS `__recovery_create_time_epoch`"));
-        assert!(sql.starts_with("SELECT `guest_id`, `guest_hash`,"));
-    }
-
-    #[test]
-    fn home_feed_card_identity_query_checks_primary_and_non_null_unique_owner() {
-        let sql = build_home_feed_card_identity_sql("2492683", "1", Some("50151"));
-
-        assert!(sql.contains("FROM `home_feed_cards`"));
-        assert!(sql.contains("`id` = '2492683'"));
-        assert!(sql.contains("`card_type_id` = '1' AND `source_id` = '50151'"));
-        assert!(sql.contains("UNIX_TIMESTAMP(`create_time`)"));
-        assert_eq!(home_feed_card_columns().len(), 20);
-
-        let null_source_sql = build_home_feed_card_identity_sql("2492683", "1", None);
-        assert!(!null_source_sql.contains("`card_type_id` ="));
     }
 
     #[test]

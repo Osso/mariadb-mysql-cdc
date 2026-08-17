@@ -97,7 +97,6 @@ fn parses_apply_binlog_config_with_all_source_and_target_options() {
 fn parses_apply_binlog_runtime_options_individually() {
     let mut config = live::ApplyBinlogConfig::default();
 
-    apply_binlog_option(&mut config, "--conflict-table", "cdc.conflicts").expect("conflict table");
     apply_binlog_option(&mut config, "--max-reconnects", "3").expect("max reconnects");
     apply_binlog_option(&mut config, "--reconnect-forever", "true").expect("reconnect forever");
     apply_binlog_option(&mut config, "--target-transaction-group-size", "25")
@@ -109,7 +108,6 @@ fn parses_apply_binlog_runtime_options_individually() {
     apply_binlog_option(&mut config, "--stop-never-slave-server-id", "4242")
         .expect("slave server id");
 
-    assert_eq!(config.conflict_table, "cdc.conflicts");
     assert_eq!(config.max_reconnects, 3);
     assert!(config.reconnect_forever);
     assert_eq!(config.target_transaction_group_size, 25);

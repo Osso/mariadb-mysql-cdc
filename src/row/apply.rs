@@ -1,31 +1,23 @@
-use super::conflict::{execute_row_statement, record_duplicate_conflict};
 use super::model::{
-    DeleteRowsEvent, DuplicateConflictInput, RowConflictContext, RowImage, RowOperation, RowResult,
-    RowTableMap, RowUpdate, TableMapEvent, TableMapRegistry, UpdateRowsEvent, WriteRowsEvent,
-    row_error,
+    DeleteRowsEvent, RowApplyError, RowImage, RowOperation, RowResult, RowTableMap, RowUpdate,
+    TableMapEvent, TableMapRegistry, UpdateRowsEvent, WriteRowsEvent, row_error,
 };
 use super::sql::{
-    build_delete_statement, build_insert_statement, build_update_statement, ordered_values,
-    primary_key_values, validate_row_has_primary_key, validate_rows_have_primary_keys,
-    writable_columns,
+    build_delete_statement, build_insert_statement, build_update_statement, primary_key_values,
+    validate_row_has_primary_key, validate_rows_have_primary_keys,
 };
 use crate::probe::BinlogCoordinate;
 use crate::target::{
-    SqlStatement, TargetExecuteError, TargetExecutionOutcome, TargetExecutor, TargetRowChange,
-    TargetRowChangeKind,
+    SqlStatement, TargetExecuteError, TargetExecutor, TargetRowChange, TargetRowChangeKind,
 };
+
+type RowPreflight<R> = fn(&RowTableMap, &[R], &BinlogCoordinate) -> RowResult<()>;
+type RowBuilder<R> = fn(&RowTableMap, &R, &BinlogCoordinate) -> RowResult<Option<TargetRowChange>>;
 
 pub struct RowApplier<E> {
     registry: TableMapRegistry,
     executor: E,
 }
-
-struct RowChange {
-    target: TargetRowChange,
-}
-
-type RowPreflight<R> = fn(&RowTableMap, &[R], &BinlogCoordinate) -> RowResult<()>;
-type RowBuilder<R> = fn(&RowTableMap, &R, &BinlogCoordinate) -> RowResult<Option<RowChange>>;
 
 struct RowEventInput<'a, R> {
     table_id: u64,
@@ -72,47 +64,15 @@ where
     }
 
     pub fn apply_write_rows(&self, event: &WriteRowsEvent) -> RowResult<()> {
-        self.apply_row_event(write_rows_input(event), None)
-    }
-
-    pub fn apply_write_rows_with_conflicts(
-        &self,
-        event: &WriteRowsEvent,
-        context: &mut RowConflictContext<'_>,
-    ) -> RowResult<()> {
-        self.apply_row_event(write_rows_input(event), Some(context))
+        self.apply_row_event(write_rows_input(event))
     }
 
     pub fn apply_update_rows(&self, event: &UpdateRowsEvent) -> RowResult<()> {
-        self.apply_row_event(update_rows_input(event), None)
-    }
-
-    pub fn apply_update_rows_with_conflicts(
-        &self,
-        event: &UpdateRowsEvent,
-        context: &mut RowConflictContext<'_>,
-    ) -> RowResult<()> {
-        self.apply_row_event(update_rows_input(event), Some(context))
+        self.apply_row_event(update_rows_input(event))
     }
 
     pub fn apply_delete_rows(&self, event: &DeleteRowsEvent) -> RowResult<()> {
-        self.apply_row_event(delete_rows_input(event), None)
-    }
-
-    pub fn apply_delete_rows_with_conflicts(
-        &self,
-        event: &DeleteRowsEvent,
-        context: &mut RowConflictContext<'_>,
-    ) -> RowResult<()> {
-        self.apply_row_event(delete_rows_input(event), Some(context))
-    }
-
-    pub fn record_duplicate_conflict<C: crate::conflict_repair::ConflictStore>(
-        &self,
-        recorder: &mut C,
-        input: DuplicateConflictInput<'_>,
-    ) -> Result<(), String> {
-        record_duplicate_conflict(recorder, input)
+        self.apply_row_event(delete_rows_input(event))
     }
 
     pub fn executor(&self) -> &E {
@@ -123,11 +83,7 @@ where
         self.registry.table(table_id)
     }
 
-    fn apply_row_event<R>(
-        &self,
-        input: RowEventInput<'_, R>,
-        mut context: Option<&mut RowConflictContext<'_>>,
-    ) -> RowResult<()> {
+    fn apply_row_event<R>(&self, input: RowEventInput<'_, R>) -> RowResult<()> {
         let table = self.resolve_table(input.table_id, input.coordinate)?;
         (input.preflight)(table, input.rows, input.coordinate)?;
 
@@ -135,20 +91,17 @@ where
             let Some(change) = (input.build_change)(table, row, input.coordinate)? else {
                 continue;
             };
-            execute_row_statement(
-                &self.executor,
-                change.target,
-                input.coordinate,
-                table,
-                input.operation,
-                context.as_deref_mut(),
-            )?;
-            if context
-                .as_ref()
-                .is_some_and(|context| !context.pending_observations.is_empty())
-            {
-                break;
-            }
+            self.executor
+                .execute_row_change(&change)
+                .map_err(|source| {
+                    row_error(RowApplyError::Target {
+                        coordinate: input.coordinate.clone(),
+                        schema: table.schema.clone(),
+                        table: table.table.clone(),
+                        operation: input.operation,
+                        source,
+                    })
+                })?;
         }
 
         Ok(())
@@ -160,7 +113,7 @@ where
         coordinate: &BinlogCoordinate,
     ) -> RowResult<&RowTableMap> {
         self.registry.table(table_id).ok_or_else(|| {
-            row_error(super::model::RowApplyError::MissingTableMap {
+            row_error(RowApplyError::MissingTableMap {
                 coordinate: coordinate.clone(),
                 table_id,
             })
@@ -213,23 +166,12 @@ fn insert_change(
     table: &RowTableMap,
     row: &RowImage,
     coordinate: &BinlogCoordinate,
-) -> RowResult<Option<RowChange>> {
-    let writable_columns = writable_columns(table);
-    let primary_key_values = primary_key_values(table, row, coordinate)?;
-    Ok(Some(RowChange {
-        target: TargetRowChange {
-            statement: build_insert_statement(table, row),
-            kind: TargetRowChangeKind::Insert,
-            table: table.table.clone(),
-            primary_key_columns: table.primary_key.clone(),
-            primary_key_values,
-            set_columns: writable_columns
-                .iter()
-                .map(|column| table.set_columns.get(column).cloned())
-                .collect(),
-            source_values: ordered_values(row, &writable_columns),
-            writable_columns,
-        },
+) -> RowResult<Option<TargetRowChange>> {
+    primary_key_values(table, row, coordinate)?;
+    Ok(Some(TargetRowChange {
+        statement: build_insert_statement(table, row),
+        kind: TargetRowChangeKind::Insert,
+        table: table.table.clone(),
     }))
 }
 
@@ -237,27 +179,15 @@ fn update_change(
     table: &RowTableMap,
     update: &RowUpdate,
     coordinate: &BinlogCoordinate,
-) -> RowResult<Option<RowChange>> {
+) -> RowResult<Option<TargetRowChange>> {
     validate_row_has_primary_key(table, &update.after, coordinate)?;
     let Some(statement) = build_update_statement(table, update, coordinate)? else {
         return Ok(None);
     };
-    let writable_columns = writable_columns(table);
-    let primary_key_values = primary_key_values(table, &update.after, coordinate)?;
-    Ok(Some(RowChange {
-        target: TargetRowChange {
-            statement,
-            kind: TargetRowChangeKind::Update,
-            table: table.table.clone(),
-            primary_key_columns: table.primary_key.clone(),
-            primary_key_values,
-            set_columns: writable_columns
-                .iter()
-                .map(|column| table.set_columns.get(column).cloned())
-                .collect(),
-            source_values: ordered_values(&update.after, &writable_columns),
-            writable_columns,
-        },
+    Ok(Some(TargetRowChange {
+        statement,
+        kind: TargetRowChangeKind::Update,
+        table: table.table.clone(),
     }))
 }
 
@@ -265,23 +195,12 @@ fn delete_change(
     table: &RowTableMap,
     row: &RowImage,
     coordinate: &BinlogCoordinate,
-) -> RowResult<Option<RowChange>> {
-    let writable_columns = writable_columns(table);
-    let primary_key_values = primary_key_values(table, row, coordinate)?;
-    Ok(Some(RowChange {
-        target: TargetRowChange {
-            statement: build_delete_statement(table, row, coordinate)?,
-            kind: TargetRowChangeKind::Delete,
-            table: table.table.clone(),
-            primary_key_columns: table.primary_key.clone(),
-            primary_key_values,
-            set_columns: writable_columns
-                .iter()
-                .map(|column| table.set_columns.get(column).cloned())
-                .collect(),
-            source_values: ordered_values(row, &writable_columns),
-            writable_columns,
-        },
+) -> RowResult<Option<TargetRowChange>> {
+    primary_key_values(table, row, coordinate)?;
+    Ok(Some(TargetRowChange {
+        statement: build_delete_statement(table, row, coordinate)?,
+        kind: TargetRowChangeKind::Delete,
+        table: table.table.clone(),
     }))
 }
 
@@ -293,10 +212,7 @@ where
         (*self).execute(statement)
     }
 
-    fn execute_row_change(
-        &self,
-        change: &TargetRowChange,
-    ) -> Result<TargetExecutionOutcome, TargetExecuteError> {
+    fn execute_row_change(&self, change: &TargetRowChange) -> Result<(), TargetExecuteError> {
         (*self).execute_row_change(change)
     }
 }

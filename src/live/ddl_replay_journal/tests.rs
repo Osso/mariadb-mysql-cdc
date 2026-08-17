@@ -73,7 +73,6 @@ fn grants() -> Vec<String> {
         "GRANT USAGE ON *.* TO `cdc_stream`@`%`".to_string(),
         "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, EVENT, TRIGGER ON `globalcomix`.* TO `cdc_stream`@`%`".to_string(),
         "GRANT SELECT, INSERT, UPDATE ON `cdc`.`stream_checkpoint` TO `cdc_stream`@`%`".to_string(),
-        "GRANT SELECT, INSERT, UPDATE ON `cdc`.`row_conflicts` TO `cdc_stream`@`%`".to_string(),
         "GRANT SELECT, INSERT, UPDATE ON `cdc`.`ddl_replay_journal` TO `cdc_stream`@`%`".to_string(),
         "GRANT SELECT, INSERT, UPDATE ON `cdc`.`table_sync_runs` TO `cdc_stream`@`%`".to_string(),
         "GRANT EXECUTE ON PROCEDURE `cdc`.`ddl_replay_journal_trigger_inventory` TO `cdc_stream`@`%`".to_string(),
@@ -100,7 +99,6 @@ fn runtime_contract<'a>(
         application_schema: "globalcomix",
         checkpoint_table: "cdc.stream_checkpoint",
         journal_table: "cdc.ddl_replay_journal",
-        conflict_table: "cdc.row_conflicts",
         inventory_procedure: "cdc.ddl_replay_journal_trigger_inventory",
     }
 }
@@ -247,34 +245,12 @@ fn validates_required_runtime_grants_and_rejects_control_plane_bypass() {
             "globalcomix",
             "cdc.stream_checkpoint",
             "cdc.ddl_replay_journal",
-            "cdc.row_conflicts",
             "cdc.ddl_replay_journal_trigger_inventory"
         )
         .is_ok()
     );
     assert_missing_application_privilege_is_rejected(&grant_rows);
-    assert_missing_conflict_update_is_rejected(&grant_rows);
     assert_bad_grants_are_rejected(&grant_rows);
-}
-
-fn assert_missing_conflict_update_is_rejected(grant_rows: &[String]) {
-    let mut missing = grant_rows
-        .iter()
-        .filter(|grant| !grant.contains("`cdc`.`row_conflicts`"))
-        .cloned()
-        .collect::<Vec<_>>();
-    missing.push("GRANT SELECT, INSERT ON `cdc`.`row_conflicts` TO `cdc_stream`@`%`".to_string());
-    let error = validate_runtime_grants(
-        &missing,
-        "globalcomix",
-        "cdc.stream_checkpoint",
-        "cdc.ddl_replay_journal",
-        "cdc.row_conflicts",
-        "cdc.ddl_replay_journal_trigger_inventory",
-    )
-    .expect_err("missing row-conflict UPDATE must fail startup grant validation");
-    assert!(error.contains("CDC.ROW_CONFLICTS"), "{error}");
-    assert!(error.contains("UPDATE"), "{error}");
 }
 
 fn assert_missing_application_privilege_is_rejected(grant_rows: &[String]) {
@@ -287,7 +263,6 @@ fn assert_missing_application_privilege_is_rejected(grant_rows: &[String]) {
             "globalcomix",
             "cdc.stream_checkpoint",
             "cdc.ddl_replay_journal",
-            "cdc.row_conflicts",
             "cdc.ddl_replay_journal_trigger_inventory",
         )
         .expect_err("missing application privilege must fail startup grant validation");
@@ -314,7 +289,6 @@ fn assert_bad_grants_are_rejected(grant_rows: &[String]) {
                 "globalcomix",
                 "cdc.stream_checkpoint",
                 "cdc.ddl_replay_journal",
-                "cdc.row_conflicts",
                 "cdc.ddl_replay_journal_trigger_inventory"
             )
             .is_err(),

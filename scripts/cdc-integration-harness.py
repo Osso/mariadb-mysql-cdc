@@ -29,8 +29,12 @@ CDC_SCHEMA = "cdc"
 ADMIN_PASSWORD = "cdc-harness-password"
 SOURCE_USER = "cdc_reader"
 SOURCE_PASSWORD = "cdc-reader-password"
-TARGET_USER = "cdc_stream"
-TARGET_PASSWORD = "cdc-stream-password"
+LIVE_TARGET_USER = "cdc_stream"
+LIVE_TARGET_PASSWORD = "cdc-stream-password"
+REPAIR_TARGET_USER = "cdc_repair"
+REPAIR_TARGET_PASSWORD = "cdc-repair-password"
+TARGET_USER = LIVE_TARGET_USER
+TARGET_PASSWORD = LIVE_TARGET_PASSWORD
 SOURCE_IMAGE = "mariadb:11.4"
 TARGET_IMAGE = "mysql:8.0"
 SOURCE_IDENTITY = "cdc-harness-source"
@@ -52,28 +56,15 @@ SCENARIOS = (
     ScenarioSpec("sync-table-fk-parent-concurrent-duplicate", True),
     ScenarioSpec("sync-table-wide-update-fk-retry", True),
     ScenarioSpec("writable-column-generated-metadata", True),
-    ScenarioSpec("home-feed-card-parent-recovery", True),
-    ScenarioSpec("superseded-release-parent-recovery", True),
-    ScenarioSpec("superseded-release-visibility-recovery", True),
-    ScenarioSpec("generic-fk-missing-parent", True),
-    ScenarioSpec("generic-fk-missing-parent-binary", True),
-    ScenarioSpec("generic-fk-superseded-attribute", True),
-    ScenarioSpec("generic-fk-source-parent-mismatch", True),
-    ScenarioSpec("generic-fk-restrict-rejected", True),
-    ScenarioSpec("superseded-users-recovery", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("catchup-snapshot-tls", True),
+    ScenarioSpec("insert-duplicate-idempotent", True),
     ScenarioSpec("parallel-target-transactions", True),
     ScenarioSpec("missing-checkpoint", True),
     ScenarioSpec("missing-trigger", True),
-    ScenarioSpec("missing-conflict-trigger", True),
     ScenarioSpec("missing-grant", True),
-    ScenarioSpec("missing-conflict-table", True),
-    ScenarioSpec("wrong-conflict-schema", True),
-    ScenarioSpec("missing-conflict-grant", True),
-    ScenarioSpec("broad-conflict-grant", True),
     ScenarioSpec("journal-outage", True),
     ScenarioSpec("translation-pending-barrier", True),
     ScenarioSpec("prepare-failure", True),
@@ -82,14 +73,10 @@ SCENARIOS = (
     ScenarioSpec("checkpoint-transaction", True),
     ScenarioSpec("source-connection-loss", True),
     ScenarioSpec("target-connection-loss", True),
-    ScenarioSpec("replace-divergent-pk", True),
     ScenarioSpec("missing-pk-two-parent-collision", True),
     ScenarioSpec("reconciliation-owner-missing-guest", True),
     ScenarioSpec("failed-run-claim-post-revalidation-race", True),
-    ScenarioSpec("row-conflict-rollback", True),
     ScenarioSpec("row-conflict-source-row-migration", True),
-    ScenarioSpec("row-conflict-indexed-resolution", True),
-    ScenarioSpec("durable-row-conflict-retry", True),
     ScenarioSpec("pre-state-drift", True),
     ScenarioSpec("coordinate-reuse", True),
     ScenarioSpec("raw-sql-reuse", True),
@@ -129,16 +116,6 @@ class Endpoint:
 class Coordinate:
     file: str
     position: int
-
-
-HOME_FEED_PRODUCTION_START = Coordinate("mysqld-bin.002709", 308_259_855)
-HOME_FEED_PRODUCTION_END = Coordinate("mysqld-bin.002709", 308_261_441)
-RELEASE_PARENT_PRODUCTION_START = Coordinate("mysqld-bin.002709", 515_816_517)
-RELEASE_PARENT_PRODUCTION_EVENT = Coordinate("mysqld-bin.002709", 515_816_736)
-RELEASE_PARENT_PRODUCTION_END = Coordinate("mysqld-bin.002709", 515_824_875)
-RELEASE_VISIBILITY_PRODUCTION_START = Coordinate("mysqld-bin.002709", 531_921_570)
-RELEASE_VISIBILITY_PRODUCTION_EVENT = Coordinate("mysqld-bin.002709", 531_921_789)
-RELEASE_VISIBILITY_PRODUCTION_END = Coordinate("mysqld-bin.002709", 531_929_925)
 
 
 @dataclass
@@ -188,7 +165,18 @@ class Harness:
         wait_for_sql(self.target, self.ca_file)
         self._bootstrap_endpoints()
         self._assert_endpoint_tls(self.source, SOURCE_USER, SOURCE_PASSWORD, "source")
-        self._assert_endpoint_tls(self.target, TARGET_USER, TARGET_PASSWORD, "target")
+        self._assert_endpoint_tls(
+            self.target,
+            LIVE_TARGET_USER,
+            LIVE_TARGET_PASSWORD,
+            "live target",
+        )
+        self._assert_endpoint_tls(
+            self.target,
+            REPAIR_TARGET_USER,
+            REPAIR_TARGET_PASSWORD,
+            "repair target",
+        )
         self._assert_source_grants()
         self._assert_target_grants()
 
@@ -343,47 +331,50 @@ class Harness:
 
     def _assert_target_grants(self) -> None:
         assert self.target
-        grants = self.admin_query(self.target, "SHOW GRANTS FOR 'cdc_stream'@'%';")
-        print("cdc_stream_show_grants_begin")
-        for row in grants.splitlines():
-            print(f"cdc_stream_show_grant row={row}")
-        print("cdc_stream_show_grants_end")
-        normalized = normalize_grants(grants)
-        assert_exact_grants(
-            normalized,
-            {
-                (frozenset({"USAGE"}), "*.*"),
-                (
-                    frozenset(
-                        {
-                            "SELECT",
-                            "INSERT",
-                            "UPDATE",
-                            "DELETE",
-                            "CREATE",
-                            "ALTER",
-                            "DROP",
-                            "INDEX",
-                            "REFERENCES",
-                            "CREATE VIEW",
-                            "SHOW VIEW",
-                            "CREATE ROUTINE",
-                            "ALTER ROUTINE",
-                            "EXECUTE",
-                            "EVENT",
-                            "TRIGGER",
-                        }
-                    ),
-                    f"{APP_SCHEMA}.*",
-                ),
-                (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.stream_checkpoint"),
-                (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.row_conflicts"),
-                (frozenset({"EXECUTE"}), "PROCEDURE cdc.row_conflicts_trigger_inventory"),
-                (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.ddl_replay_journal"),
-                (frozenset({"EXECUTE"}), "PROCEDURE cdc.ddl_replay_journal_trigger_inventory"),
-            },
-            TARGET_USER,
+        application_grant = (
+            frozenset(
+                {
+                    "SELECT",
+                    "INSERT",
+                    "UPDATE",
+                    "DELETE",
+                    "CREATE",
+                    "ALTER",
+                    "DROP",
+                    "INDEX",
+                    "REFERENCES",
+                    "CREATE VIEW",
+                    "SHOW VIEW",
+                    "CREATE ROUTINE",
+                    "ALTER ROUTINE",
+                    "EXECUTE",
+                    "EVENT",
+                    "TRIGGER",
+                }
+            ),
+            f"{APP_SCHEMA}.*",
         )
+        live_grants = {
+            (frozenset({"USAGE"}), "*.*"),
+            application_grant,
+            (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.stream_checkpoint"),
+            (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.ddl_replay_journal"),
+            (frozenset({"EXECUTE"}), "PROCEDURE cdc.ddl_replay_journal_trigger_inventory"),
+        }
+        repair_grants = live_grants | {
+            (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.row_conflicts"),
+            (frozenset({"EXECUTE"}), "PROCEDURE cdc.row_conflicts_trigger_inventory"),
+        }
+        for user, expected in (
+            (LIVE_TARGET_USER, live_grants),
+            (REPAIR_TARGET_USER, repair_grants),
+        ):
+            grants = self.admin_query(self.target, f"SHOW GRANTS FOR '{user}'@'%';")
+            print(f"{user}_show_grants_begin")
+            for row in grants.splitlines():
+                print(f"{user}_show_grant row={row}")
+            print(f"{user}_show_grants_end")
+            assert_exact_grants(normalize_grants(grants), expected, user)
 
     def refresh_endpoint(self, endpoint: Endpoint) -> Endpoint:
         port_text = run(["docker", "port", endpoint.container, "3306/tcp"]).stdout.strip()
@@ -574,10 +565,6 @@ class Harness:
         stop: Coordinate | None,
         integration_failpoint: str | None,
         max_reconnects: int,
-        insert_conflict_policy: str | None = None,
-        logical_start: Coordinate | None = None,
-        logical_checkpoint: Coordinate | None = None,
-        logical_end: Coordinate | None = None,
         target_parallel_transactions: int = 1,
     ) -> list[str]:
         assert self.source and self.target
@@ -605,7 +592,7 @@ class Harness:
             "--target-port",
             str(self.target.port),
             "--target-user",
-            TARGET_USER,
+            LIVE_TARGET_USER,
             "--target-password-env",
             "CDC_TARGET_PASSWORD",
             "--target-database",
@@ -617,23 +604,8 @@ class Harness:
         ]
         if stop:
             args.extend(["--stop-position", str(stop.position)])
-        if insert_conflict_policy is not None:
-            args.extend(["--insert-conflict-policy", insert_conflict_policy])
         if integration_failpoint is not None:
             args.extend(["--integration-failpoint", integration_failpoint])
-        if logical_start is not None and logical_end is not None:
-            args.extend(
-                [
-                    "--integration-logical-source-file",
-                    logical_start.file,
-                    "--integration-logical-start-position",
-                    str(logical_start.position),
-                    "--integration-logical-checkpoint-position",
-                    str((logical_checkpoint or logical_start).position),
-                    "--integration-logical-end-position",
-                    str(logical_end.position),
-                ]
-            )
         if target_parallel_transactions > 1:
             args.extend(["--target-parallel-transactions", str(target_parallel_transactions)])
         return args
@@ -645,17 +617,14 @@ class Harness:
         integration_failpoint: str | None = None,
         max_reconnects: int = 0,
         barrier_dir: Path | None = None,
-        insert_conflict_policy: str | None = None,
-        logical_start: Coordinate | None = None,
-        logical_checkpoint: Coordinate | None = None,
-        logical_end: Coordinate | None = None,
         target_parallel_transactions: int = 1,
     ) -> CommandResult:
-        build_feature = integration_failpoint
-        if logical_start is not None:
-            build_feature = build_feature or "logical-coordinate"
-        binary = self._stream_binary(build_feature)
-        env = {**os.environ, "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD, "CDC_TARGET_PASSWORD": TARGET_PASSWORD}
+        binary = self._stream_binary(integration_failpoint)
+        env = {
+            **os.environ,
+            "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+            "CDC_TARGET_PASSWORD": LIVE_TARGET_PASSWORD,
+        }
         if barrier_dir is not None:
             env["CDC_INTEGRATION_BARRIER_DIR"] = str(barrier_dir)
         return run(
@@ -665,10 +634,6 @@ class Harness:
                 stop,
                 integration_failpoint,
                 max_reconnects,
-                insert_conflict_policy,
-                logical_start,
-                logical_checkpoint,
-                logical_end,
                 target_parallel_transactions,
             ),
             env=env,
@@ -703,7 +668,7 @@ class Harness:
             "--target-port",
             str(self.target.port),
             "--target-user",
-            TARGET_USER,
+            REPAIR_TARGET_USER,
             "--target-password-env",
             "CDC_TARGET_PASSWORD",
             "--target-database",
@@ -745,7 +710,7 @@ class Harness:
             "--target-port",
             str(self.target.port),
             "--target-user",
-            TARGET_USER,
+            REPAIR_TARGET_USER,
             "--target-password-env",
             "CDC_TARGET_PASSWORD",
             "--target-database",
@@ -813,7 +778,7 @@ class Harness:
             "--target-port",
             str(self.target.port),
             "--target-user",
-            TARGET_USER,
+            REPAIR_TARGET_USER,
             "--target-password-env",
             "CDC_TARGET_PASSWORD",
             "--target-database",
@@ -862,7 +827,7 @@ class Harness:
         env = {
             **os.environ,
             "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-            "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
         }
         return run(
             self._repair_args(
@@ -898,7 +863,7 @@ class Harness:
         env = {
             **os.environ,
             "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-            "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
         }
         log_path = self.tempdir / f"{run_id}.log"
         log = log_path.open("w")
@@ -935,7 +900,11 @@ class Harness:
         target_parallel_transactions: int = 1,
     ) -> tuple[subprocess.Popen[str], Path]:
         binary = self._stream_binary(integration_failpoint)
-        env = {**os.environ, "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD, "CDC_TARGET_PASSWORD": TARGET_PASSWORD}
+        env = {
+            **os.environ,
+            "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+            "CDC_TARGET_PASSWORD": LIVE_TARGET_PASSWORD,
+        }
         if barrier_dir is not None:
             env["CDC_INTEGRATION_BARRIER_DIR"] = str(barrier_dir)
         log_path = self.tempdir / f"{label}.log"
@@ -1007,309 +976,6 @@ class Harness:
         """
         self.admin_sql(self.source, schema)
         self.admin_sql(self.target, schema)
-
-    GENERIC_FK_SCHEMA = """
-            CREATE TABLE artists (
-                id BIGINT NOT NULL PRIMARY KEY,
-                name VARCHAR(190) NOT NULL,
-                UNIQUE KEY uq_artist_identity (id, name)
-            ) ENGINE=InnoDB;
-            CREATE TABLE artist_comics (
-                id BIGINT NOT NULL PRIMARY KEY,
-                title VARCHAR(190) NOT NULL,
-                artist_id BIGINT NOT NULL,
-                artist_name VARCHAR(190) NOT NULL,
-                CONSTRAINT fk_artist_comics_artist FOREIGN KEY (artist_id, artist_name)
-                    REFERENCES artists(id, name) ON DELETE RESTRICT ON UPDATE CASCADE
-            ) ENGINE=InnoDB;
-        """
-
-    def run_generic_fk_missing_parent(self) -> None:
-        """An unenumerated constraint whose parent the target does not hold yet.
-
-        No coordinate is pinned anywhere: the constraint identity comes from the 1452 text and the
-        parent's primary key from the schema inventory.
-        """
-        assert self.source and self.target
-        self.admin_sql(self.source, self.GENERIC_FK_SCHEMA)
-        self.admin_sql(self.target, self.GENERIC_FK_SCHEMA)
-        self.admin_sql(self.source, "INSERT INTO artists VALUES (1,'Ada');")
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(
-            self.source,
-            "INSERT INTO artist_comics VALUES (10,'Comic A',1,'Ada');",
-        )
-        stop = self.coordinate()
-
-        result = self.run_stream(start, stop, max_reconnects=1)
-        require_success(result, "generic missing parent recovery")
-
-        parent = self.query(
-            self.target,
-            "SELECT id,name FROM artists WHERE id=1;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        if parent != "1\tAda":
-            raise HarnessError(f"installed parent mismatch: {parent!r}")
-        child = self.query(
-            self.target,
-            "SELECT id,title,artist_id,artist_name FROM artist_comics WHERE id=10;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        if child != "10\tComic A\t1\tAda":
-            raise HarnessError(f"replayed child mismatch: {child!r}")
-        if int(self.query(
-            self.target,
-            "SELECT COUNT(*) FROM artists;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()) != 1:
-            raise HarnessError("recovery must install exactly one parent")
-        checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(
-            checkpoint.get("source_position", 0)
-        ) != stop.position:
-            raise HarnessError(f"checkpoint did not advance to the child XID: {checkpoint}")
-        print(
-            "generic_fk_missing_parent_ok constraint=fk_artist_comics_artist "
-            f"boundary={start.file}:{start.position}-{stop.position} parent_id=1 child_id=10"
-        )
-
-    def run_generic_fk_superseded_attribute(self) -> None:
-        """The production race: the target parent already moved on while the stream replays.
-
-        The child event carries the historical `artist_name`, so only that derived column may be
-        fast-forwarded; the title must stay historical and the parent must not be touched.
-        """
-        assert self.source and self.target
-        self.admin_sql(self.source, self.GENERIC_FK_SCHEMA)
-        self.admin_sql(self.target, self.GENERIC_FK_SCHEMA)
-        self.admin_sql(self.source, "INSERT INTO artists VALUES (2,'Bob');")
-        self.admin_sql(self.target, "INSERT INTO artists VALUES (2,'Bob');")
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(
-            self.source,
-            "INSERT INTO artist_comics VALUES (20,'Historical Title',2,'Bob');",
-        )
-        stop = self.coordinate()
-        # Current source and catch-up target agree on the moved parent identity while the child is
-        # still absent from the target.
-        self.admin_sql(self.source, "UPDATE artists SET name='Robert' WHERE id=2;")
-        self.admin_sql(self.target, "UPDATE artists SET name='Robert' WHERE id=2;")
-
-        result = self.run_stream(start, stop, max_reconnects=1)
-        require_success(result, "generic superseded attribute recovery")
-
-        child = self.query(
-            self.target,
-            "SELECT id,title,artist_id,artist_name FROM artist_comics WHERE id=20;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        if child != "20\tHistorical Title\t2\tRobert":
-            raise HarnessError(
-                f"only the derived column may be fast-forwarded: {child!r}"
-            )
-        parent = self.query(
-            self.target,
-            "SELECT id,name FROM artists WHERE id=2;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        if parent != "2\tRobert":
-            raise HarnessError(f"recovery must not mutate the parent: {parent!r}")
-        checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(
-            checkpoint.get("source_position", 0)
-        ) != stop.position:
-            raise HarnessError(f"checkpoint did not advance to the child XID: {checkpoint}")
-        print(
-            "generic_fk_superseded_attribute_ok constraint=fk_artist_comics_artist "
-            f"boundary={start.file}:{start.position}-{stop.position} "
-            "substituted=artist_name:Bob->Robert historical_title_preserved=1 parent_unchanged=1"
-        )
-
-    def run_generic_fk_source_parent_mismatch(self) -> None:
-        assert self.source and self.target
-        self.admin_sql(self.source, self.GENERIC_FK_SCHEMA)
-        self.admin_sql(self.target, self.GENERIC_FK_SCHEMA)
-        self.admin_sql(self.source, "INSERT INTO artists VALUES (3,'Old');")
-        self.admin_sql(self.target, "INSERT INTO artists VALUES (3,'Target');")
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(self.source, "INSERT INTO artist_comics VALUES (30,'Historical',3,'Old');")
-        stop = self.coordinate()
-        self.admin_sql(self.source, "UPDATE artists SET name='Source' WHERE id=3;")
-        result = self.run_stream(start, stop, max_reconnects=0)
-        if result.returncode == 0:
-            raise HarnessError("source/target parent mismatch did not fail closed")
-        if self.checkpoint().get("source_position") != start.position:
-            raise HarnessError("source/target parent mismatch advanced checkpoint")
-        print("generic_fk_source_parent_mismatch_ok checkpoint_unchanged=true")
-
-    def run_generic_fk_restrict_rejected(self) -> None:
-        assert self.source and self.target
-        schema = self.GENERIC_FK_SCHEMA.replace("ON UPDATE CASCADE", "ON UPDATE RESTRICT")
-        self.admin_sql(self.source, schema)
-        self.admin_sql(self.target, schema)
-        self.admin_sql(self.source, "INSERT INTO artists VALUES (4,'Old');")
-        self.admin_sql(self.target, "INSERT INTO artists VALUES (4,'Current');")
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(self.source, "INSERT INTO artist_comics VALUES (40,'Historical',4,'Old');")
-        stop = self.coordinate()
-        result = self.run_stream(start, stop, max_reconnects=0)
-        if result.returncode == 0:
-            raise HarnessError("ON UPDATE RESTRICT conflict did not fail closed")
-        if self.checkpoint().get("source_position") != start.position:
-            raise HarnessError("ON UPDATE RESTRICT conflict advanced checkpoint")
-        print("generic_fk_restrict_rejected_ok checkpoint_unchanged=true")
-
-    def run_generic_fk_missing_parent_binary(self) -> None:
-        assert self.source and self.target
-        schema = """
-            CREATE TABLE binary_parents (
-                id BIGINT NOT NULL PRIMARY KEY,
-                identity VARBINARY(8) NOT NULL,
-                payload BLOB NOT NULL,
-                UNIQUE KEY uq_binary_identity (id, identity)
-            ) ENGINE=InnoDB;
-            CREATE TABLE binary_children (
-                id BIGINT NOT NULL PRIMARY KEY,
-                parent_id BIGINT NOT NULL,
-                parent_identity VARBINARY(8) NOT NULL,
-                CONSTRAINT fk_binary_parent FOREIGN KEY (parent_id,parent_identity)
-                    REFERENCES binary_parents(id,identity) ON UPDATE CASCADE
-            ) ENGINE=InnoDB;
-        """
-        self.admin_sql(self.source, schema)
-        self.admin_sql(self.target, schema)
-        self.admin_sql(self.source, "INSERT INTO binary_parents VALUES (5,X'FF00',X'80FF00');")
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(self.source, "INSERT INTO binary_children VALUES (50,5,X'FF00');")
-        stop = self.coordinate()
-        result = self.run_stream(start, stop, max_reconnects=1)
-        require_success(result, "generic binary missing parent recovery")
-        parent = self.query(self.target, "SELECT id,HEX(identity),HEX(payload) FROM binary_parents WHERE id=5;", user=TARGET_USER, password=TARGET_PASSWORD).strip()
-        if parent != "5\tFF00\t80FF00":
-            raise HarnessError(f"binary parent changed bytes: {parent!r}")
-        print("generic_fk_missing_parent_binary_ok bytes_preserved=true")
-
-    def run_home_feed_card_parent_recovery(self) -> None:
-        assert self.source and self.target
-        parent_schema = """
-            CREATE TABLE home_feed_cards (
-                id BIGINT NOT NULL PRIMARY KEY,
-                card_type_id BIGINT NOT NULL,
-                status VARCHAR(32) NOT NULL,
-                reading_direction VARCHAR(8) NOT NULL,
-                comic_id BIGINT NULL,
-                release_id BIGINT NULL,
-                caption TEXT NULL,
-                hook_image_url TEXT NULL,
-                source_id BIGINT NULL,
-                filter_reason VARCHAR(255) NULL,
-                retired_reason VARCHAR(255) NULL,
-                first_published DATETIME NULL,
-                last_active_time DATETIME NULL,
-                view_count BIGINT NOT NULL,
-                reaction_count BIGINT NOT NULL,
-                click_count BIGINT NOT NULL,
-                curator_user_id BIGINT NULL,
-                curated_score DECIMAL(10,4) NULL,
-                facets_json JSON NULL,
-                create_time DATETIME NOT NULL,
-                UNIQUE KEY uq_home_feed_card_source (card_type_id, source_id)
-            ) ENGINE=InnoDB;
-            CREATE TABLE home_feed_card_slides (
-                id BIGINT NOT NULL PRIMARY KEY,
-                card_id BIGINT NOT NULL,
-                CONSTRAINT fk_hfcs_card FOREIGN KEY (card_id)
-                    REFERENCES home_feed_cards(id)
-            ) ENGINE=InnoDB;
-        """
-        self.admin_sql(self.source, parent_schema)
-        self.admin_sql(self.target, parent_schema)
-        parent_values = (
-            "2492683,1,'active','l',10175,50715,'exact source caption',"
-            "'https://example.test/hook.jpg',50151,NULL,NULL,NULL,"
-            "'2026-07-20 22:01:03',0,0,0,NULL,NULL,NULL,'2026-06-23 05:01:16'"
-        )
-        self.admin_sql(
-            self.source,
-            f"INSERT INTO home_feed_cards VALUES ({parent_values});",
-        )
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(
-            self.source,
-            "INSERT INTO home_feed_card_slides VALUES (4508905,2492683);",
-        )
-        stop = self.coordinate()
-
-        result = self.run_stream(
-            start,
-            stop,
-            max_reconnects=1,
-            logical_start=HOME_FEED_PRODUCTION_START,
-            logical_end=HOME_FEED_PRODUCTION_END,
-        )
-        require_success(result, "exact home-feed parent recovery")
-
-        parent = self.query(
-            self.target,
-            "SELECT id,card_type_id,status,reading_direction,comic_id,release_id,caption,"
-            "hook_image_url,source_id,filter_reason,retired_reason,first_published,"
-            "last_active_time,view_count,reaction_count,click_count,curator_user_id,"
-            "curated_score,facets_json,create_time FROM home_feed_cards WHERE id=2492683;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        expected_parent = (
-            "2492683\t1\tactive\tl\t10175\t50715\texact source caption\t"
-            "https://example.test/hook.jpg\t50151\tNULL\tNULL\tNULL\t"
-            "2026-07-20 22:01:03\t0\t0\t0\tNULL\tNULL\tNULL\t2026-06-23 05:01:16"
-        )
-        if parent != expected_parent:
-            raise HarnessError(f"exact recovered parent mismatch: {parent!r}")
-        child = self.query(
-            self.target,
-            "SELECT id,card_id FROM home_feed_card_slides WHERE id=4508905;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        if child != "4508905\t2492683":
-            raise HarnessError(f"unchanged child replay mismatch: {child!r}")
-        conflict = self.query(
-            self.target,
-            "SELECT source_file,source_start_position,source_end_position,status "
-            "FROM cdc.row_conflicts WHERE schema_name='globalcomix' "
-            "AND table_name='home_feed_card_slides' AND source_primary_key_json='[\"4508905\"]';",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        expected_conflict = "mysqld-bin.002709\t308259855\t308261441\tresolved"
-        if conflict != expected_conflict:
-            raise HarnessError(f"logical recovery conflict evidence mismatch: {conflict!r}")
-        checkpoint = self.checkpoint()
-        if (
-            checkpoint.get("source_file") != HOME_FEED_PRODUCTION_END.file
-            or int(checkpoint.get("source_position", 0)) != HOME_FEED_PRODUCTION_END.position
-        ):
-            raise HarnessError(
-                f"logical child XID checkpoint mismatch: expected={HOME_FEED_PRODUCTION_END} actual={checkpoint}"
-            )
-        print(
-            "home_feed_card_parent_recovery_ok "
-            "logical_boundary=mysqld-bin.002709:308259855-308261441 "
-            f"physical_fixture_boundary={stop.file}:{start.position}-{stop.position} "
-            "parent_id=2492683 parent_columns=20 child_id=4508905"
-        )
 
     def _assert_catchup_target_unchanged(self) -> None:
         assert self.target
@@ -1392,7 +1058,7 @@ class Harness:
         env = {
             **os.environ,
             "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-            "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
         }
 
         self._assert_sync_table_source_ca_rejected(binary, env)
@@ -1473,16 +1139,74 @@ class Harness:
             "parallel_workers=2 completed_rerun_noop=true"
         )
 
+    def run_insert_duplicate_idempotent(self) -> None:
+        assert self.source and self.target
+        self.setup_accounts_table()
+        self.admin_sql(
+            self.target,
+            "INSERT INTO accounts VALUES (1, 'target@example.test', 'target-only'); "
+            "DROP PROCEDURE cdc.row_conflicts_trigger_inventory; "
+            "DROP TABLE cdc.row_conflicts;",
+        )
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "START TRANSACTION; "
+            "INSERT INTO accounts VALUES (1, 'source@example.test', 'source'); "
+            "INSERT INTO accounts VALUES (2, 'two@example.test', 'two'); "
+            "COMMIT;",
+        )
+        stop = self.coordinate()
+
+        result = self.run_stream(start, stop)
+        require_success(result, "serial source-authoritative duplicate INSERT stream")
+        rows = self.query(
+            self.target,
+            "SELECT id,email,payload FROM accounts ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        expected = "1\ttarget@example.test\ttarget-only\n2\ttwo@example.test\ttwo"
+        if rows != expected:
+            raise HarnessError(
+                f"serial duplicate INSERT changed target authority or skipped later row: {rows!r}"
+            )
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(
+            checkpoint.get("source_position", 0)
+        ) != stop.position:
+            raise HarnessError(
+                f"serial duplicate INSERT checkpoint did not reach exact stop: {checkpoint}"
+            )
+        conflict_tables = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema='cdc' AND table_name='row_conflicts';",
+        ).strip()
+        if conflict_tables != "0":
+            raise HarnessError(
+                f"serial duplicate INSERT recreated retired live conflict table: {conflict_tables}"
+            )
+        print(
+            "insert_duplicate_idempotent_ok mode=serial target_row=unchanged "
+            "later_same_transaction_row=applied conflict_table=absent "
+            f"checkpoint={stop.file}:{stop.position}"
+        )
+
     def assert_parallel_target_commit_barrier(self, start: Coordinate) -> None:
         assert self.target
         visible = self.query(
             self.target,
-            "SELECT COUNT(*) FROM accounts;",
+            "SELECT id,email,payload FROM accounts ORDER BY id;",
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         ).strip()
-        if visible != "0":
-            raise HarnessError(f"parallel target exposed an uncommitted row: {visible}")
+        expected = "1\ttarget@example.test\ttarget-only"
+        if visible != expected:
+            raise HarnessError(
+                f"parallel target exposed uncommitted rows or changed duplicate target row: {visible!r}"
+            )
         checkpoint = self.checkpoint()
         if checkpoint.get("source_file") != start.file or int(
             checkpoint.get("source_position", 0)
@@ -1494,15 +1218,22 @@ class Harness:
     def run_parallel_target_transactions(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
+        self.admin_sql(
+            self.target,
+            "INSERT INTO accounts VALUES (1, 'target@example.test', 'target-only');",
+        )
         start = self.coordinate()
         self.write_checkpoint(start)
         self.admin_sql(
             self.source,
-            "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');",
+            "START TRANSACTION; "
+            "INSERT INTO accounts VALUES (1, 'source@example.test', 'source'); "
+            "INSERT INTO accounts VALUES (2, 'two@example.test', 'two'); "
+            "COMMIT;",
         )
         self.admin_sql(
             self.source,
-            "INSERT INTO accounts VALUES (2, 'two@example.test', 'two');",
+            "INSERT INTO accounts VALUES (3, 'three@example.test', 'three');",
         )
         stop = self.coordinate()
 
@@ -1554,7 +1285,11 @@ class Harness:
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         ).strip()
-        expected = "1\tone@example.test\tone\n2\ttwo@example.test\ttwo"
+        expected = (
+            "1\ttarget@example.test\ttarget-only\n"
+            "2\ttwo@example.test\ttwo\n"
+            "3\tthree@example.test\tthree"
+        )
         if rows != expected:
             raise HarnessError(f"parallel target rows did not converge: {rows!r}")
         checkpoint = self.checkpoint()
@@ -1564,6 +1299,7 @@ class Harness:
             raise HarnessError(f"parallel target checkpoint did not reach exact stop: {checkpoint}")
         print(
             "parallel_target_transactions_ok workers=2 connector=mariadb "
+            "duplicate_target_row=unchanged later_same_transaction_row=applied "
             f"tls_connections={tls_connections} "
             f"checkpoint={stop.file}:{stop.position}"
         )
@@ -2529,110 +2265,6 @@ class Harness:
         self.assert_recovery_state(final_stop, expected_status="checkpointed", expected_index=True, expected_rows="0")
         print(f"{scenario}_converged journal=checkpointed checkpoint={final_stop.file}:{final_stop.position}")
 
-    def run_replace_divergent_pk(self) -> None:
-        assert self.source and self.target
-        self.setup_accounts_table()
-        self.admin_sql(
-            self.target,
-            "INSERT INTO accounts VALUES (1, 'target@example.test', 'target');",
-        )
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(
-            self.source,
-            "INSERT INTO accounts VALUES (1, 'source@example.test', 'source');",
-        )
-        stop = self.coordinate()
-
-        result = self.run_stream(
-            start,
-            stop,
-            insert_conflict_policy="replace-divergent-pk",
-        )
-        output = f"{result.stdout}\n{result.stderr}".lower()
-        require_success(result, "replace-divergent-pk commit")
-        if "cdc_row_conflict_replaced" not in output or 'primary_key=["1"]' not in output:
-            raise HarnessError(f"replacement did not report durable row evidence: {output}")
-        row = self.admin_query(self.target, "SELECT email,payload FROM accounts WHERE id=1;").strip()
-        if row != "source@example.test\tsource":
-            raise HarnessError(f"replacement did not install source image: {row!r}")
-        checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
-            raise HarnessError(f"replacement did not commit checkpoint at XID end: {checkpoint}")
-        evidence = self.admin_query(
-            self.target,
-            "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
-            "WHERE table_name='accounts' ORDER BY conflict_identity;",
-        ).strip()
-        if evidence:
-            raise HarnessError(f"successful replacement created ledger evidence: {evidence!r}")
-
-        self.admin_sql(
-            self.target,
-            "UPDATE accounts SET email='target@example.test', payload='target' WHERE id=1;",
-        )
-        self.write_checkpoint(start)
-        replay = self.run_stream(
-            start,
-            stop,
-            insert_conflict_policy="replace-divergent-pk",
-        )
-        replay_output = f"{replay.stdout}\n{replay.stderr}".lower()
-        require_success(replay, "replace-divergent-pk replay")
-        if "cdc_row_conflict_replaced" not in replay_output:
-            raise HarnessError(f"replacement replay did not report evidence: {replay_output}")
-        evidence = self.admin_query(
-            self.target,
-            "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
-            "WHERE table_name='accounts' ORDER BY conflict_identity;",
-        ).strip()
-        if evidence:
-            raise HarnessError(f"successful replacement replay created ledger evidence: {evidence!r}")
-
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, "DROP TABLE IF EXISTS replace_failure_rows;")
-        self.admin_sql(
-            self.source,
-            "CREATE TABLE replace_failure_rows (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL) ENGINE=InnoDB;",
-        )
-        self.admin_sql(
-            self.target,
-            "CREATE TABLE replace_failure_rows (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL, "
-            "CONSTRAINT chk_replace_failure_rows CHECK (payload <> 'blocked')) ENGINE=InnoDB;",
-        )
-        self.admin_sql(self.target, "INSERT INTO replace_failure_rows VALUES (1, 'target');")
-        failure_start = self.coordinate()
-        self.write_checkpoint(failure_start)
-        self.admin_sql(self.source, "INSERT INTO replace_failure_rows VALUES (1, 'blocked');")
-        failure_stop = self.coordinate()
-        for attempt in (1, 2):
-            failure = self.run_stream(
-                failure_start,
-                failure_stop,
-                insert_conflict_policy="replace-divergent-pk",
-            )
-            failure_output = f"{failure.stdout}\n{failure.stderr}".lower()
-            if failure.returncode == 0 or "row conflict persisted for repair" not in failure_output:
-                raise HarnessError(f"replacement update failure attempt {attempt} did not abort: {failure_output}")
-            row = self.admin_query(self.target, "SELECT payload FROM replace_failure_rows WHERE id=1;").strip()
-            if row != "target":
-                raise HarnessError(f"replacement update failure retained target mutation: {row!r}")
-            checkpoint = self.checkpoint()
-            if checkpoint.get("source_file") != failure_start.file or int(checkpoint.get("source_position", 0)) != failure_start.position:
-                raise HarnessError(f"replacement update failure advanced checkpoint: {checkpoint}")
-            evidence = self.admin_query(
-                self.target,
-                "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
-                "WHERE table_name='replace_failure_rows' ORDER BY conflict_identity;",
-            ).strip()
-            expected = f'["1"]\t3819\t{attempt}\tunresolved'
-            if evidence != expected and not evidence.startswith(f'["1"]\t4025\t{attempt}\tunresolved'):
-                raise HarnessError(f"replacement update failure evidence mismatch: {evidence!r}")
-        print(
-            "replace_divergent_pk_ok xid_commit_checkpoint=true replacement_attempts=2 "
-            "update_failure_rollback=true update_failure_attempts=2 crash_boundary_proven=false"
-        )
-
     def run_missing_pk_two_parent_collision(self) -> None:
         assert self.source and self.target
         create_sql = (
@@ -2666,7 +2298,7 @@ class Harness:
         env = {
             **os.environ,
             "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-            "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+            "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
         }
         args = self._sync_table_args(binary)
         table_index = args.index("accounts")
@@ -2783,33 +2415,6 @@ class Harness:
                 "FK parent backfill fixture was not staged: "
                 f"source_parent={source_parent!r} target_parent={target_parent!r}"
             )
-        print(
-            f"reconciliation-owner-missing-guest_staged checkpoint={pre_stream.file}:{pre_stream.position} "
-            f"source_parent={guest_id}:{guest_hash} target_parent_absent=true"
-        )
-
-        process, _log = self.start_stream(pre_stream, label="reconciliation-owner-missing-guest")
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise HarnessError(
-                    "FK parent backfill stream exited before child insert: "
-                    f"{self.process_output(process)}"
-                )
-            binlog_dump = self.admin_query(
-                self.source,
-                "SELECT COUNT(*) FROM information_schema.PROCESSLIST "
-                "WHERE USER='cdc_reader' AND COMMAND LIKE 'Binlog Dump%';",
-            ).strip()
-            if binlog_dump == "1":
-                break
-            time.sleep(0.2)
-        else:
-            raise HarnessError(
-                "FK parent backfill stream did not establish a source binlog connection: "
-                f"{self.process_output(process)}"
-            )
-
         self.admin_sql(
             self.source,
             "INSERT INTO sessions VALUES "
@@ -2822,14 +2427,45 @@ class Harness:
         ).strip()
         if source_child != f"{session_id}\t{guest_id}\t{guest_hash}\tsource-child":
             raise HarnessError(f"FK child source fixture was not inserted: {source_child!r}")
-
-        result = self.finish_stream(process)
-        output = f"{result.stdout}\n{result.stderr}"
-        if result.returncode == 0 or "row conflict persisted for repair" not in output:
+        if child_stop.file != pre_stream.file or child_stop.position <= pre_stream.position + 1:
             raise HarnessError(
-                "FK parent backfill stream did not stop at the real FK conflict: "
-                f"exit={result.returncode} output={output}"
+                "historical conflict fixture requires one source file and advancing coordinates: "
+                f"before={pre_stream} after={child_stop}"
             )
+
+        source_start_position = pre_stream.position + 1
+        conflict_key_json = json.dumps([str(session_id)])
+        conflict_identity = self.conflict_identity(
+            child_stop.file,
+            source_start_position,
+            "sessions",
+            [str(session_id)],
+            operation="insert",
+        )
+        error_text = (
+            "Cannot add or update a child row: a foreign key constraint fails "
+            "(`globalcomix`.`sessions`, CONSTRAINT `fk_sessions_guest` "
+            "FOREIGN KEY (`guest_id`, `guest_hash`) REFERENCES `guests` "
+            "(`guest_id`, `guest_hash`))"
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO cdc.row_conflicts "
+            "(conflict_identity,source_identity,source_server_id,source_file,"
+            "source_start_position,source_end_position,schema_name,table_name,operation,"
+            "source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json,"
+            "error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status) "
+            f"VALUES ({sql_literal(conflict_identity)},{sql_literal(SOURCE_IDENTITY)},101,"
+            f"{sql_literal(child_stop.file)},{source_start_position},{child_stop.position},"
+            f"{sql_literal(APP_SCHEMA)},'sessions','insert',{sql_literal(conflict_key_json)},"
+            f"NULL,NULL,1452,{sql_literal(error_text)},1,1,1,'unresolved');",
+        )
+        print(
+            "reconciliation-owner-missing-guest_staged historical_conflict=true "
+            f"checkpoint={pre_stream.file}:{pre_stream.position} "
+            f"source_parent={guest_id}:{guest_hash} target_parent_absent=true"
+        )
+
         target_parent_after = self.admin_query(
             self.target,
             f"SELECT guest_id,guest_hash,payload FROM guests WHERE guest_id={guest_id};",
@@ -2840,7 +2476,7 @@ class Harness:
         ).strip()
         if target_parent_after or target_child_after:
             raise HarnessError(
-                "FK conflict retained target rows: "
+                "historical conflict fixture retained target rows: "
                 f"parent={target_parent_after!r} child={target_child_after!r}"
             )
         checkpoint_after = self.checkpoint()
@@ -2849,7 +2485,7 @@ class Harness:
             or int(checkpoint_after.get("source_position", 0)) != pre_stream.position
         ):
             raise HarnessError(
-                "FK conflict advanced checkpoint past child XID: "
+                "historical conflict fixture changed stream checkpoint: "
                 f"before={pre_stream} after={checkpoint_after} child_stop={child_stop}"
             )
 
@@ -2950,7 +2586,7 @@ class Harness:
             env={
                 **os.environ,
                 "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+                "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
             },
             timeout=180,
             check=False,
@@ -2983,7 +2619,7 @@ class Harness:
             env={
                 **os.environ,
                 "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+                "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
             },
             timeout=180,
             check=False,
@@ -3102,7 +2738,7 @@ class Harness:
             env={
                 **os.environ,
                 "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+                "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
             },
             timeout=180,
             check=False,
@@ -3253,762 +2889,6 @@ class Harness:
             "row-conflict-source-row-migration_ok existing_rows_backfilled=true "
             "lookup_index=true identity_immutable=true"
         )
-
-    def run_row_conflict_indexed_resolution(self) -> None:
-        assert self.source and self.target
-        self.setup_accounts_table()
-        equal_row = "INSERT INTO accounts VALUES (1, 'same@example.test', 'same');"
-        self.admin_sql(self.target, equal_row)
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        conflict_identity = self.conflict_identity(
-            start.file, start.position, "accounts", ["1"], operation="insert"
-        )
-        self.admin_sql(
-            self.target,
-            "INSERT INTO cdc.row_conflicts "
-            "(conflict_identity,source_identity,source_server_id,source_file,"
-            "source_start_position,source_end_position,schema_name,table_name,operation,"
-            "source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json,"
-            "error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status) "
-            f"VALUES ({sql_literal(conflict_identity)},{sql_literal(SOURCE_IDENTITY)},101,"
-            f"{sql_literal(start.file)},{start.position},{start.position},'globalcomix',"
-            "'accounts','insert','[\"1\"]','PRIMARY',NULL,1062,'existing debt',1,1,1,'unresolved');",
-        )
-        source_row_identity = self.source_row_identity("accounts", ["1"])
-        lookup_sql = (
-            "SELECT 1 FROM cdc.row_conflicts "
-            f"WHERE source_row_identity={sql_literal(source_row_identity)} "
-            f"AND source_identity={sql_literal(SOURCE_IDENTITY)} "
-            "AND schema_name='globalcomix' AND table_name='accounts' "
-            "AND source_primary_key_json='[\"1\"]' AND status='unresolved' LIMIT 1"
-        )
-        plan = self.admin_query(self.target, f"EXPLAIN {lookup_sql};").strip().split("\t")
-        if len(plan) < 7 or plan[6] != "row_conflicts_source_row_status":
-            raise HarnessError(f"source-row lookup did not use its exact index: {plan!r}")
-        collision_lookup = lookup_sql.replace(
-            sql_literal(SOURCE_IDENTITY), sql_literal("other-source"), 1
-        )
-        if self.query(
-            self.target,
-            f"{collision_lookup};",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip():
-            raise HarnessError("source-row hash lookup bypassed exact collision predicates")
-        self.admin_sql(self.source, equal_row)
-        stop = self.coordinate()
-        result = self.run_stream(start, stop, insert_conflict_policy="ignore-duplicate")
-        output = f"{result.stdout}\n{result.stderr}".lower()
-        if result.returncode != 0 or "cdc_row_conflict_skipped" not in output:
-            raise HarnessError(f"indexed conflict resolution replay failed: {output}")
-        resolution = self.admin_query(
-            self.target,
-            "SELECT source_row_identity,status,COALESCE(repair_run_id,''),"
-            "COALESCE(resolution_evidence,'') FROM cdc.row_conflicts "
-            f"WHERE conflict_identity={sql_literal(conflict_identity)};",
-        ).strip().split("\t", 3)
-        if (
-            len(resolution) != 4
-            or resolution[0] != source_row_identity
-            or resolution[1] != "resolved"
-            or not resolution[2]
-            or not resolution[3]
-        ):
-            raise HarnessError(f"indexed source-row debt did not resolve: {resolution!r}")
-        checkpoint = self.checkpoint()
-        if (
-            checkpoint.get("source_file") != stop.file
-            or int(checkpoint.get("source_position", 0)) != stop.position
-        ):
-            raise HarnessError(f"indexed source-row replay did not checkpoint: {checkpoint}")
-        print(
-            "row-conflict-indexed-resolution_ok lookup_index=true "
-            "collision_defended=true resolved_after_commit=true"
-        )
-
-    def run_row_conflict_rollback(self) -> None:
-        assert self.source and self.target
-        self.setup_accounts_table()
-        equal_row = "INSERT INTO accounts VALUES (1, 'same@example.test', 'same');"
-        self.admin_sql(self.target, equal_row)
-        equal_start = self.coordinate()
-        self.write_checkpoint(equal_start)
-        self.admin_sql(self.source, equal_row)
-        equal_stop = self.coordinate()
-        equal_result = self.run_stream(
-            equal_start,
-            equal_stop,
-            insert_conflict_policy="ignore-duplicate",
-        )
-        equal_output = f"{equal_result.stdout}\n{equal_result.stderr}".lower()
-        if (
-            equal_result.returncode != 0
-            or "cdc_row_conflict_skipped" not in equal_output
-            or 'primary_key=["1"]' not in equal_output
-        ):
-            raise HarnessError(f"equal-PK duplicate did not continue cleanly: {equal_output}")
-        rows = self.admin_query(
-            self.target,
-            "SELECT id,email,payload FROM accounts ORDER BY id;",
-        ).strip()
-        if rows != "1\tsame@example.test\tsame":
-            raise HarnessError(f"equal-PK duplicate changed the target row: {rows!r}")
-        checkpoint = self.checkpoint()
-        if (
-            checkpoint.get("source_file") != equal_stop.file
-            or int(checkpoint.get("source_position", 0)) != equal_stop.position
-        ):
-            raise HarnessError(f"equal-PK duplicate did not advance checkpoint: {checkpoint}")
-        unresolved = self.admin_query(
-            self.target,
-            "SELECT COUNT(*) FROM cdc.row_conflicts "
-            "WHERE table_name='accounts' AND source_primary_key_json=JSON_ARRAY('1') "
-            "AND status='unresolved';",
-        ).strip()
-        if unresolved != "0":
-            raise HarnessError(f"equal-PK duplicate created unresolved conflict debt: {unresolved}")
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, "DELETE FROM accounts WHERE id=1;")
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email (email);")
-        self.admin_sql(self.target, "INSERT INTO accounts VALUES (99, 'duplicate@example.test', 'owner');")
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(
-            self.source,
-            "START TRANSACTION; "
-            "INSERT INTO accounts VALUES (1, 'first@example.test', 'first'); "
-            "INSERT INTO accounts VALUES (2, 'duplicate@example.test', 'second'); "
-            "COMMIT;",
-        )
-        stop = self.coordinate()
-        for attempt in (1, 2):
-            result = self.run_stream(start, stop, insert_conflict_policy="ignore-duplicate")
-            output = f"{result.stdout}\n{result.stderr}".lower()
-            if result.returncode == 0 or "row conflict persisted for repair" not in output:
-                raise HarnessError(f"duplicate rollback attempt {attempt} did not fail durably: {output}")
-            rows = self.admin_query(self.target, "SELECT id,email,payload FROM accounts ORDER BY id;").strip()
-            if rows != "99\tduplicate@example.test\towner":
-                raise HarnessError(f"duplicate rollback mutated sibling/owner rows: {rows!r}")
-            checkpoint = self.checkpoint()
-            if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
-                raise HarnessError(f"duplicate rollback advanced checkpoint: {checkpoint}")
-            evidence = self.admin_query(
-                self.target,
-                "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
-                "WHERE table_name='accounts' ORDER BY conflict_identity;",
-            ).strip()
-            expected = f'["2"]\t1062\t{attempt}\tunresolved'
-            if evidence != expected:
-                raise HarnessError(f"duplicate evidence mismatch attempt={attempt}: {evidence!r}")
-
-        self.admin_sql(
-            self.target,
-            "INSERT INTO accounts VALUES (98, 'different-pk@example.test', 'different-pk-owner');",
-        )
-        different_pk_start = stop
-        self.write_checkpoint(different_pk_start)
-        self.admin_sql(
-            self.source,
-            "INSERT INTO accounts VALUES (3, 'different-pk@example.test', 'different-pk');",
-        )
-        different_pk_stop = self.coordinate()
-        different_pk_result = self.run_stream(
-            different_pk_start,
-            different_pk_stop,
-            insert_conflict_policy="ignore-duplicate",
-        )
-        different_pk_output = f"{different_pk_result.stdout}\n{different_pk_result.stderr}".lower()
-        if different_pk_result.returncode == 0 or "row conflict persisted for repair" not in different_pk_output:
-            raise HarnessError(f"different-PK replay did not fail durably: {different_pk_output}")
-        rows = self.admin_query(self.target, "SELECT id,email,payload FROM accounts ORDER BY id;").strip()
-        expected_rows = (
-            "98\tdifferent-pk@example.test\tdifferent-pk-owner\n"
-            "99\tduplicate@example.test\towner"
-        )
-        if rows != expected_rows:
-            raise HarnessError(f"different-PK replay mutated owner rows: {rows!r}")
-        checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != different_pk_start.file or int(checkpoint.get("source_position", 0)) != different_pk_start.position:
-            raise HarnessError(f"different-PK replay advanced checkpoint: {checkpoint}")
-        evidence = self.admin_query(
-            self.target,
-            "SELECT source_primary_key_json,attempt_count,status FROM cdc.row_conflicts "
-            "WHERE table_name='accounts' ORDER BY source_primary_key_json;",
-        ).strip().splitlines()
-        if evidence != ['["2"]\t2\tunresolved', '["3"]\t1\tunresolved']:
-            raise HarnessError(f"different-PK evidence was not isolated: {evidence!r}")
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, "DROP TABLE IF EXISTS constraint_rows;")
-        self.admin_sql(
-            self.source,
-            "CREATE TABLE constraint_rows (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL) ENGINE=InnoDB;",
-        )
-        self.admin_sql(
-            self.target,
-            "CREATE TABLE constraint_rows (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL, "
-            "CONSTRAINT chk_constraint_rows_payload CHECK (payload <> 'blocked')) ENGINE=InnoDB;",
-        )
-        constraint_start = self.coordinate()
-        self.write_checkpoint(constraint_start)
-        self.admin_sql(
-            self.source,
-            "START TRANSACTION; "
-            "INSERT INTO constraint_rows VALUES (10, 'first'); "
-            "INSERT INTO constraint_rows VALUES (11, 'blocked'); "
-            "COMMIT;",
-        )
-        constraint_stop = self.coordinate()
-        for attempt in (1, 2):
-            result = self.run_stream(
-                constraint_start,
-                constraint_stop,
-                insert_conflict_policy="ignore-duplicate",
-            )
-            output = f"{result.stdout}\n{result.stderr}".lower()
-            if result.returncode == 0 or "constraint failure" not in output and "conflict persisted for repair" not in output:
-                raise HarnessError(f"constraint rollback attempt {attempt} did not fail durably: {output}")
-            rows = self.admin_query(self.target, "SELECT COUNT(*) FROM constraint_rows;").strip()
-            if rows != "0":
-                raise HarnessError(f"constraint rollback retained sibling rows: {rows}")
-            checkpoint = self.checkpoint()
-            if checkpoint.get("source_file") != constraint_start.file or int(checkpoint.get("source_position", 0)) != constraint_start.position:
-                raise HarnessError(f"constraint rollback advanced checkpoint: {checkpoint}")
-            evidence = self.admin_query(
-                self.target,
-                "SELECT source_primary_key_json,error_code,attempt_count,status FROM cdc.row_conflicts "
-                "WHERE table_name='constraint_rows' ORDER BY conflict_identity;",
-            ).strip().split("\t")
-            if len(evidence) != 4 or evidence[0] != '["11"]' or evidence[1] not in {"3819", "4025"} or evidence[2:] != [str(attempt), "unresolved"]:
-                raise HarnessError(f"constraint evidence mismatch attempt={attempt}: {evidence!r}")
-        print(
-            "row-conflict-rollback_ok equal_pk_duplicate=continued "
-            "equal_pk_checkpoint_advanced=true equal_pk_conflict_debt=0 "
-            "duplicate_attempts=2 different_pk_attempts=1 "
-            "constraint_attempts=2 checkpoint_unchanged=true"
-        )
-
-    def setup_superseded_release_tables(self) -> None:
-        assert self.source and self.target
-        schema_sql = (
-            "DROP TABLE IF EXISTS release_transaction_effects; "
-            "DROP TABLE IF EXISTS releases; "
-            "DROP TABLE IF EXISTS comics; "
-            "CREATE TABLE comics ("
-            "id BIGINT NOT NULL PRIMARY KEY, "
-            "section_id BIGINT NOT NULL, "
-            "title VARCHAR(64) NOT NULL, "
-            "UNIQUE KEY comics_id_section (id,section_id)"
-            ") ENGINE=InnoDB; "
-            "CREATE TABLE releases ("
-            "id BIGINT NOT NULL PRIMARY KEY, "
-            "comic_id BIGINT NOT NULL, "
-            "comic_category_id BIGINT NOT NULL, "
-            "payload VARCHAR(64) NOT NULL, "
-            "public_time BIGINT AS (1) STORED, "
-            "CONSTRAINT releases_ibfk_2 FOREIGN KEY (comic_id,comic_category_id) "
-            "REFERENCES comics (id,section_id) ON UPDATE CASCADE"
-            ") ENGINE=InnoDB; "
-            "CREATE TABLE release_transaction_effects ("
-            "id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL"
-            ") ENGINE=InnoDB;"
-        )
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, schema_sql)
-
-    def prepare_superseded_release_case(
-        self,
-        *,
-        target_parent_section: int | None = 26,
-        source_release_mismatch: bool = False,
-        prove_later_history: bool = True,
-        target_current_release: bool = False,
-        target_parent_title: str = "lagged target comic",
-    ) -> tuple[Coordinate, Coordinate]:
-        assert self.source and self.target
-        self.setup_superseded_release_tables()
-        self.admin_sql(
-            self.source,
-            "INSERT INTO comics VALUES (18384,21,'source comic');",
-        )
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(
-            self.source,
-            "START TRANSACTION; "
-            "INSERT INTO releases (id,comic_id,comic_category_id,payload) "
-            "VALUES (384446,18384,21,'historical release'); "
-            "INSERT INTO release_transaction_effects VALUES (900001,'same transaction effect'); "
-            "COMMIT;",
-        )
-        historical_stop = self.coordinate()
-        if prove_later_history:
-            self.admin_sql(
-                self.source,
-                "UPDATE comics SET section_id=26,title='current comic' WHERE id=18384; "
-                "UPDATE releases SET comic_category_id=26,payload='current release' WHERE id=384446;",
-            )
-        if source_release_mismatch:
-            self.admin_sql(
-                self.source,
-                "INSERT INTO comics VALUES (18385,27,'different comic'); "
-                "UPDATE releases SET comic_id=18385,comic_category_id=27,payload='mismatched current release' "
-                "WHERE id=384446;",
-            )
-        if target_parent_section is not None:
-            self.admin_sql(
-                self.target,
-                "INSERT INTO comics VALUES "
-                f"(18384,{target_parent_section},'{target_parent_title}');",
-            )
-        if target_current_release:
-            self.admin_sql(
-                self.target,
-                "INSERT INTO releases (id,comic_id,comic_category_id,payload) "
-                "VALUES (384446,18384,26,'current release');",
-            )
-        return start, historical_stop
-
-    def assert_superseded_release_failure(
-        self,
-        *,
-        label: str,
-        target_parent_section: int | None = 26,
-        source_release_mismatch: bool = False,
-        prove_later_history: bool = True,
-    ) -> None:
-        assert self.target
-        start, historical_stop = self.prepare_superseded_release_case(
-            target_parent_section=target_parent_section,
-            source_release_mismatch=source_release_mismatch,
-            prove_later_history=prove_later_history,
-        )
-        result = self.run_stream(
-            start,
-            historical_stop,
-            logical_start=RELEASE_PARENT_PRODUCTION_EVENT,
-            logical_checkpoint=RELEASE_PARENT_PRODUCTION_START,
-            logical_end=RELEASE_PARENT_PRODUCTION_END,
-        )
-        if result.returncode == 0:
-            raise HarnessError(f"{label} did not fail closed")
-        release_count = self.admin_query(
-            self.target,
-            "SELECT COUNT(*) FROM releases WHERE id=384446;",
-        ).strip()
-        effect_count = self.admin_query(
-            self.target,
-            "SELECT COUNT(*) FROM release_transaction_effects WHERE id=900001;",
-        ).strip()
-        if release_count != "0" or effect_count != "0":
-            raise HarnessError(
-                f"{label} retained rolled-back effects: release={release_count} effect={effect_count}"
-            )
-        checkpoint = self.checkpoint()
-        if (
-            checkpoint.get("source_file") != start.file
-            or int(checkpoint.get("source_position", 0)) != start.position
-        ):
-            raise HarnessError(f"{label} advanced checkpoint: {checkpoint}")
-
-    def run_superseded_release_parent_recovery(self) -> None:
-        assert self.source and self.target
-        start, historical_stop = self.prepare_superseded_release_case()
-        result = self.run_stream(
-            start,
-            historical_stop,
-            logical_start=RELEASE_PARENT_PRODUCTION_EVENT,
-            logical_checkpoint=RELEASE_PARENT_PRODUCTION_START,
-            logical_end=RELEASE_PARENT_PRODUCTION_END,
-        )
-        require_success(result, "superseded release parent recovery stream")
-        parent = self.admin_query(
-            self.target,
-            "SELECT id,section_id,title FROM comics WHERE id=18384;",
-        ).strip()
-        if parent != "18384\t26\tlagged target comic":
-            raise HarnessError(f"current target parent changed: {parent!r}")
-        release = self.admin_query(
-            self.target,
-            "SELECT id,comic_id,comic_category_id,payload FROM releases WHERE id=384446;",
-        ).strip()
-        # Column substitution replaced the whole-current-row install: only the derived referenced
-        # column moves to the locked parent's section_id, so the payload stays historical.
-        if release != "384446\t18384\t26\thistorical release":
-            raise HarnessError(f"derived column fast-forward mismatch: {release!r}")
-        effect = self.admin_query(
-            self.target,
-            "SELECT id,payload FROM release_transaction_effects WHERE id=900001;",
-        ).strip()
-        if effect != "900001\tsame transaction effect":
-            raise HarnessError(f"remaining transaction effect did not commit: {effect!r}")
-
-        # The four fail-closed cases that used to live here guarded evidence the whole-current-row
-        # install consumed: the current source release row, and proof that source history moved
-        # later. Column substitution reads neither. It takes the locked parent's current value for
-        # the derived column only, on the approved reasoning that the next replayed parent update
-        # writes the same value and, if the parent never changes again, the target value is already
-        # final. A differing or absent target parent is now a resolved outcome rather than a stall:
-        # differing fast-forwards to it, absent installs the exact source parent. The fail-closed
-        # boundaries of the unified path are ambiguity, a locked shape disagreeing with the error,
-        # and a NULL referenced key, covered by foreign_key_repair unit tests and by the
-        # generic-fk-* scenarios.
-
-        replay_start, replay_stop = self.prepare_superseded_release_case(
-            target_current_release=True,
-        )
-        replay = self.run_stream(
-            replay_start,
-            replay_stop,
-            insert_conflict_policy="replace-divergent-pk",
-            logical_start=RELEASE_PARENT_PRODUCTION_EVENT,
-            logical_checkpoint=RELEASE_PARENT_PRODUCTION_START,
-            logical_end=RELEASE_PARENT_PRODUCTION_END,
-        )
-        require_success(replay, "current release non-regression replay")
-        current_release = self.admin_query(
-            self.target,
-            "SELECT id,comic_id,comic_category_id,payload FROM releases WHERE id=384446;",
-        ).strip()
-        if current_release != "384446\t18384\t26\tcurrent release":
-            raise HarnessError(f"historical replay regressed current release: {current_release!r}")
-        replay_effect = self.admin_query(
-            self.target,
-            "SELECT id,payload FROM release_transaction_effects WHERE id=900001;",
-        ).strip()
-        if replay_effect != "900001\tsame transaction effect":
-            raise HarnessError(f"non-regression replay missed remaining effect: {replay_effect!r}")
-        print(
-            "superseded_release_parent_recovery_ok logical_boundary="
-            "mysqld-bin.002709:515816517-515824875 current_parent_preserved=true "
-            "missing_release_recovered=true remaining_effects_committed=true "
-            "negative_proofs_fail_closed=true current_release_not_regressed=true"
-        )
-
-    def setup_superseded_release_visibility_tables(self) -> None:
-        assert self.source and self.target
-        schema_sql = (
-            "DROP TABLE IF EXISTS release_transaction_effects; "
-            "DROP TABLE IF EXISTS releases; "
-            "DROP TABLE IF EXISTS comics; "
-            "CREATE TABLE comics ("
-            "id BIGINT NOT NULL PRIMARY KEY, "
-            "is_visible TINYINT NOT NULL, "
-            "title VARCHAR(64) NOT NULL, "
-            "update_time DATETIME NULL, "
-            "UNIQUE KEY comics_id_visible (id,is_visible)"
-            ") ENGINE=InnoDB; "
-            "CREATE TABLE releases ("
-            "id BIGINT NOT NULL PRIMARY KEY, "
-            "comic_id BIGINT NOT NULL, "
-            "comic_is_visible TINYINT NOT NULL, "
-            "slug VARCHAR(64) NOT NULL, "
-            "payload VARCHAR(64) NOT NULL, "
-            "is_visible TINYINT NOT NULL, "
-            "is_deleted TINYINT NOT NULL, "
-            "page_count INT NOT NULL, "
-            "update_time DATETIME NULL, "
-            "CONSTRAINT releases_ibfk_3 FOREIGN KEY (comic_id,comic_is_visible) "
-            "REFERENCES comics (id,is_visible) ON UPDATE CASCADE"
-            ") ENGINE=InnoDB; "
-            "CREATE TABLE release_transaction_effects ("
-            "id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL"
-            ") ENGINE=InnoDB;"
-        )
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, schema_sql)
-
-    def run_superseded_release_visibility_recovery(self) -> None:
-        assert self.source and self.target
-        self.setup_superseded_release_visibility_tables()
-        self.admin_sql(
-            self.source,
-            "INSERT INTO comics VALUES (48054,1,'historical comic','2026-07-18 05:26:16');",
-        )
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(
-            self.source,
-            "START TRANSACTION; "
-            "INSERT INTO releases VALUES "
-            "(384447,48054,1,'four-essentials','historical release',1,0,0,NULL); "
-            "INSERT INTO release_transaction_effects VALUES (900002,'same transaction effect'); "
-            "COMMIT;",
-        )
-        historical_stop = self.coordinate()
-        self.admin_sql(
-            self.source,
-            "UPDATE comics SET is_visible=0,title='current comic',"
-            "update_time='2026-07-18 06:00:26' WHERE id=48054; "
-            "UPDATE releases SET comic_is_visible=0,slug='DELETED_misc',"
-            "payload='current release',is_visible=0,is_deleted=1,page_count=13,"
-            "update_time='2026-07-18 05:41:17' WHERE id=384447;",
-        )
-        self.admin_sql(
-            self.target,
-            "INSERT INTO comics VALUES "
-            "(48054,0,'lagged target comic','2026-07-18 05:41:46');",
-        )
-        result = self.run_stream(
-            start,
-            historical_stop,
-            logical_start=RELEASE_VISIBILITY_PRODUCTION_EVENT,
-            logical_checkpoint=RELEASE_VISIBILITY_PRODUCTION_START,
-            logical_end=RELEASE_VISIBILITY_PRODUCTION_END,
-        )
-        require_success(result, "superseded release visibility recovery stream")
-        parent = self.admin_query(
-            self.target,
-            "SELECT id,is_visible,title,update_time FROM comics WHERE id=48054;",
-        ).strip()
-        if parent != "48054\t0\tlagged target comic\t2026-07-18 05:41:46":
-            raise HarnessError(f"current target visibility parent changed: {parent!r}")
-        release = self.admin_query(
-            self.target,
-            "SELECT id,comic_id,comic_is_visible,slug,payload,is_visible,is_deleted,page_count,update_time "
-            "FROM releases WHERE id=384447;",
-        ).strip()
-        # Column substitution replaced the whole-current-row install. Only the derived
-        # comic_is_visible moves to the locked parent's value; every other column stays historical,
-        # and the later replayed child updates converge it. Installing the current row here jumped
-        # the child ahead of the replay, which the stream is not supposed to do.
-        expected_release = "384447\t48054\t0\tfour-essentials\thistorical release\t1\t0\t0\tNULL"
-        if release != expected_release:
-            raise HarnessError(f"visibility derived column fast-forward mismatch: {release!r}")
-        effect = self.admin_query(
-            self.target,
-            "SELECT id,payload FROM release_transaction_effects WHERE id=900002;",
-        ).strip()
-        if effect != "900002\tsame transaction effect":
-            raise HarnessError(f"visibility recovery missed remaining effect: {effect!r}")
-        print(
-            "superseded_release_visibility_recovery_ok logical_boundary="
-            "mysqld-bin.002709:531921570-531929925 current_parent_preserved=true "
-            "current_release_installed=true remaining_effects_committed=true"
-        )
-
-    def setup_superseded_users_tables(self) -> None:
-        assert self.source and self.target
-        schema_sql = (
-            "DROP TABLE IF EXISTS users_email_settings; "
-            "DROP TABLE IF EXISTS users_profiles; "
-            "DROP TABLE IF EXISTS users; "
-            "CREATE TABLE users ("
-            "id BIGINT NOT NULL, "
-            "name VARCHAR(64) NOT NULL, "
-            "email VARCHAR(128) NOT NULL, "
-            "UNIQUE KEY name (name), "
-            "UNIQUE KEY email (email), "
-            "PRIMARY KEY (id)"
-            ") ENGINE=InnoDB; "
-            "CREATE TABLE users_profiles ("
-            "id BIGINT NOT NULL PRIMARY KEY, "
-            "full_name VARCHAR(128) NOT NULL"
-            ") ENGINE=InnoDB; "
-            "CREATE TABLE users_email_settings ("
-            "id BIGINT NOT NULL PRIMARY KEY, "
-            "user_id BIGINT NOT NULL, "
-            "setting_group_id BIGINT NOT NULL, "
-            "setting TINYINT NOT NULL, "
-            "UNIQUE KEY uq_user_setting (user_id, setting_group_id)"
-            ") ENGINE=InnoDB;"
-        )
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, schema_sql)
-        self.admin_sql(self.target, "DELETE FROM cdc.row_conflicts WHERE table_name='users';")
-
-    def prepare_superseded_users_case(self, *, target_primary_email: str) -> tuple[Coordinate, Coordinate]:
-        assert self.source and self.target
-        self.setup_superseded_users_tables()
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(
-            self.source,
-            "START TRANSACTION; "
-            "INSERT INTO users (id,name,email) VALUES (2070980,'-3572','historical@example.test'); "
-            "INSERT INTO users_profiles (id,full_name) VALUES (2070980,'Historical Profile'); "
-            "INSERT INTO users_email_settings (id,user_id,setting_group_id,setting) VALUES "
-            "(16562670,2070980,2,1),(16562671,2070980,3,1),(16562672,2070980,4,1),"
-            "(16562673,2070980,5,1),(16562674,2070980,6,1),(16562675,2070980,7,1),"
-            "(16562676,2070980,8,1),(16562677,2070980,9,1); "
-            "COMMIT;",
-        )
-        historical_stop = self.coordinate()
-        self.admin_sql(
-            self.source,
-            "UPDATE users SET name='vngt',email='current@example.test' WHERE id=2070980; "
-            "INSERT INTO users (id,name,email) VALUES (2071305,'-3572','owner@example.test');",
-        )
-        self.admin_sql(
-            self.target,
-            "INSERT INTO users (id,name,email) VALUES "
-            f"(2070980,'vngt',{sql_literal(target_primary_email)}),"
-            "(2071305,'-3572','owner@example.test');",
-        )
-        return start, historical_stop
-
-    def assert_superseded_users_current_rows(self, *, expected_primary_email: str) -> None:
-        assert self.target
-        users = self.admin_query(
-            self.target,
-            "SELECT id,name,email FROM users ORDER BY id;",
-        ).strip()
-        expected = (
-            f"2070980\tvngt\t{expected_primary_email}\n"
-            "2071305\t-3572\towner@example.test"
-        )
-        if users != expected:
-            raise HarnessError(f"superseded users current rows changed: {users!r}")
-
-    def run_superseded_users_recovery(self) -> None:
-        assert self.source and self.target
-        start, historical_stop = self.prepare_superseded_users_case(
-            target_primary_email="current@example.test"
-        )
-        result = self.run_stream(
-            start,
-            historical_stop,
-            insert_conflict_policy="replace-divergent-pk",
-        )
-        require_success(result, "superseded users recovery stream")
-        self.assert_superseded_users_current_rows(expected_primary_email="current@example.test")
-        profile = self.admin_query(
-            self.target,
-            "SELECT id,full_name FROM users_profiles WHERE id=2070980;",
-        ).strip()
-        if profile != "2070980\tHistorical Profile":
-            raise HarnessError(f"superseded recovery missed profile effect: {profile!r}")
-        settings = self.admin_query(
-            self.target,
-            "SELECT setting_group_id,setting FROM users_email_settings "
-            "WHERE user_id=2070980 ORDER BY setting_group_id;",
-        ).strip()
-        expected_settings = "\n".join(f"{group_id}\t1" for group_id in range(2, 10))
-        if settings != expected_settings:
-            raise HarnessError(f"superseded recovery missed settings effects: {settings!r}")
-        conflict = self.admin_query(
-            self.target,
-            "SELECT source_primary_key_json,status,repair_run_id,resolution_evidence "
-            "FROM cdc.row_conflicts WHERE table_name='users';",
-        ).strip().split("\t", 3)
-        if len(conflict) != 4 or conflict[0] != '["2070980"]' or conflict[1] != "resolved":
-            raise HarnessError(f"superseded recovery conflict was not resolved: {conflict!r}")
-        if not conflict[2] or "verified superseded historical insert" not in conflict[3]:
-            raise HarnessError(f"superseded recovery evidence missing proof: {conflict!r}")
-        checkpoint = self.checkpoint()
-        if (
-            checkpoint.get("source_file") != historical_stop.file
-            or int(checkpoint.get("source_position", 0)) != historical_stop.position
-        ):
-            raise HarnessError(f"superseded recovery checkpoint mismatch: {checkpoint}")
-
-        mismatch_start, mismatch_stop = self.prepare_superseded_users_case(
-            target_primary_email="mismatch@example.test"
-        )
-        mismatch = self.run_stream(
-            mismatch_start,
-            mismatch_stop,
-            insert_conflict_policy="replace-divergent-pk",
-        )
-        mismatch_output = f"{mismatch.stdout}\n{mismatch.stderr}".lower()
-        if mismatch.returncode == 0 or "targetprimaryhashmismatch" not in mismatch_output.replace("_", ""):
-            raise HarnessError(f"target mismatch did not fail closed: {mismatch_output}")
-        self.assert_superseded_users_current_rows(expected_primary_email="mismatch@example.test")
-        profile_count = self.admin_query(
-            self.target,
-            "SELECT COUNT(*) FROM users_profiles WHERE id=2070980;",
-        ).strip()
-        settings_count = self.admin_query(
-            self.target,
-            "SELECT COUNT(*) FROM users_email_settings WHERE user_id=2070980;",
-        ).strip()
-        if profile_count != "0" or settings_count != "0":
-            raise HarnessError(
-                "target mismatch retained rolled-back effects: "
-                f"profiles={profile_count} settings={settings_count}"
-            )
-        checkpoint = self.checkpoint()
-        if (
-            checkpoint.get("source_file") != mismatch_start.file
-            or int(checkpoint.get("source_position", 0)) != mismatch_start.position
-        ):
-            raise HarnessError(f"target mismatch advanced checkpoint: {checkpoint}")
-        unresolved = self.admin_query(
-            self.target,
-            "SELECT source_primary_key_json,status,attempt_count FROM cdc.row_conflicts "
-            "WHERE table_name='users';",
-        ).strip()
-        if unresolved != '["2070980"]\tunresolved\t1':
-            raise HarnessError(f"target mismatch evidence mismatch: {unresolved!r}")
-        print(
-            "superseded_users_recovery_ok current_users_preserved=true "
-            "profile_settings_applied=true checkpoint_advanced=true conflict_resolved=true "
-            "target_mismatch_rollback=true target_mismatch_checkpoint_unchanged=true"
-        )
-
-    def run_durable_row_conflict_retry(self) -> None:
-        assert self.source and self.target
-        for endpoint in (self.source, self.target):
-            self.admin_sql(
-                endpoint,
-                "DROP TABLE IF EXISTS retry_children; DROP TABLE IF EXISTS retry_parents; "
-                "CREATE TABLE retry_parents (id BIGINT NOT NULL PRIMARY KEY) ENGINE=InnoDB; "
-                "CREATE TABLE retry_children (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT NOT NULL, "
-                "CONSTRAINT retry_children_parent_fk FOREIGN KEY (parent_id) REFERENCES retry_parents (id)) ENGINE=InnoDB;",
-            )
-        self.admin_sql(self.source, "INSERT INTO retry_parents VALUES (1);")
-        start = self.coordinate()
-        self.write_checkpoint(start)
-        self.admin_sql(self.source, "INSERT INTO retry_children VALUES (10, 1);")
-        stop = self.coordinate()
-        process, _log_path = self.start_stream(
-            start,
-            stop,
-            max_reconnects=12,
-            label="durable-row-conflict-retry",
-        )
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            evidence = self.admin_query(
-                self.target,
-                "SELECT error_code,attempt_count,status FROM cdc.row_conflicts "
-                "WHERE table_name='retry_children';",
-            ).strip()
-            if evidence:
-                break
-            if process.poll() is not None:
-                raise HarnessError(f"stream exited before durable FK evidence: {self.process_output(process)}")
-            time.sleep(0.1)
-        else:
-            raise HarnessError(f"stream did not persist durable FK evidence: {self.process_output(process)}")
-        evidence_fields = evidence.split("\t")
-        if len(evidence_fields) != 3 or evidence_fields[0] != "1452" or evidence_fields[2] != "unresolved":
-            raise HarnessError(f"unexpected durable FK evidence: {evidence!r}")
-        if process.poll() is not None:
-            raise HarnessError(f"stream exited after durable FK evidence: {self.process_output(process)}")
-        checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
-            raise HarnessError(f"durable FK conflict advanced checkpoint: {checkpoint}")
-
-        self.admin_sql(self.target, "INSERT INTO retry_parents VALUES (1);")
-        result = self.finish_stream(process)
-        require_success(result, "durable-row-conflict-retry")
-        child = self.admin_query(self.target, "SELECT id,parent_id FROM retry_children;").strip()
-        if child != "10\t1":
-            raise HarnessError(f"same process did not replay FK child: {child!r}")
-        checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
-            raise HarnessError(f"successful replay did not advance checkpoint: {checkpoint}")
-        evidence = self.admin_query(
-            self.target,
-            "SELECT COUNT(*),MIN(status),MAX(attempt_count) FROM cdc.row_conflicts "
-            "WHERE table_name='retry_children';",
-        ).strip()
-        evidence_fields = evidence.split("\t")
-        if len(evidence_fields) != 3 or evidence_fields[0] != "1" or evidence_fields[1] != "resolved":
-            raise HarnessError(f"durable FK evidence duplicated or unresolved: {evidence!r}")
-        print("durable-row-conflict-retry_ok process_alive=true checkpoint_unchanged=true replayed=true checkpoint_advanced=true evidence_rows=1")
 
     def assert_foreign_keys_enabled(self) -> None:
         assert self.source and self.target
@@ -4242,7 +3122,7 @@ class Harness:
             env={
                 **os.environ,
                 "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+                "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
             },
             timeout=180,
             check=False,
@@ -4335,7 +3215,7 @@ class Harness:
             env={
                 **os.environ,
                 "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+                "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
             },
             timeout=180,
             check=False,
@@ -4422,7 +3302,7 @@ class Harness:
             env={
                 **os.environ,
                 "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+                "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
             },
             timeout=180,
             check=False,
@@ -4512,7 +3392,7 @@ class Harness:
                 env={
                     **os.environ,
                     "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-                    "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+                    "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
                 },
                 timeout=180,
                 check=False,
@@ -4625,7 +3505,7 @@ class Harness:
             env={
                 **os.environ,
                 "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-                "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+                "CDC_TARGET_PASSWORD": REPAIR_TARGET_PASSWORD,
             },
             timeout=240,
             check=False,
@@ -4988,8 +3868,8 @@ class Harness:
                 "SELECT status FROM cdc.row_conflicts "
                 f"WHERE source_identity={sql_literal(SOURCE_IDENTITY)} AND table_name='repair_bounded' "
                 "AND source_primary_key_json='[\\\"4\\\"]';",
-                user=TARGET_USER,
-                password=TARGET_PASSWORD,
+                user=REPAIR_TARGET_USER,
+                password=REPAIR_TARGET_PASSWORD,
             ).strip()
             if debt != "unresolved":
                 raise HarnessError(f"{scenario} resolved conflict outside selected PK window: {debt!r}")
@@ -5030,8 +3910,8 @@ class Harness:
             debt = self.query(
                 self.target,
                 f"SELECT status,repair_run_id,resolution_evidence FROM cdc.row_conflicts WHERE source_identity={sql_literal(SOURCE_IDENTITY)} AND table_name={sql_literal(table)};",
-                user=TARGET_USER,
-                password=TARGET_PASSWORD,
+                user=REPAIR_TARGET_USER,
+                password=REPAIR_TARGET_PASSWORD,
             ).strip()
             expected_debt = (
                 "resolved\tconflict-resolution-run\t"
@@ -5039,7 +3919,7 @@ class Harness:
             )
             if debt != expected_debt:
                 raise HarnessError(f"conflict debt did not resolve with evidence: {debt!r}")
-            unresolved = self.query(self.target, f"SELECT COUNT(*) FROM cdc.row_conflicts WHERE source_identity={sql_literal(SOURCE_IDENTITY)} AND table_name={sql_literal(table)} AND status='unresolved';", user=TARGET_USER, password=TARGET_PASSWORD).strip()
+            unresolved = self.query(self.target, f"SELECT COUNT(*) FROM cdc.row_conflicts WHERE source_identity={sql_literal(SOURCE_IDENTITY)} AND table_name={sql_literal(table)} AND status='unresolved';", user=REPAIR_TARGET_USER, password=REPAIR_TARGET_PASSWORD).strip()
             if unresolved != "0":
                 raise HarnessError(f"{scenario} left unresolved conflict debt: {unresolved}")
             print(f"{scenario}_converged secondary_owner_preserved=true verified_equality=true unresolved=0")
@@ -5103,8 +3983,8 @@ class Harness:
                 "FROM cdc.row_conflicts "
                 f"WHERE source_identity={sql_literal(SOURCE_IDENTITY)} AND table_name={sql_literal(table)} "
                 "ORDER BY source_primary_key_json;",
-                user=TARGET_USER,
-                password=TARGET_PASSWORD,
+                user=REPAIR_TARGET_USER,
+                password=REPAIR_TARGET_PASSWORD,
             ).strip()
             expected = (
                 '["1"]\tresolved\texact-equivalent-conflicts-first\n'
@@ -5136,8 +4016,8 @@ class Harness:
                 "FROM cdc.row_conflicts "
                 f"WHERE source_identity={sql_literal(SOURCE_IDENTITY)} AND table_name={sql_literal(table)} "
                 "ORDER BY source_primary_key_json;",
-                user=TARGET_USER,
-                password=TARGET_PASSWORD,
+                user=REPAIR_TARGET_USER,
+                password=REPAIR_TARGET_PASSWORD,
             ).strip()
             if evidence_after_second != expected:
                 raise HarnessError(
@@ -5220,23 +4100,8 @@ class Harness:
         elif scenario == "missing-trigger":
             self.admin_sql(self.target, "DROP TRIGGER cdc.ddl_replay_journal_update_guard;")
             expected = "trigger"
-        elif scenario == "missing-conflict-trigger":
-            self.admin_sql(self.target, "DROP TRIGGER cdc.row_conflicts_update_guard;")
-            expected = "trigger"
         elif scenario == "missing-grant":
             self.admin_sql(self.target, "REVOKE UPDATE ON cdc.ddl_replay_journal FROM 'cdc_stream'@'%';")
-            expected = "grant"
-        elif scenario == "missing-conflict-table":
-            self.admin_sql(self.target, "DROP TABLE cdc.row_conflicts;")
-            expected = "conflict store"
-        elif scenario == "wrong-conflict-schema":
-            self.admin_sql(self.target, "ALTER TABLE cdc.row_conflicts MODIFY status VARCHAR(32) NOT NULL;")
-            expected = "column schema"
-        elif scenario == "missing-conflict-grant":
-            self.admin_sql(self.target, "REVOKE UPDATE ON cdc.row_conflicts FROM 'cdc_stream'@'%';")
-            expected = "grant"
-        elif scenario == "broad-conflict-grant":
-            self.admin_sql(self.target, "GRANT DELETE ON cdc.row_conflicts TO 'cdc_stream'@'%';")
             expected = "grant"
         elif scenario == "journal-outage":
             self.admin_sql(self.target, "RENAME TABLE cdc.ddl_replay_journal TO cdc.ddl_replay_journal_outage;")
@@ -5314,24 +4179,6 @@ class Harness:
             self.run_sync_table_wide_update_fk_retry()
         elif scenario == "writable-column-generated-metadata":
             self.run_writable_column_generated_metadata()
-        elif scenario == "home-feed-card-parent-recovery":
-            self.run_home_feed_card_parent_recovery()
-        elif scenario == "superseded-release-parent-recovery":
-            self.run_superseded_release_parent_recovery()
-        elif scenario == "superseded-release-visibility-recovery":
-            self.run_superseded_release_visibility_recovery()
-        elif scenario == "generic-fk-missing-parent":
-            self.run_generic_fk_missing_parent()
-        elif scenario == "generic-fk-missing-parent-binary":
-            self.run_generic_fk_missing_parent_binary()
-        elif scenario == "generic-fk-superseded-attribute":
-            self.run_generic_fk_superseded_attribute()
-        elif scenario == "generic-fk-source-parent-mismatch":
-            self.run_generic_fk_source_parent_mismatch()
-        elif scenario == "generic-fk-restrict-rejected":
-            self.run_generic_fk_restrict_rejected()
-        elif scenario == "superseded-users-recovery":
-            self.run_superseded_users_recovery()
         elif scenario == "production-alter-table":
             self.run_production_alter_table()
         elif scenario == "create-table-crash-restart":
@@ -5340,17 +4187,14 @@ class Harness:
             self.run_bootstrap_contract()
         elif scenario == "catchup-snapshot-tls":
             self.run_catchup_snapshot_tls()
+        elif scenario == "insert-duplicate-idempotent":
+            self.run_insert_duplicate_idempotent()
         elif scenario == "parallel-target-transactions":
             self.run_parallel_target_transactions()
         elif scenario in {
             "missing-checkpoint",
             "missing-trigger",
-            "missing-conflict-trigger",
             "missing-grant",
-            "missing-conflict-table",
-            "wrong-conflict-schema",
-            "missing-conflict-grant",
-            "broad-conflict-grant",
             "journal-outage",
         }:
             self.run_startup_rejection(scenario)
@@ -5365,22 +4209,14 @@ class Harness:
             self.run_recovery_scenario(scenario)
         elif scenario in {"source-connection-loss", "target-connection-loss"}:
             self.run_connection_loss_scenario(scenario)
-        elif scenario == "replace-divergent-pk":
-            self.run_replace_divergent_pk()
         elif scenario == "missing-pk-two-parent-collision":
             self.run_missing_pk_two_parent_collision()
         elif scenario == "reconciliation-owner-missing-guest":
             self.run_reconciliation_owner_missing_guest()
         elif scenario == "failed-run-claim-post-revalidation-race":
             self.run_failed_run_claim_post_revalidation_race()
-        elif scenario == "row-conflict-rollback":
-            self.run_row_conflict_rollback()
         elif scenario == "row-conflict-source-row-migration":
             self.run_row_conflict_source_row_migration()
-        elif scenario == "row-conflict-indexed-resolution":
-            self.run_row_conflict_indexed_resolution()
-        elif scenario == "durable-row-conflict-retry":
-            self.run_durable_row_conflict_retry()
         elif scenario == "pre-state-drift":
             self.run_journal_mismatch_scenario("pre-state-drift")
         elif scenario == "coordinate-reuse":

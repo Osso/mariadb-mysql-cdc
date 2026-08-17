@@ -1,5 +1,5 @@
 use crate::checkpoint::Checkpoint;
-use crate::target::TargetExecuteError;
+use crate::target::{TargetExecuteError, TargetRowChangeKind};
 use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -19,9 +19,30 @@ pub(crate) trait SubmittedQueryConnectionFactory: Clone + Send + Sync + 'static 
     fn open(&self) -> Result<Self::Connection, TargetExecuteError>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ParallelTargetStatementKind {
+    Insert,
+    Other,
+}
+
+impl From<TargetRowChangeKind> for ParallelTargetStatementKind {
+    fn from(kind: TargetRowChangeKind) -> Self {
+        match kind {
+            TargetRowChangeKind::Insert => Self::Insert,
+            TargetRowChangeKind::Update | TargetRowChangeKind::Delete => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ParallelTargetStatement {
+    pub(super) sql: String,
+    pub(super) kind: ParallelTargetStatementKind,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ParallelTargetTransaction {
-    pub(super) body_sql: String,
+    pub(super) statements: Vec<ParallelTargetStatement>,
     pub(super) commit_sql: String,
     pub(super) checkpoint: Checkpoint,
 }
@@ -500,7 +521,7 @@ fn submit_and_drain_transaction_body<C>(
 where
     C: SubmittedQueryConnection,
 {
-    if let Err(error) = connection.send_query(&transaction.body_sql) {
+    if let Err(error) = connection.send_query("BEGIN") {
         let _ = submitted.send(Err(error));
         return false;
     }
@@ -514,7 +535,8 @@ where
             "parallel-target-first-body-submitted",
         );
     }
-    let result = connection.read_query_result();
+    let result = drain_transaction_body(connection, &transaction.statements)
+        .map_err(|error| rollback_failed_transaction(connection, error));
     #[cfg(feature = "integration-failpoints")]
     if sequence == 1 && result.is_ok() {
         super::wait_for_integration_barrier(
@@ -522,6 +544,7 @@ where
             "parallel-target-second-body-drained",
         );
     }
+    let succeeded = result.is_ok();
     events
         .send(WorkerEvent::Prepared {
             worker,
@@ -531,6 +554,50 @@ where
             result,
         })
         .is_ok()
+        && succeeded
+}
+
+fn drain_transaction_body<C>(
+    connection: &mut C,
+    statements: &[ParallelTargetStatement],
+) -> Result<(), TargetExecuteError>
+where
+    C: SubmittedQueryConnection,
+{
+    connection.read_query_result()?;
+    for statement in statements {
+        connection.send_query(&statement.sql)?;
+        match connection.read_query_result() {
+            Ok(()) => {}
+            Err(error)
+                if statement.kind == ParallelTargetStatementKind::Insert
+                    && error.mysql_code() == Some(1062) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn rollback_failed_transaction<C>(
+    connection: &mut C,
+    error: TargetExecuteError,
+) -> TargetExecuteError
+where
+    C: SubmittedQueryConnection,
+{
+    let rollback = connection
+        .send_query("ROLLBACK")
+        .and_then(|()| connection.read_query_result());
+    match rollback {
+        Ok(()) => error,
+        Err(rollback_error) => {
+            let message = format!("{error}; rollback failed: {rollback_error}");
+            match error.mysql_code() {
+                Some(code) => TargetExecuteError::from_mysql(code, message),
+                None => TargetExecuteError::new(message),
+            }
+        }
+    }
 }
 
 fn submit_and_drain_transaction_commit<C>(

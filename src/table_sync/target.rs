@@ -230,15 +230,6 @@ struct MySqlFkRepairContext {
 }
 
 impl MySqlSyncRepairTarget {
-    pub(crate) fn new(
-        writer: TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
-    ) -> Self {
-        Self {
-            writer,
-            fk_repair: None,
-        }
-    }
-
     pub(crate) fn new_with_fk_repair(
         writer: TargetMySqlWriter<crate::mysql_client::PersistentTargetExecutor>,
         source: MySqlSyncReader,

@@ -1,6 +1,6 @@
 use super::{
-    ParallelTargetTransaction, ParallelTransactionPool, SubmittedQueryConnection,
-    SubmittedQueryConnectionFactory,
+    ParallelTargetStatement, ParallelTargetStatementKind, ParallelTargetTransaction,
+    ParallelTransactionPool, SubmittedQueryConnection, SubmittedQueryConnectionFactory,
 };
 use crate::checkpoint::{Checkpoint, LastEvent};
 use crate::target::TargetExecuteError;
@@ -17,7 +17,7 @@ struct FakeConnectionFactory {
     sent: Sender<(usize, String)>,
     reads: ReadGate,
     failed_sends: Arc<Mutex<BTreeSet<String>>>,
-    failed_reads: Arc<Mutex<BTreeSet<(usize, usize)>>>,
+    failed_reads: Arc<Mutex<BTreeMap<(usize, usize), ReadFailure>>>,
 }
 
 impl SubmittedQueryConnectionFactory for FakeConnectionFactory {
@@ -44,7 +44,7 @@ struct FakeConnection {
     sent: Sender<(usize, String)>,
     reads: ReadGate,
     failed_sends: Arc<Mutex<BTreeSet<String>>>,
-    failed_reads: Arc<Mutex<BTreeSet<(usize, usize)>>>,
+    failed_reads: Arc<Mutex<BTreeMap<(usize, usize), ReadFailure>>>,
     awaiting_result: bool,
     read_index: usize,
 }
@@ -73,14 +73,12 @@ impl SubmittedQueryConnection for FakeConnection {
 
     fn read_query_result(&mut self) -> Result<(), TargetExecuteError> {
         let key = (self.id, self.read_index);
-        if self
+        let failure = self
             .failed_reads
             .lock()
             .expect("lock failed reads")
-            .contains(&key)
-        {
-            return Err(TargetExecuteError::new("injected read failure"));
-        }
+            .get(&key)
+            .cloned();
         let (states, changed) = &*self.reads;
         let states = states.lock().expect("lock read state");
         drop(
@@ -90,7 +88,39 @@ impl SubmittedQueryConnection for FakeConnection {
         );
         self.awaiting_result = false;
         self.read_index += 1;
-        Ok(())
+        match failure {
+            Some(failure) => Err(failure.into_error()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReadFailure {
+    mysql_code: Option<u16>,
+    message: String,
+}
+
+impl ReadFailure {
+    fn generic(message: &str) -> Self {
+        Self {
+            mysql_code: None,
+            message: message.to_string(),
+        }
+    }
+
+    fn mysql(code: u16, message: &str) -> Self {
+        Self {
+            mysql_code: Some(code),
+            message: message.to_string(),
+        }
+    }
+
+    fn into_error(self) -> TargetExecuteError {
+        match self.mysql_code {
+            Some(code) => TargetExecuteError::from_mysql(code, self.message),
+            None => TargetExecuteError::new(self.message),
+        }
     }
 }
 
@@ -102,18 +132,16 @@ fn later_transaction_is_submitted_before_earlier_completion() {
     pool.submit(transaction(100))
         .expect("submit first transaction");
     let (first_connection, first_sql) = receive_submission(&submitted);
-    assert_eq!(first_sql, "BEGIN; INSERT INTO events VALUES (100)");
+    assert_eq!(first_sql, "BEGIN");
 
     pool.submit(transaction(200))
         .expect("submit second transaction");
     let (second_connection, second_sql) = receive_submission(&submitted);
     assert_ne!(second_connection, first_connection);
-    assert_eq!(second_sql, "BEGIN; INSERT INTO events VALUES (200)");
+    assert_eq!(second_sql, "BEGIN");
 
-    release_read(&reads, first_connection, 0);
-    release_read(&reads, first_connection, 1);
-    release_read(&reads, second_connection, 0);
-    release_read(&reads, second_connection, 1);
+    release_reads(&reads, first_connection, 0..=2);
+    release_reads(&reads, second_connection, 0..=2);
     pool.wait_for_all().expect("finish submitted transactions");
 }
 
@@ -129,11 +157,27 @@ fn commits_in_source_order_when_later_body_finishes_first() {
     let (second_connection, _) = receive_submission(&submitted);
 
     release_read(&reads, second_connection, 0);
+    assert_eq!(
+        receive_submission(&submitted),
+        (
+            second_connection,
+            "INSERT INTO events VALUES (200)".to_string()
+        )
+    );
+    release_read(&reads, second_connection, 1);
     pool.wait_for_event()
         .expect("record second transaction prepared");
     assert!(submitted.recv_timeout(Duration::from_millis(50)).is_err());
 
     release_read(&reads, first_connection, 0);
+    assert_eq!(
+        receive_submission(&submitted),
+        (
+            first_connection,
+            "INSERT INTO events VALUES (100)".to_string()
+        )
+    );
+    release_read(&reads, first_connection, 1);
     pool.wait_for_event()
         .expect("record first transaction prepared");
     assert_eq!(
@@ -141,7 +185,7 @@ fn commits_in_source_order_when_later_body_finishes_first() {
         (first_connection, "CHECKPOINT 100; COMMIT".to_string())
     );
 
-    release_read(&reads, first_connection, 1);
+    release_read(&reads, first_connection, 2);
     pool.wait_for_event()
         .expect("record first transaction committed");
     assert_eq!(
@@ -149,7 +193,7 @@ fn commits_in_source_order_when_later_body_finishes_first() {
         (second_connection, "CHECKPOINT 200; COMMIT".to_string())
     );
 
-    release_read(&reads, second_connection, 1);
+    release_read(&reads, second_connection, 2);
     pool.wait_for_all().expect("finish second transaction");
     let committed = pool.take_committed().expect("take committed transactions");
     assert_eq!(
@@ -170,6 +214,11 @@ fn connection_stays_busy_until_commit_result_is_drained() {
     assert_eq!(pool.idle_worker_count(), 0);
 
     release_read(&reads, connection, 0);
+    assert_eq!(
+        receive_submission(&submitted),
+        (connection, "INSERT INTO events VALUES (100)".to_string())
+    );
+    release_read(&reads, connection, 1);
     pool.wait_for_event().expect("record transaction prepared");
     assert_eq!(pool.idle_worker_count(), 0);
     assert_eq!(
@@ -177,15 +226,14 @@ fn connection_stays_busy_until_commit_result_is_drained() {
         (connection, "CHECKPOINT 100; COMMIT".to_string())
     );
 
-    release_read(&reads, connection, 1);
+    release_read(&reads, connection, 2);
     pool.wait_for_all().expect("finish transaction");
     assert_eq!(pool.idle_worker_count(), 1);
 }
 
 #[test]
 fn send_failure_is_returned_before_transaction_is_accepted() {
-    let (factory, _submitted, _reads) =
-        fake_factory_with_failed_send("BEGIN; INSERT INTO events VALUES (100)");
+    let (factory, _submitted, _reads) = fake_factory_with_failed_send("BEGIN");
     let mut pool = ParallelTransactionPool::new(1, factory).expect("create pool");
 
     let error = pool
@@ -196,21 +244,105 @@ fn send_failure_is_returned_before_transaction_is_accepted() {
 }
 
 #[test]
-fn body_failure_is_reported_after_submission_without_committing() {
-    let (factory, submitted, _reads) = fake_factory_with_failed_read((0, 0));
+fn body_failure_rolls_back_after_submission_without_committing() {
+    let (factory, submitted, reads) = fake_factory_with_failed_read((0, 1));
+    release_reads(&reads, 0, 0..=2);
     let mut pool = ParallelTransactionPool::new(1, factory).expect("create pool");
 
     pool.submit(transaction(100))
         .expect("body send should be accepted before result failure");
-    assert_eq!(
-        receive_submission(&submitted),
-        (0, "BEGIN; INSERT INTO events VALUES (100)".to_string())
-    );
     let error = pool
         .wait_for_all()
         .expect_err("body result failure must stop the pool");
 
     assert!(error.to_string().contains("failed before commit"));
+    assert_eq!(receive_submission(&submitted), (0, "BEGIN".to_string()));
+    assert_eq!(
+        receive_submission(&submitted),
+        (0, "INSERT INTO events VALUES (100)".to_string())
+    );
+    assert_eq!(receive_submission(&submitted), (0, "ROLLBACK".to_string()));
+    assert!(submitted.recv_timeout(Duration::from_millis(50)).is_err());
+}
+
+#[test]
+fn insert_duplicate_result_continues_to_later_statement_and_commits() {
+    let statements = [
+        transaction_statement(
+            ParallelTargetStatementKind::Insert,
+            "INSERT INTO events VALUES (100)",
+        ),
+        transaction_statement(
+            ParallelTargetStatementKind::Other,
+            "UPDATE events SET processed = 1 WHERE id = 100",
+        ),
+    ];
+    let duplicate_read = statement_read_index(&statements, ParallelTargetStatementKind::Insert);
+    let (factory, submitted, reads) =
+        fake_factory_with_mysql_read_failure((0, duplicate_read), 1062);
+    release_reads(&reads, 0, 0..=3);
+    let mut pool = ParallelTransactionPool::new(1, factory).expect("create pool");
+
+    pool.submit(transaction_with_statements(100, &statements))
+        .expect("accept transaction submission");
+    pool.wait_for_all()
+        .expect("INSERT duplicate must not stop later statements or commit");
+
+    assert_eq!(receive_submission(&submitted), (0, "BEGIN".to_string()));
+    assert_eq!(
+        receive_submission(&submitted),
+        (0, "INSERT INTO events VALUES (100)".to_string())
+    );
+    assert_eq!(
+        receive_submission(&submitted),
+        (
+            0,
+            "UPDATE events SET processed = 1 WHERE id = 100".to_string()
+        )
+    );
+    assert_eq!(
+        receive_submission(&submitted),
+        (0, "CHECKPOINT 100; COMMIT".to_string())
+    );
+    assert!(submitted.recv_timeout(Duration::from_millis(50)).is_err());
+    let committed = pool.take_committed().expect("take committed transaction");
+    assert_eq!(committed[0].checkpoint.source_position, 100);
+}
+
+#[test]
+fn non_insert_duplicate_stops_before_later_statement_and_commit() {
+    let statements = [
+        transaction_statement(
+            ParallelTargetStatementKind::Other,
+            "UPDATE events SET processed = 1 WHERE id = 100",
+        ),
+        transaction_statement(
+            ParallelTargetStatementKind::Insert,
+            "INSERT INTO events VALUES (200)",
+        ),
+    ];
+    let duplicate_read = statement_read_index(&statements, ParallelTargetStatementKind::Other);
+    let (factory, submitted, reads) =
+        fake_factory_with_mysql_read_failure((0, duplicate_read), 1062);
+    release_reads(&reads, 0, 0..=3);
+    let mut pool = ParallelTransactionPool::new(1, factory).expect("create pool");
+
+    pool.submit(transaction_with_statements(100, &statements))
+        .expect("accept transaction submission");
+    let error = pool
+        .wait_for_all()
+        .expect_err("UPDATE duplicate must stop the transaction");
+
+    assert!(error.to_string().contains("1062"));
+    assert_eq!(receive_submission(&submitted), (0, "BEGIN".to_string()));
+    assert_eq!(
+        receive_submission(&submitted),
+        (
+            0,
+            "UPDATE events SET processed = 1 WHERE id = 100".to_string()
+        )
+    );
+    assert_eq!(receive_submission(&submitted), (0, "ROLLBACK".to_string()));
     assert!(submitted.recv_timeout(Duration::from_millis(50)).is_err());
 }
 
@@ -226,18 +358,34 @@ fn fake_factory_with_failed_send(
     } else {
         BTreeSet::from([failed_sql.to_string()])
     };
-    fake_factory_with_failures(failed_sends, BTreeSet::new())
+    fake_factory_with_failures(failed_sends, BTreeMap::new())
 }
 
 fn fake_factory_with_failed_read(
     failed_read: (usize, usize),
 ) -> (FakeConnectionFactory, Receiver<(usize, String)>, ReadGate) {
-    fake_factory_with_failures(BTreeSet::new(), BTreeSet::from([failed_read]))
+    fake_factory_with_failures(
+        BTreeSet::new(),
+        BTreeMap::from([(failed_read, ReadFailure::generic("injected read failure"))]),
+    )
+}
+
+fn fake_factory_with_mysql_read_failure(
+    failed_read: (usize, usize),
+    mysql_code: u16,
+) -> (FakeConnectionFactory, Receiver<(usize, String)>, ReadGate) {
+    fake_factory_with_failures(
+        BTreeSet::new(),
+        BTreeMap::from([(
+            failed_read,
+            ReadFailure::mysql(mysql_code, &format!("injected MySQL error {mysql_code}")),
+        )]),
+    )
 }
 
 fn fake_factory_with_failures(
     failed_sends: BTreeSet<String>,
-    failed_reads: BTreeSet<(usize, usize)>,
+    failed_reads: BTreeMap<(usize, usize), ReadFailure>,
 ) -> (FakeConnectionFactory, Receiver<(usize, String)>, ReadGate) {
     let (sent, submitted) = mpsc::channel();
     let reads = Arc::new((Mutex::new(BTreeMap::new()), Condvar::new()));
@@ -252,6 +400,24 @@ fn fake_factory_with_failures(
         submitted,
         reads,
     )
+}
+
+fn transaction_statement(kind: ParallelTargetStatementKind, sql: &str) -> ParallelTargetStatement {
+    ParallelTargetStatement {
+        sql: sql.to_string(),
+        kind,
+    }
+}
+
+fn statement_read_index(
+    statements: &[ParallelTargetStatement],
+    kind: ParallelTargetStatementKind,
+) -> usize {
+    statements
+        .iter()
+        .position(|statement| statement.kind == kind)
+        .expect("fixture contains statement kind")
+        + 1
 }
 
 fn receive_submission(submitted: &Receiver<(usize, String)>) -> (usize, String) {
@@ -269,9 +435,33 @@ fn release_read(reads: &ReadGate, connection: usize, read_index: usize) {
     changed.notify_all();
 }
 
+fn release_reads(
+    reads: &ReadGate,
+    connection: usize,
+    read_indexes: impl IntoIterator<Item = usize>,
+) {
+    for read_index in read_indexes {
+        release_read(reads, connection, read_index);
+    }
+}
+
 fn transaction(position: u64) -> ParallelTargetTransaction {
+    let sql = format!("INSERT INTO events VALUES ({position})");
+    transaction_with_statements(
+        position,
+        &[transaction_statement(
+            ParallelTargetStatementKind::Insert,
+            &sql,
+        )],
+    )
+}
+
+fn transaction_with_statements(
+    position: u64,
+    statements: &[ParallelTargetStatement],
+) -> ParallelTargetTransaction {
     ParallelTargetTransaction {
-        body_sql: format!("BEGIN; INSERT INTO events VALUES ({position})"),
+        statements: statements.to_vec(),
         commit_sql: format!("CHECKPOINT {position}; COMMIT"),
         checkpoint: checkpoint(position),
     }

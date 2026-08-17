@@ -26,7 +26,6 @@ pub(super) fn event_policy(event: &BinlogEvent) -> EventPolicy {
     }
 }
 
-#[cfg(test)]
 pub(super) fn handle_structured_event<E, R>(
     applier: &mut RowApplier<E>,
     schema_resolver: &R,
@@ -39,39 +38,8 @@ where
     E: TargetExecutor,
     R: TableSchemaResolver,
 {
-    handle_structured_event_with_conflicts(
-        applier,
-        schema_resolver,
-        state,
-        current_file,
-        header,
-        event,
-        None,
-    )
-}
-
-pub(super) fn handle_structured_event_with_conflicts<E, R>(
-    applier: &mut RowApplier<E>,
-    schema_resolver: &R,
-    state: &mut StructuredEventState,
-    current_file: &str,
-    header: &EventHeader,
-    event: &BinlogEvent,
-    conflict_context: Option<&mut RowConflictContext<'_>>,
-) -> Result<StructuredEventOutcome, ApplyBinlogError>
-where
-    E: TargetExecutor,
-    R: TableSchemaResolver,
-{
     let coordinate = event_coordinate(current_file, header, event, state.current_event_position);
-    let policy = apply_structured_event(
-        applier,
-        schema_resolver,
-        state,
-        &coordinate,
-        event,
-        conflict_context,
-    )?;
+    let policy = apply_structured_event(applier, schema_resolver, state, &coordinate, event)?;
     Ok(StructuredEventOutcome {
         policy,
         resume_coordinate: resume_coordinate(current_file, header, event),
@@ -84,7 +52,6 @@ pub(super) fn apply_structured_event<E, R>(
     state: &mut StructuredEventState,
     coordinate: &BinlogCoordinate,
     event: &BinlogEvent,
-    conflict_context: Option<&mut RowConflictContext<'_>>,
 ) -> Result<EventPolicy, ApplyBinlogError>
 where
     E: TargetExecutor,
@@ -95,13 +62,13 @@ where
             apply_table_map_event(applier, schema_resolver, state, coordinate, table_map)
         }
         BinlogEvent::WriteRowsEvent(rows) => {
-            apply_write_rows_event(applier, state, coordinate, rows, conflict_context)
+            apply_write_rows_event(applier, state, coordinate, rows)
         }
         BinlogEvent::UpdateRowsEvent(rows) => {
-            apply_update_rows_event(applier, state, coordinate, rows, conflict_context)
+            apply_update_rows_event(applier, state, coordinate, rows)
         }
         BinlogEvent::DeleteRowsEvent(rows) => {
-            apply_delete_rows_event(applier, state, coordinate, rows, conflict_context)
+            apply_delete_rows_event(applier, state, coordinate, rows)
         }
         BinlogEvent::XidEvent(_) => Ok(EventPolicy::CommitTransaction),
         BinlogEvent::IntVarEvent(event) => {

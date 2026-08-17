@@ -9,47 +9,15 @@ Catchup uses a snapshot plus forward CDC replay:
 5. Validate counts, stable primary-key windows, content, checksums, orphans, and
    schema state.
 
-This is not a parity proof by itself. `INSERT IGNORE` preserves any conflicting
-target row, but does not overwrite divergent values or remove target orphans.
-Snapshot `INSERT IGNORE` is independent of `--insert-conflict-policy`.
-For a native live ROW `INSERT`, `ignore-duplicate` skips MySQL `1062` only when
-the target row fetched by source primary key exactly equals the source row.
-The explicit `replace-divergent-pk` policy may replace an unequal row only for a
-`PRIMARY` duplicate after an exactly-one-row PK lookup and exactly-one-row
-primary-key UPDATE match; durable audit evidence records the decision. Missing or
-multiple PK rows and secondary-unique, foreign-key, CHECK, or replacement-update
-conflicts still roll back without checkpoint advancement. The live stream has
-superseded historical exceptions for `globalcomix.users`/`users.name`,
-`globalcomix.comics`/`comics.slug`, and two exact `globalcomix.releases` FK
-transactions: category `mysqld-bin.002709:515816736–515824875`
-(`releases_ibfk_2`) and visibility `mysqld-bin.002709:531921570–531929925`
-(`releases_ibfk_3`, candidate event `531921789`). Each allows exactly one
-deferred candidate and rejects any mixed ordinary conflict. It reads `SHOW MASTER STATUS` before
-one `START TRANSACTION WITH CONSISTENT SNAPSHOT`; that pre-snapshot coordinate
-is a conservative lower bound and must be beyond the candidate transaction. The
-users proof requires consistent-source full-row and active-transaction target
-`FOR UPDATE` proof for both historical PK and current unique owner. The comics
-proof requires full current primary-row equality, while accepting the locked
-unique owner by exact PK+slug identity despite unrelated mutable-field drift. If
-typed verification finds that the source primary still owns the historical identity,
-it records ordinary unresolved reconciliation debt, runs no superseded repair SQL,
-and commits the remaining transaction with its XID checkpoint; other proof or
-evidence failures still roll back. For releases, the exact FK child/parent identity must match the approved
-transaction; the complete historical release image is retained, later source
-history must show a changed parent value, and exactly one current source release,
-source parent, and locked target parent identity must match. An absent target
-release gets the complete current source row installed; an existing target
-release must hash equal to current source. The parent identity is preserved and
-never updated or deleted. Before writing the XID checkpoint, the target
-transaction requires an existing same-file predecessor before the candidate and
-no later than the XID. Remaining rows in that source
-transaction still apply; any other proof, predecessor, or commit failure rolls
-back, then persists all unresolved observations independently, surfacing rollback or
-persistence failures. Success commits its exact observation/resolution evidence
-and XID checkpoint atomically. The accepted overwrite risk is explicit. If a later
-conflict rolls back the enclosing target transaction, the replacement rolls back
-while its independent ledger evidence remains. The default `error` policy also
-rolls back on the duplicate.
+This is not a parity proof by itself. Snapshot `INSERT IGNORE` preserves any
+conflicting target row, but does not overwrite divergent values or remove target
+orphans. Snapshot behavior is independent from native live ROW streaming.
+
+For native live ROW events, the source is authoritative and the target is
+disposable. A plain INSERT that returns MySQL `1062` is accepted without target
+inspection or repair. Every other row error rolls back the complete source
+transaction and blocks checkpoint advancement. Offline `sync-table` and
+`repair-drift` remain responsible for explicit convergence and verification.
 
 Catchup source reads and target writes follow the [connection policy](schema-inventory.md#connection-policy).
 The live source MariaDB (`source-mariadb.example` / `192.0.2.10`) is
@@ -148,7 +116,7 @@ explicit ceiling, it performs zero inserts, updates, or deletes. Normal
 
 ## Completion gates
 
-- [ ] Durable live conflict observations and recurring repair scheduling.
+- [ ] Recurring repair scheduling from offline unresolved conflicts.
 - [x] FK-aware real-MySQL phased repair with crash/resume proof for the repaired scope.
 - [x] Zero unresolved conflict debt after verified equality for the repaired scope.
 - [ ] Stable checkpoint/lag, schema parity, and no quarantine/manual/journal debt.

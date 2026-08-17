@@ -116,94 +116,29 @@ receipt is unavailable, so this is semantic proof only.
 No operator-authored target SQL or manual status transition is a supported DDL
 resolution path. Fresh bootstrap remains the pre-production schema contract.
 Existing populated `cdc.row_conflicts` tables use
-`docs/row-conflicts-source-row-identity-migration.sql` once while stream and
-repair writers are stopped; runtime never performs this migration. Obsolete
+`docs/row-conflicts-source-row-identity-migration.sql` once while offline repair
+writers are stopped; runtime never performs this migration. Obsolete
 development migrations are not maintained as upgrade paths.
 
-The code contains a durable row-conflict ledger wired into the live stream and
-an FK-aware phased repair planner. Supported constraint conflicts persist
-evidence through an independent control-plane connection before the row failure
-rolls back the target transaction. Under `ignore-duplicate`, only an equal native
-ROW `INSERT` duplicate may be logged and committed without ledger persistence;
-divergent inserts and every non-`INSERT` `1062` unique conflict persist evidence,
-roll back, and leave the target transaction/checkpoint uncommitted. Durable row
-conflicts retry in-process from that unchanged checkpoint with bounded backoff.
-Ordinary transport reconnects default to 12 after the initial attempt (13 attempts
-total); `--max-reconnects 0` disables them unless `--reconnect-forever true` is
-set. Exact-parent retries require a positive `max-reconnects` setting or
-`--reconnect-forever true`, and preserve the ordinary transport budget, so repeated
-parent-recovery failures can exceed `max-reconnects`. `reconnect-forever` removes
-the ordinary transport cap and admits exact-parent retries when the max is zero.
-Successful replay resolves the matching evidence. Two narrow automatic parent-first recoveries run for persisted
-`1452`s: the exact `globalcomix.sessions` composite `fk_sessions_guest`
-(`guest_id`, `guest_hash`) parent in `guests`, and the exact
-`globalcomix.home_feed_card_slides` `fk_hfcs_card` (`card_id`) parent in
-`home_feed_cards`. The failed transaction is rolled back and recorded first.
-Recovery is evaluated only when exact-parent retry is enabled and the error is
-retryable. A failed recovery is retried on later loops without consuming the
-ordinary transport budget; a successful recovery mutates each distinct
-`ExactParentRecovery` value at most once per process reconnect loop. Each request is
-reconstructed deterministically during replay from the row image and conflict
-context; it is not stored in `cdc.row_conflicts`. Both paths require a complete,
-temporally valid source parent image, accept no matching target identity or one
-exact existing row, insert only on no match, and fail closed on unsupported,
-missing, colliding, divergent, unavailable, or write-failure state. Recovery never
-advances the checkpoint; normal child replay commit/checkpoint resolves ledger
-evidence. Structured logs carry source coordinates, child identity, action, and
-outcome. This is not generic FK repair and performs no historical binlog
-reconstruction.
+Native ROW streaming is source-authoritative and target-disposable. It emits plain
+INSERT statements and treats MySQL `1062` from INSERT as idempotent success,
+without target inspection, equality checks, replacement, conflict evidence, or
+repair. Every other row error rolls back the complete source transaction and
+blocks checkpoint advancement. `--target-parallel-transactions N` preserves the
+same rule by sending and draining each statement individually, leasing one target
+connection per complete source transaction, and committing checkpoints in source
+order.
 
-A separate superseded historical `globalcomix.releases` `ROW INSERT` proof is
-approved only for the exact production category transaction
-`mysqld-bin.002709:515816736–515824875` (`releases_ibfk_2`) and visibility
-transaction `mysqld-bin.002709:531921570–531929925` (`releases_ibfk_3`, child
-`(comic_id,comic_is_visible)` to parent `(id,is_visible)`, candidate event
-`531921789`). It retains the complete historical release image, requires later
-source history showing the same release now has a different parent value, and
-requires exactly one current source release, one matching source parent, and
-locked target release/parent identities. If the target release is absent, the
-verifier installs the complete current source row; an existing target release
-must already hash equal to it. The current parent identity is preserved: recovery
-never updates or deletes the parent. Remaining transaction effects, conflict
-resolution evidence, and the XID checkpoint commit atomically; failed proof,
-coordinate/FK scope, predecessor, or commit checks roll back target effects and
-checkpoint advancement, while unresolved evidence is persisted independently.
-Guarded observation upserts
-are idempotent. The admin-bootstrapped
-`cdc.row_conflicts` schema, guards, constraints, stored generated
-`source_row_identity`, `(source_row_identity, status)` index, definer-safe trigger
-inventory procedure, and exact table/procedure grants must validate at startup;
-runtime never creates or migrates the table. Different source primary keys remain
-different conflict identities. `repair-drift` now invokes the planner for child-first deletes,
-parent-first inserts, cycle/schema blocking, immutable resumption, bounded PK
-windows, a non-mutating full-scope Verify equality phase, and evidence-backed
-conflict resolution. In apply mode, `--conflict-reconcile-limit N` also runs a
-bounded reconciliation-only pass over unresolved evidence: it reads complete
-source and target rows by primary key, resolves only one-row exact equality,
-writes no target-table repairs, never reads or advances stream checkpoints, and
-is idempotent across repeated passes. The disposable MariaDB 11.4/MySQL 8.0
-harness defines 45 executable scenarios.
-Its `row-conflict-source-row-migration` and `row-conflict-indexed-resolution`
-scenarios prove populated-ledger migration, index selection, collision defense,
-and post-commit resolution. Earlier TLS harness coverage used a disposable TLS-enabled source, but the live
-GlobalComix source MariaDB (`source-mariadb.example` / `192.0.2.10`) is
-plaintext-only by accepted operational policy. Current production safety is:
-source plaintext only, target DigitalOcean MySQL with configured CA and hostname
-verification. The harness proves a valid four-row copy and a completed-run
-no-op; it does not prove interrupted parallel-range resume. The
-remaining scenarios cover bootstrap/grants, DDL journal crash recovery,
-reconnect/GET_LOCK behavior, FK-aware repair/conflict resolution, and a real
-`replace-divergent-pk` XID/commit/checkpoint plus replay-evidence scenario. Its
-`create-table-crash-restart` scenario passes the differing-default MariaDB/MySQL
-fixture through post-DDL/pre-applied
-crash recovery, prepared-state restart, exact checkpointing, and idempotent replay;
-its `production-alter-table` scenario passes five checkpointed ALTER events; checks column, comment,
-non-unique and unique-index metadata, duplicate rejection parity, translated
-`DROP COLUMN IF EXISTS`, and its absent-column no-op; then proves
-an unsupported unique-prefix option remains `translation_pending` without target
-mutation or checkpoint advancement. These are local Docker proofs, not live cutover
-proof;
-recurring conflict scheduling and full cutover proof remain unchecked.
+Conflict data and repair remain offline. `cdc.row_conflicts`, `repair-drift`,
+targeted conflict resolution, FK-aware table-sync ordering, bounded primary-key
+windows, and exact verification are retained, but the live stream neither reads
+nor writes the conflict ledger and does not validate its schema, procedures, or
+grants. Retired live supersession, target-replacement, and automatic parent-repair
+paths are absent from runtime and harness code.
+
+The disposable MariaDB/MySQL harness continues to cover catchup, offline repair,
+DDL journal recovery, reconnect/GET_LOCK behavior, and parallel target
+transactions. These are local proofs, not live cutover proof.
 
 Deployment remains blocked pending real-MySQL/live proof, exact grant/bootstrap
 review, bounded repair convergence, and ops rollout gates. Ops proof still needs
@@ -279,21 +214,23 @@ cargo run -- sync-catalog \
 
 `stream-binlog --target-parallel-transactions N` enables bounded target
 transaction submission when `N > 1`; the default `1` preserves serial execution.
-The opt-in path fails closed before checkpoint advancement on a delayed target
-error. It is not ready for a workload that still depends on immediate per-row
-conflict classification.
+The parallel path sends and drains body statements individually, ignores delayed
+`1062` only for INSERT statements, and fails closed before checkpoint advancement
+on every other delayed target error.
 
-Run the disposable Connector/C/TLS proof with:
+Run the disposable source-authoritative proofs with:
 
 ```sh
+python3 scripts/cdc-integration-harness.py --scenario insert-duplicate-idempotent
 python3 scripts/cdc-integration-harness.py --scenario parallel-target-transactions
 ```
 
-The scenario pauses the first worker after Connector/C accepts its body, pauses
-the second after its result is drained, verifies every target session uses
-`SSL/TLS`, and confirms rows plus the checkpoint remain invisible before ordered
-commit. Releasing both test-only barriers must produce exact row and checkpoint
-convergence.
+The serial scenario preloads a divergent target row, removes the conflict ledger
+and inventory procedure, and proves the duplicate leaves that row untouched while
+a later same-transaction row and exact checkpoint advance. The parallel scenario
+adds ordered-commit barriers, verifies every target session uses `SSL/TLS`, and
+proves both transactions converge only after release. Offline repair scenarios
+retain the separate ledger, comparison, and FK-repair identities.
 
 ### Table catalog JSON and execution contract
 
@@ -423,31 +360,17 @@ verification when changing source transport. See [connection policy](docs/schema
 
 ## Insert conflict policy
 
-`--insert-conflict-policy` is path-specific, not a global “keep CDC running past
-duplicates” switch. Values are `error`, `ignore-duplicate`, and the explicit
-`replace-divergent-pk` policy:
+`--insert-conflict-policy` applies to statement replay and offline
+snapshot/table-sync paths. Values are `error`, `ignore-duplicate`, and
+`replace-divergent-pk`:
 
-- Generic target execution treats a MySQL `1062` as success only for statements
-  beginning with `INSERT INTO` under `ignore-duplicate`. Other statements and
-  errors still fail; `replace-divergent-pk` does not add a generic SQL fallback.
-- Native ROW events under `ignore-duplicate` continue only when a duplicate
-  `INSERT` target row fetched by source primary key exactly equals the source row.
-- Native ROW events under `replace-divergent-pk` read the target row by source
-  primary key and replace an unequal row only when the duplicate index is
-  `PRIMARY`, using a safe primary-key UPDATE of the source image. The accepted
-  risk is overwriting the divergent target row. Successful replacements and
-  equal no-ops never create ledger rows; they resolve only an already-recorded
-  matching source identity/schema/table/PK record after target commit and
-  checkpoint. Secondary-unique, foreign-key, CHECK, and replacement-update
-  conflicts persist evidence and abort. If a later conflict rolls back the
-  target transaction, the replacement rolls back and the existing ledger record
-  remains unresolved.
-- With the default `error` policy, native row duplicates fail, roll back the
-  target transaction, and leave the checkpoint unchanged.
-- `catchup-snapshot` and normal range `sync-table` repairs use explicit
-  `INSERT IGNORE` independently of this flag, except
-  `sync-table --mode missing-primary-keys`, which uses strict `INSERT`.
-  `sync-table --updated-since` uses its own upsert path.
+- Generic target execution treats MySQL `1062` as success only for statements
+  beginning with `INSERT INTO` under `ignore-duplicate`.
+- Native ROW streaming does not use this policy. Its fixed rule accepts INSERT
+  `1062` and fails every other row error.
+- Snapshot modes may explicitly select upsert or duplicate-ignore behavior.
+- Table-sync missing-row and displaced-owner repair retains its bounded,
+  verified `replace-divergent-pk` behavior.
 
 `sync-table --mode missing-primary-keys` is apply-only: it compares source and
 target rows by primary key, inserts source rows whose primary keys are absent,
