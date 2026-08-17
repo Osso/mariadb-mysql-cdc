@@ -339,10 +339,10 @@ impl SyncRunExecutor for RecordingSyncExecutor {
         stage: SyncStage,
     ) -> Result<(), String> {
         self.events.push(format!("schema:{}", stage.as_str()));
-        if let Some((failed_stage, error)) = &self.schema_error {
-            if *failed_stage == stage {
-                return Err(error.clone());
-            }
+        if let Some((failed_stage, error)) = &self.schema_error
+            && *failed_stage == stage
+        {
+            return Err(error.clone());
         }
         Ok(())
     }
@@ -494,11 +494,13 @@ fn dependent_source_evidence() -> SchemaSourceEvidence {
 }
 
 fn fixture_config() -> SyncConfig {
-    let mut source = MySqlConnectionConfig::default();
-    source.host = "source".to_string();
-    source.user = "source-user".to_string();
-    source.password = "source-password".to_string();
-    source.database = "source-db".to_string();
+    let source = MySqlConnectionConfig {
+        host: "source".to_string(),
+        user: "source-user".to_string(),
+        password: "source-password".to_string(),
+        database: "source-db".to_string(),
+        ..MySqlConnectionConfig::default()
+    };
     let target = TargetMySqlConfig {
         host: "target".to_string(),
         user: "target-user".to_string(),

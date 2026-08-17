@@ -270,11 +270,13 @@ fn config_and_identity(
     tables: &[SyncTable],
     parallelism: usize,
 ) -> (SyncConfig, SyncRunIdentity) {
-    let mut source = MySqlConnectionConfig::default();
-    source.host = "source".to_string();
-    source.user = "source-user".to_string();
-    source.password = "source-password".to_string();
-    source.database = "source-db".to_string();
+    let source = MySqlConnectionConfig {
+        host: "source".to_string(),
+        user: "source-user".to_string(),
+        password: "source-password".to_string(),
+        database: "source-db".to_string(),
+        ..MySqlConnectionConfig::default()
+    };
     let target = TargetMySqlConfig {
         host: "target".to_string(),
         user: "target-user".to_string(),
