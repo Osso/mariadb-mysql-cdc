@@ -162,13 +162,7 @@ fn apply_source_window(
         .last()
         .map(|row| row.primary_key.clone())
         .expect("non-empty source window");
-    let target_rows = target
-        .read_rows(&SyncChunkReadRequest {
-            start_after,
-            end_at: Some(end_at.clone()),
-            limit: config.chunk_size,
-        })
-        .map_err(|error| format!("read target chunk for `{}`: {error}", config.table.name))?;
+    let target_rows = read_complete_target_window(config, start_after, &end_at, target)?;
     let changes = chunk_changes(&config.table, &source_rows, &target_rows);
     apply_changes(&config.table.name, target, &changes)?;
 
@@ -176,6 +170,30 @@ fn apply_source_window(
     progress.complete = false;
     record_progress(&mut progress, source_rows.len(), &changes);
     Ok(progress)
+}
+
+fn read_complete_target_window(
+    config: &SyncChunkConfig,
+    mut start_after: Option<Vec<String>>,
+    end_at: &[String],
+    target: &mut impl SyncChunkTargetSession,
+) -> Result<Vec<DatabaseRow>, String> {
+    let mut target_rows = Vec::new();
+    loop {
+        let page = target
+            .read_rows(&SyncChunkReadRequest {
+                start_after,
+                end_at: Some(end_at.to_vec()),
+                limit: config.chunk_size,
+            })
+            .map_err(|error| format!("read target chunk for `{}`: {error}", config.table.name))?;
+        let page_is_complete = page.len() < config.chunk_size;
+        start_after = page.last().map(|row| row.primary_key.clone());
+        target_rows.extend(page);
+        if page_is_complete {
+            return Ok(target_rows);
+        }
+    }
 }
 
 fn apply_target_tail(

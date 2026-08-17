@@ -111,6 +111,7 @@ struct RecordingTargetSession {
     visible_rows: Vec<DatabaseRow>,
     pending_rows: Vec<DatabaseRow>,
     read_batches: VecDeque<Vec<DatabaseRow>>,
+    honor_read_bounds: bool,
     failure: Option<FailurePoint>,
     events: Events,
 }
@@ -121,6 +122,7 @@ impl RecordingTargetSession {
             visible_rows: rows.clone(),
             pending_rows: rows,
             read_batches: VecDeque::new(),
+            honor_read_bounds: false,
             failure: None,
             events,
         }
@@ -134,9 +136,36 @@ impl RecordingTargetSession {
         self
     }
 
+    fn with_bounded_reads(mut self) -> Self {
+        self.honor_read_bounds = true;
+        self
+    }
+
     fn fail_at(mut self, failure: FailurePoint) -> Self {
         self.failure = Some(failure);
         self
+    }
+
+    fn bounded_read(&self, request: &SyncChunkReadRequest) -> Vec<DatabaseRow> {
+        let mut rows = self
+            .pending_rows
+            .iter()
+            .filter(|row| {
+                let after_start = request
+                    .start_after
+                    .as_ref()
+                    .is_none_or(|start| row.primary_key.as_slice() > start.as_slice());
+                let before_end = request
+                    .end_at
+                    .as_ref()
+                    .is_none_or(|end| row.primary_key.as_slice() <= end.as_slice());
+                after_start && before_end
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.primary_key.cmp(&right.primary_key));
+        rows.truncate(request.limit);
+        rows
     }
 }
 
@@ -175,10 +204,13 @@ impl SyncChunkTargetSession for RecordingTargetSession {
         if self.failure == Some(FailurePoint::TargetRead) {
             return Err("injected target read failure".to_string());
         }
-        Ok(self
-            .read_batches
-            .pop_front()
-            .unwrap_or_else(|| self.pending_rows.clone()))
+        if let Some(rows) = self.read_batches.pop_front() {
+            return Ok(rows);
+        }
+        if self.honor_read_bounds {
+            return Ok(self.bounded_read(request));
+        }
+        Ok(self.pending_rows.clone())
     }
 
     fn delete_rows(&mut self, primary_keys: &[Vec<String>]) -> Result<(), String> {
@@ -428,6 +460,39 @@ fn a_short_source_chunk_requires_a_later_locked_empty_source_tail_chunk() {
             Event::Unlock,
         ]
     );
+}
+
+#[test]
+fn dense_target_window_is_fully_reconciled_before_durable_completion() {
+    let events = events();
+    let expected_rows = vec![row("1", "one"), row("4", "four")];
+    let mut source = RecordingSource::scripted(
+        [expected_rows.clone(), Vec::new()],
+        Rc::clone(&events),
+    );
+    let mut target = RecordingTargetSession::new(
+        vec![
+            row("1", "one"),
+            row("2", "target-only-two"),
+            row("3", "target-only-three"),
+            row("4", "four"),
+        ],
+        Rc::clone(&events),
+    )
+    .with_bounded_reads();
+    let mut progress = RecordingProgressStore::new(events);
+    let config = config(2);
+
+    let running = sync_next_chunk(&config, &mut source, &mut target, &mut progress)
+        .expect("source window");
+    assert!(!running.complete);
+
+    let complete = sync_next_chunk(&config, &mut source, &mut target, &mut progress)
+        .expect("target tail");
+
+    assert!(complete.complete);
+    assert_rows_equal(&target.visible_rows, &expected_rows);
+    assert_eq!(progress.durable, Some(complete));
 }
 
 #[test]
