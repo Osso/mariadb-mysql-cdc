@@ -6,12 +6,7 @@ use crate::mysql_config::MySqlConnectionConfig;
 use crate::mysql_support::{
     apply_default_mysql_network_bounds, apply_mysql_connection_liveness, target_mysql_opts,
 };
-use crate::snapshot::{ChunkRequest, SnapshotError, SnapshotProgress, SnapshotRow, SnapshotSource};
-use crate::table_sync::progress::{
-    build_add_total_rows_column_sql, build_create_progress_schema_sql,
-    build_create_progress_table_sql, build_progress_upsert_sql,
-};
-use crate::table_sync::{SyncTableProgress, TableSyncError};
+use crate::snapshot::SnapshotError;
 use crate::target::{
     SqlStatement, TargetExecuteError, TargetExecutor, TargetRowChange, TargetRowChangeKind,
     TransactionalTargetExecutor,
@@ -37,16 +32,11 @@ mod tests;
 
 #[cfg(test)]
 use connection::{NetworkTimeouts, apply_network_timeouts};
-use connection::{
-    base_opts, open_conn, progress_connect_error, snapshot_connect_error, target_connect_error,
-};
+use connection::{base_opts, open_conn, snapshot_connect_error, target_connect_error};
 pub(crate) use query::value_to_string;
 use query::{
-    build_progress_error_message_sql, build_snapshot_boundary_select_sql,
-    build_snapshot_progress_select_sql, build_stream_lease_sql, build_target_column_select_sql,
-    ensure_stream_lease_acquired, generated_column_retry_sql, progress_query_error, row_to_strings,
-    rows_to_tsv, snapshot_boundary_offsets, snapshot_progress_from_rows, snapshot_query_error,
-    snapshot_row_from_mysql_row, target_query_error,
+    build_stream_lease_sql, build_target_column_select_sql, ensure_stream_lease_acquired,
+    generated_column_retry_sql, row_to_strings, snapshot_query_error, target_query_error,
 };
 
 pub struct PersistentMySqlSource {
@@ -58,12 +48,6 @@ pub struct PersistentTargetExecutor {
     conn: SharedTargetConnection,
     insert_conflict_policy: InsertConflictPolicy,
     parallel_writer: Option<SharedParallelTargetWriter>,
-}
-
-pub struct PersistentProgressWriter {
-    conn: RefCell<Conn>,
-    default_database: String,
-    progress_table: String,
 }
 
 pub(crate) fn sync_target_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
@@ -123,72 +107,6 @@ impl PersistentMySqlSource {
             .db_name(Some(config.database.clone()))
             .prefer_socket(false);
         Self::new_with_opts(Opts::from(apply_mysql_connection_liveness(builder)))
-    }
-
-    pub fn count_rows(&self, table: &str) -> Result<u64, SnapshotError> {
-        let sql = format!(
-            "SELECT COUNT(*) FROM {}",
-            crate::mysql_support::quote_ident(table)
-        );
-        self.conn
-            .borrow_mut()
-            .query_first::<u64, _>(sql)
-            .map_err(snapshot_query_error)?
-            .ok_or_else(|| SnapshotError::InvalidTable(format!("{table} row count was empty")))
-    }
-
-    pub fn read_range_boundaries(
-        &self,
-        table: &crate::snapshot::SnapshotTable,
-        workers: usize,
-        total_rows: u64,
-    ) -> Result<Vec<Vec<String>>, SnapshotError> {
-        snapshot_boundary_offsets(total_rows, workers)
-            .into_iter()
-            .map(|offset| self.read_range_boundary(table, offset))
-            .collect()
-    }
-
-    fn read_range_boundary(
-        &self,
-        table: &crate::snapshot::SnapshotTable,
-        offset: u64,
-    ) -> Result<Vec<String>, SnapshotError> {
-        let sql = build_snapshot_boundary_select_sql(table, offset);
-        let row = self
-            .conn
-            .borrow_mut()
-            .query_first::<mysql::Row, _>(sql)
-            .map_err(snapshot_query_error)?
-            .ok_or_else(|| {
-                SnapshotError::InvalidTable(format!("{} boundary was empty", table.name))
-            })?;
-        row.unwrap()
-            .into_iter()
-            .map(value_to_string)
-            .enumerate()
-            .map(|(index, value)| {
-                value.ok_or_else(|| {
-                    SnapshotError::InvalidTable(format!(
-                        "primary-key column {} was NULL",
-                        table.primary_key[index]
-                    ))
-                })
-            })
-            .collect()
-    }
-
-    pub fn read_create_table(&self, table: &str) -> Result<String, SnapshotError> {
-        let sql = format!(
-            "SHOW CREATE TABLE {}",
-            crate::mysql_support::quote_ident(table)
-        );
-        self.conn
-            .borrow_mut()
-            .query_first::<(String, String), _>(sql)
-            .map_err(snapshot_query_error)?
-            .map(|(_, ddl)| ddl)
-            .ok_or_else(|| SnapshotError::InvalidTable(format!("{table} DDL was empty")))
     }
 
     pub(crate) fn query_rows_as_strings(
@@ -254,21 +172,6 @@ fn required_binlog_coordinate_value(
         .ok_or_else(|| {
             SnapshotError::InvalidTable(format!("MariaDB binlog coordinate {field} is missing"))
         })
-}
-
-impl SnapshotSource for PersistentMySqlSource {
-    fn read_chunk(&self, request: &ChunkRequest) -> Result<Vec<SnapshotRow>, SnapshotError> {
-        let sql = crate::mysql_snapshot::build_select_chunk_sql(request);
-        let rows = self
-            .conn
-            .borrow_mut()
-            .query::<mysql::Row, _>(sql)
-            .map_err(snapshot_query_error)?;
-
-        rows.into_iter()
-            .map(|row| snapshot_row_from_mysql_row(request, row))
-            .collect()
-    }
 }
 
 fn open_initialized_target_connection(opts: Opts) -> Result<Conn, TargetExecuteError> {
@@ -590,72 +493,5 @@ impl PersistentTargetExecutor {
 
     fn can_ignore_duplicate_insert(&self, sql: &str, error: &str) -> bool {
         should_ignore_duplicate_insert(self.insert_conflict_policy, sql, error)
-    }
-}
-
-impl PersistentProgressWriter {
-    pub fn new(config: &TargetMySqlConfig, progress_table: String) -> Result<Self, TableSyncError> {
-        let opts = sync_target_opts(config).map_err(TableSyncError::Progress)?;
-        let mut conn = open_conn(opts).map_err(progress_connect_error)?;
-        conn.query_drop(crate::live::target_session_init_command())
-            .map_err(progress_query_error)?;
-        Ok(Self {
-            conn: RefCell::new(conn),
-            default_database: config.database.clone(),
-            progress_table,
-        })
-    }
-
-    pub fn ensure(&self) -> Result<(), TableSyncError> {
-        if let Some(sql) = build_create_progress_schema_sql(&self.progress_table) {
-            self.execute_progress_sql(sql)?;
-        }
-        self.execute_progress_sql(build_create_progress_table_sql(&self.progress_table))?;
-        self.execute_progress_sql(build_add_total_rows_column_sql(
-            &self.default_database,
-            &self.progress_table,
-        ))
-    }
-
-    pub fn save(&self, progress: &SyncTableProgress) -> Result<(), TableSyncError> {
-        self.execute_progress_sql(build_progress_upsert_sql(&self.progress_table, progress))
-    }
-
-    pub fn save_error_message(&self, table: &str, error: &str) -> Result<(), TableSyncError> {
-        self.execute_progress_sql(build_progress_error_message_sql(
-            &self.progress_table,
-            table,
-            error,
-        ))
-    }
-
-    pub fn load_snapshot_progress(&self) -> Result<SnapshotProgress, TableSyncError> {
-        let sql = build_snapshot_progress_select_sql(&self.progress_table);
-        let rows = self
-            .conn
-            .borrow_mut()
-            .query::<(String, String, u64, String), _>(sql)
-            .map_err(progress_query_error)?;
-        snapshot_progress_from_rows(rows)
-    }
-
-    pub fn execute_table_sync_progress_sql(&self, sql: String) -> Result<(), TableSyncError> {
-        self.execute_progress_sql(sql)
-    }
-
-    pub fn query_table_sync_progress_tsv(&self, sql: String) -> Result<String, TableSyncError> {
-        let rows = self
-            .conn
-            .borrow_mut()
-            .query::<mysql::Row, _>(sql)
-            .map_err(progress_query_error)?;
-        Ok(rows_to_tsv(rows))
-    }
-
-    fn execute_progress_sql(&self, sql: String) -> Result<(), TableSyncError> {
-        self.conn
-            .borrow_mut()
-            .query_drop(sql)
-            .map_err(progress_query_error)
     }
 }

@@ -3,7 +3,6 @@ use crate::mysql_support::{
     apply_mysql_tcp_liveness, ssl_opts_from_ca,
 };
 use crate::snapshot::SnapshotError;
-use crate::table_sync::TableSyncError;
 use crate::target::TargetExecuteError;
 use mysql::{Conn, Opts, OptsBuilder};
 use std::time::Duration;
@@ -66,8 +65,4 @@ pub(crate) fn snapshot_connect_error(error: mysql::Error) -> SnapshotError {
 
 pub(crate) fn target_connect_error(error: mysql::Error) -> TargetExecuteError {
     TargetExecuteError::new(format!("failed to connect to target mysql: {error}"))
-}
-
-pub(crate) fn progress_connect_error(error: mysql::Error) -> TableSyncError {
-    TableSyncError::Progress(format!("failed to connect to target mysql: {error}"))
 }

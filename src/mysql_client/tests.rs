@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 #[test]
-fn formats_mysql_values_like_snapshot_text_rows() {
+fn formats_mysql_values_as_source_text_rows() {
     assert_eq!(value_to_string(Value::NULL), None);
     assert_eq!(
         value_to_string(Value::Bytes(b"NULL".to_vec())),
@@ -342,82 +342,6 @@ fn live_update_duplicate_remains_fatal() {
     .expect_err("UPDATE 1062 must fail");
 
     assert_eq!(error.mysql_code(), Some(1062));
-}
-
-#[test]
-fn builds_snapshot_progress_select_sql_for_cdc_table() {
-    let sql = build_snapshot_progress_select_sql("cdc.table_sync_progress");
-
-    assert_eq!(
-        sql,
-        "SELECT table_name, COALESCE(last_primary_key_json, ''), rows_scanned, status FROM `cdc`.`table_sync_progress`"
-    );
-}
-
-#[test]
-fn builds_progress_error_sql_with_table_and_message() {
-    let sql = build_progress_error_message_sql("cdc.table_sync_progress", "releases", "can't copy");
-
-    assert_eq!(
-        sql,
-        "INSERT INTO `cdc`.`table_sync_progress` (table_name,mode,status,last_error) VALUES ('releases','apply','error','can''t copy') ON DUPLICATE KEY UPDATE status='error',last_error=VALUES(last_error)"
-    );
-}
-
-#[test]
-fn converts_mysql_progress_rows_to_snapshot_progress() {
-    let rows = vec![
-        (
-            "accounts".to_string(),
-            "[\"42\"]".to_string(),
-            42,
-            "running".to_string(),
-        ),
-        (
-            "releases".to_string(),
-            String::new(),
-            100,
-            "complete".to_string(),
-        ),
-    ];
-
-    let progress = snapshot_progress_from_rows(rows).expect("progress");
-
-    let accounts = progress.table("accounts").expect("accounts");
-    assert_eq!(accounts.last_primary_key, Some(vec!["42".to_string()]));
-    assert_eq!(accounts.rows_copied, 42);
-    assert!(!accounts.complete);
-
-    let releases = progress.table("releases").expect("releases");
-    assert_eq!(releases.last_primary_key, None);
-    assert_eq!(releases.rows_copied, 100);
-    assert!(releases.complete);
-}
-
-#[test]
-fn plans_snapshot_boundary_offsets_for_four_workers() {
-    assert_eq!(snapshot_boundary_offsets(10, 4), vec![2, 4, 7]);
-}
-
-#[test]
-fn skips_snapshot_boundary_offsets_when_rows_are_too_sparse() {
-    assert_eq!(snapshot_boundary_offsets(2, 4), vec![0, 1]);
-}
-
-#[test]
-fn builds_snapshot_boundary_select_sql() {
-    let table = crate::snapshot::SnapshotTable {
-        name: "accounts".to_string(),
-        primary_key: vec!["tenant_id".to_string(), "id".to_string()],
-        columns: Vec::new(),
-    };
-
-    let sql = build_snapshot_boundary_select_sql(&table, 99);
-
-    assert_eq!(
-        sql,
-        "SELECT `tenant_id`, `id` FROM `accounts` ORDER BY `tenant_id`, `id` LIMIT 1 OFFSET 99"
-    );
 }
 
 #[test]
