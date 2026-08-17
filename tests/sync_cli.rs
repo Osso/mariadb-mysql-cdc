@@ -4,7 +4,7 @@ const BINARY: &str = env!("CARGO_BIN_EXE_mariadb-mysql-cdc");
 const MISSING_SOURCE_PASSWORD_ENV: &str = "MARIADB_MYSQL_CDC_TEST_MISSING_SYNC_PASSWORD";
 
 #[test]
-fn help_documents_one_unified_schema_and_table_sync_command() {
+fn help_documents_one_unified_sync_command() {
     let output = run(&["--help"]);
 
     assert!(output.status.success());

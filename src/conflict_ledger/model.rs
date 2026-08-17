@@ -167,14 +167,3 @@ fn canonical_length_prefixed_input(fields: &[&[u8]]) -> Vec<u8> {
     }
     encoded
 }
-
-/// Index name from a MySQL `1062` message, e.g. `guests.idx_guest_hash`. Needed as repair evidence
-/// because a duplicate owned by another identity is otherwise unreproducible after the run exits.
-pub(crate) fn duplicate_key_name(error_text: &str) -> Option<String> {
-    let marker = " for key '";
-    let start = error_text.find(marker)? + marker.len();
-    let remainder = &error_text[start..];
-    let end = remainder.find('\'')?;
-    let key = &remainder[..end];
-    (!key.is_empty()).then(|| key.to_string())
-}

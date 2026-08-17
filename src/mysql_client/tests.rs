@@ -186,44 +186,6 @@ fn sync_target_writer_opts_have_bounded_operation_timeouts() {
 }
 
 #[test]
-fn target_reader_opts_use_configured_ca_and_dns_verification() {
-    let target = TargetMySqlConfig {
-        host: "target-db.example".to_string(),
-        tls_ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/test-ca.pem").to_string(),
-        ..TargetMySqlConfig::default()
-    };
-
-    let opts = target_reader_opts(&target).expect("target reader options");
-    let ssl = opts.get_ssl_opts().expect("target TLS");
-
-    assert_eq!(
-        ssl.root_cert_path(),
-        Some(std::path::Path::new(&target.tls_ca_file))
-    );
-    assert!(!ssl.skip_domain_validation());
-    assert!(!ssl.accept_invalid_certs());
-}
-
-#[test]
-fn target_reader_opts_reject_missing_or_invalid_ca() {
-    let missing = TargetMySqlConfig {
-        host: "target-db.example".to_string(),
-        tls_ca_file: String::new(),
-        ..TargetMySqlConfig::default()
-    };
-    let error = target_reader_opts(&missing).expect_err("missing target CA");
-    assert!(error.contains("TLS CA file is required"));
-
-    let invalid = TargetMySqlConfig {
-        host: "target-db.example".to_string(),
-        tls_ca_file: "/tmp/no-such-target-reader-ca.pem".to_string(),
-        ..TargetMySqlConfig::default()
-    };
-    let error = target_reader_opts(&invalid).expect_err("invalid target CA");
-    assert!(error.contains("unreadable"));
-}
-
-#[test]
 fn persistent_target_reader_connection_uses_configured_ca() {
     let config = crate::mysql_config::MySqlConnectionConfig {
         host: "target-db.example".to_string(),

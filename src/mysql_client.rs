@@ -75,18 +75,6 @@ pub(crate) fn sync_target_opts(target: &TargetMySqlConfig) -> Result<Opts, Strin
     Ok(Opts::from(apply_default_mysql_network_bounds(builder)))
 }
 
-pub(crate) fn target_reader_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
-    base_opts(
-        &target.host,
-        target.port,
-        &target.user,
-        &target.password,
-        &target.database,
-        Some(&target.tls_ca_file),
-        &format!("target `{}`:{}", target.host, target.port),
-    )
-}
-
 impl PersistentMySqlSource {
     pub fn new(config: &MySqlConnectionConfig) -> Result<Self, MySqlSourceError> {
         Self::new_with_tls_ca(config, None)

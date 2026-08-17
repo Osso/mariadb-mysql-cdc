@@ -313,15 +313,6 @@ fn rejects_wrong_conflict_identity_charset_or_collation() {
     );
 }
 
-#[test]
-fn duplicate_key_name_extracts_historical_index() {
-    assert_eq!(
-        duplicate_key_name("Duplicate entry 'abc' for key 'guests.idx_guest_hash'"),
-        Some("guests.idx_guest_hash".to_string())
-    );
-    assert_eq!(duplicate_key_name("duplicate without index"), None);
-}
-
 fn test_conflict_key(table: &str, id: &str) -> ConflictKey {
     ConflictKey {
         source_identity: "source".to_string(),

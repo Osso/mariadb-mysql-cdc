@@ -47,25 +47,6 @@ pub(crate) fn build_strict_insert_statement(
     }
 }
 
-pub(crate) fn build_strict_update_statement(table: &SyncTable, row: &DatabaseRow) -> SqlStatement {
-    let changed_columns = non_primary_columns(table);
-    let assignments = changed_columns
-        .iter()
-        .map(|column| format!("{} = ?", quote_ident(column)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let predicates = primary_key_predicates(&table.primary_key).join(" AND ");
-    let mut params = ordered_values(row, &changed_columns);
-    params.extend(row.primary_key.iter().cloned().map(string_param));
-    SqlStatement {
-        sql: format!(
-            "UPDATE {} SET {assignments} WHERE {predicates}",
-            quote_ident(&table.name)
-        ),
-        params,
-    }
-}
-
 pub(crate) fn build_strict_update_rows_statement(
     table: &SyncTable,
     rows: &[DatabaseRow],
@@ -85,20 +66,6 @@ pub(crate) fn build_strict_update_rows_statement(
             quote_ident(&table.name)
         ),
         params,
-    }
-}
-
-pub(crate) fn build_strict_delete_statement(
-    table: &SyncTable,
-    primary_key: &[String],
-) -> SqlStatement {
-    SqlStatement {
-        sql: format!(
-            "DELETE FROM {} WHERE {}",
-            quote_ident(&table.name),
-            primary_key_predicates(&table.primary_key).join(" AND ")
-        ),
-        params: primary_key.iter().cloned().map(string_param).collect(),
     }
 }
 

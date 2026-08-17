@@ -2,10 +2,8 @@ use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkReadRequest, SyncPrimaryKeyOrdering, SyncProgressRow, SyncProgressStatus, SyncStage,
     SyncTable, build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
-    build_lock_table_write_sql, build_strict_delete_rows_statement,
-    build_strict_delete_statement, build_strict_insert_statement,
-    build_strict_update_rows_statement, build_strict_update_statement,
-    build_sync_progress_select_sql,
+    build_lock_table_write_sql, build_strict_delete_rows_statement, build_strict_insert_statement,
+    build_strict_update_rows_statement, build_sync_progress_select_sql,
     build_sync_progress_upsert_sql, build_sync_select_sql, parse_sync_progress_row,
 };
 use mysql::Value;
@@ -45,7 +43,7 @@ fn sync_mysql_contract_builds_only_the_quoted_target_write_lock() {
 }
 
 #[test]
-fn sync_mysql_contract_builds_strict_bound_row_mutations() {
+fn sync_mysql_contract_builds_strict_insert_mutations() {
     let table = mutation_table();
     let row = row("7", "live", "Now");
 
@@ -59,23 +57,7 @@ fn sync_mysql_contract_builds_strict_bound_row_mutations() {
         vec![bytes("7"), bytes("live"), bytes("Now")]
     );
 
-    let update = build_strict_update_statement(&table, &row);
-    assert_eq!(
-        update.sql,
-        "UPDATE `episodes` SET `status` = ?, `title` = ? WHERE `id` = ?"
-    );
-    assert_eq!(
-        update.params,
-        vec![bytes("live"), bytes("Now"), bytes("7")]
-    );
-
-    let delete = build_strict_delete_statement(&table, &row.primary_key);
-    assert_eq!(delete.sql, "DELETE FROM `episodes` WHERE `id` = ?");
-    assert_eq!(delete.params, vec![bytes("7")]);
-
-    let mutation_sql = [insert.sql, update.sql, delete.sql]
-        .join("\n")
-        .to_ascii_uppercase();
+    let mutation_sql = insert.sql.to_ascii_uppercase();
     for forbidden in ["INSERT IGNORE", "ON DUPLICATE KEY UPDATE", "REPLACE"] {
         assert!(
             !mutation_sql.contains(forbidden),
