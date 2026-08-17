@@ -106,7 +106,7 @@ in [catchup.md](../catchup.md).
   not claim interrupted parallel-range resume.
 - `src/mysql_snapshot/tests.rs`
 - `src/mysql_snapshot/parallel.rs`
-- `src/snapshot/tests.rs`
+- `src/snapshot.rs` and `src/snapshot_tests.rs` — snapshot engine and tests.
 - `src/target.rs`
 - `src/sync_progress_cli.rs`
 
