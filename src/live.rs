@@ -41,7 +41,6 @@ use reconnect::{StreamCheckpointStore, run_stream_reconnect_loop, save_stream_ch
 use reconnect::{is_stale_or_missing_binlog_error, resume_from_checkpoint, should_reconnect};
 #[cfg(test)]
 use repair::{FailedStatementRepairer, repair_failed_statement};
-pub(crate) use schema_recovery::mysql_compatible_create_table;
 use schema_recovery::mysql_executor_with_recovery;
 
 #[cfg(feature = "integration-failpoints")]

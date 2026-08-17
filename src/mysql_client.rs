@@ -224,13 +224,6 @@ impl PersistentTargetExecutor {
         )
     }
 
-    pub(crate) fn new_for_sync(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
-        Self::new_with_opts(
-            sync_target_opts(config).map_err(TargetExecuteError::new)?,
-            config.insert_conflict_policy,
-        )
-    }
-
     pub(crate) fn new_for_stream(config: &ApplyBinlogConfig) -> Result<Self, TargetExecuteError> {
         let mut executor = Self::new_with_opts(
             target_mysql_opts(&config.target).map_err(TargetExecuteError::new)?,
@@ -324,18 +317,6 @@ impl PersistentTargetExecutor {
 
     pub(crate) fn execute_raw_sql(&self, sql: &str) -> Result<(), TargetExecuteError> {
         self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
-    }
-
-    pub(crate) fn begin_sync_transaction(&self) -> Result<(), TargetExecuteError> {
-        self.execute_transaction_control("BEGIN")
-    }
-
-    pub(crate) fn commit_sync_transaction(&self) -> Result<(), TargetExecuteError> {
-        self.execute_transaction_control("COMMIT")
-    }
-
-    pub(crate) fn rollback_sync_transaction(&self) -> Result<(), TargetExecuteError> {
-        self.execute_transaction_control("ROLLBACK")
     }
 }
 
