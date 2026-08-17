@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 const SYNC_RUN_ID_DOMAIN: &[u8] = b"mariadb-mysql-cdc:sync-run-id:v1\0";
 const MAX_SYNC_RUN_ID_BYTES: usize = 128;
+pub(crate) const DEFAULT_SYNC_PROGRESS_TABLE: &str = "cdc.sync_runs";
 
 #[derive(Clone, Debug)]
 pub(crate) struct SyncConfig {

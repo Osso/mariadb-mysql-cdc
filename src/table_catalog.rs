@@ -1245,7 +1245,7 @@ fn parse_sync_catalog_config(args: Vec<String>) -> Result<SyncCatalogConfig, Str
         progress_table: values
             .get("--progress-table")
             .cloned()
-            .unwrap_or_else(|| "cdc.table_sync_runs".to_string()),
+            .unwrap_or_else(|| sync::DEFAULT_SYNC_PROGRESS_TABLE.to_string()),
         run_id_prefix,
         chunk_size,
     })
@@ -1343,6 +1343,45 @@ fn cli_error(error: String, usage: &str) -> ! {
 mod tests {
     use super::*;
     use crate::inventory::{ColumnInventory, ForeignKeyInventory, SchemaInventory, TableInventory};
+
+    #[test]
+    fn sync_progress_defaults_catalog_to_unified_table() {
+        unsafe {
+            std::env::set_var("CDC_CATALOG_SOURCE_PASSWORD", "source-password");
+            std::env::set_var("CDC_CATALOG_TARGET_PASSWORD", "target-password");
+        }
+        let args = [
+            "--source-host",
+            "source",
+            "--source-user",
+            "reader",
+            "--source-password-env",
+            "CDC_CATALOG_SOURCE_PASSWORD",
+            "--source-database",
+            "source-db",
+            "--target-host",
+            "target",
+            "--target-user",
+            "writer",
+            "--target-password-env",
+            "CDC_CATALOG_TARGET_PASSWORD",
+            "--target-database",
+            "target-db",
+            "--target-tls-ca-file",
+            "/tmp/ca.pem",
+            "--catalog",
+            "catalog.json",
+            "--run-id-prefix",
+            "nightly",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        let config = parse_sync_catalog_config(args).expect("sync catalog config");
+
+        assert_eq!(config.progress_table, "cdc.sync_runs");
+    }
 
     #[test]
     fn excluded_child_keeps_own_reason_and_dependency_reason() {

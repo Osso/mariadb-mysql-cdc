@@ -63,6 +63,13 @@ mod lost_binlog_unified {
     ));
 }
 
+mod sync_progress_defaults {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_progress_defaults.rs"
+    ));
+}
+
 mod sync_runner {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

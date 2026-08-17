@@ -210,7 +210,25 @@ fn run_resync_stream_command(mut args: Vec<String>) {
         .database
         .clone()
         .expect("validated source database");
-    let config = lost_binlog_recovery::ResyncStreamConfig {
+    let config = resync_config_from_apply(apply, source_database, parallelism);
+    match lost_binlog_recovery::run_resync_stream(&config) {
+        Ok(report) => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("resync report JSON")
+        ),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn resync_config_from_apply(
+    apply: live::ApplyBinlogConfig,
+    source_database: String,
+    parallelism: usize,
+) -> lost_binlog_recovery::ResyncStreamConfig {
+    lost_binlog_recovery::ResyncStreamConfig {
         source: mysql_snapshot::MySqlConnectionConfig {
             host: apply.source.host,
             port: apply.source.port,
@@ -221,19 +239,9 @@ fn run_resync_stream_command(mut args: Vec<String>) {
         source_identity: apply.source_identity,
         target: apply.target,
         checkpoint_table: apply.checkpoint_table,
-        progress_table: "cdc.table_sync_runs".to_string(),
+        progress_table: sync::DEFAULT_SYNC_PROGRESS_TABLE.to_string(),
         chunk_size: 10_000,
         parallelism,
-    };
-    match lost_binlog_recovery::run_resync_stream(&config) {
-        Ok(report) => println!(
-            "{}",
-            serde_json::to_string_pretty(&report).expect("resync report JSON")
-        ),
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
     }
 }
 
@@ -290,7 +298,7 @@ fn recovery_config_from_apply(
         checkpoint_table: apply.checkpoint_table,
         journal_table: "cdc.ddl_replay_journal".to_string(),
         recovery_table: lost_binlog_recovery_store::DEFAULT_RECOVERY_TABLE.to_string(),
-        progress_table: "cdc.table_sync_runs".to_string(),
+        progress_table: sync::DEFAULT_SYNC_PROGRESS_TABLE.to_string(),
         chunk_size: 10_000,
     }
 }

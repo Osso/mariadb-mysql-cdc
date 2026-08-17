@@ -1,4 +1,4 @@
-use crate::sync::{SyncConfig, run_mysql_sync, validate_sync_config};
+use crate::sync::{DEFAULT_SYNC_PROGRESS_TABLE, SyncConfig, run_mysql_sync, validate_sync_config};
 use crate::{live, mysql_snapshot};
 
 pub(crate) fn run_sync_command(args: Vec<String>, usage: &str) {
@@ -41,7 +41,7 @@ fn default_sync_config() -> SyncConfig {
         tables: Vec::new(),
         chunk_size: 1000,
         parallelism: 1,
-        progress_table: "cdc.sync_runs".to_string(),
+        progress_table: DEFAULT_SYNC_PROGRESS_TABLE.to_string(),
         run_id: None,
         run_id_prefix: None,
     }
