@@ -355,6 +355,7 @@ class Harness:
             (frozenset({"USAGE"}), "*.*"),
             sync_application_grant,
             (frozenset({"CREATE"}), "cdc.*"),
+            (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.stream_checkpoint"),
             (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.sync_runs"),
         }
         for user, expected in (

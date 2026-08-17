@@ -956,6 +956,7 @@ fn target_bootstrap_uses_exact_unified_sync_progress_contract() {
         "CHECK (last_primary_key_json IS NULL OR JSON_VALID(last_primary_key_json))",
         "PRIMARY KEY (run_id, stage, table_name)",
         "GRANT CREATE ON cdc.* TO 'cdc_sync'@'%'",
+        "GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_sync'@'%'",
         "GRANT SELECT, INSERT, UPDATE ON cdc.sync_runs TO 'cdc_sync'@'%'",
     ] {
         assert!(
