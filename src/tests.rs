@@ -8,6 +8,11 @@ mod checkpoint_config {
 }
 
 #[test]
+fn usage_documents_parallel_target_transaction_option() {
+    assert!(USAGE.contains("--target-parallel-transactions COUNT"));
+}
+
+#[test]
 fn parses_apply_binlog_config_with_all_source_and_target_options() {
     set_env("SRC_PASSWORD", "source-secret");
     set_env("TARGET_PASSWORD", "target-secret");

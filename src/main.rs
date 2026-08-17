@@ -110,6 +110,8 @@ Apply options:
   --insert-conflict-policy POLICY Replay INSERT conflict policy: error, ignore-duplicate, or replace-divergent-pk.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
   --reconnect-forever BOOL        Ignore reconnect cap for transient source loss. Defaults to false.
+  --target-parallel-transactions COUNT
+                                  Submit complete target transactions concurrently. Defaults to 1 (serial).
   --stop-never-slave-server-id ID MariaDB --stop-never slave server_id. Generated when omitted.
 
 Catchup snapshot options:

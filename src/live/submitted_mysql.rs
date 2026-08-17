@@ -43,14 +43,42 @@ pub(crate) struct MariaDbSubmittedQueryConnection {
     raw: NonNull<mysqlclient_sys::MYSQL>,
 }
 
+struct MariaDbConnectionParameters {
+    host: CString,
+    user: CString,
+    password: CString,
+    database: CString,
+    ca_file: CString,
+    port: u16,
+}
+
+impl MariaDbConnectionParameters {
+    fn from_config(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
+        Ok(Self {
+            host: c_string("target host", &config.host)?,
+            user: c_string("target user", &config.user)?,
+            password: c_string("target password", &config.password)?,
+            database: c_string("target database", &config.database)?,
+            ca_file: c_string("target TLS CA file", &config.tls_ca_file)?,
+            port: config.port,
+        })
+    }
+}
+
 impl MariaDbSubmittedQueryConnection {
     fn open(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
         initialize_connector_library()?;
-        let host = c_string("target host", &config.host)?;
-        let user = c_string("target user", &config.user)?;
-        let password = c_string("target password", &config.password)?;
-        let database = c_string("target database", &config.database)?;
-        let ca_file = c_string("target TLS CA file", &config.tls_ca_file)?;
+        let parameters = MariaDbConnectionParameters::from_config(config)?;
+        let mut connection = Self::initialize()?;
+        connection.configure_network_and_tls(&parameters.ca_file)?;
+        connection.connect(&parameters)?;
+        connection.require_tls()?;
+        connection.set_character_set()?;
+        connection.execute_initialization_query(target_session_init_command())?;
+        Ok(connection)
+    }
+
+    fn initialize() -> Result<Self, TargetExecuteError> {
         let raw = NonNull::new(unsafe { mysqlclient_sys::mysql_init(ptr::null_mut()) });
         let Some(raw) = raw else {
             unsafe { mysqlclient_sys::mysql_thread_end() };
@@ -58,41 +86,45 @@ impl MariaDbSubmittedQueryConnection {
                 "failed to initialize target MariaDB client",
             ));
         };
-        let mut connection = Self { raw };
+        Ok(Self { raw })
+    }
 
-        connection.configure_timeout(
+    fn configure_network_and_tls(&mut self, ca_file: &CString) -> Result<(), TargetExecuteError> {
+        self.configure_timeout(
             TimeoutOption::Connect,
             duration_seconds(DEFAULT_MYSQL_CONNECT_TIMEOUT),
         )?;
-        connection.configure_timeout(
+        self.configure_timeout(
             TimeoutOption::Read,
             duration_seconds(DEFAULT_MYSQL_READ_TIMEOUT),
         )?;
-        connection.configure_timeout(
+        self.configure_timeout(
             TimeoutOption::Write,
             duration_seconds(DEFAULT_MYSQL_WRITE_TIMEOUT),
         )?;
-        connection.configure_tls(&ca_file)?;
+        self.configure_tls(ca_file)
+    }
 
+    fn connect(
+        &mut self,
+        parameters: &MariaDbConnectionParameters,
+    ) -> Result<(), TargetExecuteError> {
         let connected = unsafe {
             mysqlclient_sys::mysql_real_connect(
-                connection.raw.as_ptr(),
-                host.as_ptr(),
-                user.as_ptr(),
-                password.as_ptr(),
-                database.as_ptr(),
-                u32::from(config.port),
+                self.raw.as_ptr(),
+                parameters.host.as_ptr(),
+                parameters.user.as_ptr(),
+                parameters.password.as_ptr(),
+                parameters.database.as_ptr(),
+                u32::from(parameters.port),
                 ptr::null(),
                 CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS,
             )
         };
         if connected.is_null() {
-            return Err(connection.error("connect"));
+            return Err(self.error("connect"));
         }
-        connection.require_tls()?;
-        connection.set_character_set()?;
-        connection.execute_initialization_query(target_session_init_command())?;
-        Ok(connection)
+        Ok(())
     }
 
     fn configure_timeout(

@@ -213,24 +213,28 @@ where
             let event = self.events.recv().map_err(|_| {
                 self.fail("parallel target worker initialization channel disconnected".to_string())
             })?;
-            match event {
-                WorkerEvent::Initialized { worker, result } => {
-                    result.map_err(|error| {
-                        self.workers[worker].state = WorkerState::Failed;
-                        self.fail(format!(
-                            "parallel target worker {worker} connection failed: {error}"
-                        ))
-                    })?;
-                    self.workers[worker].state = WorkerState::Idle;
-                    initialized += 1;
-                }
-                _ => {
-                    return Err(self.fail(
-                        "parallel target worker emitted work before initialization".to_string(),
-                    ));
-                }
-            }
+            self.accept_worker_initialization(event)?;
+            initialized += 1;
         }
+        Ok(())
+    }
+
+    fn accept_worker_initialization(
+        &mut self,
+        event: WorkerEvent,
+    ) -> Result<(), TargetExecuteError> {
+        let WorkerEvent::Initialized { worker, result } = event else {
+            return Err(
+                self.fail("parallel target worker emitted work before initialization".to_string())
+            );
+        };
+        if let Err(error) = result {
+            self.workers[worker].state = WorkerState::Failed;
+            return Err(self.fail(format!(
+                "parallel target worker {worker} connection failed: {error}"
+            )));
+        }
+        self.workers[worker].state = WorkerState::Idle;
         Ok(())
     }
 
@@ -446,61 +450,97 @@ fn run_worker<C>(
     C: SubmittedQueryConnection,
 {
     while let Ok(command) = commands.recv() {
-        match command {
-            WorkerCommand::Execute {
-                sequence,
-                transaction,
-                submitted,
-            } => {
-                let send_result = connection.send_query(&transaction.body_sql);
-                match send_result {
-                    Ok(()) => {
-                        if submitted.send(Ok(())).is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = submitted.send(Err(error));
-                        return;
-                    }
-                }
-                let result = connection.read_query_result();
-                if events
-                    .send(WorkerEvent::Prepared {
-                        worker,
-                        sequence,
-                        commit_sql: transaction.commit_sql,
-                        checkpoint: transaction.checkpoint,
-                        result,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            WorkerCommand::Commit {
-                sequence,
-                sql,
-                checkpoint,
-            } => {
-                let result = commit_transaction(&mut connection, sequence, &sql);
-                let failed = result.is_err();
-                if events
-                    .send(WorkerEvent::Committed {
-                        worker,
-                        sequence,
-                        checkpoint,
-                        result,
-                    })
-                    .is_err()
-                    || failed
-                {
-                    return;
-                }
-            }
-            WorkerCommand::Shutdown => return,
+        if !execute_worker_command(worker, &mut connection, &events, command) {
+            return;
         }
     }
+}
+
+fn execute_worker_command<C>(
+    worker: usize,
+    connection: &mut C,
+    events: &Sender<WorkerEvent>,
+    command: WorkerCommand,
+) -> bool
+where
+    C: SubmittedQueryConnection,
+{
+    match command {
+        WorkerCommand::Execute {
+            sequence,
+            transaction,
+            submitted,
+        } => submit_and_drain_transaction_body(
+            worker,
+            connection,
+            events,
+            sequence,
+            transaction,
+            submitted,
+        ),
+        WorkerCommand::Commit {
+            sequence,
+            sql,
+            checkpoint,
+        } => submit_and_drain_transaction_commit(
+            worker, connection, events, sequence, sql, checkpoint,
+        ),
+        WorkerCommand::Shutdown => false,
+    }
+}
+
+fn submit_and_drain_transaction_body<C>(
+    worker: usize,
+    connection: &mut C,
+    events: &Sender<WorkerEvent>,
+    sequence: u64,
+    transaction: ParallelTargetTransaction,
+    submitted: Sender<Result<(), TargetExecuteError>>,
+) -> bool
+where
+    C: SubmittedQueryConnection,
+{
+    if let Err(error) = connection.send_query(&transaction.body_sql) {
+        let _ = submitted.send(Err(error));
+        return false;
+    }
+    if submitted.send(Ok(())).is_err() {
+        return false;
+    }
+    let result = connection.read_query_result();
+    events
+        .send(WorkerEvent::Prepared {
+            worker,
+            sequence,
+            commit_sql: transaction.commit_sql,
+            checkpoint: transaction.checkpoint,
+            result,
+        })
+        .is_ok()
+}
+
+fn submit_and_drain_transaction_commit<C>(
+    worker: usize,
+    connection: &mut C,
+    events: &Sender<WorkerEvent>,
+    sequence: u64,
+    sql: String,
+    checkpoint: Checkpoint,
+) -> bool
+where
+    C: SubmittedQueryConnection,
+{
+    let result = commit_transaction(connection, sequence, &sql);
+    let succeeded = result.is_ok();
+    events
+        .send(WorkerEvent::Committed {
+            worker,
+            sequence,
+            checkpoint,
+            result,
+        })
+        .is_ok()
+        && succeeded
 }
 
 fn commit_transaction<C>(
