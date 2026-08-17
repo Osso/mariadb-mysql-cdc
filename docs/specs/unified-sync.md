@@ -1,6 +1,6 @@
 # Unified source-authoritative synchronization
 
-The unified synchronization engine runs prerequisite schema convergence, source-authoritative row synchronization, and final constraint convergence under one immutable run identity. The production `sync` command exposes this orchestration for selected source tables; migration of existing callers remains in progress. Operator usage belongs in the sync runbook.
+The unified synchronization engine runs prerequisite schema convergence, source-authoritative row synchronization, and final constraint convergence under one immutable run identity. The production `sync` command exposes this orchestration for selected source tables, and `resync-stream` now supplies one captured source evidence set to the same staged engine. `recover-lost-binlog` remains on its legacy recovery path. Operator usage belongs in the sync runbook.
 
 ## What it must do
 
@@ -22,7 +22,9 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - [x] Expose the orchestration through one `sync` CLI and reject `catchup-snapshot`, `sync-table`, and `repair-drift` as unknown commands rather than aliasing them.
 - [x] Require exactly one immutable `--run-id` or `--run-id-prefix`; default progress persistence to `cdc.sync_runs` and support repeated `--table`, `--chunk-size`, `--parallelism`, and `--progress-table` options.
 - [x] Route `sync-catalog` through one unified run with shared immutable identity and `cdc.sync_runs` progress.
-- [ ] Route lost-binlog recovery, resync, and other callers through unified sync.
+- [x] Route `resync-stream` through one unified run with the fixed `resync-stream:<source_identity>` run identity.
+- [ ] Prove the resync source-evidence capture and complete staged execution through the production-shaped path.
+- [ ] Route `recover-lost-binlog` and other callers through unified sync.
 
 ### Schema and progress contracts
 
@@ -48,6 +50,7 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - `src/sync/progress.rs` — `cdc.sync_runs` SQL and progress serialization.
 - `src/sync_schema.rs` — source evidence reads plus prerequisite and final schema-stage planning/execution.
 - `src/table_catalog.rs` — catalog validation and one-run `SyncConfig` mapping for `sync-catalog`.
+- `src/lost_binlog_recovery.rs` — `resync-stream` source-coordinate/evidence capture and unified-sync invocation; `recover-lost-binlog` remains on the legacy recovery path.
 
 ## Tests asserting this spec
 
@@ -57,10 +60,11 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - `src/main/tests/sync_runner.rs` — bounded deterministic table execution and completion behavior.
 - `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering and checkpoint boundary.
 - `src/main/tests/sync_mysql_adapter.rs` and `src/main/tests/sync_mysql_contract.rs` — adapter and SQL contracts.
+- `src/main/tests/resync_unified.rs` — resync run identity, all-table mapping, and changed-table reporting.
 
 ## Known gaps (current cycle)
 
-- [ ] Migrate recovery, resync, scripts, fixtures, grants, harnesses, and ops callers.
+- [ ] Migrate `recover-lost-binlog`, scripts, fixtures, grants, harnesses, and ops callers.
 - [ ] Prove the complete catalog-to-unified MySQL path against disposable endpoints.
 - [ ] Delete legacy production engines and progress paths.
 - [ ] Run full-project tests, Clippy without warning suppression, and final integration verification.

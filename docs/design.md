@@ -150,6 +150,18 @@ that exact barrier, and both are terminal. This transition skips purged source
 history; it is not replay proof and does not claim production completion until
 restart health and subsequent zero-drift verification are recorded.
 
+## Resync stream
+
+`resync-stream` is a separate checkpoint-bootstrap path. It reads the source
+binlog coordinate and one committed `SchemaSourceEvidence` set, validates the
+transactional source scope, then invokes unified sync for every source table with
+run ID `resync-stream:<source_identity>`. Unified sync owns prerequisite schema
+convergence, locked source-authoritative row chunks, durable `cdc.sync_runs`
+progress, and final constraint convergence. Resync no longer invokes the legacy
+repair engine, runs a separate final schema pass, or re-inventories the target
+for post-write drift verification. `recover-lost-binlog` remains on the legacy
+recovery path and is not covered by this migration.
+
 ## Repair model
 
 Live ROW streaming and out-of-band repair are separate systems. The live stream

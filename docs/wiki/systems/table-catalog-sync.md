@@ -19,6 +19,6 @@ The unified run owns prerequisite schema convergence, locked source-authoritativ
 
 ## Failure and recovery
 
-A unified run failure is recorded through `cdc.sync_runs` and returned by `sync-catalog`. Resume behavior follows the unified run identity and staged progress contract; the catalog JSON is not mutated. Recovery and resync callers remain separate migration work.
+A unified run failure is recorded through `cdc.sync_runs` and returned by `sync-catalog`. Resume behavior follows the unified run identity and staged progress contract; the catalog JSON is not mutated. `resync-stream` now uses unified sync; `recover-lost-binlog` remains separate migration work.
 
 The non-syncable catalog is operator input only. Full-dump execution and automatic deployment are outside this command.

@@ -46,7 +46,7 @@ in [the table catalog sync wiki](../wiki/systems/table-catalog-sync.md).
 ## Known gaps (current cycle)
 
 - [ ] Prove the complete catalog-to-unified MySQL path against disposable endpoints.
-- [ ] Migrate lost-binlog recovery and resync callers.
+- [ ] Migrate the lost-binlog recovery caller; `resync-stream` now uses unified sync.
 - [ ] Remove legacy snapshot, table-sync, repair-drift, and progress modules after all callers migrate.
 
 ## Out of scope

@@ -322,9 +322,12 @@ row chunks, bounded row workers, and final constraint convergence. The removed
 catalog-specific dependency scheduler, admission locks, deterministic child run
 IDs, target-only repair verification, and per-table progress handling are not
 used. Catalog FK metadata still classifies syncable scope; it does not create
-separate child runs. Recovery and resync callers remain separate migration work.
-The non-syncable catalog is classification/operator input only; full-dump
-execution is out of scope.
+separate child runs. `resync-stream` now uses this unified path with one captured
+source evidence set, a fixed `resync-stream:<source_identity>` run identity, and
+no legacy repair phases or post-write target-inventory drift scan.
+`recover-lost-binlog` remains a separate legacy migration. The non-syncable
+catalog is classification/operator input only; full-dump execution is out of
+scope.
 
 ## TLS policy
 
