@@ -31,10 +31,10 @@ foreign-key and CHECK failures, schema mismatches that reach execution, connecti
 errors, and generated-column failures. The target transaction rolls back and its
 checkpoint does not advance.
 
-`--insert-conflict-policy` remains an out-of-band statement/snapshot and
-table-sync setting. It does not change native ROW streaming behavior. Live
-supersession, conflict-ledger, target-equality, row-replacement, and automatic parent-recovery
-paths do not exist.
+`--insert-conflict-policy` does not change native ROW streaming behavior. Live
+supersession, conflict-ledger, target-equality, row-replacement, and automatic
+parent-recovery paths do not exist. Explicit source-authoritative convergence
+uses the staged `sync` operation separately from live streaming.
 
 Primary-key values are extracted from the table map's primary-key columns. A row
 event with no table map, no primary key, or a missing primary-key value fails

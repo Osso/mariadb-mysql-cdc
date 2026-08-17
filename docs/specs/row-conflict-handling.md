@@ -36,7 +36,7 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 ### Out-of-band boundary
 
-- [x] Keep snapshot/table-sync insert modes, drift repair, targeted conflict resolution, and historical `cdc.row_conflicts` data independent from live streaming.
+- [x] Keep staged `sync`, targeted conflict resolution, and historical `cdc.row_conflicts` data independent from live streaming.
 - [x] Do not require `cdc.row_conflicts`, its trigger inventory procedure, or its grants to start the live stream.
 - [x] Exclude retired live conflict, supersession, and automatic parent-recovery scenarios from the integration harness.
 
@@ -45,7 +45,6 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - [Row Events](../row-events.md)
 - [Target Writer](../target-writer.md)
 - [Live Stream Reconnect](live-stream-reconnect.md)
-- [Table Sync Repair](table-sync-repair.md)
 
 ## Implementation inventory
 

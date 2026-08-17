@@ -29,7 +29,6 @@ in [the table catalog sync wiki](../wiki/systems/table-catalog-sync.md).
 ## How it works
 
 - [Table catalog sync](../wiki/systems/table-catalog-sync.md)
-- [Table sync repair](table-sync-repair.md)
 
 ## Implementation inventory
 
@@ -46,8 +45,7 @@ in [the table catalog sync wiki](../wiki/systems/table-catalog-sync.md).
 ## Known gaps (current cycle)
 
 - [ ] Prove the complete catalog-to-unified MySQL path against disposable endpoints.
-- [ ] Migrate the lost-binlog recovery caller; `resync-stream` now uses unified sync.
-- [ ] Remove legacy snapshot, table-sync, repair-drift, and progress modules after all callers migrate.
+- [x] Route the lost-binlog recovery caller through unified sync; `resync-stream` and recovery use the staged engine.
 
 ## Out of scope
 

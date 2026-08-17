@@ -1,7 +1,7 @@
 # Schema Inventory
 
-Schema inventory captures the source database metadata needed before snapshot
-and CDC apply work begins.
+Schema inventory captures the source database metadata needed before staged
+`sync` and CDC apply work begins.
 
 Captured objects:
 
@@ -45,8 +45,8 @@ paths have been removed.
 
 The live GlobalComix source MariaDB (`source-mariadb.example` /
 `192.0.2.10`) is plaintext-only by accepted operational policy. CDC source
-inventory, snapshot, stream, repair, and sync-table connections must use an
-explicit plaintext source mode for this endpoint. Do not require a source CA,
+inventory, staged sync, and stream connections must use an explicit plaintext
+source mode for this endpoint. Do not require a source CA,
 do not attempt opportunistic TLS-to-plaintext fallback, and do not treat
 source CA absence as an error for the current source.
 

@@ -20,8 +20,8 @@ The CLI reads operator JSON containing the exact old checkpoint and exact
 positions, and raw SQL. It rejects a configured source/checkpoint identity
 mismatch. Before preparing recovery it computes and records the current complete source
 scope hash for that attempt and rejects any non-InnoDB source table. Recovery
-data repair covers every current source-scope table even when target-only base
-tables exist; the generic `repair-drift` contract remains strict. An explicitly
+synchronization covers every current source-scope table even when target-only
+base tables exist. An explicitly
 supplied scope hash must match that attempt's current source inventory; an omitted
 hash is filled from the current source inventory and recorded as evidence.
 

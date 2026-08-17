@@ -123,9 +123,10 @@ development migrations are not maintained as upgrade paths.
 Native ROW streaming is source-authoritative and target-disposable. It emits plain
 INSERT statements and treats MySQL `1062` from INSERT as idempotent success,
 without target inspection, equality checks, replacement, conflict evidence, or
-repair. A skipped duplicate may leave divergent target contents; convergence is
-an explicit out-of-band operational task. Every other row error rolls back the
-complete source transaction and blocks checkpoint advancement.
+repair. A skipped duplicate may leave divergent target contents; explicit
+source-authoritative convergence uses the staged `sync` operation. Every other
+row error rolls back the complete source transaction and blocks checkpoint
+advancement.
 `--target-parallel-transactions N` preserves the
 same rule by sending and draining each statement individually, leasing one target
 connection per complete source transaction, and committing checkpoints in source
@@ -141,18 +142,16 @@ canonicalization is owned by `src/canonical_foreign_key.rs`. Retired live
 supersession, target-replacement, and automatic parent-repair paths are absent
 from runtime and harness code.
 
-The disposable MariaDB/MySQL harness continues to cover catchup, out-of-band
-repair, DDL journal recovery, reconnect/GET_LOCK behavior, and parallel target
-transactions. These are local proofs, not live cutover proof.
+The disposable MariaDB/MySQL harness covers DDL journal recovery,
+reconnect/GET_LOCK behavior, and parallel target transactions. These are local
+proofs, not live cutover proof.
 
 Deployment remains blocked pending real-MySQL/live proof, exact grant/bootstrap
-review, bounded repair convergence, and ops rollout gates. Ops proof still needs
-fresh immutable image tags, suspended repair/catchup rollout review, replacement
-or justification of privileged catchup credentials, unique recurring run IDs,
-exact chunk verification, FK-safe ordering, CA/config-map verification, journal
-arguments, and single-writer `GET_LOCK` proof. No ops or deployment action is
-part of this worktree. The legacy `probe` text-binlog path is not a supported
-health check.
+review, staged-sync convergence proof, and ops rollout gates. Ops proof still
+needs fresh immutable image tags, unique recurring run IDs, exact chunk
+verification, FK-safe ordering, CA/config-map verification, journal arguments,
+and single-writer `GET_LOCK` proof. No ops or deployment action is part of this
+worktree. The legacy `probe` text-binlog path is not a supported health check.
 
 ## DDL resolution
 

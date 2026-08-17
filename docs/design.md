@@ -7,10 +7,11 @@ MariaDB and MySQL differ in SQL, metadata, and binlog behavior.
 
 ## Approach
 
-1. Snapshot existing data in deterministic primary-key chunks.
-2. Consume MariaDB ROW/FULL binlog events from the snapshot boundary.
-3. Reconcile target drift before cutover; do not serve traffic from an unproven
-   target.
+1. Converge target schema from committed source evidence.
+2. Synchronize source-authoritative rows in target-WRITE-locked primary-key
+   chunks under one immutable run identity.
+3. Consume MariaDB ROW/FULL binlog events with ordered target commits and
+   checkpoints; do not serve traffic from an unproven target.
 
 ## Event handling
 
@@ -154,37 +155,30 @@ binlog coordinate and one committed `SchemaSourceEvidence` set, validates the
 transactional source scope, then invokes unified sync for every source table with
 run ID `resync-stream:<source_identity>`. Unified sync owns prerequisite schema
 convergence, locked source-authoritative row chunks, durable `cdc.sync_runs`
-progress, and final constraint convergence. Resync no longer invokes the legacy
-repair engine, runs a separate final schema pass, or re-inventories the target
-for post-write drift verification. `recover-lost-binlog` remains on the legacy
-recovery path and is not covered by this migration.
+progress, and final constraint convergence. Recovery uses the same staged engine
+with its exact authorized recovery ID; neither path runs a separate repair engine
+or post-write drift scan.
 
-## Repair model
+## Convergence and conflict evidence
 
-Live ROW streaming and out-of-band repair are separate systems. The live stream
-writes source DML directly, accepts only INSERT `1062` as idempotent success, and
-never reads target rows or writes conflict evidence. A skipped duplicate can
-leave divergent target contents; an explicit out-of-band convergence run can
-repair that state. Every other row error rolls back the source transaction and
-blocks its checkpoint.
+Live ROW streaming and staged synchronization are separate systems. The live
+stream writes source DML directly, accepts only INSERT `1062` as idempotent
+success, and never reads target rows or writes conflict evidence. A skipped
+duplicate may leave divergent target contents; explicit convergence uses the
+source-authoritative staged `sync` operation. Every other row error rolls back
+the source transaction and blocks its checkpoint.
 
-`cdc.row_conflicts` remains historical out-of-band data. These repair commands
-connect to source and target; “out-of-band” distinguishes them from live stream
-execution, not from database connectivity. `repair-drift`, targeted conflict
-resolution, and table-sync retain their source/target comparison, FK-aware
-ordering, immutable progress, bounded windows, and exact verification.
-Historical ledger persistence is owned by concrete `MySqlConflictLedger` in
-`src/conflict_ledger.rs` and `src/conflict_ledger/`; FK canonicalization and
-repair-plan construction are owned by `src/repair_drift/model.rs` and
-`src/repair_drift/planner.rs`. The
-removed generic phased executor and test-only stores are not runtime paths. The
+`cdc.row_conflicts` remains historical out-of-band data. Targeted conflict
+resolution connects to source and target separately from live streaming and
+staged synchronization. Historical ledger persistence is owned by concrete
+`MySqlConflictLedger` in `src/conflict_ledger.rs` and `src/conflict_ledger/`;
+canonical foreign-key metadata is owned by `src/canonical_foreign_key.rs`. The
 live stream does not validate the conflict table, its triggers, its procedure,
 or its grants.
 
-The disposable MariaDB/MySQL harness covers catchup, out-of-band repair, DDL,
-reconnect, and parallel transaction boundaries. Retired live conflict,
-supersession, target-replacement, and automatic parent-recovery scenarios are not
-part of the harness.
+The disposable MariaDB/MySQL harness covers DDL, reconnect, and parallel
+transaction boundaries. Retired conflict and repair scenarios are not runtime
+paths.
 
 ## Safety and validation
 
@@ -192,10 +186,9 @@ part of the harness.
 - Validate checkpoint and DDL-journal schema, guards, routines, exact grants,
   and the single-writer `GET_LOCK` state once before source replication; do not
   repeat this static policy per event.
-- Use stable primary-key windows for count/content checks.
-- Treat live row errors, quarantine, journal barriers, schema drift, and
-  CA/grant gaps as blockers. Historical unresolved conflicts remain an out-of-band
-  repair concern. `translation_pending` is cleared only by translator
+- Treat live row errors, quarantine, journal barriers, schema-stage failures,
+  and CA/grant gaps as blockers. Historical unresolved conflicts remain
+  out-of-band evidence. `translation_pending` is cleared only by translator
   code and automatic promotion in the event path; config/bootstrap/grant/harness
   dependencies and migration safety remain open.
 - Keep the target out of service through repeated validation and cutover review.

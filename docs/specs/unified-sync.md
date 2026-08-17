@@ -31,13 +31,12 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - [x] Reuse the prerequisite schema stage that removes blocking target constraints and converges structure before row work.
 - [x] Reuse the final-constraint stage after row work and fail closed on remaining structural drift.
 - [ ] Prove the complete production MySQL path, including source evidence reads, target schema stages, row workers, and `cdc.sync_runs` persistence against disposable endpoints.
-- [ ] Replace legacy snapshot, table-sync, repair-drift, and progress modules after all callers migrate.
+- [x] Remove legacy snapshot, table-sync, repair-drift, and obsolete progress modules; no fallback engine remains.
 
 ## How it works
 
 - [Schema synchronization details](sync-schema.md) define source-to-target structural convergence within the staged `sync` run; there is no standalone schema command.
-- [Table sync repair](table-sync-repair.md) records the legacy row-repair contract being replaced by this engine.
-- [Lost-binlog recovery](lost-binlog-recovery.md) records the recovery caller that must migrate to unified sync.
+- [Lost-binlog recovery](lost-binlog-recovery.md) records the recovery caller routed through unified sync.
 
 ## Implementation inventory
 
@@ -67,7 +66,7 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 
 - [ ] Migrate scripts, fixtures, grants, harnesses, and ops callers.
 - [ ] Prove the complete catalog/resync/recovery MySQL paths against disposable endpoints.
-- [ ] Delete legacy production engines and progress paths.
+- [x] Delete legacy production engines and progress paths.
 - [ ] Run full-project tests, Clippy without warning suppression, and final integration verification.
 
 ## Out of scope

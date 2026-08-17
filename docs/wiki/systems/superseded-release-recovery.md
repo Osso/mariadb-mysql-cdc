@@ -10,6 +10,6 @@ same source-authoritative rule as every other ROW event:
 - The stream does not read or repair target rows and does not write conflict
   evidence.
 
-Historical conflict records remain available to offline `repair-drift` and
-targeted resolution workflows. This page is retained only to make the removal of
-the former special case explicit.
+Historical conflict records remain available to targeted resolution workflows.
+Explicit source-authoritative convergence uses staged `sync`. This page is
+retained only to make the removal of the former special case explicit.
