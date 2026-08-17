@@ -1,6 +1,7 @@
 use super::model::{
     SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest, SyncChunkSource,
-    SyncChunkTargetSession, SyncProgressRow, SyncProgressStatus, SyncStage, SyncTable,
+    SyncChunkTargetSession, SyncProgressRow, SyncProgressStatus, SyncRunProgressStore, SyncStage,
+    SyncTable,
 };
 use super::progress::{
     build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
@@ -174,8 +175,24 @@ impl MySqlSyncProgressStore {
 
 impl SyncChunkProgressStore for MySqlSyncProgressStore {
     fn load(&mut self, run_id: &str, table: &str) -> Result<Option<SyncChunkProgress>, String> {
-        let sql =
-            build_sync_progress_select_sql(&self.progress_table, run_id, SyncStage::Rows, table);
+        self.load_stage(run_id, SyncStage::Rows, table)?
+            .map(sync_chunk_progress_from_row)
+            .transpose()
+    }
+
+    fn save(&mut self, progress: &SyncChunkProgress) -> Result<(), String> {
+        self.save_stage(&sync_progress_row_from_chunk(progress))
+    }
+}
+
+impl SyncRunProgressStore for MySqlSyncProgressStore {
+    fn load_stage(
+        &mut self,
+        run_id: &str,
+        stage: SyncStage,
+        table_name: &str,
+    ) -> Result<Option<SyncProgressRow>, String> {
+        let sql = build_sync_progress_select_sql(&self.progress_table, run_id, stage, table_name);
         let rows = self
             .conn
             .query::<mysql::Row, _>(sql)
@@ -183,15 +200,11 @@ impl SyncChunkProgressStore for MySqlSyncProgressStore {
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
-        let row = mysql_row_to_tsv(row);
-        parse_sync_progress_row(&row)
-            .and_then(sync_chunk_progress_from_row)
-            .map(Some)
+        parse_sync_progress_row(&mysql_row_to_tsv(row)).map(Some)
     }
 
-    fn save(&mut self, progress: &SyncChunkProgress) -> Result<(), String> {
-        let row = sync_progress_row_from_chunk(progress);
-        let statement = build_sync_progress_upsert_sql(&self.progress_table, &row);
+    fn save_stage(&mut self, row: &SyncProgressRow) -> Result<(), String> {
+        let statement = build_sync_progress_upsert_sql(&self.progress_table, row);
         self.execute_progress_statement(statement)
     }
 }

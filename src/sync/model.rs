@@ -137,3 +137,14 @@ pub(crate) trait SyncChunkProgressStore {
     fn load(&mut self, run_id: &str, table: &str) -> Result<Option<SyncChunkProgress>, String>;
     fn save(&mut self, progress: &SyncChunkProgress) -> Result<(), String>;
 }
+
+pub(crate) trait SyncRunProgressStore {
+    fn load_stage(
+        &mut self,
+        run_id: &str,
+        stage: SyncStage,
+        table_name: &str,
+    ) -> Result<Option<SyncProgressRow>, String>;
+
+    fn save_stage(&mut self, row: &SyncProgressRow) -> Result<(), String>;
+}

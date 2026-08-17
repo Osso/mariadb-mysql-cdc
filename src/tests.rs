@@ -42,6 +42,13 @@ mod sync_runner {
     ));
 }
 
+mod sync_orchestrator {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_orchestrator.rs"
+    ));
+}
+
 #[test]
 fn usage_documents_parallel_target_transaction_option() {
     assert!(USAGE.contains("--target-parallel-transactions COUNT"));

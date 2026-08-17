@@ -1444,6 +1444,26 @@ pub(crate) fn run_sync_schema_command(args: Vec<String>, _usage: &str) {
     }
 }
 
+pub(crate) fn read_sync_source_evidence(
+    source: &crate::mysql_snapshot::MySqlConnectionConfig,
+) -> Result<SchemaSourceEvidence, String> {
+    let config = inventory_config_source(source);
+    let reader = MariaDbInventoryReader::new(config.clone());
+    let inventory = build_inventory(&source.database, &reader)
+        .map_err(|error| format!("source schema inventory failed: {error}"))?;
+    let checks = CheckConstraintReader::new(config)
+        .read(&source.database, None)
+        .map_err(|error| format!("source check constraint inventory failed: {error}"))?;
+    let canonical_foreign_keys =
+        build_canonical_foreign_key_inventory(&source.database, &reader)
+            .map_err(|error| format!("source canonical foreign key inventory failed: {error}"))?;
+    Ok(SchemaSourceEvidence {
+        inventory,
+        checks,
+        canonical_foreign_keys,
+    })
+}
+
 pub(crate) fn run_schema_convergence_from_source_evidence(
     evidence: SchemaSourceEvidence,
     target: crate::live::TargetMySqlConfig,

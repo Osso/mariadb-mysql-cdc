@@ -2,6 +2,7 @@ mod chunk;
 mod config;
 mod model;
 mod mysql;
+mod orchestrate;
 mod progress;
 mod run;
 mod sql;
@@ -14,13 +15,16 @@ pub(crate) use config::{
 pub(crate) use model::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
     SyncChunkSource, SyncChunkTargetSession, SyncPrimaryKeyOrdering, SyncProgressRow,
-    SyncProgressStatus, SyncStage, SyncTable,
+    SyncProgressStatus, SyncRunProgressStore, SyncStage, SyncTable,
 };
 pub(crate) use mysql::{
     MySqlSyncProgressStore, MySqlSyncSource, MySqlSyncTargetSession, build_strict_delete_batches,
     build_strict_insert_batches, build_strict_update_batches, decode_sync_rows,
     strict_delete_batch_capacity, strict_insert_batch_capacity, strict_update_batch_capacity,
     sync_chunk_progress_from_row, sync_progress_row_from_chunk, validate_sync_target_lock_identity,
+};
+pub(crate) use orchestrate::{
+    SyncRunExecutor, run_mysql_sync, run_sync_orchestration, sync_tables_from_source_inventory,
 };
 pub(crate) use progress::{
     build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
