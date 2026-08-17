@@ -290,7 +290,7 @@ impl From<ValidationError> for CutoverError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::SnapshotRow;
+    use crate::database_row::DatabaseRow;
     use crate::validation::{ChecksumRequest, ChecksumSample, DivergenceRequest};
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
@@ -431,8 +431,8 @@ mod tests {
         }
     }
 
-    fn row(id: &str, name: &str) -> SnapshotRow {
-        SnapshotRow {
+    fn row(id: &str, name: &str) -> DatabaseRow {
+        DatabaseRow {
             primary_key: vec![id.to_string()],
             values: BTreeMap::from([
                 ("id".to_string(), Some(id.to_string())),
@@ -502,7 +502,7 @@ mod tests {
 
     struct ValidationFixture {
         count: u64,
-        rows: Vec<SnapshotRow>,
+        rows: Vec<DatabaseRow>,
     }
 
     impl ValidationFixture {
@@ -510,7 +510,7 @@ mod tests {
             Self::new(1, vec![row("1", "alpha")])
         }
 
-        fn new(count: u64, rows: Vec<SnapshotRow>) -> Self {
+        fn new(count: u64, rows: Vec<DatabaseRow>) -> Self {
             Self { count, rows }
         }
     }
@@ -545,7 +545,7 @@ mod tests {
         fn read_rows(
             &self,
             _request: &DivergenceRequest,
-        ) -> Result<Vec<SnapshotRow>, ValidationError> {
+        ) -> Result<Vec<DatabaseRow>, ValidationError> {
             Ok(self.rows.clone())
         }
     }

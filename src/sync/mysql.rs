@@ -11,10 +11,10 @@ use super::sql::{
     build_lock_table_write_sql, build_strict_delete_rows_statement, build_strict_insert_statement,
     build_strict_update_rows_statement, build_sync_select_sql,
 };
+use crate::database_row::DatabaseRow;
 use crate::live::TargetMySqlConfig;
 use crate::mysql_client::{PersistentMySqlSource, sync_target_opts, value_to_string};
 use crate::mysql_config::MySqlConnectionConfig;
-use crate::snapshot::SnapshotRow;
 use crate::target::SqlStatement;
 use mysql::prelude::Queryable;
 use mysql::{Conn, Params};
@@ -47,7 +47,7 @@ impl MySqlSyncSource {
 }
 
 impl SyncChunkSource for MySqlSyncSource {
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<SnapshotRow>, String> {
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
         let sql = build_sync_select_sql(&self.table, request);
         let rows = self
             .source
@@ -82,7 +82,7 @@ impl MySqlSyncTargetSession {
             .map_err(|error| format!("target mysql session command `{sql}` failed: {error}"))
     }
 
-    fn query_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<SnapshotRow>, String> {
+    fn query_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
         let sql = build_sync_select_sql(&self.table, request);
         let rows = query_rows_as_strings(&mut self.conn, &sql, "target")?;
         decode_sync_rows(&self.table, rows)
@@ -101,7 +101,7 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
         self.execute_control(&sql)
     }
 
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<SnapshotRow>, String> {
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
         self.query_rows(request)
     }
 
@@ -112,14 +112,14 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
         Ok(())
     }
 
-    fn update_rows(&mut self, rows: &[SnapshotRow]) -> Result<(), String> {
+    fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
         for statement in build_strict_update_batches(&self.table, rows) {
             self.execute_statement(statement)?;
         }
         Ok(())
     }
 
-    fn insert_rows(&mut self, rows: &[SnapshotRow]) -> Result<(), String> {
+    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
         for statement in build_strict_insert_batches(&self.table, rows) {
             self.execute_statement(statement)?;
         }
@@ -212,13 +212,13 @@ impl SyncRunProgressStore for MySqlSyncProgressStore {
 pub(crate) fn decode_sync_rows(
     table: &SyncTable,
     rows: Vec<Vec<Option<String>>>,
-) -> Result<Vec<SnapshotRow>, String> {
+) -> Result<Vec<DatabaseRow>, String> {
     rows.into_iter()
         .map(|fields| decode_sync_row(table, fields))
         .collect()
 }
 
-fn decode_sync_row(table: &SyncTable, fields: Vec<Option<String>>) -> Result<SnapshotRow, String> {
+fn decode_sync_row(table: &SyncTable, fields: Vec<Option<String>>) -> Result<DatabaseRow, String> {
     if fields.len() != table.columns.len() {
         return Err(format!(
             "sync row has {} fields for {} selected columns",
@@ -237,7 +237,7 @@ fn decode_sync_row(table: &SyncTable, fields: Vec<Option<String>>) -> Result<Sna
         .iter()
         .map(|column| required_primary_key_value(column, &values))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(SnapshotRow {
+    Ok(DatabaseRow {
         primary_key,
         values,
     })
@@ -278,7 +278,7 @@ fn bounded_mutation_capacity(placeholders_per_row: usize) -> usize {
 
 pub(crate) fn build_strict_insert_batches(
     table: &SyncTable,
-    rows: &[SnapshotRow],
+    rows: &[DatabaseRow],
 ) -> Vec<SqlStatement> {
     rows.chunks(strict_insert_batch_capacity(table))
         .map(|batch| build_strict_insert_statement(table, batch))
@@ -287,7 +287,7 @@ pub(crate) fn build_strict_insert_batches(
 
 pub(crate) fn build_strict_update_batches(
     table: &SyncTable,
-    rows: &[SnapshotRow],
+    rows: &[DatabaseRow],
 ) -> Vec<SqlStatement> {
     rows.chunks(strict_update_batch_capacity(table))
         .map(|batch| build_strict_update_rows_statement(table, batch))

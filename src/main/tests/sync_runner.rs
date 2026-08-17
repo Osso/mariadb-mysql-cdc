@@ -1,6 +1,6 @@
 use crate::live::TargetMySqlConfig;
 use crate::mysql_config::MySqlConnectionConfig;
-use crate::snapshot::SnapshotRow;
+use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
     SyncChunkSource, SyncChunkTargetSession, SyncConfig, SyncPrimaryKeyOrdering, SyncRunIdentity,
@@ -159,21 +159,21 @@ struct EmptySource {
 }
 
 impl SyncChunkSource for EmptySource {
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<SnapshotRow>, String> {
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
         self.requests.push(request.clone());
         Ok(Vec::new())
     }
 }
 
 struct TailTarget {
-    tail_rows: VecDeque<Vec<SnapshotRow>>,
+    tail_rows: VecDeque<Vec<DatabaseRow>>,
     read_requests: Vec<SyncChunkReadRequest>,
     deleted: Vec<Vec<String>>,
     commits: usize,
 }
 
 impl TailTarget {
-    fn new(tail_rows: Vec<Vec<SnapshotRow>>) -> Self {
+    fn new(tail_rows: Vec<Vec<DatabaseRow>>) -> Self {
         Self {
             tail_rows: tail_rows.into(),
             read_requests: Vec::new(),
@@ -192,7 +192,7 @@ impl SyncChunkTargetSession for TailTarget {
         Ok(())
     }
 
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<SnapshotRow>, String> {
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
         self.read_requests.push(request.clone());
         Ok(self.tail_rows.pop_front().unwrap_or_default())
     }
@@ -202,11 +202,11 @@ impl SyncChunkTargetSession for TailTarget {
         Ok(())
     }
 
-    fn update_rows(&mut self, _rows: &[SnapshotRow]) -> Result<(), String> {
+    fn update_rows(&mut self, _rows: &[DatabaseRow]) -> Result<(), String> {
         Ok(())
     }
 
-    fn insert_rows(&mut self, _rows: &[SnapshotRow]) -> Result<(), String> {
+    fn insert_rows(&mut self, _rows: &[DatabaseRow]) -> Result<(), String> {
         Ok(())
     }
 
@@ -331,8 +331,8 @@ fn table(name: &str) -> SyncTable {
     }
 }
 
-fn row(id: &str) -> SnapshotRow {
-    SnapshotRow {
+fn row(id: &str) -> DatabaseRow {
+    DatabaseRow {
         primary_key: strings([id]),
         values: BTreeMap::from([
             ("id".to_string(), Some(id.to_string())),

@@ -1,4 +1,4 @@
-use crate::snapshot::SnapshotRow;
+use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
     SyncChunkSource, SyncChunkTargetSession, SyncPrimaryKeyOrdering, SyncTable, sync_next_chunk,
@@ -63,18 +63,18 @@ enum FailurePoint {
 }
 
 struct RecordingSource {
-    reads: VecDeque<Vec<SnapshotRow>>,
+    reads: VecDeque<Vec<DatabaseRow>>,
     failure: Option<FailurePoint>,
     events: Events,
 }
 
 impl RecordingSource {
-    fn new(rows: Vec<SnapshotRow>, events: Events) -> Self {
+    fn new(rows: Vec<DatabaseRow>, events: Events) -> Self {
         Self::scripted([rows], events)
     }
 
     fn scripted(
-        reads: impl IntoIterator<Item = Vec<SnapshotRow>>,
+        reads: impl IntoIterator<Item = Vec<DatabaseRow>>,
         events: Events,
     ) -> Self {
         Self {
@@ -94,7 +94,7 @@ impl SyncChunkSource for RecordingSource {
     fn read_rows(
         &mut self,
         request: &SyncChunkReadRequest,
-    ) -> Result<Vec<SnapshotRow>, String> {
+    ) -> Result<Vec<DatabaseRow>, String> {
         self.events.borrow_mut().push(Event::SourceRead {
             start_after: request.start_after.clone(),
             end_at: request.end_at.clone(),
@@ -108,15 +108,15 @@ impl SyncChunkSource for RecordingSource {
 }
 
 struct RecordingTargetSession {
-    visible_rows: Vec<SnapshotRow>,
-    pending_rows: Vec<SnapshotRow>,
-    read_batches: VecDeque<Vec<SnapshotRow>>,
+    visible_rows: Vec<DatabaseRow>,
+    pending_rows: Vec<DatabaseRow>,
+    read_batches: VecDeque<Vec<DatabaseRow>>,
     failure: Option<FailurePoint>,
     events: Events,
 }
 
 impl RecordingTargetSession {
-    fn new(rows: Vec<SnapshotRow>, events: Events) -> Self {
+    fn new(rows: Vec<DatabaseRow>, events: Events) -> Self {
         Self {
             visible_rows: rows.clone(),
             pending_rows: rows,
@@ -128,7 +128,7 @@ impl RecordingTargetSession {
 
     fn with_read_batches(
         mut self,
-        reads: impl IntoIterator<Item = Vec<SnapshotRow>>,
+        reads: impl IntoIterator<Item = Vec<DatabaseRow>>,
     ) -> Self {
         self.read_batches = reads.into_iter().collect();
         self
@@ -166,7 +166,7 @@ impl SyncChunkTargetSession for RecordingTargetSession {
     fn read_rows(
         &mut self,
         request: &SyncChunkReadRequest,
-    ) -> Result<Vec<SnapshotRow>, String> {
+    ) -> Result<Vec<DatabaseRow>, String> {
         self.events.borrow_mut().push(Event::TargetRead {
             start_after: request.start_after.clone(),
             end_at: request.end_at.clone(),
@@ -193,7 +193,7 @@ impl SyncChunkTargetSession for RecordingTargetSession {
         Ok(())
     }
 
-    fn update_rows(&mut self, rows: &[SnapshotRow]) -> Result<(), String> {
+    fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
         self.events
             .borrow_mut()
             .push(Event::Update(primary_keys(rows)));
@@ -211,7 +211,7 @@ impl SyncChunkTargetSession for RecordingTargetSession {
         Ok(())
     }
 
-    fn insert_rows(&mut self, rows: &[SnapshotRow]) -> Result<(), String> {
+    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
         self.events
             .borrow_mut()
             .push(Event::Insert(primary_keys(rows)));
@@ -897,16 +897,16 @@ fn run_spec_json(chunk_size: usize) -> String {
     format!(r#"{{"chunk_size":{chunk_size},"scope":"all-source-tables"}}"#)
 }
 
-fn source_rows() -> Vec<SnapshotRow> {
+fn source_rows() -> Vec<DatabaseRow> {
     vec![row("1", "same"), row("2", "new"), row("4", "missing")]
 }
 
-fn target_rows() -> Vec<SnapshotRow> {
+fn target_rows() -> Vec<DatabaseRow> {
     vec![row("1", "same"), row("2", "old"), row("3", "extra")]
 }
 
-fn row(id: &str, name: &str) -> SnapshotRow {
-    SnapshotRow {
+fn row(id: &str, name: &str) -> DatabaseRow {
+    DatabaseRow {
         primary_key: keys([id]),
         values: BTreeMap::from([
             ("id".to_string(), Some(id.to_string())),
@@ -919,11 +919,11 @@ fn keys<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.into_iter().map(str::to_string).collect()
 }
 
-fn primary_keys(rows: &[SnapshotRow]) -> Vec<Vec<String>> {
+fn primary_keys(rows: &[DatabaseRow]) -> Vec<Vec<String>> {
     rows.iter().map(|row| row.primary_key.clone()).collect()
 }
 
-fn assert_rows_equal(actual: &[SnapshotRow], expected: &[SnapshotRow]) {
+fn assert_rows_equal(actual: &[DatabaseRow], expected: &[DatabaseRow]) {
     assert_eq!(actual.len(), expected.len(), "row count differs");
     for expected_row in expected {
         assert!(

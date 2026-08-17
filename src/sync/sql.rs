@@ -1,6 +1,6 @@
 use super::model::{SyncChunkReadRequest, SyncPrimaryKeyOrdering, SyncTable};
+use crate::database_row::DatabaseRow;
 use crate::mysql_support::{quote_ident, quote_sql_literal};
-use crate::snapshot::SnapshotRow;
 use crate::target::SqlStatement;
 use mysql::Value;
 
@@ -30,7 +30,7 @@ pub(crate) fn build_lock_table_write_sql(database: &str, table: &str) -> String 
 
 pub(crate) fn build_strict_insert_statement(
     table: &SyncTable,
-    rows: &[SnapshotRow],
+    rows: &[DatabaseRow],
 ) -> SqlStatement {
     let columns = quote_ident_list(&table.columns);
     let placeholders = row_placeholders(table.columns.len(), rows.len());
@@ -47,7 +47,7 @@ pub(crate) fn build_strict_insert_statement(
     }
 }
 
-pub(crate) fn build_strict_update_statement(table: &SyncTable, row: &SnapshotRow) -> SqlStatement {
+pub(crate) fn build_strict_update_statement(table: &SyncTable, row: &DatabaseRow) -> SqlStatement {
     let changed_columns = non_primary_columns(table);
     let assignments = changed_columns
         .iter()
@@ -68,7 +68,7 @@ pub(crate) fn build_strict_update_statement(table: &SyncTable, row: &SnapshotRow
 
 pub(crate) fn build_strict_update_rows_statement(
     table: &SyncTable,
-    rows: &[SnapshotRow],
+    rows: &[DatabaseRow],
 ) -> SqlStatement {
     let changed_columns = non_primary_columns(table);
     let assignments = changed_columns
@@ -147,7 +147,7 @@ fn primary_key_row_filter(primary_key: &[String], row_count: usize) -> String {
     )
 }
 
-fn ordered_update_params(changed_columns: &[String], rows: &[SnapshotRow]) -> Vec<Value> {
+fn ordered_update_params(changed_columns: &[String], rows: &[DatabaseRow]) -> Vec<Value> {
     let changed_values = changed_columns.iter().flat_map(|column| {
         rows.iter().flat_map(|row| {
             let mut params = row
@@ -287,7 +287,7 @@ fn primary_key_predicates(primary_key: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn ordered_values(row: &SnapshotRow, columns: &[String]) -> Vec<Value> {
+fn ordered_values(row: &DatabaseRow, columns: &[String]) -> Vec<Value> {
     columns
         .iter()
         .map(|column| match row.values.get(column).cloned().flatten() {

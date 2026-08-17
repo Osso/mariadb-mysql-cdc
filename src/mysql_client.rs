@@ -6,7 +6,6 @@ use crate::mysql_config::MySqlConnectionConfig;
 use crate::mysql_support::{
     apply_default_mysql_network_bounds, apply_mysql_connection_liveness, target_mysql_opts,
 };
-use crate::snapshot::SnapshotError;
 use crate::target::{
     SqlStatement, TargetExecuteError, TargetExecutor, TargetRowChange, TargetRowChangeKind,
     TransactionalTargetExecutor,
@@ -32,12 +31,33 @@ mod tests;
 
 #[cfg(test)]
 use connection::{NetworkTimeouts, apply_network_timeouts};
-use connection::{base_opts, open_conn, snapshot_connect_error, target_connect_error};
+use connection::{base_opts, open_conn, source_connect_error, target_connect_error};
 pub(crate) use query::value_to_string;
 use query::{
     build_stream_lease_sql, build_target_column_select_sql, ensure_stream_lease_acquired,
-    generated_column_retry_sql, row_to_strings, snapshot_query_error, target_query_error,
+    generated_column_retry_sql, row_to_strings, source_query_error, target_query_error,
 };
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct MySqlSourceError {
+    message: String,
+}
+
+impl MySqlSourceError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for MySqlSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MySqlSourceError {}
 
 pub struct PersistentMySqlSource {
     conn: RefCell<Conn>,
@@ -68,12 +88,12 @@ pub(crate) fn target_reader_opts(target: &TargetMySqlConfig) -> Result<Opts, Str
 }
 
 impl PersistentMySqlSource {
-    pub fn new(config: &MySqlConnectionConfig) -> Result<Self, SnapshotError> {
+    pub fn new(config: &MySqlConnectionConfig) -> Result<Self, MySqlSourceError> {
         Self::new_with_tls_ca(config, None)
     }
 
-    pub(crate) fn new_with_opts(opts: Opts) -> Result<Self, SnapshotError> {
-        let conn = open_conn(opts).map_err(snapshot_connect_error)?;
+    pub(crate) fn new_with_opts(opts: Opts) -> Result<Self, MySqlSourceError> {
+        let conn = open_conn(opts).map_err(source_connect_error)?;
         Ok(Self {
             conn: RefCell::new(conn),
         })
@@ -82,7 +102,7 @@ impl PersistentMySqlSource {
     pub(crate) fn new_with_tls_ca(
         config: &MySqlConnectionConfig,
         tls_ca_file: Option<&str>,
-    ) -> Result<Self, SnapshotError> {
+    ) -> Result<Self, MySqlSourceError> {
         let opts = base_opts(
             &config.host,
             config.port,
@@ -92,13 +112,13 @@ impl PersistentMySqlSource {
             tls_ca_file,
             &format!("source `{}`:{}", config.host, config.port),
         )
-        .map_err(SnapshotError::InvalidTable)?;
+        .map_err(MySqlSourceError::new)?;
         Self::new_with_opts(opts)
     }
 
     pub(crate) fn new_without_operation_timeout(
         config: &MySqlConnectionConfig,
-    ) -> Result<Self, SnapshotError> {
+    ) -> Result<Self, MySqlSourceError> {
         let builder = OptsBuilder::default()
             .ip_or_hostname(Some(config.host.clone()))
             .tcp_port(config.port)
@@ -112,16 +132,16 @@ impl PersistentMySqlSource {
     pub(crate) fn query_rows_as_strings(
         &self,
         sql: &str,
-    ) -> Result<Vec<Vec<Option<String>>>, SnapshotError> {
+    ) -> Result<Vec<Vec<Option<String>>>, MySqlSourceError> {
         let rows = self
             .conn
             .borrow_mut()
             .query::<mysql::Row, _>(sql)
-            .map_err(snapshot_query_error)?;
+            .map_err(source_query_error)?;
         Ok(rows.into_iter().map(row_to_strings).collect())
     }
 
-    pub(crate) fn read_binlog_coordinate(&self) -> Result<Checkpoint, SnapshotError> {
+    pub(crate) fn read_binlog_coordinate(&self) -> Result<Checkpoint, MySqlSourceError> {
         let rows = self.query_rows_as_strings(binlog_coordinate_query())?;
         parse_binlog_coordinate_checkpoint(rows)
     }
@@ -133,10 +153,11 @@ fn binlog_coordinate_query() -> &'static str {
 
 fn parse_binlog_coordinate_checkpoint(
     rows: Vec<Vec<Option<String>>>,
-) -> Result<Checkpoint, SnapshotError> {
-    let row = rows.into_iter().next().ok_or_else(|| {
-        SnapshotError::InvalidTable("MariaDB binlog coordinate is missing".to_string())
-    })?;
+) -> Result<Checkpoint, MySqlSourceError> {
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| MySqlSourceError::new("MariaDB binlog coordinate is missing".to_string()))?;
     let source_file = required_binlog_coordinate_value(&row, 0, "file")?;
     let source_position = parse_binlog_coordinate_position(&row)?;
     Ok(Checkpoint {
@@ -151,11 +172,11 @@ fn parse_binlog_coordinate_checkpoint(
     })
 }
 
-fn parse_binlog_coordinate_position(row: &[Option<String>]) -> Result<u64, SnapshotError> {
+fn parse_binlog_coordinate_position(row: &[Option<String>]) -> Result<u64, MySqlSourceError> {
     required_binlog_coordinate_value(row, 1, "position")?
         .parse::<u64>()
         .map_err(|error| {
-            SnapshotError::InvalidTable(format!(
+            MySqlSourceError::new(format!(
                 "invalid MariaDB binlog coordinate position: {error}"
             ))
         })
@@ -165,12 +186,12 @@ fn required_binlog_coordinate_value(
     row: &[Option<String>],
     index: usize,
     field: &str,
-) -> Result<String, SnapshotError> {
+) -> Result<String, MySqlSourceError> {
     row.get(index)
         .and_then(Clone::clone)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            SnapshotError::InvalidTable(format!("MariaDB binlog coordinate {field} is missing"))
+            MySqlSourceError::new(format!("MariaDB binlog coordinate {field} is missing"))
         })
 }
 

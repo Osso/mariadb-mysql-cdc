@@ -1,10 +1,10 @@
+use super::MySqlSourceError;
 use crate::mysql_support::quote_sql_literal;
-use crate::snapshot::SnapshotError;
 use crate::target::{SqlStatement, TargetExecuteError, render_sql_statement};
 use mysql::Value;
 
-pub(crate) fn snapshot_query_error(error: mysql::Error) -> SnapshotError {
-    SnapshotError::InvalidTable(format!("source mysql query failed: {error}"))
+pub(crate) fn source_query_error(error: mysql::Error) -> MySqlSourceError {
+    MySqlSourceError::new(format!("source mysql query failed: {error}"))
 }
 
 pub(crate) fn target_query_error(error: mysql::Error) -> TargetExecuteError {

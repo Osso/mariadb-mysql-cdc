@@ -1,4 +1,4 @@
-use crate::snapshot::SnapshotRow;
+use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkProgress, SyncPrimaryKeyOrdering, SyncProgressStatus, SyncStage, SyncTable,
     build_strict_delete_batches, build_strict_insert_batches, build_strict_update_batches,
@@ -23,7 +23,7 @@ fn sync_mysql_adapter_decodes_exact_selected_columns_and_rejects_invalid_rows() 
 
     assert_eq!(
         decoded,
-        vec![SnapshotRow {
+        vec![DatabaseRow {
             primary_key: vec!["7".to_string()],
             values: BTreeMap::from([
                 ("id".to_string(), Some("7".to_string())),
@@ -232,8 +232,8 @@ fn wide_primary_key_table(column_count: usize) -> SyncTable {
     }
 }
 
-fn row(id: &str, status: &str, title: &str) -> SnapshotRow {
-    SnapshotRow {
+fn row(id: &str, status: &str, title: &str) -> DatabaseRow {
+    DatabaseRow {
         primary_key: vec![id.to_string()],
         values: BTreeMap::from([
             ("id".to_string(), Some(id.to_string())),

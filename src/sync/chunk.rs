@@ -2,7 +2,7 @@ use super::model::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
     SyncChunkSource, SyncChunkTargetSession, SyncTable,
 };
-use crate::snapshot::SnapshotRow;
+use crate::database_row::DatabaseRow;
 use std::collections::BTreeMap;
 
 pub(crate) fn sync_next_chunk(
@@ -155,7 +155,7 @@ fn apply_source_window(
     config: &SyncChunkConfig,
     mut progress: SyncChunkProgress,
     start_after: Option<Vec<String>>,
-    source_rows: Vec<SnapshotRow>,
+    source_rows: Vec<DatabaseRow>,
     target: &mut impl SyncChunkTargetSession,
 ) -> Result<SyncChunkProgress, String> {
     let end_at = source_rows
@@ -212,14 +212,14 @@ fn apply_target_tail(
 
 struct ChunkChanges {
     deletes: Vec<Vec<String>>,
-    updates: Vec<SnapshotRow>,
-    inserts: Vec<SnapshotRow>,
+    updates: Vec<DatabaseRow>,
+    inserts: Vec<DatabaseRow>,
 }
 
 fn chunk_changes(
     table: &SyncTable,
-    source_rows: &[SnapshotRow],
-    target_rows: &[SnapshotRow],
+    source_rows: &[DatabaseRow],
+    target_rows: &[DatabaseRow],
 ) -> ChunkChanges {
     let source_by_key = index_rows(source_rows);
     let target_by_key = index_rows(target_rows);
@@ -230,15 +230,15 @@ fn chunk_changes(
     }
 }
 
-fn index_rows(rows: &[SnapshotRow]) -> BTreeMap<Vec<String>, &SnapshotRow> {
+fn index_rows(rows: &[DatabaseRow]) -> BTreeMap<Vec<String>, &DatabaseRow> {
     rows.iter()
         .map(|row| (row.primary_key.clone(), row))
         .collect()
 }
 
 fn target_only_primary_keys(
-    target_rows: &[SnapshotRow],
-    source_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
+    target_rows: &[DatabaseRow],
+    source_by_key: &BTreeMap<Vec<String>, &DatabaseRow>,
 ) -> Vec<Vec<String>> {
     target_rows
         .iter()
@@ -249,9 +249,9 @@ fn target_only_primary_keys(
 
 fn divergent_source_rows(
     table: &SyncTable,
-    source_rows: &[SnapshotRow],
-    target_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
-) -> Vec<SnapshotRow> {
+    source_rows: &[DatabaseRow],
+    target_by_key: &BTreeMap<Vec<String>, &DatabaseRow>,
+) -> Vec<DatabaseRow> {
     source_rows
         .iter()
         .filter(|row| {
@@ -264,9 +264,9 @@ fn divergent_source_rows(
 }
 
 fn missing_source_rows(
-    source_rows: &[SnapshotRow],
-    target_by_key: &BTreeMap<Vec<String>, &SnapshotRow>,
-) -> Vec<SnapshotRow> {
+    source_rows: &[DatabaseRow],
+    target_by_key: &BTreeMap<Vec<String>, &DatabaseRow>,
+) -> Vec<DatabaseRow> {
     source_rows
         .iter()
         .filter(|row| !target_by_key.contains_key(&row.primary_key))
@@ -274,7 +274,7 @@ fn missing_source_rows(
         .collect()
 }
 
-fn rows_diverge(table: &SyncTable, source: &SnapshotRow, target: &SnapshotRow) -> bool {
+fn rows_diverge(table: &SyncTable, source: &DatabaseRow, target: &DatabaseRow) -> bool {
     table
         .columns
         .iter()

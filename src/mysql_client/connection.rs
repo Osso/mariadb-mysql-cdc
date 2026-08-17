@@ -1,8 +1,8 @@
+use super::MySqlSourceError;
 use crate::mysql_support::{
     DEFAULT_MYSQL_CONNECT_TIMEOUT, DEFAULT_MYSQL_READ_TIMEOUT, DEFAULT_MYSQL_WRITE_TIMEOUT,
     apply_mysql_tcp_liveness, ssl_opts_from_ca,
 };
-use crate::snapshot::SnapshotError;
 use crate::target::TargetExecuteError;
 use mysql::{Conn, Opts, OptsBuilder};
 use std::time::Duration;
@@ -59,8 +59,8 @@ pub(crate) fn open_conn(opts: Opts) -> mysql::Result<Conn> {
     Conn::new(opts)
 }
 
-pub(crate) fn snapshot_connect_error(error: mysql::Error) -> SnapshotError {
-    SnapshotError::InvalidTable(format!("failed to connect to source mysql: {error}"))
+pub(crate) fn source_connect_error(error: mysql::Error) -> MySqlSourceError {
+    MySqlSourceError::new(format!("failed to connect to source mysql: {error}"))
 }
 
 pub(crate) fn target_connect_error(error: mysql::Error) -> TargetExecuteError {

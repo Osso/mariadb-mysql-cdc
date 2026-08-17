@@ -1,5 +1,5 @@
+use crate::database_row::DatabaseRow;
 pub(crate) use crate::primary_key_ordering::PrimaryKeyOrdering as SyncPrimaryKeyOrdering;
-use crate::snapshot::SnapshotRow;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -112,16 +112,16 @@ pub(crate) struct SyncProgressRow {
 }
 
 pub(crate) trait SyncChunkSource {
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<SnapshotRow>, String>;
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String>;
 }
 
 pub(crate) trait SyncChunkTargetSession {
     fn set_autocommit(&mut self, enabled: bool) -> Result<(), String>;
     fn lock_table_write(&mut self, database: &str, table: &str) -> Result<(), String>;
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<SnapshotRow>, String>;
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String>;
     fn delete_rows(&mut self, primary_keys: &[Vec<String>]) -> Result<(), String>;
-    fn update_rows(&mut self, rows: &[SnapshotRow]) -> Result<(), String>;
-    fn insert_rows(&mut self, rows: &[SnapshotRow]) -> Result<(), String>;
+    fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String>;
+    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String>;
     fn commit(&mut self) -> Result<(), String>;
     fn rollback(&mut self) -> Result<(), String>;
     fn unlock_tables(&mut self) -> Result<(), String>;

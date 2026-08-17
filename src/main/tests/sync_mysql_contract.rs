@@ -1,4 +1,4 @@
-use crate::snapshot::SnapshotRow;
+use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkReadRequest, SyncPrimaryKeyOrdering, SyncProgressRow, SyncProgressStatus, SyncStage,
     SyncTable, build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
@@ -264,8 +264,8 @@ fn composite_delete_table() -> SyncTable {
     }
 }
 
-fn row(id: &str, status: &str, title: &str) -> SnapshotRow {
-    SnapshotRow {
+fn row(id: &str, status: &str, title: &str) -> DatabaseRow {
+    DatabaseRow {
         primary_key: vec![id.to_string()],
         values: BTreeMap::from([
             ("id".to_string(), Some(id.to_string())),
