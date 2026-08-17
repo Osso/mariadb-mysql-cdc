@@ -347,9 +347,13 @@ class Harness:
             (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.ddl_replay_journal"),
             (frozenset({"EXECUTE"}), "PROCEDURE cdc.ddl_replay_journal_trigger_inventory"),
         }
+        sync_application_grant = (
+            application_grant[0].union({"LOCK TABLES"}),
+            application_grant[1],
+        )
         sync_grants = {
             (frozenset({"USAGE"}), "*.*"),
-            application_grant,
+            sync_application_grant,
             (frozenset({"CREATE"}), "cdc.*"),
             (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.sync_runs"),
         }
