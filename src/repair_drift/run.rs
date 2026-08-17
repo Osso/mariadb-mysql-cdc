@@ -9,6 +9,7 @@ use super::{
     EquivalentConflictReport, RepairDriftConfig, RepairDriftError, RepairDriftReport,
     RepairDriftTableReport,
 };
+use crate::conflict_ledger::MySqlConflictLedger;
 use crate::drift_check::{self, DriftCheckConfig};
 use crate::inventory::{InventoryConfig, InventoryEndpointRole, SchemaInventory, build_inventory};
 use crate::mysql_snapshot::MySqlConnectionConfig;
@@ -200,7 +201,7 @@ fn run_consistent_snapshot_repair_phases(
     source_inventory: &SchemaInventory,
     target_inventory: &SchemaInventory,
 ) -> Result<Vec<RepairDriftTableReport>, RepairDriftError> {
-    let mut conflict_store = initialize_conflict_store(config)?;
+    let mut conflict_ledger = initialize_conflict_ledger(config)?;
     let mut state = RepairState::default();
     for (phase, order) in repair_phases(plan) {
         run_consistent_snapshot_phase_order(
@@ -210,7 +211,7 @@ fn run_consistent_snapshot_repair_phases(
                 plan,
                 repair_tables,
                 phase,
-                conflict_store: &mut conflict_store,
+                conflict_ledger: &mut conflict_ledger,
                 state: &mut state,
             },
             order,
@@ -228,7 +229,7 @@ struct ConsistentSnapshotPhaseContext<'a> {
     plan: &'a crate::repair_drift::RepairPlan,
     repair_tables: &'a RepairTableInputs,
     phase: SyncPhase,
-    conflict_store: &'a mut Option<crate::conflict_repair::MySqlConflictStore>,
+    conflict_ledger: &'a mut Option<MySqlConflictLedger>,
     state: &'a mut RepairState,
 }
 
@@ -306,7 +307,7 @@ fn run_sequential_consistent_snapshot_phase_table(
             phase: context.phase,
             table_name,
             run: RepairPhaseRun {
-                conflict_store: context.conflict_store,
+                conflict_ledger: context.conflict_ledger,
                 state: context.state,
             },
         },
@@ -412,7 +413,7 @@ fn record_parallel_phase_results(
                 phase: context.phase,
                 table_name: &result.table_name,
                 run: RepairPhaseRun {
-                    conflict_store: context.conflict_store,
+                    conflict_ledger: context.conflict_ledger,
                     state: context.state,
                 },
             },
@@ -587,7 +588,7 @@ fn run_repair_phases(
     plan: &crate::repair_drift::RepairPlan,
     repair_tables: &RepairTableInputs,
 ) -> Result<Vec<RepairDriftTableReport>, RepairDriftError> {
-    let mut conflict_store = initialize_conflict_store(config)?;
+    let mut conflict_ledger = initialize_conflict_ledger(config)?;
     let mut state = RepairState::default();
     for (phase, order) in repair_phases(plan) {
         run_repair_phase_order(
@@ -596,7 +597,7 @@ fn run_repair_phases(
                 run_id,
                 plan,
                 repair_tables,
-                conflict_store: &mut conflict_store,
+                conflict_ledger: &mut conflict_ledger,
                 state: &mut state,
             },
             phase,
@@ -611,7 +612,7 @@ struct RepairPhaseOrderContext<'a> {
     run_id: &'a str,
     plan: &'a crate::repair_drift::RepairPlan,
     repair_tables: &'a RepairTableInputs,
-    conflict_store: &'a mut Option<crate::conflict_repair::MySqlConflictStore>,
+    conflict_ledger: &'a mut Option<MySqlConflictLedger>,
     state: &'a mut RepairState,
 }
 
@@ -626,7 +627,7 @@ fn run_repair_phase_order(
             context.run_id,
             context.plan,
             context.repair_tables,
-            context.conflict_store,
+            context.conflict_ledger,
             context.state,
         );
     }
@@ -647,7 +648,7 @@ fn run_nonverification_phase_order(
             phase,
             table_name,
             run: RepairPhaseRun {
-                conflict_store: context.conflict_store,
+                conflict_ledger: context.conflict_ledger,
                 state: context.state,
             },
         })?;
@@ -765,7 +766,7 @@ fn run_verification_phases(
     run_id: &str,
     plan: &crate::repair_drift::RepairPlan,
     repair_tables: &RepairTableInputs,
-    conflict_store: &mut Option<crate::conflict_repair::MySqlConflictStore>,
+    conflict_ledger: &mut Option<MySqlConflictLedger>,
     state: &mut RepairState,
 ) -> Result<(), RepairDriftError> {
     for table_name in &plan.tables {
@@ -784,7 +785,7 @@ fn run_verification_phases(
             phase,
             table_name,
             run: RepairPhaseRun {
-                conflict_store,
+                conflict_ledger,
                 state,
             },
         })?;
@@ -792,21 +793,20 @@ fn run_verification_phases(
     Ok(())
 }
 
-fn initialize_conflict_store(
+fn initialize_conflict_ledger(
     config: &RepairDriftConfig,
-) -> Result<Option<crate::conflict_repair::MySqlConflictStore>, RepairDriftError> {
+) -> Result<Option<MySqlConflictLedger>, RepairDriftError> {
     if config.mode != SyncMode::Apply {
         return Ok(None);
     }
-    let store =
-        crate::conflict_repair::MySqlConflictStore::new(&config.target, "cdc.row_conflicts")
-            .map_err(RepairDriftError::Repair)?;
-    store.ensure().map_err(RepairDriftError::Repair)?;
-    Ok(Some(store))
+    let ledger = MySqlConflictLedger::new(&config.target, "cdc.row_conflicts")
+        .map_err(RepairDriftError::Repair)?;
+    ledger.ensure().map_err(RepairDriftError::Repair)?;
+    Ok(Some(ledger))
 }
 
 struct RepairPhaseRun<'a> {
-    conflict_store: &'a mut Option<crate::conflict_repair::MySqlConflictStore>,
+    conflict_ledger: &'a mut Option<MySqlConflictLedger>,
     state: &'a mut RepairState,
 }
 
@@ -997,7 +997,7 @@ fn record_phase(
         context.phase,
         context.table_name,
         &input.phase_report,
-        context.run.conflict_store.as_mut(),
+        context.run.conflict_ledger.as_mut(),
     )?;
     merge_phase_report(
         &mut context.run.state.repaired_by_table,
@@ -1064,15 +1064,15 @@ fn resolve_verified_conflicts(
     phase: SyncPhase,
     table_name: &str,
     report: &table_sync::SyncTableReport,
-    conflict_store: Option<&mut crate::conflict_repair::MySqlConflictStore>,
+    conflict_ledger: Option<&mut MySqlConflictLedger>,
 ) -> Result<(), RepairDriftError> {
     if !can_resolve_verified_conflicts_after_verify(config, phase, report) {
         return Ok(());
     }
-    let Some(store) = conflict_store else {
+    let Some(ledger) = conflict_ledger else {
         return Ok(());
     };
-    store
+    ledger
         .resolve_verified_table(
             &config.source_identity,
             table_name,
@@ -1308,7 +1308,7 @@ mod tests {
 
     #[test]
     fn verify_phase_covers_union_of_directional_execution_scopes() {
-        let plan = crate::conflict_repair::RepairPlan {
+        let plan = crate::repair_drift::RepairPlan {
             run_id: "run".to_string(),
             source_identity: "source".to_string(),
             target_identity: "target".to_string(),

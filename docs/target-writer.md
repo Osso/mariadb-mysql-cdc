@@ -34,13 +34,17 @@ Every other native row error is returned to the transaction layer. Non-INSERT
 `1062`, foreign-key, CHECK, schema, generated-column, and connection failures
 roll back the complete source transaction and block its checkpoint.
 
-`--insert-conflict-policy` controls generic statement execution and offline
+`--insert-conflict-policy` controls generic statement execution and out-of-band
 snapshot/table-sync behavior only. It does not select a native ROW live-stream
 policy.
 
 Snapshot/catchup writes may still use `INSERT IGNORE` where their configured
-snapshot mode requests duplicate-ignore. Normal table-sync range repairs do
-not: they use strict batched `INSERT` and surface constraint failures.
+snapshot mode requests duplicate-ignore. That preserves an existing target row
+for the copy operation only; source remains authoritative, and an explicit
+out-of-band `repair-drift` run can converge target divergence and extras. Normal
+table-sync range
+repairs do not use `INSERT IGNORE`: they use strict batched `INSERT` and surface
+constraint failures.
 
 When table-sync insert or divergent-update batches receive a foreign-key error,
 the repair target uses source/target schema-inventory FK metadata to discover

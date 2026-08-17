@@ -1,17 +1,21 @@
 mod config;
 mod equivalent_conflicts;
+mod model;
 mod plan;
+mod planner;
 mod run;
 
 #[cfg(test)]
 mod tests;
 
-pub use crate::conflict_repair::{
-    CanonicalForeignKey, MySqlConflictStore, RepairInventory, RepairPlan, RepairPlanError,
-    build_repair_plan,
-};
 use crate::table_sync::{self, SyncMode};
 use crate::{live::TargetMySqlConfig, mysql_snapshot::MySqlConnectionConfig};
+pub use model::{
+    CanonicalForeignKey, CanonicalForeignKeyRow, RepairInventory, RepairPlan, RepairPlanError,
+    canonicalize_foreign_keys,
+};
+pub use planner::build_repair_plan;
+pub(crate) use planner::{DirectionalRepairInventories, build_repair_plan_with_directional_scopes};
 use std::fmt;
 
 #[derive(Clone, Debug)]

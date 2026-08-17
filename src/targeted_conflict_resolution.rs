@@ -1,4 +1,4 @@
-use crate::conflict_repair::{ConflictStore, MySqlConflictStore};
+use crate::conflict_ledger::MySqlConflictLedger;
 use crate::live::TargetMySqlConfig;
 use crate::mysql_snapshot::MySqlConnectionConfig;
 use crate::snapshot::SnapshotRow;
@@ -42,7 +42,7 @@ pub trait ConflictResolutionWriter {
     ) -> Result<(), String>;
 }
 
-impl<T: ConflictStore> ConflictResolutionWriter for T {
+impl ConflictResolutionWriter for MySqlConflictLedger {
     fn resolve_if_equal(
         &mut self,
         table: &str,
@@ -51,7 +51,7 @@ impl<T: ConflictStore> ConflictResolutionWriter for T {
         repair_run_id: &str,
         evidence: &str,
     ) -> Result<(), String> {
-        ConflictStore::resolve_if_equal(
+        MySqlConflictLedger::resolve_if_equal(
             self,
             table,
             primary_key,
@@ -203,11 +203,11 @@ pub fn run_mysql_targeted_conflict_resolution(
 ) -> Result<(TargetedConflictResolutionReport, u128), String> {
     let started = Instant::now();
     let mut reader = MySqlConflictEvidenceReader::new(config)?;
-    let mut store = MySqlConflictStore::new(&config.target, "cdc.row_conflicts")?;
-    store.ensure()?;
+    let mut ledger = MySqlConflictLedger::new(&config.target, "cdc.row_conflicts")?;
+    ledger.ensure()?;
     let report = resolve_comics_releases_views_conflicts(
         &mut reader,
-        &mut store,
+        &mut ledger,
         &config.run_id,
         config.batch_size,
     )?;

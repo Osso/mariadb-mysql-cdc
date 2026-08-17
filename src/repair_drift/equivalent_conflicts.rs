@@ -1,5 +1,5 @@
 use super::{EquivalentConflictReport, RepairDriftConfig, RepairDriftError};
-use crate::conflict_repair::{ConflictKey, ConflictResolution, ConflictStore, MySqlConflictStore};
+use crate::conflict_ledger::{ConflictKey, ConflictResolution, MySqlConflictLedger};
 use crate::inventory::{SchemaInventory, TableInventory};
 use crate::table_sync::{MySqlSyncReader, SyncMode};
 use std::collections::BTreeSet;
@@ -35,7 +35,7 @@ struct ReconcileContext<'a> {
     config: &'a RepairDriftConfig,
     run_id: &'a str,
     source_inventory: &'a SchemaInventory,
-    store: MySqlConflictStore,
+    ledger: MySqlConflictLedger,
     source_reader: MySqlSyncReader,
     target_reader: MySqlSyncReader,
 }
@@ -46,9 +46,9 @@ impl<'a> ReconcileContext<'a> {
         run_id: &'a str,
         source_inventory: &'a SchemaInventory,
     ) -> Result<Self, RepairDriftError> {
-        let store = MySqlConflictStore::new(&config.target, "cdc.row_conflicts")
+        let ledger = MySqlConflictLedger::new(&config.target, "cdc.row_conflicts")
             .map_err(RepairDriftError::Repair)?;
-        store.ensure().map_err(RepairDriftError::Repair)?;
+        ledger.ensure().map_err(RepairDriftError::Repair)?;
         let source_reader = MySqlSyncReader::new(config.source.clone());
         let target_reader = MySqlSyncReader::new_with_target(config.source.clone(), &config.target)
             .map_err(RepairDriftError::Repair)?;
@@ -56,7 +56,7 @@ impl<'a> ReconcileContext<'a> {
             config,
             run_id,
             source_inventory,
-            store,
+            ledger,
             source_reader,
             target_reader,
         })
@@ -66,7 +66,7 @@ impl<'a> ReconcileContext<'a> {
         &self,
         selected_tables: &[String],
     ) -> Result<Vec<ConflictKey>, RepairDriftError> {
-        self.store
+        self.ledger
             .unresolved_source_rows(
                 &self.config.source_identity,
                 &self.config.source.database,
@@ -102,7 +102,7 @@ impl<'a> ReconcileContext<'a> {
     }
 
     fn resolve(&mut self, candidate: ConflictKey) -> Result<(), RepairDriftError> {
-        self.store
+        self.ledger
             .resolve_existing(ConflictResolution {
                 source_identity: self.config.source_identity.clone(),
                 schema: candidate.schema,

@@ -52,12 +52,6 @@ pub(crate) const SOURCE_ROW_IDENTITY_GENERATION_EXPRESSION: &str = "SHA2(CONCAT(
 pub(crate) const CONFLICT_INSERT_GUARD_BODY: &str = "BEGIN IF NEW.status <> 'unresolved' OR NEW.attempt_count <> 1 OR NEW.repair_run_id IS NOT NULL OR NEW.resolution_evidence IS NOT NULL THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'row conflicts may only be inserted unresolved'; END IF; END";
 pub(crate) const CONFLICT_UPDATE_GUARD_BODY: &str = "BEGIN IF NOT (OLD.conflict_identity <=> NEW.conflict_identity) OR NOT (OLD.source_row_identity <=> NEW.source_row_identity) OR NOT (OLD.source_identity <=> NEW.source_identity) OR NOT (OLD.source_server_id <=> NEW.source_server_id) OR NOT (OLD.source_file <=> NEW.source_file) OR NOT (OLD.source_start_position <=> NEW.source_start_position) OR NOT (OLD.source_end_position <=> NEW.source_end_position) OR NOT (OLD.schema_name <=> NEW.schema_name) OR NOT (OLD.table_name <=> NEW.table_name) OR NOT (OLD.operation <=> NEW.operation) OR NOT (OLD.source_primary_key_json <=> NEW.source_primary_key_json) OR OLD.status = 'resolved' AND (NEW.status <> 'resolved' OR NOT (OLD.duplicate_index <=> NEW.duplicate_index) OR NOT (OLD.duplicate_owner_primary_key_json <=> NEW.duplicate_owner_primary_key_json) OR NOT (OLD.error_code <=> NEW.error_code) OR NOT (OLD.error_text <=> NEW.error_text) OR NOT (OLD.first_observed_at_ms <=> NEW.first_observed_at_ms) OR NOT (OLD.last_observed_at_ms <=> NEW.last_observed_at_ms) OR NOT (OLD.attempt_count <=> NEW.attempt_count) OR NOT (OLD.repair_run_id <=> NEW.repair_run_id) OR NOT (OLD.resolution_evidence <=> NEW.resolution_evidence)) OR OLD.status = 'unresolved' AND ((NEW.status = 'unresolved' AND (NEW.repair_run_id IS NOT NULL OR NEW.resolution_evidence IS NOT NULL OR NEW.attempt_count <> OLD.attempt_count + 1)) OR (NEW.status = 'resolved' AND (NEW.repair_run_id IS NULL OR NEW.repair_run_id = '' OR NEW.resolution_evidence IS NULL OR NEW.resolution_evidence = '' OR NOT (OLD.duplicate_index <=> NEW.duplicate_index) OR NOT (OLD.duplicate_owner_primary_key_json <=> NEW.duplicate_owner_primary_key_json) OR NOT (OLD.error_code <=> NEW.error_code) OR NOT (OLD.error_text <=> NEW.error_text) OR NOT (OLD.first_observed_at_ms <=> NEW.first_observed_at_ms) OR NOT (OLD.last_observed_at_ms <=> NEW.last_observed_at_ms) OR NOT (OLD.attempt_count <=> NEW.attempt_count)))) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'row conflict identity is immutable and status transition is not allowed'; END IF; END";
 
-pub fn build_conflict_validation_sql(table: &str) -> String {
-    format!(
-        "SELECT conflict_identity,source_row_identity,source_identity,source_server_id,source_file,source_start_position,source_end_position,schema_name,table_name,operation,source_primary_key_json,duplicate_index,duplicate_owner_primary_key_json,error_code,error_text,first_observed_at_ms,last_observed_at_ms,attempt_count,status,repair_run_id,resolution_evidence FROM {table} LIMIT 0"
-    )
-}
-
 pub(crate) fn split_conflict_table(table: &str) -> Result<(&str, &str), String> {
     let (schema, table_name) = table
         .split_once('.')
@@ -404,9 +398,9 @@ fn normalize_trigger_metadata(triggers: &[TriggerMetadata]) -> Vec<TriggerMetada
 }
 
 pub(crate) fn conflict_mysql_error(error: mysql::Error) -> String {
-    format!("conflict store mysql query failed: {error}")
+    format!("conflict ledger mysql query failed: {error}")
 }
 
 pub(crate) fn conflict_validation_error(error: String) -> String {
-    format!("conflict store validation failed: {error}")
+    format!("conflict ledger validation failed: {error}")
 }

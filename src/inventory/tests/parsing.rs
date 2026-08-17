@@ -1,9 +1,9 @@
 use super::fixtures::{accounts_insert_trigger, nightly_recalc_event};
-use crate::conflict_repair::canonicalize_foreign_keys;
 use crate::inventory::parse::*;
 use crate::inventory::query::*;
 use crate::inventory::values::inventory_value_to_string;
 use crate::inventory::*;
+use crate::repair_drift::canonicalize_foreign_keys;
 
 #[test]
 fn parses_native_mysql_values_and_quotes_schema_names() {

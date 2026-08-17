@@ -192,7 +192,7 @@ identity matching stops immediately.
   overrides static startup coordinates.
 - [x] Prove serial and parallel INSERT `1062` continuation against disposable
   real MariaDB/MySQL endpoints; keep the conflict ledger and repair paths
-  offline-only.
+  out-of-band only.
 - [x] Add a failing test that checkpoint is written only after successful target
   apply.
 - [x] Production streaming uses the native client/reconnect loop; the

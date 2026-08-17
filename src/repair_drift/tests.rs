@@ -512,3 +512,120 @@ fn fresh_run_ids_are_unique_within_one_process() {
     assert!(first.starts_with("repair-drift-"));
     assert!(second.starts_with("repair-drift-"));
 }
+
+#[test]
+fn canonical_fk_inventory_preserves_schema_columns_and_rules() {
+    let rows = vec![CanonicalForeignKeyRow {
+        constraint_schema: "app".to_string(),
+        constraint_name: "child_parent_fk".to_string(),
+        child_schema: "app".to_string(),
+        child_table: "children".to_string(),
+        child_column: "parent_id".to_string(),
+        ordinal_position: 1,
+        parent_schema: "app".to_string(),
+        parent_table: "parents".to_string(),
+        parent_column: "id".to_string(),
+        update_rule: "RESTRICT".to_string(),
+        delete_rule: "CASCADE".to_string(),
+        match_option: "NONE".to_string(),
+        enforced: true,
+    }];
+    let inventory = canonicalize_foreign_keys(rows).expect("canonical inventory");
+    assert_eq!(inventory[0].child_schema, "app");
+    assert_eq!(inventory[0].parent_schema, "app");
+    assert_eq!(inventory[0].child_columns, vec!["parent_id"]);
+    assert_eq!(inventory[0].parent_columns, vec!["id"]);
+    assert_eq!(inventory[0].delete_rule, "CASCADE");
+    assert!(inventory[0].enforced);
+}
+
+#[test]
+fn canonical_fk_inventory_keeps_same_name_distinct_across_child_tables() {
+    let rows = vec![
+        CanonicalForeignKeyRow {
+            constraint_schema: "app".to_string(),
+            constraint_name: "parent_fk".to_string(),
+            child_schema: "app".to_string(),
+            child_table: "child_a".to_string(),
+            child_column: "parent_id".to_string(),
+            ordinal_position: 1,
+            parent_schema: "app".to_string(),
+            parent_table: "parents".to_string(),
+            parent_column: "id".to_string(),
+            update_rule: "RESTRICT".to_string(),
+            delete_rule: "CASCADE".to_string(),
+            match_option: "NONE".to_string(),
+            enforced: true,
+        },
+        CanonicalForeignKeyRow {
+            constraint_schema: "app".to_string(),
+            constraint_name: "parent_fk".to_string(),
+            child_schema: "app".to_string(),
+            child_table: "child_b".to_string(),
+            child_column: "parent_id".to_string(),
+            ordinal_position: 1,
+            parent_schema: "app".to_string(),
+            parent_table: "parents".to_string(),
+            parent_column: "id".to_string(),
+            update_rule: "RESTRICT".to_string(),
+            delete_rule: "CASCADE".to_string(),
+            match_option: "NONE".to_string(),
+            enforced: true,
+        },
+    ];
+
+    let inventory = canonicalize_foreign_keys(rows).expect("canonical inventory");
+
+    assert_eq!(inventory.len(), 2);
+    assert_eq!(
+        inventory
+            .iter()
+            .map(|foreign_key| foreign_key.child_table.as_str())
+            .collect::<Vec<_>>(),
+        vec!["child_a", "child_b"]
+    );
+}
+
+#[test]
+fn canonical_foreign_keys_treat_no_action_as_restrict_for_cross_engine_parity() {
+    let mut rows = vec![CanonicalForeignKeyRow {
+        constraint_schema: "app".to_string(),
+        constraint_name: "child_parent_fk".to_string(),
+        child_schema: "app".to_string(),
+        child_table: "children".to_string(),
+        child_column: "parent_id".to_string(),
+        ordinal_position: 1,
+        parent_schema: "app".to_string(),
+        parent_table: "parents".to_string(),
+        parent_column: "id".to_string(),
+        update_rule: "NO ACTION".to_string(),
+        delete_rule: "NO ACTION".to_string(),
+        match_option: "NONE".to_string(),
+        enforced: true,
+    }];
+    let canonical = canonicalize_foreign_keys(std::mem::take(&mut rows)).expect("canonical FK");
+    assert_eq!(canonical[0].update_rule, "RESTRICT");
+    assert_eq!(canonical[0].delete_rule, "RESTRICT");
+}
+
+#[test]
+fn planner_ignores_self_references_for_dependency_ordering() {
+    let table = "comics_facets_groups_options";
+    let inventory = RepairInventory {
+        schema: "globalcomix".to_string(),
+        tables: vec![table.to_string()],
+        foreign_keys: vec![canonical_fk(table, table)],
+    };
+
+    let plan = build_repair_plan(
+        "run-self-reference",
+        "source",
+        "target",
+        &inventory,
+        &inventory,
+    )
+    .expect("self-referential foreign keys do not create inter-table cycles");
+
+    assert_eq!(plan.insert_order, vec![table]);
+    assert_eq!(plan.delete_order, vec![table]);
+}

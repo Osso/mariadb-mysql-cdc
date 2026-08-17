@@ -1,6 +1,6 @@
 # Live Row Error Handling
 
-Native ROW/FULL streaming treats the MariaDB source as authoritative and the MySQL target as disposable. This spec defines live row-error behavior; offline drift repair and historical conflict data remain separate workflows. See [Row Events](../row-events.md) and [Target Writer](../target-writer.md).
+Native ROW/FULL streaming treats the MariaDB source as authoritative and the MySQL target as disposable. This spec defines live row-error behavior; out-of-band drift repair and historical conflict data remain separate workflows. See [Row Events](../row-events.md) and [Target Writer](../target-writer.md).
 
 ## What it must do
 
@@ -9,6 +9,7 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - [x] Build a plain `INSERT` containing every writable source column, including the source primary key.
 - [x] Treat MySQL `1062` from a native ROW `INSERT` as idempotent success.
 - [x] Continue applying later statements in the same source transaction after an ignored INSERT `1062`.
+- [x] Leave any divergent preexisting target row for out-of-band source/target convergence; live replay does not replace it.
 - [x] Ignore the duplicate without reading, comparing, replacing, or updating any target row.
 - [x] Ignore the duplicate without creating, resolving, or validating live conflict-ledger evidence.
 
@@ -33,7 +34,7 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - [x] Commit parallel transactions and checkpoints in source order.
 - [x] Stop later commits and checkpoint advancement when an earlier body or commit fails.
 
-### Offline boundary
+### Out-of-band boundary
 
 - [x] Keep snapshot/table-sync insert modes, drift repair, targeted conflict resolution, and historical `cdc.row_conflicts` data independent from live streaming.
 - [x] Do not require `cdc.row_conflicts`, its trigger inventory procedure, or its grants to start the live stream.
@@ -68,10 +69,10 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 - [x] Prove the INSERT `1062` continuation contract against disposable real
       MariaDB/MySQL endpoints in serial and parallel modes; the harness keeps
-      live source-authoritative replay separate from offline conflict repair.
+      live source-authoritative replay separate from out-of-band conflict repair.
 
 ## Out of scope
 
 - Deployment or production mutation.
 - Target-row equality checks, merge semantics, automatic replacement, or live parent repair.
-- Deleting historical conflict records or removing offline repair commands.
+- Deleting historical conflict records or removing out-of-band repair commands.

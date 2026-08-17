@@ -2,7 +2,7 @@
 
 `sync-table` reconciles one source table against one target table in primary-key
 chunks. It is the child operation used by the run-scoped `repair-drift`
-orchestration; historical `cdc.row_conflicts` records are offline repair inputs
+orchestration; historical `cdc.row_conflicts` records are out-of-band repair inputs
 and are resolved only after verified equality. Native live ROW streaming does not
 create or resolve those records. Generic `repair-drift` remains strict
 about its source/target inventory contract; lost-binlog recovery uses a separate
@@ -148,10 +148,9 @@ table-sync recovery contract is implemented by commits `fa018af..3fe8b17`.
       divergent, or extra row keeps completion blocked.
 - [x] Provide a durable conflict schema/SQL contract and resolve rows only after
       verified source/target equality.
-- [ ] Complete the remaining FK-aware phased repair work for `repair-drift`:
-      canonical child/parent columns, cross-engine rule normalization, and
-      resumable per-operation state remain separate from table-sync's runtime
-      parent repair.
+- [x] Keep FK canonicalization and repair-plan construction in
+      `src/repair_drift/model.rs` and `src/repair_drift/planner.rs`; the removed
+      generic phased executor and test-only stores are not runtime paths.
 - [x] Build read-only and repair inputs from the full `plan.tables` union. Per-chunk
       DeleteExtras budget checks and child-first deletes cover every childward
       table; parentward inserts/updates retain their directional scope.
@@ -161,7 +160,7 @@ table-sync recovery contract is implemented by commits `fa018af..3fe8b17`.
 
 ## Remaining boundaries
 
-- [x] Historical durable conflict records remain valid offline repair inputs.
+- [x] Historical durable conflict records remain valid out-of-band repair inputs.
       Native live ROW streaming does not create or resolve ledger records;
       `replace-divergent-pk` remains limited to explicit table-sync repair paths.
 - [x] `repair-drift` creates a fresh orchestration ID, derives FK-safe phases, and

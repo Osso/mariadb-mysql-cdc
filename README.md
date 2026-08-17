@@ -116,28 +116,35 @@ receipt is unavailable, so this is semantic proof only.
 No operator-authored target SQL or manual status transition is a supported DDL
 resolution path. Fresh bootstrap remains the pre-production schema contract.
 Existing populated `cdc.row_conflicts` tables use
-`docs/row-conflicts-source-row-identity-migration.sql` once while offline repair
+`docs/row-conflicts-source-row-identity-migration.sql` once while out-of-band repair
 writers are stopped; runtime never performs this migration. Obsolete
 development migrations are not maintained as upgrade paths.
 
 Native ROW streaming is source-authoritative and target-disposable. It emits plain
 INSERT statements and treats MySQL `1062` from INSERT as idempotent success,
 without target inspection, equality checks, replacement, conflict evidence, or
-repair. Every other row error rolls back the complete source transaction and
-blocks checkpoint advancement. `--target-parallel-transactions N` preserves the
+repair. A skipped duplicate may leave divergent target contents; an explicit
+out-of-band `repair-drift` run can converge that target state. Every other row
+error rolls back the complete source transaction and blocks checkpoint
+advancement. `--target-parallel-transactions N` preserves the
 same rule by sending and draining each statement individually, leasing one target
 connection per complete source transaction, and committing checkpoints in source
 order.
 
-Conflict data and repair remain offline. `cdc.row_conflicts`, `repair-drift`,
-targeted conflict resolution, FK-aware table-sync ordering, bounded primary-key
-windows, and exact verification are retained, but the live stream neither reads
-nor writes the conflict ledger and does not validate its schema, procedures, or
-grants. Retired live supersession, target-replacement, and automatic parent-repair
-paths are absent from runtime and harness code.
+Conflict data and repair remain out-of-band. These commands connect to source and
+target; they are separate from the live stream, not disconnected workflows.
+`cdc.row_conflicts`, `repair-drift`, targeted conflict resolution, FK-aware
+table-sync ordering, bounded primary-key windows, and exact verification are
+retained, but the live stream neither reads nor writes the conflict ledger and
+does not validate its schema, procedures, or grants. Historical ledger
+persistence is owned by concrete `MySqlConflictLedger` in
+`src/conflict_ledger.rs` and `src/conflict_ledger/`; FK canonicalization and
+repair-plan construction are owned by `src/repair_drift/model.rs` and
+`src/repair_drift/planner.rs`. Retired live supersession, target-replacement,
+and automatic parent-repair paths are absent from runtime and harness code.
 
-The disposable MariaDB/MySQL harness continues to cover catchup, offline repair,
-DDL journal recovery, reconnect/GET_LOCK behavior, and parallel target
+The disposable MariaDB/MySQL harness continues to cover catchup, out-of-band
+repair, DDL journal recovery, reconnect/GET_LOCK behavior, and parallel target
 transactions. These are local proofs, not live cutover proof.
 
 Deployment remains blocked pending real-MySQL/live proof, exact grant/bootstrap
@@ -229,7 +236,7 @@ The serial scenario preloads a divergent target row, removes the conflict ledger
 and inventory procedure, and proves the duplicate leaves that row untouched while
 a later same-transaction row and exact checkpoint advance. The parallel scenario
 adds ordered-commit barriers, verifies every target session uses `SSL/TLS`, and
-proves both transactions converge only after release. Offline repair scenarios
+proves both transactions converge only after release. Out-of-band repair scenarios
 retain the separate ledger, comparison, and FK-repair identities.
 
 ### Table catalog JSON and execution contract
@@ -360,7 +367,7 @@ verification when changing source transport. See [connection policy](docs/schema
 
 ## Insert conflict policy
 
-`--insert-conflict-policy` applies to statement replay and offline
+`--insert-conflict-policy` applies to statement replay and out-of-band
 snapshot/table-sync paths. Values are `error`, `ignore-duplicate`, and
 `replace-divergent-pk`:
 

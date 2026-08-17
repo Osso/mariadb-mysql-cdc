@@ -1,4 +1,4 @@
-use crate::conflict_repair::CanonicalForeignKeyRow;
+use crate::repair_drift::CanonicalForeignKeyRow;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

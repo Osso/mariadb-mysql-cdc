@@ -152,18 +152,27 @@ restart health and subsequent zero-drift verification are recorded.
 
 ## Repair model
 
-Live ROW streaming and offline repair are separate systems. The live stream
+Live ROW streaming and out-of-band repair are separate systems. The live stream
 writes source DML directly, accepts only INSERT `1062` as idempotent success, and
-never reads target rows or writes conflict evidence. Every other row error rolls
-back the source transaction and blocks its checkpoint.
+never reads target rows or writes conflict evidence. A skipped duplicate can
+leave divergent target contents; an explicit out-of-band convergence run can
+repair that state. Every other row error rolls back the source transaction and
+blocks its checkpoint.
 
-`cdc.row_conflicts` remains historical/offline data. `repair-drift`, targeted
-conflict resolution, and table-sync retain their source/target comparison,
-FK-aware ordering, immutable progress, bounded windows, and exact verification.
-The live stream does not validate the conflict table, its triggers, its procedure,
+`cdc.row_conflicts` remains historical out-of-band data. These repair commands
+connect to source and target; “out-of-band” distinguishes them from live stream
+execution, not from database connectivity. `repair-drift`, targeted conflict
+resolution, and table-sync retain their source/target comparison, FK-aware
+ordering, immutable progress, bounded windows, and exact verification.
+Historical ledger persistence is owned by concrete `MySqlConflictLedger` in
+`src/conflict_ledger.rs` and `src/conflict_ledger/`; FK canonicalization and
+repair-plan construction are owned by `src/repair_drift/model.rs` and
+`src/repair_drift/planner.rs`. The
+removed generic phased executor and test-only stores are not runtime paths. The
+live stream does not validate the conflict table, its triggers, its procedure,
 or its grants.
 
-The disposable MariaDB/MySQL harness covers catchup, offline repair, DDL,
+The disposable MariaDB/MySQL harness covers catchup, out-of-band repair, DDL,
 reconnect, and parallel transaction boundaries. Retired live conflict,
 supersession, target-replacement, and automatic parent-recovery scenarios are not
 part of the harness.
@@ -176,7 +185,7 @@ part of the harness.
   repeat this static policy per event.
 - Use stable primary-key windows for count/content checks.
 - Treat live row errors, quarantine, journal barriers, schema drift, and
-  CA/grant gaps as blockers. Historical unresolved conflicts remain an offline
+  CA/grant gaps as blockers. Historical unresolved conflicts remain an out-of-band
   repair concern. `translation_pending` is cleared only by translator
   code and automatic promotion in the event path; config/bootstrap/grant/harness
   dependencies and migration safety remain open.

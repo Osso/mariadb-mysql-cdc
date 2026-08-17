@@ -4,7 +4,7 @@ use super::model::{
     InventoryReader, PrimaryKeyRow, RoutineInventory, RoutineRow, SchemaInventory, TableInventory,
     TableRow, TriggerInventory, TriggerRow, ViewInventory, ViewRow,
 };
-use crate::conflict_repair::{CanonicalForeignKey, canonicalize_foreign_keys};
+use crate::repair_drift::{CanonicalForeignKey, canonicalize_foreign_keys};
 use std::collections::BTreeMap;
 
 const BASE_TABLE_TYPE: &str = "BASE TABLE";

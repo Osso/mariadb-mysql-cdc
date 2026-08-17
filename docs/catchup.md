@@ -16,7 +16,7 @@ orphans. Snapshot behavior is independent from native live ROW streaming.
 For native live ROW events, the source is authoritative and the target is
 disposable. A plain INSERT that returns MySQL `1062` is accepted without target
 inspection or repair. Every other row error rolls back the complete source
-transaction and blocks checkpoint advancement. Offline `sync-table` and
+transaction and blocks checkpoint advancement. Out-of-band `sync-table` and
 `repair-drift` remain responsible for explicit convergence and verification.
 
 Catchup source reads and target writes follow the [connection policy](schema-inventory.md#connection-policy).
@@ -116,7 +116,7 @@ explicit ceiling, it performs zero inserts, updates, or deletes. Normal
 
 ## Completion gates
 
-- [ ] Recurring repair scheduling from offline unresolved conflicts.
+- [ ] Recurring repair scheduling from out-of-band unresolved conflicts.
 - [x] FK-aware real-MySQL phased repair with crash/resume proof for the repaired scope.
 - [x] Zero unresolved conflict debt after verified equality for the repaired scope.
 - [ ] Stable checkpoint/lag, schema parity, and no quarantine/manual/journal debt.

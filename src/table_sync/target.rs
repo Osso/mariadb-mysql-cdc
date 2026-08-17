@@ -1287,7 +1287,7 @@ const FOREIGN_OWNED_DUPLICATE_EVIDENCE_KEYS: usize = 10;
 /// other unique index owns the key. Without the index name and the source keys, the failure cannot be
 /// reproduced once the live stream has moved the target on.
 fn foreign_owned_duplicate_evidence(rows: &[SnapshotRow], duplicate_error: &str) -> String {
-    let index = crate::conflict_repair::duplicate_key_name(duplicate_error)
+    let index = crate::conflict_ledger::duplicate_key_name(duplicate_error)
         .unwrap_or_else(|| "<unparsed>".to_string());
     let shown = rows
         .iter()

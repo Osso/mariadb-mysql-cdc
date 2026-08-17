@@ -1,7 +1,7 @@
 pub mod catchup;
 pub mod checkpoint;
 pub mod checksum;
-pub mod conflict_repair;
+pub mod conflict_ledger;
 pub mod cutover;
 pub mod drift_check;
 pub mod inventory;
