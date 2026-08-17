@@ -6,7 +6,7 @@ target with minimal downtime.
 ## Design constraints
 
 - Consume production `binlog_format=ROW` with `binlog_row_image=FULL`.
-- Snapshot table data first, then stream from a recorded binlog position.
+- Use staged `sync` for source-authoritative convergence while the live ROW stream handles ongoing changes.
 - Apply row changes by source primary key; a secondary-unique conflict never
   mutates another target primary key. For a primary-key-changing ROW update,
   assign every writable, non-generated after-image column and predicate on every
