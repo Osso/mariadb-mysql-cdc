@@ -926,6 +926,12 @@ fn recovery_specs_assert_state_evidence_not_only_process_exit() {
 #[test]
 fn target_bootstrap_uses_exact_unified_sync_progress_contract() {
     let target = fs::read_to_string(&fixture_paths()[1]).expect("read target bootstrap fixture");
+    let sync_application_grant = target
+        .split(';')
+        .find(|statement| statement.contains("ON globalcomix.* TO 'cdc_sync'@'%'"))
+        .expect("cdc_sync application grant");
+    assert!(sync_application_grant.contains("LOCK TABLES"));
+
     for required in [
         "CREATE USER IF NOT EXISTS 'cdc_sync'@'%'",
         "CREATE TABLE IF NOT EXISTS cdc.sync_runs",

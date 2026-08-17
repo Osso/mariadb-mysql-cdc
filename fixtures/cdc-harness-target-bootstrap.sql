@@ -262,7 +262,7 @@ GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_stream'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.ddl_replay_journal TO 'cdc_stream'@'%';
 GRANT EXECUTE ON PROCEDURE cdc.ddl_replay_journal_trigger_inventory TO 'cdc_stream'@'%';
 
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES,
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, LOCK TABLES,
       CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, EVENT, TRIGGER
       ON globalcomix.* TO 'cdc_sync'@'%';
 GRANT CREATE ON cdc.* TO 'cdc_sync'@'%';
