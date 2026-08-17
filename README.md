@@ -123,25 +123,23 @@ development migrations are not maintained as upgrade paths.
 Native ROW streaming is source-authoritative and target-disposable. It emits plain
 INSERT statements and treats MySQL `1062` from INSERT as idempotent success,
 without target inspection, equality checks, replacement, conflict evidence, or
-repair. A skipped duplicate may leave divergent target contents; an explicit
-out-of-band `repair-drift` run can converge that target state. Every other row
-error rolls back the complete source transaction and blocks checkpoint
-advancement. `--target-parallel-transactions N` preserves the
+repair. A skipped duplicate may leave divergent target contents; convergence is
+an explicit out-of-band operational task. Every other row error rolls back the
+complete source transaction and blocks checkpoint advancement.
+`--target-parallel-transactions N` preserves the
 same rule by sending and draining each statement individually, leasing one target
 connection per complete source transaction, and committing checkpoints in source
 order.
 
-Conflict data and repair remain out-of-band. These commands connect to source and
-target; they are separate from the live stream, not disconnected workflows.
-`cdc.row_conflicts`, `repair-drift`, targeted conflict resolution, FK-aware
-table-sync ordering, bounded primary-key windows, and exact verification are
-retained, but the live stream neither reads nor writes the conflict ledger and
+Conflict data remains out-of-band. Targeted conflict resolution connects to
+source and target as a separate workflow from the live stream. The live stream
+neither reads nor writes the conflict ledger and
 does not validate its schema, procedures, or grants. Historical ledger
 persistence is owned by concrete `MySqlConflictLedger` in
-`src/conflict_ledger.rs` and `src/conflict_ledger/`; FK canonicalization and
-repair-plan construction are owned by `src/repair_drift/model.rs` and
-`src/repair_drift/planner.rs`. Retired live supersession, target-replacement,
-and automatic parent-repair paths are absent from runtime and harness code.
+`src/conflict_ledger.rs` and `src/conflict_ledger/`; shared foreign-key
+canonicalization is owned by `src/canonical_foreign_key.rs`. Retired live
+supersession, target-replacement, and automatic parent-repair paths are absent
+from runtime and harness code.
 
 The disposable MariaDB/MySQL harness continues to cover catchup, out-of-band
 repair, DDL journal recovery, reconnect/GET_LOCK behavior, and parallel target
@@ -161,25 +159,22 @@ health check.
 - [Authoritative DDL transformation spec](docs/specs/ddl-transformation.md)
 - [DDL Resolution Runbook](docs/ddl-resolution.md) for journal barriers,
   translation-pending promotion, evidence inspection, and restart procedure.
-- [Schema synchronization spec](docs/specs/sync-schema.md) for selected-table
-  full convergence through the shared streamed-DDL translator.
+- [Schema synchronization details](docs/specs/sync-schema.md) for source-to-target
+  convergence through the shared streamed-DDL translator.
 
 ## Schema synchronization
 
-The implemented `sync-schema` command applies by default and converges only explicitly
-selected tables to the source-authoritative MySQL 8-compatible schema. It runs one
-table at a time, permits destructive changes within selected tables, and never
-drops unselected target tables. Every mapping must use the same DDL translator as
-streamed DDL replay; there is no direct-source-DDL fallback or second compatibility
-mapping.
+The staged `sync` command is the only standalone synchronization entry point. It
+runs prerequisite schema convergence, source-authoritative locked row chunks, and
+final constraint convergence under one immutable run identity. Schema work is not
+available as a separate `sync-schema` command; `sync-catalog`, `resync-stream`, and
+`recover-lost-binlog` route through the same staged engine.
 
-Before a potentially lossy column change, it checks actual target data. Values that
-would truncate, coerce, or fail block that table and produce representative primary
-keys; independent tables continue, while dependent operations are skipped. The
-command re-inventories every selected table and emits structured JSON for every
-statement, preflight, skip, error, and verification result. It exits nonzero if
-anything remains divergent. It has no persistent schema journal or rollback claim
-for implicitly committed MySQL DDL.
+Before a potentially lossy column change, the prerequisite schema stage checks
+actual target data. Values that would truncate, coerce, or fail block that table
+and produce representative primary keys; independent tables continue, while
+dependent operations are skipped. The staged run persists progress in
+`cdc.sync_runs` and fails closed if final structural convergence is not achieved.
 
 ## Commands
 
@@ -222,9 +217,11 @@ cargo run -- sync-catalog \
 `--table` for a closed source scope and provide exactly one immutable `--run-id`
 or `--run-id-prefix`; the progress table defaults to `cdc.sync_runs`. The command
 runs prerequisite schema convergence, source-authoritative locked row chunks, and
-final constraint convergence as one staged operation. The obsolete
-`catchup-snapshot`, `sync-table`, and `repair-drift` names are not aliases and are
-rejected as unknown commands.
+final constraint convergence as one staged operation. The removed
+`catchup-progress`, `sync-progress`, standalone `sync-schema`, and `drift-check`
+commands are not available; their work is either part of `sync` stages or removed
+from the CLI. Legacy `catchup-snapshot`, `sync-table`, and `repair-drift` names are
+also rejected as unknown commands.
 
 `stream-binlog --target-parallel-transactions N` enables bounded target
 transaction submission when `N > 1`; the default `1` preserves serial execution.

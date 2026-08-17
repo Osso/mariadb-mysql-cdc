@@ -16,10 +16,10 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 
 ### Source scope and execution
 
-- [x] Convert the selected source inventory into deterministic sync-table definitions.
+- [x] Convert the selected source inventory into deterministic table definitions.
 - [x] Reject an empty or duplicated selection and reject a selected child whose same-schema source parent is outside the selection.
 - [x] Invoke bounded row workers between the two schema stages.
-- [x] Expose the orchestration through one `sync` CLI and reject `catchup-snapshot`, `sync-table`, and `repair-drift` as unknown commands rather than aliasing them.
+- [x] Expose the staged orchestration through one `sync` CLI. Removed progress, standalone schema, drift-check, catchup-snapshot, sync-table, and repair-drift command names are rejected as unknown commands rather than aliased.
 - [x] Require exactly one immutable `--run-id` or `--run-id-prefix`; default progress persistence to `cdc.sync_runs` and support repeated `--table`, `--chunk-size`, `--parallelism`, and `--progress-table` options.
 - [x] Route `sync-catalog` through one unified run with shared immutable identity and `cdc.sync_runs` progress; `--progress-table` may override this default.
 - [x] Route `resync-stream` through one unified run with the fixed `resync-stream:<source_identity>` run identity and `cdc.sync_runs` progress.
@@ -35,7 +35,7 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 
 ## How it works
 
-- [Schema synchronization](sync-schema.md) defines source-to-target structural convergence.
+- [Schema synchronization details](sync-schema.md) define source-to-target structural convergence within the staged `sync` run; there is no standalone schema command.
 - [Table sync repair](table-sync-repair.md) records the legacy row-repair contract being replaced by this engine.
 - [Lost-binlog recovery](lost-binlog-recovery.md) records the recovery caller that must migrate to unified sync.
 
