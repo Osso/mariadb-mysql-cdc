@@ -20,6 +20,7 @@ mod snapshot_ranges;
 mod sql_type;
 pub mod statement;
 pub mod stream_checkpoint;
+mod sync;
 mod sync_cli;
 mod sync_progress_cli;
 mod sync_schema;

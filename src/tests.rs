@@ -7,6 +7,13 @@ mod checkpoint_config {
     ));
 }
 
+mod sync_chunk_boundary {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_chunk_boundary.rs"
+    ));
+}
+
 #[test]
 fn usage_documents_parallel_target_transaction_option() {
     assert!(USAGE.contains("--target-parallel-transactions COUNT"));
