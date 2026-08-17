@@ -1,6 +1,6 @@
-use crate::inventory::TableInventory;
+pub use crate::primary_key_ordering::PrimaryKeyOrdering as SyncPrimaryKeyOrdering;
 use crate::snapshot::SnapshotRow;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -26,44 +26,10 @@ pub struct SyncTable {
     pub columns: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "labels")]
-pub enum SyncPrimaryKeyOrdering {
-    Native,
-    Enum(Vec<String>),
-}
-
 fn primary_key_ordering_is_native(ordering: &[SyncPrimaryKeyOrdering]) -> bool {
     ordering
         .iter()
         .all(|entry| *entry == SyncPrimaryKeyOrdering::Native)
-}
-
-pub(crate) fn primary_key_ordering_from_inventory(
-    table: &TableInventory,
-) -> Result<Vec<SyncPrimaryKeyOrdering>, TableSyncError> {
-    table
-        .primary_key
-        .iter()
-        .map(|name| {
-            let column = table
-                .columns
-                .iter()
-                .find(|column| column.name == *name)
-                .ok_or_else(|| {
-                    TableSyncError::InvalidTable(format!(
-                        "primary-key column `{name}` is absent from `{}` inventory",
-                        table.name
-                    ))
-                })?;
-            Ok(
-                match crate::sql_type::parse_enum_column_type(&column.column_type) {
-                    Some(labels) => SyncPrimaryKeyOrdering::Enum(labels),
-                    None => SyncPrimaryKeyOrdering::Native,
-                },
-            )
-        })
-        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

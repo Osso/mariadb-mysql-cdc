@@ -2,7 +2,8 @@ use crate::inventory::{
     InventoryConfig, InventoryEndpointRole, MariaDbInventoryReader, SchemaInventory,
     TableInventory, build_inventory,
 };
-use crate::{live, sync, table_sync};
+use crate::primary_key_ordering::{PrimaryKeyOrdering, primary_key_ordering_from_inventory};
+use crate::{live, sync};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder};
 use serde::{Deserialize, Serialize};
@@ -60,7 +61,7 @@ pub struct SyncableTableEntry {
     pub name: String,
     pub primary_key: Vec<String>,
     #[serde(default)]
-    pub primary_key_ordering: Vec<table_sync::SyncPrimaryKeyOrdering>,
+    pub primary_key_ordering: Vec<PrimaryKeyOrdering>,
     pub columns: Vec<String>,
     pub estimated_source_rows: u64,
     pub parent_dependencies: Vec<String>,
@@ -210,7 +211,7 @@ fn syncable_entry(
     SyncableTableEntry {
         name: table.name.clone(),
         primary_key: table.primary_key.clone(),
-        primary_key_ordering: table_sync::primary_key_ordering_from_inventory(table)
+        primary_key_ordering: primary_key_ordering_from_inventory(table)
             .expect("catalog primary-key columns exist in source inventory"),
         columns: writable_columns(table),
         estimated_source_rows: estimated_rows.get(&table.name).copied().unwrap_or(0),
@@ -2384,7 +2385,7 @@ mod tests {
         SyncableTableEntry {
             name: name.into(),
             primary_key: vec!["id".into()],
-            primary_key_ordering: vec![table_sync::SyncPrimaryKeyOrdering::Native],
+            primary_key_ordering: vec![PrimaryKeyOrdering::Native],
             columns: vec!["id".into()],
             estimated_source_rows: rows,
             parent_dependencies: parents.iter().map(|v| (*v).into()).collect(),

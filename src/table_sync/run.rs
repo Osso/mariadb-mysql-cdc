@@ -356,7 +356,8 @@ fn resolved_sync_table_config(
                 config.table.name
             ))
         })?;
-    let ordering = super::primary_key_ordering_from_inventory(source_table)?;
+    let ordering = crate::primary_key_ordering::primary_key_ordering_from_inventory(source_table)
+        .map_err(TableSyncError::InvalidTable)?;
     if !config.table.primary_key_ordering.is_empty()
         && config.table.primary_key_ordering != ordering
     {

@@ -13,6 +13,7 @@ pub mod mysql_client;
 pub mod mysql_config;
 pub mod mysql_snapshot;
 pub mod mysql_support;
+mod primary_key_ordering;
 mod probe;
 pub mod rehearsal;
 pub mod repair_drift;

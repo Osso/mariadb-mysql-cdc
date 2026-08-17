@@ -1,3 +1,4 @@
+pub(crate) use crate::primary_key_ordering::PrimaryKeyOrdering as SyncPrimaryKeyOrdering;
 use crate::snapshot::SnapshotRow;
 use serde::Serialize;
 
@@ -7,13 +8,6 @@ pub(crate) struct SyncTable {
     pub(crate) primary_key: Vec<String>,
     pub(crate) primary_key_ordering: Vec<SyncPrimaryKeyOrdering>,
     pub(crate) columns: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "labels")]
-pub(crate) enum SyncPrimaryKeyOrdering {
-    Native,
-    Enum(Vec<String>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

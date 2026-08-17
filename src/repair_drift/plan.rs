@@ -9,7 +9,8 @@ use crate::inventory::{
     build_canonical_foreign_key_inventory,
 };
 use crate::mysql_config::MySqlConnectionConfig;
-use crate::table_sync::{SyncTable, primary_key_ordering_from_inventory};
+use crate::primary_key_ordering::primary_key_ordering_from_inventory;
+use crate::table_sync::SyncTable;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) type RepairTableInputs = BTreeMap<String, (u64, u64, SyncTable)>;
