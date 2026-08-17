@@ -325,9 +325,15 @@ used. Catalog FK metadata still classifies syncable scope; it does not create
 separate child runs. `resync-stream` now uses this unified path with one captured
 source evidence set, a fixed `resync-stream:<source_identity>` run identity, and
 no legacy repair phases or post-write target-inventory drift scan.
-`recover-lost-binlog` remains a separate legacy migration. The non-syncable
-catalog is classification/operator input only; full-dump execution is out of
-scope.
+`recover-lost-binlog` now uses the same staged engine with one captured source
+evidence set and exact `recovery_id` progress across every source table. Prepared
+evidence is source-only. Recovery proof requires complete exact run/table
+progress plus an unchanged source scope; it does not capture a target final
+inventory or run a post-write drift scan. The stream lease, authorization,
+checkpoint/barrier revalidation, and atomic recovery transaction remain in
+place. This documents code behavior only; deployment and production execution
+are not claimed. The non-syncable catalog is classification/operator input only;
+full-dump execution is out of scope.
 
 ## TLS policy
 

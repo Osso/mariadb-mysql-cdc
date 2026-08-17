@@ -116,39 +116,36 @@ duplicate allowlists.
 when the live checkpoint names purged MariaDB history. JSON authorization binds
 one recovery ID to the exact old checkpoint and exact journal barrier; source
 identity and checkpoint name must also match the configured stream. The command
-computes the current complete source scope hash and rejects non-InnoDB source
-tables. Recovery data repair covers every current source-scope table even when
-target-only base tables exist; generic `repair-drift` remains strict about its
-source/target inventory contract.
+captures one complete source scope hash and rejects non-InnoDB source tables.
 
 The command acquires the stream lease and captures the current MariaDB binlog
-coordinate with ordinary non-locking reads. It does not execute `FLUSH TABLES
-WITH READ LOCK`, `UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and
-does not keep a cross-table repeatable-read transaction open. Source schema
-and row reconciliation use normally committed reads for the attempt's actual
-scope. Commits after the captured coordinate remain in the binlog and are
-replayed by the stream after recovery advances the checkpoint.
+coordinate plus one committed `SchemaSourceEvidence` set with ordinary
+non-locking reads. It does not execute `FLUSH TABLES WITH READ LOCK`,
+`UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and does not keep
+a cross-table repeatable-read transaction open. The captured evidence is reused
+by one unified staged sync for every source table with run ID `recovery_id`,
+parallelism `1`, and `cdc.sync_runs` progress. Unified sync owns prerequisite
+schema convergence, target-WRITE-locked source-authoritative row chunks, durable
+stage/table progress, and final constraint convergence. Commits after the
+captured coordinate remain in the binlog and are replayed by the stream after
+recovery advances the checkpoint.
 
-A prepared immutable recovery record links old state, the captured coordinate,
-source, the attempt's actual scope, operator, reason, and evidence. Before
-source-scoped data repair, pre-repair convergence may add only required source
-tables, columns, primary keys, and indexes; it performs no `DROP`, target-only
-table removal, foreign-key convergence, or CHECK-constraint convergence. After
-data repair, recovery-only schema convergence drops target-only
-base tables child-before-parent with normal foreign-key enforcement; cycles and
-source-table references to target-only parents fail closed. The final target
-inventory must exactly match the attempt's source inventory before one target
-transaction revalidates the exact old state, updates the checkpoint, and commits
-only the exact historical barrier supersession. A separately authorized
-replacement may atomically mark the exact prepared owner `abandoned` with
-server-generated evidence and insert a new `prepared` owner for the same exact
-checkpoint, barrier, and source identity. The replacement records its own
-current scope; its scope hash need not equal the abandoned owner's. All old
-identity, scope, and prepared evidence remain durable. Abandoned history never
-suppresses the journal barrier. Only `committed` or `verified` ownership excludes
-that exact barrier, and both are terminal. This transition skips purged source
-history; it is not replay proof and does not claim production completion until
-restart health and subsequent zero-drift verification are recorded.
+The prepared immutable recovery record retains old state, the captured
+coordinate, source scope, operator, reason, and source-only preparation
+evidence. Recovery proof requires exactly one complete progress result for each
+captured source table under the exact recovery ID, with no missing, unexpected,
+duplicate, incomplete, or mismatched rows. Before the final target transaction,
+recovery rechecks only the source scope hash; target final inventory and
+post-write drift scans are not used. A separately authorized replacement may
+atomically mark the exact prepared owner `abandoned` with server-generated
+evidence and insert a new `prepared` owner for the same exact checkpoint,
+barrier, and source identity. The replacement records its own current scope;
+its scope hash need not equal the abandoned owner's. All old identity, scope,
+and prepared evidence remain durable. Abandoned history never suppresses the
+journal barrier. Only `committed` or `verified` ownership excludes that exact
+barrier, and both are terminal. This transition skips purged source history; it
+is not replay proof and does not claim production completion until restart
+health and subsequent verification are recorded.
 
 ## Resync stream
 

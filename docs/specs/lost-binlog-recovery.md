@@ -1,6 +1,6 @@
 # Lost-binlog recovery
 
-`recover-lost-binlog` is the audited availability-first transition for a stream whose durable MariaDB binlog checkpoint names purged history. It consumes an operator JSON authorization, captures a non-locking MariaDB binlog coordinate, reconciles committed source state for the attempt's actual scope even when the target has extra base tables, then performs recovery-only schema convergence before atomically advancing only the authorized stream checkpoint and superseding only the exact historical journal barrier. Binlog events after the captured coordinate are replayed by the stream after recovery. The implementation is present on `ad-drop-trigger-lost-binlog-recovery`; production execution and post-transition verification are not claimed here. `resync-stream` is a separate path now routed through unified sync with one captured source evidence set; this spec does not claim that `recover-lost-binlog` has migrated.
+`recover-lost-binlog` is the audited availability-first transition for a stream whose durable MariaDB binlog checkpoint names purged history. It consumes an operator JSON authorization, captures one non-locking MariaDB binlog coordinate plus one committed source evidence set, then runs the unified staged sync for the exact source-table scope before atomically advancing only the authorized stream checkpoint and superseding only the exact historical journal barrier. Binlog events after the captured coordinate remain eligible for replay after recovery. The implementation is present on this branch; deployment, production execution, restart health, and post-transition verification are not claimed here.
 
 ## What it must do
 
@@ -16,16 +16,14 @@
 - [x] Acquire the stream lease before recovery state changes.
 - [x] Capture the MariaDB binlog coordinate with ordinary non-locking source reads; source recovery must not require `FLUSH TABLES WITH READ LOCK`, `UNLOCK TABLES`, `LOCK TABLES`, or `RELOAD`.
 - [x] Reconcile normally committed source rows and schema evidence without a long-lived cross-table transaction or repeatable-read snapshot.
-- [x] Begin full-scope row synchronization directly from table inventories; do not run source or target `COUNT(*)` pre-scans.
-- [x] When configured with `--parallelism`, run independent full-scope tables concurrently within delete/insert/update/verify phase barriers, never crossing foreign-key dependency levels; each worker reads from the configured source endpoint.
-- [x] Keep deterministic per-phase table progress IDs within the target's 128-byte key limit while preserving every existing ID that already fits, so resumed runs reuse prior durable state.
+- [x] Invoke one unified staged sync for every source-table in the captured inventory, using run ID `recovery_id`, parallelism `1`, and the configured `cdc.sync_runs` progress table.
 - [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
-- [x] Reconcile every current source-scope table, including target-only orphan rows; target-only target tables do not narrow the recovery data plan, and generic `repair-drift` remains strict about its source/target inventory contract.
-- [x] Before data reconciliation, converge only required repair prerequisites: add missing source tables, columns, primary keys, and indexes. This phase permits no `DROP`, target-only table removal, foreign-key convergence, or CHECK-constraint convergence.
-- [x] Run final recovery-only schema convergence after data reconciliation: drop target-only base tables child-before-parent with normal foreign-key enforcement, fail closed on cycles or source-table references to target-only parents, and converge remaining source tables and constraints.
-- [x] Require the final target base-table inventory to exactly match the source inventory before commit.
-- [x] Refuse checkpoint transition when any table is skipped, unsupported, unresolved, or the final target inventory differs from source.
-- [ ] Prove the complete live CLI path against the production-shaped full scope, including data repair before final destructive/foreign-key/CHECK convergence.
+- [x] Use the unified stages for prerequisite schema convergence, target-WRITE-locked source-authoritative chunks, durable per-stage/per-table progress, and final constraint convergence.
+- [x] Keep prepared evidence source-only: scope hash, source schema fingerprint, and source table count; no target inventory is captured for preparation proof.
+- [x] Require every expected source table to have exactly one complete progress result for the exact recovery ID; missing, unexpected, duplicate, incomplete, or differently identified rows fail closed.
+- [x] Recheck the captured source scope hash before checkpoint transition; a changed source scope blocks proof.
+- [x] Refuse checkpoint transition when unified stage execution or exact run/table progress proof fails.
+- [ ] Prove the complete live CLI path against disposable production-shaped endpoints, including checkpoint bootstrap, unified progress, restart health, and recovery proof; production execution is not claimed.
 
 ### Durable transition
 
@@ -34,7 +32,7 @@
 - [x] When a separately authorized recovery ID replaces a `prepared` owner for the exact checkpoint, barrier, and source identity, atomically mark only the old row `abandoned` with server-generated `abandoned_at` and evidence binding both recovery IDs, operator, reason, checkpoint, barrier, source identity, and both attempts' scopes, then insert the replacement `prepared` row.
 - [x] Preserve all old identity, scope, and prepared-evidence fields during abandonment; refuse committed, verified, abandoned, duplicate-ID, or checkpoint/barrier/source-mismatched owners. The replacement records its actual current scope and need not equal the abandoned owner's scope.
 - [x] Revalidate the exact checkpoint, barrier, source identity, and prepared recovery record in the target transaction; after a prepared failure, reject reuse and require a separately authorized new recovery ID.
-- [x] Require complete zero-drift schema/data proof before atomically updating the checkpoint, superseding the exact barrier, and marking the recovery `committed`.
+- [x] Require complete exact unified run/table progress proof and unchanged source scope before atomically updating the checkpoint, superseding the exact barrier, and marking the recovery `committed`.
 - [x] Preserve the historical journal row; active-barrier selection excludes only the exact committed or verified recovery identity and barrier coordinates/raw-SQL hash; abandoned history never suppresses the journal barrier.
 - [x] Roll back the transition on checkpoint/recovery commit failure.
 - [x] Fail closed on interruption or error before proof/commit: no checkpoint or barrier transition is allowed without complete proof and exact CAS revalidation; resumability is not claimed.
@@ -59,16 +57,15 @@
 - `src/lost_binlog_recovery_store.rs` — target-side CAS reads, exact-barrier owner locking, immutable prepared insert, abandoned replacement transition, checkpoint update, commit, and exact barrier exclusion.
 - `src/mysql_client.rs` — non-locking MariaDB coordinate capture.
 - `src/inventory/reader.rs` — committed source metadata reads.
-- `src/repair_drift/` — full-scope insert/update/delete and verification phases.
-- `src/sync_schema.rs` — repair-prerequisite table/column/key convergence before data repair, then final constraint convergence after repair.
+- `src/sync/orchestrate.rs`, `src/sync/run.rs`, and `src/sync/chunk.rs` — unified prerequisite schema, locked source-authoritative row chunks, durable progress, and final constraints.
+- `src/sync_schema.rs` — prerequisite and final schema-stage planning/execution.
 - `docs/stream-recovery-records-bootstrap.sql` — recovery-record table, active-barrier identity, guards, inventory procedure, and grants.
 - `docs/stream-recovery-records-abandoned-replacement-migration.sql` — target-only live-schema migration with duplicate-owner preflight and prepared-row postflight.
 
 ## Tests asserting this spec
 
-- `src/lost_binlog_recovery.rs` — phase ordering, repair-prerequisite schema before data reconciliation, target-orphan repair before schema/FK convergence, replacement owner abandonment, rollback/refusal cases, exact old-state validation, duplicate/non-advancing refusal, incomplete-proof refusal, atomic rollback, and exact historical-barrier supersession.
-- `src/repair_drift/run.rs` — deterministic per-phase table progress IDs stay within the 128-byte target key while preserving compatible existing IDs.
-- `src/sync_schema.rs` — pre-repair plans add missing columns/keys without scheduling foreign-key constraints.
+- `src/lost_binlog_recovery.rs` and `src/main/tests/lost_binlog_unified.rs` — captured source evidence reuse, unified run configuration, exact run/table progress proof, unchanged-scope proof, replacement owner abandonment, rollback/refusal cases, exact old-state validation, duplicate/non-advancing refusal, and exact historical-barrier supersession.
+- `src/sync/chunk.rs`, `src/sync/orchestrate.rs`, and `src/sync_schema.rs` — locked chunk boundaries, staged schema/row progress, and final-constraint behavior.
 - `src/lost_binlog_recovery_store.rs` — immutable prepared insert, locked CAS queries, abandoned parsing/replacement SQL, checkpoint update, committed transition, and exact barrier predicates.
 
 ## Known gaps (current cycle)
