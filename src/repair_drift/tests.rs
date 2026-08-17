@@ -16,7 +16,7 @@ use crate::mysql_support::target_mysql_opts;
 use crate::table_sync::SyncPhase;
 
 #[test]
-fn fk_aware_plan_is_available_without_lexical_guessing() {
+fn fk_aware_plan_preserves_dependency_order_and_progress_identity() {
     let inventory = RepairInventory {
         schema: "app".to_string(),
         tables: vec!["children".to_string(), "parents".to_string()],
@@ -38,7 +38,12 @@ fn fk_aware_plan_is_available_without_lexical_guessing() {
     let plan = build_fk_aware_repair_plan("run", "source", "target", &inventory, &inventory)
         .expect("fk-aware plan");
     assert_eq!(plan.insert_order, vec!["parents", "children"]);
+    assert_eq!(plan.update_order, vec!["parents", "children"]);
     assert_eq!(plan.delete_order, vec!["children", "parents"]);
+    assert_eq!(
+        (plan.inventory_hash.as_str(), plan.plan_hash.as_str()),
+        ("b083b344d5aef475", "af2d6df988bdf387")
+    );
 }
 
 #[test]
