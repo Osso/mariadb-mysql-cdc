@@ -510,8 +510,9 @@ fn column_type_is_compatible(
 /// Whether two column collations name the same converged collation.
 ///
 /// MariaDB 11.8 defaults new tables to the UCA-1400 collations, which MySQL 8 does not have, and
-/// `sync-schema` converges each to its MySQL equivalent rather than rewriting the column. Comparing
-/// the raw names here classified every recently created table as `incompatible_schema` even though
+/// the prerequisite schema stage converges each to its MySQL equivalent rather than rewriting the
+/// column. Comparing the raw names here classified every recently created table as
+/// `incompatible_schema` even though
 /// its schema had already converged, which silently excluded 40 tables from every catalog sync.
 fn collations_are_equivalent(source: Option<&str>, target: Option<&str>) -> bool {
     match (source, target) {
@@ -1138,8 +1139,8 @@ mod tests {
         );
     }
 
-    /// MariaDB 11.8 defaults new tables to UCA-1400, which `sync-schema` converges to the MySQL
-    /// spelling. Such a table is fully synced and must stay syncable.
+    /// MariaDB 11.8 defaults new tables to UCA-1400, which the prerequisite schema stage converges
+    /// to the MySQL spelling. Such a table is fully synced and must stay syncable.
     #[test]
     fn converged_uca1400_column_collations_stay_syncable() {
         let mut source_name = typed_column("name", "varchar(32)", false);
