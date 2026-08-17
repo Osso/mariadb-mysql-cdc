@@ -74,7 +74,7 @@ Both engines describe an identical converged column differently, so comparison u
 
 ## Implementation inventory
 
-- `src/sync_schema.rs` — selection, schema planning, canonical MariaDB/MySQL metadata comparison, target-data preflight, sequential execution, re-inventory, structured reporting, and CLI parsing.
+- `src/sync_schema.rs` — selection, schema planning, canonical MariaDB/MySQL metadata comparison, target-data preflight, sequential execution, re-inventory, structured reporting, CLI parsing, and reusable prerequisite/final-constraint stages for unified sync.
 - `src/inventory/reader.rs` and `src/inventory/query.rs` — optional table scope and the batched single-round-trip scoped read.
 - `src/live/ddl_semantics.rs` and `src/live/ddl_semantics/transform.rs` — sole shared MariaDB-to-MySQL DDL translation contract used by streamed replay and schema convergence.
 - `src/main.rs` — `sync-schema` command dispatch.
