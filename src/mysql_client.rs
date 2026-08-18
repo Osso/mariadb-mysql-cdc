@@ -25,6 +25,7 @@ type SharedParallelTargetWriter = Rc<
 >;
 
 mod connection;
+mod missing_foreign_key;
 mod query;
 #[cfg(test)]
 mod tests;
@@ -66,6 +67,7 @@ pub struct PersistentMySqlSource {
 #[derive(Clone)]
 pub struct PersistentTargetExecutor {
     conn: SharedTargetConnection,
+    source: Option<Rc<PersistentMySqlSource>>,
     insert_conflict_policy: InsertConflictPolicy,
     parallel_writer: Option<SharedParallelTargetWriter>,
 }
@@ -73,6 +75,26 @@ pub struct PersistentTargetExecutor {
 pub(crate) fn sync_target_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
     let builder = OptsBuilder::from_opts(target_mysql_opts(target)?);
     Ok(Opts::from(apply_default_mysql_network_bounds(builder)))
+}
+
+fn open_stream_source(
+    config: &ApplyBinlogConfig,
+) -> Result<PersistentMySqlSource, TargetExecuteError> {
+    let database =
+        config.source.database.clone().ok_or_else(|| {
+            TargetExecuteError::new("missing-FK repair requires a source database")
+        })?;
+    let source = MySqlConnectionConfig {
+        host: config.source.host.clone(),
+        port: config.source.port,
+        user: config.source.user.clone(),
+        password: config.source.password.clone(),
+        database,
+    };
+    let tls_ca_file =
+        (!config.source.tls_ca_file.is_empty()).then_some(config.source.tls_ca_file.as_str());
+    PersistentMySqlSource::new_with_tls_ca(&source, tls_ca_file)
+        .map_err(|error| TargetExecuteError::new(error.to_string()))
 }
 
 impl PersistentMySqlSource {
@@ -217,6 +239,7 @@ impl PersistentTargetExecutor {
             target_mysql_opts(&config.target).map_err(TargetExecuteError::new)?,
             InsertConflictPolicy::Error,
         )?;
+        executor.source = Some(Rc::new(open_stream_source(config)?));
         if config.target_parallel_transactions <= 1 {
             return Ok(executor);
         }
@@ -239,6 +262,7 @@ impl PersistentTargetExecutor {
         let conn = open_initialized_target_connection(opts.clone())?;
         Ok(Self {
             conn: Rc::new(RefCell::new(Some(conn))),
+            source: None,
             insert_conflict_policy,
             parallel_writer: None,
         })
@@ -323,7 +347,19 @@ impl TargetExecutor for PersistentTargetExecutor {
                 .with_parallel_writer(|writer| writer.execute_row_change(change))
                 .expect("parallel writer exists while its transaction is active");
         }
-        live_row_change_result(change.kind, self.execute_statement(&change.statement))
+        let result = self.execute_statement(&change.statement);
+        let result = match result {
+            Err(error)
+                if error.mysql_code() == Some(1452)
+                    && change.kind != TargetRowChangeKind::Delete
+                    && self.source.is_some() =>
+            {
+                self.repair_missing_foreign_key_parent(change, &error)?;
+                self.execute_statement(&change.statement)
+            }
+            result => result,
+        };
+        live_row_change_result(change.kind, result)
     }
 }
 

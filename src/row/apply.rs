@@ -171,7 +171,9 @@ fn insert_change(
     Ok(Some(TargetRowChange {
         statement: build_insert_statement(table, row),
         kind: TargetRowChangeKind::Insert,
+        schema: table.schema.clone(),
         table: table.table.clone(),
+        values: row.clone(),
     }))
 }
 
@@ -187,7 +189,9 @@ fn update_change(
     Ok(Some(TargetRowChange {
         statement,
         kind: TargetRowChangeKind::Update,
+        schema: table.schema.clone(),
         table: table.table.clone(),
+        values: update.after.clone(),
     }))
 }
 
@@ -200,7 +204,9 @@ fn delete_change(
     Ok(Some(TargetRowChange {
         statement: build_delete_statement(table, row, coordinate)?,
         kind: TargetRowChangeKind::Delete,
+        schema: table.schema.clone(),
         table: table.table.clone(),
+        values: row.clone(),
     }))
 }
 

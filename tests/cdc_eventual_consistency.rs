@@ -48,6 +48,12 @@ fn real_strict_secondary_btree_harness_smoke() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_live_missing_fk_parent_is_copied_before_child_retry() {
+    run_harness_scenario("missing-fk-parent-auto-insert");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_unified_sync_tls_harness_smoke() {
     run_harness_scenario("sync-tls");
 }

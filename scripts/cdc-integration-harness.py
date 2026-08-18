@@ -62,6 +62,7 @@ SCENARIOS = (
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("insert-duplicate-idempotent", True),
+    ScenarioSpec("missing-fk-parent-auto-insert", True),
     ScenarioSpec("parallel-target-transactions", True),
     ScenarioSpec("missing-checkpoint", True),
     ScenarioSpec("missing-trigger", True),
@@ -1023,6 +1024,71 @@ class Harness:
         print(
             "insert_duplicate_idempotent_ok mode=serial target_row=unchanged "
             "later_same_transaction_row=applied conflict_table=absent "
+            f"checkpoint={stop.file}:{stop.position}"
+        )
+
+    def run_missing_fk_parent_auto_insert(self) -> None:
+        assert self.source and self.target
+        schema = """
+            CREATE TABLE guests (
+                guest_id BIGINT NOT NULL,
+                guest_hash CHAR(32) NOT NULL,
+                label VARCHAR(64) NOT NULL,
+                PRIMARY KEY (guest_id, guest_hash)
+            ) ENGINE=InnoDB;
+            CREATE TABLE sessions (
+                session_id BIGINT NOT NULL PRIMARY KEY,
+                guest_id BIGINT NOT NULL,
+                guest_hash CHAR(32) NOT NULL,
+                payload VARCHAR(64) NOT NULL,
+                CONSTRAINT sessions_fk_sessions_guest
+                    FOREIGN KEY (guest_id, guest_hash)
+                    REFERENCES guests (guest_id, guest_hash)
+                    ON DELETE RESTRICT ON UPDATE RESTRICT
+            ) ENGINE=InnoDB;
+        """
+        self.admin_sql(self.source, schema)
+        self.admin_sql(self.target, schema)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO guests VALUES (41, '0123456789abcdef0123456789abcdef', 'source-parent');",
+        )
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO sessions VALUES "
+            "(7001, 41, '0123456789abcdef0123456789abcdef', 'child');",
+        )
+        stop = self.coordinate()
+
+        result = self.run_stream(start, stop)
+        require_success(result, "missing FK parent auto-insert stream")
+        parent = self.query(
+            self.target,
+            "SELECT guest_id,guest_hash,label FROM guests;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        child = self.query(
+            self.target,
+            "SELECT session_id,guest_id,guest_hash,payload FROM sessions;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if parent != "41\t0123456789abcdef0123456789abcdef\tsource-parent":
+            raise HarnessError(f"missing FK parent was not copied from source: {parent!r}")
+        if child != "7001\t41\t0123456789abcdef0123456789abcdef\tchild":
+            raise HarnessError(f"child row was not retried after parent copy: {child!r}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(
+            checkpoint.get("source_position", 0)
+        ) != stop.position:
+            raise HarnessError(
+                f"missing FK repair checkpoint did not reach exact stop: {checkpoint}"
+            )
+        print(
+            "missing_fk_parent_auto_insert_ok parent=guests child=sessions "
             f"checkpoint={stop.file}:{stop.position}"
         )
 
@@ -2747,6 +2813,8 @@ class Harness:
             self.run_bootstrap_contract()
         elif scenario == "insert-duplicate-idempotent":
             self.run_insert_duplicate_idempotent()
+        elif scenario == "missing-fk-parent-auto-insert":
+            self.run_missing_fk_parent_auto_insert()
         elif scenario == "parallel-target-transactions":
             self.run_parallel_target_transactions()
         elif scenario in {

@@ -1,5 +1,6 @@
 use crate::checkpoint::Checkpoint;
 use mysql::Value;
+use std::collections::BTreeMap;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -19,7 +20,9 @@ pub enum TargetRowChangeKind {
 pub struct TargetRowChange {
     pub statement: SqlStatement,
     pub kind: TargetRowChangeKind,
+    pub schema: String,
     pub table: String,
+    pub values: BTreeMap<String, Value>,
 }
 
 pub trait TargetExecutor {

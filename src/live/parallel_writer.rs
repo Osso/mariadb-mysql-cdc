@@ -303,7 +303,9 @@ mod tests {
         TargetRowChange {
             statement: insert(id),
             kind: TargetRowChangeKind::Insert,
+            schema: "globalcomix".to_string(),
             table: "events".to_string(),
+            values: [("id".to_string(), Value::UInt(id))].into_iter().collect(),
         }
     }
 
