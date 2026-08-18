@@ -1116,6 +1116,35 @@ class Harness:
     def run_parallel_target_transactions(self) -> None:
         assert self.source and self.target
         self.setup_accounts_table()
+        nested_fk_schema = """
+            CREATE TABLE utms (
+                id BIGINT NOT NULL PRIMARY KEY,
+                label VARCHAR(64) NOT NULL
+            ) ENGINE=InnoDB;
+            CREATE TABLE guests (
+                id BIGINT NOT NULL PRIMARY KEY,
+                utm_id BIGINT NOT NULL,
+                label VARCHAR(64) NOT NULL,
+                CONSTRAINT guests_fk_guests_utm_id
+                    FOREIGN KEY (utm_id) REFERENCES utms (id)
+                    ON DELETE RESTRICT ON UPDATE RESTRICT
+            ) ENGINE=InnoDB;
+            CREATE TABLE sessions (
+                id BIGINT NOT NULL PRIMARY KEY,
+                guest_id BIGINT NOT NULL,
+                payload VARCHAR(64) NOT NULL,
+                CONSTRAINT sessions_fk_sessions_guest
+                    FOREIGN KEY (guest_id) REFERENCES guests (id)
+                    ON DELETE RESTRICT ON UPDATE RESTRICT
+            ) ENGINE=InnoDB;
+        """
+        self.admin_sql(self.source, nested_fk_schema)
+        self.admin_sql(self.target, nested_fk_schema)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO utms VALUES (501, 'source-utm'); "
+            "INSERT INTO guests VALUES (41, 501, 'source-guest');",
+        )
         self.admin_sql(
             self.target,
             "INSERT INTO accounts VALUES (1, 'target@example.test', 'target-only');",
@@ -1131,7 +1160,10 @@ class Harness:
         )
         self.admin_sql(
             self.source,
-            "INSERT INTO accounts VALUES (3, 'three@example.test', 'three');",
+            "START TRANSACTION; "
+            "INSERT INTO accounts VALUES (3, 'three@example.test', 'three'); "
+            "INSERT INTO sessions VALUES (7001, 41, 'parallel-child'); "
+            "COMMIT;",
         )
         stop = self.coordinate()
 
@@ -1190,6 +1222,27 @@ class Harness:
         )
         if rows != expected:
             raise HarnessError(f"parallel target rows did not converge: {rows!r}")
+        parents = self.query(
+            self.target,
+            "SELECT u.id,u.label,g.id,g.utm_id,g.label "
+            "FROM utms u JOIN guests g ON g.utm_id=u.id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        child = self.query(
+            self.target,
+            "SELECT id,guest_id,payload FROM sessions;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if parents != "501\tsource-utm\t41\t501\tsource-guest":
+            raise HarnessError(
+                f"parallel target did not recursively copy missing parents: {parents!r}"
+            )
+        if child != "7001\t41\tparallel-child":
+            raise HarnessError(
+                f"parallel target did not retry the child after parent repair: {child!r}"
+            )
         checkpoint = self.checkpoint()
         if checkpoint.get("source_file") != stop.file or int(
             checkpoint.get("source_position", 0)
@@ -1197,7 +1250,8 @@ class Harness:
             raise HarnessError(f"parallel target checkpoint did not reach exact stop: {checkpoint}")
         print(
             "parallel_target_transactions_ok workers=2 connector=mariadb "
-            "duplicate_target_row=unchanged later_same_transaction_row=applied "
+            "duplicate_target_row=unchanged nested_missing_fk=repaired "
+            "later_same_transaction_row=applied "
             f"tls_connections={tls_connections} "
             f"checkpoint={stop.file}:{stop.position}"
         )

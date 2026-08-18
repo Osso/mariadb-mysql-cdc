@@ -26,9 +26,16 @@ INSERT is idempotent success without a target read, equality proof, replacement,
 ledger write, or repair attempt. The stream continues with later statements in
 the same source transaction.
 
-Every other native row error is returned to the transaction layer. Non-INSERT
-`1062`, foreign-key, CHECK, schema, generated-column, and connection failures
-roll back the complete source transaction and block its checkpoint.
+MySQL `1452` from a native INSERT or UPDATE invokes bounded same-schema parent
+repair. The executor resolves the exact target constraint, fetches the exact
+parent row from the source, recursively inserts the parent chain in the current
+target transaction, and retries the blocked row. Parallel workers retain the full
+row metadata and own a source connection for this lookup.
+
+Non-INSERT `1062`, unrepaired `1452`, CHECK, schema, generated-column, and
+connection failures roll back the complete source transaction and block its
+checkpoint. Repair also fails closed on absent source rows, cross-schema
+references, repeated keys, or a chain deeper than eight.
 
 `--insert-conflict-policy` is not part of unified `sync` and does not select a
 native ROW live-stream policy. Unified sync never uses `INSERT IGNORE`, upsert,

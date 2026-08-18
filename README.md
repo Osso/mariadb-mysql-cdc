@@ -160,15 +160,18 @@ maintained as upgrade paths.
 
 Native ROW streaming is source-authoritative and target-disposable. It emits plain
 INSERT statements and treats MySQL `1062` from INSERT as idempotent success,
-without target inspection, equality checks, replacement, conflict evidence, or
-repair. A skipped duplicate may leave divergent target contents; explicit
-source-authoritative convergence uses the staged `sync` operation. Every other
-row error rolls back the complete source transaction and blocks checkpoint
-advancement.
-`--target-parallel-transactions N` preserves the
-same rule by sending and draining each statement individually, leasing one target
-connection per complete source transaction, and committing checkpoints in source
-order.
+without target inspection, equality checks, replacement, or conflict evidence. A
+skipped duplicate may leave divergent target contents; explicit broad
+source-authoritative convergence uses the staged `sync` operation.
+
+MySQL `1452` from an INSERT or UPDATE resolves the exact target constraint,
+fetches the exact same-schema parent row from the source, recursively installs a
+bounded parent chain inside the current target transaction, and retries the
+blocked row. Every unrepaired row error rolls back the complete source
+transaction and blocks checkpoint advancement. `--target-parallel-transactions
+N` preserves the same rule with worker-local source connections, one leased
+target connection per complete source transaction, and source-ordered checkpoint
+commits.
 
 Conflict data remains out-of-band. Targeted conflict resolution connects to
 source and target as a separate workflow from the live stream. The live stream
@@ -176,20 +179,19 @@ neither reads nor writes the conflict ledger and
 does not validate its schema, procedures, or grants. Historical ledger
 persistence is owned by concrete `MySqlConflictLedger` in
 `src/conflict_ledger.rs` and `src/conflict_ledger/`; shared foreign-key
-canonicalization is owned by `src/canonical_foreign_key.rs`. Retired live
-supersession, target-replacement, and automatic parent-repair paths are absent
-from runtime and harness code.
+canonicalization is owned by `src/canonical_foreign_key.rs`. Live missing-parent
+repair is independent from that ledger. Retired supersession and target-replacement
+paths remain absent from runtime and harness code.
 
 The disposable MariaDB/MySQL harness covers DDL journal recovery,
 reconnect/GET_LOCK behavior, and parallel target transactions. These are local
 proofs, not live cutover proof.
 
-Deployment remains blocked pending real-MySQL/live proof, exact grant/bootstrap
-review, staged-sync convergence proof, and ops rollout gates. Ops proof still
-needs fresh immutable image tags, unique recurring run IDs, exact chunk
-verification, FK-safe ordering, CA/config-map verification, journal arguments,
-and single-writer `GET_LOCK` proof. No ops or deployment action is part of this
-worktree. The legacy `probe` text-binlog path is not a supported health check.
+Deployment runs through `deploy.sh`, which checks the repository, publishes and
+verifies an immutable image, scans it, and commits the ops image reference.
+Production parallelism is enabled separately in the ops stream manifest only
+after the focused real MariaDB/MySQL proof. The legacy `probe` text-binlog path
+is not a supported health check.
 
 ## DDL resolution
 
@@ -262,9 +264,11 @@ also rejected as unknown commands.
 
 `stream-binlog --target-parallel-transactions N` enables bounded target
 transaction submission when `N > 1`; the default `1` preserves serial execution.
-The parallel path sends and drains body statements individually, ignores delayed
-`1062` only for INSERT statements, and fails closed before checkpoint advancement
-on every other delayed target error.
+The parallel path retains each row change's schema, table, values, and operation;
+sends and drains body statements individually; ignores delayed `1062` only for
+INSERT statements; and repairs eligible `1452` failures inside the leased worker
+transaction. Later commits and checkpoints remain blocked behind any earlier
+failure.
 
 Run the disposable source-authoritative proofs with:
 
@@ -277,8 +281,9 @@ The serial scenario preloads a divergent target row, removes the conflict ledger
 and inventory procedure, and proves the duplicate leaves that row untouched while
 a later same-transaction row and exact checkpoint advance. The parallel scenario
 adds ordered-commit barriers, verifies every target session uses `SSL/TLS`, and
-proves both transactions converge only after release. Out-of-band repair scenarios
-retain the separate ledger, comparison, and FK-repair identities.
+proves nested `sessions → guests → utms` repair before exact checkpoint
+completion. Out-of-band repair scenarios retain separate ledger and comparison
+identities.
 
 ### Table catalog JSON and execution contract
 
@@ -392,7 +397,8 @@ verification when changing source transport. See [connection policy](docs/schema
 - Generic target execution treats MySQL `1062` as success only for statements
   beginning with `INSERT INTO` under `ignore-duplicate`.
 - Native ROW streaming does not use this policy. Its fixed rule accepts INSERT
-  `1062` and fails every other row error.
+  `1062`, attempts bounded source-authoritative repair for eligible `1452`, and
+  fails every other row error.
 - Unified sync is source-authoritative and uses strict insert/update/delete
   mutations; its staged progress defaults to `cdc.sync_runs`.
 

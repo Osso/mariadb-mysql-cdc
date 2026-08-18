@@ -286,27 +286,6 @@ fn stream_lease_rejects_missing_or_unacquired_lock() {
 }
 
 #[test]
-fn live_insert_duplicate_is_idempotent_success() {
-    let result = live_row_change_result(
-        TargetRowChangeKind::Insert,
-        Err(TargetExecuteError::from_mysql(1062, "duplicate")),
-    );
-
-    assert_eq!(result, Ok(()));
-}
-
-#[test]
-fn live_update_duplicate_remains_fatal() {
-    let error = live_row_change_result(
-        TargetRowChangeKind::Update,
-        Err(TargetExecuteError::from_mysql(1062, "duplicate")),
-    )
-    .expect_err("UPDATE 1062 must fail");
-
-    assert_eq!(error.mysql_code(), Some(1062));
-}
-
-#[test]
 fn builds_target_column_select_sql() {
     let sql = build_target_column_select_sql("accounts");
 

@@ -1,5 +1,9 @@
 use crate::checkpoint::Checkpoint;
-use crate::target::{TargetExecuteError, TargetRowChangeKind};
+use crate::mysql_client::missing_foreign_key::{
+    MissingForeignKeyParent, MissingForeignKeyRepairExecutor,
+    execute_row_change_with_missing_foreign_key_repair,
+};
+use crate::target::{TargetExecuteError, TargetRowChange, render_submitted_sql_statement};
 use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -11,6 +15,14 @@ pub(crate) trait SubmittedQueryConnection {
 
     /// Drains every result belonging to the most recently submitted query.
     fn read_query_result(&mut self) -> Result<(), TargetExecuteError>;
+
+    fn load_missing_foreign_key_parent(
+        &mut self,
+        _change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
+        Err(error.clone())
+    }
 }
 
 pub(crate) trait SubmittedQueryConnectionFactory: Clone + Send + Sync + 'static {
@@ -19,25 +31,10 @@ pub(crate) trait SubmittedQueryConnectionFactory: Clone + Send + Sync + 'static 
     fn open(&self) -> Result<Self::Connection, TargetExecuteError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ParallelTargetStatementKind {
-    Insert,
-    Other,
-}
-
-impl From<TargetRowChangeKind> for ParallelTargetStatementKind {
-    fn from(kind: TargetRowChangeKind) -> Self {
-        match kind {
-            TargetRowChangeKind::Insert => Self::Insert,
-            TargetRowChangeKind::Update | TargetRowChangeKind::Delete => Self::Other,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ParallelTargetStatement {
-    pub(super) sql: String,
-    pub(super) kind: ParallelTargetStatementKind,
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum ParallelTargetStatement {
+    RowChange(TargetRowChange),
+    Sql(String),
 }
 
 #[derive(Clone, Debug)]
@@ -566,16 +563,55 @@ where
 {
     connection.read_query_result()?;
     for statement in statements {
-        connection.send_query(&statement.sql)?;
-        match connection.read_query_result() {
-            Ok(()) => {}
-            Err(error)
-                if statement.kind == ParallelTargetStatementKind::Insert
-                    && error.mysql_code() == Some(1062) => {}
-            Err(error) => return Err(error),
-        }
+        drain_target_statement(connection, statement)?;
     }
     Ok(())
+}
+
+fn drain_target_statement<C>(
+    connection: &mut C,
+    statement: &ParallelTargetStatement,
+) -> Result<(), TargetExecuteError>
+where
+    C: SubmittedQueryConnection,
+{
+    match statement {
+        ParallelTargetStatement::RowChange(change) => {
+            let mut executor = SubmittedRowChangeExecutor { connection };
+            execute_row_change_with_missing_foreign_key_repair(&mut executor, change)
+        }
+        ParallelTargetStatement::Sql(sql) => {
+            connection.send_query(sql)?;
+            connection.read_query_result()
+        }
+    }
+}
+
+struct SubmittedRowChangeExecutor<'a, C> {
+    connection: &'a mut C,
+}
+
+impl<C> MissingForeignKeyRepairExecutor for SubmittedRowChangeExecutor<'_, C>
+where
+    C: SubmittedQueryConnection,
+{
+    fn execute_row_change_statement(
+        &mut self,
+        change: &TargetRowChange,
+    ) -> Result<(), TargetExecuteError> {
+        let sql = render_submitted_sql_statement(&change.statement)?;
+        self.connection.send_query(&sql)?;
+        self.connection.read_query_result()
+    }
+
+    fn load_missing_foreign_key_parent(
+        &mut self,
+        change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
+        self.connection
+            .load_missing_foreign_key_parent(change, error)
+    }
 }
 
 fn rollback_failed_transaction<C>(

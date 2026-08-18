@@ -16,7 +16,10 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 ### Other row errors
 
 - [x] Propagate MySQL `1062` from ROW `UPDATE` or `DELETE`.
-- [x] Propagate every non-`1062` row error, including foreign-key, CHECK, schema, connection, and generated-column failures.
+- [x] On MySQL `1452` from ROW `INSERT` or `UPDATE`, resolve the exact target constraint and fetch the exact same-schema parent row from the source.
+- [x] Insert and recursively repair the parent chain inside the current target transaction, then retry the blocked row.
+- [x] Bound repair to eight active parent edges and fail on a repeated repair key.
+- [x] Propagate unrepaired `1452` and every other row error, including CHECK, schema, connection, and generated-column failures.
 - [x] Roll back the complete source transaction after a propagated row error.
 - [x] Do not commit or advance the transaction checkpoint after a propagated row error.
 
@@ -30,7 +33,9 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 - [x] Keep `--target-parallel-transactions 1` serial.
 - [x] With `N > 1`, lease one target connection per complete source transaction.
-- [x] Send and drain parallel body statements individually so only INSERT `1062` can be ignored and later statements can continue.
+- [x] Preserve the full `TargetRowChange` through delayed worker execution.
+- [x] Give each parallel worker its own source connection and perform parent inserts on the leased target transaction.
+- [x] Send and drain parallel body statements individually so INSERT `1062` can be ignored, `1452` can be repaired, and later statements can continue only after success.
 - [x] Commit parallel transactions and checkpoints in source order.
 - [x] Stop later commits and checkpoint advancement when an earlier body or commit fails.
 
@@ -38,7 +43,7 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 - [x] Keep staged `sync`, targeted conflict resolution, and historical `cdc.row_conflicts` data independent from live streaming.
 - [x] Do not require `cdc.row_conflicts`, its trigger inventory procedure, or its grants to start the live stream.
-- [x] Exclude retired live conflict, supersession, and automatic parent-recovery scenarios from the integration harness.
+- [x] Keep missing-parent repair source-authoritative and independent from conflict-ledger evidence.
 
 ## How it works
 
@@ -50,9 +55,11 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 - `src/row/apply.rs` — maps ROW events to typed target row changes.
 - `src/row/sql.rs` — builds plain INSERT, before-key UPDATE, and key DELETE SQL.
-- `src/mysql_client.rs` — applies the serial INSERT-only `1062` rule.
-- `src/live/parallel_target.rs` — drains parallel statements with operation metadata.
-- `src/live/parallel_writer.rs` — preserves connection leasing and source-ordered commits.
+- `src/mysql_client.rs` — applies serial ROW outcomes and creates parallel workers.
+- `src/mysql_client/missing_foreign_key.rs` — resolves exact parents and enforces recursive depth/cycle bounds.
+- `src/live/parallel_target.rs` — drains row changes with delayed error handling and source-ordered commits.
+- `src/live/parallel_writer.rs` — preserves full row metadata through worker submission.
+- `src/live/submitted_mysql.rs` — owns each worker's submitted target connection, source connection, and lazy target-metadata connection.
 - `src/live/structured_stream/transaction.rs` — owns transaction rollback and checkpoint boundaries.
 - `src/live/ddl_replay_journal/` — validates only live checkpoint and DDL-journal runtime contracts.
 
@@ -64,14 +71,12 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - `src/live/structured_stream/tests/transaction.rs`
 - `tests/cdc_eventual_consistency.rs`
 
-## Known gaps (current cycle)
+## Focused proof
 
-- [x] Prove the INSERT `1062` continuation contract against disposable real
-      MariaDB/MySQL endpoints in serial and parallel modes; the harness keeps
-      live source-authoritative replay separate from out-of-band conflict repair.
+- `parallel-target-transactions` exercises concurrent real MariaDB/MySQL transactions, nested `sessions → guests → utms` repair, the ordered commit barrier, INSERT `1062` continuation, TLS, and exact checkpoint completion.
+- Parallel pool tests prove a later prepared transaction cannot commit or publish a checkpoint after an earlier body failure.
 
 ## Out of scope
 
-- Deployment or production mutation.
-- Target-row equality checks, merge semantics, automatic replacement, or live parent repair.
+- Target-row equality checks, merge semantics, or automatic replacement.
 - Deleting historical conflict records or removing out-of-band repair commands.

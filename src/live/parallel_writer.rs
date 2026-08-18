@@ -1,6 +1,6 @@
 use super::parallel_target::{
-    ParallelTargetStatement, ParallelTargetStatementKind, ParallelTargetTransaction,
-    ParallelTransactionPool, SubmittedQueryConnectionFactory,
+    ParallelTargetStatement, ParallelTargetTransaction, ParallelTransactionPool,
+    SubmittedQueryConnectionFactory,
 };
 use crate::checkpoint::Checkpoint;
 use crate::target::{
@@ -51,14 +51,22 @@ where
     }
 
     pub(crate) fn execute(&mut self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
-        self.buffer_statement(statement, ParallelTargetStatementKind::Other)
+        let sql = render_submitted_sql_statement(statement)?;
+        self.active_mut()?
+            .statements
+            .push(ParallelTargetStatement::Sql(sql));
+        Ok(())
     }
 
     pub(crate) fn execute_row_change(
         &mut self,
         change: &TargetRowChange,
     ) -> Result<(), TargetExecuteError> {
-        self.buffer_statement(&change.statement, change.kind.into())
+        render_submitted_sql_statement(&change.statement)?;
+        self.active_mut()?
+            .statements
+            .push(ParallelTargetStatement::RowChange(change.clone()));
+        Ok(())
     }
 
     pub(crate) fn logical_checkpoint(&self) -> Checkpoint {
@@ -138,18 +146,6 @@ where
 
     pub(crate) fn is_active(&self) -> bool {
         self.active.is_some()
-    }
-
-    fn buffer_statement(
-        &mut self,
-        statement: &SqlStatement,
-        kind: ParallelTargetStatementKind,
-    ) -> Result<(), TargetExecuteError> {
-        let sql = render_submitted_sql_statement(statement)?;
-        self.active_mut()?
-            .statements
-            .push(ParallelTargetStatement { sql, kind });
-        Ok(())
     }
 
     fn active_mut(&mut self) -> Result<&mut BufferedTargetTransaction, TargetExecuteError> {

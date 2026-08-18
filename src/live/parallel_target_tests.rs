@@ -1,9 +1,9 @@
 use super::{
-    ParallelTargetStatement, ParallelTargetStatementKind, ParallelTargetTransaction,
-    ParallelTransactionPool, SubmittedQueryConnection, SubmittedQueryConnectionFactory,
+    ParallelTargetStatement, ParallelTargetTransaction, ParallelTransactionPool,
+    SubmittedQueryConnection, SubmittedQueryConnectionFactory,
 };
 use crate::checkpoint::{Checkpoint, LastEvent};
-use crate::target::TargetExecuteError;
+use crate::target::{SqlStatement, TargetExecuteError, TargetRowChange, TargetRowChangeKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -266,18 +266,75 @@ fn body_failure_rolls_back_after_submission_without_committing() {
 }
 
 #[test]
+fn earlier_body_failure_blocks_later_prepared_commit_and_checkpoint() {
+    let (factory, submitted, reads) = fake_factory();
+    let failed_reads = Arc::clone(&factory.failed_reads);
+    let mut pool = ParallelTransactionPool::new(2, factory).expect("create pool");
+
+    pool.submit(transaction(100))
+        .expect("submit first transaction");
+    let (first_connection, first_begin) = receive_submission(&submitted);
+    assert_eq!(first_begin, "BEGIN");
+    failed_reads.lock().expect("lock failed reads").insert(
+        (first_connection, 1),
+        ReadFailure::generic("injected earlier body failure"),
+    );
+
+    pool.submit(transaction(200))
+        .expect("submit second transaction");
+    let (second_connection, second_begin) = receive_submission(&submitted);
+    assert_eq!(second_begin, "BEGIN");
+    assert_ne!(second_connection, first_connection);
+
+    release_read(&reads, second_connection, 0);
+    assert_eq!(
+        receive_submission(&submitted),
+        (
+            second_connection,
+            "INSERT INTO events VALUES (200)".to_string()
+        )
+    );
+    release_read(&reads, second_connection, 1);
+    pool.wait_for_event()
+        .expect("record later transaction prepared");
+    assert!(submitted.recv_timeout(Duration::from_millis(50)).is_err());
+
+    release_read(&reads, first_connection, 0);
+    assert_eq!(
+        receive_submission(&submitted),
+        (
+            first_connection,
+            "INSERT INTO events VALUES (100)".to_string()
+        )
+    );
+    release_read(&reads, first_connection, 1);
+    assert_eq!(
+        receive_submission(&submitted),
+        (first_connection, "ROLLBACK".to_string())
+    );
+    release_read(&reads, first_connection, 2);
+
+    let error = pool
+        .wait_for_all()
+        .expect_err("earlier failure must stop ordered commits");
+
+    assert!(error.to_string().contains("failed before commit"));
+    assert!(submitted.recv_timeout(Duration::from_millis(50)).is_err());
+}
+
+#[test]
 fn insert_duplicate_result_continues_to_later_statement_and_commits() {
     let statements = [
         transaction_statement(
-            ParallelTargetStatementKind::Insert,
+            TargetRowChangeKind::Insert,
             "INSERT INTO events VALUES (100)",
         ),
         transaction_statement(
-            ParallelTargetStatementKind::Other,
+            TargetRowChangeKind::Update,
             "UPDATE events SET processed = 1 WHERE id = 100",
         ),
     ];
-    let duplicate_read = statement_read_index(&statements, ParallelTargetStatementKind::Insert);
+    let duplicate_read = statement_read_index(&statements, TargetRowChangeKind::Insert);
     let (factory, submitted, reads) =
         fake_factory_with_mysql_read_failure((0, duplicate_read), 1062);
     release_reads(&reads, 0, 0..=3);
@@ -313,15 +370,15 @@ fn insert_duplicate_result_continues_to_later_statement_and_commits() {
 fn non_insert_duplicate_stops_before_later_statement_and_commit() {
     let statements = [
         transaction_statement(
-            ParallelTargetStatementKind::Other,
+            TargetRowChangeKind::Update,
             "UPDATE events SET processed = 1 WHERE id = 100",
         ),
         transaction_statement(
-            ParallelTargetStatementKind::Insert,
+            TargetRowChangeKind::Insert,
             "INSERT INTO events VALUES (200)",
         ),
     ];
-    let duplicate_read = statement_read_index(&statements, ParallelTargetStatementKind::Other);
+    let duplicate_read = statement_read_index(&statements, TargetRowChangeKind::Update);
     let (factory, submitted, reads) =
         fake_factory_with_mysql_read_failure((0, duplicate_read), 1062);
     release_reads(&reads, 0, 0..=3);
@@ -402,20 +459,28 @@ fn fake_factory_with_failures(
     )
 }
 
-fn transaction_statement(kind: ParallelTargetStatementKind, sql: &str) -> ParallelTargetStatement {
-    ParallelTargetStatement {
-        sql: sql.to_string(),
+fn transaction_statement(kind: TargetRowChangeKind, sql: &str) -> ParallelTargetStatement {
+    ParallelTargetStatement::RowChange(TargetRowChange {
+        statement: SqlStatement {
+            sql: sql.to_string(),
+            params: Vec::new(),
+        },
         kind,
-    }
+        schema: "globalcomix".to_string(),
+        table: "events".to_string(),
+        values: BTreeMap::new(),
+    })
 }
 
 fn statement_read_index(
     statements: &[ParallelTargetStatement],
-    kind: ParallelTargetStatementKind,
+    kind: TargetRowChangeKind,
 ) -> usize {
     statements
         .iter()
-        .position(|statement| statement.kind == kind)
+        .position(|statement| {
+            matches!(statement, ParallelTargetStatement::RowChange(change) if change.kind == kind)
+        })
         .expect("fixture contains statement kind")
         + 1
 }
@@ -449,10 +514,7 @@ fn transaction(position: u64) -> ParallelTargetTransaction {
     let sql = format!("INSERT INTO events VALUES ({position})");
     transaction_with_statements(
         position,
-        &[transaction_statement(
-            ParallelTargetStatementKind::Insert,
-            &sql,
-        )],
+        &[transaction_statement(TargetRowChangeKind::Insert, &sql)],
     )
 }
 

@@ -54,6 +54,12 @@ fn real_live_missing_fk_parent_is_copied_before_child_retry() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_parallel_target_repairs_nested_missing_fk_parents() {
+    run_harness_scenario("parallel-target-transactions");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_unified_sync_tls_harness_smoke() {
     run_harness_scenario("sync-tls");
 }

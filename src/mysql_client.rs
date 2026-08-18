@@ -7,8 +7,7 @@ use crate::mysql_support::{
     apply_default_mysql_network_bounds, apply_mysql_connection_liveness, target_mysql_opts,
 };
 use crate::target::{
-    SqlStatement, TargetExecuteError, TargetExecutor, TargetRowChange, TargetRowChangeKind,
-    TransactionalTargetExecutor,
+    SqlStatement, TargetExecuteError, TargetExecutor, TargetRowChange, TransactionalTargetExecutor,
 };
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Params};
@@ -25,7 +24,7 @@ type SharedParallelTargetWriter = Rc<
 >;
 
 mod connection;
-mod missing_foreign_key;
+pub(crate) mod missing_foreign_key;
 mod query;
 #[cfg(test)]
 mod tests;
@@ -77,7 +76,7 @@ pub(crate) fn sync_target_opts(target: &TargetMySqlConfig) -> Result<Opts, Strin
     Ok(Opts::from(apply_default_mysql_network_bounds(builder)))
 }
 
-fn open_stream_source(
+pub(crate) fn open_stream_source(
     config: &ApplyBinlogConfig,
 ) -> Result<PersistentMySqlSource, TargetExecuteError> {
     let database =
@@ -205,7 +204,7 @@ fn required_binlog_coordinate_value(
         })
 }
 
-fn open_initialized_target_connection(opts: Opts) -> Result<Conn, TargetExecuteError> {
+pub(crate) fn open_initialized_target_connection(opts: Opts) -> Result<Conn, TargetExecuteError> {
     let mut conn = open_conn(opts).map_err(target_connect_error)?;
     conn.query_drop(crate::live::target_session_init_command())
         .map_err(target_query_error)?;
@@ -239,13 +238,12 @@ impl PersistentTargetExecutor {
             target_mysql_opts(&config.target).map_err(TargetExecuteError::new)?,
             InsertConflictPolicy::Error,
         )?;
-        executor.source = Some(Rc::new(open_stream_source(config)?));
         if config.target_parallel_transactions <= 1 {
+            executor.source = Some(Rc::new(open_stream_source(config)?));
             return Ok(executor);
         }
         let initial_checkpoint = parallel_initial_checkpoint(config);
-        let factory =
-            crate::live::submitted_mysql::MariaDbSubmittedQueryFactory::new(&config.target);
+        let factory = crate::live::submitted_mysql::MariaDbSubmittedQueryFactory::new(config);
         let writer = crate::live::parallel_writer::ParallelTargetWriter::new(
             config.target_parallel_transactions,
             factory,
@@ -332,6 +330,27 @@ impl PersistentTargetExecutor {
     }
 }
 
+struct SerialRowChangeExecutor<'a> {
+    target: &'a PersistentTargetExecutor,
+}
+
+impl missing_foreign_key::MissingForeignKeyRepairExecutor for SerialRowChangeExecutor<'_> {
+    fn execute_row_change_statement(
+        &mut self,
+        change: &TargetRowChange,
+    ) -> Result<(), TargetExecuteError> {
+        self.target.execute_statement(&change.statement)
+    }
+
+    fn load_missing_foreign_key_parent(
+        &mut self,
+        change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<missing_foreign_key::MissingForeignKeyParent, TargetExecuteError> {
+        self.target.load_missing_foreign_key_parent(change, error)
+    }
+}
+
 impl TargetExecutor for PersistentTargetExecutor {
     fn execute(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
         let result = self.execute_statement(statement);
@@ -347,19 +366,11 @@ impl TargetExecutor for PersistentTargetExecutor {
                 .with_parallel_writer(|writer| writer.execute_row_change(change))
                 .expect("parallel writer exists while its transaction is active");
         }
-        let result = self.execute_statement(&change.statement);
-        let result = match result {
-            Err(error)
-                if error.mysql_code() == Some(1452)
-                    && change.kind != TargetRowChangeKind::Delete
-                    && self.source.is_some() =>
-            {
-                self.repair_missing_foreign_key_parent(change, &error)?;
-                self.execute_statement(&change.statement)
-            }
-            result => result,
-        };
-        live_row_change_result(change.kind, result)
+        let mut executor = SerialRowChangeExecutor { target: self };
+        missing_foreign_key::execute_row_change_with_missing_foreign_key_repair(
+            &mut executor,
+            change,
+        )
     }
 }
 
@@ -462,18 +473,6 @@ impl TransactionalTargetExecutor for PersistentTargetExecutor {
 
     fn uses_parallel_transactions(&self) -> bool {
         self.parallel_writer.is_some()
-    }
-}
-
-fn live_row_change_result(
-    kind: TargetRowChangeKind,
-    result: Result<(), TargetExecuteError>,
-) -> Result<(), TargetExecuteError> {
-    match result {
-        Err(error) if error.mysql_code() == Some(1062) && kind == TargetRowChangeKind::Insert => {
-            Ok(())
-        }
-        result => result,
     }
 }
 

@@ -26,15 +26,23 @@ returns MySQL `1062` is treated as idempotent success. The stream does not read,
 compare, replace, or repair the target row and does not write conflict-ledger
 evidence. Later statements in the same source transaction continue.
 
+MySQL `1452` from an INSERT or UPDATE triggers bounded source-authoritative
+parent repair. The worker resolves the exact target constraint, fetches the exact
+same-schema parent row from the source, recursively installs any missing parent
+chain inside the same target transaction, and retries the blocked row. A missing
+source row, cross-schema reference, repeated repair key, depth beyond eight,
+metadata failure, or unsuccessful retry is transaction-fatal.
+
 Every other row error is transaction-fatal. This includes non-`INSERT` `1062`,
-foreign-key and CHECK failures, schema mismatches that reach execution, connection
-errors, and generated-column failures. The target transaction rolls back and its
-checkpoint does not advance.
+`1452` that cannot be repaired, CHECK failures, schema mismatches that reach
+execution, connection errors, and generated-column failures. The target
+transaction rolls back and its checkpoint does not advance.
 
 `--insert-conflict-policy` does not change native ROW streaming behavior. Live
-supersession, conflict-ledger, target-equality, row-replacement, and automatic
-parent-recovery paths do not exist. Explicit source-authoritative convergence
-uses the staged `sync` operation separately from live streaming.
+supersession, conflict-ledger, target-equality, and row-replacement paths do not
+exist. Missing-parent repair neither reads nor writes conflict-ledger evidence;
+explicit broad source-authoritative convergence remains the staged `sync`
+operation.
 
 Primary-key values are extracted from the table map's primary-key columns. A row
 event with no table map, no primary key, or a missing primary-key value fails

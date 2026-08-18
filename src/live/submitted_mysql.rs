@@ -1,9 +1,17 @@
 use super::parallel_target::{SubmittedQueryConnection, SubmittedQueryConnectionFactory};
-use super::{TargetMySqlConfig, target_session_init_command};
+use super::{ApplyBinlogConfig, TargetMySqlConfig, target_session_init_command};
+use crate::mysql_client::missing_foreign_key::{
+    MissingForeignKeyParent, query_foreign_key_reference, source_missing_foreign_key_parent,
+};
+use crate::mysql_client::{
+    PersistentMySqlSource, open_initialized_target_connection, open_stream_source,
+};
 use crate::mysql_support::{
     DEFAULT_MYSQL_CONNECT_TIMEOUT, DEFAULT_MYSQL_READ_TIMEOUT, DEFAULT_MYSQL_WRITE_TIMEOUT,
+    target_mysql_opts,
 };
-use crate::target::TargetExecuteError;
+use crate::target::{TargetExecuteError, TargetRowChange};
+use mysql::Conn;
 use mysqlclient_sys::mysql_option::{
     MYSQL_OPT_CONNECT_TIMEOUT, MYSQL_OPT_READ_TIMEOUT, MYSQL_OPT_SSL_CA, MYSQL_OPT_SSL_ENFORCE,
     MYSQL_OPT_SSL_VERIFY_SERVER_CERT, MYSQL_OPT_WRITE_TIMEOUT,
@@ -20,11 +28,11 @@ static CONNECTOR_LIBRARY_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[derive(Clone)]
 pub(crate) struct MariaDbSubmittedQueryFactory {
-    config: TargetMySqlConfig,
+    config: ApplyBinlogConfig,
 }
 
 impl MariaDbSubmittedQueryFactory {
-    pub(crate) fn new(config: &TargetMySqlConfig) -> Self {
+    pub(crate) fn new(config: &ApplyBinlogConfig) -> Self {
         Self {
             config: config.clone(),
         }
@@ -41,6 +49,9 @@ impl SubmittedQueryConnectionFactory for MariaDbSubmittedQueryFactory {
 
 pub(crate) struct MariaDbSubmittedQueryConnection {
     raw: NonNull<mysqlclient_sys::MYSQL>,
+    source: PersistentMySqlSource,
+    target_config: TargetMySqlConfig,
+    target_metadata: Option<Conn>,
 }
 
 struct MariaDbConnectionParameters {
@@ -66,10 +77,11 @@ impl MariaDbConnectionParameters {
 }
 
 impl MariaDbSubmittedQueryConnection {
-    fn open(config: &TargetMySqlConfig) -> Result<Self, TargetExecuteError> {
+    fn open(config: &ApplyBinlogConfig) -> Result<Self, TargetExecuteError> {
         initialize_connector_library()?;
-        let parameters = MariaDbConnectionParameters::from_config(config)?;
-        let mut connection = Self::initialize()?;
+        let source = open_stream_source(config)?;
+        let parameters = MariaDbConnectionParameters::from_config(&config.target)?;
+        let mut connection = Self::initialize(source, config.target.clone())?;
         connection.configure_network_and_tls(&parameters.ca_file)?;
         connection.connect(&parameters)?;
         connection.require_tls()?;
@@ -78,7 +90,10 @@ impl MariaDbSubmittedQueryConnection {
         Ok(connection)
     }
 
-    fn initialize() -> Result<Self, TargetExecuteError> {
+    fn initialize(
+        source: PersistentMySqlSource,
+        target_config: TargetMySqlConfig,
+    ) -> Result<Self, TargetExecuteError> {
         let raw = NonNull::new(unsafe { mysqlclient_sys::mysql_init(ptr::null_mut()) });
         let Some(raw) = raw else {
             unsafe { mysqlclient_sys::mysql_thread_end() };
@@ -86,7 +101,12 @@ impl MariaDbSubmittedQueryConnection {
                 "failed to initialize target MariaDB client",
             ));
         };
-        Ok(Self { raw })
+        Ok(Self {
+            raw,
+            source,
+            target_config,
+            target_metadata: None,
+        })
     }
 
     fn configure_network_and_tls(&mut self, ca_file: &CString) -> Result<(), TargetExecuteError> {
@@ -211,6 +231,17 @@ impl MariaDbSubmittedQueryConnection {
         self.read_query_result()
     }
 
+    fn target_metadata_connection(&mut self) -> Result<&mut Conn, TargetExecuteError> {
+        if self.target_metadata.is_none() {
+            let opts = target_mysql_opts(&self.target_config).map_err(TargetExecuteError::new)?;
+            let connection = open_initialized_target_connection(opts)?;
+            self.target_metadata = Some(connection);
+        }
+        self.target_metadata.as_mut().ok_or_else(|| {
+            TargetExecuteError::new("parallel target metadata connection is unavailable")
+        })
+    }
+
     fn consume_current_result(&mut self) -> Result<(), TargetExecuteError> {
         let result = unsafe { mysqlclient_sys::mysql_store_result(self.raw.as_ptr()) };
         if !result.is_null() {
@@ -267,6 +298,18 @@ impl SubmittedQueryConnection for MariaDbSubmittedQueryConnection {
                 _ => return Err(self.error("read next query result")),
             }
         }
+    }
+
+    fn load_missing_foreign_key_parent(
+        &mut self,
+        change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
+        let reference = {
+            let target = self.target_metadata_connection()?;
+            query_foreign_key_reference(target, change, error)?
+        };
+        source_missing_foreign_key_parent(&self.source, change, &reference)
     }
 }
 
