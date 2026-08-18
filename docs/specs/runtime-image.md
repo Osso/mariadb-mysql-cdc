@@ -19,7 +19,7 @@ The production binary is packaged in a fixed, minimal Ubuntu runtime independent
 
 - [x] Build the final runtime from the Dockerfile's fixed base; no `BASE_IMAGE` argument or environment variable selects the runtime.
 - [x] Keep the direct image build compatible with Docker BuildKit cache mounts used by the Rust builder.
-- [x] Require `IMAGE_REPO` for `deploy.sh` while allowing the existing tag, Depot project, ops checkout, check, and push controls.
+- [x] Require `IMAGE_REPO` for `deploy.sh`; retain the optional tag, `DEPOT_PROJECT_ID` (default `jnnl97r4s7`), `OPS_REPO` (default `../ops`), `SKIP_VERIFIED_CHECKS`, and `PUSH_OPS=0` controls.
 - [x] Unless `SKIP_VERIFIED_CHECKS=1`, run `cargo fmt --check`, the repository `./run-tests.sh` path, and Clippy with warnings denied before building. The repository test path runs both `cargo test` and `python3 -m unittest tests/test_deploy_script.py`.
 - [x] Do not forward a `BASE_IMAGE` build argument to Depot.
 - [x] After Depot publishes the candidate tag, resolve its immutable digest with `docker buildx imagetools inspect --format '{{.Manifest.Digest}}'`, reject an invalid digest, and pull the exact `tag@digest`.

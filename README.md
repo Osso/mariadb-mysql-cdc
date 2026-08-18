@@ -49,7 +49,9 @@ IMAGE_REPO=registry.example/mariadb-mysql-cdc ./deploy.sh [TAG]
 
 The runtime base is fixed by digest in the Dockerfile; there is no `BASE_IMAGE`
 build contract. `OPS_REPO` is optional and defaults to the sibling `../ops`
-checkout.
+checkout. `DEPOT_PROJECT_ID` optionally selects the Depot project and defaults
+to `jnnl97r4s7`; `PUSH_OPS=0` keeps the verified ops commit local instead of
+pushing it.
 
 Unless `SKIP_VERIFIED_CHECKS=1`, `deploy.sh` runs formatting, the repository
 `./run-tests.sh` path, and Clippy before building. The repository test path runs
