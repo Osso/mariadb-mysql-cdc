@@ -20,23 +20,51 @@ target with minimal downtime.
 Parallel target submission uses MariaDB Connector/C through `mysqlclient-sys` so
 query send and result completion remain separate operations. Local builds require
 `pkg-config` plus MariaDB client development files. The Docker builder installs
-`libmariadb-dev`; the selected runtime `BASE_IMAGE` must provide
-`libmariadb.so.3`.
+`libmariadb-dev`; the Ubuntu 24.04 runtime is pinned to a verified OCI index
+digest, upgrades installed packages during the build, and installs only CA
+certificates and the libraries required by the built binary, including
+`libmariadb3`.
+
+## Runtime image verification
+
+Build and behaviorally verify a local candidate without publishing it:
+
+```sh
+docker build --tag mariadb-mysql-cdc:runtime-test .
+python3 tests/verify_runtime_image.py mariadb-mysql-cdc:runtime-test
+```
+
+The verifier checks the built image rather than Dockerfile text: Ubuntu 24.04,
+fixed numeric UID/GID `65532:65532`, direct entrypoint execution, CA certificates,
+readability of a read-only mounted CA file under the runtime identity, required
+packages and linked libraries, and absence of `gosu`.
 
 ## Deployment
 
-`deploy.sh` requires `IMAGE_REPO` and `BASE_IMAGE`:
+`deploy.sh` requires only `IMAGE_REPO`:
 
 ```sh
-IMAGE_REPO=registry.example/mariadb-mysql-cdc \
-BASE_IMAGE=registry.example/mariadb:tag \
-./deploy.sh [TAG]
+IMAGE_REPO=registry.example/mariadb-mysql-cdc ./deploy.sh [TAG]
 ```
 
-`OPS_REPO` is optional and defaults to the sibling `../ops` checkout. The script
-passes `BASE_IMAGE` to Docker as a build argument for the runtime image, then
-updates and commits only the live stream manifest. Unified sync Jobs are reviewed
-and managed separately; `deploy.sh` does not create or update them.
+The runtime base is fixed by digest in the Dockerfile; there is no `BASE_IMAGE`
+build contract. `OPS_REPO` is optional and defaults to the sibling `../ops`
+checkout.
+
+Unless `SKIP_VERIFIED_CHECKS=1`, `deploy.sh` runs formatting, the repository
+`./run-tests.sh` path, and Clippy before building. The repository test path runs
+both Rust tests and `tests/test_deploy_script.py`.
+
+Depot publishes the candidate tag before deployment admission. `deploy.sh` then
+resolves the tag's immutable manifest digest, pulls and behaviorally verifies the
+exact `tag@digest`, and scans that digest through the Docker socket with pinned
+Trivy 0.73.0. The scan covers vulnerability findings at HIGH and CRITICAL
+severity, ignores unfixed findings, skips Trivy's version check, and fails closed
+through its exit code. Only after image verification and the vulnerability gate
+pass does the script write the exact `repo:tag@sha256:...` reference to the live
+stream manifest, then commit or push it. A failed gate may leave the candidate in
+the registry but leaves ops reconciliation unchanged. Unified sync Jobs remain
+reviewed and managed separately; `deploy.sh` does not create or update them.
 
 ## Current status
 

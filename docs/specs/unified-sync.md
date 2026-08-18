@@ -50,7 +50,7 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - `src/sync_schema.rs` — source evidence reads plus prerequisite and final schema-stage planning/execution.
 - `src/table_catalog.rs` — catalog validation and one-run `SyncConfig` mapping for `sync-catalog`.
 - `src/lost_binlog_recovery.rs` — source-coordinate/evidence capture, unified-sync invocation for resync and authorized recovery, exact run/table proof, and checkpoint/barrier transition.
-- `deploy.sh` — builds the runtime image and updates only the live stream manifest; reviewed unified-sync Jobs are managed separately.
+- `deploy.sh` — builds the fixed-base runtime image and updates only the live stream manifest; reviewed unified-sync Jobs are managed separately. The image contract is defined in [Runtime container image](runtime-image.md).
 
 ## Tests asserting this spec
 

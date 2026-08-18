@@ -2,11 +2,12 @@
 set -eu
 
 image_repo="${IMAGE_REPO:?IMAGE_REPO is required}"
-base_image="${BASE_IMAGE:?BASE_IMAGE is required}"
 depot_project_id="${DEPOT_PROJECT_ID:-jnnl97r4s7}"
 tag="${1:-$(git rev-parse --short HEAD)}"
 ops_repo="${OPS_REPO:-../ops}"
 image="${image_repo}:${tag}"
+trivy_image="ghcr.io/aquasecurity/trivy@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c"
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 stream_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-stream.yaml"
 
@@ -20,9 +21,10 @@ require_clean_tree() {
     fi
 }
 
-update_image_tag() {
+update_image_reference() {
     manifest="$1"
-    perl -0pi -e "s#image: ${image_repo}:[^\\s]+#image: ${image}#g" "$manifest"
+    IMAGE_REPO="$image_repo" IMMUTABLE_IMAGE="$immutable_image" \
+        perl -0pi -e 's#image: \Q$ENV{IMAGE_REPO}\E:[^\s]+#image: $ENV{IMMUTABLE_IMAGE}#g' "$manifest"
 }
 
 require_clean_tree "." "mariadb-mysql-cdc repo"
@@ -30,22 +32,41 @@ require_clean_tree "$ops_repo" "ops repo"
 
 if [ "${SKIP_VERIFIED_CHECKS:-0}" != "1" ]; then
     cargo fmt --check
-    cargo test
+    ./run-tests.sh
     cargo clippy --all-targets --all-features -- -D warnings
 fi
 depot build \
     --project "$depot_project_id" \
     --platform linux/amd64 \
-    --build-arg "BASE_IMAGE=$base_image" \
     --tag "$image" \
     --push \
     .
 
-update_image_tag "$stream_manifest"
+digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image")"
+if ! printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+    echo "published image returned invalid digest: $digest" >&2
+    exit 1
+fi
+immutable_image="${image}@${digest}"
+
+docker pull "$immutable_image"
+python3 "$script_dir/tests/verify_runtime_image.py" "$immutable_image"
+docker run --rm \
+    --volume /var/run/docker.sock:/var/run/docker.sock \
+    "$trivy_image" \
+    image \
+    --scanners vuln \
+    --severity HIGH,CRITICAL \
+    --ignore-unfixed \
+    --skip-version-check \
+    --exit-code 1 \
+    "$immutable_image"
+
+update_image_reference "$stream_manifest"
 
 git -C "$ops_repo" add "$stream_manifest"
 if git -C "$ops_repo" diff --cached --quiet; then
-    echo "ops manifests already use $image"
+    echo "ops manifests already use $immutable_image"
 else
     git -C "$ops_repo" commit -m "Deploy CDC image ${tag}"
 fi
