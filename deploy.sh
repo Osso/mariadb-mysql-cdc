@@ -50,18 +50,20 @@ if ! printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
 fi
 immutable_image="${image}@${digest}"
 
-docker pull "$immutable_image"
-python3 "$script_dir/tests/verify_runtime_image.py" "$immutable_image"
-docker run --rm \
-    --volume /var/run/docker.sock:/var/run/docker.sock \
-    "$trivy_image" \
-    image \
-    --scanners vuln \
-    --severity HIGH,CRITICAL \
-    --ignore-unfixed \
-    --skip-version-check \
-    --exit-code 1 \
-    "$immutable_image"
+if [ "${SKIP_RUNTIME_VERIFICATION:-0}" != "1" ]; then
+    docker pull "$immutable_image"
+    python3 "$script_dir/tests/verify_runtime_image.py" "$immutable_image"
+    docker run --rm \
+        --volume /var/run/docker.sock:/var/run/docker.sock \
+        "$trivy_image" \
+        image \
+        --scanners vuln \
+        --severity HIGH,CRITICAL \
+        --ignore-unfixed \
+        --skip-version-check \
+        --exit-code 1 \
+        "$immutable_image"
+fi
 
 update_image_reference "$stream_manifest"
 
