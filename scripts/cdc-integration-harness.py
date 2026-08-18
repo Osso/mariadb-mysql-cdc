@@ -1137,6 +1137,10 @@ class Harness:
                     FOREIGN KEY (guest_id) REFERENCES guests (id)
                     ON DELETE RESTRICT ON UPDATE RESTRICT
             ) ENGINE=InnoDB;
+            CREATE TABLE parallel_decimal_values (
+                id BIGINT NOT NULL PRIMARY KEY,
+                gc_service_fee_percentage DECIMAL(5,2) UNSIGNED NOT NULL
+            ) ENGINE=InnoDB;
         """
         self.admin_sql(self.source, nested_fk_schema)
         self.admin_sql(self.target, nested_fk_schema)
@@ -1162,6 +1166,7 @@ class Harness:
             self.source,
             "START TRANSACTION; "
             "INSERT INTO accounts VALUES (3, 'three@example.test', 'three'); "
+            "INSERT INTO parallel_decimal_values VALUES (1, 65.00); "
             "INSERT INTO sessions VALUES (7001, 41, 'parallel-child'); "
             "COMMIT;",
         )
@@ -1243,6 +1248,17 @@ class Harness:
             raise HarnessError(
                 f"parallel target did not retry the child after parent repair: {child!r}"
             )
+        decimal_value = self.query(
+            self.target,
+            "SELECT id,gc_service_fee_percentage FROM parallel_decimal_values;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if decimal_value != "1\t65.00":
+            raise HarnessError(
+                "parallel target did not preserve DECIMAL byte parameter semantics: "
+                f"{decimal_value!r}"
+            )
         checkpoint = self.checkpoint()
         if checkpoint.get("source_file") != stop.file or int(
             checkpoint.get("source_position", 0)
@@ -1251,7 +1267,7 @@ class Harness:
         print(
             "parallel_target_transactions_ok workers=2 connector=mariadb "
             "duplicate_target_row=unchanged nested_missing_fk=repaired "
-            "later_same_transaction_row=applied "
+            "decimal_bytes=preserved later_same_transaction_row=applied "
             f"tls_connections={tls_connections} "
             f"checkpoint={stop.file}:{stop.position}"
         )

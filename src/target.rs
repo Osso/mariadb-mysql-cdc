@@ -224,7 +224,7 @@ fn quote_sql_value(value: &Value) -> String {
 fn quote_submitted_sql_value(value: &Value) -> Result<String, TargetExecuteError> {
     match value {
         Value::NULL => Ok("NULL".to_string()),
-        Value::Bytes(bytes) => Ok(hex_sql_literal(bytes)),
+        Value::Bytes(bytes) => Ok(binary_string_sql_literal(bytes)),
         Value::Int(value) => Ok(value.to_string()),
         Value::UInt(value) => Ok(value.to_string()),
         Value::Float(value) if value.is_finite() => Ok(value.to_string()),
@@ -248,11 +248,11 @@ fn quote_submitted_sql_value(value: &Value) -> Result<String, TargetExecuteError
     }
 }
 
-fn hex_sql_literal(bytes: &[u8]) -> String {
+fn binary_string_sql_literal(bytes: &[u8]) -> String {
     use std::fmt::Write;
 
-    let mut literal = String::with_capacity(bytes.len() * 2 + 3);
-    literal.push_str("X'");
+    let mut literal = String::with_capacity(bytes.len() * 2 + 11);
+    literal.push_str("_binary X'");
     for byte in bytes {
         write!(literal, "{byte:02x}").expect("writing hexadecimal bytes to String cannot fail");
     }
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_submitted_statement_bytes_without_utf8_loss() {
+    fn renders_submitted_statement_bytes_as_binary_strings_without_utf8_loss() {
         let rendered = render_submitted_sql_statement(&SqlStatement {
             sql: "INSERT INTO `binary_values` (`payload`) VALUES (?)".to_string(),
             params: vec![Value::Bytes(vec![0x00, 0xff, b'\'', b'\\'])],
@@ -292,7 +292,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "INSERT INTO `binary_values` (`payload`) VALUES (X'00ff275c')"
+            "INSERT INTO `binary_values` (`payload`) VALUES (_binary X'00ff275c')"
         );
     }
 
