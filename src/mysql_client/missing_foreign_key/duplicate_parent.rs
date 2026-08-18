@@ -293,32 +293,8 @@ fn duplicate_parent_owner_from_rows(
     metadata: &DuplicateParentMetadata,
     rows: Vec<Vec<Value>>,
 ) -> Result<DuplicateParentOwner, TargetExecuteError> {
-    if rows.len() != 1 {
-        return Err(TargetExecuteError::new(format!(
-            "duplicate-parent owner query returned {} rows for {}.{} index {}",
-            rows.len(),
-            change.schema,
-            change.table,
-            metadata.duplicate_index.name
-        )));
-    }
-    let mut row = rows.into_iter().next().expect("one duplicate owner row");
-    let expected_fields = metadata.primary_key.len() + 1;
-    if row.len() != expected_fields {
-        return Err(TargetExecuteError::new(format!(
-            "duplicate-parent owner query returned {} fields for {}.{}; expected {expected_fields}",
-            row.len(),
-            change.schema,
-            change.table
-        )));
-    }
-    let same_primary_key = row.pop().expect("same-primary-key field");
-    let owns_intended_primary_key = mysql_boolean(&same_primary_key).ok_or_else(|| {
-        TargetExecuteError::new(format!(
-            "duplicate-parent owner query returned an invalid identity flag for {}.{}",
-            change.schema, change.table
-        ))
-    })?;
+    let mut row = take_single_duplicate_owner_row(change, metadata, rows)?;
+    let owns_intended_primary_key = pop_duplicate_owner_identity(change, &mut row)?;
     if row.iter().any(|value| matches!(value, Value::NULL)) {
         return Err(TargetExecuteError::new(format!(
             "duplicate-parent owner has a NULL primary key for {}.{}",
@@ -328,6 +304,46 @@ fn duplicate_parent_owner_from_rows(
     Ok(DuplicateParentOwner {
         primary_key: row,
         owns_intended_primary_key,
+    })
+}
+
+fn take_single_duplicate_owner_row(
+    change: &TargetRowChange,
+    metadata: &DuplicateParentMetadata,
+    rows: Vec<Vec<Value>>,
+) -> Result<Vec<Value>, TargetExecuteError> {
+    if rows.len() != 1 {
+        return Err(TargetExecuteError::new(format!(
+            "duplicate-parent owner query returned {} rows for {}.{} index {}",
+            rows.len(),
+            change.schema,
+            change.table,
+            metadata.duplicate_index.name
+        )));
+    }
+    let row = rows.into_iter().next().expect("one duplicate owner row");
+    let expected_fields = metadata.primary_key.len() + 1;
+    if row.len() != expected_fields {
+        return Err(TargetExecuteError::new(format!(
+            "duplicate-parent owner query returned {} fields for {}.{}; expected {expected_fields}",
+            row.len(),
+            change.schema,
+            change.table
+        )));
+    }
+    Ok(row)
+}
+
+fn pop_duplicate_owner_identity(
+    change: &TargetRowChange,
+    row: &mut Vec<Value>,
+) -> Result<bool, TargetExecuteError> {
+    let same_primary_key = row.pop().expect("same-primary-key field");
+    mysql_boolean(&same_primary_key).ok_or_else(|| {
+        TargetExecuteError::new(format!(
+            "duplicate-parent owner query returned an invalid identity flag for {}.{}",
+            change.schema, change.table
+        ))
     })
 }
 
