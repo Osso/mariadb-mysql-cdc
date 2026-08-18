@@ -92,8 +92,12 @@ where
     let repair_key = parent.repair_key.clone();
     active_repairs.insert(repair_key.clone());
 
-    let result = execute_row_change_with_active_repairs(executor, &parent.change, active_repairs)
-        .and_then(|()| execute_row_change_with_active_repairs(executor, change, active_repairs));
+    let parent_result =
+        execute_row_change_with_active_repairs(executor, &parent.change, active_repairs);
+    let result = match parent_result {
+        Ok(()) => execute_row_change_with_active_repairs(executor, change, active_repairs),
+        Err(error) => Err(error),
+    };
     if result.is_ok() {
         eprintln!(
             "cdc_missing_fk_parent_inserted child={}.{} constraint={} parent={}.{}",
@@ -139,7 +143,7 @@ impl PersistentTargetExecutor {
         })?;
         let reference =
             self.with_connection(|target| query_foreign_key_reference(target, change, error))?;
-        source_missing_foreign_key_parent(source, change, &reference)
+        fetch_source_missing_foreign_key_parent(source, change, &reference)
     }
 }
 
@@ -166,16 +170,16 @@ pub(crate) fn query_foreign_key_reference(
     build_foreign_key_reference(change, constraint, rows)
 }
 
-pub(crate) fn source_missing_foreign_key_parent(
+pub(crate) fn fetch_source_missing_foreign_key_parent(
     source: &PersistentMySqlSource,
     change: &TargetRowChange,
     reference: &ForeignKeyReference,
 ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
     let key_values = foreign_key_values(change, reference)?;
     let repair_key = missing_foreign_key_repair_key(change, reference, &key_values)?;
-    let (columns, values) = source_parent_row(source, reference, key_values)?;
+    let (columns, values) = fetch_source_parent_row(source, reference, key_values)?;
     Ok(MissingForeignKeyParent {
-        change: parent_row_change(reference, columns, values),
+        change: build_parent_row_change(reference, columns, values),
         constraint: reference.constraint.clone(),
         repair_key,
     })
@@ -269,7 +273,7 @@ fn render_repair_key_value(value: &Value) -> Result<String, TargetExecuteError> 
     })
 }
 
-fn source_parent_row(
+fn fetch_source_parent_row(
     source: &PersistentMySqlSource,
     reference: &ForeignKeyReference,
     key_values: Vec<Value>,
@@ -335,7 +339,7 @@ fn source_parent_row(
     Ok((columns, values))
 }
 
-fn parent_row_change(
+fn build_parent_row_change(
     reference: &ForeignKeyReference,
     columns: Vec<String>,
     values: Vec<Value>,
@@ -346,7 +350,7 @@ fn parent_row_change(
         .zip(values.iter().cloned())
         .collect::<BTreeMap<_, _>>();
     TargetRowChange {
-        statement: parent_insert_statement(reference, &columns, values),
+        statement: build_parent_insert_statement(reference, &columns, values),
         kind: TargetRowChangeKind::Insert,
         schema: reference.parent_schema.clone(),
         table: reference.parent_table.clone(),
@@ -354,7 +358,7 @@ fn parent_row_change(
     }
 }
 
-fn parent_insert_statement(
+fn build_parent_insert_statement(
     reference: &ForeignKeyReference,
     columns: &[String],
     values: Vec<Value>,

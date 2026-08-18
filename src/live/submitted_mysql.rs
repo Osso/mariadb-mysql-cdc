@@ -1,7 +1,7 @@
 use super::parallel_target::{SubmittedQueryConnection, SubmittedQueryConnectionFactory};
 use super::{ApplyBinlogConfig, TargetMySqlConfig, target_session_init_command};
 use crate::mysql_client::missing_foreign_key::{
-    MissingForeignKeyParent, query_foreign_key_reference, source_missing_foreign_key_parent,
+    MissingForeignKeyParent, fetch_source_missing_foreign_key_parent, query_foreign_key_reference,
 };
 use crate::mysql_client::{
     PersistentMySqlSource, open_initialized_target_connection, open_stream_source,
@@ -231,7 +231,9 @@ impl MariaDbSubmittedQueryConnection {
         self.read_query_result()
     }
 
-    fn target_metadata_connection(&mut self) -> Result<&mut Conn, TargetExecuteError> {
+    fn open_or_reuse_target_metadata_connection(
+        &mut self,
+    ) -> Result<&mut Conn, TargetExecuteError> {
         if self.target_metadata.is_none() {
             let opts = target_mysql_opts(&self.target_config).map_err(TargetExecuteError::new)?;
             let connection = open_initialized_target_connection(opts)?;
@@ -306,10 +308,10 @@ impl SubmittedQueryConnection for MariaDbSubmittedQueryConnection {
         error: &TargetExecuteError,
     ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
         let reference = {
-            let target = self.target_metadata_connection()?;
+            let target = self.open_or_reuse_target_metadata_connection()?;
             query_foreign_key_reference(target, change, error)?
         };
-        source_missing_foreign_key_parent(&self.source, change, &reference)
+        fetch_source_missing_foreign_key_parent(&self.source, change, &reference)
     }
 }
 
