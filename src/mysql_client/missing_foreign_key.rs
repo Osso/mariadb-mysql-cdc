@@ -30,6 +30,11 @@ pub(crate) struct MissingForeignKeyParent {
     repair_key: MissingForeignKeyRepairKey,
 }
 
+struct SourceParentRow {
+    columns: Vec<String>,
+    values: Vec<Value>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SupersededSourceInsert {
     current_change: Option<TargetRowChange>,
@@ -470,9 +475,9 @@ pub(crate) fn fetch_source_missing_foreign_key_repair(
     let key_values = foreign_key_values(change, reference)?;
     let repair_key = missing_foreign_key_repair_key(change, reference, &key_values)?;
     let parent = fetch_source_parent_row(source, reference, key_values)?;
-    if let Some((columns, values)) = parent {
+    if let Some(parent) = parent {
         return Ok(MissingForeignKeyRepair::Parent(MissingForeignKeyParent {
-            change: build_parent_row_change(reference, columns, values),
+            change: build_parent_row_change(reference, parent.columns, parent.values),
             constraint: reference.constraint.clone(),
             repair_key,
         }));
@@ -576,12 +581,13 @@ fn fetch_source_parent_row(
     source: &PersistentMySqlSource,
     reference: &ForeignKeyReference,
     key_values: Vec<Value>,
-) -> Result<Option<(Vec<String>, Vec<Value>)>, TargetExecuteError> {
+) -> Result<Option<SourceParentRow>, TargetExecuteError> {
     let mut conn = source.conn.borrow_mut();
     let columns = query_source_parent_columns(&mut conn, reference)?;
     let sql = build_source_parent_select(reference, &columns);
     let rows = query_source_parent_rows(&mut conn, reference, sql, key_values)?;
-    decode_source_parent_row(reference, rows).map(|values| values.map(|values| (columns, values)))
+    decode_source_parent_row(reference, rows)
+        .map(|values| values.map(|values| SourceParentRow { columns, values }))
 }
 
 fn query_source_parent_columns(
