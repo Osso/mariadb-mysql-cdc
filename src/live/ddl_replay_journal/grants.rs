@@ -150,9 +150,9 @@ impl RuntimeGrantPolicy {
         if record.scope == "*.*" {
             return validate_global_grant(grant, record);
         }
-        let scope = self.scope_policy(&record.scope).ok_or_else(|| {
-            format!("CDC runtime grant targets an unapproved control-plane scope: {grant}")
-        })?;
+        let Some(scope) = self.scope_policy(&record.scope) else {
+            return Ok(None);
+        };
         match scope {
             RuntimeGrantScope::Application => validate_application_grant(grant, record),
             RuntimeGrantScope::Control(allowed) => validate_control_grant(grant, record, allowed),

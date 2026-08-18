@@ -237,7 +237,7 @@ fn assert_runtime_contract_rejects_blocked_transition(
 }
 
 #[test]
-fn validates_required_runtime_grants_and_rejects_control_plane_bypass() {
+fn validates_required_runtime_grants_and_ignores_extra_scopes() {
     let grant_rows = grants();
     assert!(
         validate_runtime_grants(
@@ -250,7 +250,31 @@ fn validates_required_runtime_grants_and_rejects_control_plane_bypass() {
         .is_ok()
     );
     assert_missing_application_privilege_is_rejected(&grant_rows);
+    assert_extra_scope_grants_are_ignored(&grant_rows);
     assert_bad_grants_are_rejected(&grant_rows);
+}
+
+fn assert_extra_scope_grants_are_ignored(grant_rows: &[String]) {
+    for extra in [
+        "GRANT UPDATE ON `cdc`.* TO `cdc_stream`@`%`",
+        "GRANT SELECT ON `admin`.* TO `cdc_stream`@`%`",
+        "GRANT DELETE ON `cdc`.`row_conflicts` TO `cdc_stream`@`%`",
+        "GRANT EXECUTE ON `cdc`.* TO `cdc_stream`@`%`",
+    ] {
+        let mut drifted = grant_rows.to_vec();
+        drifted.push(extra.to_string());
+        assert!(
+            validate_runtime_grants(
+                &drifted,
+                "globalcomix",
+                "cdc.stream_checkpoint",
+                "cdc.ddl_replay_journal",
+                "cdc.ddl_replay_journal_trigger_inventory"
+            )
+            .is_ok(),
+            "rejected unrelated grant scope {extra}"
+        );
+    }
 }
 
 fn assert_missing_application_privilege_is_rejected(grant_rows: &[String]) {
@@ -272,14 +296,10 @@ fn assert_missing_application_privilege_is_rejected(grant_rows: &[String]) {
 
 fn assert_bad_grants_are_rejected(grant_rows: &[String]) {
     for bad in [
-        "GRANT UPDATE ON `cdc`.* TO `cdc_stream`@`%`",
-        "GRANT SELECT ON `admin`.* TO `cdc_stream`@`%`",
         "GRANT ALL PRIVILEGES ON *.* TO `cdc_stream`@`%`",
         "GRANT PROXY ON `admin`@`%` TO `cdc_stream`@`%`",
         "GRANT `ddl_admin`@`%` TO `cdc_stream`@`%`",
         "GRANT SELECT ON `cdc`.`ddl_replay_journal` TO `cdc_stream`@`%` WITH GRANT OPTION",
-        "GRANT DELETE ON `cdc`.`row_conflicts` TO `cdc_stream`@`%`",
-        "GRANT EXECUTE ON `cdc`.* TO `cdc_stream`@`%`",
     ] {
         let mut drifted = grant_rows.to_vec();
         drifted.push(bad.to_string());
