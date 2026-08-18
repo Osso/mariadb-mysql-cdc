@@ -1,7 +1,9 @@
 use super::parallel_target::{SubmittedQueryConnection, SubmittedQueryConnectionFactory};
 use super::{ApplyBinlogConfig, TargetMySqlConfig, target_session_init_command};
 use crate::mysql_client::missing_foreign_key::{
-    MissingForeignKeyParent, fetch_source_missing_foreign_key_parent, query_foreign_key_reference,
+    DuplicateParentReconciliation, MissingForeignKeyParent,
+    fetch_source_missing_foreign_key_parent, finish_duplicate_parent_probe,
+    prepare_duplicate_parent_probe, query_foreign_key_reference, verify_parent_query_rows,
 };
 use crate::mysql_client::{
     PersistentMySqlSource, open_initialized_target_connection, open_stream_source,
@@ -10,8 +12,10 @@ use crate::mysql_support::{
     DEFAULT_MYSQL_CONNECT_TIMEOUT, DEFAULT_MYSQL_READ_TIMEOUT, DEFAULT_MYSQL_WRITE_TIMEOUT,
     target_mysql_opts,
 };
-use crate::target::{TargetExecuteError, TargetRowChange};
-use mysql::Conn;
+use crate::target::{
+    SqlStatement, TargetExecuteError, TargetRowChange, render_submitted_sql_statement,
+};
+use mysql::{Conn, Value};
 use mysqlclient_sys::mysql_option::{
     MYSQL_OPT_CONNECT_TIMEOUT, MYSQL_OPT_READ_TIMEOUT, MYSQL_OPT_SSL_CA, MYSQL_OPT_SSL_ENFORCE,
     MYSQL_OPT_SSL_VERIFY_SERVER_CERT, MYSQL_OPT_WRITE_TIMEOUT,
@@ -19,6 +23,7 @@ use mysqlclient_sys::mysql_option::{
 use std::ffi::{CStr, CString, c_void};
 use std::os::raw::{c_char, c_ulong};
 use std::ptr::{self, NonNull};
+use std::slice;
 use std::sync::OnceLock;
 
 const CLIENT_MULTI_STATEMENTS: c_ulong = 1 << 16;
@@ -52,6 +57,14 @@ pub(crate) struct MariaDbSubmittedQueryConnection {
     source: PersistentMySqlSource,
     target_config: TargetMySqlConfig,
     target_metadata: Option<Conn>,
+}
+
+struct StoredResult(NonNull<mysqlclient_sys::MYSQL_RES>);
+
+impl Drop for StoredResult {
+    fn drop(&mut self) {
+        unsafe { mysqlclient_sys::mysql_free_result(self.0.as_ptr()) };
+    }
 }
 
 struct MariaDbConnectionParameters {
@@ -244,6 +257,81 @@ impl MariaDbSubmittedQueryConnection {
         })
     }
 
+    fn query_transaction_rows(
+        &mut self,
+        statement: &SqlStatement,
+    ) -> Result<Vec<Vec<Value>>, TargetExecuteError> {
+        let sql = render_submitted_sql_statement(statement)?;
+        self.send_query(&sql)?;
+        self.read_transaction_rows()
+    }
+
+    fn read_transaction_rows(&mut self) -> Result<Vec<Vec<Value>>, TargetExecuteError> {
+        self.accept_row_query_result()?;
+        let result = self.store_row_query_result()?;
+        let rows = self.read_stored_query_rows(&result)?;
+        self.reject_additional_row_query_results()?;
+        Ok(rows)
+    }
+
+    fn accept_row_query_result(&self) -> Result<(), TargetExecuteError> {
+        let failed = unsafe { mysqlclient_sys::mysql_read_query_result(self.raw.as_ptr()) }
+            != mysqlclient_sys::FALSE;
+        if failed {
+            return Err(self.error("read row query result"));
+        }
+        Ok(())
+    }
+
+    fn store_row_query_result(&self) -> Result<StoredResult, TargetExecuteError> {
+        let result =
+            NonNull::new(unsafe { mysqlclient_sys::mysql_store_result(self.raw.as_ptr()) });
+        if let Some(result) = result {
+            return Ok(StoredResult(result));
+        }
+        if unsafe { mysqlclient_sys::mysql_errno(self.raw.as_ptr()) } != 0 {
+            return Err(self.error("store row query result"));
+        }
+        Err(TargetExecuteError::new(
+            "submitted duplicate-parent query returned no result set",
+        ))
+    }
+
+    fn read_stored_query_rows(
+        &self,
+        result: &StoredResult,
+    ) -> Result<Vec<Vec<Value>>, TargetExecuteError> {
+        let field_count =
+            usize::try_from(unsafe { mysqlclient_sys::mysql_num_fields(result.0.as_ptr()) })
+                .map_err(|_| TargetExecuteError::new("submitted row query field count overflow"))?;
+        let mut rows = Vec::new();
+        loop {
+            let row = unsafe { mysqlclient_sys::mysql_fetch_row(result.0.as_ptr()) };
+            if row.is_null() {
+                if unsafe { mysqlclient_sys::mysql_errno(self.raw.as_ptr()) } != 0 {
+                    return Err(self.error("fetch row query result"));
+                }
+                return Ok(rows);
+            }
+            let lengths = unsafe { mysqlclient_sys::mysql_fetch_lengths(result.0.as_ptr()) };
+            if lengths.is_null() {
+                return Err(self.error("fetch row query lengths"));
+            }
+            rows.push(copy_result_row(row, lengths, field_count)?);
+        }
+    }
+
+    fn reject_additional_row_query_results(&self) -> Result<(), TargetExecuteError> {
+        let has_more = unsafe { mysqlclient_sys::mysql_more_results(self.raw.as_ptr()) }
+            != mysqlclient_sys::FALSE;
+        if has_more {
+            return Err(TargetExecuteError::new(
+                "submitted duplicate-parent query returned additional result sets",
+            ));
+        }
+        Ok(())
+    }
+
     fn consume_current_result(&mut self) -> Result<(), TargetExecuteError> {
         let result = unsafe { mysqlclient_sys::mysql_store_result(self.raw.as_ptr()) };
         if !result.is_null() {
@@ -267,6 +355,26 @@ impl MariaDbSubmittedQueryConnection {
             ),
         )
     }
+}
+
+fn copy_result_row(
+    row: mysqlclient_sys::MYSQL_ROW,
+    lengths: *mut c_ulong,
+    field_count: usize,
+) -> Result<Vec<Value>, TargetExecuteError> {
+    (0..field_count)
+        .map(|index| {
+            let value = unsafe { *row.add(index) };
+            if value.is_null() {
+                return Ok(Value::NULL);
+            }
+            let length = usize::try_from(unsafe { *lengths.add(index) }).map_err(|_| {
+                TargetExecuteError::new("submitted row query value length overflow")
+            })?;
+            let bytes = unsafe { slice::from_raw_parts(value.cast::<u8>(), length) };
+            Ok(Value::Bytes(bytes.to_vec()))
+        })
+        .collect()
 }
 
 impl SubmittedQueryConnection for MariaDbSubmittedQueryConnection {
@@ -312,6 +420,30 @@ impl SubmittedQueryConnection for MariaDbSubmittedQueryConnection {
             query_foreign_key_reference(target, change, error)?
         };
         fetch_source_missing_foreign_key_parent(&self.source, change, &reference)
+    }
+
+    fn load_duplicate_parent_reconciliation(
+        &mut self,
+        change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<DuplicateParentReconciliation, TargetExecuteError> {
+        let probe = {
+            let target = self.open_or_reuse_target_metadata_connection()?;
+            prepare_duplicate_parent_probe(target, change, error)?
+        };
+        let owner_statement = probe.owner_statement.clone();
+        let owner_rows = self.query_transaction_rows(&owner_statement)?;
+        finish_duplicate_parent_probe(&self.source, change, probe, owner_rows)
+    }
+
+    fn verify_duplicate_parent_reconciliation(
+        &mut self,
+        change: &TargetRowChange,
+        reconciliation: &DuplicateParentReconciliation,
+    ) -> Result<(), TargetExecuteError> {
+        let verification = reconciliation.verification.clone();
+        let rows = self.query_transaction_rows(&verification)?;
+        verify_parent_query_rows(change, rows)
     }
 }
 

@@ -63,6 +63,7 @@ SCENARIOS = (
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("insert-duplicate-idempotent", True),
     ScenarioSpec("missing-fk-parent-auto-insert", True),
+    ScenarioSpec("missing-fk-duplicate-parent-reconcile", True),
     ScenarioSpec("parallel-target-transactions", True),
     ScenarioSpec("missing-checkpoint", True),
     ScenarioSpec("missing-trigger", True),
@@ -1091,6 +1092,144 @@ class Harness:
             "missing_fk_parent_auto_insert_ok parent=guests child=sessions "
             f"checkpoint={stop.file}:{stop.position}"
         )
+
+    def setup_missing_fk_duplicate_parent_tables(self) -> None:
+        assert self.source and self.target
+        schema = """
+            CREATE TABLE users (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                name VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                label VARCHAR(64) NOT NULL,
+                UNIQUE KEY uq_users_id_name (id, name)
+            ) ENGINE=InnoDB;
+            CREATE TABLE artists_favorites (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                user_id BIGINT UNSIGNED NOT NULL,
+                user_name VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                CONSTRAINT artists_favorites_ibfk_2
+                    FOREIGN KEY (user_id, user_name) REFERENCES users (id, name)
+                    ON DELETE RESTRICT ON UPDATE RESTRICT
+            ) ENGINE=InnoDB;
+            CREATE TABLE comics (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                slug VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                label VARCHAR(64) NOT NULL,
+                UNIQUE KEY slug (slug)
+            ) ENGINE=InnoDB;
+            CREATE TABLE releases (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                comic_id BIGINT UNSIGNED NOT NULL,
+                CONSTRAINT releases_ibfk_6
+                    FOREIGN KEY (comic_id) REFERENCES comics (id)
+                    ON DELETE RESTRICT ON UPDATE RESTRICT
+            ) ENGINE=InnoDB;
+        """
+        self.admin_sql(self.source, schema)
+        self.admin_sql(self.target, schema)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO users VALUES (2108466, 'OvalTeen', 'source-user'); "
+            "INSERT INTO comics VALUES "
+            "(44083, 'old-night-shift', 'source-owner'), "
+            "(49125, 'night-shift', 'source-parent'), "
+            "(49126, 'deleted-owner', 'source-deleted-owner-parent');",
+        )
+
+    def seed_missing_fk_duplicate_parent_target(self) -> None:
+        assert self.target
+        self.admin_sql(
+            self.target,
+            "DELETE FROM artists_favorites; "
+            "DELETE FROM releases; "
+            "DELETE FROM users; "
+            "DELETE FROM comics; "
+            "INSERT INTO users VALUES (2108466, 'Oval-Teen', 'target-divergent'); "
+            "INSERT INTO comics VALUES "
+            "(44083, 'night-shift', 'target-stale-owner'), "
+            "(44084, 'deleted-owner', 'target-source-absent-owner');",
+        )
+
+    def assert_missing_fk_duplicate_parent_result(
+        self,
+        mode: str,
+        stop: Coordinate,
+    ) -> None:
+        assert self.target
+        users = self.query(
+            self.target,
+            "SELECT id,name,label FROM users ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        favorites = self.query(
+            self.target,
+            "SELECT id,user_id,user_name FROM artists_favorites ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        comics = self.query(
+            self.target,
+            "SELECT id,slug,label FROM comics ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        releases = self.query(
+            self.target,
+            "SELECT id,comic_id FROM releases ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if users != "2108466\tOvalTeen\tsource-user":
+            raise HarnessError(f"{mode} same-PK parent did not converge: {users!r}")
+        if favorites != "1\t2108466\tOvalTeen":
+            raise HarnessError(f"{mode} same-PK child was not retried: {favorites!r}")
+        expected_comics = (
+            "44083\told-night-shift\tsource-owner\n"
+            "49125\tnight-shift\tsource-parent\n"
+            "49126\tdeleted-owner\tsource-deleted-owner-parent"
+        )
+        if comics != expected_comics:
+            raise HarnessError(f"{mode} unique owners did not converge: {comics!r}")
+        if releases != "391409\t49125\n391410\t49126":
+            raise HarnessError(f"{mode} comic children were not retried: {releases!r}")
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(
+            checkpoint.get("source_position", 0)
+        ) != stop.position:
+            raise HarnessError(
+                f"{mode} duplicate-parent checkpoint did not reach exact stop: {checkpoint}"
+            )
+
+    def run_missing_fk_duplicate_parent_reconcile(self) -> None:
+        assert self.source and self.target
+        self.setup_missing_fk_duplicate_parent_tables()
+        start = self.coordinate()
+        self.admin_sql(
+            self.source,
+            "START TRANSACTION; "
+            "INSERT INTO artists_favorites VALUES (1, 2108466, 'OvalTeen'); "
+            "COMMIT; "
+            "START TRANSACTION; "
+            "INSERT INTO releases VALUES (391409, 49125), (391410, 49126); "
+            "COMMIT;",
+        )
+        stop = self.coordinate()
+
+        for mode, parallel_transactions in (("serial", 1), ("submitted", 2)):
+            self.seed_missing_fk_duplicate_parent_target()
+            self.write_checkpoint(start)
+            result = self.run_stream(
+                start,
+                stop,
+                target_parallel_transactions=parallel_transactions,
+            )
+            require_success(result, f"{mode} duplicate-parent reconciliation stream")
+            self.assert_missing_fk_duplicate_parent_result(mode, stop)
+            print(
+                "missing_fk_duplicate_parent_reconcile_ok "
+                f"mode={mode} same_pk=updated different_pk=updated "
+                f"source_absent=deleted checkpoint={stop.file}:{stop.position}"
+            )
 
     def assert_parallel_target_commit_barrier(self, start: Coordinate) -> None:
         assert self.target
@@ -2885,6 +3024,8 @@ class Harness:
             self.run_insert_duplicate_idempotent()
         elif scenario == "missing-fk-parent-auto-insert":
             self.run_missing_fk_parent_auto_insert()
+        elif scenario == "missing-fk-duplicate-parent-reconcile":
+            self.run_missing_fk_duplicate_parent_reconcile()
         elif scenario == "parallel-target-transactions":
             self.run_parallel_target_transactions()
         elif scenario in {

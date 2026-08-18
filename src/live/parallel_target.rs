@@ -1,6 +1,6 @@
 use crate::checkpoint::Checkpoint;
 use crate::mysql_client::missing_foreign_key::{
-    MissingForeignKeyParent, MissingForeignKeyRepairExecutor,
+    DuplicateParentReconciliation, MissingForeignKeyParent, MissingForeignKeyRepairExecutor,
     execute_row_change_with_missing_foreign_key_repair,
 };
 use crate::target::{TargetExecuteError, TargetRowChange, render_submitted_sql_statement};
@@ -22,6 +22,24 @@ pub(crate) trait SubmittedQueryConnection {
         error: &TargetExecuteError,
     ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
         Err(error.clone())
+    }
+
+    fn load_duplicate_parent_reconciliation(
+        &mut self,
+        _change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<DuplicateParentReconciliation, TargetExecuteError> {
+        Err(error.clone())
+    }
+
+    fn verify_duplicate_parent_reconciliation(
+        &mut self,
+        _change: &TargetRowChange,
+        _reconciliation: &DuplicateParentReconciliation,
+    ) -> Result<(), TargetExecuteError> {
+        Err(TargetExecuteError::new(
+            "submitted duplicate-parent verification is unavailable",
+        ))
     }
 }
 
@@ -611,6 +629,24 @@ where
     ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
         self.connection
             .load_missing_foreign_key_parent(change, error)
+    }
+
+    fn load_duplicate_parent_reconciliation(
+        &mut self,
+        change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<DuplicateParentReconciliation, TargetExecuteError> {
+        self.connection
+            .load_duplicate_parent_reconciliation(change, error)
+    }
+
+    fn verify_duplicate_parent_reconciliation(
+        &mut self,
+        change: &TargetRowChange,
+        reconciliation: &DuplicateParentReconciliation,
+    ) -> Result<(), TargetExecuteError> {
+        self.connection
+            .verify_duplicate_parent_reconciliation(change, reconciliation)
     }
 }
 

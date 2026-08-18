@@ -349,6 +349,24 @@ impl missing_foreign_key::MissingForeignKeyRepairExecutor for SerialRowChangeExe
     ) -> Result<missing_foreign_key::MissingForeignKeyParent, TargetExecuteError> {
         self.target.load_missing_foreign_key_parent(change, error)
     }
+
+    fn load_duplicate_parent_reconciliation(
+        &mut self,
+        change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<missing_foreign_key::DuplicateParentReconciliation, TargetExecuteError> {
+        self.target
+            .load_duplicate_parent_reconciliation(change, error)
+    }
+
+    fn verify_duplicate_parent_reconciliation(
+        &mut self,
+        change: &TargetRowChange,
+        reconciliation: &missing_foreign_key::DuplicateParentReconciliation,
+    ) -> Result<(), TargetExecuteError> {
+        self.target
+            .verify_duplicate_parent_reconciliation(change, reconciliation)
+    }
 }
 
 impl TargetExecutor for PersistentTargetExecutor {

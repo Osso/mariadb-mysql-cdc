@@ -9,6 +9,11 @@ use mysql::prelude::Queryable;
 use mysql::{Conn, Params, Row, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod duplicate_parent;
+pub(crate) use duplicate_parent::{
+    finish_duplicate_parent_probe, prepare_duplicate_parent_probe, verify_parent_query_rows,
+};
+
 const MAX_MISSING_FOREIGN_KEY_REPAIR_DEPTH: usize = 8;
 
 #[derive(Clone, Debug)]
@@ -18,12 +23,34 @@ pub(crate) struct MissingForeignKeyParent {
     repair_key: MissingForeignKeyRepairKey,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DuplicateParentReconciliation {
+    pub(crate) owner_change: TargetRowChange,
+    pub(crate) retry_parent_insert: bool,
+    pub(crate) verification: SqlStatement,
+    repair_key: DuplicateParentRepairKey,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DuplicateParentRepairKey {
+    schema: String,
+    table: String,
+    index: String,
+    values: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct MissingForeignKeyRepairKey {
     child_schema: String,
     child_table: String,
     constraint: String,
     values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ActiveRepairKey {
+    DuplicateParent(DuplicateParentRepairKey),
+    MissingForeignKey(MissingForeignKeyRepairKey),
 }
 
 pub(crate) struct ForeignKeyReference {
@@ -44,6 +71,31 @@ pub(crate) trait MissingForeignKeyRepairExecutor {
         change: &TargetRowChange,
         error: &TargetExecuteError,
     ) -> Result<MissingForeignKeyParent, TargetExecuteError>;
+
+    fn load_duplicate_parent_reconciliation(
+        &mut self,
+        _change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<DuplicateParentReconciliation, TargetExecuteError> {
+        Err(error.clone())
+    }
+
+    fn verify_duplicate_parent_reconciliation(
+        &mut self,
+        _change: &TargetRowChange,
+        _reconciliation: &DuplicateParentReconciliation,
+    ) -> Result<(), TargetExecuteError> {
+        Err(TargetExecuteError::new(
+            "duplicate-parent verification is unavailable",
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DuplicateInsertBehavior {
+    Ignore,
+    Reconcile,
+    Reject,
 }
 
 pub(crate) fn execute_row_change_with_missing_foreign_key_repair<E>(
@@ -54,13 +106,19 @@ where
     E: MissingForeignKeyRepairExecutor,
 {
     let mut active_repairs = BTreeSet::new();
-    execute_row_change_with_active_repairs(executor, change, &mut active_repairs)
+    execute_row_change_with_active_repairs(
+        executor,
+        change,
+        &mut active_repairs,
+        DuplicateInsertBehavior::Ignore,
+    )
 }
 
 fn execute_row_change_with_active_repairs<E>(
     executor: &mut E,
     change: &TargetRowChange,
-    active_repairs: &mut BTreeSet<MissingForeignKeyRepairKey>,
+    active_repairs: &mut BTreeSet<ActiveRepairKey>,
+    duplicate_behavior: DuplicateInsertBehavior,
 ) -> Result<(), TargetExecuteError>
 where
     E: MissingForeignKeyRepairExecutor,
@@ -70,32 +128,116 @@ where
         return Ok(());
     };
     if error.mysql_code() == Some(1062) && change.kind == TargetRowChangeKind::Insert {
-        return Ok(());
+        return handle_duplicate_insert(
+            executor,
+            change,
+            error,
+            active_repairs,
+            duplicate_behavior,
+        );
     }
     if error.mysql_code() != Some(1452) || change.kind == TargetRowChangeKind::Delete {
         return Err(error);
     }
-    repair_parent_and_retry(executor, change, &error, active_repairs)
+    repair_parent_and_retry(executor, change, &error, active_repairs, duplicate_behavior)
+}
+
+fn handle_duplicate_insert<E>(
+    executor: &mut E,
+    change: &TargetRowChange,
+    error: TargetExecuteError,
+    active_repairs: &mut BTreeSet<ActiveRepairKey>,
+    duplicate_behavior: DuplicateInsertBehavior,
+) -> Result<(), TargetExecuteError>
+where
+    E: MissingForeignKeyRepairExecutor,
+{
+    match duplicate_behavior {
+        DuplicateInsertBehavior::Ignore => Ok(()),
+        DuplicateInsertBehavior::Reject => Err(error),
+        DuplicateInsertBehavior::Reconcile => {
+            reconcile_duplicate_parent(executor, change, &error, active_repairs)
+        }
+    }
+}
+
+fn reconcile_duplicate_parent<E>(
+    executor: &mut E,
+    parent_change: &TargetRowChange,
+    error: &TargetExecuteError,
+    active_repairs: &mut BTreeSet<ActiveRepairKey>,
+) -> Result<(), TargetExecuteError>
+where
+    E: MissingForeignKeyRepairExecutor,
+{
+    let reconciliation = executor.load_duplicate_parent_reconciliation(parent_change, error)?;
+    ensure_duplicate_repair_can_start(parent_change, &reconciliation, active_repairs)?;
+    let repair_key = ActiveRepairKey::DuplicateParent(reconciliation.repair_key.clone());
+    active_repairs.insert(repair_key.clone());
+    let result = apply_duplicate_parent_reconciliation(
+        executor,
+        parent_change,
+        &reconciliation,
+        active_repairs,
+    );
+    active_repairs.remove(&repair_key);
+    result
+}
+
+fn apply_duplicate_parent_reconciliation<E>(
+    executor: &mut E,
+    parent_change: &TargetRowChange,
+    reconciliation: &DuplicateParentReconciliation,
+    active_repairs: &mut BTreeSet<ActiveRepairKey>,
+) -> Result<(), TargetExecuteError>
+where
+    E: MissingForeignKeyRepairExecutor,
+{
+    execute_row_change_with_active_repairs(
+        executor,
+        &reconciliation.owner_change,
+        active_repairs,
+        DuplicateInsertBehavior::Reconcile,
+    )?;
+    if reconciliation.retry_parent_insert {
+        execute_row_change_with_active_repairs(
+            executor,
+            parent_change,
+            active_repairs,
+            DuplicateInsertBehavior::Reject,
+        )?;
+    }
+    executor.verify_duplicate_parent_reconciliation(parent_change, reconciliation)
 }
 
 fn repair_parent_and_retry<E>(
     executor: &mut E,
     change: &TargetRowChange,
     error: &TargetExecuteError,
-    active_repairs: &mut BTreeSet<MissingForeignKeyRepairKey>,
+    active_repairs: &mut BTreeSet<ActiveRepairKey>,
+    duplicate_behavior: DuplicateInsertBehavior,
 ) -> Result<(), TargetExecuteError>
 where
     E: MissingForeignKeyRepairExecutor,
 {
     let parent = executor.load_missing_foreign_key_parent(change, error)?;
-    ensure_repair_can_start(change, &parent, active_repairs)?;
-    let repair_key = parent.repair_key.clone();
+    ensure_missing_foreign_key_repair_can_start(change, &parent, active_repairs)?;
+    let repair_key = ActiveRepairKey::MissingForeignKey(parent.repair_key.clone());
     active_repairs.insert(repair_key.clone());
 
-    let parent_result =
-        execute_row_change_with_active_repairs(executor, &parent.change, active_repairs);
+    let parent_result = execute_row_change_with_active_repairs(
+        executor,
+        &parent.change,
+        active_repairs,
+        DuplicateInsertBehavior::Reconcile,
+    );
     let result = match parent_result {
-        Ok(()) => execute_row_change_with_active_repairs(executor, change, active_repairs),
+        Ok(()) => execute_row_change_with_active_repairs(
+            executor,
+            change,
+            active_repairs,
+            duplicate_behavior,
+        ),
         Err(error) => Err(error),
     };
     if result.is_ok() {
@@ -112,21 +254,56 @@ where
     result
 }
 
-fn ensure_repair_can_start(
+fn ensure_missing_foreign_key_repair_can_start(
     change: &TargetRowChange,
     parent: &MissingForeignKeyParent,
-    active_repairs: &BTreeSet<MissingForeignKeyRepairKey>,
+    active_repairs: &BTreeSet<ActiveRepairKey>,
 ) -> Result<(), TargetExecuteError> {
-    if active_repairs.contains(&parent.repair_key) {
+    let repair_key = ActiveRepairKey::MissingForeignKey(parent.repair_key.clone());
+    if active_repairs.contains(&repair_key) {
         return Err(TargetExecuteError::new(format!(
             "missing-FK repair cycle detected for {}.{} constraint {}",
             change.schema, change.table, parent.constraint
         )));
     }
+    ensure_repair_depth(
+        active_repairs,
+        format!(
+            "applying {}.{} constraint {}",
+            change.schema, change.table, parent.constraint
+        ),
+    )
+}
+
+fn ensure_duplicate_repair_can_start(
+    change: &TargetRowChange,
+    reconciliation: &DuplicateParentReconciliation,
+    active_repairs: &BTreeSet<ActiveRepairKey>,
+) -> Result<(), TargetExecuteError> {
+    let repair_key = ActiveRepairKey::DuplicateParent(reconciliation.repair_key.clone());
+    if active_repairs.contains(&repair_key) {
+        return Err(TargetExecuteError::new(format!(
+            "duplicate-parent repair cycle detected for {}.{} index {}",
+            change.schema, change.table, reconciliation.repair_key.index
+        )));
+    }
+    ensure_repair_depth(
+        active_repairs,
+        format!(
+            "reconciling {}.{} index {}",
+            change.schema, change.table, reconciliation.repair_key.index
+        ),
+    )
+}
+
+fn ensure_repair_depth(
+    active_repairs: &BTreeSet<ActiveRepairKey>,
+    context: String,
+) -> Result<(), TargetExecuteError> {
     if active_repairs.len() >= MAX_MISSING_FOREIGN_KEY_REPAIR_DEPTH {
         return Err(TargetExecuteError::new(format!(
-            "missing-FK repair exceeded maximum depth {} while applying {}.{} constraint {}",
-            MAX_MISSING_FOREIGN_KEY_REPAIR_DEPTH, change.schema, change.table, parent.constraint
+            "automatic repair exceeded maximum depth {} while {context}",
+            MAX_MISSING_FOREIGN_KEY_REPAIR_DEPTH
         )));
     }
     Ok(())
@@ -144,6 +321,29 @@ impl PersistentTargetExecutor {
         let reference =
             self.with_connection(|target| query_foreign_key_reference(target, change, error))?;
         fetch_source_missing_foreign_key_parent(source, change, &reference)
+    }
+
+    pub(super) fn load_duplicate_parent_reconciliation(
+        &self,
+        change: &TargetRowChange,
+        error: &TargetExecuteError,
+    ) -> Result<DuplicateParentReconciliation, TargetExecuteError> {
+        let source = self.source.as_ref().ok_or_else(|| {
+            TargetExecuteError::new("duplicate-parent repair source connection is unavailable")
+        })?;
+        self.with_connection(|target| {
+            duplicate_parent::load_duplicate_parent_reconciliation(target, source, change, error)
+        })
+    }
+
+    pub(super) fn verify_duplicate_parent_reconciliation(
+        &self,
+        change: &TargetRowChange,
+        reconciliation: &DuplicateParentReconciliation,
+    ) -> Result<(), TargetExecuteError> {
+        self.with_connection(|target| {
+            duplicate_parent::verify_duplicate_parent_reconciliation(target, change, reconciliation)
+        })
     }
 }
 
@@ -279,6 +479,17 @@ fn fetch_source_parent_row(
     key_values: Vec<Value>,
 ) -> Result<(Vec<String>, Vec<Value>), TargetExecuteError> {
     let mut conn = source.conn.borrow_mut();
+    let columns = query_source_parent_columns(&mut conn, reference)?;
+    let sql = build_source_parent_select(reference, &columns);
+    let rows = query_source_parent_rows(&mut conn, reference, sql, key_values)?;
+    let values = require_one_source_parent_row(reference, rows)?;
+    Ok((columns, values))
+}
+
+fn query_source_parent_columns(
+    conn: &mut Conn,
+    reference: &ForeignKeyReference,
+) -> Result<Vec<String>, TargetExecuteError> {
     let columns = conn
         .exec::<String, _, _>(
             "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
@@ -297,7 +508,10 @@ fn fetch_source_parent_row(
             reference.parent_schema, reference.parent_table
         )));
     }
+    Ok(columns)
+}
 
+fn build_source_parent_select(reference: &ForeignKeyReference, columns: &[String]) -> String {
     let select_columns = columns
         .iter()
         .map(|column| quote_ident(column))
@@ -309,19 +523,32 @@ fn fetch_source_parent_row(
         .map(|(_, parent_column)| format!("{} <=> ?", quote_ident(parent_column)))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let sql = format!(
+    format!(
         "SELECT {select_columns} FROM {}.{} WHERE {predicates} LIMIT 2",
         quote_ident(&reference.parent_schema),
         quote_ident(&reference.parent_table)
-    );
-    let rows = conn
-        .exec::<Row, _, _>(sql, Params::Positional(key_values))
+    )
+}
+
+fn query_source_parent_rows(
+    conn: &mut Conn,
+    reference: &ForeignKeyReference,
+    sql: String,
+    key_values: Vec<Value>,
+) -> Result<Vec<Row>, TargetExecuteError> {
+    conn.exec(sql, Params::Positional(key_values))
         .map_err(|error| {
             TargetExecuteError::new(format!(
                 "missing-FK source parent query failed for {}.{}: {error}",
                 reference.parent_schema, reference.parent_table
             ))
-        })?;
+        })
+}
+
+fn require_one_source_parent_row(
+    reference: &ForeignKeyReference,
+    rows: Vec<Row>,
+) -> Result<Vec<Value>, TargetExecuteError> {
     if rows.len() != 1 {
         return Err(TargetExecuteError::new(format!(
             "missing-FK source parent query returned {} rows for {}.{} constraint {}",
@@ -331,12 +558,11 @@ fn fetch_source_parent_row(
             reference.constraint
         )));
     }
-    let values = rows
+    Ok(rows
         .into_iter()
         .next()
         .expect("one source parent row")
-        .unwrap();
-    Ok((columns, values))
+        .unwrap())
 }
 
 fn build_parent_row_change(
@@ -380,170 +606,5 @@ fn build_parent_insert_statement(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::VecDeque;
-
-    struct FakeRepairExecutor {
-        outcomes: BTreeMap<String, VecDeque<Result<(), TargetExecuteError>>>,
-        parents: BTreeMap<String, MissingForeignKeyParent>,
-        executed: Vec<String>,
-    }
-
-    impl MissingForeignKeyRepairExecutor for FakeRepairExecutor {
-        fn execute_row_change_statement(
-            &mut self,
-            change: &TargetRowChange,
-        ) -> Result<(), TargetExecuteError> {
-            self.executed.push(change.table.clone());
-            self.outcomes
-                .get_mut(&change.table)
-                .and_then(VecDeque::pop_front)
-                .unwrap_or(Ok(()))
-        }
-
-        fn load_missing_foreign_key_parent(
-            &mut self,
-            change: &TargetRowChange,
-            error: &TargetExecuteError,
-        ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
-            assert_eq!(error.mysql_code(), Some(1452));
-            self.parents.get(&change.table).cloned().ok_or_else(|| {
-                TargetExecuteError::new(format!(
-                    "missing fake parent for {}.{}",
-                    change.schema, change.table
-                ))
-            })
-        }
-    }
-
-    #[test]
-    fn recursively_repairs_nested_parents_before_retrying_child() {
-        let mut executor = FakeRepairExecutor {
-            outcomes: BTreeMap::from([
-                ("sessions".to_string(), outcomes([missing_fk(), Ok(())])),
-                ("guests".to_string(), outcomes([missing_fk(), Ok(())])),
-                ("utms".to_string(), outcomes([Ok(())])),
-            ]),
-            parents: BTreeMap::from([
-                (
-                    "sessions".to_string(),
-                    fake_parent("sessions", "sessions_guest", "guests"),
-                ),
-                (
-                    "guests".to_string(),
-                    fake_parent("guests", "guests_utm", "utms"),
-                ),
-            ]),
-            executed: Vec::new(),
-        };
-
-        execute_row_change_with_missing_foreign_key_repair(&mut executor, &row_change("sessions"))
-            .expect("repair nested parents");
-
-        assert_eq!(
-            executor.executed,
-            ["sessions", "guests", "utms", "guests", "sessions"]
-        );
-    }
-
-    #[test]
-    fn rejects_repeated_repair_key_as_a_cycle() {
-        let mut executor = FakeRepairExecutor {
-            outcomes: BTreeMap::from([
-                ("alpha".to_string(), outcomes([missing_fk(), missing_fk()])),
-                ("beta".to_string(), outcomes([missing_fk()])),
-            ]),
-            parents: BTreeMap::from([
-                (
-                    "alpha".to_string(),
-                    fake_parent("alpha", "alpha_beta", "beta"),
-                ),
-                (
-                    "beta".to_string(),
-                    fake_parent("beta", "beta_alpha", "alpha"),
-                ),
-            ]),
-            executed: Vec::new(),
-        };
-
-        let error =
-            execute_row_change_with_missing_foreign_key_repair(&mut executor, &row_change("alpha"))
-                .expect_err("cycle must fail closed");
-
-        assert!(error.to_string().contains("repair cycle detected"));
-        assert_eq!(executor.executed, ["alpha", "beta", "alpha"]);
-    }
-
-    #[test]
-    fn rejects_parent_chain_beyond_bounded_depth() {
-        let mut outcomes_by_table = BTreeMap::new();
-        let mut parents = BTreeMap::new();
-        for depth in 0..=MAX_MISSING_FOREIGN_KEY_REPAIR_DEPTH {
-            let child = format!("table_{depth}");
-            let parent = format!("table_{}", depth + 1);
-            outcomes_by_table.insert(child.clone(), outcomes([missing_fk()]));
-            parents.insert(
-                child.clone(),
-                fake_parent(&child, &format!("constraint_{depth}"), &parent),
-            );
-        }
-        let mut executor = FakeRepairExecutor {
-            outcomes: outcomes_by_table,
-            parents,
-            executed: Vec::new(),
-        };
-
-        let error = execute_row_change_with_missing_foreign_key_repair(
-            &mut executor,
-            &row_change("table_0"),
-        )
-        .expect_err("over-depth repair must fail closed");
-
-        assert!(error.to_string().contains("exceeded maximum depth"));
-        assert_eq!(
-            executor.executed.len(),
-            MAX_MISSING_FOREIGN_KEY_REPAIR_DEPTH + 1
-        );
-    }
-
-    fn outcomes<const N: usize>(
-        values: [Result<(), TargetExecuteError>; N],
-    ) -> VecDeque<Result<(), TargetExecuteError>> {
-        VecDeque::from(values)
-    }
-
-    fn missing_fk() -> Result<(), TargetExecuteError> {
-        Err(TargetExecuteError::from_mysql(1452, "missing parent"))
-    }
-
-    fn fake_parent(
-        child_table: &str,
-        constraint: &str,
-        parent_table: &str,
-    ) -> MissingForeignKeyParent {
-        MissingForeignKeyParent {
-            change: row_change(parent_table),
-            constraint: constraint.to_string(),
-            repair_key: MissingForeignKeyRepairKey {
-                child_schema: "globalcomix".to_string(),
-                child_table: child_table.to_string(),
-                constraint: constraint.to_string(),
-                values: vec![parent_table.to_string()],
-            },
-        }
-    }
-
-    fn row_change(table: &str) -> TargetRowChange {
-        TargetRowChange {
-            statement: SqlStatement {
-                sql: format!("INSERT INTO `{table}` (`id`) VALUES (?)"),
-                params: vec![Value::UInt(1)],
-            },
-            kind: TargetRowChangeKind::Insert,
-            schema: "globalcomix".to_string(),
-            table: table.to_string(),
-            values: BTreeMap::from([("id".to_string(), Value::UInt(1))]),
-        }
-    }
-}
+#[path = "missing_foreign_key/tests.rs"]
+mod tests;

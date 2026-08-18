@@ -18,7 +18,12 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - [x] Propagate MySQL `1062` from ROW `UPDATE` or `DELETE`.
 - [x] On MySQL `1452` from ROW `INSERT` or `UPDATE`, resolve the exact target constraint and fetch the exact same-schema parent row from the source.
 - [x] Insert and recursively repair the parent chain inside the current target transaction, then retry the blocked row.
-- [x] Bound repair to eight active parent edges and fail on a repeated repair key.
+- [x] When that repair-generated parent `INSERT` returns `1062`, resolve the exact non-prefix, non-expression unique index and lock exactly one conflicting target owner inside the same target transaction.
+- [x] Update a same-primary-key owner to the intended source parent row without reinserting it.
+- [x] For a different-primary-key owner, update it from its current source row or delete it when that source row no longer exists, then insert the intended parent.
+- [x] Verify the intended parent values with binary-exact byte predicates before retrying the blocked child.
+- [x] Fail closed on absent or ambiguous index metadata, zero or multiple owners, a remaining duplicate after owner reconciliation, or failed parent verification.
+- [x] Bound missing-FK and duplicate-parent repair together to eight active repair keys and fail on a repeated key.
 - [x] Propagate unrepaired `1452` and every other row error, including CHECK, schema, connection, and generated-column failures.
 - [x] Roll back the complete source transaction after a propagated row error.
 - [x] Do not commit or advance the transaction checkpoint after a propagated row error.
@@ -35,7 +40,8 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - [x] With `N > 1`, lease one target connection per complete source transaction.
 - [x] Preserve the full `TargetRowChange` through delayed worker execution.
 - [x] Give each parallel worker its own source connection and perform parent inserts on the leased target transaction.
-- [x] Send and drain parallel body statements individually so INSERT `1062` can be ignored, `1452` can be repaired, and later statements can continue only after success.
+- [x] Query and lock duplicate-parent owners through that same leased target transaction; use the separate target connection only for index and constraint metadata.
+- [x] Send and drain parallel body statements individually so native INSERT `1062` can be ignored, `1452` can be repaired, and later statements can continue only after success.
 - [x] Commit parallel transactions and checkpoints in source order.
 - [x] Stop later commits and checkpoint advancement when an earlier body or commit fails.
 
@@ -56,7 +62,8 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - `src/row/apply.rs` — maps ROW events to typed target row changes.
 - `src/row/sql.rs` — builds plain INSERT, before-key UPDATE, and key DELETE SQL.
 - `src/mysql_client.rs` — applies serial ROW outcomes and creates parallel workers.
-- `src/mysql_client/missing_foreign_key.rs` — resolves exact parents and enforces recursive depth/cycle bounds.
+- `src/mysql_client/missing_foreign_key.rs` — orchestrates exact parent repair and shared depth/cycle bounds.
+- `src/mysql_client/missing_foreign_key/duplicate_parent.rs` — resolves duplicate indexes and owners, plans source-authoritative owner changes, and verifies the intended parent.
 - `src/live/parallel_target.rs` — drains row changes with delayed error handling and source-ordered commits.
 - `src/live/parallel_writer.rs` — preserves full row metadata through worker submission.
 - `src/live/submitted_mysql.rs` — owns each worker's submitted target connection, source connection, and lazy target-metadata connection.
@@ -70,13 +77,15 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - `src/live/parallel_target_tests.rs`
 - `src/live/structured_stream/tests/transaction.rs`
 - `tests/cdc_eventual_consistency.rs`
+- `scripts/cdc-integration-harness.py`
 
 ## Focused proof
 
-- `parallel-target-transactions` exercises concurrent real MariaDB/MySQL transactions, nested `sessions → guests → utms` repair, the ordered commit barrier, INSERT `1062` continuation, TLS, and exact checkpoint completion.
+- `parallel-target-transactions` exercises concurrent real MariaDB/MySQL transactions, nested `sessions → guests → utms` repair, the ordered commit barrier, native INSERT `1062` continuation, TLS, and exact checkpoint completion.
+- `missing-fk-duplicate-parent-reconcile` replays production-shaped `users.name` and `comics.slug` collisions through serial and submitted workers, covering same-primary-key update, different-primary-key source update, source-absent owner deletion, child retry, and exact checkpoint completion.
 - Parallel pool tests prove a later prepared transaction cannot commit or publish a checkpoint after an earlier body failure.
 
 ## Out of scope
 
-- Target-row equality checks, merge semantics, or automatic replacement.
+- General target-row equality checks, merge semantics, or automatic replacement outside a repair-generated missing-FK parent insertion.
 - Deleting historical conflict records or removing out-of-band repair commands.

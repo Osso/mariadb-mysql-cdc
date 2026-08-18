@@ -29,13 +29,23 @@ the same source transaction.
 MySQL `1452` from a native INSERT or UPDATE invokes bounded same-schema parent
 repair. The executor resolves the exact target constraint, fetches the exact
 parent row from the source, recursively inserts the parent chain in the current
-target transaction, and retries the blocked row. Parallel workers retain the full
-row metadata and own a source connection for this lookup.
+target transaction, and retries the blocked row.
+
+A `1062` from that repair-generated parent insert is not ignored. The executor
+resolves the exact unique index, locks one target owner in the current
+transaction, and reconciles that owner from source. It updates a same-primary-key
+owner to the intended parent; for a different primary key, it updates the owner
+from its source row or deletes it when source-absent, then retries the parent
+insert. Exact parent values are verified before child retry. Parallel workers use
+their leased target transaction for owner reads and locks, while their separate
+target connection remains metadata-only.
 
 Non-INSERT `1062`, unrepaired `1452`, CHECK, schema, generated-column, and
 connection failures roll back the complete source transaction and block its
-checkpoint. Repair also fails closed on absent source rows, cross-schema
-references, repeated keys, or a chain deeper than eight.
+checkpoint. Repair also fails closed on absent source parents, cross-schema
+references, unsupported or ambiguous unique-index metadata, ambiguous owners,
+remaining duplicates, verification failure, repeated keys, or combined repair
+depth beyond eight.
 
 `--insert-conflict-policy` is not part of unified `sync` and does not select a
 native ROW live-stream policy. Unified sync never uses `INSERT IGNORE`, upsert,

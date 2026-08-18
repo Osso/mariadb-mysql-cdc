@@ -167,11 +167,15 @@ source-authoritative convergence uses the staged `sync` operation.
 MySQL `1452` from an INSERT or UPDATE resolves the exact target constraint,
 fetches the exact same-schema parent row from the source, recursively installs a
 bounded parent chain inside the current target transaction, and retries the
-blocked row. Every unrepaired row error rolls back the complete source
-transaction and blocks checkpoint advancement. `--target-parallel-transactions
-N` preserves the same rule with worker-local source connections, one leased
-target connection per complete source transaction, and source-ordered checkpoint
-commits.
+blocked row. If that repair-generated parent insert hits `1062`, CDC locks the
+exact duplicate-index owner in the same target transaction. It updates the owner
+from source, or deletes a source-absent different-primary-key owner, then inserts
+and verifies the intended parent before retrying the child. Ambiguous ownership,
+unsupported index metadata, a remaining duplicate, or verification failure rolls
+back without checkpoint advancement. Native source INSERT `1062` behavior remains
+unchanged. `--target-parallel-transactions N` preserves the same rules with
+worker-local source connections, one leased target connection per complete source
+transaction, and source-ordered checkpoint commits.
 
 Conflict data remains out-of-band. Targeted conflict resolution connects to
 source and target as a separate workflow from the live stream. The live stream
@@ -184,8 +188,9 @@ repair is independent from that ledger. Retired supersession and target-replacem
 paths remain absent from runtime and harness code.
 
 The disposable MariaDB/MySQL harness covers DDL journal recovery,
-reconnect/GET_LOCK behavior, and parallel target transactions. These are local
-proofs, not live cutover proof.
+reconnect/GET_LOCK behavior, parallel target transactions, and serial/submitted
+source-authoritative repair of production-shaped duplicate missing-FK parents.
+These are local proofs, not live cutover proof.
 
 Deployment runs through `deploy.sh`, which checks the repository, publishes and
 verifies an immutable image, scans it, and commits the ops image reference.
