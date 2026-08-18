@@ -1,4 +1,3 @@
-use super::grants::validate_runtime_grants;
 use super::mysql_error;
 use crate::mysql_support::{quote_ident, quote_sql_literal};
 use mysql::Conn;
@@ -376,18 +375,12 @@ pub(crate) struct JournalRuntimeContract<'a> {
     pub(crate) constraints: &'a [JournalConstraint],
     pub(crate) checks: &'a [String],
     pub(crate) triggers: &'a [JournalTriggerMetadata],
-    pub(crate) grants: &'a [String],
-    pub(crate) application_schema: &'a str,
-    pub(crate) checkpoint_table: &'a str,
-    pub(crate) journal_table: &'a str,
-    pub(crate) inventory_procedure: &'a str,
 }
 
 pub(crate) fn validate_journal_runtime_contract(
     contract: JournalRuntimeContract<'_>,
 ) -> Result<(), String> {
-    validate_journal_structure(&contract)?;
-    validate_runtime_access(&contract)
+    validate_journal_structure(&contract)
 }
 
 fn validate_journal_structure(contract: &JournalRuntimeContract<'_>) -> Result<(), String> {
@@ -400,16 +393,6 @@ fn validate_journal_structure(contract: &JournalRuntimeContract<'_>) -> Result<(
         contract.expected_schema,
         contract.expected_table,
         contract.triggers,
-    )
-}
-
-fn validate_runtime_access(contract: &JournalRuntimeContract<'_>) -> Result<(), String> {
-    validate_runtime_grants(
-        contract.grants,
-        contract.application_schema,
-        contract.checkpoint_table,
-        contract.journal_table,
-        contract.inventory_procedure,
     )
 }
 

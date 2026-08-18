@@ -4,6 +4,7 @@ use super::{TargetMySqlConfig, target_session_init_command};
 use crate::mysql_support::target_mysql_opts;
 use crate::target::SqlStatement;
 
+#[cfg(test)]
 mod grants;
 mod schema;
 mod store;

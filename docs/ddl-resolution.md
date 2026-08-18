@@ -82,18 +82,18 @@ maintained as compatibility paths.
 
 Bootstrap and startup validate live external administrative state once, before
 source replication: journal/checkpoint columns, keys, checks, guards, the DDL
-journal trigger-inventory procedure call result, effective stream grants, and the
-single-writer `GET_LOCK` prerequisite. Independent conflict-ledger state is not a
-live startup dependency. Admin/resolver bootstrap separately reviews its objects.
-A live-contract mismatch is deployment drift and fails fast. Runtime does not
-create or repair that state.
+journal trigger-inventory procedure call result, and the single-writer `GET_LOCK`
+prerequisite. Startup does not inspect effective grants or query `SHOW GRANTS`;
+authorization failures surface from the operation that requires the privilege.
+Independent conflict-ledger state is not a live startup dependency.
+Admin/resolver bootstrap separately reviews its objects. A live-contract mismatch
+is deployment drift and fails fast. Runtime does not create or repair that state.
 
 Binlog DDL is untrusted source input and is classified per event against the
 admission policy. After translation, CDC-generated SQL is trusted internal
 program behavior. Event handling executes known internal operations, performs
 only event-specific state/evidence checks, and surfaces database errors. It does
-not rerun effective-grant policy validation, query `SHOW GRANTS`, or maintain a
-second grant/control-plane allowlist.
+not maintain a grant/control-plane allowlist.
 
 The removed manual ledger is absent from runtime, configuration, startup
 validation, bootstrap, grants, and harness behavior.

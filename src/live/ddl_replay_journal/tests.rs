@@ -85,7 +85,6 @@ fn runtime_contract<'a>(
     constraints: &'a [JournalConstraint],
     checks: &'a [String],
     triggers: &'a [JournalTriggerMetadata],
-    grants: &'a [String],
 ) -> JournalRuntimeContract<'a> {
     JournalRuntimeContract {
         expected_schema: "cdc",
@@ -95,11 +94,6 @@ fn runtime_contract<'a>(
         constraints,
         checks,
         triggers,
-        grants,
-        application_schema: "globalcomix",
-        checkpoint_table: "cdc.stream_checkpoint",
-        journal_table: "cdc.ddl_replay_journal",
-        inventory_procedure: "cdc.ddl_replay_journal_trigger_inventory",
     }
 }
 
@@ -164,7 +158,7 @@ fn assert_trigger_and_routine_drift_is_rejected() {
 }
 
 #[test]
-fn validates_journal_runtime_contract_with_call_rows_and_exact_execute_only() {
+fn validates_journal_runtime_contract_with_call_rows() {
     let columns = expected_ddl_replay_journal_columns();
     let keys = expected_ddl_replay_journal_keys();
     let constraints = expected_ddl_replay_journal_constraints();
@@ -173,22 +167,13 @@ fn validates_journal_runtime_contract_with_call_rows_and_exact_execute_only() {
             .to_string(),
     ];
     let trigger_rows = triggers();
-    let grant_rows = grants();
-    assert_runtime_contract(
-        &columns,
-        &keys,
-        &constraints,
-        &checks,
-        &trigger_rows,
-        &grant_rows,
-    );
+    assert_runtime_contract(&columns, &keys, &constraints, &checks, &trigger_rows);
     assert_runtime_contract_rejects_blocked_transition(
         &columns,
         &keys,
         &constraints,
         &checks,
         &trigger_rows,
-        &grant_rows,
     );
 }
 
@@ -198,7 +183,6 @@ fn assert_runtime_contract(
     constraints: &[JournalConstraint],
     checks: &[String],
     triggers: &[JournalTriggerMetadata],
-    grants: &[String],
 ) {
     assert!(
         validate_journal_runtime_contract(runtime_contract(
@@ -207,7 +191,6 @@ fn assert_runtime_contract(
             constraints,
             checks,
             triggers,
-            grants,
         ))
         .is_ok()
     );
@@ -219,7 +202,6 @@ fn assert_runtime_contract_rejects_blocked_transition(
     constraints: &[JournalConstraint],
     checks: &[String],
     triggers: &[JournalTriggerMetadata],
-    grants: &[String],
 ) {
     let mut blocked = triggers.to_vec();
     blocked[1].5 = "BEGIN SET NEW.status='blocked'; END".to_string();
@@ -230,7 +212,6 @@ fn assert_runtime_contract_rejects_blocked_transition(
             constraints,
             checks,
             &blocked,
-            grants,
         ))
         .is_err()
     );

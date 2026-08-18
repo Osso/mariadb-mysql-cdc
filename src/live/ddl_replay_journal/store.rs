@@ -1,8 +1,7 @@
 use super::schema::{
-    JournalRuntimeContract, journal_schema_and_table, journal_trigger_inventory_routine_path,
-    query_journal_columns, query_journal_constraints, query_journal_keys,
-    query_journal_status_checks, query_journal_trigger_inventory,
-    validate_journal_runtime_contract,
+    JournalRuntimeContract, journal_schema_and_table, query_journal_columns,
+    query_journal_constraints, query_journal_keys, query_journal_status_checks,
+    query_journal_trigger_inventory, validate_journal_runtime_contract,
 };
 use super::{
     DdlEvent, DdlReplayStatus, DdlSemanticEvidence, JournalBarrier, SqlStatement,
@@ -74,11 +73,6 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
         let constraints = query_journal_constraints(&mut conn, schema, table)?;
         let checks = query_journal_status_checks(&mut conn, schema, table)?;
         let triggers = query_journal_trigger_inventory(&mut conn, &self.table)?;
-        let grants = conn
-            .query::<String, _>("SHOW GRANTS")
-            .map_err(mysql_error)?;
-        let inventory_procedure =
-            journal_trigger_inventory_routine_path(&self.table).replace('`', "");
         validate_journal_runtime_contract(JournalRuntimeContract {
             expected_schema: schema,
             expected_table: table,
@@ -87,11 +81,6 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
             constraints: &constraints,
             checks: &checks,
             triggers: &triggers,
-            grants: &grants,
-            application_schema: &self.target.database,
-            checkpoint_table: "cdc.stream_checkpoint",
-            journal_table: &self.table,
-            inventory_procedure: &inventory_procedure,
         })
     }
 
