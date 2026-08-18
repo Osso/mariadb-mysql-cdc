@@ -146,14 +146,8 @@ GRANT SELECT, INSERT, UPDATE
     ON cdc.stream_checkpoint
     TO 'cdc_stream'@'%';
 
-GRANT SELECT, INSERT, UPDATE
-    ON cdc.row_conflicts
-    TO 'cdc_stream'@'%';
-
-GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory TO 'cdc_stream'@'%';
-
--- Inspect these as admin/resolver credentials. Runtime startup has only the
--- exact EXECUTE grant and validates CALL result rows; it never runs SHOW CREATE
--- PROCEDURE or requires routine metadata privileges.
+-- Historical row-conflict objects remain available to the independent evidence
+-- workflow. Live streaming receives no row-conflict table or procedure grants
+-- and does not validate this procedure during startup.
 SHOW CREATE PROCEDURE cdc.row_conflicts_trigger_inventory;
 SHOW GRANTS FOR 'cdc_stream'@'%';

@@ -798,6 +798,43 @@ fn bootstrap_fixtures_use_exact_restricted_accounts() {
 }
 
 #[test]
+fn runtime_grant_docs_remove_legacy_stream_control_plane_access() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let runtime_grants = fs::read_to_string(root.join("docs/ddl-runtime-grants.sql.example"))
+        .expect("read runtime grants example");
+    let control_plane = fs::read_to_string(root.join("docs/ddl-control-plane-bootstrap.sql"))
+        .expect("read control-plane bootstrap");
+
+    for sql in [runtime_grants, control_plane] {
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !normalized
+                .contains("GRANT SELECT, INSERT, UPDATE ON cdc.row_conflicts TO 'cdc_stream'@'%';")
+        );
+        assert!(!normalized.contains(
+            "GRANT EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory TO 'cdc_stream'@'%';"
+        ));
+    }
+
+    let migration =
+        fs::read_to_string(root.join("docs/live-stream-runtime-grants-migration-20260818.sql"))
+            .expect("read live-stream runtime grants migration");
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    for revoke in [
+        "REVOKE SELECT, INSERT, UPDATE ON cdc.row_conflicts FROM 'cdc_stream'@'%';",
+        "REVOKE EXECUTE ON PROCEDURE cdc.row_conflicts_trigger_inventory FROM 'cdc_stream'@'%';",
+        "REVOKE SELECT, INSERT, UPDATE ON cdc.table_sync_runs FROM 'cdc_stream'@'%';",
+    ] {
+        assert!(
+            normalized.contains(revoke),
+            "missing migration statement: {revoke}"
+        );
+    }
+    assert!(!normalized.contains("DROP TABLE"));
+    assert!(!normalized.contains("DROP PROCEDURE"));
+}
+
+#[test]
 fn source_based_harness_rebuilds_existing_binary_but_explicit_binary_does_not() {
     let script = harness_script();
     let code = format!(

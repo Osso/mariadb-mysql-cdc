@@ -61,9 +61,15 @@ mariadb --defaults-extra-file=/path/admin.cnf < docs/ddl-control-plane-bootstrap
 mariadb --defaults-extra-file=/path/admin.cnf < docs/ddl-replay-journal-bootstrap.sql
 ```
 
-The contract provisions checkpoint, row-conflict, and automatic DDL journal
-objects with exact control-plane scopes and journal/row-conflict trigger-inventory
-procedures.
+The contract provisions checkpoint, historical row-conflict, and automatic DDL
+journal objects. Live stream startup validates only checkpoint and DDL-journal
+state; row-conflict objects remain independent evidence storage.
+
+Before deploying the independent-ledger stream against an account provisioned by
+the older contract, run `docs/live-stream-runtime-grants-migration-20260818.sql`
+with target admin credentials. It revokes only obsolete `cdc_stream` access to
+`cdc.row_conflicts`, its inventory procedure, and `cdc.table_sync_runs`; it does
+not delete historical objects or resolver access.
 
 For an existing populated `cdc.row_conflicts` table, run
 `docs/row-conflicts-source-row-identity-migration.sql` once with stream and repair
@@ -74,12 +80,13 @@ maintained as compatibility paths.
 
 ## Startup/bootstrap validation boundary
 
-Bootstrap and startup validate external administrative state once, before source
-replication: journal/checkpoint/conflict columns, keys, checks, guards,
-trigger-inventory procedure call results, effective grants, and the single-writer
-`GET_LOCK` prerequisite. Admin/resolver bootstrap separately reviews
-`SHOW CREATE PROCEDURE` and direct trigger rows. A mismatch is deployment drift
-and fails fast. Runtime does not create or repair that state.
+Bootstrap and startup validate live external administrative state once, before
+source replication: journal/checkpoint columns, keys, checks, guards, the DDL
+journal trigger-inventory procedure call result, effective stream grants, and the
+single-writer `GET_LOCK` prerequisite. Independent conflict-ledger state is not a
+live startup dependency. Admin/resolver bootstrap separately reviews its objects.
+A live-contract mismatch is deployment drift and fails fast. Runtime does not
+create or repair that state.
 
 Binlog DDL is untrusted source input and is classified per event against the
 admission policy. After translation, CDC-generated SQL is trusted internal

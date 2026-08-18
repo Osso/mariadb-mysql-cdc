@@ -1,6 +1,8 @@
 -- Run with admin/resolver credentials. Replace the password and review the
 -- application schema before use. Runtime validation is fail-closed; it never
--- creates or repairs control-plane objects.
+-- creates or repairs control-plane objects. Existing accounts provisioned by
+-- the legacy contract must first apply
+-- docs/live-stream-runtime-grants-migration-20260818.sql.
 CREATE USER 'cdc_stream'@'%' IDENTIFIED BY '<strong-generated-password>' REQUIRE SSL;
 
 -- Application-schema DDL grant used by the reviewed automatic replay contract.
@@ -28,43 +30,31 @@ GRANT SELECT, INSERT, UPDATE
     ON cdc.stream_checkpoint
     TO 'cdc_stream'@'%';
 
--- Durable row-conflict observations/resolutions: exact table scope only.
-GRANT SELECT, INSERT, UPDATE
-    ON cdc.row_conflicts
-    TO 'cdc_stream'@'%';
-
 GRANT SELECT, INSERT, UPDATE
     ON cdc.ddl_replay_journal
-    TO 'cdc_stream'@'%';
-
-GRANT EXECUTE
-    ON PROCEDURE cdc.row_conflicts_trigger_inventory
     TO 'cdc_stream'@'%';
 
 GRANT EXECUTE
     ON PROCEDURE cdc.ddl_replay_journal_trigger_inventory
     TO 'cdc_stream'@'%';
 
+-- Historical cdc.row_conflicts objects belong to the independent evidence
+-- workflow. Do not grant that table or its inventory procedure to cdc_stream.
+--
 -- Effective-grant acceptance contract. This is bootstrap/startup state and is
 -- validated once before source replication; event handling does not rerun SHOW
 -- GRANTS or a second grant-policy allowlist for each generated statement.
 -- * global scope: USAGE only;
 -- * exact checkpoint SELECT/INSERT/UPDATE;
--- * exact row-conflicts SELECT/INSERT/UPDATE;
 -- * exact journal SELECT/INSERT/UPDATE;
--- * EXECUTE only on the two reviewed trigger-inventory procedures;
+-- * EXECUTE only on the DDL-journal trigger-inventory procedure;
 -- * no GRANT OPTION, PROXY, roles, ALL, global mutation, schema-wide cdc
---   mutation/object creation, or ledger/journal DELETE/ALTER/DROP/TRIGGER.
+--   mutation/object creation, historical sync progress, or conflict-ledger access.
 --
--- The row-conflicts grant must never be widened to DELETE, ALTER, DROP, schema-wide,
--- global, administrative, role, or GRANT OPTION access. Startup/bootstrap validates
--- the exact table schema, guards, constraints, and effective grant before source
--- streaming.
---
--- Startup calls the exact definer-safe procedure and validates its returned
--- trigger rows. Event handling executes known internal operations directly and
--- surfaces database errors; it does not rerun grant validation. Admin/resolver
--- credentials independently review SHOW CREATE PROCEDURE and actual trigger
--- rows; runtime does not require routine metadata privileges or a SHOW CREATE
--- query.
+-- Startup calls the exact definer-safe DDL-journal procedure and validates its
+-- returned trigger rows. Event handling executes known internal operations
+-- directly and surfaces database errors; it does not rerun grant validation.
+-- Admin/resolver credentials independently review SHOW CREATE PROCEDURE and
+-- actual trigger rows; runtime does not require routine metadata privileges or
+-- a SHOW CREATE query.
 SHOW GRANTS FOR 'cdc_stream'@'%';
