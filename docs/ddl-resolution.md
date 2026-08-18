@@ -280,23 +280,32 @@ never skips the source event or falls back to raw SQL.
 
 ## Runtime grant contract
 
-Required control-plane scopes are separate from the application-schema grant:
+Required live-stream control-plane scopes are separate from the application-schema
+grant:
 
 - global `USAGE` only;
 - `SELECT, INSERT, UPDATE` on `cdc.stream_checkpoint`;
-- `SELECT, INSERT, UPDATE` on `cdc.row_conflicts`;
 - `SELECT, INSERT, UPDATE` on `cdc.ddl_replay_journal`;
 - `EXECUTE` only on the exact definer-safe
-  `cdc.row_conflicts_trigger_inventory` and
-  `cdc.ddl_replay_journal_trigger_inventory` procedures.
+  `cdc.ddl_replay_journal_trigger_inventory` procedure.
+
+The historical `cdc.row_conflicts` table and
+`cdc.row_conflicts_trigger_inventory` procedure remain available to the
+independent evidence/resolution workflow, but the live stream has no grants on
+them and does not validate them at startup. Accounts provisioned under the old
+contract must first run
+`docs/live-stream-runtime-grants-migration-20260818.sql` with target admin
+credentials before deploying the new image. That one-time migration revokes
+only obsolete live-stream access; it does not delete historical ledger objects
+or alter resolver access.
 
 Reject control-plane/global/admin mutation, `ALL`, `GRANT OPTION`, `PROXY`,
-roles, broad `cdc.*`, and row-conflict `DELETE`, `ALTER`, or `DROP` privileges.
-The startup/bootstrap validator fails before source streaming when the tables,
-guards, constraints, procedures, or effective exact grant is missing or widened.
-Application-schema privileges remain a separate reviewed bootstrap contract.
-Runtime calls the exact inventory procedures during startup validation; it does
-not rerun grant policy validation during event handling.
+roles, broad `cdc.*`, historical sync-progress access, and conflict-ledger
+access. The startup/bootstrap validator fails before source streaming when the
+live tables, guards, journal procedure, or effective exact grant is missing or
+widened. Application-schema privileges remain a separate reviewed bootstrap
+contract. Runtime calls only the DDL-journal inventory procedure during startup
+validation and does not rerun grant policy validation during event handling.
 
 ## Monitoring and bounded stops
 

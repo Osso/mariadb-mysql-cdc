@@ -119,8 +119,14 @@ No operator-authored target SQL or manual status transition is a supported DDL
 resolution path. Fresh bootstrap remains the pre-production schema contract.
 Existing populated `cdc.row_conflicts` tables use
 `docs/row-conflicts-source-row-identity-migration.sql` once while out-of-band repair
-writers are stopped; runtime never performs this migration. Obsolete
-development migrations are not maintained as upgrade paths.
+writers are stopped; runtime never performs this migration. Before deploying the
+new live-stream image, accounts provisioned under the older runtime-grant contract
+must also run
+`docs/live-stream-runtime-grants-migration-20260818.sql` with target admin
+credentials. That one-time migration revokes obsolete live-stream access to the
+historical conflict ledger and legacy table-sync progress without deleting those
+objects or changing resolver access. Obsolete development migrations are not
+maintained as upgrade paths.
 
 Native ROW streaming is source-authoritative and target-disposable. It emits plain
 INSERT statements and treats MySQL `1062` from INSERT as idempotent success,
