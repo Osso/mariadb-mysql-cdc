@@ -9,7 +9,8 @@ image="${image_repo}:${tag}"
 trivy_image="ghcr.io/aquasecurity/trivy@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c"
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
-stream_manifest="${ops_repo}/infrastructure/ops/mariadb-mysql-cdc-stream.yaml"
+stream_manifest_relative="infrastructure/ops/mariadb-mysql-cdc-stream.yaml"
+stream_manifest="${ops_repo}/${stream_manifest_relative}"
 
 require_clean_tree() {
     repo="$1"
@@ -64,7 +65,7 @@ docker run --rm \
 
 update_image_reference "$stream_manifest"
 
-git -C "$ops_repo" add "$stream_manifest"
+git -C "$ops_repo" add "$stream_manifest_relative"
 if git -C "$ops_repo" diff --cached --quiet; then
     echo "ops manifests already use $immutable_image"
 else

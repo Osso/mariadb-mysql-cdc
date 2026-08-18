@@ -218,6 +218,34 @@ class DeployScriptTest(unittest.TestCase):
             self.assertIn(IMAGE, arguments)
             self.assertIn("--push", arguments)
 
+    def test_default_sibling_ops_repo_updates_and_commits_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture = DeploymentFixture(Path(temporary_directory))
+            environment = fixture.environment()
+            environment.pop("OPS_REPO")
+
+            result = run(
+                str(fixture.project / "deploy.sh"),
+                "candidate",
+                cwd=fixture.project,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = (
+                fixture.ops
+                / "infrastructure/ops/mariadb-mysql-cdc-stream.yaml"
+            ).read_text()
+            self.assertIn(f"image: {IMMUTABLE_IMAGE}", manifest)
+            commit_subject = run(
+                "git",
+                "log",
+                "-1",
+                "--pretty=%s",
+                cwd=fixture.ops,
+            )
+            self.assertEqual(commit_subject.stdout.strip(), "Deploy CDC image candidate")
+
     def test_verifies_pushed_digest_and_scans_before_ops_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             fixture = DeploymentFixture(Path(temporary_directory))
