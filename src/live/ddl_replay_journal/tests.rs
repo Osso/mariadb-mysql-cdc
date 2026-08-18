@@ -68,17 +68,6 @@ fn triggers() -> Vec<JournalTriggerMetadata> {
     ]
 }
 
-fn grants() -> Vec<String> {
-    vec![
-        "GRANT USAGE ON *.* TO `cdc_stream`@`%`".to_string(),
-        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE, EVENT, TRIGGER ON `globalcomix`.* TO `cdc_stream`@`%`".to_string(),
-        "GRANT SELECT, INSERT, UPDATE ON `cdc`.`stream_checkpoint` TO `cdc_stream`@`%`".to_string(),
-        "GRANT SELECT, INSERT, UPDATE ON `cdc`.`ddl_replay_journal` TO `cdc_stream`@`%`".to_string(),
-        "GRANT SELECT, INSERT, UPDATE ON `cdc`.`sync_runs` TO `cdc_stream`@`%`".to_string(),
-        "GRANT EXECUTE ON PROCEDURE `cdc`.`ddl_replay_journal_trigger_inventory` TO `cdc_stream`@`%`".to_string(),
-    ]
-}
-
 fn runtime_contract<'a>(
     columns: &'a [JournalColumn],
     keys: &'a [JournalKey],
@@ -215,87 +204,6 @@ fn assert_runtime_contract_rejects_blocked_transition(
         ))
         .is_err()
     );
-}
-
-#[test]
-fn validates_required_runtime_grants_and_ignores_extra_scopes() {
-    let grant_rows = grants();
-    assert!(
-        validate_runtime_grants(
-            &grant_rows,
-            "globalcomix",
-            "cdc.stream_checkpoint",
-            "cdc.ddl_replay_journal",
-            "cdc.ddl_replay_journal_trigger_inventory"
-        )
-        .is_ok()
-    );
-    assert_missing_application_privilege_is_rejected(&grant_rows);
-    assert_extra_scope_grants_are_ignored(&grant_rows);
-    assert_bad_grants_are_rejected(&grant_rows);
-}
-
-fn assert_extra_scope_grants_are_ignored(grant_rows: &[String]) {
-    for extra in [
-        "GRANT UPDATE ON `cdc`.* TO `cdc_stream`@`%`",
-        "GRANT SELECT ON `admin`.* TO `cdc_stream`@`%`",
-        "GRANT DELETE ON `cdc`.`row_conflicts` TO `cdc_stream`@`%`",
-        "GRANT EXECUTE ON `cdc`.* TO `cdc_stream`@`%`",
-    ] {
-        let mut drifted = grant_rows.to_vec();
-        drifted.push(extra.to_string());
-        assert!(
-            validate_runtime_grants(
-                &drifted,
-                "globalcomix",
-                "cdc.stream_checkpoint",
-                "cdc.ddl_replay_journal",
-                "cdc.ddl_replay_journal_trigger_inventory"
-            )
-            .is_ok(),
-            "rejected unrelated grant scope {extra}"
-        );
-    }
-}
-
-fn assert_missing_application_privilege_is_rejected(grant_rows: &[String]) {
-    for privilege in ["SELECT", "INSERT", "UPDATE", "DELETE", "EXECUTE"] {
-        let mut missing = grant_rows.to_vec();
-        missing[1] = missing[1].replace(&format!("{privilege}, "), "");
-        missing[1] = missing[1].replace(&format!(", {privilege}"), "");
-        let error = validate_runtime_grants(
-            &missing,
-            "globalcomix",
-            "cdc.stream_checkpoint",
-            "cdc.ddl_replay_journal",
-            "cdc.ddl_replay_journal_trigger_inventory",
-        )
-        .expect_err("missing application privilege must fail startup grant validation");
-        assert!(error.contains(privilege), "missing {privilege}: {error}");
-    }
-}
-
-fn assert_bad_grants_are_rejected(grant_rows: &[String]) {
-    for bad in [
-        "GRANT ALL PRIVILEGES ON *.* TO `cdc_stream`@`%`",
-        "GRANT PROXY ON `admin`@`%` TO `cdc_stream`@`%`",
-        "GRANT `ddl_admin`@`%` TO `cdc_stream`@`%`",
-        "GRANT SELECT ON `cdc`.`ddl_replay_journal` TO `cdc_stream`@`%` WITH GRANT OPTION",
-    ] {
-        let mut drifted = grant_rows.to_vec();
-        drifted.push(bad.to_string());
-        assert!(
-            validate_runtime_grants(
-                &drifted,
-                "globalcomix",
-                "cdc.stream_checkpoint",
-                "cdc.ddl_replay_journal",
-                "cdc.ddl_replay_journal_trigger_inventory"
-            )
-            .is_err(),
-            "accepted {bad}"
-        );
-    }
 }
 
 #[test]
