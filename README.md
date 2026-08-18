@@ -167,8 +167,12 @@ source-authoritative convergence uses the staged `sync` operation.
 MySQL `1452` from an INSERT or UPDATE resolves the exact target constraint,
 fetches the exact same-schema parent row from the source, recursively installs a
 bounded parent chain inside the current target transaction, and retries the
-blocked row. If that repair-generated parent insert hits `1062`, CDC locks the
-exact duplicate-index owner in the same target transaction. It updates the owner
+blocked row. When an older native INSERT references a composite parent key that
+no longer exists, CDC loads the current source child by primary key. It applies
+the current row recursively when the FK values changed, skips the historical
+INSERT when the source row is absent, and fails closed when the current row still
+requests the missing parent. If a repair-generated parent insert hits `1062`, CDC
+locks the exact duplicate-index owner in the same target transaction. It updates the owner
 from source, or deletes a source-absent different-primary-key owner, then inserts
 and verifies the intended parent before retrying the child. Ambiguous ownership,
 unsupported index metadata, a remaining duplicate, or verification failure rolls
@@ -184,13 +188,15 @@ does not validate its schema, procedures, or grants. Historical ledger
 persistence is owned by concrete `MySqlConflictLedger` in
 `src/conflict_ledger.rs` and `src/conflict_ledger/`; shared foreign-key
 canonicalization is owned by `src/canonical_foreign_key.rs`. Live missing-parent
-repair is independent from that ledger. Retired supersession and target-replacement
-paths remain absent from runtime and harness code.
+repair is independent from that ledger. General supersession and target-replacement
+paths remain absent; the only source-current INSERT substitution is the narrow
+missing-FK recovery described above.
 
 The disposable MariaDB/MySQL harness covers DDL journal recovery,
 reconnect/GET_LOCK behavior, parallel target transactions, and serial/submitted
-source-authoritative repair of production-shaped duplicate missing-FK parents.
-These are local proofs, not live cutover proof.
+source-authoritative repair of production-shaped duplicate missing-FK parents and
+historical child FK values superseded by current source rows. These are local
+proofs, not live cutover proof.
 
 Deployment runs through `deploy.sh`, which checks the repository, publishes and
 verifies an immutable image, scans it, and commits the ops image reference.
@@ -279,6 +285,7 @@ Run the disposable source-authoritative proofs with:
 
 ```sh
 python3 scripts/cdc-integration-harness.py --scenario insert-duplicate-idempotent
+python3 scripts/cdc-integration-harness.py --scenario missing-fk-superseded-insert
 python3 scripts/cdc-integration-harness.py --scenario parallel-target-transactions
 ```
 

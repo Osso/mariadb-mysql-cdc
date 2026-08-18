@@ -31,6 +31,13 @@ parent repair. The worker resolves the exact target constraint, fetches the exac
 same-schema parent row from the source, recursively installs any missing parent
 chain inside the same target transaction, and retries the blocked row.
 
+If an older native INSERT's exact composite parent key no longer exists, the
+worker loads that child table's current source row by primary key. A changed FK
+causes the current row to be inserted through the same recursive repair path
+without retrying the historical values. An absent current source row makes the
+historical INSERT a no-op. A current row that still references the absent parent
+fails closed.
+
 If a repair-generated parent `INSERT` returns `1062`, the worker resolves the
 reported unique index and locks its single target owner in that transaction. A
 same-primary-key owner is updated to the intended source parent. A different
@@ -39,20 +46,23 @@ longer exists, before the intended parent is inserted. The worker then verifies
 the intended parent with binary-exact byte predicates before retrying the child.
 Native ROW `INSERT` duplicates remain unchanged and never enter this path.
 
-A missing source parent, cross-schema reference, prefix or expression index,
-ambiguous index or owner, repeated repair key, combined repair depth beyond
-eight, remaining duplicate, metadata failure, verification mismatch, or
-unsuccessful child retry is transaction-fatal.
+A missing source parent not resolved by the narrow superseded-INSERT rule,
+cross-schema reference, prefix or expression index, ambiguous index or owner,
+repeated repair key, combined repair depth beyond eight, remaining duplicate,
+metadata failure, verification mismatch, or unsuccessful child retry is
+transaction-fatal.
 
 Every other row error is transaction-fatal. This includes non-`INSERT` `1062`,
 `1452` that cannot be repaired, CHECK failures, schema mismatches that reach
 execution, connection errors, and generated-column failures. The target
 transaction rolls back and its checkpoint does not advance.
 
-`--insert-conflict-policy` does not change native ROW streaming behavior. Live
-supersession, conflict-ledger, general target-equality, and general row-replacement
-paths do not exist. The narrow duplicate-owner reconciliation above exists only
-inside a repair-generated missing-FK parent insertion. It neither reads nor
+`--insert-conflict-policy` does not change native ROW streaming behavior. General
+supersession, conflict-ledger, target-equality, and row-replacement paths do not
+exist. Source-current INSERT substitution is limited to an exact parent lookup
+that became stale after the source row changed or disappeared. The narrow
+duplicate-owner reconciliation above exists only inside a repair-generated
+missing-FK parent insertion. It neither reads nor
 writes conflict-ledger evidence; explicit broad source-authoritative convergence
 remains the staged `sync` operation.
 

@@ -63,6 +63,7 @@ SCENARIOS = (
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("insert-duplicate-idempotent", True),
     ScenarioSpec("missing-fk-parent-auto-insert", True),
+    ScenarioSpec("missing-fk-superseded-insert", True),
     ScenarioSpec("missing-fk-duplicate-parent-reconcile", True),
     ScenarioSpec("parallel-target-transactions", True),
     ScenarioSpec("missing-checkpoint", True),
@@ -1092,6 +1093,83 @@ class Harness:
             "missing_fk_parent_auto_insert_ok parent=guests child=sessions "
             f"checkpoint={stop.file}:{stop.position}"
         )
+
+    def run_missing_fk_superseded_insert(self) -> None:
+        assert self.source and self.target
+        schema = """
+            CREATE TABLE comics (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                comic_format_id TINYINT UNSIGNED NOT NULL,
+                label VARCHAR(64) NOT NULL,
+                UNIQUE KEY uq_comics_id_format (id, comic_format_id)
+            ) ENGINE=InnoDB;
+            CREATE TABLE releases (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                comic_id BIGINT UNSIGNED NOT NULL,
+                comic_format_id TINYINT UNSIGNED NOT NULL,
+                payload VARCHAR(64) NOT NULL,
+                CONSTRAINT releases_ibfk_format
+                    FOREIGN KEY (comic_id, comic_format_id)
+                    REFERENCES comics (id, comic_format_id)
+                    ON DELETE RESTRICT ON UPDATE CASCADE
+            ) ENGINE=InnoDB;
+        """
+        self.admin_sql(self.source, schema)
+        self.admin_sql(self.target, schema)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO comics VALUES (49868, 2, 'source-parent');",
+        )
+        start = self.coordinate()
+        self.admin_sql(
+            self.source,
+            "INSERT INTO releases VALUES (391468, 49868, 2, 'historical'); "
+            "UPDATE comics SET comic_format_id = 1, label = 'source-current-parent' "
+            "WHERE id = 49868; "
+            "UPDATE releases SET payload = 'source-current-child' WHERE id = 391468;",
+        )
+        stop = self.coordinate()
+
+        for mode, parallel_transactions in (("serial", 1), ("submitted", 2)):
+            self.admin_sql(
+                self.target,
+                "DELETE FROM releases; DELETE FROM comics; "
+                "INSERT INTO comics VALUES (49868, 1, 'source-current-parent');",
+            )
+            self.write_checkpoint(start)
+            result = self.run_stream(
+                start,
+                stop,
+                target_parallel_transactions=parallel_transactions,
+            )
+            require_success(result, f"{mode} superseded missing-FK insert stream")
+            child = self.query(
+                self.target,
+                "SELECT id,comic_id,comic_format_id,payload FROM releases;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            expected = "391468\t49868\t1\tsource-current-child"
+            if child != expected:
+                raise HarnessError(
+                    f"{mode} superseded source INSERT did not converge: {child!r}"
+                )
+            checkpoint = self.checkpoint()
+            if checkpoint.get("source_file") != stop.file or int(
+                checkpoint.get("source_position", 0)
+            ) != stop.position:
+                raise HarnessError(
+                    f"{mode} superseded INSERT checkpoint did not reach exact stop: {checkpoint}"
+                )
+            output = f"{result.stdout}\n{result.stderr}"
+            if "cdc_missing_fk_superseded_insert_reconciled" not in output:
+                raise HarnessError(
+                    f"{mode} superseded INSERT did not report reconciliation: {output}"
+                )
+            print(
+                "missing_fk_superseded_insert_ok "
+                f"mode={mode} current_source_row=applied checkpoint={stop.file}:{stop.position}"
+            )
 
     def setup_missing_fk_duplicate_parent_tables(self) -> None:
         assert self.source and self.target
@@ -3024,6 +3102,8 @@ class Harness:
             self.run_insert_duplicate_idempotent()
         elif scenario == "missing-fk-parent-auto-insert":
             self.run_missing_fk_parent_auto_insert()
+        elif scenario == "missing-fk-superseded-insert":
+            self.run_missing_fk_superseded_insert()
         elif scenario == "missing-fk-duplicate-parent-reconcile":
             self.run_missing_fk_duplicate_parent_reconcile()
         elif scenario == "parallel-target-transactions":

@@ -31,7 +31,14 @@ repair. The executor resolves the exact target constraint, fetches the exact
 parent row from the source, recursively inserts the parent chain in the current
 target transaction, and retries the blocked row.
 
-A `1062` from that repair-generated parent insert is not ignored. The executor
+When an older native INSERT's exact parent key is absent, the executor queries the
+current source child by primary key. It recursively inserts that current row when
+its FK values changed, skips the historical INSERT when the current source row is
+absent, and fails closed when the current row still references the missing key.
+This repair-generated current INSERT may reconcile its own `1062`; the original
+native INSERT duplicate-ignore rule is unchanged.
+
+A `1062` from a repair-generated parent insert is not ignored. The executor
 resolves the exact unique index, locks one target owner in the current
 transaction, and reconciles that owner from source. It updates a same-primary-key
 owner to the intended parent; for a different primary key, it updates the owner
@@ -42,10 +49,10 @@ target connection remains metadata-only.
 
 Non-INSERT `1062`, unrepaired `1452`, CHECK, schema, generated-column, and
 connection failures roll back the complete source transaction and block its
-checkpoint. Repair also fails closed on absent source parents, cross-schema
-references, unsupported or ambiguous unique-index metadata, ambiguous owners,
-remaining duplicates, verification failure, repeated keys, or combined repair
-depth beyond eight.
+checkpoint. Repair also fails closed on absent source parents outside the narrow
+superseded-INSERT rule, cross-schema references, unsupported or ambiguous
+unique-index metadata, ambiguous owners, remaining duplicates, verification
+failure, repeated keys, or combined repair depth beyond eight.
 
 `--insert-conflict-policy` is not part of unified `sync` and does not select a
 native ROW live-stream policy. Unified sync never uses `INSERT IGNORE`, upsert,

@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 struct FakeRepairExecutor {
     outcomes: BTreeMap<String, VecDeque<Result<(), TargetExecuteError>>>,
     parents: BTreeMap<String, MissingForeignKeyParent>,
+    superseded_source_inserts: BTreeMap<String, Option<TargetRowChange>>,
     duplicate_reconciliations:
         BTreeMap<String, Result<DuplicateParentReconciliation, TargetExecuteError>>,
     duplicate_reconciliations_loaded: Vec<String>,
@@ -24,18 +25,24 @@ impl MissingForeignKeyRepairExecutor for FakeRepairExecutor {
             .unwrap_or(Ok(()))
     }
 
-    fn load_missing_foreign_key_parent(
+    fn load_missing_foreign_key_repair(
         &mut self,
         change: &TargetRowChange,
         error: &TargetExecuteError,
-    ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
+    ) -> Result<MissingForeignKeyRepair, TargetExecuteError> {
         assert_eq!(error.mysql_code(), Some(1452));
-        self.parents.get(&change.table).cloned().ok_or_else(|| {
-            TargetExecuteError::new(format!(
-                "missing fake parent for {}.{}",
-                change.schema, change.table
-            ))
-        })
+        if let Some(parent) = self.parents.get(&change.table).cloned() {
+            return Ok(MissingForeignKeyRepair::Parent(parent));
+        }
+        if let Some(current_change) = self.superseded_source_inserts.get(&change.table).cloned() {
+            return Ok(MissingForeignKeyRepair::SupersededInsert(
+                fake_superseded_source_insert(&change.table, current_change),
+            ));
+        }
+        Err(TargetExecuteError::new(format!(
+            "missing fake repair for {}.{}",
+            change.schema, change.table
+        )))
     }
 
     fn load_duplicate_parent_reconciliation(
@@ -87,6 +94,7 @@ fn recursively_repairs_nested_parents_before_retrying_child() {
                 fake_parent("guests", "guests_utm", "utms"),
             ),
         ]),
+        superseded_source_inserts: BTreeMap::new(),
         duplicate_reconciliations: BTreeMap::new(),
         duplicate_reconciliations_loaded: Vec::new(),
         duplicate_verification_outcomes: BTreeMap::new(),
@@ -101,6 +109,47 @@ fn recursively_repairs_nested_parents_before_retrying_child() {
         executor.executed,
         ["sessions", "guests", "utms", "guests", "sessions"]
     );
+}
+
+#[test]
+fn applies_current_source_insert_without_retrying_historical_values() {
+    let mut executor = FakeRepairExecutor {
+        outcomes: BTreeMap::from([("releases".to_string(), outcomes([missing_fk(), Ok(())]))]),
+        parents: BTreeMap::new(),
+        superseded_source_inserts: BTreeMap::from([(
+            "releases".to_string(),
+            Some(row_change("releases")),
+        )]),
+        duplicate_reconciliations: BTreeMap::new(),
+        duplicate_reconciliations_loaded: Vec::new(),
+        duplicate_verification_outcomes: BTreeMap::new(),
+        duplicate_verifications: Vec::new(),
+        executed: Vec::new(),
+    };
+
+    execute_row_change_with_missing_foreign_key_repair(&mut executor, &row_change("releases"))
+        .expect("apply current source insert");
+
+    assert_eq!(executor.executed, ["releases", "releases"]);
+}
+
+#[test]
+fn skips_historical_insert_when_current_source_row_is_absent() {
+    let mut executor = FakeRepairExecutor {
+        outcomes: BTreeMap::from([("releases".to_string(), outcomes([missing_fk()]))]),
+        parents: BTreeMap::new(),
+        superseded_source_inserts: BTreeMap::from([("releases".to_string(), None)]),
+        duplicate_reconciliations: BTreeMap::new(),
+        duplicate_reconciliations_loaded: Vec::new(),
+        duplicate_verification_outcomes: BTreeMap::new(),
+        duplicate_verifications: Vec::new(),
+        executed: Vec::new(),
+    };
+
+    execute_row_change_with_missing_foreign_key_repair(&mut executor, &row_change("releases"))
+        .expect("skip source-absent historical insert");
+
+    assert_eq!(executor.executed, ["releases"]);
 }
 
 #[test]
@@ -289,6 +338,7 @@ fn keeps_ignoring_duplicate_on_original_source_insert() {
     let mut executor = FakeRepairExecutor {
         outcomes: BTreeMap::from([("accounts".to_string(), outcomes([duplicate()]))]),
         parents: BTreeMap::new(),
+        superseded_source_inserts: BTreeMap::new(),
         duplicate_reconciliations: BTreeMap::new(),
         duplicate_reconciliations_loaded: Vec::new(),
         duplicate_verification_outcomes: BTreeMap::new(),
@@ -320,6 +370,7 @@ fn rejects_repeated_repair_key_as_a_cycle() {
                 fake_parent("beta", "beta_alpha", "alpha"),
             ),
         ]),
+        superseded_source_inserts: BTreeMap::new(),
         duplicate_reconciliations: BTreeMap::new(),
         duplicate_reconciliations_loaded: Vec::new(),
         duplicate_verification_outcomes: BTreeMap::new(),
@@ -351,6 +402,7 @@ fn rejects_parent_chain_beyond_bounded_depth() {
     let mut executor = FakeRepairExecutor {
         outcomes: outcomes_by_table,
         parents,
+        superseded_source_inserts: BTreeMap::new(),
         duplicate_reconciliations: BTreeMap::new(),
         duplicate_reconciliations_loaded: Vec::new(),
         duplicate_verification_outcomes: BTreeMap::new(),
@@ -384,11 +436,28 @@ fn duplicate_parent_executor(
             "artists_favorites".to_string(),
             fake_parent("artists_favorites", "artists_favorites_user", "users"),
         )]),
+        superseded_source_inserts: BTreeMap::new(),
         duplicate_reconciliations: BTreeMap::from([("users".to_string(), reconciliation)]),
         duplicate_reconciliations_loaded: Vec::new(),
         duplicate_verification_outcomes: BTreeMap::new(),
         duplicate_verifications: Vec::new(),
         executed: Vec::new(),
+    }
+}
+
+fn fake_superseded_source_insert(
+    child_table: &str,
+    current_change: Option<TargetRowChange>,
+) -> SupersededSourceInsert {
+    SupersededSourceInsert {
+        current_change,
+        constraint: format!("{child_table}_parent"),
+        repair_key: MissingForeignKeyRepairKey {
+            child_schema: "globalcomix".to_string(),
+            child_table: child_table.to_string(),
+            constraint: format!("{child_table}_parent"),
+            values: vec!["historical".to_string()],
+        },
     }
 }
 

@@ -18,6 +18,10 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - [x] Propagate MySQL `1062` from ROW `UPDATE` or `DELETE`.
 - [x] On MySQL `1452` from ROW `INSERT` or `UPDATE`, resolve the exact target constraint and fetch the exact same-schema parent row from the source.
 - [x] Insert and recursively repair the parent chain inside the current target transaction, then retry the blocked row.
+- [x] When an older native INSERT's exact parent key is absent, load its current source row by primary key.
+- [x] Apply the current source INSERT through recursive repair without retrying historical values when its FK key changed.
+- [x] Skip the historical INSERT when its current source row is absent; fail closed when the current row still requests the missing parent.
+- [x] Keep this source-current substitution inside the missing-FK path so normal native INSERT `1062` remains read-free duplicate-ignore behavior.
 - [x] When that repair-generated parent `INSERT` returns `1062`, resolve the exact non-prefix, non-expression unique index and lock exactly one conflicting target owner inside the same target transaction.
 - [x] Update a same-primary-key owner to the intended source parent row without reinserting it.
 - [x] For a different-primary-key owner, update it from its current source row or delete it when that source row no longer exists, then insert the intended parent.
@@ -64,6 +68,7 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - `src/mysql_client.rs` — applies serial ROW outcomes and creates parallel workers.
 - `src/mysql_client/missing_foreign_key.rs` — orchestrates exact parent repair and shared depth/cycle bounds.
 - `src/mysql_client/missing_foreign_key/duplicate_parent.rs` — resolves duplicate indexes and owners, plans source-authoritative owner changes, and verifies the intended parent.
+- `src/mysql_client/missing_foreign_key/superseded_insert.rs` — loads a current source child when a historical INSERT's exact parent key no longer exists.
 - `src/live/parallel_target.rs` — drains row changes with delayed error handling and source-ordered commits.
 - `src/live/parallel_writer.rs` — preserves full row metadata through worker submission.
 - `src/live/submitted_mysql.rs` — owns each worker's submitted target connection, source connection, and lazy target-metadata connection.
@@ -83,9 +88,10 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 - `parallel-target-transactions` exercises concurrent real MariaDB/MySQL transactions, nested `sessions → guests → utms` repair, the ordered commit barrier, native INSERT `1062` continuation, TLS, and exact checkpoint completion.
 - `missing-fk-duplicate-parent-reconcile` replays production-shaped `users.name` and `comics.slug` collisions through serial and submitted workers, covering same-primary-key update, different-primary-key source update, source-absent owner deletion, child retry, and exact checkpoint completion.
+- `missing-fk-superseded-insert` replays a historical `(comic_id, comic_format_id)` child after the source and preconverged target parent changed format, proving current-child substitution and exact serial/submitted checkpoints.
 - Parallel pool tests prove a later prepared transaction cannot commit or publish a checkpoint after an earlier body failure.
 
 ## Out of scope
 
-- General target-row equality checks, merge semantics, or automatic replacement outside a repair-generated missing-FK parent insertion.
+- General target-row equality checks, merge semantics, or automatic replacement outside repair-generated missing-FK parent/current-child insertion.
 - Deleting historical conflict records or removing out-of-band repair commands.

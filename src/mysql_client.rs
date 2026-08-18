@@ -342,12 +342,12 @@ impl missing_foreign_key::MissingForeignKeyRepairExecutor for SerialRowChangeExe
         self.target.execute_statement(&change.statement)
     }
 
-    fn load_missing_foreign_key_parent(
+    fn load_missing_foreign_key_repair(
         &mut self,
         change: &TargetRowChange,
         error: &TargetExecuteError,
-    ) -> Result<missing_foreign_key::MissingForeignKeyParent, TargetExecuteError> {
-        self.target.load_missing_foreign_key_parent(change, error)
+    ) -> Result<missing_foreign_key::MissingForeignKeyRepair, TargetExecuteError> {
+        self.target.load_missing_foreign_key_repair(change, error)
     }
 
     fn load_duplicate_parent_reconciliation(

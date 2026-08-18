@@ -1,8 +1,8 @@
 use super::parallel_target::{SubmittedQueryConnection, SubmittedQueryConnectionFactory};
 use super::{ApplyBinlogConfig, TargetMySqlConfig, target_session_init_command};
 use crate::mysql_client::missing_foreign_key::{
-    DuplicateParentReconciliation, MissingForeignKeyParent,
-    fetch_source_missing_foreign_key_parent, finish_duplicate_parent_probe,
+    DuplicateParentReconciliation, MissingForeignKeyRepair,
+    fetch_source_missing_foreign_key_repair, finish_duplicate_parent_probe,
     prepare_duplicate_parent_probe, query_foreign_key_reference, verify_parent_query_rows,
 };
 use crate::mysql_client::{
@@ -410,16 +410,16 @@ impl SubmittedQueryConnection for MariaDbSubmittedQueryConnection {
         }
     }
 
-    fn load_missing_foreign_key_parent(
+    fn load_missing_foreign_key_repair(
         &mut self,
         change: &TargetRowChange,
         error: &TargetExecuteError,
-    ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
+    ) -> Result<MissingForeignKeyRepair, TargetExecuteError> {
         let reference = {
             let target = self.open_or_reuse_target_metadata_connection()?;
             query_foreign_key_reference(target, change, error)?
         };
-        fetch_source_missing_foreign_key_parent(&self.source, change, &reference)
+        fetch_source_missing_foreign_key_repair(&self.source, change, &reference)
     }
 
     fn load_duplicate_parent_reconciliation(

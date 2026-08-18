@@ -1,6 +1,6 @@
 use crate::checkpoint::Checkpoint;
 use crate::mysql_client::missing_foreign_key::{
-    DuplicateParentReconciliation, MissingForeignKeyParent, MissingForeignKeyRepairExecutor,
+    DuplicateParentReconciliation, MissingForeignKeyRepair, MissingForeignKeyRepairExecutor,
     execute_row_change_with_missing_foreign_key_repair,
 };
 use crate::target::{TargetExecuteError, TargetRowChange, render_submitted_sql_statement};
@@ -16,11 +16,11 @@ pub(crate) trait SubmittedQueryConnection {
     /// Drains every result belonging to the most recently submitted query.
     fn read_query_result(&mut self) -> Result<(), TargetExecuteError>;
 
-    fn load_missing_foreign_key_parent(
+    fn load_missing_foreign_key_repair(
         &mut self,
         _change: &TargetRowChange,
         error: &TargetExecuteError,
-    ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
+    ) -> Result<MissingForeignKeyRepair, TargetExecuteError> {
         Err(error.clone())
     }
 
@@ -622,13 +622,13 @@ where
         self.connection.read_query_result()
     }
 
-    fn load_missing_foreign_key_parent(
+    fn load_missing_foreign_key_repair(
         &mut self,
         change: &TargetRowChange,
         error: &TargetExecuteError,
-    ) -> Result<MissingForeignKeyParent, TargetExecuteError> {
+    ) -> Result<MissingForeignKeyRepair, TargetExecuteError> {
         self.connection
-            .load_missing_foreign_key_parent(change, error)
+            .load_missing_foreign_key_repair(change, error)
     }
 
     fn load_duplicate_parent_reconciliation(
