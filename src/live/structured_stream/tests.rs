@@ -207,11 +207,19 @@ struct NoopCheckpointStore;
 
 struct RecordingCheckpointStore {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    saved_positions: std::rc::Rc<std::cell::RefCell<Vec<u64>>>,
 }
 
 impl RecordingCheckpointStore {
     fn new(operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>) -> Self {
-        Self { operations }
+        Self {
+            operations,
+            saved_positions: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        }
+    }
+
+    fn saved_positions(&self) -> Vec<u64> {
+        self.saved_positions.borrow().clone()
     }
 }
 
@@ -222,9 +230,12 @@ impl StreamCheckpointStore for RecordingCheckpointStore {
 
     fn save_checkpoint(
         &self,
-        _checkpoint: &crate::checkpoint::Checkpoint,
+        checkpoint: &crate::checkpoint::Checkpoint,
     ) -> Result<(), ApplyBinlogError> {
         self.operations.borrow_mut().push("CHECKPOINT");
+        self.saved_positions
+            .borrow_mut()
+            .push(checkpoint.source_position);
         Ok(())
     }
 }

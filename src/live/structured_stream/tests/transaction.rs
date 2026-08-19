@@ -383,14 +383,136 @@ fn groups_multiple_xids_in_one_mysql_target_transaction() {
             "EXEC",
             "LOCK_CHECKPOINT",
             "CHECKPOINT",
-            "COMMIT",
-            "BEGIN",
             "EXEC",
             "LOCK_CHECKPOINT",
             "CHECKPOINT",
             "COMMIT",
         ]
     );
+}
+
+#[test]
+fn grouped_update_duplicate_rolls_back_complete_target_transaction() {
+    let mut applier =
+        crate::row::RowApplier::new(TransactionRecordingExecutor::with_update_duplicate());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let group_config = TargetTransactionGroupConfig {
+        size: 2,
+        timeout: Duration::ZERO,
+    };
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
+                current_file: &mut current_file,
+                group_config,
+            };
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+    process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("first row");
+    process_event!(
+        event_header(16, 260),
+        BinlogEvent::XidEvent(XidEvent { xid: 42 })
+    )
+    .expect("first XID");
+
+    assert!(transaction.is_open());
+
+    let error = process_event!(event_header(31, 280), account_update_event())
+        .expect_err("later UPDATE 1062 must roll back the complete target group");
+
+    assert!(error.to_string().contains("1062"));
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        [
+            "BEGIN",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "EXEC",
+            "ROLLBACK",
+        ]
+    );
+    assert!(!applier.executor().operations().contains(&"COMMIT"));
+    assert!(!transaction.is_open());
+}
+
+#[test]
+fn group_timeout_flushes_before_next_target_write() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut current_file = "mysqld-bin.000777".to_string();
+    let mut transaction = TargetTransaction::default();
+    let group_config = TargetTransactionGroupConfig {
+        size: 10,
+        timeout: Duration::from_millis(5),
+    };
+    macro_rules! process_event {
+        ($header:expr, $event:expr) => {{
+            let header = $header;
+            let event = $event;
+            let mut context = StreamEventContext {
+                schema_resolver: &resolver,
+                state: &mut state,
+                target_transaction: &mut transaction,
+                checkpoint_store: Some(&NoopCheckpointStore),
+                transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+                transaction_checkpoint_name: Some("stream-binlog:test-source"),
+                current_file: &mut current_file,
+                group_config,
+            };
+            apply_stream_event_transactionally(&mut applier, &mut context, &header, &event)
+        }};
+    }
+
+    process_event!(
+        event_header(19, 200),
+        BinlogEvent::TableMapEvent(accounts_table_map_event(5))
+    )
+    .expect("table map");
+    process_event!(event_header(30, 220), write_rows_event(18, 1, "alpha")).expect("first row");
+    process_event!(
+        event_header(16, 260),
+        BinlogEvent::XidEvent(XidEvent { xid: 42 })
+    )
+    .expect("first XID");
+
+    assert!(transaction.is_open());
+    std::thread::sleep(Duration::from_millis(20));
+
+    process_event!(event_header(30, 280), write_rows_event(18, 2, "beta")).expect("second row");
+
+    assert_eq!(
+        applier.executor().operations().as_slice(),
+        [
+            "BEGIN",
+            "EXEC",
+            "LOCK_CHECKPOINT",
+            "CHECKPOINT",
+            "COMMIT",
+            "BEGIN",
+            "EXEC",
+        ]
+    );
+    assert!(transaction.is_open());
 }
 
 #[test]
@@ -443,17 +565,9 @@ fn grouped_file_checkpoint_saves_last_xid_after_group_commit() {
 
     assert_eq!(
         applier.executor().operations().as_slice(),
-        [
-            "BEGIN",
-            "EXEC",
-            "COMMIT",
-            "CHECKPOINT",
-            "BEGIN",
-            "EXEC",
-            "COMMIT",
-            "CHECKPOINT",
-        ]
+        ["BEGIN", "EXEC", "EXEC", "COMMIT", "CHECKPOINT"]
     );
+    assert_eq!(checkpoint_store.saved_positions(), [320]);
 }
 
 #[test]
