@@ -43,9 +43,9 @@ resolves the exact unique index, locks one target owner in the current
 transaction, and reconciles that owner from source. It updates a same-primary-key
 owner to the intended parent; for a different primary key, it updates the owner
 from its source row or deletes it when source-absent, then retries the parent
-insert. Exact parent values are verified before child retry. Parallel workers use
-their leased target transaction for owner reads and locks, while their separate
-target connection remains metadata-only.
+insert. Exact parent values are verified before child retry. The sole serial target
+connection performs owner reads, locks, parent repair, child retry, and the
+surrounding transaction atomically.
 
 Non-INSERT `1062`, unrepaired `1452`, CHECK, schema, generated-column, and
 connection failures roll back the complete source transaction and block its
@@ -72,6 +72,9 @@ Errors include:
 - executor error
 - SQL text
 
-The executor trait keeps SQL generation testable without tying the core to a
-specific MySQL client crate yet.
+Live execution uses one initialized Rust `mysql::Conn`; source transaction
+size and timeout controls may group complete source transactions, but no
+concurrent target workers or parallel submission option exists. The executor
+trait keeps SQL generation testable without exposing client-specific details to
+the row-mapping core.
 

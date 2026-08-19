@@ -1,10 +1,6 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.92-bookworm AS builder
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libmariadb-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY vendor ./vendor
@@ -24,7 +20,6 @@ RUN apt-get update \
         ca-certificates \
         libc6 \
         libgcc-s1 \
-        libmariadb3 \
         libssl3t64 \
         zlib1g \
     && rm -rf /var/lib/apt/lists/*

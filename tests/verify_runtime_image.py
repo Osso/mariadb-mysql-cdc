@@ -18,7 +18,6 @@ REQUIRED_PACKAGES = (
     "ca-certificates",
     "libc6",
     "libgcc-s1",
-    "libmariadb3",
     "libssl3t64",
     "zlib1g",
 )

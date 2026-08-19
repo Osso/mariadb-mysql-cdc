@@ -63,9 +63,9 @@ SCENARIOS = (
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("insert-duplicate-idempotent", True),
     ScenarioSpec("missing-fk-parent-auto-insert", True),
+    ScenarioSpec("missing-fk-nested-parent-auto-insert", True),
     ScenarioSpec("missing-fk-superseded-insert", True),
     ScenarioSpec("missing-fk-duplicate-parent-reconcile", True),
-    ScenarioSpec("parallel-target-transactions", True),
     ScenarioSpec("missing-checkpoint", True),
     ScenarioSpec("missing-trigger", True),
     ScenarioSpec("missing-grant", True),
@@ -561,7 +561,6 @@ class Harness:
         stop: Coordinate | None,
         integration_failpoint: str | None,
         max_reconnects: int,
-        target_parallel_transactions: int = 1,
     ) -> list[str]:
         assert self.source and self.target
         args = [
@@ -602,8 +601,6 @@ class Harness:
             args.extend(["--stop-position", str(stop.position)])
         if integration_failpoint is not None:
             args.extend(["--integration-failpoint", integration_failpoint])
-        if target_parallel_transactions > 1:
-            args.extend(["--target-parallel-transactions", str(target_parallel_transactions)])
         return args
 
     def run_stream(
@@ -613,7 +610,6 @@ class Harness:
         integration_failpoint: str | None = None,
         max_reconnects: int = 0,
         barrier_dir: Path | None = None,
-        target_parallel_transactions: int = 1,
     ) -> CommandResult:
         binary = self._stream_binary(integration_failpoint)
         env = {
@@ -630,7 +626,6 @@ class Harness:
                 stop,
                 integration_failpoint,
                 max_reconnects,
-                target_parallel_transactions,
             ),
             env=env,
             timeout=90,
@@ -766,7 +761,6 @@ class Harness:
         max_reconnects: int = 0,
         barrier_dir: Path | None = None,
         label: str = "stream",
-        target_parallel_transactions: int = 1,
     ) -> tuple[subprocess.Popen[str], Path]:
         binary = self._stream_binary(integration_failpoint)
         env = {
@@ -785,7 +779,6 @@ class Harness:
                 stop,
                 integration_failpoint,
                 max_reconnects,
-                target_parallel_transactions=target_parallel_transactions,
             ),
             cwd=self.repo,
             env=env,
@@ -1130,46 +1123,41 @@ class Harness:
         )
         stop = self.coordinate()
 
-        for mode, parallel_transactions in (("serial", 1), ("submitted", 2)):
-            self.admin_sql(
-                self.target,
-                "DELETE FROM releases; DELETE FROM comics; "
-                "INSERT INTO comics VALUES (49868, 1, 'source-current-parent');",
+        self.admin_sql(
+            self.target,
+            "DELETE FROM releases; DELETE FROM comics; "
+            "INSERT INTO comics VALUES (49868, 1, 'source-current-parent');",
+        )
+        self.write_checkpoint(start)
+        result = self.run_stream(start, stop)
+        require_success(result, "serial superseded missing-FK insert stream")
+        child = self.query(
+            self.target,
+            "SELECT id,comic_id,comic_format_id,payload FROM releases;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        expected = "391468\t49868\t1\tsource-current-child"
+        if child != expected:
+            raise HarnessError(
+                f"serial superseded source INSERT did not converge: {child!r}"
             )
-            self.write_checkpoint(start)
-            result = self.run_stream(
-                start,
-                stop,
-                target_parallel_transactions=parallel_transactions,
+        checkpoint = self.checkpoint()
+        if checkpoint.get("source_file") != stop.file or int(
+            checkpoint.get("source_position", 0)
+        ) != stop.position:
+            raise HarnessError(
+                f"serial superseded INSERT checkpoint did not reach exact stop: {checkpoint}"
             )
-            require_success(result, f"{mode} superseded missing-FK insert stream")
-            child = self.query(
-                self.target,
-                "SELECT id,comic_id,comic_format_id,payload FROM releases;",
-                user=TARGET_USER,
-                password=TARGET_PASSWORD,
-            ).strip()
-            expected = "391468\t49868\t1\tsource-current-child"
-            if child != expected:
-                raise HarnessError(
-                    f"{mode} superseded source INSERT did not converge: {child!r}"
-                )
-            checkpoint = self.checkpoint()
-            if checkpoint.get("source_file") != stop.file or int(
-                checkpoint.get("source_position", 0)
-            ) != stop.position:
-                raise HarnessError(
-                    f"{mode} superseded INSERT checkpoint did not reach exact stop: {checkpoint}"
-                )
-            output = f"{result.stdout}\n{result.stderr}"
-            if "cdc_missing_fk_superseded_insert_reconciled" not in output:
-                raise HarnessError(
-                    f"{mode} superseded INSERT did not report reconciliation: {output}"
-                )
-            print(
-                "missing_fk_superseded_insert_ok "
-                f"mode={mode} current_source_row=applied checkpoint={stop.file}:{stop.position}"
+        output = f"{result.stdout}\n{result.stderr}"
+        if "cdc_missing_fk_superseded_insert_reconciled" not in output:
+            raise HarnessError(
+                f"serial superseded INSERT did not report reconciliation: {output}"
             )
+        print(
+            "missing_fk_superseded_insert_ok "
+            f"mode=serial current_source_row=applied checkpoint={stop.file}:{stop.position}"
+        )
 
     def setup_missing_fk_duplicate_parent_tables(self) -> None:
         assert self.source and self.target
@@ -1293,47 +1281,20 @@ class Harness:
         )
         stop = self.coordinate()
 
-        for mode, parallel_transactions in (("serial", 1), ("submitted", 2)):
-            self.seed_missing_fk_duplicate_parent_target()
-            self.write_checkpoint(start)
-            result = self.run_stream(
-                start,
-                stop,
-                target_parallel_transactions=parallel_transactions,
-            )
-            require_success(result, f"{mode} duplicate-parent reconciliation stream")
-            self.assert_missing_fk_duplicate_parent_result(mode, stop)
-            print(
-                "missing_fk_duplicate_parent_reconcile_ok "
-                f"mode={mode} same_pk=updated different_pk=updated "
-                f"source_absent=deleted checkpoint={stop.file}:{stop.position}"
-            )
+        self.seed_missing_fk_duplicate_parent_target()
+        self.write_checkpoint(start)
+        result = self.run_stream(start, stop)
+        require_success(result, "serial duplicate-parent reconciliation stream")
+        self.assert_missing_fk_duplicate_parent_result("serial", stop)
+        print(
+            "missing_fk_duplicate_parent_reconcile_ok "
+            "mode=serial same_pk=updated different_pk=updated "
+            f"source_absent=deleted checkpoint={stop.file}:{stop.position}"
+        )
 
-    def assert_parallel_target_commit_barrier(self, start: Coordinate) -> None:
-        assert self.target
-        visible = self.query(
-            self.target,
-            "SELECT id,email,payload FROM accounts ORDER BY id;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        expected = "1\ttarget@example.test\ttarget-only"
-        if visible != expected:
-            raise HarnessError(
-                f"parallel target exposed uncommitted rows or changed duplicate target row: {visible!r}"
-            )
-        checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != start.file or int(
-            checkpoint.get("source_position", 0)
-        ) != start.position:
-            raise HarnessError(
-                f"parallel target advanced checkpoint before ordered commit: {checkpoint}"
-            )
-
-    def run_parallel_target_transactions(self) -> None:
+    def run_missing_fk_nested_parent_auto_insert(self) -> None:
         assert self.source and self.target
-        self.setup_accounts_table()
-        nested_fk_schema = """
+        schema = """
             CREATE TABLE utms (
                 id BIGINT NOT NULL PRIMARY KEY,
                 label VARCHAR(64) NOT NULL
@@ -1354,96 +1315,24 @@ class Harness:
                     FOREIGN KEY (guest_id) REFERENCES guests (id)
                     ON DELETE RESTRICT ON UPDATE RESTRICT
             ) ENGINE=InnoDB;
-            CREATE TABLE parallel_decimal_values (
-                id BIGINT NOT NULL PRIMARY KEY,
-                gc_service_fee_percentage DECIMAL(5,2) UNSIGNED NOT NULL
-            ) ENGINE=InnoDB;
         """
-        self.admin_sql(self.source, nested_fk_schema)
-        self.admin_sql(self.target, nested_fk_schema)
+        self.admin_sql(self.source, schema)
+        self.admin_sql(self.target, schema)
         self.admin_sql(
             self.source,
             "INSERT INTO utms VALUES (501, 'source-utm'); "
             "INSERT INTO guests VALUES (41, 501, 'source-guest');",
         )
-        self.admin_sql(
-            self.target,
-            "INSERT INTO accounts VALUES (1, 'target@example.test', 'target-only');",
-        )
         start = self.coordinate()
         self.write_checkpoint(start)
         self.admin_sql(
             self.source,
-            "START TRANSACTION; "
-            "INSERT INTO accounts VALUES (1, 'source@example.test', 'source'); "
-            "INSERT INTO accounts VALUES (2, 'two@example.test', 'two'); "
-            "COMMIT;",
-        )
-        self.admin_sql(
-            self.source,
-            "START TRANSACTION; "
-            "INSERT INTO accounts VALUES (3, 'three@example.test', 'three'); "
-            "INSERT INTO parallel_decimal_values VALUES (1, 65.00); "
-            "INSERT INTO sessions VALUES (7001, 41, 'parallel-child'); "
-            "COMMIT;",
+            "INSERT INTO sessions VALUES (7001, 41, 'serial-child');",
         )
         stop = self.coordinate()
 
-        first_boundary = "parallel-target-first-body-submitted"
-        second_boundary = "parallel-target-second-body-drained"
-        barrier_dir = self.tempdir / "parallel-target-transactions-barrier"
-        stream, _log = self.start_stream(
-            start,
-            stop,
-            integration_failpoint="parallel-target-submission",
-            barrier_dir=barrier_dir,
-            label="parallel-target-transactions",
-            target_parallel_transactions=2,
-        )
-        proof_ready = False
-        try:
-            self.wait_for_barrier(stream, barrier_dir, first_boundary)
-            self.wait_for_barrier(stream, barrier_dir, second_boundary)
-            tls_evidence = self.admin_query(
-                self.target,
-                "SELECT COUNT(*),"
-                "COALESCE(SUM(CONNECTION_TYPE='SSL/TLS'),0) "
-                "FROM performance_schema.threads "
-                "WHERE PROCESSLIST_USER='cdc_stream';",
-            ).strip()
-            total_connections, tls_connections = [
-                int(value) for value in tls_evidence.split("\t")
-            ]
-            if total_connections < 3 or tls_connections != total_connections:
-                raise HarnessError(
-                    "parallel target worker connections were not all TLS: "
-                    f"total={total_connections} tls={tls_connections}"
-                )
-            self.assert_parallel_target_commit_barrier(start)
-            proof_ready = True
-        finally:
-            for boundary in (second_boundary, first_boundary):
-                if (barrier_dir / f"{boundary}.ready").is_file():
-                    self.release_barrier(barrier_dir, boundary)
-            if not proof_ready and stream.poll() is None:
-                stream.terminate()
-                stream.wait(timeout=10)
-
-        result = self.finish_stream(stream)
-        require_success(result, "parallel target Connector/C stream")
-        rows = self.query(
-            self.target,
-            "SELECT id,email,payload FROM accounts ORDER BY id;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        expected = (
-            "1\ttarget@example.test\ttarget-only\n"
-            "2\ttwo@example.test\ttwo\n"
-            "3\tthree@example.test\tthree"
-        )
-        if rows != expected:
-            raise HarnessError(f"parallel target rows did not converge: {rows!r}")
+        result = self.run_stream(start, stop)
+        require_success(result, "serial nested missing-FK parent stream")
         parents = self.query(
             self.target,
             "SELECT u.id,u.label,g.id,g.utm_id,g.label "
@@ -1459,33 +1348,22 @@ class Harness:
         ).strip()
         if parents != "501\tsource-utm\t41\t501\tsource-guest":
             raise HarnessError(
-                f"parallel target did not recursively copy missing parents: {parents!r}"
+                f"serial target did not recursively copy missing parents: {parents!r}"
             )
-        if child != "7001\t41\tparallel-child":
+        if child != "7001\t41\tserial-child":
             raise HarnessError(
-                f"parallel target did not retry the child after parent repair: {child!r}"
-            )
-        decimal_value = self.query(
-            self.target,
-            "SELECT id,gc_service_fee_percentage FROM parallel_decimal_values;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
-        ).strip()
-        if decimal_value != "1\t65.00":
-            raise HarnessError(
-                "parallel target did not preserve DECIMAL byte parameter semantics: "
-                f"{decimal_value!r}"
+                f"serial target did not retry child after nested parent repair: {child!r}"
             )
         checkpoint = self.checkpoint()
         if checkpoint.get("source_file") != stop.file or int(
             checkpoint.get("source_position", 0)
         ) != stop.position:
-            raise HarnessError(f"parallel target checkpoint did not reach exact stop: {checkpoint}")
+            raise HarnessError(
+                f"serial nested missing-FK checkpoint did not reach exact stop: {checkpoint}"
+            )
         print(
-            "parallel_target_transactions_ok workers=2 connector=mariadb "
-            "duplicate_target_row=unchanged nested_missing_fk=repaired "
-            "decimal_bytes=preserved later_same_transaction_row=applied "
-            f"tls_connections={tls_connections} "
+            "missing_fk_nested_parent_auto_insert_ok mode=serial "
+            "parents=recursive child=retried "
             f"checkpoint={stop.file}:{stop.position}"
         )
 
@@ -3102,12 +2980,12 @@ class Harness:
             self.run_insert_duplicate_idempotent()
         elif scenario == "missing-fk-parent-auto-insert":
             self.run_missing_fk_parent_auto_insert()
+        elif scenario == "missing-fk-nested-parent-auto-insert":
+            self.run_missing_fk_nested_parent_auto_insert()
         elif scenario == "missing-fk-superseded-insert":
             self.run_missing_fk_superseded_insert()
         elif scenario == "missing-fk-duplicate-parent-reconcile":
             self.run_missing_fk_duplicate_parent_reconcile()
-        elif scenario == "parallel-target-transactions":
-            self.run_parallel_target_transactions()
         elif scenario in {
             "missing-checkpoint",
             "missing-trigger",

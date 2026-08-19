@@ -495,7 +495,6 @@ struct TransactionRecordingExecutor {
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     fail_execute: bool,
     fail_update_with_duplicate: bool,
-    record_pending_flush: bool,
     locked_checkpoint: Option<crate::checkpoint::Checkpoint>,
 }
 
@@ -505,7 +504,6 @@ impl Default for TransactionRecordingExecutor {
             operations: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             fail_execute: false,
             fail_update_with_duplicate: false,
-            record_pending_flush: false,
             locked_checkpoint: Some(test_checkpoint("mysqld-bin.000000", 4)),
         }
     }
@@ -531,13 +529,6 @@ impl TransactionRecordingExecutor {
     fn with_locked_checkpoint(checkpoint: crate::checkpoint::Checkpoint) -> Self {
         Self {
             locked_checkpoint: Some(checkpoint),
-            ..Self::default()
-        }
-    }
-
-    fn with_pending_flush() -> Self {
-        Self {
-            record_pending_flush: true,
             ..Self::default()
         }
     }
@@ -639,13 +630,6 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
 
     fn rollback_transaction(&self) -> Result<(), crate::target::TargetExecuteError> {
         self.operations.borrow_mut().push("ROLLBACK");
-        Ok(())
-    }
-
-    fn flush_pending_transactions(&self) -> Result<(), crate::target::TargetExecuteError> {
-        if self.record_pending_flush {
-            self.operations.borrow_mut().push("FLUSH");
-        }
         Ok(())
     }
 }

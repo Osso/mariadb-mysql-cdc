@@ -17,13 +17,12 @@ target with minimal downtime.
 
 ## Build prerequisites
 
-Parallel target submission uses MariaDB Connector/C through `mysqlclient-sys` so
-query send and result completion remain separate operations. Local builds require
-`pkg-config` plus MariaDB client development files. The Docker builder installs
-`libmariadb-dev`; the Ubuntu 24.04 runtime is pinned to a verified OCI index
-digest, upgrades installed packages during the build, and installs only CA
-certificates and the libraries required by the built binary, including
-`libmariadb3`.
+Live target execution uses Rust's `mysql` client on one initialized target
+connection. The removed parallel submission path no longer requires MariaDB
+Connector/C, `mysqlclient-sys`, `pkg-config`, or `libmariadb` packages. The
+Ubuntu 24.04 runtime remains pinned to a verified OCI index digest, upgrades
+installed packages during the build, and installs only CA certificates and the
+libraries required by the built binary.
 
 ## Runtime image verification
 
@@ -177,9 +176,9 @@ from source, or deletes a source-absent different-primary-key owner, then insert
 and verifies the intended parent before retrying the child. Ambiguous ownership,
 unsupported index metadata, a remaining duplicate, or verification failure rolls
 back without checkpoint advancement. Native source INSERT `1062` behavior remains
-unchanged. `--target-parallel-transactions N` preserves the same rules with
-worker-local source connections, one leased target connection per complete source
-transaction, and source-ordered checkpoint commits.
+unchanged. Repair remains serial inside the active target transaction; existing
+group-size and timeout controls may group complete source transactions, but no
+concurrent target workers or parallel live-stream option are supported.
 
 Conflict data remains out-of-band. Targeted conflict resolution connects to
 source and target as a separate workflow from the live stream. The live stream
@@ -193,15 +192,17 @@ paths remain absent; the only source-current INSERT substitution is the narrow
 missing-FK recovery described above.
 
 The disposable MariaDB/MySQL harness covers DDL journal recovery,
-reconnect/GET_LOCK behavior, parallel target transactions, and serial/submitted
-source-authoritative repair of production-shaped duplicate missing-FK parents and
-historical child FK values superseded by current source rows. These are local
-proofs, not live cutover proof.
+reconnect/GET_LOCK behavior, serial grouped transaction boundaries, and
+source-authoritative repair of production-shaped duplicate missing-FK parents
+and historical child FK values superseded by current source rows. The nested
+missing-FK proof runs through the serial live stream. These are local proofs,
+not live cutover proof.
 
 Deployment runs through `deploy.sh`, which checks the repository, publishes and
-verifies an immutable image, scans it, and commits the ops image reference.
-Production parallelism is enabled separately in the ops stream manifest only
-after the focused real MariaDB/MySQL proof. The legacy `probe` text-binlog path
+verifies an immutable image, scans it, and commits the ops image reference. Live
+target execution is serial on one initialized `mysql::Conn`; source transactions
+may still be grouped by the existing group-size and timeout controls, but no
+parallel target-worker configuration exists. The legacy `probe` text-binlog path
 is not a supported health check.
 
 ## DDL resolution
@@ -273,28 +274,24 @@ commands are not available; their work is either part of `sync` stages or remove
 from the CLI. Legacy `catchup-snapshot`, `sync-table`, and `repair-drift` names are
 also rejected as unknown commands.
 
-`stream-binlog --target-parallel-transactions N` enables bounded target
-transaction submission when `N > 1`; the default `1` preserves serial execution.
-The parallel path retains each row change's schema, table, values, and operation;
-sends and drains body statements individually; ignores delayed `1062` only for
-INSERT statements; and repairs eligible `1452` failures inside the leased worker
-transaction. Later commits and checkpoints remain blocked behind any earlier
-failure.
+Live `stream-binlog` applies target work serially on one initialized
+`mysql::Conn`. Existing target transaction group-size and timeout controls may
+combine complete source transactions before one atomic target commit and
+checkpoint write. There is no supported `--target-parallel-transactions` option
+or concurrent target-worker path.
 
 Run the disposable source-authoritative proofs with:
 
 ```sh
 python3 scripts/cdc-integration-harness.py --scenario insert-duplicate-idempotent
+python3 scripts/cdc-integration-harness.py --scenario missing-fk-parent-auto-insert
+python3 scripts/cdc-integration-harness.py --scenario missing-fk-nested-parent-auto-insert
 python3 scripts/cdc-integration-harness.py --scenario missing-fk-superseded-insert
-python3 scripts/cdc-integration-harness.py --scenario parallel-target-transactions
 ```
 
-The serial scenario preloads a divergent target row, removes the conflict ledger
-and inventory procedure, and proves the duplicate leaves that row untouched while
-a later same-transaction row and exact checkpoint advance. The parallel scenario
-adds ordered-commit barriers, verifies every target session uses `SSL/TLS`, and
-proves nested `sessions → guests → utms` repair before exact checkpoint
-completion. Out-of-band repair scenarios retain separate ledger and comparison
+The serial proofs cover divergent-target INSERT `1062` continuation, nested
+missing-FK repair, source-current child substitution, and exact checkpoint
+advancement. Out-of-band repair scenarios retain separate ledger and comparison
 identities.
 
 ### Table catalog JSON and execution contract

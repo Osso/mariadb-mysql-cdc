@@ -54,8 +54,8 @@ fn real_live_missing_fk_parent_is_copied_before_child_retry() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
-fn real_parallel_target_repairs_nested_missing_fk_parents() {
-    run_harness_scenario("parallel-target-transactions");
+fn real_serial_target_repairs_nested_missing_fk_parents() {
+    run_harness_scenario("missing-fk-nested-parent-auto-insert");
 }
 
 #[test]
@@ -431,6 +431,7 @@ fn harness_scenario_listing_has_behavior_or_explicit_prerequisite() {
         "sync-wide-update",
         "sync-resume",
         "sync-progress-least-privilege",
+        "missing-fk-nested-parent-auto-insert",
         "prepare-failure",
         "post-ddl-pre-applied",
         "applied-pre-checkpoint",
@@ -444,7 +445,12 @@ fn harness_scenario_listing_has_behavior_or_explicit_prerequisite() {
                 .any(|line| line == format!("{scenario}\texecutable"))
         );
     }
-    for removed_prefix in ["catchup-snapshot", "sync-table", "repair-"] {
+    for removed_prefix in [
+        "catchup-snapshot",
+        "sync-table",
+        "repair-",
+        "parallel-target-transactions",
+    ] {
         assert!(!listed.lines().any(|line| line.starts_with(removed_prefix)));
     }
 }
@@ -709,7 +715,6 @@ fn live_harness_covers_source_authoritative_duplicate_inserts() {
 
     assert!(script.contains("ScenarioSpec(\"insert-duplicate-idempotent\", True)"));
     assert!(script.contains("self.run_insert_duplicate_idempotent()"));
-    assert!(script.contains("self.run_parallel_target_transactions()"));
 }
 
 #[test]

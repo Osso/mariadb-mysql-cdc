@@ -176,9 +176,10 @@ canonical foreign-key metadata is owned by `src/canonical_foreign_key.rs`. The
 live stream does not validate the conflict table, its triggers, its procedure,
 or its grants.
 
-The disposable MariaDB/MySQL harness covers DDL, reconnect, and parallel
-transaction boundaries. Retired conflict and repair scenarios are not runtime
-paths.
+The disposable MariaDB/MySQL harness covers DDL, reconnect, and serial grouped
+transaction boundaries. The nested missing-FK proof runs through the serial live
+stream; retired concurrent-worker and conflict-ledger scenarios are not runtime
+paths. Recursive missing-FK and duplicate-parent repair remain live serial paths.
 
 ## Safety and validation
 

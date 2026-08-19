@@ -41,7 +41,7 @@ impl TargetTransaction {
             return Ok(());
         }
         executor
-            .begin_stream_transaction()
+            .begin_transaction()
             .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         self.open = true;
         self.opened_at = Some(Instant::now());
@@ -232,9 +232,6 @@ where
     if let Some(checkpoint) = checkpoint
         && let Some(store) = context.checkpoint_store
     {
-        executor
-            .flush_pending_transactions()
-            .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
         store.save_checkpoint(&checkpoint)?;
     }
     Ok(())
@@ -300,9 +297,6 @@ where
         return Ok(());
     }
 
-    executor
-        .flush_pending_transactions()
-        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
     crate::live::reconnect::save_coordinate_checkpoint(
         context.checkpoint_store,
         coordinate,

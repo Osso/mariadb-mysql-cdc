@@ -40,14 +40,14 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 ### Transaction execution
 
-- [x] Keep `--target-parallel-transactions 1` serial.
-- [x] With `N > 1`, lease one target connection per complete source transaction.
-- [x] Preserve the full `TargetRowChange` through delayed worker execution.
-- [x] Give each parallel worker its own source connection and perform parent inserts on the leased target transaction.
-- [x] Query and lock duplicate-parent owners through that same leased target transaction; use the separate target connection only for index and constraint metadata.
-- [x] Send and drain parallel body statements individually so native INSERT `1062` can be ignored, `1452` can be repaired, and later statements can continue only after success.
-- [x] Commit parallel transactions and checkpoints in source order.
-- [x] Stop later commits and checkpoint advancement when an earlier body or commit fails.
+- [x] Apply live row changes serially on one initialized target connection.
+- [x] Keep recursive missing-FK repair and duplicate-parent reconciliation inside
+  that active target transaction.
+- [x] Allow existing source transaction group-size and timeout controls to group
+  complete source transactions without concurrent target workers.
+- [x] Commit grouped target DML and its checkpoint atomically in source order.
+- [x] Roll back the active target transaction and leave its checkpoint unchanged
+  after any propagated row error.
 
 ### Out-of-band boundary
 
@@ -65,13 +65,11 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 - `src/row/apply.rs` — maps ROW events to typed target row changes.
 - `src/row/sql.rs` — builds plain INSERT, before-key UPDATE, and key DELETE SQL.
-- `src/mysql_client.rs` — applies serial ROW outcomes and creates parallel workers.
+- `src/mysql_client.rs` — applies serial ROW outcomes, grouped transactions,
+  checkpoints, and source-authoritative repair on the sole target connection.
 - `src/mysql_client/missing_foreign_key.rs` — orchestrates exact parent repair and shared depth/cycle bounds.
 - `src/mysql_client/missing_foreign_key/duplicate_parent.rs` — resolves duplicate indexes and owners, plans source-authoritative owner changes, and verifies the intended parent.
 - `src/mysql_client/missing_foreign_key/superseded_insert.rs` — loads a current source child when a historical INSERT's exact parent key no longer exists.
-- `src/live/parallel_target.rs` — drains row changes with delayed error handling and source-ordered commits.
-- `src/live/parallel_writer.rs` — preserves full row metadata through worker submission.
-- `src/live/submitted_mysql.rs` — owns each worker's submitted target connection, source connection, and lazy target-metadata connection.
 - `src/live/structured_stream/transaction.rs` — owns transaction rollback and checkpoint boundaries.
 - `src/live/ddl_replay_journal/` — validates only live checkpoint and DDL-journal runtime contracts.
 
@@ -79,19 +77,26 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 - `src/mysql_client/tests.rs`
 - `src/row/tests.rs`
-- `src/live/parallel_target_tests.rs`
 - `src/live/structured_stream/tests/transaction.rs`
 - `tests/cdc_eventual_consistency.rs`
 - `scripts/cdc-integration-harness.py`
 
 ## Focused proof
 
-- `parallel-target-transactions` exercises concurrent real MariaDB/MySQL transactions, nested `sessions → guests → utms` repair, the ordered commit barrier, native INSERT `1062` continuation, TLS, and exact checkpoint completion.
-- `missing-fk-duplicate-parent-reconcile` replays production-shaped `users.name` and `comics.slug` collisions through serial and submitted workers, covering same-primary-key update, different-primary-key source update, source-absent owner deletion, child retry, and exact checkpoint completion.
-- `missing-fk-superseded-insert` replays a historical `(comic_id, comic_format_id)` child after the source and preconverged target parent changed format, proving current-child substitution and exact serial/submitted checkpoints.
-- Parallel pool tests prove a later prepared transaction cannot commit or publish a checkpoint after an earlier body failure.
+- `missing-fk-nested-parent-auto-insert` exercises nested `sessions → guests → utms`
+  repair through the serial live stream, including child retry and exact
+  checkpoint completion.
+- `missing-fk-duplicate-parent-reconcile` replays production-shaped `users.name`
+  and `comics.slug` collisions through serial live apply, covering same-primary-key
+  update, different-primary-key source update, source-absent owner deletion,
+  child retry, and exact checkpoint completion.
+- `missing-fk-superseded-insert` replays a historical `(comic_id, comic_format_id)`
+  child after the source and preconverged target parent changed format, proving
+  current-child substitution and exact serial checkpoint completion.
 
 ## Out of scope
 
+- Concurrent live target workers, parallel target submission, and any
+  `--target-parallel-transactions` option.
 - General target-row equality checks, merge semantics, or automatic replacement outside repair-generated missing-FK parent/current-child insertion.
 - Deleting historical conflict records or removing out-of-band repair commands.

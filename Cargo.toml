@@ -9,7 +9,6 @@ integration-failpoints = []
 
 [dependencies]
 mysql = { version = "28.0.0", features = ["native-tls"] }
-mysqlclient-sys = "0.5.2"
 native-tls = "0.2.18"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

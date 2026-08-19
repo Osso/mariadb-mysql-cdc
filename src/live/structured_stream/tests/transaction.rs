@@ -141,9 +141,8 @@ fn rolls_back_open_target_transaction_when_row_apply_fails() {
 }
 
 #[test]
-fn file_checkpoint_waits_until_after_pending_target_commits() {
-    let mut applier =
-        crate::row::RowApplier::new(TransactionRecordingExecutor::with_pending_flush());
+fn file_checkpoint_follows_serial_target_commit() {
+    let mut applier = crate::row::RowApplier::new(TransactionRecordingExecutor::default());
     let checkpoint_store = RecordingCheckpointStore::new(applier.executor().shared_operations());
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -178,7 +177,7 @@ fn file_checkpoint_waits_until_after_pending_target_commits() {
 
     assert_eq!(
         applier.executor().operations().as_slice(),
-        ["BEGIN", "EXEC", "COMMIT", "FLUSH", "CHECKPOINT"]
+        ["BEGIN", "EXEC", "COMMIT", "CHECKPOINT"]
     );
 }
 
@@ -298,8 +297,8 @@ fn query_dml_does_not_open_or_checkpoint_target_transaction() {
 }
 
 #[test]
-fn direct_checkpoint_waits_for_pending_target_commits() {
-    let executor = TransactionRecordingExecutor::with_pending_flush();
+fn direct_checkpoint_saves_without_parallel_flush() {
+    let executor = TransactionRecordingExecutor::default();
     let checkpoint_store = RecordingCheckpointStore::new(executor.shared_operations());
     let resolver = FixtureSchemaResolver;
     let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
@@ -327,7 +326,7 @@ fn direct_checkpoint_waits_for_pending_target_commits() {
     save_outcome_checkpoint(&executor, &mut context, &event, &outcome)
         .expect("save direct checkpoint");
 
-    assert_eq!(executor.operations(), ["FLUSH", "CHECKPOINT"]);
+    assert_eq!(executor.operations(), ["CHECKPOINT"]);
 }
 
 #[test]

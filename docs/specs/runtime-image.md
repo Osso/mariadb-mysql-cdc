@@ -1,6 +1,6 @@
 # Runtime container image
 
-The production binary is packaged in a fixed, minimal Ubuntu runtime independent of the MariaDB server image. Build and operator usage are documented in the [README](../../README.md#runtime-image-verification).
+The production binary is packaged in a fixed, minimal Ubuntu runtime independent of the MariaDB server image. Live target execution uses the serial Rust `mysql` client; the removed Connector/C submission path has no `mysqlclient-sys` or `libmariadb` build/runtime dependency. Build and operator usage are documented in the [README](../../README.md#runtime-image-verification).
 
 ## What it must do
 
@@ -11,7 +11,7 @@ The production binary is packaged in a fixed, minimal Ubuntu runtime independent
 - [x] Preserve direct `mariadb-mysql-cdc` entrypoint execution without a privilege-drop wrapper.
 - [x] Exclude the unused `gosu` executable.
 - [x] Provide a non-empty system CA certificate bundle and permit UID/GID `65532:65532` to read a separately mounted read-only CA file without write access.
-- [x] Install the runtime packages required by the built binary: `ca-certificates`, `libc6`, `libgcc-s1`, `libmariadb3`, `libssl3t64`, and `zlib1g`, plus package-manager dependencies.
+- [x] Install the runtime packages required by the built binary: `ca-certificates`, `libc6`, `libgcc-s1`, `libssl3t64`, and `zlib1g`, plus package-manager dependencies; do not include the removed MariaDB Connector/C runtime library.
 - [x] Resolve every dynamic library required by `/usr/local/bin/mariadb-mysql-cdc` and execute the binary successfully.
 - [x] Update the Ubuntu package index, upgrade installed runtime packages, install without recommended extras, and remove package-list cache from the final layer.
 
@@ -36,7 +36,7 @@ The production binary is packaged in a fixed, minimal Ubuntu runtime independent
 
 ## Implementation inventory
 
-- `Dockerfile` — builds the Rust binary, upgrades the Ubuntu 24.04 runtime, installs runtime dependencies, and selects numeric UID/GID `65532:65532`.
+- `Dockerfile` — builds the Rust binary, upgrades the Ubuntu 24.04 runtime, installs only the libraries required by the serial Rust client, and selects numeric UID/GID `65532:65532`.
 - `deploy.sh` — runs the repository verification path, publishes the fixed-base image, resolves and verifies its immutable digest, runs the pinned Trivy gate, and only then admits the digest-pinned reference to ops reconciliation.
 - `run-tests.sh` — runs Rust tests and the Python deploy-contract suite through the repository test path.
 - `tests/verify_runtime_image.py` — inspects and executes a built image at the container boundary.
@@ -44,7 +44,7 @@ The production binary is packaged in a fixed, minimal Ubuntu runtime independent
 
 ## Tests asserting this spec
 
-- `tests/verify_runtime_image.py` asserts operating system identity, image user/entrypoint metadata, runtime UID/GID, CA bundle, read-only mounted CA-file readability, required packages, dynamic-link resolution, binary execution, and `gosu` absence.
+- `tests/verify_runtime_image.py` asserts operating system identity, image user/entrypoint metadata, runtime UID/GID, CA bundle, read-only mounted CA-file readability, the serial client's required packages and dynamic links, binary execution, and `gosu` absence.
 - `tests/test_deploy_script.py` asserts deployment succeeds without `BASE_IMAGE`, runs repository tests between formatting and Clippy, includes itself through `run-tests.sh`, verifies and scans the exact published digest before ops mutation, writes the immutable reference, and proves a failed Trivy gate leaves the ops manifest and commit unchanged.
 
 ## Known gaps (current cycle)
@@ -55,5 +55,6 @@ The production binary is packaged in a fixed, minimal Ubuntu runtime independent
 ## Out of scope
 
 - Publishing, deployment, ops manifest changes, production access, or registry mutation.
-- Changing Rust linkage, CDC behavior, stream arguments, or database privileges.
+- Reintroducing MariaDB Connector/C, `mysqlclient-sys`, or `libmariadb` linkage.
+- Changing CDC behavior, stream arguments, or database privileges.
 - Adding a shell entrypoint or runtime privilege-escalation path.

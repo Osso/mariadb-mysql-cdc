@@ -48,7 +48,6 @@ const MYSQL_CDC_HEARTBEAT_SECONDS: u64 = 30;
 // Bounds read-ahead memory while keeping the source socket drained during slow
 // applies, so the server's net_write_timeout does not kill the dump connection.
 const READ_AHEAD_EVENT_BUFFER: usize = 1024;
-const PARALLEL_TARGET_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MYSQL_COLUMN_TYPE_ENUM: u8 = 247;
 const MYSQL_COLUMN_TYPE_SET: u8 = 248;
 const MYSQL_COLUMN_TYPE_STRING: u8 = 254;

@@ -14,15 +14,12 @@ mod ddl_replay_journal;
 pub(crate) mod ddl_semantics;
 mod insert_conflict;
 mod mysql_cli;
-pub(crate) mod parallel_target;
-pub(crate) mod parallel_writer;
 mod progress;
 mod reconnect;
 #[cfg(test)]
 mod repair;
 mod schema_recovery;
 mod structured_stream;
-pub(crate) mod submitted_mysql;
 #[cfg(test)]
 use crate::target::{SqlStatement, TargetExecuteError};
 use binlog_command::read_remote_binlog;
@@ -53,7 +50,6 @@ pub enum IntegrationFailpoint {
     SourceConnectionLoss,
     TargetConnectionLoss,
     FailedRunClaimRevalidated,
-    ParallelTargetSubmission,
 }
 
 #[cfg(feature = "integration-failpoints")]
@@ -67,7 +63,6 @@ impl IntegrationFailpoint {
             "source-connection-loss" => Ok(Self::SourceConnectionLoss),
             "target-connection-loss" => Ok(Self::TargetConnectionLoss),
             "failed-run-claim-revalidated" => Ok(Self::FailedRunClaimRevalidated),
-            "parallel-target-submission" => Ok(Self::ParallelTargetSubmission),
             other => Err(format!("unknown integration failpoint: {other}")),
         }
     }
@@ -81,7 +76,6 @@ impl IntegrationFailpoint {
             Self::SourceConnectionLoss => 5,
             Self::TargetConnectionLoss => 6,
             Self::FailedRunClaimRevalidated => 7,
-            Self::ParallelTargetSubmission => 8,
         }
     }
 }
@@ -141,7 +135,6 @@ pub struct ApplyBinlogConfig {
     pub reconnect_forever: bool,
     pub target_transaction_group_size: usize,
     pub target_transaction_group_timeout_ms: u64,
-    pub target_parallel_transactions: usize,
     #[cfg(feature = "integration-failpoints")]
     pub integration_failpoint: Option<IntegrationFailpoint>,
 }
@@ -157,7 +150,6 @@ impl Default for ApplyBinlogConfig {
             reconnect_forever: false,
             target_transaction_group_size: 1,
             target_transaction_group_timeout_ms: 0,
-            target_parallel_transactions: 1,
             #[cfg(feature = "integration-failpoints")]
             integration_failpoint: None,
         }
@@ -224,11 +216,6 @@ fn validate_apply_runtime_settings(config: &ApplyBinlogConfig) -> Result<(), App
     if config.target_transaction_group_size == 0 {
         return Err(config_error(
             "target transaction group size must be greater than zero",
-        ));
-    }
-    if config.target_parallel_transactions == 0 {
-        return Err(config_error(
-            "target parallel transactions must be greater than zero",
         ));
     }
     Ok(())

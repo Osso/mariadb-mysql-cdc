@@ -11,7 +11,6 @@ where
 {
     if let Err(error) = bounded_stop_completion_error(runtime.source_row_transaction_open) {
         rollback_stream_transaction(runtime)?;
-        wait_for_parallel_target_transactions(runtime)?;
         return Err(error);
     }
     flush_stream_grouped_transaction(
@@ -19,8 +18,7 @@ where
         checkpoint_store,
         transaction_checkpoint_table,
         transaction_checkpoint_name,
-    )?;
-    wait_for_parallel_target_transactions(runtime)
+    )
 }
 
 pub(in crate::live::structured_stream) fn finish_stream<C>(
@@ -35,7 +33,6 @@ where
 {
     if let Some(stop_position) = config.source.stop_position {
         rollback_stream_transaction(runtime)?;
-        wait_for_parallel_target_transactions(runtime)?;
         return Err(bounded_stop_not_reached_error(stop_position));
     }
     flush_stream_grouped_transaction(
@@ -44,7 +41,6 @@ where
         transaction_checkpoint_table,
         transaction_checkpoint_name,
     )?;
-    wait_for_parallel_target_transactions(runtime)?;
     Err(stream_ended_error())
 }
 
@@ -85,46 +81,4 @@ pub(in crate::live::structured_stream) fn rollback_stream_transaction(
     runtime
         .target_transaction
         .rollback_if_open(runtime.applier.executor())
-}
-
-pub(in crate::live::structured_stream) fn wait_for_parallel_target_transactions(
-    runtime: &mut StreamRuntime,
-) -> Result<(), ApplyBinlogError> {
-    runtime
-        .applier
-        .executor()
-        .flush_pending_transactions()
-        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    reap_parallel_target_transactions(runtime)
-}
-
-pub(in crate::live::structured_stream) fn reap_parallel_target_transactions(
-    runtime: &mut StreamRuntime,
-) -> Result<(), ApplyBinlogError> {
-    let checkpoints = runtime
-        .applier
-        .executor()
-        .take_committed_checkpoints()
-        .map_err(|error| ApplyBinlogError::Target(error.to_string()))?;
-    let Some(progress) = runtime.durable_progress.as_mut() else {
-        debug_assert!(checkpoints.is_empty());
-        return Ok(());
-    };
-    record_committed_target_progress(progress, checkpoints);
-    Ok(())
-}
-
-pub(in crate::live::structured_stream) fn record_committed_target_progress(
-    progress: &mut StreamProgress,
-    checkpoints: Vec<crate::checkpoint::Checkpoint>,
-) {
-    for checkpoint in checkpoints {
-        let coordinate = BinlogCoordinate {
-            file: checkpoint.source_file,
-            position: checkpoint.source_position,
-        };
-        if progress.record_applied(&coordinate) {
-            println!("{}", format_stream_progress(progress));
-        }
-    }
 }

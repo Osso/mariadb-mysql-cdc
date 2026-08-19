@@ -37,9 +37,6 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
     fn acquire_stream_lease(&self, _lease_name: &str) -> Result<(), TargetExecuteError> {
         Ok(())
     }
-    fn begin_stream_transaction(&self) -> Result<(), TargetExecuteError> {
-        self.begin_transaction()
-    }
     fn begin_transaction(&self) -> Result<(), TargetExecuteError>;
     fn load_transaction_checkpoint_for_update(
         &self,
@@ -54,15 +51,6 @@ pub trait TransactionalTargetExecutor: TargetExecutor {
     ) -> Result<(), TargetExecuteError>;
     fn commit_transaction(&self) -> Result<(), TargetExecuteError>;
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError>;
-    fn flush_pending_transactions(&self) -> Result<(), TargetExecuteError> {
-        Ok(())
-    }
-    fn take_committed_checkpoints(&self) -> Result<Vec<Checkpoint>, TargetExecuteError> {
-        Ok(Vec::new())
-    }
-    fn uses_parallel_transactions(&self) -> bool {
-        false
-    }
 }
 
 impl<E> TransactionalTargetExecutor for &E
@@ -71,10 +59,6 @@ where
 {
     fn acquire_stream_lease(&self, lease_name: &str) -> Result<(), TargetExecuteError> {
         (*self).acquire_stream_lease(lease_name)
-    }
-
-    fn begin_stream_transaction(&self) -> Result<(), TargetExecuteError> {
-        (*self).begin_stream_transaction()
     }
 
     fn begin_transaction(&self) -> Result<(), TargetExecuteError> {
@@ -104,18 +88,6 @@ where
 
     fn rollback_transaction(&self) -> Result<(), TargetExecuteError> {
         (*self).rollback_transaction()
-    }
-
-    fn flush_pending_transactions(&self) -> Result<(), TargetExecuteError> {
-        (*self).flush_pending_transactions()
-    }
-
-    fn take_committed_checkpoints(&self) -> Result<Vec<Checkpoint>, TargetExecuteError> {
-        (*self).take_committed_checkpoints()
-    }
-
-    fn uses_parallel_transactions(&self) -> bool {
-        (*self).uses_parallel_transactions()
     }
 }
 

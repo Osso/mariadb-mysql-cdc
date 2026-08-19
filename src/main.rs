@@ -105,8 +105,6 @@ Apply options:
   --insert-conflict-policy POLICY Statement/snapshot INSERT policy: error, ignore-duplicate, or replace-divergent-pk. Native ROW streaming is fixed.
   --max-reconnects COUNT          Stream reconnect cap. Defaults to 12.
   --reconnect-forever BOOL        Ignore reconnect cap for transient source loss. Defaults to false.
-  --target-parallel-transactions COUNT
-                                  Submit complete target transactions concurrently. Defaults to 1 (serial).
   --stop-never-slave-server-id ID MariaDB --stop-never slave server_id. Generated when omitted.
 
 Sync catalog options:
@@ -521,9 +519,6 @@ fn apply_binlog_transaction_option(
         }
         "--target-transaction-group-timeout-ms" => {
             config.target_transaction_group_timeout_ms = parse_u64(flag, value)?;
-        }
-        "--target-parallel-transactions" => {
-            config.target_parallel_transactions = parse_nonzero_usize(flag, value)?;
         }
         #[cfg(feature = "integration-failpoints")]
         "--integration-failpoint" => {

@@ -11,9 +11,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod duplicate_parent;
 mod superseded_insert;
-pub(crate) use duplicate_parent::{
-    finish_duplicate_parent_probe, prepare_duplicate_parent_probe, verify_parent_query_rows,
-};
 
 const MAX_MISSING_FOREIGN_KEY_REPAIR_DEPTH: usize = 8;
 

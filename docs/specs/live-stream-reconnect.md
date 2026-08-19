@@ -44,29 +44,22 @@ source uses explicit plaintext mode from the start. Target TLS configuration is
 separate; failed target CA loading, chain validation, or required DNS/hostname
 identity matching stops immediately.
 
-### Parallel target transactions
+### Serial target transactions
 
-- [x] Preserve serial target execution by default. Parallel submission requires
-  explicit `--target-parallel-transactions N` with `N > 1`.
-- [x] Bound concurrency to `N` leased target connections. One complete source
-  transaction stays on one connection from `BEGIN` through `COMMIT`; a connection
-  is not reusable until its final result is drained.
-- [x] Send each body statement separately with its row-operation metadata, then
-  submit the checkpoint and `COMMIT` only after the body drains successfully.
-- [x] Drain transaction bodies concurrently, but dispatch checkpoint plus
-  `COMMIT` strictly in source order. A later transaction must never commit or
-  advance the durable checkpoint before every earlier transaction succeeds.
+- [x] Execute live target work serially on one initialized Rust `mysql::Conn`.
+- [x] Keep each complete source transaction on that connection from `BEGIN`
+  through `COMMIT` or `ROLLBACK`.
+- [x] Allow the existing target transaction group-size and timeout controls to
+  group complete source transactions without introducing concurrent target
+  workers.
+- [x] Write the target checkpoint in the same target transaction as grouped DML
+  and commit both atomically in source order.
 - [x] Treat DDL, synchronous target reads, direct checkpoint writes, bounded stop,
-  and stream completion as barriers that wait for pending target transactions.
-- [x] Poison the parallel pool on body or commit failure. Do not dispatch later
-  commits or advance past the last successfully committed checkpoint.
-- [x] Prove the Connector/C path against disposable real MariaDB/MySQL endpoints:
-  pause the first worker after client-side body submission, pause the second after
-  result draining, observe only `SSL/TLS` target sessions, prove no row or
-  checkpoint is visible before ordered commit, and converge both rows plus the
-  exact stop checkpoint after releasing the test-only barriers.
-- [x] Ignore delayed MySQL `1062` only for INSERT statements, continue draining
-  later body statements, and fail the transaction for every other delayed error.
+  and stream completion as barriers that flush the active grouped transaction.
+- [x] Roll back the active grouped transaction and leave its checkpoint unchanged
+  after any non-ignored target row failure.
+- [x] Ignore MySQL `1062` only for native INSERT statements; continue later
+  statements in the same source transaction and fail on every other row error.
 
 ### Durable checkpointing
 
@@ -131,8 +124,8 @@ identity matching stops immediately.
 - `src/live/structured_stream/` — production native `mysql_cdc` row/DDL stream,
   transaction boundaries, and event-end checkpoint decisions.
 - `src/live/reconnect.rs` — reconnect policy and checkpoint resume semantics.
-- `src/live/parallel_target.rs` and `src/live/parallel_writer.rs` — per-statement
-  delayed-error handling and source-ordered parallel commits.
+- `src/mysql_client.rs` — serial target connection, grouped transaction execution,
+  checkpoint writes, and source-authoritative row repair.
 - `src/lost_binlog_recovery.rs` and `src/lost_binlog_recovery_store.rs` — audited
   purged-history checkpoint/barrier transition with anchored full-scope repair.
 - `src/stream_checkpoint.rs` — target-table checkpoint store.
@@ -163,10 +156,8 @@ identity matching stops immediately.
   with no target execution or checkpoint write.
 - `src/live/tests/reconnect.rs` — asserts transient checkpoint reload, stale
   binlog refusal, bounded retry, and non-retryable target failure.
-- `src/live/structured_stream/tests/transaction.rs` — asserts row failures roll
-  back without checkpoint advancement and preserve source transaction boundaries.
-- `src/live/parallel_target_tests.rs` — asserts delayed INSERT `1062` continues
-  while non-INSERT `1062` stops before later statements and commit.
+- `src/live/structured_stream/tests/transaction.rs` — asserts grouped serial
+  transaction boundaries, row-failure rollback, and checkpoint ordering.
 - `src/stream_checkpoint.rs` — asserts target checkpoint writes and resume
   selection remain source-identity scoped.
 - `scripts/cdc-integration-harness.py --scenario insert-duplicate-idempotent` —
@@ -174,13 +165,10 @@ identity matching stops immediately.
   a divergent preexisting target row and no `cdc.row_conflicts` table or
   inventory procedure. It verifies the duplicate leaves that row untouched,
   applies a later same-transaction row, and advances the exact checkpoint.
-- `scripts/cdc-integration-harness.py --scenario parallel-target-transactions` —
-  runs the production binary with `--target-parallel-transactions 2` against a
-  TLS-required MySQL target. Test-only barriers expose the first accepted body
-  before result reading and the later drained body before commit dispatch; the
-  scenario verifies all target sessions are `SSL/TLS`, checks the row/checkpoint
-  barrier, releases both workers, and verifies ordered convergence after an
-  INSERT `1062` plus later statements.
+- `scripts/cdc-integration-harness.py --scenario missing-fk-nested-parent-auto-insert` —
+  runs the production binary against disposable MariaDB/MySQL endpoints and
+  proves recursive nested parent repair, child retry, and exact serial checkpoint
+  completion.
 
 ## Known gaps (current cycle)
 
@@ -190,9 +178,9 @@ identity matching stops immediately.
   next stream resumes from the saved checkpoint.
 - [x] Add a failing test where process startup reads an existing checkpoint and
   overrides static startup coordinates.
-- [x] Prove serial and parallel INSERT `1062` continuation against disposable
-  real MariaDB/MySQL endpoints; keep the conflict ledger and repair paths
-  out-of-band only.
+- [x] Prove serial INSERT `1062` continuation against disposable real
+  MariaDB/MySQL endpoints; keep the conflict ledger and repair paths out-of-band
+  only.
 - [x] Add a failing test that checkpoint is written only after successful target
   apply.
 - [x] Production streaming uses the native client/reconnect loop; the
@@ -200,6 +188,9 @@ identity matching stops immediately.
 
 ## Out of scope
 
+- Concurrent live target workers, parallel target submission, or a
+  `--target-parallel-transactions` option. Existing group-size and timeout
+  controls group source transactions only.
 - Solving SQL compatibility gaps. Unsupported SQL still belongs to statement or
   row-event handling specs.
 - Cutover automation. Reconnect is required before cutover, but endpoint switch
