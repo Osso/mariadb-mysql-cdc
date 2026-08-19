@@ -54,8 +54,10 @@ identity matching stops immediately.
   workers.
 - [x] Write the target checkpoint in the same target transaction as grouped DML
   and commit both atomically in source order.
-- [x] Treat DDL, synchronous target reads, direct checkpoint writes, bounded stop,
-  and stream completion as barriers that flush the active grouped transaction.
+- [x] Flush the active grouped transaction when its group-size or timeout limit is
+  reached, at binlog rotation, for DDL, at bounded stop, and at stream completion.
+- [x] Keep missing-FK and duplicate-parent reconciliation reads inside the active
+  target transaction.
 - [x] Roll back the active grouped transaction and leave its checkpoint unchanged
   after any non-ignored target row failure.
 - [x] Ignore MySQL `1062` only for native INSERT statements; continue later
