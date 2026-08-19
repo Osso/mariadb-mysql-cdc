@@ -332,19 +332,38 @@ where
         current_file,
         group_config: *group_config,
     };
-    match handle_ddl_event(
+    dispatch_ddl_or_transactional_event(
         applier,
         ddl_replay_journal,
         semantic_inventory,
         source_identity,
         &mut context,
+        input,
+    )
+}
+
+fn dispatch_ddl_or_transactional_event<C>(
+    applier: &mut RowApplier<crate::mysql_client::PersistentTargetExecutor>,
+    ddl_replay_journal: &MySqlDdlReplayJournal,
+    semantic_inventory: &LiveDdlSemanticInventory,
+    source_identity: &str,
+    context: &mut StreamEventContext<'_, TargetInventorySchemaResolver, C>,
+    input: SourceStreamEvent<'_>,
+) -> Result<StructuredEventOutcome, ApplyBinlogError>
+where
+    C: StreamCheckpointStore,
+{
+    match handle_ddl_event(
+        applier,
+        ddl_replay_journal,
+        semantic_inventory,
+        source_identity,
+        context,
         input.header,
         input.event,
     )? {
         Some(outcome) => Ok(outcome),
-        None => {
-            apply_stream_event_transactionally(applier, &mut context, input.header, input.event)
-        }
+        None => apply_stream_event_transactionally(applier, context, input.header, input.event),
     }
 }
 
