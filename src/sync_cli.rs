@@ -44,6 +44,7 @@ fn default_sync_config() -> SyncConfig {
         progress_table: DEFAULT_SYNC_PROGRESS_TABLE.to_string(),
         run_id: None,
         run_id_prefix: None,
+        authorized_old_run_spec_sha256: None,
     }
 }
 
@@ -61,6 +62,9 @@ fn apply_sync_option(config: &mut SyncConfig, flag: &str, value: &str) -> Result
         "--progress-table" => config.progress_table = value.to_string(),
         "--run-id" => config.run_id = Some(value.to_string()),
         "--run-id-prefix" => config.run_id_prefix = Some(value.to_string()),
+        "--authorize-old-run-spec-sha256" => {
+            config.authorized_old_run_spec_sha256 = Some(value.to_string());
+        }
         _ => return Err(format!("unknown sync option: {flag}")),
     }
     Ok(())

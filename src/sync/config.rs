@@ -2,7 +2,7 @@ use super::model::{SyncPrimaryKeyOrdering, SyncTable};
 use crate::inventory::{SchemaInventory, TableInventory};
 use crate::live::TargetMySqlConfig;
 use crate::mysql_config::MySqlConnectionConfig;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,16 +20,17 @@ pub(crate) struct SyncConfig {
     pub(crate) progress_table: String,
     pub(crate) run_id: Option<String>,
     pub(crate) run_id_prefix: Option<String>,
+    pub(crate) authorized_old_run_spec_sha256: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct SyncEndpointSpec {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) database: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct SyncRunSpec {
     pub(crate) source: SyncEndpointSpec,
     pub(crate) target: SyncEndpointSpec,
@@ -291,7 +292,8 @@ pub(crate) fn validate_sync_config(config: &SyncConfig) -> Result<(), String> {
     validate_target_connection(&config.target)?;
     validate_sync_scope(config)?;
     validate_progress_table(&config.progress_table)?;
-    validate_run_identity(config)
+    validate_run_identity(config)?;
+    validate_run_spec_migration_authorization(config)
 }
 
 pub(crate) fn build_sync_run_identity(
@@ -411,6 +413,29 @@ fn validate_run_identity(config: &SyncConfig) -> Result<(), String> {
         (None, Some(prefix)) => require_nonempty(prefix, "run id prefix is required"),
         _ => Err("exactly one of run_id or run_id_prefix is required".to_string()),
     }
+}
+
+fn validate_run_spec_migration_authorization(config: &SyncConfig) -> Result<(), String> {
+    let Some(authorized_sha256) = &config.authorized_old_run_spec_sha256 else {
+        return Ok(());
+    };
+    let valid_sha256 = authorized_sha256.len() == 64
+        && authorized_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid_sha256 {
+        return Err(
+            "authorized old run-spec SHA-256 must be exactly 64 lowercase ASCII hex characters"
+                .to_string(),
+        );
+    }
+    if config.run_id_prefix.is_some() {
+        return Err(
+            "authorized old run-spec SHA-256 requires an exact run_id, not run_id_prefix"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_exact_run_id(run_id: &str) -> Result<(), String> {

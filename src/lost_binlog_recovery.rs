@@ -733,6 +733,7 @@ fn full_scope_sync_config(
         progress_table: run.progress_table.to_string(),
         run_id: Some(run.run_id),
         run_id_prefix: None,
+        authorized_old_run_spec_sha256: None,
     }
 }
 

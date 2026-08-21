@@ -518,6 +518,7 @@ fn fixture_config() -> SyncConfig {
         progress_table: "cdc.sync_runs".to_string(),
         run_id: Some("sync-run-42".to_string()),
         run_id_prefix: None,
+        authorized_old_run_spec_sha256: None,
     }
 }
 

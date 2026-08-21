@@ -1,8 +1,8 @@
 use crate::database_row::DatabaseRow;
 pub(crate) use crate::primary_key_ordering::PrimaryKeyOrdering as SyncPrimaryKeyOrdering;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct SyncTable {
     pub(crate) name: String,
     pub(crate) primary_key: Vec<String>,

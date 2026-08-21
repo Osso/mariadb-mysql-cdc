@@ -5,6 +5,7 @@ mod mysql;
 mod orchestrate;
 mod progress;
 mod run;
+mod run_spec_migration;
 mod sql;
 
 #[cfg(test)]
@@ -42,6 +43,9 @@ pub(crate) use progress::{
 };
 #[cfg(test)]
 pub(crate) use run::{run_sync_tables_bounded, sync_table_to_completion};
+pub(crate) use run_spec_migration::{
+    LockedSyncProgressRow, SyncRunSpecMigrationDecision, decide_locked_run_spec_migration,
+};
 #[cfg(test)]
 pub(crate) use sql::{
     build_lock_table_write_sql, build_strict_delete_rows_statement, build_strict_insert_statement,

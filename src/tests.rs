@@ -42,6 +42,13 @@ mod sync_cli_config {
     ));
 }
 
+mod sync_run_spec_migration {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_run_spec_migration.rs"
+    ));
+}
+
 mod sync_catalog_unified {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

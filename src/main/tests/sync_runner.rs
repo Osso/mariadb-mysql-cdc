@@ -294,6 +294,7 @@ fn config_and_identity(
         progress_table: "cdc.sync_runs".to_string(),
         run_id: Some("sync-run-42".to_string()),
         run_id_prefix: None,
+        authorized_old_run_spec_sha256: None,
     };
     let identity = build_sync_run_identity(&config, tables.to_vec()).expect("sync run identity");
     (config, identity)

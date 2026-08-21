@@ -367,6 +367,7 @@ pub(crate) fn sync_config_from_catalog(
         progress_table: config.progress_table.clone(),
         run_id: None,
         run_id_prefix: Some(config.run_id_prefix.clone()),
+        authorized_old_run_spec_sha256: None,
     }
 }
 
