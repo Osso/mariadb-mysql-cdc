@@ -28,9 +28,10 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 
 ### Connection construction retry
 
-- [x] Retry source, locked-target, and separate progress-store connection construction only when `mysql::Error::is_connectivity_error()` classifies the failure as connectivity-related.
+- [x] Retry a sync connection construction only when `mysql::Error::is_connectivity_error()` classifies the failure as connectivity-related.
 - [x] Bound connection construction to five attempts with exponential backoff and jitter; return the last connectivity error after exhaustion and fail immediately on permanent errors.
-- [x] Do not retry session initialization, progress schema operations, SQL statements, row chunks, table work, or completed stages.
+- [x] Preserve single-attempt row-chunk and table failure behavior after connections are constructed.
+- [ ] Prove through disposable MySQL fault injection that source, locked-target, and separate progress-store constructors use the retry boundary while session initialization, progress schema operations, SQL statements, and completed stages remain single-attempt.
 
 ### Schema and progress contracts
 
@@ -72,7 +73,7 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 ## Known gaps (current cycle)
 
 - [ ] Migrate scripts, fixtures, grants, harnesses, and ops callers.
-- [ ] Prove the complete catalog/resync/recovery MySQL paths against disposable endpoints.
+- [ ] Prove the complete catalog/resync/recovery MySQL paths against disposable endpoints, including connection-construction and post-connect failure boundaries.
 - [x] Delete legacy production engines and progress paths.
 - [ ] Run full-project tests, Clippy without warning suppression, and final integration verification.
 
