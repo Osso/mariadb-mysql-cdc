@@ -560,10 +560,10 @@ fn add_column_insertion_index(
     column: &ParsedAddColumnAst,
     existing_index: Option<usize>,
 ) -> Result<usize, String> {
-    if column.if_not_exists {
-        if let Some(index) = existing_index {
-            return Ok(index);
-        }
+    if column.if_not_exists
+        && let Some(index) = existing_index
+    {
+        return Ok(index);
     }
     match &column.after {
         Some(after) => table
