@@ -1,10 +1,10 @@
 use super::model::{SyncPrimaryKeyOrdering, SyncTable};
-use crate::inventory::TableInventory;
+use crate::inventory::{SchemaInventory, TableInventory};
 use crate::live::TargetMySqlConfig;
 use crate::mysql_config::MySqlConnectionConfig;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SYNC_RUN_ID_DOMAIN: &[u8] = b"mariadb-mysql-cdc:sync-run-id:v1\0";
 const MAX_SYNC_RUN_ID_BYTES: usize = 128;
@@ -44,6 +44,246 @@ pub(crate) struct SyncRunIdentity {
     pub(crate) run_id: String,
     pub(crate) run_spec: SyncRunSpec,
     pub(crate) run_spec_json: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdditiveRunSpecMigrationPlan {
+    pub(crate) changed_tables: Vec<AdditiveRunSpecTableChange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdditiveRunSpecTableChange {
+    pub(crate) table: String,
+    pub(crate) added_columns: Vec<String>,
+}
+
+pub(crate) fn plan_additive_run_spec_migration(
+    persisted: &SyncRunSpec,
+    current: &SyncRunSpec,
+    source: &SchemaInventory,
+    target: &SchemaInventory,
+) -> Result<AdditiveRunSpecMigrationPlan, String> {
+    validate_unchanged_migration_settings(persisted, current)?;
+    validate_unchanged_table_scope(persisted, current)?;
+
+    let source_tables = inventory_tables_by_name(source);
+    let target_tables = inventory_tables_by_name(target);
+    let changed_tables = persisted
+        .tables
+        .iter()
+        .zip(&current.tables)
+        .map(|(persisted_table, current_table)| {
+            plan_additive_table_change(
+                persisted_table,
+                current_table,
+                &source_tables,
+                &target_tables,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    if changed_tables.is_empty() {
+        return Err("additive run-spec migration has no added writable columns".to_string());
+    }
+    Ok(AdditiveRunSpecMigrationPlan { changed_tables })
+}
+
+fn validate_unchanged_migration_settings(
+    persisted: &SyncRunSpec,
+    current: &SyncRunSpec,
+) -> Result<(), String> {
+    for (unchanged, error) in [
+        (
+            persisted.source == current.source,
+            "additive run-spec migration source endpoint changed",
+        ),
+        (
+            persisted.target == current.target,
+            "additive run-spec migration target endpoint changed",
+        ),
+        (
+            persisted.chunk_size == current.chunk_size,
+            "additive run-spec migration chunk size changed",
+        ),
+        (
+            persisted.parallelism == current.parallelism,
+            "additive run-spec migration parallelism changed",
+        ),
+        (
+            persisted.progress_table == current.progress_table,
+            "additive run-spec migration progress table changed",
+        ),
+    ] {
+        if !unchanged {
+            return Err(error.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_unchanged_table_scope(
+    persisted: &SyncRunSpec,
+    current: &SyncRunSpec,
+) -> Result<(), String> {
+    let persisted_names = persisted
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect::<Vec<_>>();
+    let current_names = current
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect::<Vec<_>>();
+    if persisted_names != current_names {
+        return Err("additive run-spec migration table scope or order changed".to_string());
+    }
+    Ok(())
+}
+
+fn inventory_tables_by_name(inventory: &SchemaInventory) -> BTreeMap<&str, &TableInventory> {
+    inventory
+        .tables
+        .iter()
+        .map(|table| (table.name.as_str(), table))
+        .collect()
+}
+
+fn plan_additive_table_change(
+    persisted: &SyncTable,
+    current: &SyncTable,
+    source_tables: &BTreeMap<&str, &TableInventory>,
+    target_tables: &BTreeMap<&str, &TableInventory>,
+) -> Result<Option<AdditiveRunSpecTableChange>, String> {
+    validate_unchanged_primary_key(persisted, current)?;
+    let added_columns = added_writable_columns(persisted, current)?;
+    let source = required_inventory_table(source_tables, "source", &persisted.name)?;
+    let target = required_inventory_table(target_tables, "target", &persisted.name)?;
+    validate_current_table_inventory(current, source, target)?;
+
+    Ok(
+        (!added_columns.is_empty()).then(|| AdditiveRunSpecTableChange {
+            table: persisted.name.clone(),
+            added_columns,
+        }),
+    )
+}
+
+fn validate_unchanged_primary_key(
+    persisted: &SyncTable,
+    current: &SyncTable,
+) -> Result<(), String> {
+    if persisted.primary_key != current.primary_key {
+        return Err(format!(
+            "additive run-spec migration table `{}` primary key changed",
+            persisted.name
+        ));
+    }
+    if persisted.primary_key_ordering != current.primary_key_ordering {
+        return Err(format!(
+            "additive run-spec migration table `{}` primary-key ordering changed",
+            persisted.name
+        ));
+    }
+    Ok(())
+}
+
+fn required_inventory_table<'a>(
+    tables: &'a BTreeMap<&str, &TableInventory>,
+    endpoint: &str,
+    table: &str,
+) -> Result<&'a TableInventory, String> {
+    tables
+        .get(table)
+        .copied()
+        .ok_or_else(|| format!("additive run-spec migration {endpoint} table `{table}` is missing"))
+}
+
+fn validate_current_table_inventory(
+    current: &SyncTable,
+    source: &TableInventory,
+    target: &TableInventory,
+) -> Result<(), String> {
+    let source_table = sync_table_from_inventory(source)?;
+    if source_table != *current {
+        return Err(format!(
+            "additive run-spec migration table `{}` current specification does not match source inventory",
+            current.name
+        ));
+    }
+    if !crate::table_catalog::schemas_are_compatible(source, target) {
+        return Err(format!(
+            "additive run-spec migration table `{}` current source and target schemas are incompatible",
+            current.name
+        ));
+    }
+    Ok(())
+}
+
+fn added_writable_columns(
+    persisted: &SyncTable,
+    current: &SyncTable,
+) -> Result<Vec<String>, String> {
+    let persisted_names = persisted
+        .columns
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let current_names = current
+        .columns
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    validate_no_removed_columns(persisted, &persisted_names, &current_names)?;
+    validate_existing_column_order(persisted, current, &persisted_names)?;
+
+    Ok(current
+        .columns
+        .iter()
+        .filter(|column| !persisted_names.contains(column.as_str()))
+        .cloned()
+        .collect())
+}
+
+fn validate_no_removed_columns(
+    persisted: &SyncTable,
+    persisted_names: &BTreeSet<&str>,
+    current_names: &BTreeSet<&str>,
+) -> Result<(), String> {
+    let removed = persisted_names
+        .difference(current_names)
+        .copied()
+        .collect::<Vec<_>>();
+    if removed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "additive run-spec migration table `{}` removed writable columns: {}",
+        persisted.name,
+        removed.join(", ")
+    ))
+}
+
+fn validate_existing_column_order(
+    persisted: &SyncTable,
+    current: &SyncTable,
+    persisted_names: &BTreeSet<&str>,
+) -> Result<(), String> {
+    let retained = current
+        .columns
+        .iter()
+        .filter(|column| persisted_names.contains(column.as_str()))
+        .collect::<Vec<_>>();
+    if retained == persisted.columns.iter().collect::<Vec<_>>() {
+        return Ok(());
+    }
+    Err(format!(
+        "additive run-spec migration table `{}` reordered existing writable columns",
+        persisted.name
+    ))
 }
 
 pub(crate) fn validate_sync_config(config: &SyncConfig) -> Result<(), String> {

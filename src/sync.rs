@@ -9,6 +9,10 @@ mod sql;
 
 #[cfg(test)]
 pub(crate) use chunk::sync_next_chunk;
+pub(crate) use config::{
+    AdditiveRunSpecMigrationPlan, AdditiveRunSpecTableChange, SyncRunSpec,
+    plan_additive_run_spec_migration,
+};
 pub(crate) use config::{DEFAULT_SYNC_PROGRESS_TABLE, SyncConfig, validate_sync_config};
 #[cfg(test)]
 pub(crate) use config::{SyncRunIdentity, build_sync_run_identity, sync_table_from_inventory};

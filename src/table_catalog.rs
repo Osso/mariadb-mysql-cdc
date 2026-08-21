@@ -450,7 +450,7 @@ fn validate_catalog_dependencies_are_acyclic<'a>(
     Ok(())
 }
 
-fn schemas_are_compatible(source: &TableInventory, target: &TableInventory) -> bool {
+pub(crate) fn schemas_are_compatible(source: &TableInventory, target: &TableInventory) -> bool {
     source.primary_key == target.primary_key
         && compatible_character_set(source.collation.as_deref(), target.collation.as_deref())
         && writable_columns(source) == writable_columns(target)
