@@ -60,7 +60,9 @@ proves both columns absent. When both exact columns are present, normal converge
 state suppression records a proven no-op. Partial presence or any divergent
 column definition blocks before target execution. `ALGORITHM=INPLACE` and every
 other table, column, comment, type, clause count/order, or algorithm variant remain
-`translation_pending`; no journal or checkpoint edit is required.
+`translation_pending`; they execute no target SQL and do not advance the
+checkpoint. The runtime records or preserves the durable journal barrier; no
+manual journal or checkpoint edit is required.
 
 The stream does not create or repair control-plane objects. Bootstrap must run
 with admin/resolver credentials while the stream is stopped:
