@@ -1369,16 +1369,23 @@ pub(crate) fn read_sync_target_inventory(
 ) -> Result<SchemaInventory, String> {
     let config = inventory_config_target(target);
     let reader = MariaDbInventoryReader::new(config);
-    build_inventory(&target.database, &reader)
+    read_sync_target_inventory_with_reader(target, &reader)
+}
+
+fn read_sync_target_inventory_with_reader(
+    target: &crate::live::TargetMySqlConfig,
+    reader: &MariaDbInventoryReader,
+) -> Result<SchemaInventory, String> {
+    build_inventory(&target.database, reader)
         .map_err(|error| format!("target schema inventory failed: {error}"))
 }
 
 fn read_sync_stage_target_evidence(
     target: &crate::live::TargetMySqlConfig,
 ) -> Result<SyncStageTargetEvidence, String> {
-    let inventory = read_sync_target_inventory(target)?;
     let config = inventory_config_target(target);
     let reader = MariaDbInventoryReader::new(config.clone());
+    let inventory = read_sync_target_inventory_with_reader(target, &reader)?;
     let checks = CheckConstraintReader::new(config)
         .read(&target.database, None)
         .map_err(|error| format!("target check constraint inventory failed: {error}"))?;
