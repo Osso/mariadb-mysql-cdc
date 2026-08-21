@@ -43,8 +43,13 @@ pub(crate) use progress::{
 };
 #[cfg(test)]
 pub(crate) use run::{run_sync_tables_bounded, sync_table_to_completion};
+#[cfg(test)]
 pub(crate) use run_spec_migration::{
-    LockedSyncProgressRow, SyncRunSpecMigrationDecision, decide_locked_run_spec_migration,
+    LockedSyncProgressRow, SyncRunSpecMigrationDecision, SyncRunSpecMigrationExecutor,
+    decide_locked_run_spec_migration,
+};
+pub(crate) use run_spec_migration::{
+    SyncRunSpecMigrationOutcome, SyncRunSpecMigrationRequest, run_locked_sync_run_spec_migration,
 };
 #[cfg(test)]
 pub(crate) use sql::{

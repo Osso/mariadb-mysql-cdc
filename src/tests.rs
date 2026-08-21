@@ -49,6 +49,13 @@ mod sync_run_spec_migration {
     ));
 }
 
+mod sync_run_spec_migration_store {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/main/tests/sync_run_spec_migration_store.rs"
+    ));
+}
+
 mod sync_catalog_unified {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

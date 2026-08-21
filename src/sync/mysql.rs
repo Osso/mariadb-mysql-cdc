@@ -7,6 +7,7 @@ use super::progress::{
     build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
     build_sync_progress_select_sql, build_sync_progress_upsert_sql, parse_sync_progress_row,
 };
+use super::run_spec_migration::{LockedSyncProgressRow, SyncRunSpecMigrationExecutor};
 use super::sql::{
     build_lock_table_write_sql, build_strict_delete_rows_statement, build_strict_insert_statement,
     build_strict_update_rows_statement, build_sync_select_sql,
@@ -17,9 +18,10 @@ use crate::mysql_client::{
     PersistentMySqlSource, sync_source_opts, sync_target_opts, value_to_string,
 };
 use crate::mysql_config::MySqlConnectionConfig;
+use crate::mysql_support::quote_identifier_path;
 use crate::target::SqlStatement;
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, Params};
+use mysql::{Conn, Opts, Params, Value};
 use std::collections::BTreeMap;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -229,6 +231,91 @@ impl MySqlSyncProgressStore {
         self.conn
             .exec_drop(&statement.sql, Params::Positional(statement.params))
             .map_err(|error| format!("sync progress mysql statement failed: {error}"))
+    }
+}
+
+impl SyncRunSpecMigrationExecutor for MySqlSyncProgressStore {
+    fn begin_serializable_transaction(&mut self) -> Result<(), String> {
+        self.conn
+            .query_drop("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .map_err(|error| {
+                format!(
+                    "set sync run-spec migration transaction isolation to SERIALIZABLE: {error}"
+                )
+            })?;
+        self.conn.query_drop("START TRANSACTION").map_err(|error| {
+            format!("begin serializable sync run-spec migration transaction: {error}")
+        })
+    }
+
+    fn lock_run_rows(&mut self, run_id: &str) -> Result<Vec<LockedSyncProgressRow>, String> {
+        let sql = format!(
+            "SELECT stage, table_name, run_spec_json FROM {} WHERE run_id = ? ORDER BY stage, table_name FOR UPDATE",
+            quote_identifier_path(&self.progress_table)
+        );
+        let rows = self
+            .conn
+            .exec::<(String, String, String), _, _>(sql, (run_id,))
+            .map_err(|error| format!("lock sync run progress rows: {error}"))?;
+        rows.into_iter()
+            .map(|(stage, table_name, run_spec_json)| {
+                Ok(LockedSyncProgressRow {
+                    stage: SyncStage::parse(&stage)?,
+                    table_name,
+                    run_spec_json,
+                })
+            })
+            .collect()
+    }
+
+    fn update_run_spec(
+        &mut self,
+        run_id: &str,
+        old_json: &str,
+        current_json: &str,
+    ) -> Result<u64, String> {
+        let sql = format!(
+            "UPDATE {} SET run_spec_json = ?, updated_at = updated_at WHERE run_id = ? AND run_spec_json = ?",
+            quote_identifier_path(&self.progress_table)
+        );
+        self.conn
+            .exec_drop(
+                sql,
+                Params::Positional(vec![
+                    Value::Bytes(current_json.as_bytes().to_vec()),
+                    Value::Bytes(run_id.as_bytes().to_vec()),
+                    Value::Bytes(old_json.as_bytes().to_vec()),
+                ]),
+            )
+            .map_err(|error| format!("update sync run specification: {error}"))?;
+        Ok(self.conn.affected_rows())
+    }
+
+    fn count_run_rows_with_spec(
+        &mut self,
+        run_id: &str,
+        current_json: &str,
+    ) -> Result<u64, String> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE run_id = ? AND run_spec_json = ?",
+            quote_identifier_path(&self.progress_table)
+        );
+        self.conn
+            .exec_first::<u64, _, _>(sql, (run_id, current_json))
+            .map_err(|error| format!("verify sync run specification migration: {error}"))?
+            .ok_or_else(|| "verify sync run specification migration returned no count".to_string())
+    }
+
+    fn commit_transaction(&mut self) -> Result<(), String> {
+        self.conn
+            .query_drop("COMMIT")
+            .map_err(|error| format!("commit sync run-spec migration transaction: {error}"))
+    }
+
+    fn rollback_transaction(&mut self) -> Result<(), String> {
+        self.conn
+            .query_drop("ROLLBACK")
+            .map_err(|error| format!("target mysql rollback: {error}"))
     }
 }
 
