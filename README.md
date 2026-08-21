@@ -268,7 +268,20 @@ cargo run -- sync-catalog \
 `--table` for a closed source scope and provide exactly one immutable `--run-id`
 or `--run-id-prefix`; the progress table defaults to `cdc.sync_runs`. The command
 runs prerequisite schema convergence, source-authoritative locked row chunks, and
-final constraint convergence as one staged operation. The removed
+final constraint convergence as one staged operation.
+
+`--authorize-old-run-spec-sha256 <64-lowercase-hex>` is an explicit recovery-only
+option for an exact `--run-id`. It authorizes migration from that one persisted
+run-spec hash only when endpoints, settings, ordered scope, primary keys, primary-key
+ordering, and existing writable-column order are unchanged; current source and
+target schemas must agree, and each changed table must have no rows-stage progress.
+The command locks and revalidates every run row in one serializable transaction,
+updates only `run_spec_json`, verifies affected/current row counts, and rolls back
+on any failure without retrying the transaction. A retry after commit is a no-write
+`already_current` result. Authorization is not serialized into the run identity,
+and it is not a general run-spec compatibility bypass.
+
+The removed
 `catchup-progress`, `sync-progress`, standalone `sync-schema`, and `drift-check`
 commands are not available; their work is either part of `sync` stages or removed
 from the CLI. Legacy `catchup-snapshot`, `sync-table`, and `repair-drift` names are
@@ -287,6 +300,7 @@ python3 scripts/cdc-integration-harness.py --scenario insert-duplicate-idempoten
 python3 scripts/cdc-integration-harness.py --scenario missing-fk-parent-auto-insert
 python3 scripts/cdc-integration-harness.py --scenario missing-fk-nested-parent-auto-insert
 python3 scripts/cdc-integration-harness.py --scenario missing-fk-superseded-insert
+python3 scripts/cdc-integration-harness.py --scenario sync-authorized-additive-spec-migration
 ```
 
 The serial proofs cover divergent-target INSERT `1062` continuation, nested
