@@ -56,8 +56,8 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - `src/sync/orchestrate.rs` — stage ordering, immutable progress validation, resumable stage persistence, source-scope selection, and production executor wiring.
 - `src/sync/run.rs` — bounded deterministic row-table execution.
 - `src/sync/chunk.rs` — locked source/target chunk mutation and progress boundary.
-- `src/sync/mysql.rs` — source, locked target-session, and separate progress-store adapters.
-- `src/sync/progress.rs` — `cdc.sync_runs` SQL, progress serialization, exact-run locking, and transactional run-spec replacement.
+- `src/sync/mysql.rs` — source, locked target-session, separate progress-store adapters, and the MySQL exact-run migration transaction.
+- `src/sync/progress.rs` — `cdc.sync_runs` SQL and progress serialization.
 - `src/sync/run_spec_migration.rs` — additive compatibility planning, persisted-spec/hash validation, changed-table progress gates, and idempotent locked-state decisions.
 - `src/sync_schema.rs` — source evidence reads plus prerequisite and final schema-stage planning/execution.
 - `src/table_catalog.rs` — catalog validation and one-run `SyncConfig` mapping for `sync-catalog`.
