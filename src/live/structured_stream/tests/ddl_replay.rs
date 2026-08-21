@@ -348,6 +348,232 @@ fn existing_translation_pending_tinyint_add_column_is_proven_and_checkpointed() 
     );
 }
 
+const CONTENT_SECTIONS_EVENTS_RAW_SEEN_DDL: &str = "ALTER TABLE `content_sections_events_raw`\n\
+    ADD COLUMN IF NOT EXISTS `direct_seen_at` timestamp NULL DEFAULT NULL\n\
+        COMMENT 'When CmsEventsBufferManager (direct write) first saw this event',\n\
+    ADD COLUMN IF NOT EXISTS `sync_seen_at` timestamp NULL DEFAULT NULL\n\
+        COMMENT 'When ContentSectionsEventSyncService (Mixpanel Export) first saw it',\n\
+    ALGORITHM=INSTANT";
+
+const CONTENT_SECTIONS_EVENTS_RAW_SEEN_TARGET_SQL: &str = "ALTER TABLE `content_sections_events_raw` ADD COLUMN `direct_seen_at` TIMESTAMP NULL DEFAULT NULL COMMENT 'When CmsEventsBufferManager (direct write) first saw this event', ADD COLUMN `sync_seen_at` TIMESTAMP NULL DEFAULT NULL COMMENT 'When ContentSectionsEventSyncService (Mixpanel Export) first saw it', ALGORITHM=INSTANT";
+
+#[test]
+fn existing_translation_pending_content_sections_seen_columns_replays_and_checkpoints() {
+    let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let executor = TransactionRecordingExecutor::with_operations(operations.clone());
+    let mut applier = crate::row::RowApplier::new(executor);
+    let journal = RecordingDdlReplayJournal::with_operations(operations.clone());
+    *journal.status.borrow_mut() = Some(DdlReplayStatus::TranslationPending);
+    let semantic_inventory = RecordingSemanticInventory {
+        use_live_transform: true,
+        ..RecordingSemanticInventory::default()
+    };
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let mut current_file = "mysqld-bin.002893".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "globalcomix".to_string(),
+        sql_statement: CONTENT_SECTIONS_EVENTS_RAW_SEEN_DDL.to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some(
+            "stream-binlog:globalcomix-prod-mariadb-resync-2026-08-13",
+        ),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+    let header = EventHeader {
+        timestamp: 0,
+        event_type: 2,
+        server_id: 3,
+        event_length: 466,
+        next_event_position: 7_899_792,
+        event_flags: 0,
+    };
+
+    let outcome = handle_ddl_event(
+        &mut applier,
+        &journal,
+        &semantic_inventory,
+        "globalcomix-prod-mariadb-resync-2026-08-13",
+        &mut context,
+        &header,
+        &event,
+    )
+    .expect("existing multi-column ADD COLUMN barrier must recover automatically")
+    .expect("DDL outcome");
+
+    assert_eq!(
+        outcome.resume_coordinate,
+        Some(BinlogCoordinate {
+            file: "mysqld-bin.002893".to_string(),
+            position: 7_899_792,
+        })
+    );
+    assert_eq!(
+        journal
+            .evidence
+            .borrow()
+            .as_ref()
+            .and_then(|evidence| evidence.generated_sql.as_deref()),
+        Some(CONTENT_SECTIONS_EVENTS_RAW_SEEN_TARGET_SQL)
+    );
+    assert_eq!(
+        operations.borrow().as_slice(),
+        &[
+            "PROMOTE",
+            "EXEC",
+            "APPLIED",
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "EXEC",
+            "CHECKPOINT",
+            "COMMIT",
+        ]
+    );
+}
+
+#[test]
+fn existing_content_sections_seen_columns_are_checkpointed_without_target_ddl() {
+    let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let executor = TransactionRecordingExecutor::with_operations(operations.clone());
+    let mut applier = crate::row::RowApplier::new(executor);
+    let journal = RecordingDdlReplayJournal::with_operations(operations.clone());
+    *journal.status.borrow_mut() = Some(DdlReplayStatus::TranslationPending);
+    let semantic_inventory = RecordingSemanticInventory {
+        evidence: super::super::super::ddl_semantics::DdlSemanticEvidence {
+            transformation_version: "test-v1".to_string(),
+            generated_sql: Some(CONTENT_SECTIONS_EVENTS_RAW_SEEN_TARGET_SQL.to_string()),
+            canonical_ast: "{\"family\":\"table\"}".to_string(),
+            pre_state: "already-applied".to_string(),
+            expected_post_state: "already-applied".to_string(),
+        },
+        observed_state: "already-applied".to_string(),
+        use_live_transform: true,
+        ..RecordingSemanticInventory::default()
+    };
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let mut current_file = "mysqld-bin.002893".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "globalcomix".to_string(),
+        sql_statement: CONTENT_SECTIONS_EVENTS_RAW_SEEN_DDL.to_string(),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some(
+            "stream-binlog:globalcomix-prod-mariadb-resync-2026-08-13",
+        ),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    handle_ddl_event(
+        &mut applier,
+        &journal,
+        &semantic_inventory,
+        "globalcomix-prod-mariadb-resync-2026-08-13",
+        &mut context,
+        &event_header(2, 7_899_792),
+        &event,
+    )
+    .expect("converged multi-column ADD COLUMN barrier must recover")
+    .expect("DDL outcome");
+
+    assert_eq!(
+        journal
+            .evidence
+            .borrow()
+            .as_ref()
+            .and_then(|evidence| evidence.generated_sql.as_deref()),
+        None
+    );
+    assert_eq!(
+        operations.borrow().as_slice(),
+        &[
+            "PROMOTE",
+            "APPLIED",
+            "BEGIN",
+            "LOCK_CHECKPOINT",
+            "EXEC",
+            "CHECKPOINT",
+            "COMMIT",
+        ]
+    );
+}
+
+#[test]
+fn content_sections_seen_columns_noninstant_alter_remains_translation_pending() {
+    let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let executor = TransactionRecordingExecutor::with_operations(operations.clone());
+    let mut applier = crate::row::RowApplier::new(executor);
+    let journal = RecordingDdlReplayJournal::with_operations(operations.clone());
+    let semantic_inventory = RecordingSemanticInventory {
+        use_live_transform: true,
+        ..RecordingSemanticInventory::default()
+    };
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let mut current_file = "mysqld-bin.002893".to_string();
+    let mut transaction = TargetTransaction::default();
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "globalcomix".to_string(),
+        sql_statement: CONTENT_SECTIONS_EVENTS_RAW_SEEN_DDL
+            .replace("ALGORITHM=INSTANT", "ALGORITHM=INPLACE"),
+    });
+    let mut context = StreamEventContext {
+        schema_resolver: &resolver,
+        state: &mut state,
+        target_transaction: &mut transaction,
+        checkpoint_store: Some(&NoopCheckpointStore),
+        transaction_checkpoint_table: Some("cdc.stream_checkpoint"),
+        transaction_checkpoint_name: Some("stream-binlog:test-source"),
+        current_file: &mut current_file,
+        group_config: TargetTransactionGroupConfig::default(),
+    };
+
+    let error = handle_ddl_event(
+        &mut applier,
+        &journal,
+        &semantic_inventory,
+        "globalcomix-prod-mariadb-resync-2026-08-13",
+        &mut context,
+        &event_header(2, 7_899_792),
+        &event,
+    )
+    .expect_err("unrelated ALGORITHM variants must remain blocked");
+
+    assert!(error.to_string().contains("translator unavailable"));
+    assert_eq!(
+        *journal.status.borrow(),
+        Some(DdlReplayStatus::TranslationPending)
+    );
+    assert_eq!(operations.borrow().as_slice(), &["TRANSLATION_PENDING"]);
+}
+
 #[test]
 fn exact_drop_trigger_replays_and_checkpoints_after_normal_journal_proof() {
     let operations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));

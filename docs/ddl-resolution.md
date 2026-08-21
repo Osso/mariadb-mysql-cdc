@@ -6,11 +6,14 @@ The event handler uses one durable DDL control plane:
 Automatic admission currently covers strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
 metadata and no FK dependency; the production-observed unqualified multi-clause
-`ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type grammar
+`ALTER TABLE` form with general `ADD COLUMN` under the exact unquoted type grammar
 `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or
-`FLOAT UNSIGNED`; quoted type keywords, quoted `VARCHAR` lengths, and quoted
-`UNSIGNED` forms are rejected, as are `DATETIME` precision, `SMALLINT` display
-width, and `FLOAT` parameters. The observed `NULL` or `NOT NULL`, `DEFAULT NULL`
+`FLOAT UNSIGNED`; plus the exact `content_sections_events_raw` two-column
+`ADD COLUMN IF NOT EXISTS ... TIMESTAMP NULL DEFAULT NULL COMMENT ...,
+ALGORITHM=INSTANT` recovery shape. Quoted type keywords, quoted `VARCHAR` lengths,
+and quoted `UNSIGNED` forms are rejected, as are `DATETIME` precision, `SMALLINT`
+display width, `FLOAT` parameters, and every other guarded `TIMESTAMP` or algorithm
+variant. The observed `NULL` or `NOT NULL`, `DEFAULT NULL`
 or `DEFAULT 0`, `COMMENT`, and `AFTER` options, named composite `ADD KEY`,
 MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
 clauses. Multiple admitted clauses render in source order as deterministic MySQL
@@ -38,20 +41,26 @@ target SQL is accepted as a resolution path.
 ### Exact production ALTER recovery target
 
 The active recovery target is the exact source event at
-`mysqld-bin.002778:750897987-750898224`. The event is 150 raw bytes with
-CRLF line endings and SHA-256
-`ea9f789b158dca0146715bafe9f2712b5945b9c6626411b382347e60e52eb85f`:
+`mysqld-bin.002893:7899326-7899792`:
 
 ```sql
--- The serve-time blacklist check resolves a blacklisted artist's imprints.
-ALTER TABLE `artists_imprints`
-    ADD KEY `idx_artist_id` (`artist_id`)
+ALTER TABLE `content_sections_events_raw`
+    ADD COLUMN IF NOT EXISTS `direct_seen_at` timestamp NULL DEFAULT NULL
+        COMMENT 'When CmsEventsBufferManager (direct write) first saw this event',
+    ADD COLUMN IF NOT EXISTS `sync_seen_at` timestamp NULL DEFAULT NULL
+        COMMENT 'When ContentSectionsEventSyncService (Mixpanel Export) first saw it',
+    ALGORITHM=INSTANT
 ```
 
-Admission is limited to this otherwise-supported ALTER preceded by exactly one
-ordinary MySQL `-- ` line comment. Embedded comments, executable/version comments,
-optimizer hints, and all other leading comment forms remain `translation_pending`
-barriers with no target execution or checkpoint advance.
+Admission is limited to this table, the two ordered column identities and exact
+comments, nullable `TIMESTAMP DEFAULT NULL`, both source `IF NOT EXISTS` guards,
+and the final `ALGORITHM=INSTANT` option. The guards are modeled but not emitted:
+MySQL 8 target SQL is one unguarded, atomic two-column ALTER after fenced pre-state
+proves both columns absent. When both exact columns are present, normal converged-
+state suppression records a proven no-op. Partial presence or any divergent
+column definition blocks before target execution. `ALGORITHM=INPLACE` and every
+other table, column, comment, type, clause count/order, or algorithm variant remain
+`translation_pending`; no journal or checkpoint edit is required.
 
 The stream does not create or repair control-plane objects. Bootstrap must run
 with admin/resolver credentials while the stream is stopped:

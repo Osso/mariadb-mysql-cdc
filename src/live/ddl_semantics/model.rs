@@ -70,6 +70,7 @@ pub struct ParsedCreateTableAst {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedAddColumnAst {
     pub name: String,
+    pub if_not_exists: bool,
     pub column_type: String,
     pub data_type: String,
     pub nullable: bool,
@@ -95,6 +96,7 @@ pub enum ParsedAlterClause {
 pub struct ParsedAlterTableAst {
     pub table: String,
     pub clauses: Vec<ParsedAlterClause>,
+    pub algorithm_instant: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

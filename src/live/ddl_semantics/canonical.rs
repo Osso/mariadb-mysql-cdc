@@ -420,19 +420,11 @@ fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::V
 }
 
 fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Value {
-    json!({
-        "table": ast.table,
-        "clauses": ast.clauses.iter().map(|clause| match clause {
-            ParsedAlterClause::AddColumn(column) => json!({
-                "kind": "add_column",
-                "name": column.name,
-                "column_type": column.column_type,
-                "data_type": column.data_type,
-                "nullable": column.nullable,
-                "default_value": column.default_value,
-                "comment": column.comment,
-                "after": column.after,
-            }),
+    let clauses = ast
+        .clauses
+        .iter()
+        .map(|clause| match clause {
+            ParsedAlterClause::AddColumn(column) => canonical_add_column_ast_value(column),
             ParsedAlterClause::AddKey(index) => json!({
                 "kind": "add_key",
                 "index": canonical_index_ast_value(index),
@@ -442,8 +434,33 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                 "name": column.name,
                 "if_exists": column.if_exists,
             }),
-        }).collect::<Vec<_>>(),
-    })
+        })
+        .collect::<Vec<_>>();
+    let mut value = json!({
+        "table": ast.table,
+        "clauses": clauses,
+    });
+    if ast.algorithm_instant {
+        value["algorithm"] = json!("instant");
+    }
+    value
+}
+
+fn canonical_add_column_ast_value(column: &ParsedAddColumnAst) -> serde_json::Value {
+    let mut value = json!({
+        "kind": "add_column",
+        "name": column.name,
+        "column_type": column.column_type,
+        "data_type": column.data_type,
+        "nullable": column.nullable,
+        "default_value": column.default_value,
+        "comment": column.comment,
+        "after": column.after,
+    });
+    if column.if_not_exists {
+        value["if_not_exists"] = json!(true);
+    }
+    value
 }
 
 fn translated_alter_table_post_state(
@@ -454,11 +471,42 @@ fn translated_alter_table_post_state(
         .alter_table_ast
         .as_ref()
         .ok_or_else(|| "ALTER TABLE DDL lacks parsed AST".to_string())?;
+    validate_guarded_add_column_pre_state(target, ast)?;
     let mut expected = target.clone();
     for clause in &ast.clauses {
         apply_alter_clause(&mut expected, ast, clause)?;
     }
     canonical_table_structure_state(&expected, &ast.table)
+}
+
+fn validate_guarded_add_column_pre_state(
+    target: &SemanticSchemaSnapshot,
+    ast: &ParsedAlterTableAst,
+) -> Result<(), String> {
+    let guarded_columns = ast
+        .clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            ParsedAlterClause::AddColumn(column) if column.if_not_exists => Some(column),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if guarded_columns.is_empty() {
+        return Ok(());
+    }
+    let table = find_table(target, &ast.table)
+        .ok_or_else(|| format!("ALTER TABLE target `{}` is missing", ast.table))?;
+    let present_count = guarded_columns
+        .iter()
+        .filter(|column| table.columns.iter().any(|item| item.name == column.name))
+        .count();
+    if present_count == 0 || present_count == guarded_columns.len() {
+        return Ok(());
+    }
+    Err(format!(
+        "guarded ADD COLUMN target `{}` has partial pre-state",
+        ast.table
+    ))
 }
 
 fn apply_alter_clause(
@@ -512,6 +560,11 @@ fn add_column_insertion_index(
     column: &ParsedAddColumnAst,
     existing_index: Option<usize>,
 ) -> Result<usize, String> {
+    if column.if_not_exists {
+        if let Some(index) = existing_index {
+            return Ok(index);
+        }
+    }
     match &column.after {
         Some(after) => table
             .columns

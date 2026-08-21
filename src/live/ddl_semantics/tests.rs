@@ -1960,6 +1960,136 @@ fn production_float_unsigned_add_column_preserves_required_options() {
     ));
 }
 
+const CONTENT_SECTIONS_SEEN_DDL: &str = "ALTER TABLE `content_sections_events_raw`\n\
+    ADD COLUMN IF NOT EXISTS `direct_seen_at` timestamp NULL DEFAULT NULL\n\
+        COMMENT 'When CmsEventsBufferManager (direct write) first saw this event',\n\
+    ADD COLUMN IF NOT EXISTS `sync_seen_at` timestamp NULL DEFAULT NULL\n\
+        COMMENT 'When ContentSectionsEventSyncService (Mixpanel Export) first saw it',\n\
+    ALGORITHM=INSTANT";
+const DIRECT_SEEN_COMMENT: &str = "When CmsEventsBufferManager (direct write) first saw this event";
+const SYNC_SEEN_COMMENT: &str =
+    "When ContentSectionsEventSyncService (Mixpanel Export) first saw it";
+
+#[test]
+fn content_sections_seen_columns_strip_source_guards_from_mysql8_sql() {
+    let transformation = transform_production_alter_table(CONTENT_SECTIONS_SEEN_DDL)
+        .expect("exact guarded TIMESTAMP ALTER must translate");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `content_sections_events_raw` ADD COLUMN `direct_seen_at` TIMESTAMP NULL DEFAULT NULL COMMENT 'When CmsEventsBufferManager (direct write) first saw this event', ADD COLUMN `sync_seen_at` TIMESTAMP NULL DEFAULT NULL COMMENT 'When ContentSectionsEventSyncService (Mixpanel Export) first saw it', ALGORITHM=INSTANT"
+        )
+    );
+}
+
+#[test]
+fn content_sections_seen_columns_near_misses_remain_unsupported() {
+    let near_misses = [
+        CONTENT_SECTIONS_SEEN_DDL.replace(
+            "content_sections_events_raw",
+            "content_sections_events",
+        ),
+        CONTENT_SECTIONS_SEEN_DDL.replace("direct_seen_at", "direct_seen"),
+        CONTENT_SECTIONS_SEEN_DDL.replace("direct write", "direct-write"),
+        CONTENT_SECTIONS_SEEN_DDL.replace(
+            "ADD COLUMN IF NOT EXISTS `direct_seen_at` timestamp NULL DEFAULT NULL\nCOMMENT 'When CmsEventsBufferManager (direct write) first saw this event',\nADD COLUMN IF NOT EXISTS `sync_seen_at` timestamp NULL DEFAULT NULL\nCOMMENT 'When ContentSectionsEventSyncService (Mixpanel Export) first saw it'",
+            "ADD COLUMN IF NOT EXISTS `sync_seen_at` timestamp NULL DEFAULT NULL\nCOMMENT 'When ContentSectionsEventSyncService (Mixpanel Export) first saw it',\nADD COLUMN IF NOT EXISTS `direct_seen_at` timestamp NULL DEFAULT NULL\nCOMMENT 'When CmsEventsBufferManager (direct write) first saw this event'",
+        ),
+        CONTENT_SECTIONS_SEEN_DDL.replace("ALGORITHM=INSTANT", "ALGORITHM=INPLACE"),
+    ];
+
+    for sql in near_misses {
+        assert!(
+            !supports_production_alter_table(&sql),
+            "near-miss ALTER was admitted: {sql}"
+        );
+    }
+}
+
+#[test]
+fn existing_content_sections_seen_columns_have_equal_pre_and_post_state() {
+    let target = content_sections_events_raw_seen_columns(true, true);
+    let operation = parse_ddl_operation(CONTENT_SECTIONS_SEEN_DDL).expect("production ALTER");
+
+    let evidence = build_semantic_evidence(&operation, &target, &target)
+        .expect("both exact columns must be a proven no-op");
+
+    assert_eq!(evidence.pre_state, evidence.expected_post_state);
+}
+
+#[test]
+fn partial_content_sections_seen_columns_pre_state_remains_blocked() {
+    let operation = parse_ddl_operation(CONTENT_SECTIONS_SEEN_DDL).expect("production ALTER");
+
+    for (case, direct_seen, sync_seen) in [("direct-only", true, false), ("sync-only", false, true)]
+    {
+        let target = content_sections_events_raw_seen_columns(direct_seen, sync_seen);
+        let error = build_semantic_evidence(&operation, &target, &target)
+            .expect_err("partial guarded ADD COLUMN state must fail closed");
+        assert!(error.contains("partial"), "{case}: {error}");
+    }
+}
+
+#[test]
+fn divergent_content_sections_seen_columns_pre_state_remains_blocked() {
+    let operation = parse_ddl_operation(CONTENT_SECTIONS_SEEN_DDL).expect("production ALTER");
+    let mut target = content_sections_events_raw_seen_columns(true, true);
+    target.inventory.tables[0]
+        .columns
+        .iter_mut()
+        .find(|column| column.name == "direct_seen_at")
+        .expect("direct_seen_at fixture column")
+        .comment = "divergent".to_string();
+
+    let error = build_semantic_evidence(&operation, &target, &target)
+        .expect_err("divergent guarded ADD COLUMN state must fail closed");
+
+    assert!(error.contains("already contains divergent"), "{error}");
+}
+
+fn content_sections_events_raw_seen_columns(
+    direct_seen: bool,
+    sync_seen: bool,
+) -> SemanticSchemaSnapshot {
+    let mut target = semantic_snapshot(0, None);
+    let table = &mut target.inventory.tables[0];
+    table.name = "content_sections_events_raw".to_string();
+    if direct_seen {
+        table.columns.push(seen_timestamp_column(
+            "direct_seen_at",
+            DIRECT_SEEN_COMMENT,
+            table.columns.len() + 1,
+        ));
+    }
+    if sync_seen {
+        table.columns.push(seen_timestamp_column(
+            "sync_seen_at",
+            SYNC_SEEN_COMMENT,
+            table.columns.len() + 1,
+        ));
+    }
+    target.inventory.indexes.clear();
+    target.table_runtime.clear();
+    target
+}
+
+fn seen_timestamp_column(name: &str, comment: &str, ordinal: usize) -> ColumnInventory {
+    ColumnInventory {
+        name: name.to_string(),
+        ordinal_position: ordinal as u32,
+        column_type: "timestamp".to_string(),
+        data_type: "timestamp".to_string(),
+        is_nullable: true,
+        character_set: None,
+        collation: None,
+        default_value: None,
+        extra: String::new(),
+        comment: comment.to_string(),
+        generated: None,
+    }
+}
+
 const DISABLE_SAM_DDL: &str = "ALTER TABLE `artists_settings`\n\
     ADD COLUMN `disable_sam` TINYINT(1) UNSIGNED NOT NULL DEFAULT 0 AFTER `markup_before_transaction_fee`";
 

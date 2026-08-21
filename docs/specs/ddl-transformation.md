@@ -36,11 +36,12 @@ allowlist.
 - [x] Transform only the exact raw, unqualified, unquoted, comment-free `DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives` form, with an optional trailing semicolon. Stable target trigger evidence matches the name case-insensitively; a present target emits deterministic quoted MySQL `DROP TRIGGER`, while an absent target records `generated_sql = NULL` as a proven no-op. Qualified, quoted, commented, differently named, extra-token, and all other trigger forms remain `translation_pending` barriers.
 - [x] Admit the source-only `CREATE PROCEDURE` form only when the complete statement matches one of two private exact hashes for the exact unqualified routine identity `apply_release_move_purchase_repair`. The exact admitted bodies are tracked as `fixtures/ddl/create-apply-release-move-purchase-repair.sql` and `fixtures/ddl/create-apply-release-move-purchase-repair-95.sql`; fixture tests exercise both bodies, and adding a comment or changing any body text remains rejected. Admission precedes generic qualified-identifier rejection because the admitted statements contain qualified tokens. Require the target routine to be absent before and after evidence capture, execute no target SQL, and record a proven no-op. The body is never executed; data effects may arrive only through subsequent source ROW/FULL events in source order. An existing `translation_pending` row promotes automatically after exact-hash admission. Every other body, name, and routine DDL remains a `translation_pending` barrier. Raw production procedure bodies, `DEFINER` hosts, and event coordinates are intentionally excluded from public documentation.
 - [x] Transform the production-observed unqualified multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form from target column pre-state into deterministic MySQL 8 SQL. Exactly one leading ordinary MySQL `-- ` line comment is removed only for parsing and reattached verbatim to executable generated SQL, including its source prefix and line ending. Any remaining or embedded comment form is rejected into the durable `translation_pending`/`blocked` DDL path. Absent rename clauses remain proven no-ops and emit no target SQL.
-- [x] Transform the observed `ADD COLUMN` forms only under the exact unquoted type grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or `FLOAT UNSIGNED`. The first three retain the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options; `FLOAT UNSIGNED` additionally admits the observed `NOT NULL DEFAULT 0` form. Expected post-state for added character columns records the table-inherited character set and collation so live inventory comparison matches MySQL metadata. Type keywords, `VARCHAR` parentheses and length, and `UNSIGNED` must be unquoted; `DATETIME` precision, `SMALLINT` display width, `FLOAT` parameters, and other numeric defaults remain unsupported.
+- [x] Transform the general observed `ADD COLUMN` forms only under the exact unquoted type grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or `FLOAT UNSIGNED`. The first three retain the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options; `FLOAT UNSIGNED` additionally admits the observed `NOT NULL DEFAULT 0` form. Expected post-state for added character columns records the table-inherited character set and collation so live inventory comparison matches MySQL metadata. Type keywords, `VARCHAR` parentheses and length, and `UNSIGNED` must be unquoted; `DATETIME` precision, `SMALLINT` display width, `FLOAT` parameters, and other numeric defaults remain unsupported.
+- [x] Admit only the exact production `content_sections_events_raw` shape with two ordered `ADD COLUMN IF NOT EXISTS` clauses for nullable `TIMESTAMP DEFAULT NULL` columns `direct_seen_at` and `sync_seen_at`, their exact comments, and a final `ALGORITHM=INSTANT`. Model both source existence guards in the AST, but emit valid MySQL 8 SQL as one atomic two-column ALTER without `IF NOT EXISTS` after proving both columns are absent. When both exact columns are already present, suppress target SQL as a proven no-op. Partial presence or any divergent definition fails closed before target execution. `ALGORITHM=INPLACE` and every other table, column, comment, type, clause count/order, or algorithm variant remain `translation_pending` with no target execution or checkpoint advance.
 - [x] Admit the production-observed `TINYINT(1) UNSIGNED NOT NULL DEFAULT 0` `ADD COLUMN` form and emit deterministic MySQL 8 `TINYINT UNSIGNED`. When the target already contains the exact column definition at the requested position, promote the same `translation_pending` journal row as a proven no-op with `generated_sql = NULL`; any definition or position mismatch remains blocked.
 - [x] Reject quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms as unsupported syntax. These variants remain `translation_pending` with no target DDL or checkpoint advance.
 - [x] Transform named composite `ADD KEY`, MariaDB-syntax `ADD INDEX`, and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; multiple admitted clauses remain ordered, source `ADD INDEX` emits as target `ADD KEY`, and broader index and clause options remain outside this slice.
-- [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, while `add_key` records the typed index AST and ordered key parts.
+- [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position and records `if_not_exists` only for the admitted guarded form; `add_key` records the typed index AST and ordered key parts; the exact instant ALTER records `algorithm=instant`.
 - [x] Record expected target object state for crash/replay verification without treating that evidence as source/target reconciliation.
 - [x] Fail closed as `translation_pending` before target execution when syntax, context, dependencies, or semantics fall outside that explicit slice; the stream checkpoint and later-event barrier must remain unchanged, and the durable DDL block retries in-process without skipping or executing raw source SQL.
 - [x] Carry `TIMESTAMP` column types across unchanged. The former unconditional `TIMESTAMP` to `DATETIME` rewrite is removed: MySQL rejects values past 2038-01-19 that MariaDB 11 accepts, but no source column holds one, so the rewrite bought nothing and would have required rebuilding 384 tables and about 864 GB with `ALGORITHM=COPY`.
@@ -169,6 +170,7 @@ No other `CREATE TABLE` syntax is admitted.
 - `src/live/ddl_semantics.rs` — dispatches current DDL transformations and
   captures semantic evidence.
 - `src/live/ddl_semantics/transform.rs` — production-derived `ADD COLUMN`,
+  the exact guarded two-column `TIMESTAMP ... ALGORITHM=INSTANT` admission,
   `ADD KEY`/MariaDB `ADD INDEX`, `ADD UNIQUE KEY`, generic and exact `DROP PROCEDURE`,
   exact `DROP TRIGGER IF EXISTS`, and `RENAME COLUMN IF EXISTS` translators,
   including deterministic SQL emission.
@@ -197,7 +199,11 @@ The current slice is covered by:
       runtime-admission contract.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
       generated SQL and preserves journal/checkpoint ordering for supported
-      fixtures; unsupported CREATE remains pending without target/checkpoint
+      fixtures; the exact `content_sections_events_raw` barrier emits one unguarded
+      atomic ALTER when both columns are absent, suppresses SQL when both exact
+      columns are present, and blocks partial or divergent pre-state; its
+      `ALGORITHM=INPLACE` and other near-misses remain pending; unsupported CREATE
+      remains pending without target/checkpoint
       execution, and `unsupported_ddl_keeps_replicator_alive_at_unchanged_checkpoint`
       proves the durable block loop retries from the unchanged checkpoint.
 - [x] `production_tinyint_unsigned_add_column_normalizes_display_width`,
@@ -250,10 +256,11 @@ transformation contract, a full MariaDB/MySQL matrix, or deployment safety.
 
 - Manual target-SQL authoring or operator resolution as a CDC fallback.
 - Index-only automatic replay as the target DDL architecture.
-- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`, `ADD KEY`/MariaDB
-  `ADD INDEX`, `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` forms.
-- Additional column types, defaults, clauses, index options, and DDL families not
-  listed in the implemented slice.
+- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`, exact guarded
+  two-column `TIMESTAMP ... ALGORITHM=INSTANT`, `ADD KEY`/MariaDB `ADD INDEX`,
+  `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` forms.
+- Additional column types, defaults, clauses, algorithm options, index options,
+  and DDL families not listed in the implemented slice.
 - Silently dropping, weakening, or approximating parsed DDL clauses.
 - Cross-schema mutation outside the configured application schema.
 - Detecting or reconciling preexisting source/target schema differences,

@@ -24,19 +24,67 @@ struct RenameColumnClause {
 }
 
 pub fn supports_production_alter_table(source_sql: &str) -> bool {
-    parse_production_alter_table_ast(source_sql).is_ok_and(|ast| {
-        ast.clauses.iter().all(|clause| {
-            matches!(
-                clause,
-                ParsedAlterClause::AddColumn(_) | ParsedAlterClause::AddKey(_)
-            )
+    parse_production_alter_table_ast(source_sql)
+        .is_ok_and(|ast| supports_parsed_production_alter(&ast))
+}
+
+fn supports_parsed_production_alter(ast: &ParsedAlterTableAst) -> bool {
+    supports_existing_production_alter(ast) || supports_content_sections_seen_columns_instant(ast)
+}
+
+fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
+    !ast.algorithm_instant
+        && ast.clauses.iter().all(|clause| match clause {
+            ParsedAlterClause::AddColumn(column) => {
+                !column.if_not_exists && column.data_type != "timestamp"
+            }
+            ParsedAlterClause::AddKey(_) => true,
+            ParsedAlterClause::DropColumn(_) => false,
         })
-    })
+}
+
+fn supports_content_sections_seen_columns_instant(ast: &ParsedAlterTableAst) -> bool {
+    if ast.table != "content_sections_events_raw" || !ast.algorithm_instant {
+        return false;
+    }
+    let [
+        ParsedAlterClause::AddColumn(direct_seen),
+        ParsedAlterClause::AddColumn(sync_seen),
+    ] = ast.clauses.as_slice()
+    else {
+        return false;
+    };
+    is_exact_seen_column(
+        direct_seen,
+        "direct_seen_at",
+        "When CmsEventsBufferManager (direct write) first saw this event",
+    ) && is_exact_seen_column(
+        sync_seen,
+        "sync_seen_at",
+        "When ContentSectionsEventSyncService (Mixpanel Export) first saw it",
+    )
+}
+
+fn is_exact_seen_column(column: &ParsedAddColumnAst, name: &str, comment: &str) -> bool {
+    column
+        == &ParsedAddColumnAst {
+            name: name.to_string(),
+            if_not_exists: true,
+            column_type: "timestamp".to_string(),
+            data_type: "timestamp".to_string(),
+            nullable: true,
+            default_value: None,
+            comment: comment.to_string(),
+            after: None,
+        }
 }
 
 pub fn transform_production_alter_table(source_sql: &str) -> Result<DdlTransformation, String> {
     let (leading_comment, _) = split_one_leading_mysql_line_comment(source_sql);
     let ast = parse_production_alter_table_ast(source_sql)?;
+    if !supports_parsed_production_alter(&ast) {
+        return Err("unsupported production ALTER TABLE shape".to_string());
+    }
     let rendered_sql = render_production_alter_table(&ast);
     let target_sql = match leading_comment {
         Some(comment) => format!("{comment}{rendered_sql}"),
@@ -49,13 +97,19 @@ pub fn transform_production_alter_table(source_sql: &str) -> Result<DdlTransform
 }
 
 fn render_production_alter_table(ast: &ParsedAlterTableAst) -> String {
-    let clauses = ast
+    let mut clauses = ast
         .clauses
         .iter()
         .map(render_production_alter_clause)
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("ALTER TABLE {} {clauses}", quote_identifier(&ast.table))
+        .collect::<Vec<_>>();
+    if ast.algorithm_instant {
+        clauses.push("ALGORITHM=INSTANT".to_string());
+    }
+    format!(
+        "ALTER TABLE {} {}",
+        quote_identifier(&ast.table),
+        clauses.join(", ")
+    )
 }
 
 fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
@@ -1481,9 +1535,11 @@ fn parse_supported_drop_procedure(source_sql: &str) -> Result<String, String> {
 
 pub fn supports_drop_columns_if_exists(source_sql: &str) -> bool {
     parse_production_alter_table_ast(source_sql).is_ok_and(|ast| {
-        ast.clauses
-            .iter()
-            .all(|clause| matches!(clause, ParsedAlterClause::DropColumn(_)))
+        !ast.algorithm_instant
+            && ast
+                .clauses
+                .iter()
+                .all(|clause| matches!(clause, ParsedAlterClause::DropColumn(_)))
     })
 }
 
@@ -1492,10 +1548,11 @@ pub fn transform_drop_columns_if_exists(
     target_columns: &BTreeSet<String>,
 ) -> Result<DdlTransformation, String> {
     let ast = parse_production_alter_table_ast(source_sql)?;
-    if !ast
-        .clauses
-        .iter()
-        .all(|clause| matches!(clause, ParsedAlterClause::DropColumn(_)))
+    if ast.algorithm_instant
+        || !ast
+            .clauses
+            .iter()
+            .all(|clause| matches!(clause, ParsedAlterClause::DropColumn(_)))
     {
         return Err("ALTER TABLE mixes DROP COLUMN IF EXISTS with unsupported clauses".to_string());
     }
@@ -1583,37 +1640,85 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
     require_keyword(&tokens, 0, "ALTER")?;
     require_keyword(&tokens, 1, "TABLE")?;
     let table = require_identifier(&tokens, 2, "ALTER TABLE name")?;
-    let mut literals = extract_single_quoted_literals(source_sql)?.into_iter();
+    let literals = extract_single_quoted_literals(source_sql)?;
+    let (clauses, algorithm_instant) =
+        parse_production_alter_body(&tokens, &quoted_flags, &table, literals)?;
+    Ok(ParsedAlterTableAst {
+        table,
+        clauses,
+        algorithm_instant,
+    })
+}
+
+fn parse_production_alter_body(
+    tokens: &[String],
+    quoted_flags: &[bool],
+    table: &str,
+    literals: Vec<String>,
+) -> Result<(Vec<ParsedAlterClause>, bool), String> {
+    let mut literals = literals.into_iter();
     let mut clauses = Vec::new();
     let mut index = 3;
     while index < tokens.len() {
-        let (clause, next_index) = match tokens
-            .get(index)
-            .map(|token| token.to_ascii_uppercase())
-            .as_deref()
-        {
-            Some("ADD") => {
-                parse_production_add_clause(&tokens, &quoted_flags, index, &table, &mut literals)?
-            }
-            Some("DROP") => parse_drop_column_clause(&tokens, index)?,
-            actual => {
-                return Err(format!(
-                    "unsupported production ALTER TABLE clause {actual:?}"
-                ));
-            }
-        };
+        if parse_instant_algorithm_option(tokens, index)?.is_some() {
+            return Ok((require_alter_clauses(clauses)?, true));
+        }
+        let (clause, next_index) =
+            parse_production_alter_clause(tokens, quoted_flags, index, table, &mut literals)?;
         clauses.push(clause);
         index = next_index;
         if index == tokens.len() {
-            break;
+            return Ok((clauses, false));
         }
-        require_keyword(&tokens, index, ",")?;
+        require_keyword(tokens, index, ",")?;
         index += 1;
     }
+    Ok((require_alter_clauses(clauses)?, false))
+}
+
+fn parse_instant_algorithm_option(
+    tokens: &[String],
+    index: usize,
+) -> Result<Option<usize>, String> {
+    if !tokens[index].eq_ignore_ascii_case("ALGORITHM") {
+        return Ok(None);
+    }
+    require_keyword(tokens, index + 1, "=")?;
+    require_keyword(tokens, index + 2, "INSTANT")?;
+    let next_index = index + 3;
+    if next_index != tokens.len() {
+        return Err("ALGORITHM=INSTANT must be the final ALTER TABLE option".to_string());
+    }
+    Ok(Some(next_index))
+}
+
+fn require_alter_clauses(
+    clauses: Vec<ParsedAlterClause>,
+) -> Result<Vec<ParsedAlterClause>, String> {
     if clauses.is_empty() {
         return Err("ALTER TABLE has no supported clauses".to_string());
     }
-    Ok(ParsedAlterTableAst { table, clauses })
+    Ok(clauses)
+}
+
+fn parse_production_alter_clause(
+    tokens: &[String],
+    quoted_flags: &[bool],
+    index: usize,
+    table: &str,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(ParsedAlterClause, usize), String> {
+    match tokens
+        .get(index)
+        .map(|token| token.to_ascii_uppercase())
+        .as_deref()
+    {
+        Some("ADD") => parse_production_add_clause(tokens, quoted_flags, index, table, literals),
+        Some("DROP") => parse_drop_column_clause(tokens, index),
+        actual => Err(format!(
+            "unsupported production ALTER TABLE clause {actual:?}"
+        )),
+    }
 }
 
 fn parse_production_add_clause(
@@ -1657,13 +1762,23 @@ fn parse_add_column_clause(
     index: usize,
     literals: &mut impl Iterator<Item = String>,
 ) -> Result<(ParsedAlterClause, usize), String> {
-    let name = require_identifier(tokens, index + 2, "added column")?;
+    let mut name_index = index + 2;
+    let if_not_exists = tokens
+        .get(name_index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("IF"));
+    if if_not_exists {
+        require_keyword(tokens, name_index + 1, "NOT")?;
+        require_keyword(tokens, name_index + 2, "EXISTS")?;
+        name_index += 3;
+    }
+    let name = require_identifier(tokens, name_index, "added column")?;
     let (column_type, data_type, options_start) =
-        parse_observed_column_type(tokens, quoted_flags, index + 3)?;
+        parse_observed_column_type(tokens, quoted_flags, name_index + 1)?;
     let options = parse_observed_column_options(tokens, options_start, literals, &data_type)?;
     Ok((
         ParsedAlterClause::AddColumn(ParsedAddColumnAst {
             name,
+            if_not_exists,
             column_type,
             data_type,
             nullable: options.nullable,
@@ -1727,7 +1842,7 @@ fn parse_observed_column_type(
     let data_type = require_identifier(tokens, index, "added column type")?.to_ascii_lowercase();
     if !matches!(
         data_type.as_str(),
-        "varchar" | "datetime" | "tinyint" | "smallint" | "float"
+        "varchar" | "datetime" | "timestamp" | "tinyint" | "smallint" | "float"
     ) {
         return Err(format!(
             "unsupported production ADD COLUMN type {data_type}"
@@ -1754,9 +1869,12 @@ fn parse_observed_column_type(
             index += 3;
             format!("varchar({parsed_length})")
         }
-        "datetime" => {
+        "datetime" | "timestamp" => {
             if tokens.get(index).map(String::as_str) == Some("(") {
-                return Err("DATETIME precision is unsupported".to_string());
+                return Err(format!(
+                    "{} precision is unsupported",
+                    data_type.to_ascii_uppercase()
+                ));
             }
             data_type.clone()
         }
