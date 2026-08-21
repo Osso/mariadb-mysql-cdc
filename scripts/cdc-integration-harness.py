@@ -56,6 +56,7 @@ SCENARIOS = (
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
     ScenarioSpec("sync-wide-update", True),
     ScenarioSpec("sync-resume", True),
+    ScenarioSpec("sync-authorized-additive-spec-migration", True),
     ScenarioSpec("sync-progress-least-privilege", True),
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("production-alter-table", True),
@@ -650,6 +651,7 @@ class Harness:
         parallelism: int = 1,
         progress_table: str = "cdc.sync_runs",
         target_ca_file: Path | None = None,
+        authorized_old_run_spec_sha256: str | None = None,
     ) -> list[str]:
         assert self.source and self.target
         args = [
@@ -686,6 +688,13 @@ class Harness:
             "--run-id",
             run_id,
         ]
+        if authorized_old_run_spec_sha256 is not None:
+            args.extend(
+                [
+                    "--authorize-old-run-spec-sha256",
+                    authorized_old_run_spec_sha256,
+                ]
+            )
         for table in tables:
             args.extend(["--table", table])
         return args
@@ -699,6 +708,7 @@ class Harness:
         parallelism: int = 1,
         progress_table: str = "cdc.sync_runs",
         timeout: float = 180,
+        authorized_old_run_spec_sha256: str | None = None,
     ) -> CommandResult:
         binary = self._sync_binary()
         env = {
@@ -714,6 +724,7 @@ class Harness:
                 chunk_size=chunk_size,
                 parallelism=parallelism,
                 progress_table=progress_table,
+                authorized_old_run_spec_sha256=authorized_old_run_spec_sha256,
             ),
             cwd=self.repo,
             env=env,
@@ -2712,6 +2723,487 @@ class Harness:
             raise HarnessError(f"wide sync progress mismatch: {progress!r}")
         print("sync_wide_update_ok rows=129 updates=129 chunks=1")
 
+    def sync_progress_snapshot(
+        self,
+        run_id: str,
+        *,
+        stage: str | None = None,
+        include_run_spec: bool = True,
+    ) -> str:
+        assert self.target
+        columns = [
+            "HEX(run_id)",
+            "HEX(stage)",
+            "HEX(table_name)",
+        ]
+        if include_run_spec:
+            columns.append("HEX(run_spec_json)")
+        columns.extend(
+            [
+                "IF(last_primary_key_json IS NULL, '<NULL>', HEX(last_primary_key_json))",
+                "chunks",
+                "rows_scanned",
+                "inserts_applied",
+                "updates_applied",
+                "deletes_applied",
+                "HEX(status)",
+                "IF(last_error IS NULL, '<NULL>', HEX(last_error))",
+                "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f')",
+                "DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s.%f')",
+                "IF(completed_at IS NULL, '<NULL>', DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s.%f'))",
+            ]
+        )
+        filters = [f"run_id={sql_literal(run_id)}"]
+        if stage is not None:
+            filters.append(f"stage={sql_literal(stage)}")
+        sql = (
+            f"SELECT {','.join(columns)} FROM cdc.sync_runs "
+            f"WHERE {' AND '.join(filters)} "
+            "ORDER BY FIELD(stage,'prerequisite_schema','rows','final_constraints'),table_name;"
+        )
+        return self.admin_query(self.target, sql).strip()
+
+    def sync_run_spec_and_sha256(self, run_id: str) -> tuple[str, str]:
+        assert self.target
+        output = self.admin_query(
+            self.target,
+            "SELECT run_spec_json,LOWER(SHA2(run_spec_json,256)) "
+            "FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} ORDER BY stage,table_name LIMIT 1;",
+        ).strip()
+        fields = output.split("\t", 1)
+        if len(fields) != 2:
+            raise HarnessError(f"unexpected sync run specification evidence: {output!r}")
+        return fields[0], fields[1]
+
+    def sync_run_spec_migration_audit(self, result: CommandResult) -> dict:
+        audits = []
+        for line in "\n".join((result.stdout, result.stderr)).splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if value.get("event") == "sync_run_spec_migration":
+                audits.append(value)
+        if len(audits) != 1:
+            raise HarnessError(
+                "expected exactly one sync_run_spec_migration audit, "
+                f"found {len(audits)} in stdout={result.stdout!r} stderr={result.stderr!r}"
+            )
+        return audits[0]
+
+    def stop_sync_process(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=30)
+        log = getattr(process, "_cdc_log", None)
+        if log is not None:
+            log.close()
+
+    def run_sync_authorized_additive_spec_migration(self) -> None:
+        assert self.source and self.target
+        run_id = "sync-authorized-additive-spec-migration"
+        table_a = "migration_a_started"
+        table_z = "migration_z_changed"
+        tables = [table_a, table_z]
+
+        (
+            old_spec,
+            old_sha256,
+            before_wrong_hash,
+            prerequisite_before_migration,
+            preexisting_row_count,
+        ) = self.prepare_interrupted_run_spec_migration(
+            run_id,
+            table_a,
+            table_z,
+            tables,
+        )
+        self.assert_wrong_hash_run_spec_migration_no_write(
+            run_id,
+            table_z,
+            tables,
+            before_wrong_hash,
+        )
+        _, current_sha256 = self.execute_successful_run_spec_migration(
+            run_id,
+            table_a,
+            table_z,
+            tables,
+            old_spec,
+            old_sha256,
+            prerequisite_before_migration,
+            preexisting_row_count,
+        )
+        self.assert_idempotent_run_spec_migration(
+            run_id,
+            tables,
+            old_sha256,
+            current_sha256,
+        )
+        self.assert_changed_table_row_progress_rejection(
+            run_id,
+            table_z,
+            tables,
+            current_sha256,
+        )
+
+        print(
+            "sync_authorized_additive_spec_migration_ok "
+            f"run_id={run_id} old_sha256={old_sha256} new_sha256={current_sha256} "
+            f"migrated_rows={preexisting_row_count} idempotent=true "
+            "changed_table_row_progress_rejected=true"
+        )
+
+    def prepare_interrupted_run_spec_migration(
+        self,
+        run_id: str,
+        table_a: str,
+        table_z: str,
+        tables: list[str],
+    ) -> tuple[str, str, str, str, int]:
+        assert self.source and self.target
+        create_tables = (
+            f"DROP TABLE IF EXISTS {table_a}; "
+            f"DROP TABLE IF EXISTS {table_z}; "
+            f"CREATE TABLE {table_a} ("
+            "id INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "value VARCHAR(64) NOT NULL"
+            ") ENGINE=InnoDB; "
+            f"CREATE TABLE {table_z} ("
+            "id INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "value VARCHAR(64) NOT NULL"
+            ") ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, create_tables)
+
+        started_values = ",".join(
+            f"({index}, 'migration-a-{index}')" for index in range(1, 4001)
+        )
+        changed_values = "(1, 'migration-z-1'),(2, 'migration-z-2')"
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table_a} VALUES {started_values}; "
+            f"INSERT INTO {table_z} VALUES {changed_values};",
+        )
+        self.admin_sql(self.target, f"INSERT INTO {table_z} VALUES {changed_values};")
+
+        process, log_path = self.start_sync(
+            tables=tables,
+            run_id=run_id,
+            chunk_size=10,
+            parallelism=1,
+        )
+        expected_precondition = [
+            f"prerequisite_schema\t{table_a}\tcomplete",
+            f"prerequisite_schema\t{table_z}\tcomplete",
+            f"rows\t{table_a}\trunning",
+        ]
+        deadline = time.monotonic() + 90
+        progress_rows: list[str] = []
+        try:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    self.stop_sync_process(process)
+                    raise HarnessError(
+                        "authorized migration setup sync exited before interruption: "
+                        f"{log_path.read_text()}"
+                    )
+                progress_rows = self.admin_query(
+                    self.target,
+                    "SELECT stage,table_name,status FROM cdc.sync_runs "
+                    f"WHERE run_id={sql_literal(run_id)} "
+                    "ORDER BY FIELD(stage,'prerequisite_schema','rows','final_constraints'),table_name;",
+                ).splitlines()
+                if progress_rows == expected_precondition:
+                    break
+                time.sleep(0.02)
+            else:
+                raise HarnessError(
+                    "authorized migration setup did not reach the exact interrupted precondition: "
+                    f"{progress_rows!r}"
+                )
+        finally:
+            self.stop_sync_process(process)
+
+        progress_rows = self.admin_query(
+            self.target,
+            "SELECT stage,table_name,status FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} "
+            "ORDER BY FIELD(stage,'prerequisite_schema','rows','final_constraints'),table_name;",
+        ).splitlines()
+        if progress_rows != expected_precondition:
+            raise HarnessError(
+                "interrupted sync crossed the changed-table row boundary before termination: "
+                f"{progress_rows!r}"
+            )
+
+        old_spec, old_sha256 = self.sync_run_spec_and_sha256(run_id)
+        mismatched_specs = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} "
+            f"AND BINARY run_spec_json <> BINARY {sql_literal(old_spec)};",
+        ).strip()
+        if mismatched_specs != "0":
+            raise HarnessError(
+                f"interrupted sync persisted multiple raw specifications: {mismatched_specs}"
+            )
+        before_wrong_hash = self.sync_progress_snapshot(run_id)
+        prerequisite_before_migration = self.sync_progress_snapshot(
+            run_id,
+            stage="prerequisite_schema",
+            include_run_spec=False,
+        )
+        preexisting_row_count = len(before_wrong_hash.splitlines())
+        if preexisting_row_count != 3:
+            raise HarnessError(
+                f"unexpected preexisting migration row count: {preexisting_row_count}"
+            )
+
+        additive_columns = (
+            " ADD COLUMN direct_seen_at TIMESTAMP(6) NULL,"
+            " ADD COLUMN sync_seen_at TIMESTAMP(6) NULL"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, f"ALTER TABLE {table_z}{additive_columns};")
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table_z} SET "
+            "direct_seen_at='2026-08-21 12:00:00.123456', "
+            "sync_seen_at='2026-08-21 12:05:00.654321';",
+        )
+        return (
+            old_spec,
+            old_sha256,
+            before_wrong_hash,
+            prerequisite_before_migration,
+            preexisting_row_count,
+        )
+
+    def assert_wrong_hash_run_spec_migration_no_write(
+        self,
+        run_id: str,
+        table_z: str,
+        tables: list[str],
+        before_wrong_hash: str,
+    ) -> None:
+        assert self.target
+        wrong_hash = self.run_sync(
+            tables=tables,
+            run_id=run_id,
+            chunk_size=10,
+            parallelism=1,
+            authorized_old_run_spec_sha256="0" * 64,
+        )
+        wrong_output = "\n".join((wrong_hash.stdout, wrong_hash.stderr))
+        if wrong_hash.returncode == 0 or "does not match authorized SHA-256" not in wrong_output:
+            raise HarnessError(
+                f"wrong run-spec authorization did not fail at the hash boundary: {wrong_hash}"
+            )
+        if self.sync_progress_snapshot(run_id) != before_wrong_hash:
+            raise HarnessError("wrong run-spec authorization changed durable progress")
+        target_nulls = self.admin_query(
+            self.target,
+            f"SELECT COUNT(*) FROM {table_z} "
+            "WHERE direct_seen_at IS NULL AND sync_seen_at IS NULL;",
+        ).strip()
+        if target_nulls != "2":
+            raise HarnessError(
+                f"wrong authorization changed target additive values: null_rows={target_nulls}"
+            )
+
+    def execute_successful_run_spec_migration(
+        self,
+        run_id: str,
+        table_a: str,
+        table_z: str,
+        tables: list[str],
+        old_spec: str,
+        old_sha256: str,
+        prerequisite_before_migration: str,
+        preexisting_row_count: int,
+    ) -> tuple[str, str]:
+        assert self.source and self.target
+        migrated = self.run_sync(
+            tables=tables,
+            run_id=run_id,
+            chunk_size=10,
+            parallelism=1,
+            authorized_old_run_spec_sha256=old_sha256,
+            timeout=240,
+        )
+        require_success(migrated, "authorized additive run-spec migration")
+        migrated_audit = self.sync_run_spec_migration_audit(migrated)
+        current_spec, current_sha256 = self.sync_run_spec_and_sha256(run_id)
+        expected_migrated_audit = {
+            "event": "sync_run_spec_migration",
+            "run_id": run_id,
+            "status": "migrated",
+            "authorized_old_sha256": old_sha256,
+            "old_sha256": old_sha256,
+            "new_sha256": current_sha256,
+            "locked_row_count": preexisting_row_count,
+            "affected_row_count": preexisting_row_count,
+            "delta": [
+                {
+                    "table": table_z,
+                    "added_columns": ["direct_seen_at", "sync_seen_at"],
+                }
+            ],
+        }
+        if migrated_audit != expected_migrated_audit:
+            raise HarnessError(
+                f"unexpected migrated run-spec audit: {migrated_audit!r}"
+            )
+        if current_sha256 == old_sha256 or current_spec == old_spec:
+            raise HarnessError("authorized additive migration retained the old run specification")
+
+        terminal_rows = self.admin_query(
+            self.target,
+            "SELECT stage,table_name,status FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} "
+            "ORDER BY FIELD(stage,'prerequisite_schema','rows','final_constraints'),table_name;",
+        ).splitlines()
+        expected_terminal_rows = [
+            f"prerequisite_schema\t{table_a}\tcomplete",
+            f"prerequisite_schema\t{table_z}\tcomplete",
+            f"rows\t{table_a}\tcomplete",
+            f"rows\t{table_z}\tcomplete",
+            f"final_constraints\t{table_a}\tcomplete",
+            f"final_constraints\t{table_z}\tcomplete",
+        ]
+        if terminal_rows != expected_terminal_rows:
+            raise HarnessError(
+                f"authorized migration did not produce six terminal rows: {terminal_rows!r}"
+            )
+        spec_counts = self.admin_query(
+            self.target,
+            "SELECT COUNT(*),"
+            f"SUM(BINARY run_spec_json = BINARY {sql_literal(current_spec)}),"
+            f"SUM(BINARY run_spec_json = BINARY {sql_literal(old_spec)}) "
+            "FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)};",
+        ).strip()
+        if spec_counts != "6\t6\t0":
+            raise HarnessError(f"terminal progress specification mismatch: {spec_counts!r}")
+        prerequisite_after_migration = self.sync_progress_snapshot(
+            run_id,
+            stage="prerequisite_schema",
+            include_run_spec=False,
+        )
+        if prerequisite_after_migration != prerequisite_before_migration:
+            raise HarnessError(
+                "authorized migration changed prerequisite progress outside run_spec_json"
+            )
+
+        table_a_state_sql = (
+            f"SELECT COUNT(*),COALESCE(SUM(id),0),"
+            f"COALESCE(SUM(CRC32(CONCAT(id,'|',value))),0) FROM {table_a};"
+        )
+        source_a_state = self.admin_query(self.source, table_a_state_sql).strip()
+        target_a_state = self.admin_query(self.target, table_a_state_sql).strip()
+        if source_a_state != target_a_state or not source_a_state.startswith("4000\t"):
+            raise HarnessError(
+                f"started table did not converge: source={source_a_state!r} target={target_a_state!r}"
+            )
+        table_z_state_sql = (
+            f"SELECT id,value,DATE_FORMAT(direct_seen_at,'%Y-%m-%d %H:%i:%s.%f'),"
+            f"DATE_FORMAT(sync_seen_at,'%Y-%m-%d %H:%i:%s.%f') FROM {table_z} ORDER BY id;"
+        )
+        source_z_state = self.admin_query(self.source, table_z_state_sql).strip()
+        target_z_state = self.admin_query(self.target, table_z_state_sql).strip()
+        if source_z_state != target_z_state:
+            raise HarnessError(
+                f"changed table additive values did not converge: source={source_z_state!r} target={target_z_state!r}"
+            )
+        return current_spec, current_sha256
+
+    def assert_idempotent_run_spec_migration(
+        self,
+        run_id: str,
+        tables: list[str],
+        old_sha256: str,
+        current_sha256: str,
+    ) -> None:
+        before_idempotent = self.sync_progress_snapshot(run_id)
+        idempotent = self.run_sync(
+            tables=tables,
+            run_id=run_id,
+            chunk_size=10,
+            parallelism=1,
+            authorized_old_run_spec_sha256=old_sha256,
+            timeout=240,
+        )
+        require_success(idempotent, "idempotent authorized additive run-spec migration")
+        idempotent_audit = self.sync_run_spec_migration_audit(idempotent)
+        expected_idempotent_audit = {
+            "event": "sync_run_spec_migration",
+            "run_id": run_id,
+            "status": "already_current",
+            "authorized_old_sha256": old_sha256,
+            "old_sha256": old_sha256,
+            "new_sha256": current_sha256,
+            "locked_row_count": 6,
+            "affected_row_count": 0,
+            "delta": [],
+        }
+        if idempotent_audit != expected_idempotent_audit:
+            raise HarnessError(
+                f"unexpected already-current run-spec audit: {idempotent_audit!r}"
+            )
+        if self.sync_progress_snapshot(run_id) != before_idempotent:
+            raise HarnessError("idempotent authorized command changed durable progress")
+
+    def assert_changed_table_row_progress_rejection(
+        self,
+        run_id: str,
+        table_z: str,
+        tables: list[str],
+        current_sha256: str,
+    ) -> None:
+        assert self.source and self.target
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                f"ALTER TABLE {table_z} "
+                "ADD COLUMN third_seen_at TIMESTAMP(6) NULL;",
+            )
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table_z} SET third_seen_at='2026-08-21 12:10:00.111222';",
+        )
+        before_rejection = self.sync_progress_snapshot(run_id)
+        rejection = self.run_sync(
+            tables=tables,
+            run_id=run_id,
+            chunk_size=10,
+            parallelism=1,
+            authorized_old_run_spec_sha256=current_sha256,
+        )
+        rejection_output = "\n".join((rejection.stdout, rejection.stderr))
+        if (
+            rejection.returncode == 0
+            or f"changed table `{table_z}` already has rows-stage progress"
+            not in rejection_output
+        ):
+            raise HarnessError(
+                "changed-table row-progress gate did not reject the second migration: "
+                f"{rejection}"
+            )
+        if self.sync_progress_snapshot(run_id) != before_rejection:
+            raise HarnessError("changed-table row-progress rejection changed durable progress")
+        third_target_nulls = self.admin_query(
+            self.target,
+            f"SELECT COUNT(*) FROM {table_z} WHERE third_seen_at IS NULL;",
+        ).strip()
+        if third_target_nulls != "2":
+            raise HarnessError(
+                "changed-table row-progress rejection changed target third-column values: "
+                f"null_rows={third_target_nulls}"
+            )
+
     def run_sync_resume(self) -> None:
         assert self.source and self.target
         self.setup_sync_accounts("sync_resume")
@@ -2966,6 +3458,8 @@ class Harness:
             self.run_sync_wide_update()
         elif scenario == "sync-resume":
             self.run_sync_resume()
+        elif scenario == "sync-authorized-additive-spec-migration":
+            self.run_sync_authorized_additive_spec_migration()
         elif scenario == "sync-progress-least-privilege":
             self.run_sync_progress_least_privilege()
         elif scenario == "writable-column-generated-metadata":
