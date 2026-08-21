@@ -22,9 +22,9 @@ pub(crate) use model::{
 #[cfg(test)]
 pub(crate) use mysql::{
     build_strict_delete_batches, build_strict_insert_batches, build_strict_update_batches,
-    decode_sync_rows, strict_delete_batch_capacity, strict_insert_batch_capacity,
-    strict_update_batch_capacity, sync_chunk_progress_from_row, sync_progress_row_from_chunk,
-    validate_sync_target_lock_identity,
+    decode_sync_rows, retry_sync_connection_construction, strict_delete_batch_capacity,
+    strict_insert_batch_capacity, strict_update_batch_capacity, sync_chunk_progress_from_row,
+    sync_progress_row_from_chunk, validate_sync_target_lock_identity,
 };
 #[cfg(test)]
 pub(crate) use orchestrate::{

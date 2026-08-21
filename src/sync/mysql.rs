@@ -13,15 +13,21 @@ use super::sql::{
 };
 use crate::database_row::DatabaseRow;
 use crate::live::TargetMySqlConfig;
-use crate::mysql_client::{PersistentMySqlSource, sync_target_opts, value_to_string};
+use crate::mysql_client::{
+    PersistentMySqlSource, sync_source_opts, sync_target_opts, value_to_string,
+};
 use crate::mysql_config::MySqlConnectionConfig;
 use crate::target::SqlStatement;
 use mysql::prelude::Queryable;
-use mysql::{Conn, Params};
+use mysql::{Conn, Opts, Params};
 use std::collections::BTreeMap;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
 const MAX_SYNC_MUTATION_ROWS_PER_STATEMENT: usize = 128;
+const MAX_SYNC_CONNECTION_RETRIES: u32 = 4;
+const INITIAL_SYNC_CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub(crate) struct MySqlSyncSource {
     source: PersistentMySqlSource,
@@ -39,9 +45,62 @@ pub(crate) struct MySqlSyncProgressStore {
     progress_table: String,
 }
 
+fn open_sync_connection(opts: Opts) -> mysql::Result<Conn> {
+    retry_sync_connection_construction(
+        || Conn::new(opts.clone()),
+        thread::sleep,
+        sample_connection_retry_jitter,
+    )
+}
+
+pub(crate) fn retry_sync_connection_construction<T, C, S, J>(
+    mut connect: C,
+    mut sleep: S,
+    mut sample_jitter: J,
+) -> mysql::Result<T>
+where
+    C: FnMut() -> mysql::Result<T>,
+    S: FnMut(Duration),
+    J: FnMut(Duration) -> Duration,
+{
+    let mut retry = 0;
+    loop {
+        match connect() {
+            Ok(connection) => return Ok(connection),
+            Err(error) if error.is_connectivity_error() && retry < MAX_SYNC_CONNECTION_RETRIES => {
+                let base_delay = INITIAL_SYNC_CONNECTION_RETRY_DELAY.saturating_mul(1 << retry);
+                let maximum_jitter = base_delay / 2;
+                let jitter = sample_jitter(base_delay).min(maximum_jitter);
+                sleep(base_delay.saturating_add(jitter));
+                retry += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sample_connection_retry_jitter(base_delay: Duration) -> Duration {
+    let maximum_jitter = base_delay / 2;
+    let maximum_nanos = maximum_jitter.as_nanos();
+    if maximum_nanos == 0 {
+        return Duration::ZERO;
+    }
+
+    let clock_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let entropy = clock_nanos ^ u128::from(std::process::id());
+    let jitter_nanos = entropy % (maximum_nanos + 1);
+    Duration::from_nanos(jitter_nanos as u64)
+}
+
 impl MySqlSyncSource {
     pub(crate) fn new(config: &MySqlConnectionConfig, table: SyncTable) -> Result<Self, String> {
-        let source = PersistentMySqlSource::new(config).map_err(|error| error.to_string())?;
+        let opts = sync_source_opts(config)?;
+        let conn = open_sync_connection(opts)
+            .map_err(|error| format!("failed to connect to source mysql: {error}"))?;
+        let source = PersistentMySqlSource::from_sync_connection(conn);
         Ok(Self { source, table })
     }
 }
@@ -60,7 +119,7 @@ impl SyncChunkSource for MySqlSyncSource {
 impl MySqlSyncTargetSession {
     pub(crate) fn new(config: &TargetMySqlConfig, table: SyncTable) -> Result<Self, String> {
         let opts = sync_target_opts(config)?;
-        let mut conn = Conn::new(opts)
+        let mut conn = open_sync_connection(opts)
             .map_err(|error| format!("failed to connect to target mysql: {error}"))?;
         initialize_target_session(&mut conn)?;
         Ok(Self {
@@ -142,7 +201,7 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
 impl MySqlSyncProgressStore {
     pub(crate) fn new(config: &TargetMySqlConfig, progress_table: String) -> Result<Self, String> {
         let opts = sync_target_opts(config)?;
-        let mut conn = Conn::new(opts)
+        let mut conn = open_sync_connection(opts)
             .map_err(|error| format!("failed to connect to sync progress mysql: {error}"))?;
         initialize_target_session(&mut conn)?;
         let mut store = Self {

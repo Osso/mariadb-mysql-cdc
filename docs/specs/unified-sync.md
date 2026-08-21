@@ -26,6 +26,12 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - [x] Route `recover-lost-binlog` through one unified run with exact `recovery_id`, captured source evidence, exact source-table progress proof, and `cdc.sync_runs` progress.
 - [ ] Prove resync/recovery source-evidence capture and complete staged execution through disposable production-shaped endpoints.
 
+### Connection construction retry
+
+- [x] Retry source, locked-target, and separate progress-store connection construction only when `mysql::Error::is_connectivity_error()` classifies the failure as connectivity-related.
+- [x] Bound connection construction to five attempts with exponential backoff and jitter; return the last connectivity error after exhaustion and fail immediately on permanent errors.
+- [x] Do not retry session initialization, progress schema operations, SQL statements, row chunks, table work, or completed stages.
+
 ### Schema and progress contracts
 
 - [x] Reuse the prerequisite schema stage that removes blocking target constraints and converges structure before row work.
@@ -57,9 +63,9 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - `tests/sync_cli.rs` — unified help/dispatch, obsolete-command rejection, accepted options, and obsolete-flag rejection.
 - `src/main/tests/sync_cli_config.rs` — endpoint, scope, defaults, runtime options, and exclusive immutable run identity parsing.
 - `src/main/tests/sync_orchestrator.rs` — stage order, resume behavior, immutable progress identity, table-selection validation, error persistence, and row-failure cutoff.
-- `src/main/tests/sync_runner.rs` — bounded deterministic table execution and completion behavior.
+- `src/main/tests/sync_runner.rs` — bounded deterministic table execution, completion behavior, and no retry of row-chunk failures.
 - `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering and checkpoint boundary.
-- `src/main/tests/sync_mysql_adapter.rs` and `src/main/tests/sync_mysql_contract.rs` — adapter and SQL contracts.
+- `src/main/tests/sync_mysql_adapter.rs` and `src/main/tests/sync_mysql_contract.rs` — adapter and SQL contracts, including bounded connectivity-only connection construction retry.
 - `src/main/tests/resync_unified.rs` — resync run identity, all-table mapping, and changed-table reporting.
 - `src/main/tests/lost_binlog_unified.rs` — recovery run identity, source-only proof evidence, exact progress scope, and incomplete/wrong-run rejection.
 

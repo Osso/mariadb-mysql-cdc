@@ -63,6 +63,18 @@ pub struct PersistentTargetExecutor {
     insert_conflict_policy: InsertConflictPolicy,
 }
 
+pub(crate) fn sync_source_opts(source: &MySqlConnectionConfig) -> Result<Opts, String> {
+    base_opts(
+        &source.host,
+        source.port,
+        &source.user,
+        &source.password,
+        &source.database,
+        None,
+        &format!("source `{}`:{}", source.host, source.port),
+    )
+}
+
 pub(crate) fn sync_target_opts(target: &TargetMySqlConfig) -> Result<Opts, String> {
     let builder = OptsBuilder::from_opts(target_mysql_opts(target)?);
     Ok(Opts::from(apply_default_mysql_network_bounds(builder)))
@@ -89,6 +101,12 @@ pub(crate) fn open_stream_source(
 }
 
 impl PersistentMySqlSource {
+    pub(crate) fn from_sync_connection(conn: Conn) -> Self {
+        Self {
+            conn: RefCell::new(conn),
+        }
+    }
+
     pub fn new(config: &MySqlConnectionConfig) -> Result<Self, MySqlSourceError> {
         Self::new_with_tls_ca(config, None)
     }

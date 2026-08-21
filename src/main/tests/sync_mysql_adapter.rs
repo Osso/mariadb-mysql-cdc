@@ -2,11 +2,99 @@ use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkProgress, SyncPrimaryKeyOrdering, SyncProgressStatus, SyncStage, SyncTable,
     build_strict_delete_batches, build_strict_insert_batches, build_strict_update_batches,
-    decode_sync_rows, strict_delete_batch_capacity, strict_insert_batch_capacity,
-    strict_update_batch_capacity, sync_chunk_progress_from_row, sync_progress_row_from_chunk,
-    validate_sync_target_lock_identity,
+    decode_sync_rows, retry_sync_connection_construction, strict_delete_batch_capacity,
+    strict_insert_batch_capacity, strict_update_batch_capacity, sync_chunk_progress_from_row,
+    sync_progress_row_from_chunk, validate_sync_target_lock_identity,
 };
+use mysql::MySqlError;
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::io;
+use std::time::Duration;
+
+#[test]
+fn sync_connection_construction_retries_connectivity_errors_with_backoff_and_jitter() {
+    let attempts = Cell::new(0);
+    let mut delays = Vec::new();
+
+    let result = retry_sync_connection_construction(
+        || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt < 3 {
+                Err(mysql::Error::IoError(io::Error::from(
+                    io::ErrorKind::WouldBlock,
+                )))
+            } else {
+                Ok("connected")
+            }
+        },
+        |delay| delays.push(delay),
+        |base_delay| base_delay / 4,
+    )
+    .expect("transient connection succeeds");
+
+    assert_eq!(result, "connected");
+    assert_eq!(attempts.get(), 3);
+    assert_eq!(
+        delays,
+        [Duration::from_millis(125), Duration::from_millis(250)]
+    );
+}
+
+#[test]
+fn sync_connection_construction_fails_fast_for_permanent_mysql_errors() {
+    let attempts = Cell::new(0);
+    let mut delays = Vec::new();
+
+    let error = retry_sync_connection_construction(
+        || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(mysql::Error::MySqlError(MySqlError {
+                state: "28000".to_string(),
+                message: "access denied".to_string(),
+                code: 1045,
+            }))
+        },
+        |delay| delays.push(delay),
+        |_| Duration::from_millis(25),
+    )
+    .expect_err("permanent connection error");
+
+    assert!(matches!(error, mysql::Error::MySqlError(_)));
+    assert_eq!(attempts.get(), 1);
+    assert!(delays.is_empty());
+}
+
+#[test]
+fn sync_connection_construction_returns_last_error_after_bounded_attempts() {
+    let attempts = Cell::new(0);
+    let mut delays = Vec::new();
+
+    let error = retry_sync_connection_construction(
+        || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(mysql::Error::IoError(io::Error::from(
+                io::ErrorKind::WouldBlock,
+            )))
+        },
+        |delay| delays.push(delay),
+        |_| Duration::ZERO,
+    )
+    .expect_err("exhausted connectivity retries");
+
+    assert!(error.is_connectivity_error());
+    assert_eq!(attempts.get(), 5);
+    assert_eq!(
+        delays,
+        [
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(800),
+        ]
+    );
+}
 
 #[test]
 fn sync_mysql_adapter_decodes_exact_selected_columns_and_rejects_invalid_rows() {
