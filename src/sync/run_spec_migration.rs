@@ -1,5 +1,6 @@
-use super::AdditiveRunSpecTableChange;
-use super::config::{SyncRunIdentity, SyncRunSpec, plan_additive_run_spec_migration};
+use super::config::{
+    AdditiveRunSpecTableChange, SyncRunIdentity, SyncRunSpec, plan_additive_run_spec_migration,
+};
 use super::model::SyncStage;
 use crate::inventory::SchemaInventory;
 use sha2::{Digest, Sha256};

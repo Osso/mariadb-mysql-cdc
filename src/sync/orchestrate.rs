@@ -8,9 +8,14 @@ use super::model::{
 };
 use super::mysql::MySqlSyncProgressStore;
 use super::run::run_mysql_sync_tables;
+use super::run_spec_migration::{
+    SyncRunSpecMigrationExecutor, SyncRunSpecMigrationOutcome, SyncRunSpecMigrationRequest,
+    run_locked_sync_run_spec_migration,
+};
 use crate::inventory::SchemaInventory;
 use crate::sync_schema::{
-    SchemaSourceEvidence, SyncSchemaStageKind, read_sync_source_evidence, run_sync_schema_stage,
+    SchemaSourceEvidence, SyncSchemaStageKind, read_sync_source_evidence,
+    read_sync_target_inventory, run_sync_schema_stage,
 };
 use std::collections::BTreeSet;
 
@@ -80,6 +85,167 @@ pub(crate) fn run_sync_orchestration(
     Ok(rows)
 }
 
+pub(crate) fn read_sync_run_spec_migration_target_inventory(
+    config: &SyncConfig,
+    read_target: impl FnOnce(&crate::live::TargetMySqlConfig) -> Result<SchemaInventory, String>,
+) -> Result<Option<SchemaInventory>, String> {
+    if config.authorized_old_run_spec_sha256.is_none() {
+        return Ok(None);
+    }
+    read_target(&config.target).map(Some)
+}
+
+pub(crate) fn run_optional_sync_run_spec_migration(
+    config: &SyncConfig,
+    current: &SyncRunIdentity,
+    source: &SchemaInventory,
+    target: Option<&SchemaInventory>,
+    executor: &mut impl SyncRunSpecMigrationExecutor,
+) -> Result<Option<SyncRunSpecMigrationOutcome>, String> {
+    let Some(authorized_old_sha256) = config.authorized_old_run_spec_sha256.as_deref() else {
+        return Ok(None);
+    };
+    let target = target.ok_or_else(|| {
+        "authorized sync run-spec migration requires current target inventory".to_string()
+    })?;
+    let request = SyncRunSpecMigrationRequest {
+        run_id: &current.run_id,
+        authorized_old_sha256,
+        current,
+        source,
+        target,
+    };
+    run_locked_sync_run_spec_migration(executor, &request).map(Some)
+}
+
+pub(crate) fn continue_after_sync_run_spec_migration<T>(
+    migration: Result<Option<SyncRunSpecMigrationOutcome>, String>,
+    emit_audit: impl FnOnce(&SyncRunSpecMigrationOutcome),
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let migration = migration?;
+    if let Some(outcome) = &migration {
+        emit_audit(outcome);
+    }
+    action()
+}
+
+struct SyncRunSpecMigrationAuditFields<'a> {
+    status: &'static str,
+    authorized_old_sha256: &'a str,
+    old_sha256: &'a str,
+    new_sha256: &'a str,
+    locked_row_count: usize,
+    affected_row_count: u64,
+    changed_tables: &'a [super::config::AdditiveRunSpecTableChange],
+}
+
+pub(crate) fn format_sync_run_spec_migration_audit(
+    run_id: &str,
+    outcome: &SyncRunSpecMigrationOutcome,
+) -> String {
+    let fields = sync_run_spec_migration_audit_fields(outcome);
+    serde_json::json!({
+        "event": "sync_run_spec_migration",
+        "run_id": run_id,
+        "status": fields.status,
+        "authorized_old_sha256": fields.authorized_old_sha256,
+        "old_sha256": fields.old_sha256,
+        "new_sha256": fields.new_sha256,
+        "locked_row_count": fields.locked_row_count,
+        "affected_row_count": fields.affected_row_count,
+        "delta": sync_run_spec_migration_audit_delta(fields.changed_tables),
+    })
+    .to_string()
+}
+
+fn sync_run_spec_migration_audit_fields(
+    outcome: &SyncRunSpecMigrationOutcome,
+) -> SyncRunSpecMigrationAuditFields<'_> {
+    match outcome {
+        SyncRunSpecMigrationOutcome::AlreadyCurrent {
+            locked_row_count,
+            affected_row_count,
+            authorized_old_sha256,
+            current_sha256,
+        } => already_current_migration_audit_fields(
+            *locked_row_count,
+            *affected_row_count,
+            authorized_old_sha256,
+            current_sha256,
+        ),
+        SyncRunSpecMigrationOutcome::Migrated {
+            locked_row_count,
+            affected_row_count,
+            authorized_old_sha256,
+            old_sha256,
+            new_sha256,
+            changed_tables,
+        } => migrated_run_spec_audit_fields(
+            *locked_row_count,
+            *affected_row_count,
+            authorized_old_sha256,
+            old_sha256,
+            new_sha256,
+            changed_tables,
+        ),
+    }
+}
+
+fn already_current_migration_audit_fields<'a>(
+    locked_row_count: usize,
+    affected_row_count: u64,
+    authorized_old_sha256: &'a str,
+    current_sha256: &'a str,
+) -> SyncRunSpecMigrationAuditFields<'a> {
+    SyncRunSpecMigrationAuditFields {
+        status: "already_current",
+        authorized_old_sha256,
+        old_sha256: authorized_old_sha256,
+        new_sha256: current_sha256,
+        locked_row_count,
+        affected_row_count,
+        changed_tables: &[],
+    }
+}
+
+fn migrated_run_spec_audit_fields<'a>(
+    locked_row_count: usize,
+    affected_row_count: u64,
+    authorized_old_sha256: &'a str,
+    old_sha256: &'a str,
+    new_sha256: &'a str,
+    changed_tables: &'a [super::config::AdditiveRunSpecTableChange],
+) -> SyncRunSpecMigrationAuditFields<'a> {
+    SyncRunSpecMigrationAuditFields {
+        status: "migrated",
+        authorized_old_sha256,
+        old_sha256,
+        new_sha256,
+        locked_row_count,
+        affected_row_count,
+        changed_tables,
+    }
+}
+
+fn sync_run_spec_migration_audit_delta(
+    changed_tables: &[super::config::AdditiveRunSpecTableChange],
+) -> Vec<serde_json::Value> {
+    changed_tables
+        .iter()
+        .map(|change| {
+            serde_json::json!({
+                "table": change.table,
+                "added_columns": change.added_columns,
+            })
+        })
+        .collect()
+}
+
+fn emit_sync_run_spec_migration_audit(run_id: &str, outcome: &SyncRunSpecMigrationOutcome) {
+    eprintln!("{}", format_sync_run_spec_migration_audit(run_id, outcome));
+}
+
 pub(crate) fn run_mysql_sync(config: SyncConfig) -> Result<Vec<SyncChunkProgress>, String> {
     validate_sync_config(&config)?;
     let evidence = read_sync_source_evidence(&config.source)?;
@@ -93,15 +259,30 @@ pub(crate) fn run_mysql_sync_with_evidence(
     validate_sync_config(&config)?;
     let tables = sync_tables_from_source_inventory(&evidence.inventory, &config.tables)?;
     let identity = build_sync_run_identity(&config, tables.clone())?;
+    let target_inventory =
+        read_sync_run_spec_migration_target_inventory(&config, read_sync_target_inventory)?;
     let mut progress = MySqlSyncProgressStore::new(&config.target, config.progress_table.clone())?;
-    let mut executor = MySqlSyncRunExecutor;
-    run_sync_orchestration(
+    let migration = run_optional_sync_run_spec_migration(
         &config,
         &identity,
-        &evidence,
-        tables,
-        &mut executor,
+        &evidence.inventory,
+        target_inventory.as_ref(),
         &mut progress,
+    );
+    let mut executor = MySqlSyncRunExecutor;
+    continue_after_sync_run_spec_migration(
+        migration,
+        |outcome| emit_sync_run_spec_migration_audit(&identity.run_id, outcome),
+        || {
+            run_sync_orchestration(
+                &config,
+                &identity,
+                &evidence,
+                tables,
+                &mut executor,
+                &mut progress,
+            )
+        },
     )
 }
 

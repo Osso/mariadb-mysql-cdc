@@ -2,8 +2,11 @@ use crate::inventory::{ColumnInventory, SchemaInventory, TableInventory};
 use crate::sync::{
     AdditiveRunSpecTableChange, LockedSyncProgressRow, SyncConfig, SyncPrimaryKeyOrdering,
     SyncRunSpecMigrationExecutor, SyncRunSpecMigrationOutcome, SyncRunSpecMigrationRequest,
-    SyncStage, SyncTable, build_sync_run_identity, run_locked_sync_run_spec_migration,
+    SyncStage, SyncTable, build_sync_run_identity, continue_after_sync_run_spec_migration,
+    format_sync_run_spec_migration_audit, read_sync_run_spec_migration_target_inventory,
+    run_locked_sync_run_spec_migration, run_optional_sync_run_spec_migration,
 };
+use std::cell::{Cell, RefCell};
 
 const AUTHORIZED_OLD_SHA256: &str =
     "01605f111206a2b2200c122431c9d5084bce7a4ee9eea14e79f5dda51cfb30a9";
@@ -320,6 +323,169 @@ fn sync_run_spec_migration_store_decision_failure_rolls_back_without_write() {
             Operation::Update { .. } | Operation::Verify { .. } | Operation::Commit
         )
     }));
+}
+
+#[test]
+fn ordinary_sync_skips_target_inventory_and_run_spec_migration_transaction() {
+    let config = config();
+    let target_read = Cell::new(false);
+    let target = read_sync_run_spec_migration_target_inventory(&config, |_| {
+        target_read.set(true);
+        Ok(inventory())
+    })
+    .expect("ordinary target inventory decision");
+    let fixture = fixture();
+    let mut executor = ScriptedMigrationExecutor::with_rows(fixture.persisted_rows());
+
+    let outcome = run_optional_sync_run_spec_migration(
+        &config,
+        &fixture.current,
+        &fixture.inventory,
+        target.as_ref(),
+        &mut executor,
+    )
+    .expect("ordinary sync migration decision");
+
+    assert_eq!(outcome, None);
+    assert!(!target_read.get());
+    assert!(executor.operations.is_empty());
+}
+
+#[test]
+fn authorized_sync_reads_target_inventory_and_returns_exact_migration_outcome() {
+    let fixture = fixture();
+    let mut config = config();
+    config.authorized_old_run_spec_sha256 = Some(AUTHORIZED_OLD_SHA256.to_string());
+    let target_read = Cell::new(false);
+    let target = read_sync_run_spec_migration_target_inventory(&config, |_| {
+        target_read.set(true);
+        Ok(fixture.inventory.clone())
+    })
+    .expect("authorized target inventory")
+    .expect("target inventory required");
+    let mut executor = ScriptedMigrationExecutor::with_rows(fixture.persisted_rows());
+
+    let outcome = run_optional_sync_run_spec_migration(
+        &config,
+        &fixture.current,
+        &fixture.inventory,
+        Some(&target),
+        &mut executor,
+    )
+    .expect("authorized migration")
+    .expect("migration outcome");
+
+    assert!(target_read.get());
+    assert_eq!(
+        outcome,
+        SyncRunSpecMigrationOutcome::Migrated {
+            locked_row_count: 3,
+            affected_row_count: 3,
+            authorized_old_sha256: AUTHORIZED_OLD_SHA256.to_string(),
+            old_sha256: AUTHORIZED_OLD_SHA256.to_string(),
+            new_sha256: CURRENT_SHA256.to_string(),
+            changed_tables: vec![AdditiveRunSpecTableChange {
+                table: "alpha".to_string(),
+                added_columns: strings(["direct_seen_at", "sync_seen_at"]),
+            }],
+        }
+    );
+}
+
+#[test]
+fn migration_error_prevents_subsequent_sync_action() {
+    let fixture = fixture();
+    let mut config = config();
+    config.authorized_old_run_spec_sha256 = Some(AUTHORIZED_OLD_SHA256.to_string());
+    let mut executor = ScriptedMigrationExecutor::with_rows(fixture.persisted_rows());
+    executor.locked_rows = Err("forced migration failure".to_string());
+    let migration = run_optional_sync_run_spec_migration(
+        &config,
+        &fixture.current,
+        &fixture.inventory,
+        Some(&fixture.inventory),
+        &mut executor,
+    );
+    let action_called = Cell::new(false);
+
+    let error = continue_after_sync_run_spec_migration(
+        migration,
+        |_| {},
+        || {
+            action_called.set(true);
+            Ok(())
+        },
+    )
+    .expect_err("migration failure");
+
+    assert_eq!(error, "forced migration failure");
+    assert!(!action_called.get());
+}
+
+#[test]
+fn committed_migration_emits_audit_before_subsequent_sync_action() {
+    let outcome = SyncRunSpecMigrationOutcome::AlreadyCurrent {
+        locked_row_count: 576,
+        affected_row_count: 0,
+        authorized_old_sha256: AUTHORIZED_OLD_SHA256.to_string(),
+        current_sha256: CURRENT_SHA256.to_string(),
+    };
+    let events = RefCell::new(Vec::new());
+
+    continue_after_sync_run_spec_migration(
+        Ok(Some(outcome)),
+        |_| events.borrow_mut().push("audit"),
+        || {
+            events.borrow_mut().push("orchestration");
+            Ok(())
+        },
+    )
+    .expect("post-migration sequence");
+
+    assert_eq!(*events.borrow(), ["audit", "orchestration"]);
+}
+
+#[test]
+fn run_spec_migration_audit_is_stable_secret_free_json_with_exact_fields() {
+    let outcome = SyncRunSpecMigrationOutcome::Migrated {
+        locked_row_count: 576,
+        affected_row_count: 576,
+        authorized_old_sha256: AUTHORIZED_OLD_SHA256.to_string(),
+        old_sha256: AUTHORIZED_OLD_SHA256.to_string(),
+        new_sha256: CURRENT_SHA256.to_string(),
+        changed_tables: vec![AdditiveRunSpecTableChange {
+            table: "content_sections_events_raw".to_string(),
+            added_columns: strings(["direct_seen_at", "sync_seen_at"]),
+        }],
+    };
+
+    let audit = format_sync_run_spec_migration_audit("full-catalog-sync-20260819-01", &outcome);
+    let parsed: serde_json::Value = serde_json::from_str(&audit).expect("audit JSON");
+
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "event": "sync_run_spec_migration",
+            "run_id": "full-catalog-sync-20260819-01",
+            "status": "migrated",
+            "authorized_old_sha256": AUTHORIZED_OLD_SHA256,
+            "old_sha256": AUTHORIZED_OLD_SHA256,
+            "new_sha256": CURRENT_SHA256,
+            "locked_row_count": 576,
+            "affected_row_count": 576,
+            "delta": [{
+                "table": "content_sections_events_raw",
+                "added_columns": ["direct_seen_at", "sync_seen_at"]
+            }]
+        })
+    );
+    assert_eq!(
+        audit,
+        format_sync_run_spec_migration_audit("full-catalog-sync-20260819-01", &outcome)
+    );
+    assert!(!audit.contains("run_spec_json"));
+    assert!(!audit.contains("source-secret"));
+    assert!(!audit.contains("target-secret"));
 }
 
 fn run(

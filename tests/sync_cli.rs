@@ -16,6 +16,8 @@ fn help_documents_one_unified_sync_command() {
         .collect::<Vec<_>>();
     assert_eq!(sync_usage.len(), 1, "unexpected sync usage:\n{help}");
     assert!(help.contains("Synchronize target schemas and table rows from source."));
+    assert!(help.contains("--authorize-old-run-spec-sha256 SHA256"));
+    assert!(help.contains("Authorize one exact persisted run-spec migration."));
     for obsolete in [
         "catchup-snapshot",
         "catchup-progress",
