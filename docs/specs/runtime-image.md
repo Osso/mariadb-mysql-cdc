@@ -47,10 +47,14 @@ The production binary is packaged in a fixed, minimal Ubuntu runtime independent
 - `tests/verify_runtime_image.py` asserts operating system identity, image user/entrypoint metadata, runtime UID/GID, CA bundle, read-only mounted CA-file readability, the serial client's required packages and dynamic links, binary execution, and `gosu` absence.
 - `tests/test_deploy_script.py` asserts deployment succeeds without `BASE_IMAGE`, runs repository tests between formatting and Clippy, includes itself through `run-tests.sh`, verifies and scans the exact published digest before ops mutation, writes the immutable reference, and proves a failed Trivy gate leaves the ops manifest and commit unchanged.
 
+## Current-cycle evidence
+
+- [x] Published image `registry.digitalocean.com/globalcomix/mariadb-mysql-cdc:6047e38@sha256:aa132d5104560522679089965ca9e2f41521abc6662fb529e3e691c32d4a30da` passed all 11 runtime-image checks and the pinned Trivy HIGH/CRITICAL scan with zero findings.
+- [x] Stream rollout through ops commit `984d7b165` runs that immutable image; Deployment Ready `1/1`, zero restarts, advancing checkpoint, and zero quarantined statements were observed.
+
 ## Known gaps (current cycle)
 
-- [ ] Execute the new published-digest verification and Trivy gate against the next real Depot candidate.
-- [ ] After deployment, prove the live stream reads its mounted target CA, starts successfully, and advances its checkpoint under UID/GID `65532:65532`.
+None for image `6047e38`. Full-catalog sync acceptance remains tracked in the [run evidence](../local/full-catalog-sync-run-20260819-01.md).
 
 ## Out of scope
 
