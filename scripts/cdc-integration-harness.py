@@ -2700,23 +2700,27 @@ class Harness:
         ).splitlines()
         transactions: list[list[str]] = []
         active_by_thread: dict[str, list[str]] = {}
-        owner_primary_key = re.compile(
-            r"\bwhere\b.*(?:`id`|id)\s*(?:<=>|=)\s*200(?:\D|$)"
+        owner_primary_key_predicate = re.compile(
+            r"\bwhere `id` in \('200'\) order by `id`$"
         )
         for record in records:
             thread_id, command_type, statement = record.split("\t", 2)
             if command_type not in {"Query", "Execute"}:
                 continue
             normalized = " ".join(statement.lower().split()).rstrip(";")
-            if normalized == "begin" or normalized.startswith("start transaction"):
-                active_by_thread[thread_id] = ["begin"]
+            if normalized in {"begin", "set autocommit=0"} or normalized.startswith(
+                "start transaction"
+            ):
+                active_by_thread[thread_id] = ["transaction_start"]
                 continue
             transaction = active_by_thread.get(thread_id)
             if transaction is None:
                 continue
 
             event = None
-            if normalized == "commit" or normalized.startswith("commit "):
+            if normalized == f"lock tables `globalcomix`.`{table}` write":
+                event = "table_write_lock"
+            elif normalized == "commit" or normalized.startswith("commit "):
                 event = "commit"
             elif normalized == "rollback" or normalized.startswith("rollback "):
                 event = "rollback"
@@ -2731,7 +2735,7 @@ class Harness:
                     )
             elif (
                 normalized.startswith(f"update `{table}` set")
-                and owner_primary_key.search(normalized)
+                and owner_primary_key_predicate.search(normalized)
                 and all(
                     value in normalized
                     for value in ("token-200", "page-200", "payload-200")
@@ -2740,7 +2744,7 @@ class Harness:
                 event = "owner_update"
             elif normalized.startswith(
                 f"delete from `{table}`"
-            ) and owner_primary_key.search(normalized):
+            ) and owner_primary_key_predicate.search(normalized):
                 event = "owner_delete"
 
             if event is None:
@@ -2759,7 +2763,8 @@ class Harness:
         outcome: str,
     ) -> list[str]:
         expected = [
-            "begin",
+            "transaction_start",
+            "table_write_lock",
             "first_batch_insert",
             "colliding_insert",
             f"owner_{owner_action}",
