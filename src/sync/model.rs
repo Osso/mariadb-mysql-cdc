@@ -27,6 +27,73 @@ pub(crate) struct SyncChunkReadRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyncInsertFailure {
+    pub(crate) mysql_code: Option<u16>,
+    pub(crate) message: String,
+    pub(crate) failed_batch: Vec<DatabaseRow>,
+    pub(crate) remaining_rows: Vec<DatabaseRow>,
+}
+
+impl SyncInsertFailure {
+    pub(crate) fn retry_rows(&self) -> Vec<DatabaseRow> {
+        self.failed_batch
+            .iter()
+            .chain(&self.remaining_rows)
+            .cloned()
+            .collect()
+    }
+}
+
+impl std::fmt::Display for SyncInsertFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyncUniqueIndex {
+    pub(crate) name: String,
+    pub(crate) columns: Vec<String>,
+}
+
+impl SyncUniqueIndex {
+    pub(crate) fn values(&self, row: &DatabaseRow, label: &str) -> Result<Vec<String>, String> {
+        self.columns
+            .iter()
+            .map(|column| {
+                row.values
+                    .get(column)
+                    .ok_or_else(|| format!("{label} unique column `{column}` is absent"))?
+                    .clone()
+                    .ok_or_else(|| format!("{label} unique column `{column}` is NULL"))
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyncUniqueOwnerConflict {
+    pub(crate) index: SyncUniqueIndex,
+    pub(crate) intended: DatabaseRow,
+    pub(crate) owner: DatabaseRow,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SyncUniqueOwnerAction {
+    Update(DatabaseRow),
+    Delete,
+}
+
+impl SyncUniqueOwnerAction {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Update(_) => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SyncChunkProgress {
     pub(crate) run_id: String,
     pub(crate) table: String,
@@ -113,6 +180,13 @@ pub(crate) struct SyncProgressRow {
 
 pub(crate) trait SyncChunkSource {
     fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String>;
+
+    fn read_row_by_primary_key(
+        &mut self,
+        _primary_key: &[String],
+    ) -> Result<Option<DatabaseRow>, String> {
+        Err("exact source primary-key reads are unavailable".to_string())
+    }
 }
 
 pub(crate) trait SyncChunkTargetSession {
@@ -121,7 +195,27 @@ pub(crate) trait SyncChunkTargetSession {
     fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String>;
     fn delete_rows(&mut self, primary_keys: &[Vec<String>]) -> Result<(), String>;
     fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String>;
-    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String>;
+    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncInsertFailure>;
+
+    fn inspect_unique_owner_conflicts(
+        &mut self,
+        _failure: &SyncInsertFailure,
+    ) -> Result<Vec<SyncUniqueOwnerConflict>, String> {
+        Err("secondary unique-owner inspection is unavailable".to_string())
+    }
+
+    fn reconcile_unique_owner(
+        &mut self,
+        _conflict: &SyncUniqueOwnerConflict,
+        _action: &SyncUniqueOwnerAction,
+    ) -> Result<(), String> {
+        Err("secondary unique-owner reconciliation is unavailable".to_string())
+    }
+
+    fn verify_rows(&mut self, _rows: &[DatabaseRow]) -> Result<(), String> {
+        Err("exact target row verification is unavailable".to_string())
+    }
+
     fn commit(&mut self) -> Result<(), String>;
     fn rollback(&mut self) -> Result<(), String>;
     fn unlock_tables(&mut self) -> Result<(), String>;

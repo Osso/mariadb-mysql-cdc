@@ -1,7 +1,8 @@
 use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
-    SyncChunkSource, SyncChunkTargetSession, SyncPrimaryKeyOrdering, SyncTable, sync_next_chunk,
+    SyncChunkSource, SyncChunkTargetSession, SyncInsertFailure, SyncPrimaryKeyOrdering, SyncTable,
+    SyncUniqueIndex, SyncUniqueOwnerAction, SyncUniqueOwnerConflict, sync_next_chunk,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -31,6 +32,18 @@ enum Event {
     Delete(Vec<Vec<String>>),
     Update(Vec<Vec<String>>),
     Insert(Vec<Vec<String>>),
+    ReconcileUniqueOwner {
+        index: String,
+        action: String,
+        intended_primary_key: Vec<String>,
+        target_owner_primary_key: Vec<String>,
+    },
+    UniqueOwnerAudit {
+        index: String,
+        action: String,
+        intended_primary_key: Vec<String>,
+        target_owner_primary_key: Vec<String>,
+    },
     Commit,
     ProgressSave {
         run_spec_json: String,
@@ -57,6 +70,10 @@ enum FailurePoint {
     Delete,
     Update,
     Insert,
+    InsertUniqueConflict,
+    InsertUniqueConflictThenRetryFailure,
+    InsertUniqueConflictThenCommitFailure,
+    UniqueOwnerReconciliation,
     Commit,
     ProgressSave,
     Unlock,
@@ -64,6 +81,7 @@ enum FailurePoint {
 
 struct RecordingSource {
     reads: VecDeque<Vec<DatabaseRow>>,
+    exact_rows: BTreeMap<Vec<String>, DatabaseRow>,
     failure: Option<FailurePoint>,
     events: Events,
 }
@@ -79,9 +97,18 @@ impl RecordingSource {
     ) -> Self {
         Self {
             reads: reads.into_iter().collect(),
+            exact_rows: BTreeMap::new(),
             failure: None,
             events,
         }
+    }
+
+    fn with_exact_rows(mut self, rows: impl IntoIterator<Item = DatabaseRow>) -> Self {
+        self.exact_rows = rows
+            .into_iter()
+            .map(|row| (row.primary_key.clone(), row))
+            .collect();
+        self
     }
 
     fn fail_at(mut self, failure: FailurePoint) -> Self {
@@ -105,6 +132,13 @@ impl SyncChunkSource for RecordingSource {
         }
         Ok(self.reads.pop_front().unwrap_or_default())
     }
+
+    fn read_row_by_primary_key(
+        &mut self,
+        primary_key: &[String],
+    ) -> Result<Option<DatabaseRow>, String> {
+        Ok(self.exact_rows.get(primary_key).cloned())
+    }
 }
 
 struct RecordingTargetSession {
@@ -113,6 +147,7 @@ struct RecordingTargetSession {
     read_batches: VecDeque<Vec<DatabaseRow>>,
     honor_read_bounds: bool,
     failure: Option<FailurePoint>,
+    pending_audits: Vec<Event>,
     events: Events,
 }
 
@@ -124,6 +159,7 @@ impl RecordingTargetSession {
             read_batches: VecDeque::new(),
             honor_read_bounds: false,
             failure: None,
+            pending_audits: Vec::new(),
             events,
         }
     }
@@ -144,6 +180,44 @@ impl RecordingTargetSession {
     fn fail_at(mut self, failure: FailurePoint) -> Self {
         self.failure = Some(failure);
         self
+    }
+
+    fn take_insert_failure(&mut self, rows: &[DatabaseRow]) -> Option<SyncInsertFailure> {
+        if self.failure == Some(FailurePoint::Insert) {
+            return Some(SyncInsertFailure {
+                mysql_code: None,
+                message: "injected insert failure".to_string(),
+                failed_batch: rows.to_vec(),
+                remaining_rows: Vec::new(),
+            });
+        }
+        if !matches!(
+            self.failure,
+            Some(
+                FailurePoint::InsertUniqueConflict
+                    | FailurePoint::InsertUniqueConflictThenRetryFailure
+                    | FailurePoint::InsertUniqueConflictThenCommitFailure
+                    | FailurePoint::UniqueOwnerReconciliation
+            )
+        ) {
+            return None;
+        }
+        self.failure = match self.failure {
+            Some(FailurePoint::InsertUniqueConflict) => None,
+            Some(FailurePoint::InsertUniqueConflictThenRetryFailure) => {
+                Some(FailurePoint::Insert)
+            }
+            Some(FailurePoint::InsertUniqueConflictThenCommitFailure) => {
+                Some(FailurePoint::Commit)
+            }
+            failure => failure,
+        };
+        Some(SyncInsertFailure {
+            mysql_code: Some(1062),
+            message: "target mysql statement failed: MySqlError { ERROR 1062 (23000): Duplicate entry 'token-a-page-a' for key 'widgets.uidx_token_page' }".to_string(),
+            failed_batch: rows.to_vec(),
+            remaining_rows: Vec::new(),
+        })
     }
 
     fn bounded_read(&self, request: &SyncChunkReadRequest) -> Vec<DatabaseRow> {
@@ -243,27 +317,120 @@ impl SyncChunkTargetSession for RecordingTargetSession {
         Ok(())
     }
 
-    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
+    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncInsertFailure> {
         self.events
             .borrow_mut()
             .push(Event::Insert(primary_keys(rows)));
-        if self.failure == Some(FailurePoint::Insert) {
-            return Err("injected insert failure".to_string());
+        if let Some(failure) = self.take_insert_failure(rows) {
+            return Err(failure);
         }
         self.pending_rows.extend_from_slice(rows);
         Ok(())
     }
 
+    fn inspect_unique_owner_conflicts(
+        &mut self,
+        failure: &SyncInsertFailure,
+    ) -> Result<Vec<SyncUniqueOwnerConflict>, String> {
+        let index = SyncUniqueIndex {
+            name: "uidx_token_page".to_string(),
+            columns: vec!["token".to_string(), "page".to_string()],
+        };
+        let mut conflicts = Vec::new();
+        for intended in &failure.failed_batch {
+            let intended_identity = index.values(intended, "intended")?;
+            let owners = self
+                .pending_rows
+                .iter()
+                .filter(|owner| {
+                    index
+                        .values(owner, "target owner")
+                        .is_ok_and(|identity| identity == intended_identity)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            match owners.as_slice() {
+                [] => {}
+                [owner] => conflicts.push(SyncUniqueOwnerConflict {
+                    index: index.clone(),
+                    intended: intended.clone(),
+                    owner: owner.clone(),
+                }),
+                _ => return Err("ambiguous injected unique owner".to_string()),
+            }
+        }
+        if conflicts.is_empty() {
+            return Err("missing injected unique owner".to_string());
+        }
+        Ok(conflicts)
+    }
+
+    fn reconcile_unique_owner(
+        &mut self,
+        conflict: &SyncUniqueOwnerConflict,
+        action: &SyncUniqueOwnerAction,
+    ) -> Result<(), String> {
+        self.events
+            .borrow_mut()
+            .push(Event::ReconcileUniqueOwner {
+                index: conflict.index.name.clone(),
+                action: action.as_str().to_string(),
+                intended_primary_key: conflict.intended.primary_key.clone(),
+                target_owner_primary_key: conflict.owner.primary_key.clone(),
+            });
+        if self.failure == Some(FailurePoint::UniqueOwnerReconciliation) {
+            return Err("injected unique-owner reconciliation failure".to_string());
+        }
+        match action {
+            SyncUniqueOwnerAction::Update(row) => {
+                let owner = self
+                    .pending_rows
+                    .iter_mut()
+                    .find(|owner| owner.primary_key == conflict.owner.primary_key)
+                    .expect("target unique owner exists");
+                *owner = row.clone();
+            }
+            SyncUniqueOwnerAction::Delete => self
+                .pending_rows
+                .retain(|owner| owner.primary_key != conflict.owner.primary_key),
+        }
+        self.pending_audits.push(Event::UniqueOwnerAudit {
+            index: conflict.index.name.clone(),
+            action: action.as_str().to_string(),
+            intended_primary_key: conflict.intended.primary_key.clone(),
+            target_owner_primary_key: conflict.owner.primary_key.clone(),
+        });
+        Ok(())
+    }
+
+    fn verify_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
+        let all_match = rows.iter().all(|expected| {
+            self.pending_rows
+                .iter()
+                .any(|actual| actual == expected)
+        });
+        if all_match {
+            Ok(())
+        } else {
+            Err("injected row verification failure".to_string())
+        }
+    }
+
     fn commit(&mut self) -> Result<(), String> {
         self.events.borrow_mut().push(Event::Commit);
         if self.failure == Some(FailurePoint::Commit) {
+            self.pending_audits.clear();
             return Err("injected commit failure".to_string());
         }
         self.visible_rows = self.pending_rows.clone();
+        self.events
+            .borrow_mut()
+            .extend(self.pending_audits.drain(..));
         Ok(())
     }
 
     fn rollback(&mut self) -> Result<(), String> {
+        self.pending_audits.clear();
         self.events.borrow_mut().push(Event::Rollback);
         self.pending_rows = self.visible_rows.clone();
         Ok(())
@@ -379,6 +546,268 @@ fn locks_before_reads_and_saves_progress_after_commit_before_unlock() {
             },
             Event::Unlock,
         ]
+    );
+}
+
+#[test]
+fn unique_owner_conflict_reconciles_current_source_owner_before_insert() {
+    let events = events();
+    let intended = unique_row("10", "token-a", "page-a", "intended");
+    let stale_target_owner = unique_row("20", "token-a", "page-a", "stale-owner");
+    let current_source_owner = unique_row("20", "token-b", "page-b", "current-owner");
+    let mut source = RecordingSource::new(vec![intended.clone()], Rc::clone(&events))
+        .with_exact_rows([current_source_owner.clone()]);
+    let mut target = RecordingTargetSession::new(
+        vec![stale_target_owner],
+        Rc::clone(&events),
+    )
+    .with_bounded_reads()
+    .fail_at(FailurePoint::InsertUniqueConflict);
+    let mut progress = RecordingProgressStore::new(Rc::clone(&events));
+
+    let outcome = sync_next_chunk(
+        &unique_config(10),
+        &mut source,
+        &mut target,
+        &mut progress,
+    )
+    .expect("reconcile exact unique-key owner from current source and insert intended row");
+
+    assert_eq!(outcome.last_primary_key, Some(keys(["10"])));
+    assert_rows_equal(
+        &target.visible_rows,
+        &[intended, current_source_owner],
+    );
+    let recorded = events.borrow();
+    let first_insert = recorded
+        .iter()
+        .position(|event| event == &Event::Insert(vec![keys(["10"])]))
+        .expect("initial conflicting insert");
+    assert_eq!(
+        &recorded[first_insert..first_insert + 6],
+        [
+            Event::Insert(vec![keys(["10"])]),
+            Event::ReconcileUniqueOwner {
+                index: "uidx_token_page".to_string(),
+                action: "update".to_string(),
+                intended_primary_key: keys(["10"]),
+                target_owner_primary_key: keys(["20"]),
+            },
+            Event::Insert(vec![keys(["10"])]),
+            Event::Commit,
+            Event::UniqueOwnerAudit {
+                index: "uidx_token_page".to_string(),
+                action: "update".to_string(),
+                intended_primary_key: keys(["10"]),
+                target_owner_primary_key: keys(["20"]),
+            },
+            Event::ProgressSave {
+                run_spec_json: unique_run_spec_json(10),
+                last_primary_key: Some(keys(["10"])),
+                complete: false,
+                chunks: 1,
+                rows_scanned: 1,
+                inserts: 1,
+                updates: 0,
+                deletes: 0,
+            },
+        ]
+    );
+}
+
+#[test]
+fn unique_owner_conflict_failure_does_not_save_progress() {
+    let events = events();
+    let intended = unique_row("10", "token-a", "page-a", "intended");
+    let stale_target_owner = unique_row("20", "token-a", "page-a", "stale-owner");
+    let current_source_owner = unique_row("20", "token-b", "page-b", "current-owner");
+    let mut source = RecordingSource::new(vec![intended], Rc::clone(&events))
+        .with_exact_rows([current_source_owner]);
+    let mut target = RecordingTargetSession::new(
+        vec![stale_target_owner.clone()],
+        Rc::clone(&events),
+    )
+    .with_bounded_reads()
+    .fail_at(FailurePoint::UniqueOwnerReconciliation);
+    let mut progress = RecordingProgressStore::new(Rc::clone(&events));
+
+    let result = sync_next_chunk(
+        &unique_config(10),
+        &mut source,
+        &mut target,
+        &mut progress,
+    );
+
+    assert!(result.is_err(), "owner reconciliation failure must fail the chunk");
+    assert_eq!(progress.durable, None, "failed reconciliation saved progress");
+    assert_rows_equal(&target.visible_rows, &[stale_target_owner]);
+    let recorded = events.borrow();
+    assert!(recorded.contains(&Event::ReconcileUniqueOwner {
+        index: "uidx_token_page".to_string(),
+        action: "update".to_string(),
+        intended_primary_key: keys(["10"]),
+        target_owner_primary_key: keys(["20"]),
+    }));
+    assert_eq!(
+        &recorded[recorded.len() - 2..],
+        [Event::Rollback, Event::Unlock]
+    );
+    assert!(!recorded.contains(&Event::Commit));
+    assert!(!recorded
+        .iter()
+        .any(|event| matches!(event, Event::UniqueOwnerAudit { .. })));
+    assert!(!recorded
+        .iter()
+        .any(|event| matches!(event, Event::ProgressSave { .. })));
+}
+
+#[test]
+fn unique_owner_audit_is_discarded_when_retry_fails() {
+    let events = events();
+    let intended = unique_row("10", "token-a", "page-a", "intended");
+    let stale_target_owner = unique_row("20", "token-a", "page-a", "stale-owner");
+    let current_source_owner = unique_row("20", "token-b", "page-b", "current-owner");
+    let mut source = RecordingSource::new(vec![intended], Rc::clone(&events))
+        .with_exact_rows([current_source_owner]);
+    let mut target = RecordingTargetSession::new(
+        vec![stale_target_owner.clone()],
+        Rc::clone(&events),
+    )
+    .with_bounded_reads()
+    .fail_at(FailurePoint::InsertUniqueConflictThenRetryFailure);
+    let mut progress = RecordingProgressStore::new(Rc::clone(&events));
+
+    let error = sync_next_chunk(
+        &unique_config(10),
+        &mut source,
+        &mut target,
+        &mut progress,
+    )
+    .expect_err("retry failure must roll back unique-owner reconciliation");
+
+    assert!(error.contains("insert missing rows"), "{error}");
+    assert_eq!(progress.durable, None);
+    assert_rows_equal(&target.visible_rows, &[stale_target_owner]);
+    let recorded = events.borrow();
+    assert!(recorded.contains(&Event::ReconcileUniqueOwner {
+        index: "uidx_token_page".to_string(),
+        action: "update".to_string(),
+        intended_primary_key: keys(["10"]),
+        target_owner_primary_key: keys(["20"]),
+    }));
+    assert!(!recorded
+        .iter()
+        .any(|event| matches!(event, Event::UniqueOwnerAudit { .. })));
+    assert!(!recorded.contains(&Event::Commit));
+    assert_eq!(
+        &recorded[recorded.len() - 2..],
+        [Event::Rollback, Event::Unlock]
+    );
+}
+
+#[test]
+fn unique_owner_audit_is_discarded_when_commit_fails() {
+    let events = events();
+    let intended = unique_row("10", "token-a", "page-a", "intended");
+    let stale_target_owner = unique_row("20", "token-a", "page-a", "stale-owner");
+    let current_source_owner = unique_row("20", "token-b", "page-b", "current-owner");
+    let mut source = RecordingSource::new(vec![intended], Rc::clone(&events))
+        .with_exact_rows([current_source_owner]);
+    let mut target = RecordingTargetSession::new(
+        vec![stale_target_owner.clone()],
+        Rc::clone(&events),
+    )
+    .with_bounded_reads()
+    .fail_at(FailurePoint::InsertUniqueConflictThenCommitFailure);
+    let mut progress = RecordingProgressStore::new(Rc::clone(&events));
+
+    let error = sync_next_chunk(
+        &unique_config(10),
+        &mut source,
+        &mut target,
+        &mut progress,
+    )
+    .expect_err("commit failure must discard unique-owner audit");
+
+    assert!(error.contains("commit target chunk"), "{error}");
+    assert_eq!(progress.durable, None);
+    assert_rows_equal(&target.visible_rows, &[stale_target_owner]);
+    let recorded = events.borrow();
+    assert!(recorded.contains(&Event::Commit));
+    assert!(!recorded
+        .iter()
+        .any(|event| matches!(event, Event::UniqueOwnerAudit { .. })));
+    assert_eq!(
+        &recorded[recorded.len() - 3..],
+        [Event::Commit, Event::Rollback, Event::Unlock]
+    );
+}
+
+#[test]
+fn unique_owner_conflict_deletes_source_absent_owner_before_insert() {
+    let events = events();
+    let intended = unique_row("10", "token-a", "page-a", "intended");
+    let stale_target_owner = unique_row("20", "token-a", "page-a", "stale-owner");
+    let mut source = RecordingSource::new(vec![intended.clone()], Rc::clone(&events));
+    let mut target = RecordingTargetSession::new(
+        vec![stale_target_owner],
+        Rc::clone(&events),
+    )
+    .with_bounded_reads()
+    .fail_at(FailurePoint::InsertUniqueConflict);
+    let mut progress = RecordingProgressStore::new(Rc::clone(&events));
+
+    let outcome = sync_next_chunk(
+        &unique_config(10),
+        &mut source,
+        &mut target,
+        &mut progress,
+    )
+    .expect("delete stale unique owner and insert intended row");
+
+    assert_rows_equal(&target.visible_rows, &[intended]);
+    assert_eq!(outcome.inserts, 1);
+    assert_eq!(outcome.updates, 0);
+    assert_eq!(outcome.deletes, 0);
+    assert!(events.borrow().contains(&Event::ReconcileUniqueOwner {
+        index: "uidx_token_page".to_string(),
+        action: "delete".to_string(),
+        intended_primary_key: keys(["10"]),
+        target_owner_primary_key: keys(["20"]),
+    }));
+}
+
+#[test]
+fn unique_owner_conflict_fails_closed_when_source_owner_legitimately_owns_identity() {
+    let events = events();
+    let intended = unique_row("10", "token-a", "page-a", "intended");
+    let target_owner = unique_row("20", "token-a", "page-a", "target-owner");
+    let source_owner = unique_row("20", "token-a", "page-a", "source-owner");
+    let mut source = RecordingSource::new(vec![intended], Rc::clone(&events))
+        .with_exact_rows([source_owner]);
+    let mut target = RecordingTargetSession::new(
+        vec![target_owner.clone()],
+        Rc::clone(&events),
+    )
+    .with_bounded_reads()
+    .fail_at(FailurePoint::InsertUniqueConflict);
+    let mut progress = RecordingProgressStore::new(Rc::clone(&events));
+
+    let error = sync_next_chunk(
+        &unique_config(10),
+        &mut source,
+        &mut target,
+        &mut progress,
+    )
+    .expect_err("legitimate source owner must fail closed");
+
+    assert!(error.contains("legitimately owns"), "{error}");
+    assert_eq!(progress.durable, None);
+    assert_rows_equal(&target.visible_rows, &[target_owner]);
+    let recorded = events.borrow();
+    assert_eq!(
+        &recorded[recorded.len() - 2..],
+        [Event::Rollback, Event::Unlock]
     );
 }
 
@@ -943,6 +1372,30 @@ fn config(chunk_size: usize) -> SyncChunkConfig {
     }
 }
 
+fn unique_config(chunk_size: usize) -> SyncChunkConfig {
+    SyncChunkConfig {
+        run_id: "sync-run-unique-owner".to_string(),
+        run_spec_json: unique_run_spec_json(chunk_size),
+        target_database: "target_db".to_string(),
+        table: SyncTable {
+            name: "widgets".to_string(),
+            primary_key: vec!["id".to_string()],
+            primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
+            columns: vec![
+                "id".to_string(),
+                "token".to_string(),
+                "page".to_string(),
+                "payload".to_string(),
+            ],
+        },
+        chunk_size,
+    }
+}
+
+fn unique_run_spec_json(chunk_size: usize) -> String {
+    format!(r#"{{"chunk_size":{chunk_size},"scope":"unique-owner"}}"#)
+}
+
 fn loaded_progress() -> SyncChunkProgress {
     SyncChunkProgress {
         run_id: "sync-run-1".to_string(),
@@ -976,6 +1429,18 @@ fn row(id: &str, name: &str) -> DatabaseRow {
         values: BTreeMap::from([
             ("id".to_string(), Some(id.to_string())),
             ("name".to_string(), Some(name.to_string())),
+        ]),
+    }
+}
+
+fn unique_row(id: &str, token: &str, page: &str, payload: &str) -> DatabaseRow {
+    DatabaseRow {
+        primary_key: keys([id]),
+        values: BTreeMap::from([
+            ("id".to_string(), Some(id.to_string())),
+            ("token".to_string(), Some(token.to_string())),
+            ("page".to_string(), Some(page.to_string())),
+            ("payload".to_string(), Some(payload.to_string())),
         ]),
     }
 }

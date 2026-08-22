@@ -152,11 +152,23 @@ impl PersistentMySqlSource {
         &self,
         sql: &str,
     ) -> Result<Vec<Vec<Option<String>>>, MySqlSourceError> {
-        let rows = self
-            .conn
-            .borrow_mut()
-            .query::<mysql::Row, _>(sql)
-            .map_err(source_query_error)?;
+        self.query_and_decode_rows(|conn| conn.query(sql))
+    }
+
+    pub(crate) fn query_statement_rows_as_strings(
+        &self,
+        statement: &SqlStatement,
+    ) -> Result<Vec<Vec<Option<String>>>, MySqlSourceError> {
+        self.query_and_decode_rows(|conn| {
+            conn.exec(&statement.sql, Params::Positional(statement.params.clone()))
+        })
+    }
+
+    fn query_and_decode_rows(
+        &self,
+        query: impl FnOnce(&mut Conn) -> mysql::Result<Vec<mysql::Row>>,
+    ) -> Result<Vec<Vec<Option<String>>>, MySqlSourceError> {
+        let rows = query(&mut self.conn.borrow_mut()).map_err(source_query_error)?;
         Ok(rows.into_iter().map(row_to_strings).collect())
     }
 

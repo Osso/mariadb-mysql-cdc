@@ -54,6 +54,7 @@ SCENARIOS = (
     ScenarioSpec("sync-fk-parent-insert", True),
     ScenarioSpec("sync-fk-parent-update", True),
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
+    ScenarioSpec("sync-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-wide-update", True),
     ScenarioSpec("sync-resume", True),
     ScenarioSpec("sync-authorized-additive-spec-migration", True),
@@ -2654,6 +2655,313 @@ class Harness:
             raise HarnessError(f"child did not converge after parent displacement: {child!r}")
         print("sync_fk_parent_stale_unique_owner_ok constraints_restored=true")
 
+    def reset_target_general_log(self) -> None:
+        assert self.target
+        self.admin_sql(
+            self.target,
+            "SET GLOBAL general_log=OFF; TRUNCATE TABLE mysql.general_log; "
+            "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;",
+        )
+
+    def sync_unique_owner_insert_sequence(self, table: str) -> list[str]:
+        assert self.target
+        records = self.admin_query(
+            self.target,
+            "SELECT command_type,argument FROM mysql.general_log "
+            "WHERE user_host LIKE 'cdc_sync%' "
+            f"AND LOWER(argument) LIKE '%{table}%' ORDER BY event_time;",
+        ).splitlines()
+        sequence = []
+        for record in records:
+            command_type, statement = record.split("\t", 1)
+            normalized = " ".join(statement.lower().split())
+            if not normalized.startswith(f"insert into `{table}`"):
+                continue
+            if "payload-001" in normalized and "payload-128" in normalized:
+                sequence.append("first")
+            elif "payload-129" in normalized and "payload-130" in normalized:
+                sequence.append("second")
+            elif command_type != "Prepare":
+                raise HarnessError(
+                    f"unclassified strict INSERT in target general log: {normalized!r}"
+                )
+        if not sequence:
+            raise HarnessError(
+                f"target general log has no value-bearing strict INSERTs: {records!r}"
+            )
+        return sequence
+
+    def sync_unique_owner_transaction_sequences(self, table: str) -> list[list[str]]:
+        assert self.target
+        records = self.admin_query(
+            self.target,
+            "SELECT thread_id,command_type,argument FROM mysql.general_log "
+            "WHERE user_host LIKE 'cdc_sync%' ORDER BY event_time,thread_id;",
+        ).splitlines()
+        transactions: list[list[str]] = []
+        active_by_thread: dict[str, list[str]] = {}
+        owner_primary_key = re.compile(
+            r"\bwhere\b.*(?:`id`|id)\s*(?:<=>|=)\s*200(?:\D|$)"
+        )
+        for record in records:
+            thread_id, command_type, statement = record.split("\t", 2)
+            if command_type not in {"Query", "Execute"}:
+                continue
+            normalized = " ".join(statement.lower().split()).rstrip(";")
+            if normalized == "begin" or normalized.startswith("start transaction"):
+                active_by_thread[thread_id] = ["begin"]
+                continue
+            transaction = active_by_thread.get(thread_id)
+            if transaction is None:
+                continue
+
+            event = None
+            if normalized == "commit" or normalized.startswith("commit "):
+                event = "commit"
+            elif normalized == "rollback" or normalized.startswith("rollback "):
+                event = "rollback"
+            elif normalized.startswith(f"insert into `{table}`"):
+                if "payload-001" in normalized and "payload-128" in normalized:
+                    event = "first_batch_insert"
+                elif "payload-129" in normalized and "payload-130" in normalized:
+                    event = (
+                        "colliding_insert"
+                        if "colliding_insert" not in transaction
+                        else "retry_insert"
+                    )
+            elif (
+                normalized.startswith(f"update `{table}` set")
+                and owner_primary_key.search(normalized)
+                and all(
+                    value in normalized
+                    for value in ("token-200", "page-200", "payload-200")
+                )
+            ):
+                event = "owner_update"
+            elif normalized.startswith(
+                f"delete from `{table}`"
+            ) and owner_primary_key.search(normalized):
+                event = "owner_delete"
+
+            if event is None:
+                continue
+            transaction.append(event)
+            if event in {"commit", "rollback"}:
+                transactions.append(transaction)
+                del active_by_thread[thread_id]
+        return transactions
+
+    def assert_sync_unique_owner_transaction(
+        self,
+        table: str,
+        *,
+        owner_action: str,
+        outcome: str,
+    ) -> list[str]:
+        expected = [
+            "begin",
+            "first_batch_insert",
+            "colliding_insert",
+            f"owner_{owner_action}",
+            "retry_insert",
+            outcome,
+        ]
+        transactions = self.sync_unique_owner_transaction_sequences(table)
+        matches = [transaction for transaction in transactions if transaction == expected]
+        if len(matches) != 1:
+            raise HarnessError(
+                "unique-owner transaction ordering mismatch: "
+                f"expected={expected!r} transactions={transactions!r}"
+            )
+        return matches[0]
+
+    def sync_unique_owner_audits(self, result: CommandResult) -> list[dict]:
+        audits = []
+        for line in "\n".join((result.stdout, result.stderr)).splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if value.get("event") == "sync_unique_owner_reconciliation":
+                audits.append(value)
+        return audits
+
+    def run_sync_unique_owner_rollback_resume(self) -> None:
+        assert self.source and self.target
+        table = "sync_unique_owner_rows"
+        run_id = "sync-unique-owner-rollback-resume"
+        schema = (
+            f"DROP TABLE IF EXISTS {table}; "
+            f"CREATE TABLE {table} ("
+            "id INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "token VARCHAR(64) NOT NULL, "
+            "page VARCHAR(64) NOT NULL, "
+            "payload VARCHAR(64) NOT NULL, "
+            "UNIQUE KEY uidx_token_page (token,page)"
+            ") ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema)
+        source_rows = [
+            (row_id, f"token-{row_id:03}", f"page-{row_id:03}", f"payload-{row_id:03}")
+            for row_id in range(1, 131)
+        ]
+        source_rows.append((200, "token-200", "page-200", "payload-200"))
+        values = ",".join(
+            f"({row_id},{sql_literal(token)},{sql_literal(page)},{sql_literal(payload)})"
+            for row_id, token, page, payload in source_rows
+        )
+        self.admin_sql(self.source, f"INSERT INTO {table} VALUES {values};")
+        self.admin_sql(
+            self.target,
+            f"INSERT INTO {table} VALUES "
+            "(200,'token-129','page-129','misfiled-owner');",
+        )
+        self.admin_sql(
+            self.target,
+            f"DELIMITER //\n"
+            f"CREATE TRIGGER {table}_owner_repaired AFTER UPDATE ON {table} FOR EACH ROW\n"
+            "BEGIN\n"
+            "  IF NEW.id=200 THEN SET @sync_owner_repaired=1; END IF;\n"
+            "END//\n"
+            f"CREATE TRIGGER {table}_retry_failure BEFORE INSERT ON {table} FOR EACH ROW\n"
+            "BEGIN\n"
+            "  IF COALESCE(@sync_owner_repaired,0)=1 THEN\n"
+            "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected unique-owner retry failure';\n"
+            "  END IF;\n"
+            "END//\n"
+            "DELIMITER ;\n",
+        )
+
+        self.reset_target_general_log()
+        failed = self.run_sync(tables=[table], run_id=run_id, chunk_size=130)
+        failed_sequence = self.sync_unique_owner_insert_sequence(table)
+        failed_transaction = self.assert_sync_unique_owner_transaction(
+            table,
+            owner_action="update",
+            outcome="rollback",
+        )
+        self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
+        failed_output = "\n".join((failed.stdout, failed.stderr))
+        if failed.returncode == 0 or "injected unique-owner retry failure" not in failed_output:
+            raise HarnessError(
+                "unique-owner retry failure was not observed: "
+                f"exit={failed.returncode} output={failed_output!r}"
+            )
+        retained = self.admin_query(
+            self.target,
+            f"SELECT id,token,page,payload FROM {table} ORDER BY id;",
+        ).strip()
+        if retained != "200\ttoken-129\tpage-129\tmisfiled-owner":
+            raise HarnessError(f"failed sync did not roll back target rows: {retained!r}")
+        failed_progress = self.admin_query(
+            self.target,
+            "SELECT status,IF(last_primary_key_json IS NULL,'<NULL>',last_primary_key_json),"
+            "chunks,rows_scanned,inserts_applied,updates_applied,deletes_applied,"
+            "IF(last_error IS NULL,'<NULL>',last_error) FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='rows' AND table_name={sql_literal(table)};",
+        ).strip()
+        if failed_progress:
+            raise HarnessError(
+                f"failed first chunk unexpectedly persisted row-stage progress: {failed_progress!r}"
+            )
+        retained_run_identity = self.admin_query(
+            self.target,
+            "SELECT COUNT(*),SUM(stage='prerequisite_schema' AND status='complete'),"
+            "SUM(stage='rows'),COUNT(DISTINCT run_spec_json) FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND table_name={sql_literal(table)};",
+        ).strip()
+        if retained_run_identity != "1\t1\t0\t1":
+            raise HarnessError(
+                "failed first chunk did not retain one resumable prerequisite identity: "
+                f"{retained_run_identity!r}"
+            )
+        if failed_sequence != ["first", "second", "second"]:
+            raise HarnessError(
+                f"failed sync strict INSERT sequence was not atomic: {failed_sequence!r}"
+            )
+        failed_audits = self.sync_unique_owner_audits(failed)
+        if failed_audits:
+            raise HarnessError(
+                "rolled-back unique-owner repair emitted an audit: "
+                f"audits={failed_audits!r} progress='<ABSENT>' "
+                f"run_identity={retained_run_identity!r} insert_sequence={failed_sequence!r} "
+                f"transaction={failed_transaction!r}"
+            )
+
+        self.admin_sql(
+            self.target,
+            f"DROP TRIGGER {table}_retry_failure; DROP TRIGGER {table}_owner_repaired;",
+        )
+        self.reset_target_general_log()
+        resumed = self.run_sync(tables=[table], run_id=run_id, chunk_size=130)
+        resumed_sequence = self.sync_unique_owner_insert_sequence(table)
+        resumed_transaction = self.assert_sync_unique_owner_transaction(
+            table,
+            owner_action="update",
+            outcome="commit",
+        )
+        self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
+        require_success(resumed, "resumed secondary unique-owner sync")
+
+        source_snapshot = self.admin_query(
+            self.source,
+            f"SELECT id,token,page,payload FROM {table} ORDER BY id;",
+        ).strip()
+        target_snapshot = self.admin_query(
+            self.target,
+            f"SELECT id,token,page,payload FROM {table} ORDER BY id;",
+        ).strip()
+        if target_snapshot != source_snapshot or len(target_snapshot.splitlines()) != 131:
+            raise HarnessError(
+                "resumed sync did not converge all 131 source rows: "
+                f"source={source_snapshot!r} target={target_snapshot!r}"
+            )
+        critical_rows = self.admin_query(
+            self.target,
+            f"SELECT id,token,page,payload FROM {table} WHERE id IN (129,200) ORDER BY id;",
+        ).splitlines()
+        if critical_rows != [
+            "129\ttoken-129\tpage-129\tpayload-129",
+            "200\ttoken-200\tpage-200\tpayload-200",
+        ]:
+            raise HarnessError(f"critical unique-owner rows are wrong: {critical_rows!r}")
+        progress = self.admin_query(
+            self.target,
+            "SELECT status,last_primary_key_json,chunks,rows_scanned,inserts_applied,"
+            "updates_applied,deletes_applied FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='rows' AND table_name={sql_literal(table)};",
+        ).strip()
+        if progress != 'complete\t["200"]\t3\t131\t130\t0\t0':
+            raise HarnessError(f"resumed unique-owner progress mismatch: {progress!r}")
+        if resumed_sequence != ["first", "second", "second"]:
+            raise HarnessError(
+                f"resumed sync replayed or skipped strict INSERT batches: {resumed_sequence!r}"
+            )
+        audits = self.sync_unique_owner_audits(resumed)
+        if len(audits) != 1:
+            raise HarnessError(f"expected one committed reconciliation audit: {audits!r}")
+        expected_audit = {
+            "event": "sync_unique_owner_reconciliation",
+            "table": table,
+            "index": "uidx_token_page",
+            "action": "update",
+            "intended_primary_key": ["129"],
+            "owner_primary_key": ["200"],
+        }
+        if audits[0] != expected_audit:
+            raise HarnessError(f"unexpected reconciliation audit: {audits[0]!r}")
+        encoded_audit = json.dumps(audits[0], sort_keys=True)
+        for secret in ["token-129", "page-129", "payload-129", "misfiled-owner", "token-200"]:
+            if secret in encoded_audit:
+                raise HarnessError(f"reconciliation audit leaked {secret!r}: {encoded_audit}")
+        print(
+            "sync_unique_owner_rollback_resume_ok rows=131 chunks=3 inserts=130 "
+            "failed_sequence=first,second,second resumed_sequence=first,second,second "
+            f"failed_transaction={','.join(failed_transaction)} "
+            f"resumed_transaction={','.join(resumed_transaction)} audits=1"
+        )
+
     def run_sync_wide_update(self) -> None:
         assert self.source and self.target
         payload_columns = [f"value_{index}" for index in range(1, 256)]
@@ -3454,6 +3762,8 @@ class Harness:
             self.run_sync_fk_parent_convergence(update_existing_child=True)
         elif scenario == "sync-fk-parent-stale-unique-owner":
             self.run_sync_fk_parent_stale_unique_owner()
+        elif scenario == "sync-unique-owner-rollback-resume":
+            self.run_sync_unique_owner_rollback_resume()
         elif scenario == "sync-wide-update":
             self.run_sync_wide_update()
         elif scenario == "sync-resume":

@@ -90,6 +90,12 @@ fn real_unified_sync_reconciles_stale_unique_owner() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_unified_sync_unique_owner_repair_rolls_back_and_resumes() {
+    run_harness_scenario("sync-unique-owner-rollback-resume");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_unified_sync_wide_update_converges() {
     run_harness_scenario("sync-wide-update");
 }
@@ -343,6 +349,7 @@ harness.run_sync_fk_parent_convergence = lambda update_existing_child=False: cal
     'sync-fk-parent-update' if update_existing_child else 'sync-fk-parent-insert'
 )
 harness.run_sync_fk_parent_stale_unique_owner = lambda: calls.append('sync-fk-parent-stale-unique-owner')
+harness.run_sync_unique_owner_rollback_resume = lambda: calls.append('sync-unique-owner-rollback-resume')
 harness.run_sync_wide_update = lambda: calls.append('sync-wide-update')
 harness.run_sync_resume = lambda: calls.append('sync-resume')
 harness.run_sync_progress_least_privilege = lambda: calls.append('sync-progress-least-privilege')
@@ -353,6 +360,7 @@ for scenario in (
     'sync-fk-parent-insert',
     'sync-fk-parent-update',
     'sync-fk-parent-stale-unique-owner',
+    'sync-unique-owner-rollback-resume',
     'sync-wide-update',
     'sync-resume',
     'sync-progress-least-privilege',

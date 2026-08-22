@@ -29,6 +29,15 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - [x] Route `recover-lost-binlog` through one unified run with exact `recovery_id`, captured source evidence, exact source-table progress proof, and `cdc.sync_runs` progress.
 - [ ] Prove resync/recovery source-evidence capture and complete staged execution through disposable production-shaped endpoints.
 
+### Strict row mutations and secondary-unique repair
+
+- [x] Keep unified-sync row mutations source-authoritative and strict: normal missing-row work uses plain batched `INSERT`; never use `INSERT IGNORE`, upsert, `REPLACE`, or a fallback engine.
+- [x] On a strict insert `1062`, reconcile only the named full-column, non-`PRIMARY` secondary unique index reported by MySQL. The target session keeps the existing table `WRITE` lock and transaction, resolves exactly one owner per intended row with NULL-safe `<=>` predicates, and exact-reads that owner primary key from the current source.
+- [x] The supported index must have contiguous metadata for every full indexed column. Prefixed columns, expression columns, `PRIMARY`, absent or ambiguous index metadata, absent or ambiguous owner evidence, and NULL-valued unique identities fail closed; `<=>` is used for owner lookup so NULL handling cannot become accidental ordinary-equality behavior.
+- [x] A different-primary-key owner is reconciled to its complete current source row, or deleted when that source primary key is absent. If the current source owner still legitimately owns the intended unique identity, or its primary key/column set disagrees, reconciliation fails closed.
+- [x] Verify each owner mutation and the intended source rows, then retry only the failed insert batch plus untouched remaining insert rows. Repeated conflict keys are rejected rather than retried indefinitely; any repair, retry, verification, or commit failure rolls back the whole locked chunk and leaves durable progress unchanged.
+- [x] Commit the target chunk before persisting its progress. Reconciliation audits are secret-free and emitted only after a successful commit; rollback or commit failure discards pending audits. Counters remain tied to planned source operations, and this behavior does not change run identity, run specification, or live CDC duplicate handling.
+
 ### Connection construction retry
 
 - [x] Retry a sync connection construction only when `mysql::Error::is_connectivity_error()` classifies the failure as connectivity-related.
@@ -70,12 +79,13 @@ The unified synchronization engine runs prerequisite schema convergence, source-
 - `src/main/tests/sync_cli_config.rs` — endpoint, scope, defaults, runtime options, and exclusive immutable run identity parsing.
 - `src/main/tests/sync_orchestrator.rs` — stage order, resume behavior, immutable progress identity, table-selection validation, error persistence, and row-failure cutoff.
 - `src/main/tests/sync_runner.rs` — bounded deterministic table execution, completion behavior, and no retry of row-chunk failures.
-- `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering and checkpoint boundary.
-- `src/main/tests/sync_mysql_adapter.rs` and `src/main/tests/sync_mysql_contract.rs` — adapter and SQL contracts, including bounded connectivity-only connection construction retry.
+- `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering, checkpoint boundary, strict secondary-unique owner repair, rollback, retry, verification, and post-commit audit behavior.
+- `src/main/tests/sync_mysql_adapter.rs` and `src/main/tests/sync_mysql_contract.rs` — adapter and SQL contracts, including strict insert batching, exact owner/index reads, fail-closed index handling, and bounded connectivity-only connection construction retry.
 - `src/main/tests/resync_unified.rs` — resync run identity, all-table mapping, and changed-table reporting.
 - `src/main/tests/lost_binlog_unified.rs` — recovery run identity, source-only proof evidence, exact progress scope, and incomplete/wrong-run rejection.
 - `src/main/tests/sync_config.rs`, `src/main/tests/sync_run_spec_migration.rs`, and `src/main/tests/sync_run_spec_migration_store.rs` — authorization parsing, additive compatibility, locked-state decisions, transactional rollback/count verification, and runtime wiring.
 - `scripts/cdc-integration-harness.py` scenario `sync-authorized-additive-spec-migration` — real MariaDB-to-MySQL wrong-hash no-write, atomic migration, preserved metadata, data convergence, idempotence, and changed-table row-progress rejection.
+- `scripts/cdc-integration-harness.py` scenario `sync-unique-owner-rollback-resume`, with `tests/cdc_eventual_consistency.rs` wrapper — real MariaDB-to-MySQL 128-row/2-row strict insert boundary, rollback with absent row progress, identical-run resume, 131-row convergence, no replay, and post-commit audit.
 
 ## Known gaps (current cycle)
 

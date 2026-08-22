@@ -1,4 +1,4 @@
-use super::model::{SyncChunkReadRequest, SyncPrimaryKeyOrdering, SyncTable};
+use super::model::{SyncChunkReadRequest, SyncPrimaryKeyOrdering, SyncTable, SyncUniqueIndex};
 use crate::database_row::DatabaseRow;
 use crate::mysql_support::{quote_ident, quote_sql_literal};
 use crate::target::SqlStatement;
@@ -18,6 +18,64 @@ pub(crate) fn build_sync_select_sql(table: &SyncTable, request: &SyncChunkReadRe
         quote_ident(&table.name),
         request.limit
     )
+}
+
+pub(crate) fn build_exact_primary_key_select_statement(
+    table: &SyncTable,
+    primary_key: &[String],
+) -> Result<SqlStatement, String> {
+    if primary_key.len() != table.primary_key.len() {
+        return Err(format!(
+            "exact primary-key width mismatch for `{}`: expected {}, found {}",
+            table.name,
+            table.primary_key.len(),
+            primary_key.len()
+        ));
+    }
+    Ok(SqlStatement {
+        sql: format!(
+            "SELECT {} FROM {} WHERE {} LIMIT 2",
+            quote_ident_list(&table.columns),
+            quote_ident(&table.name),
+            primary_key_predicates(&table.primary_key).join(" AND ")
+        ),
+        params: primary_key.iter().cloned().map(string_param).collect(),
+    })
+}
+
+pub(crate) fn build_unique_index_columns_statement(database: &str, table: &str) -> SqlStatement {
+    SqlStatement {
+        sql: "SELECT INDEX_NAME,COLUMN_NAME,SEQ_IN_INDEX,SUB_PART FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0 ORDER BY INDEX_NAME,SEQ_IN_INDEX".to_string(),
+        params: vec![string_param(database.to_string()), string_param(table.to_string())],
+    }
+}
+
+pub(crate) fn build_unique_owner_select_statement(
+    table: &SyncTable,
+    index: &SyncUniqueIndex,
+    intended: &DatabaseRow,
+) -> Result<SqlStatement, String> {
+    if index.columns.is_empty() {
+        return Err(format!(
+            "secondary unique index `{}` has no columns for `{}`",
+            index.name, table.name
+        ));
+    }
+    let params = required_non_null_values(intended, &index.columns, "unique index")?;
+    let predicates = index
+        .columns
+        .iter()
+        .map(|column| format!("{} <=> ?", quote_ident(column)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    Ok(SqlStatement {
+        sql: format!(
+            "SELECT {} FROM {} WHERE {predicates} LIMIT 2",
+            quote_ident_list(&table.columns),
+            quote_ident(&table.name)
+        ),
+        params,
+    })
 }
 
 pub(crate) fn build_lock_table_write_sql(database: &str, table: &str) -> String {
@@ -251,6 +309,24 @@ fn primary_key_predicates(primary_key: &[String]) -> Vec<String> {
     primary_key
         .iter()
         .map(|column| format!("{} = ?", quote_ident(column)))
+        .collect()
+}
+
+fn required_non_null_values(
+    row: &DatabaseRow,
+    columns: &[String],
+    label: &str,
+) -> Result<Vec<Value>, String> {
+    columns
+        .iter()
+        .map(|column| {
+            row.values
+                .get(column)
+                .ok_or_else(|| format!("{label} column `{column}` is absent"))?
+                .clone()
+                .map(string_param)
+                .ok_or_else(|| format!("{label} column `{column}` is NULL"))
+        })
         .collect()
 }
 

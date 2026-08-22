@@ -21,13 +21,15 @@ pub(crate) use model::SyncChunkProgress;
 #[cfg(test)]
 pub(crate) use model::{
     SyncChunkConfig, SyncChunkProgressStore, SyncChunkReadRequest, SyncChunkSource,
-    SyncChunkTargetSession, SyncPrimaryKeyOrdering, SyncProgressRow, SyncProgressStatus,
-    SyncRunProgressStore, SyncStage, SyncTable,
+    SyncChunkTargetSession, SyncInsertFailure, SyncPrimaryKeyOrdering, SyncProgressRow,
+    SyncProgressStatus, SyncRunProgressStore, SyncStage, SyncTable, SyncUniqueIndex,
+    SyncUniqueOwnerAction, SyncUniqueOwnerConflict,
 };
 #[cfg(test)]
 pub(crate) use mysql::{
-    build_strict_delete_batches, build_strict_insert_batches, build_strict_update_batches,
-    decode_sync_rows, retry_sync_connection_construction, strict_delete_batch_capacity,
+    SyncUniqueIndexColumn, build_strict_delete_batches, build_strict_update_batches,
+    build_sync_insert_failure, decode_sync_rows, format_unique_owner_reconciliation_event,
+    resolve_sync_unique_index, retry_sync_connection_construction, strict_delete_batch_capacity,
     strict_insert_batch_capacity, strict_update_batch_capacity, sync_chunk_progress_from_row,
     sync_progress_row_from_chunk, validate_sync_target_lock_identity,
 };
@@ -56,6 +58,8 @@ pub(crate) use run_spec_migration::{
 };
 #[cfg(test)]
 pub(crate) use sql::{
-    build_lock_table_write_sql, build_strict_delete_rows_statement, build_strict_insert_statement,
+    build_exact_primary_key_select_statement, build_lock_table_write_sql,
+    build_strict_delete_rows_statement, build_strict_insert_statement,
     build_strict_update_rows_statement, build_sync_select_sql,
+    build_unique_index_columns_statement, build_unique_owner_select_statement,
 };

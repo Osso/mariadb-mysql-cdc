@@ -9,8 +9,26 @@ Supported operations:
 - update by primary key
 - delete by primary key
 
-Unified sync emits strict plain multi-row `INSERT` statements. The native ROW
-applier uses a separate plain `INSERT` path and emits:
+Unified sync emits strict plain multi-row `INSERT` statements. On a `1062`
+from the named full-column non-`PRIMARY` secondary unique index, unified sync may
+reconcile one proven wrong-primary-key owner inside the same target `WRITE` lock
+and transaction. For each intended row, it resolves exactly one owner with
+NULL-safe `<=>` predicates, exact-reads that owner primary key from current source,
+updates it to the complete
+source row or deletes it when source-absent, verifies the mutation and intended
+row, then retries only the failed batch plus untouched remaining insert rows.
+`PRIMARY`, prefixed, expression, absent, ambiguous, NULL-valued, repeated, and
+source-legitimate-owner evidence fail closed. Normal inserts remain strict; no
+ignore, upsert, replace, or fallback path exists. Repeated conflicts are bounded
+and fail rather than loop.
+
+The target chunk commits before durable progress is saved. Repair, retry,
+verification, or commit failure rolls back the whole locked chunk and leaves
+progress unchanged. Reconciliation audit events are secret-free, held pending
+commit, emitted only after successful commit, and discarded on rollback or commit
+failure.
+
+The native ROW applier uses a separate plain `INSERT` path and emits:
 
 - `UPDATE ... SET ... WHERE <primary-key predicates>`
 - `DELETE FROM ... WHERE <primary-key predicates>`
@@ -56,8 +74,11 @@ failure, repeated keys, or combined repair depth beyond eight.
 
 `--insert-conflict-policy` is not part of unified `sync` and does not select a
 native ROW live-stream policy. Unified sync never uses `INSERT IGNORE`, upsert,
-`REPLACE`, post-write rereads, or final drift scans. Strict mutation errors fail
-the locked chunk and leave its durable progress unchanged.
+`REPLACE`, or a fallback engine. Its narrowly scoped secondary-unique repair uses
+exact post-mutation rereads and retries only the failed plus untouched remaining
+insert rows; strict mutation, repair, verification, and commit failures fail the
+locked chunk and leave its durable progress unchanged. Final drift scans remain
+outside the row-chunk boundary.
 
 Schema constraints are prepared and restored by the staged schema phases. Row
 chunks hold the target-table `WRITE` lock through source read, target read,

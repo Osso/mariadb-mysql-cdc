@@ -1,8 +1,10 @@
 use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkProgress, SyncPrimaryKeyOrdering, SyncProgressStatus, SyncStage, SyncTable,
-    build_strict_delete_batches, build_strict_insert_batches, build_strict_update_batches,
-    decode_sync_rows, retry_sync_connection_construction, strict_delete_batch_capacity,
+    SyncUniqueIndex, SyncUniqueIndexColumn, SyncUniqueOwnerAction, SyncUniqueOwnerConflict,
+    build_strict_delete_batches, build_strict_update_batches, build_sync_insert_failure,
+    decode_sync_rows, format_unique_owner_reconciliation_event,
+    resolve_sync_unique_index, retry_sync_connection_construction, strict_delete_batch_capacity,
     strict_insert_batch_capacity, strict_update_batch_capacity, sync_chunk_progress_from_row,
     sync_progress_row_from_chunk, validate_sync_target_lock_identity,
 };
@@ -169,20 +171,16 @@ fn sync_mysql_adapter_batches_strict_mutations_within_placeholder_limits() {
     assert_eq!(strict_update_batch_capacity(&table), 128);
     assert_eq!(strict_delete_batch_capacity(&table), 128);
 
-    let inserts = build_strict_insert_batches(&table, &rows);
     let updates = build_strict_update_batches(&table, &rows);
     let deletes = build_strict_delete_batches(&table, &primary_keys);
 
-    assert_eq!(inserts.len(), 2);
     assert_eq!(updates.len(), 2);
     assert_eq!(deletes.len(), 2);
-    assert_eq!(inserts[0].params.len(), 128 * 3);
     assert_eq!(updates[0].params.len(), 128 * 5);
     assert_eq!(deletes[0].params.len(), 128);
 
-    let mutation_sql = inserts
+    let mutation_sql = updates
         .iter()
-        .chain(&updates)
         .chain(&deletes)
         .map(|statement| statement.sql.as_str())
         .collect::<Vec<_>>()
@@ -195,7 +193,6 @@ fn sync_mysql_adapter_batches_strict_mutations_within_placeholder_limits() {
         );
     }
 
-    assert!(build_strict_insert_batches(&table, &[]).is_empty());
     assert!(build_strict_update_batches(&table, &[]).is_empty());
     assert!(build_strict_delete_batches(&table, &[]).is_empty());
 
@@ -205,6 +202,115 @@ fn sync_mysql_adapter_batches_strict_mutations_within_placeholder_limits() {
 
     let wide_primary_key_table = wide_primary_key_table(1_000);
     assert_eq!(strict_delete_batch_capacity(&wide_primary_key_table), 65);
+}
+
+#[test]
+fn sync_mysql_adapter_retains_unique_owner_failed_batch_and_remaining_insert_rows() {
+    let rows = (0..260)
+        .map(|index| row(&index.to_string(), "live", "Now"))
+        .collect::<Vec<_>>();
+
+    let failure = build_sync_insert_failure(
+        &rows,
+        128,
+        128,
+        Some(1062),
+        "duplicate".to_string(),
+    );
+
+    assert_eq!(failure.failed_batch, rows[128..256]);
+    assert_eq!(failure.remaining_rows, rows[256..]);
+    assert_eq!(failure.retry_rows(), rows[128..]);
+}
+
+#[test]
+fn sync_mysql_adapter_resolves_only_named_full_secondary_unique_owner_indexes() {
+    let rows = vec![
+        unique_index_column("PRIMARY", "id", 1, None),
+        unique_index_column("uidx_token_page", "token", 1, None),
+        unique_index_column("uidx_token_page", "page", 2, None),
+    ];
+    assert_eq!(
+        resolve_sync_unique_index(
+            "widgets",
+            "Duplicate entry 'token-a-page-a' for key 'widgets.uidx_token_page'",
+            rows.clone(),
+        )
+        .expect("qualified secondary unique index"),
+        SyncUniqueIndex {
+            name: "uidx_token_page".to_string(),
+            columns: strings(["token", "page"]),
+        }
+    );
+    assert!(
+        resolve_sync_unique_index(
+            "widgets",
+            "Duplicate entry '10' for key 'PRIMARY'",
+            rows.clone(),
+        )
+        .expect_err("PRIMARY must fail closed")
+        .contains("PRIMARY")
+    );
+
+    let prefixed = vec![unique_index_column(
+        "uidx_token_page",
+        "token",
+        1,
+        Some(8),
+    )];
+    assert!(
+        resolve_sync_unique_index(
+            "widgets",
+            "Duplicate entry 'token-a' for key 'uidx_token_page'",
+            prefixed,
+        )
+        .expect_err("prefixed unique index must fail closed")
+        .contains("prefixed")
+    );
+
+    let expression = vec![SyncUniqueIndexColumn {
+        index: "uidx_expression".to_string(),
+        column: None,
+        sequence: 1,
+        prefix_length: None,
+    }];
+    assert!(
+        resolve_sync_unique_index(
+            "widgets",
+            "Duplicate entry 'x' for key 'uidx_expression'",
+            expression,
+        )
+        .expect_err("expression unique index must fail closed")
+        .contains("expression")
+    );
+}
+
+#[test]
+fn sync_mysql_adapter_formats_secret_free_reconciliation_event() {
+    let conflict = SyncUniqueOwnerConflict {
+        index: SyncUniqueIndex {
+            name: "uidx_token_page".to_string(),
+            columns: strings(["token", "page"]),
+        },
+        intended: unique_row("10", "token-a", "page-a", "intended-secret"),
+        owner: unique_row("20", "token-a", "page-a", "owner-secret"),
+    };
+    let action = SyncUniqueOwnerAction::Update(unique_row(
+        "20",
+        "token-b",
+        "page-b",
+        "source-secret",
+    ));
+
+    let event = format_unique_owner_reconciliation_event("widgets", &conflict, &action);
+
+    assert_eq!(
+        event,
+        r#"{"event":"sync_unique_owner_reconciliation","table":"widgets","index":"uidx_token_page","action":"update","intended_primary_key":["10"],"owner_primary_key":["20"]}"#
+    );
+    for secret in ["token-a", "page-a", "intended-secret", "owner-secret", "source-secret"] {
+        assert!(!event.contains(secret), "event leaked `{secret}`: {event}");
+    }
 }
 
 #[test]
@@ -294,6 +400,32 @@ fn mutation_table() -> SyncTable {
         primary_key: strings(["id"]),
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "status", "title"]),
+    }
+}
+
+fn unique_index_column(
+    index: &str,
+    column: &str,
+    sequence: u64,
+    prefix_length: Option<u64>,
+) -> SyncUniqueIndexColumn {
+    SyncUniqueIndexColumn {
+        index: index.to_string(),
+        column: Some(column.to_string()),
+        sequence,
+        prefix_length,
+    }
+}
+
+fn unique_row(id: &str, token: &str, page: &str, payload: &str) -> DatabaseRow {
+    DatabaseRow {
+        primary_key: strings([id]),
+        values: BTreeMap::from([
+            ("id".to_string(), Some(id.to_string())),
+            ("token".to_string(), Some(token.to_string())),
+            ("page".to_string(), Some(page.to_string())),
+            ("payload".to_string(), Some(payload.to_string())),
+        ]),
     }
 }
 

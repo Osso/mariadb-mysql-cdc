@@ -3,7 +3,8 @@ use crate::mysql_config::MySqlConnectionConfig;
 use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
-    SyncChunkSource, SyncChunkTargetSession, SyncConfig, SyncPrimaryKeyOrdering, SyncRunIdentity,
+    SyncChunkSource, SyncChunkTargetSession, SyncConfig, SyncInsertFailure,
+    SyncPrimaryKeyOrdering, SyncRunIdentity,
     SyncTable, build_sync_run_identity, run_sync_tables_bounded, sync_table_to_completion,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -206,7 +207,7 @@ impl SyncChunkTargetSession for TailTarget {
         Ok(())
     }
 
-    fn insert_rows(&mut self, _rows: &[DatabaseRow]) -> Result<(), String> {
+    fn insert_rows(&mut self, _rows: &[DatabaseRow]) -> Result<(), SyncInsertFailure> {
         Ok(())
     }
 

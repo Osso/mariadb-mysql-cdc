@@ -1,9 +1,10 @@
 use super::model::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
-    SyncChunkSource, SyncChunkTargetSession, SyncTable,
+    SyncChunkSource, SyncChunkTargetSession, SyncInsertFailure, SyncTable, SyncUniqueOwnerAction,
+    SyncUniqueOwnerConflict,
 };
 use crate::database_row::DatabaseRow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn sync_next_chunk(
     config: &SyncChunkConfig,
@@ -142,7 +143,7 @@ fn apply_locked_chunk(
     let next_progress = if source_rows.is_empty() {
         apply_target_tail(config, progress, start_after, target)?
     } else {
-        apply_source_window(config, progress, start_after, source_rows, target)?
+        apply_source_window(config, progress, start_after, source_rows, source, target)?
     };
 
     target
@@ -156,6 +157,7 @@ fn apply_source_window(
     mut progress: SyncChunkProgress,
     start_after: Option<Vec<String>>,
     source_rows: Vec<DatabaseRow>,
+    source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
 ) -> Result<SyncChunkProgress, String> {
     let end_at = source_rows
@@ -164,7 +166,7 @@ fn apply_source_window(
         .expect("non-empty source window");
     let target_rows = read_complete_target_window(config, start_after, &end_at, target)?;
     let changes = chunk_changes(&config.table, &source_rows, &target_rows);
-    apply_changes(&config.table.name, target, &changes)?;
+    apply_changes(&config.table.name, source, target, &changes)?;
 
     progress.last_primary_key = Some(end_at);
     progress.complete = false;
@@ -302,6 +304,7 @@ fn rows_diverge(table: &SyncTable, source: &DatabaseRow, target: &DatabaseRow) -
 
 fn apply_changes(
     table: &str,
+    source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
     changes: &ChunkChanges,
 ) -> Result<(), String> {
@@ -315,12 +318,195 @@ fn apply_changes(
             .update_rows(&changes.updates)
             .map_err(|error| format!("update divergent rows in `{table}`: {error}"))?;
     }
-    if !changes.inserts.is_empty() {
+    apply_strict_inserts(table, source, target, &changes.inserts)
+}
+
+fn apply_strict_inserts(
+    table: &str,
+    source: &mut impl SyncChunkSource,
+    target: &mut impl SyncChunkTargetSession,
+    rows: &[DatabaseRow],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut pending_rows = rows.to_vec();
+    let mut reconciled_conflicts = BTreeSet::new();
+    let mut reconciled_intended_rows = BTreeMap::new();
+    loop {
+        let Some(failure) = try_strict_insert(table, target, &pending_rows)? else {
+            break;
+        };
+        pending_rows = failure.retry_rows();
+        inspect_and_reconcile_insert_failure(
+            table,
+            source,
+            target,
+            &failure,
+            &mut reconciled_conflicts,
+            &mut reconciled_intended_rows,
+        )?;
+    }
+    if !reconciled_intended_rows.is_empty() {
+        let rows = reconciled_intended_rows.into_values().collect::<Vec<_>>();
         target
-            .insert_rows(&changes.inserts)
-            .map_err(|error| format!("insert missing rows into `{table}`: {error}"))?;
+            .verify_rows(&rows)
+            .map_err(|error| format!("verify reconciled inserts in `{table}`: {error}"))?;
     }
     Ok(())
+}
+
+fn try_strict_insert(
+    table: &str,
+    target: &mut impl SyncChunkTargetSession,
+    rows: &[DatabaseRow],
+) -> Result<Option<SyncInsertFailure>, String> {
+    match target.insert_rows(rows) {
+        Ok(()) => Ok(None),
+        Err(failure) if failure.mysql_code == Some(1062) => Ok(Some(failure)),
+        Err(failure) => Err(format!("insert missing rows into `{table}`: {failure}")),
+    }
+}
+
+fn inspect_and_reconcile_insert_failure(
+    table: &str,
+    source: &mut impl SyncChunkSource,
+    target: &mut impl SyncChunkTargetSession,
+    failure: &SyncInsertFailure,
+    reconciled_conflicts: &mut BTreeSet<(String, Vec<String>, Vec<String>)>,
+    reconciled_intended_rows: &mut BTreeMap<Vec<String>, DatabaseRow>,
+) -> Result<(), String> {
+    let conflicts = target
+        .inspect_unique_owner_conflicts(failure)
+        .map_err(|error| format!("inspect secondary unique conflict in `{table}`: {error}"))?;
+    for conflict in conflicts {
+        reconcile_unique_owner_conflict(
+            table,
+            source,
+            target,
+            conflict,
+            reconciled_conflicts,
+            reconciled_intended_rows,
+        )?;
+    }
+    Ok(())
+}
+
+fn reconcile_unique_owner_conflict(
+    table: &str,
+    source: &mut impl SyncChunkSource,
+    target: &mut impl SyncChunkTargetSession,
+    conflict: SyncUniqueOwnerConflict,
+    reconciled_conflicts: &mut BTreeSet<(String, Vec<String>, Vec<String>)>,
+    reconciled_intended_rows: &mut BTreeMap<Vec<String>, DatabaseRow>,
+) -> Result<(), String> {
+    record_unique_owner_repair_key(table, &conflict, reconciled_conflicts)?;
+    let source_owner = source
+        .read_row_by_primary_key(&conflict.owner.primary_key)
+        .map_err(|error| {
+            format!(
+                "read current source owner for `{table}` index `{}`: {error}",
+                conflict.index.name
+            )
+        })?;
+    let action = plan_unique_owner_action(table, &conflict, source_owner.as_ref())?;
+    target
+        .reconcile_unique_owner(&conflict, &action)
+        .map_err(|error| {
+            format!(
+                "reconcile secondary unique owner in `{table}` index `{}`: {error}",
+                conflict.index.name
+            )
+        })?;
+    reconciled_intended_rows.insert(conflict.intended.primary_key.clone(), conflict.intended);
+    Ok(())
+}
+
+fn record_unique_owner_repair_key(
+    table: &str,
+    conflict: &SyncUniqueOwnerConflict,
+    reconciled_conflicts: &mut BTreeSet<(String, Vec<String>, Vec<String>)>,
+) -> Result<(), String> {
+    let repair_key = (
+        conflict.index.name.clone(),
+        conflict.intended.primary_key.clone(),
+        conflict.owner.primary_key.clone(),
+    );
+    if reconciled_conflicts.insert(repair_key) {
+        return Ok(());
+    }
+    Err(format!(
+        "secondary unique conflict repeated for `{table}` index `{}` intended primary key {:?}",
+        conflict.index.name, conflict.intended.primary_key
+    ))
+}
+
+fn plan_unique_owner_action(
+    table: &str,
+    conflict: &SyncUniqueOwnerConflict,
+    source_owner: Option<&DatabaseRow>,
+) -> Result<SyncUniqueOwnerAction, String> {
+    let intended_identity = validate_unique_owner_conflict(table, conflict)?;
+    let Some(source_owner) = source_owner else {
+        return Ok(SyncUniqueOwnerAction::Delete);
+    };
+    validate_current_source_owner(table, conflict, source_owner, &intended_identity)?;
+    Ok(SyncUniqueOwnerAction::Update(source_owner.clone()))
+}
+
+fn validate_unique_owner_conflict(
+    table: &str,
+    conflict: &SyncUniqueOwnerConflict,
+) -> Result<Vec<String>, String> {
+    if conflict.owner.primary_key == conflict.intended.primary_key {
+        return Err(format!(
+            "secondary unique owner for `{table}` index `{}` has the intended primary key",
+            conflict.index.name
+        ));
+    }
+    let intended_identity = conflict.index.values(&conflict.intended, "intended")?;
+    let target_identity = conflict.index.values(&conflict.owner, "target owner")?;
+    if target_identity == intended_identity {
+        return Ok(intended_identity);
+    }
+    Err(format!(
+        "secondary unique owner for `{table}` index `{}` has ambiguous identity",
+        conflict.index.name
+    ))
+}
+
+fn validate_current_source_owner(
+    table: &str,
+    conflict: &SyncUniqueOwnerConflict,
+    source_owner: &DatabaseRow,
+    intended_identity: &[String],
+) -> Result<(), String> {
+    if source_owner.primary_key != conflict.owner.primary_key {
+        return Err(format!(
+            "current source owner primary key disagrees for `{table}` index `{}`",
+            conflict.index.name
+        ));
+    }
+    if source_owner
+        .values
+        .keys()
+        .ne(conflict.intended.values.keys())
+    {
+        return Err(format!(
+            "current source owner row is incomplete for `{table}` index `{}`",
+            conflict.index.name
+        ));
+    }
+    let source_identity = conflict
+        .index
+        .values(source_owner, "current source owner")?;
+    if source_identity != intended_identity {
+        return Ok(());
+    }
+    Err(format!(
+        "current source owner legitimately owns `{}` identity for `{table}`",
+        conflict.index.name
+    ))
 }
 
 fn record_progress(progress: &mut SyncChunkProgress, source_rows: usize, changes: &ChunkChanges) {

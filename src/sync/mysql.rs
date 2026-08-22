@@ -1,7 +1,8 @@
 use super::model::{
     SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest, SyncChunkSource,
-    SyncChunkTargetSession, SyncProgressRow, SyncProgressStatus, SyncRunProgressStore, SyncStage,
-    SyncTable,
+    SyncChunkTargetSession, SyncInsertFailure, SyncProgressRow, SyncProgressStatus,
+    SyncRunProgressStore, SyncStage, SyncTable, SyncUniqueIndex, SyncUniqueOwnerAction,
+    SyncUniqueOwnerConflict,
 };
 use super::progress::{
     build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
@@ -9,8 +10,10 @@ use super::progress::{
 };
 use super::run_spec_migration::{LockedSyncProgressRow, SyncRunSpecMigrationExecutor};
 use super::sql::{
-    build_lock_table_write_sql, build_strict_delete_rows_statement, build_strict_insert_statement,
+    build_exact_primary_key_select_statement, build_lock_table_write_sql,
+    build_strict_delete_rows_statement, build_strict_insert_statement,
     build_strict_update_rows_statement, build_sync_select_sql,
+    build_unique_index_columns_statement, build_unique_owner_select_statement,
 };
 use crate::database_row::DatabaseRow;
 use crate::live::TargetMySqlConfig;
@@ -22,9 +25,19 @@ use crate::mysql_support::quote_identifier_path;
 use crate::target::SqlStatement;
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, Params, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod query;
+mod unique_owner;
+
+use query::{decode_optional_exact_row, mysql_rows_to_strings, query_statement_rows_as_strings};
+pub(crate) use unique_owner::{
+    SyncUniqueIndexColumn, build_sync_insert_failure, format_unique_owner_reconciliation_event,
+    resolve_sync_unique_index,
+};
+use unique_owner::{mysql_error_code, validate_unique_owner, verify_exact_row};
 
 const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
 const MAX_SYNC_MUTATION_ROWS_PER_STATEMENT: usize = 128;
@@ -40,6 +53,7 @@ pub(crate) struct MySqlSyncTargetSession {
     conn: Conn,
     database: String,
     table: SyncTable,
+    pending_reconciliation_events: Vec<String>,
 }
 
 pub(crate) struct MySqlSyncProgressStore {
@@ -116,6 +130,18 @@ impl SyncChunkSource for MySqlSyncSource {
             .map_err(|error| error.to_string())?;
         decode_sync_rows(&self.table, rows)
     }
+
+    fn read_row_by_primary_key(
+        &mut self,
+        primary_key: &[String],
+    ) -> Result<Option<DatabaseRow>, String> {
+        let statement = build_exact_primary_key_select_statement(&self.table, primary_key)?;
+        let rows = self
+            .source
+            .query_statement_rows_as_strings(&statement)
+            .map_err(|error| error.to_string())?;
+        decode_optional_exact_row(&self.table, rows, "source")
+    }
 }
 
 impl MySqlSyncTargetSession {
@@ -128,6 +154,7 @@ impl MySqlSyncTargetSession {
             conn,
             database: config.database.clone(),
             table,
+            pending_reconciliation_events: Vec::new(),
         })
     }
 
@@ -147,6 +174,73 @@ impl MySqlSyncTargetSession {
         let sql = build_sync_select_sql(&self.table, request);
         let rows = query_rows_as_strings(&mut self.conn, &sql, "target")?;
         decode_sync_rows(&self.table, rows)
+    }
+
+    fn query_statement_rows(
+        &mut self,
+        statement: &SqlStatement,
+        operation: &str,
+    ) -> Result<Vec<Vec<Option<String>>>, String> {
+        query_statement_rows_as_strings(&mut self.conn, statement, operation)
+    }
+
+    fn query_exact_row(&mut self, primary_key: &[String]) -> Result<Option<DatabaseRow>, String> {
+        let statement = build_exact_primary_key_select_statement(&self.table, primary_key)?;
+        let rows = self.query_statement_rows(&statement, "target exact-row")?;
+        decode_optional_exact_row(&self.table, rows, "target")
+    }
+
+    fn load_unique_index(&mut self, error: &str) -> Result<SyncUniqueIndex, String> {
+        let statement = build_unique_index_columns_statement(&self.database, &self.table.name);
+        let rows = self
+            .conn
+            .exec::<(String, Option<String>, u64, Option<u64>), _, _>(
+                &statement.sql,
+                Params::Positional(statement.params),
+            )
+            .map_err(|query_error| {
+                format!(
+                    "query target unique indexes for `{}`: {query_error}",
+                    self.table.name
+                )
+            })?
+            .into_iter()
+            .map(
+                |(index, column, sequence, prefix_length)| SyncUniqueIndexColumn {
+                    index,
+                    column,
+                    sequence,
+                    prefix_length,
+                },
+            )
+            .collect();
+        resolve_sync_unique_index(&self.table.name, error, rows)
+    }
+
+    fn query_unique_owner(
+        &mut self,
+        index: &SyncUniqueIndex,
+        intended: &DatabaseRow,
+    ) -> Result<Option<DatabaseRow>, String> {
+        let statement = build_unique_owner_select_statement(&self.table, index, intended)?;
+        let rows = self.query_statement_rows(&statement, "target unique-owner")?;
+        decode_optional_exact_row(&self.table, rows, "target unique-owner")
+    }
+
+    fn verify_unique_identity_unowned(
+        &mut self,
+        conflict: &SyncUniqueOwnerConflict,
+    ) -> Result<(), String> {
+        if self
+            .query_unique_owner(&conflict.index, &conflict.intended)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "reconciled target owner still owns `{}` identity for `{}`",
+            conflict.index.name, self.table.name
+        ))
     }
 }
 
@@ -180,18 +274,120 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
         Ok(())
     }
 
-    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
-        for statement in build_strict_insert_batches(&self.table, rows) {
-            self.execute_statement(statement)?;
+    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncInsertFailure> {
+        let capacity = strict_insert_batch_capacity(&self.table);
+        for (batch_index, batch) in rows.chunks(capacity).enumerate() {
+            let statement = build_strict_insert_statement(&self.table, batch);
+            let result = self
+                .conn
+                .exec_drop(&statement.sql, Params::Positional(statement.params));
+            if let Err(error) = result {
+                let batch_start = batch_index * capacity;
+                return Err(build_sync_insert_failure(
+                    rows,
+                    batch_start,
+                    batch.len(),
+                    mysql_error_code(&error),
+                    format!("target mysql statement failed: {error}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn inspect_unique_owner_conflicts(
+        &mut self,
+        failure: &SyncInsertFailure,
+    ) -> Result<Vec<SyncUniqueOwnerConflict>, String> {
+        if failure.mysql_code != Some(1062) {
+            return Err(failure.message.clone());
+        }
+        let index = self.load_unique_index(&failure.message)?;
+        let mut owner_primary_keys = BTreeSet::new();
+        let mut conflicts = Vec::new();
+        for intended in &failure.failed_batch {
+            let Some(owner) = self.query_unique_owner(&index, intended)? else {
+                continue;
+            };
+            validate_unique_owner(&self.table.name, &index, intended, &owner)?;
+            if !owner_primary_keys.insert(owner.primary_key.clone()) {
+                return Err(format!(
+                    "secondary unique-owner evidence is ambiguous for `{}` index `{}`",
+                    self.table.name, index.name
+                ));
+            }
+            conflicts.push(SyncUniqueOwnerConflict {
+                index: index.clone(),
+                intended: intended.clone(),
+                owner,
+            });
+        }
+        if conflicts.is_empty() {
+            return Err(format!(
+                "secondary unique-owner evidence is absent for `{}` index `{}`",
+                self.table.name, index.name
+            ));
+        }
+        Ok(conflicts)
+    }
+
+    fn reconcile_unique_owner(
+        &mut self,
+        conflict: &SyncUniqueOwnerConflict,
+        action: &SyncUniqueOwnerAction,
+    ) -> Result<(), String> {
+        match action {
+            SyncUniqueOwnerAction::Update(row) => {
+                self.update_rows(std::slice::from_ref(row))?;
+                verify_exact_row(
+                    self.query_exact_row(&conflict.owner.primary_key)?,
+                    Some(row),
+                    "updated unique owner",
+                )?;
+            }
+            SyncUniqueOwnerAction::Delete => {
+                self.delete_rows(std::slice::from_ref(&conflict.owner.primary_key))?;
+                verify_exact_row(
+                    self.query_exact_row(&conflict.owner.primary_key)?,
+                    None,
+                    "deleted unique owner",
+                )?;
+            }
+        }
+        self.verify_unique_identity_unowned(conflict)?;
+        self.pending_reconciliation_events
+            .push(format_unique_owner_reconciliation_event(
+                &self.table.name,
+                conflict,
+                action,
+            ));
+        Ok(())
+    }
+
+    fn verify_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
+        for expected in rows {
+            verify_exact_row(
+                self.query_exact_row(&expected.primary_key)?,
+                Some(expected),
+                "inserted intended row",
+            )?;
         }
         Ok(())
     }
 
     fn commit(&mut self) -> Result<(), String> {
-        self.execute_control("COMMIT")
+        if let Err(error) = self.execute_control("COMMIT") {
+            self.pending_reconciliation_events.clear();
+            return Err(error);
+        }
+        for event in self.pending_reconciliation_events.drain(..) {
+            eprintln!("{event}");
+        }
+        Ok(())
     }
 
     fn rollback(&mut self) -> Result<(), String> {
+        self.pending_reconciliation_events.clear();
         self.execute_control("ROLLBACK")
     }
 
@@ -422,15 +618,6 @@ fn bounded_mutation_capacity(placeholders_per_row: usize) -> usize {
     capacity.clamp(1, MAX_SYNC_MUTATION_ROWS_PER_STATEMENT)
 }
 
-pub(crate) fn build_strict_insert_batches(
-    table: &SyncTable,
-    rows: &[DatabaseRow],
-) -> Vec<SqlStatement> {
-    rows.chunks(strict_insert_batch_capacity(table))
-        .map(|batch| build_strict_insert_statement(table, batch))
-        .collect()
-}
-
 pub(crate) fn build_strict_update_batches(
     table: &SyncTable,
     rows: &[DatabaseRow],
@@ -538,10 +725,7 @@ fn query_rows_as_strings(
     let rows = conn
         .query::<mysql::Row, _>(sql)
         .map_err(|error| format!("{endpoint} mysql query failed: {error}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|row| row.unwrap().into_iter().map(value_to_string).collect())
-        .collect())
+    Ok(mysql_rows_to_strings(rows))
 }
 
 fn mysql_row_to_tsv(row: mysql::Row) -> String {

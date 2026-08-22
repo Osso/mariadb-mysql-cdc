@@ -1,10 +1,12 @@
 use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkReadRequest, SyncPrimaryKeyOrdering, SyncProgressRow, SyncProgressStatus, SyncStage,
-    SyncTable, build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
+    SyncTable, SyncUniqueIndex, build_create_sync_progress_schema_sql,
+    build_create_sync_progress_table_sql, build_exact_primary_key_select_statement,
     build_lock_table_write_sql, build_strict_delete_rows_statement, build_strict_insert_statement,
     build_strict_update_rows_statement, build_sync_progress_select_sql,
-    build_sync_progress_upsert_sql, build_sync_select_sql, parse_sync_progress_row,
+    build_sync_progress_upsert_sql, build_sync_select_sql, build_unique_index_columns_statement,
+    build_unique_owner_select_statement, parse_sync_progress_row,
 };
 use mysql::Value;
 use std::collections::BTreeMap;
@@ -40,6 +42,56 @@ fn sync_mysql_contract_builds_only_the_quoted_target_write_lock() {
         "LOCK TABLES `target``db`.`episodes``current` WRITE"
     );
     assert!(!sql.to_ascii_uppercase().contains("START TRANSACTION"));
+}
+
+#[test]
+fn sync_mysql_contract_builds_unique_owner_exact_reads_without_relaxed_mutations() {
+    let table = unique_mutation_table();
+    let intended = unique_row("10", "token-a", "page-a", "intended");
+    let index = SyncUniqueIndex {
+        name: "uidx_token_page".to_string(),
+        columns: strings(["token", "page"]),
+    };
+
+    let exact = build_exact_primary_key_select_statement(&table, &strings(["20"]))
+        .expect("exact primary-key read");
+    assert_eq!(
+        exact.sql,
+        "SELECT `id`, `token`, `page`, `payload` FROM `widgets` WHERE `id` = ? LIMIT 2"
+    );
+    assert_eq!(exact.params, vec![bytes("20")]);
+
+    let metadata = build_unique_index_columns_statement("target_db", "widgets");
+    assert_eq!(
+        metadata.sql,
+        "SELECT INDEX_NAME,COLUMN_NAME,SEQ_IN_INDEX,SUB_PART FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0 ORDER BY INDEX_NAME,SEQ_IN_INDEX"
+    );
+    assert_eq!(metadata.params, vec![bytes("target_db"), bytes("widgets")]);
+
+    let owner = build_unique_owner_select_statement(&table, &index, &intended)
+        .expect("exact unique owner read");
+    assert_eq!(
+        owner.sql,
+        "SELECT `id`, `token`, `page`, `payload` FROM `widgets` WHERE `token` <=> ? AND `page` <=> ? LIMIT 2"
+    );
+    assert_eq!(owner.params, vec![bytes("token-a"), bytes("page-a")]);
+
+    let insert = build_strict_insert_statement(&table, std::slice::from_ref(&intended));
+    let mutation_sql = insert.sql.to_ascii_uppercase();
+    for forbidden in ["INSERT IGNORE", "ON DUPLICATE KEY UPDATE", "REPLACE"] {
+        assert!(
+            !mutation_sql.contains(forbidden),
+            "unique-owner path relaxed strict insert with `{forbidden}`: {mutation_sql}"
+        );
+    }
+
+    let mut null_identity = intended;
+    null_identity.values.insert("page".to_string(), None);
+    assert_eq!(
+        build_unique_owner_select_statement(&table, &index, &null_identity)
+            .expect_err("NULL unique identity"),
+        "unique index column `page` is NULL"
+    );
 }
 
 #[test]
@@ -234,6 +286,15 @@ fn mutation_table() -> SyncTable {
     }
 }
 
+fn unique_mutation_table() -> SyncTable {
+    SyncTable {
+        name: "widgets".to_string(),
+        primary_key: strings(["id"]),
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
+        columns: strings(["id", "token", "page", "payload"]),
+    }
+}
+
 fn composite_delete_table() -> SyncTable {
     SyncTable {
         name: "episode_revisions".to_string(),
@@ -243,6 +304,18 @@ fn composite_delete_table() -> SyncTable {
             SyncPrimaryKeyOrdering::Native,
         ],
         columns: strings(["series_id", "revision", "title"]),
+    }
+}
+
+fn unique_row(id: &str, token: &str, page: &str, payload: &str) -> DatabaseRow {
+    DatabaseRow {
+        primary_key: strings([id]),
+        values: BTreeMap::from([
+            ("id".to_string(), Some(id.to_string())),
+            ("token".to_string(), Some(token.to_string())),
+            ("page".to_string(), Some(page.to_string())),
+            ("payload".to_string(), Some(payload.to_string())),
+        ]),
     }
 }
 
