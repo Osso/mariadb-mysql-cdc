@@ -333,10 +333,7 @@ fn apply_strict_inserts(
     let mut pending_rows = rows.to_vec();
     let mut reconciled_conflicts = BTreeSet::new();
     let mut reconciled_intended_rows = BTreeMap::new();
-    loop {
-        let Some(failure) = try_strict_insert(table, target, &pending_rows)? else {
-            break;
-        };
+    while let Some(failure) = try_strict_insert(table, target, &pending_rows)? {
         pending_rows = failure.retry_rows();
         inspect_and_reconcile_insert_failure(
             table,
