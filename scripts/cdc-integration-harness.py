@@ -3314,8 +3314,17 @@ class Harness:
             raise HarnessError(f"sync resume retained nonterminal progress rows: {nonterminal}")
 
         print(
-            "sync_resume_ok same_run_id=true target_address_changed=true "
-            "parallelism=16 completed_table_preserved=true running_table_resumed=true"
+            "sync_resume_ok same_run_id=true target_address_changed=true parallelism=16 "
+            "completed_table_preserved=true running_table_resumed=true "
+            f"completed_chunks={complete_before['chunks']} "
+            f"completed_pk={complete_before['last_primary_key_json']} "
+            f"running_chunks_before={running_before['chunks']} "
+            f"running_rows_before={running_before['rows_scanned']} "
+            f"running_pk_before={running_before['last_primary_key_json']} "
+            f"running_chunks_after={running_after['chunks']} "
+            f"running_rows_after={running_after['rows_scanned']} "
+            f"running_pk_after={running_after['last_primary_key_json']} "
+            "legacy_specs_unchanged=true final_stage_rows=6"
         )
 
     def run_writable_column_generated_metadata(self) -> None:
