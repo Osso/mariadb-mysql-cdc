@@ -261,6 +261,9 @@ class Harness:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
+        publish_args = ["-p", f"127.0.0.1:{port}:3306"]
+        if role == "target":
+            publish_args.extend(["-p", f"[::1]:{port}:3306"])
         args = [
             "docker",
             "run",
@@ -277,8 +280,7 @@ class Harness:
             f"MARIADB_DATABASE={APP_SCHEMA}",
             "-v",
             f"{self.tempdir}:/etc/cdc-tls:ro",
-            "-p",
-            f"127.0.0.1:{port}:3306",
+            *publish_args,
             image,
             "--server-id=" + str(server_id),
             "--log-bin=mysql-bin",
