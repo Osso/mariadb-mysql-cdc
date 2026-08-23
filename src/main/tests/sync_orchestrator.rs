@@ -326,7 +326,6 @@ fn sync_orchestrator_resumes_run_id_with_changed_invocation_and_scope() {
     config.target.tls_ca_file = "/tmp/replacement-ca.pem".to_string();
     config.chunk_size = 17;
     config.parallelism = 16;
-    config.progress_table = "other.sync_progress".to_string();
     config.tables = vec!["alpha".to_string(), "gamma".to_string()];
     let evidence = SchemaSourceEvidence {
         inventory: SchemaInventory {

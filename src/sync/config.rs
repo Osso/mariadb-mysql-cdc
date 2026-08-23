@@ -2,10 +2,11 @@ use super::model::{SyncPrimaryKeyOrdering, SyncTable};
 use crate::inventory::TableInventory;
 use crate::live::TargetMySqlConfig;
 use crate::mysql_config::MySqlConnectionConfig;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-const SYNC_RUN_ID_DOMAIN: &[u8] = b"mariadb-mysql-cdc:sync-run-id:v2\0";
+const SYNC_RUN_ID_V1_DOMAIN: &[u8] = b"mariadb-mysql-cdc:sync-run-id:v1\0";
 const MAX_SYNC_RUN_ID_BYTES: usize = 128;
 pub(crate) const DEFAULT_SYNC_PROGRESS_TABLE: &str = "cdc.sync_runs";
 
@@ -26,6 +27,23 @@ pub(crate) struct SyncRunIdentity {
     pub(crate) run_id: String,
 }
 
+#[derive(Serialize)]
+struct LegacyV1RunIdDerivationEndpoint<'a> {
+    host: &'a str,
+    port: u16,
+    database: &'a str,
+}
+
+#[derive(Serialize)]
+struct LegacyV1RunIdDerivationInput<'a> {
+    source: LegacyV1RunIdDerivationEndpoint<'a>,
+    target: LegacyV1RunIdDerivationEndpoint<'a>,
+    tables: &'a [SyncTable],
+    chunk_size: usize,
+    parallelism: usize,
+    progress_table: &'a str,
+}
+
 pub(crate) fn validate_sync_config(config: &SyncConfig) -> Result<(), String> {
     validate_source_connection(&config.source)?;
     validate_target_connection(&config.target)?;
@@ -36,12 +54,13 @@ pub(crate) fn validate_sync_config(config: &SyncConfig) -> Result<(), String> {
 
 pub(crate) fn build_sync_run_identity(
     config: &SyncConfig,
-    tables: Vec<SyncTable>,
+    mut tables: Vec<SyncTable>,
 ) -> Result<SyncRunIdentity, String> {
     validate_sync_config(config)?;
     validate_concrete_tables(&tables)?;
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(SyncRunIdentity {
-        run_id: resolved_run_id(config)?,
+        run_id: resolved_run_id(config, &tables)?,
     })
 }
 
@@ -147,7 +166,7 @@ fn validate_concrete_tables(tables: &[SyncTable]) -> Result<(), String> {
     Ok(())
 }
 
-fn resolved_run_id(config: &SyncConfig) -> Result<String, String> {
+fn resolved_run_id(config: &SyncConfig, tables: &[SyncTable]) -> Result<String, String> {
     if let Some(run_id) = &config.run_id {
         return Ok(run_id.clone());
     }
@@ -155,7 +174,10 @@ fn resolved_run_id(config: &SyncConfig) -> Result<String, String> {
         .run_id_prefix
         .as_deref()
         .expect("validated sync run id prefix");
-    let run_id = derive_run_id(prefix);
+    let input = legacy_v1_run_id_derivation_input(config, tables);
+    let input_json = serde_json::to_string(&input)
+        .map_err(|error| format!("encode legacy sync-v1 run ID input: {error}"))?;
+    let run_id = derive_v1_run_id(prefix, &input_json);
     if run_id.len() > MAX_SYNC_RUN_ID_BYTES {
         return Err(format!(
             "generated run id is {} bytes; cdc.sync_runs.run_id allows at most {MAX_SYNC_RUN_ID_BYTES}",
@@ -165,12 +187,39 @@ fn resolved_run_id(config: &SyncConfig) -> Result<String, String> {
     Ok(run_id)
 }
 
-fn derive_run_id(prefix: &str) -> String {
+fn legacy_v1_run_id_derivation_input<'a>(
+    config: &'a SyncConfig,
+    tables: &'a [SyncTable],
+) -> LegacyV1RunIdDerivationInput<'a> {
+    LegacyV1RunIdDerivationInput {
+        source: LegacyV1RunIdDerivationEndpoint {
+            host: &config.source.host,
+            port: config.source.port,
+            database: &config.source.database,
+        },
+        target: LegacyV1RunIdDerivationEndpoint {
+            host: &config.target.host,
+            port: config.target.port,
+            database: &config.target.database,
+        },
+        tables,
+        chunk_size: config.chunk_size,
+        parallelism: config.parallelism,
+        progress_table: &config.progress_table,
+    }
+}
+
+fn derive_v1_run_id(prefix: &str, input_json: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(SYNC_RUN_ID_DOMAIN);
-    hasher.update((prefix.len() as u64).to_be_bytes());
-    hasher.update(prefix.as_bytes());
-    format!("sync-v2-{:x}", hasher.finalize())
+    hasher.update(SYNC_RUN_ID_V1_DOMAIN);
+    update_framed_hash(&mut hasher, prefix.as_bytes());
+    update_framed_hash(&mut hasher, input_json.as_bytes());
+    format!("sync-v1-{:x}", hasher.finalize())
+}
+
+fn update_framed_hash(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 fn validate_inventory_columns(table: &TableInventory) -> Result<(), String> {

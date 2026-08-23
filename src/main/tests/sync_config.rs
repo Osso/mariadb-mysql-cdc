@@ -31,27 +31,16 @@ fn sync_config_preserves_exact_run_id_across_invocation_changes() {
 }
 
 #[test]
-fn sync_config_derives_run_id_from_prefix_only() {
+fn sync_config_preserves_known_v1_prefix_derived_run_id() {
     let config = prefixed_run_config();
     let tables = vec![sync_table("alpha", "alpha_id"), sync_table("zeta", "zeta_id")];
-    let first = build_sync_run_identity(&config, tables.clone()).expect("first identity");
 
-    let mut changed = config;
-    changed.source.host = "replacement-source.example".to_string();
-    changed.target.host = "10.20.30.40".to_string();
-    changed.target.database = "replacement_target".to_string();
-    changed.target.tls_ca_file = "/tmp/replacement-ca.pem".to_string();
-    changed.chunk_size = 37;
-    changed.parallelism = 16;
-    changed.progress_table = "other.sync_progress".to_string();
-    changed.tables = strings(["replacement"]);
-    let changed_tables = vec![sync_table("replacement", "replacement_id")];
-    let resumed = build_sync_run_identity(&changed, changed_tables).expect("changed invocation");
+    let identity = build_sync_run_identity(&config, tables).expect("prefixed identity");
 
-    assert_eq!(resumed, first);
-    assert!(first.run_id.starts_with("sync-v2-"));
-    assert_eq!(first.run_id.len(), "sync-v2-".len() + 64);
-    assert!(first.run_id.len() <= 128);
+    assert_eq!(
+        identity.run_id,
+        "sync-v1-4badcffdeb82f66e8a205b63aebeded3079295bb22658ce4e59b9d8b163ef751"
+    );
 }
 
 #[test]

@@ -12,7 +12,7 @@ the run ID. Operator usage belongs in the sync runbook.
 ### Durable stage lifecycle
 
 - [x] Execute stages in order: `prerequisite_schema`, `rows`, then `final_constraints`.
-- [x] Persist progress per `(run_id, stage, table_name)`; the run ID is the only durable invocation identity.
+- [x] Persist progress per `(run_id, stage, table_name)`; within the selected progress store, the run ID is the only durable invocation identity.
 - [x] Load and validate only the stored run ID, stage, and table name. Do not load or compare persisted invocation configuration.
 - [x] Leave omitted-table rows untouched, skip selected rows already marked `complete`, replay selected `running` or `error` rows, and create missing rows for newly selected tables.
 - [x] Resume row progress from its stored primary-key cursor and counters while applying the current chunk size and table definition.
@@ -29,8 +29,8 @@ the run ID. Operator usage belongs in the sync runbook.
 - [x] Invoke bounded row workers between the two schema stages.
 - [x] Expose the staged orchestration through one `sync` CLI. Removed progress, standalone schema, drift-check, catchup-snapshot, sync-table, and repair-drift command names are rejected as unknown commands rather than aliased.
 - [x] Require exactly one `--run-id` or `--run-id-prefix`; default progress persistence to `cdc.sync_runs` and support repeated `--table`, `--chunk-size`, `--parallelism`, and `--progress-table` options.
-- [x] Preserve an exact `--run-id` unchanged. Derive a prefixed run ID from the prefix alone, independent of endpoints, databases, TLS settings, selected tables, table definitions, chunk size, parallelism, and progress settings.
-- [x] Resolve source and target configuration, current table scope and definitions, chunk size, parallelism, and progress location fresh on every invocation without authorization or durable-state migration.
+- [x] Preserve an exact `--run-id` unchanged. Preserve backward-compatible `sync-v1` prefix-derived IDs from the prefix plus serialized invocation/table input; this private derivation input is not persisted or compared as progress identity.
+- [x] Resolve source and target configuration, current table scope and definitions, chunk size, and parallelism fresh on every invocation without authorization or durable-state migration. The selected progress table locates the store; changing it selects a different store and does not cross-read prior rows.
 - [x] Route `sync-catalog` through one unified run with one prefix-derived durable run ID and `cdc.sync_runs` progress; `--progress-table` may override this default.
 - [x] Route `resync-stream` through one unified run with the fixed `resync-stream:<source_identity>` run ID and `cdc.sync_runs` progress.
 - [x] Route `recover-lost-binlog` through one unified run with exact `recovery_id`, captured source evidence, exact source-table progress proof, and `cdc.sync_runs` progress.
@@ -83,7 +83,7 @@ the run ID. Operator usage belongs in the sync runbook.
 
 - `tests/sync_cli.rs` — unified help/dispatch, obsolete-command rejection, accepted options, and obsolete authorization-flag rejection.
 - `src/main/tests/sync_cli_config.rs` — endpoint, scope, defaults, runtime options, and exclusive run-ID parsing.
-- `src/main/tests/sync_config.rs` — exact-ID preservation, prefix-only derivation, current-invocation validation, and source-inventory table conversion.
+- `src/main/tests/sync_config.rs` — exact-ID preservation, backward-compatible `sync-v1` prefix derivation, current-invocation validation, and source-inventory table conversion.
 - `src/main/tests/sync_orchestrator.rs` — stage order, changed-invocation resume, omitted/new/complete table behavior, run/stage/table validation, error persistence, and row-failure cutoff.
 - `src/main/tests/sync_runner.rs` — bounded deterministic table execution, current parallelism/scope validation, completion behavior, and no retry of row-chunk failures.
 - `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering, changed-chunk-size resume, checkpoint boundary, strict secondary-unique owner repair, rollback, retry, verification, and post-commit audit behavior.
@@ -91,10 +91,11 @@ the run ID. Operator usage belongs in the sync runbook.
 - `src/main/tests/resync_unified.rs` — resync run ID, all-table mapping, and changed-table reporting.
 - `src/main/tests/lost_binlog_unified.rs` — recovery run ID, source-only proof evidence, exact progress scope, and incomplete/wrong-run rejection.
 - `scripts/cdc-integration-harness.py` scenario `sync-unique-owner-rollback-resume`, with `tests/cdc_eventual_consistency.rs` wrapper — real MariaDB-to-MySQL strict insert rollback/resume and progress-boundary proof.
+- `scripts/cdc-integration-harness.py` scenario `sync-resume`, with `tests/cdc_eventual_consistency.rs` wrapper — disposable same-run resume through a changed target address from parallelism 1 to 16 without restarting committed row progress.
 
 ## Known gaps (current cycle)
 
-- [ ] Prove disposable MariaDB-to-MySQL same-run resume across changed target address and parallelism without restarting completed work.
+- [x] Prove disposable MariaDB-to-MySQL same-run resume across changed target address and parallelism without restarting completed work through the `sync-resume` scenario.
 - [ ] Prove the complete catalog/resync/recovery MySQL paths against disposable endpoints, including connection-construction and post-connect failure boundaries.
 - [x] Delete legacy production engines, run-spec migration, and obsolete progress paths.
 - [ ] Run full-project tests, Clippy without warning suppression, and final integration verification.
