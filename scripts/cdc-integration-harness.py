@@ -650,6 +650,7 @@ class Harness:
         chunk_size: int = 1000,
         parallelism: int = 1,
         progress_table: str = "cdc.sync_runs",
+        target_host: str = "127.0.0.1",
         target_ca_file: Path | None = None,
     ) -> list[str]:
         assert self.source and self.target
@@ -667,7 +668,7 @@ class Harness:
             "--source-database",
             APP_SCHEMA,
             "--target-host",
-            "127.0.0.1",
+            target_host,
             "--target-port",
             str(self.target.port),
             "--target-user",
@@ -699,6 +700,7 @@ class Harness:
         chunk_size: int = 1000,
         parallelism: int = 1,
         progress_table: str = "cdc.sync_runs",
+        target_host: str = "127.0.0.1",
         timeout: float = 180,
     ) -> CommandResult:
         binary = self._sync_binary()
@@ -715,6 +717,7 @@ class Harness:
                 chunk_size=chunk_size,
                 parallelism=parallelism,
                 progress_table=progress_table,
+                target_host=target_host,
             ),
             cwd=self.repo,
             env=env,
@@ -729,6 +732,7 @@ class Harness:
         run_id: str,
         chunk_size: int,
         parallelism: int = 1,
+        target_host: str = "127.0.0.1",
     ) -> tuple[subprocess.Popen[str], Path]:
         binary = self._sync_binary()
         log_path = self.tempdir / f"{run_id}.log"
@@ -740,6 +744,7 @@ class Harness:
                 run_id=run_id,
                 chunk_size=chunk_size,
                 parallelism=parallelism,
+                target_host=target_host,
             ),
             cwd=self.repo,
             env={
@@ -3025,66 +3030,291 @@ class Harness:
             raise HarnessError(f"wide sync progress mismatch: {progress!r}")
         print("sync_wide_update_ok rows=129 updates=129 chunks=1")
 
-    def run_sync_resume(self) -> None:
-        assert self.source and self.target
-        self.setup_sync_accounts("sync_resume")
-        values = ",".join(
-            f"({index}, 'resume-{index}', 'source-{index}')"
-            for index in range(1, 4001)
-        )
-        self.admin_sql(self.source, f"INSERT INTO sync_resume VALUES {values};")
-        run_id = "sync-resume"
-        process, log_path = self.start_sync(
-            tables=["sync_resume"],
-            run_id=run_id,
-            chunk_size=10,
-        )
-        deadline = time.monotonic() + 90
-        progress = ""
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise HarnessError(f"sync resume exited before interruption: {log_path.read_text()}")
-            progress = self.admin_query(
-                self.target,
-                "SELECT status,chunks FROM cdc.sync_runs "
-                "WHERE run_id='sync-resume' AND stage='rows' AND table_name='sync_resume';",
-            ).strip()
-            fields = progress.split("	")
-            if len(fields) == 2 and fields[0] == "running" and int(fields[1]) >= 10:
-                break
-            time.sleep(0.1)
-        else:
-            raise HarnessError(f"sync resume did not persist interrupted progress: {progress}")
-        process.kill()
+    def stop_sync_process(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            process.kill()
         process.wait(timeout=30)
         log = getattr(process, "_cdc_log", None)
         if log is not None:
             log.close()
 
-        changed = self.run_sync(
-            tables=["sync_resume"],
-            run_id=run_id,
-            chunk_size=11,
+    def sync_row_progress_evidence(self, run_id: str, table: str) -> dict[str, str]:
+        assert self.target
+        output = self.admin_query(
+            self.target,
+            "SELECT run_id,stage,table_name,"
+            "IF(last_primary_key_json IS NULL,'<NULL>',last_primary_key_json),"
+            "chunks,rows_scanned,inserts_applied,updates_applied,deletes_applied,status,"
+            "IF(last_error IS NULL,'<NULL>',last_error),"
+            "DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s.%f'),"
+            "DATE_FORMAT(updated_at,'%Y-%m-%d %H:%i:%s.%f'),"
+            "IF(completed_at IS NULL,'<NULL>',DATE_FORMAT(completed_at,'%Y-%m-%d %H:%i:%s.%f')) "
+            "FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='rows' "
+            f"AND table_name={sql_literal(table)};",
+        ).strip()
+        columns = (
+            "run_id",
+            "stage",
+            "table_name",
+            "last_primary_key_json",
+            "chunks",
+            "rows_scanned",
+            "inserts_applied",
+            "updates_applied",
+            "deletes_applied",
+            "status",
+            "last_error",
+            "created_at",
+            "updated_at",
+            "completed_at",
         )
-        changed_output = " ".join((changed.stdout, changed.stderr)).lower()
-        if changed.returncode == 0 or "run specification mismatch" not in changed_output:
-            raise HarnessError(f"sync resume accepted changed specification: {changed}")
-        resumed = self.run_sync(
-            tables=["sync_resume"],
+        fields = output.split("\t")
+        if len(fields) != len(columns):
+            raise HarnessError(f"unexpected sync row progress evidence for {table}: {output!r}")
+        return dict(zip(columns, fields, strict=True))
+
+    def sync_table_state(self, endpoint: Endpoint, table: str) -> tuple[int, int, int]:
+        output = self.admin_query(
+            endpoint,
+            f"SELECT COUNT(*),COUNT(DISTINCT id),"
+            f"COALESCE(SUM(CRC32(CONCAT(id,'|',email,'|',payload))),0) FROM {table};",
+        ).strip()
+        fields = output.split("\t")
+        if len(fields) != 3:
+            raise HarnessError(f"unexpected sync table state for {table}: {output!r}")
+        return tuple(int(field) for field in fields)
+
+    def sync_legacy_run_spec(self, run_id: str, table: str) -> str:
+        assert self.target
+        return self.admin_query(
+            self.target,
+            "SELECT run_spec_json FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='rows' "
+            f"AND table_name={sql_literal(table)};",
+        ).strip()
+
+    def run_sync_resume(self) -> None:
+        assert self.source and self.target
+        run_id = "sync-resume"
+        complete_table = "sync_resume_a_complete"
+        running_table = "sync_resume_z_running"
+        tables = [complete_table, running_table]
+        for table in tables:
+            self.setup_sync_accounts(table)
+
+        complete_values = ",".join(
+            f"({index}, 'complete-{index}', 'source-{index}')"
+            for index in range(1, 31)
+        )
+        running_values = ",".join(
+            f"({index}, 'running-{index}', 'source-{index}')"
+            for index in range(1, 4001)
+        )
+        self.admin_sql(self.source, f"INSERT INTO {complete_table} VALUES {complete_values};")
+        self.admin_sql(self.source, f"INSERT INTO {running_table} VALUES {running_values};")
+
+        process, log_path = self.start_sync(
+            tables=tables,
             run_id=run_id,
             chunk_size=10,
+            parallelism=1,
+        )
+        deadline = time.monotonic() + 90
+        boundary = ""
+        try:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise HarnessError(
+                        f"sync resume exited before interruption: {log_path.read_text()}"
+                    )
+                boundary = self.admin_query(
+                    self.target,
+                    "SELECT table_name,status,chunks FROM cdc.sync_runs "
+                    f"WHERE run_id={sql_literal(run_id)} AND stage='rows' "
+                    "ORDER BY table_name;",
+                ).strip()
+                rows = [line.split("\t") for line in boundary.splitlines()]
+                progress = {
+                    fields[0]: (fields[1], int(fields[2]))
+                    for fields in rows
+                    if len(fields) == 3
+                }
+                complete = progress.get(complete_table)
+                running = progress.get(running_table)
+                if (
+                    complete is not None
+                    and complete[0] == "complete"
+                    and running is not None
+                    and running[0] == "running"
+                    and running[1] >= 150
+                ):
+                    break
+                time.sleep(0.05)
+            else:
+                raise HarnessError(
+                    f"sync resume did not reach complete/running boundary: {boundary!r}"
+                )
+        finally:
+            self.stop_sync_process(process)
+
+        legacy_specs = {
+            complete_table: '{"legacy":"completed-table"}',
+            running_table: '{"legacy":"running-table"}',
+        }
+        for table, value in legacy_specs.items():
+            self.admin_sql(
+                self.target,
+                "UPDATE cdc.sync_runs "
+                f"SET run_spec_json={sql_literal(value)} "
+                f"WHERE run_id={sql_literal(run_id)} AND stage='rows' "
+                f"AND table_name={sql_literal(table)};",
+            )
+
+        complete_before = self.sync_row_progress_evidence(run_id, complete_table)
+        running_before = self.sync_row_progress_evidence(run_id, running_table)
+        if complete_before["status"] != "complete" or running_before["status"] != "running":
+            raise HarnessError(
+                "interrupted sync did not retain exact complete/running boundary: "
+                f"complete={complete_before!r} running={running_before!r}"
+            )
+        if int(running_before["chunks"]) < 150:
+            raise HarnessError(f"running progress regressed before resume: {running_before!r}")
+
+        source_before = {table: self.sync_table_state(self.source, table) for table in tables}
+        target_before = {table: self.sync_table_state(self.target, table) for table in tables}
+        if source_before[complete_table] != target_before[complete_table]:
+            raise HarnessError(
+                "completed table was not converged before resume: "
+                f"source={source_before[complete_table]} target={target_before[complete_table]}"
+            )
+        running_source_count = source_before[running_table][0]
+        running_target_count, running_target_distinct, _ = target_before[running_table]
+        if not 0 < running_target_count < running_source_count:
+            raise HarnessError(
+                "running table target was not partially converged before resume: "
+                f"source={source_before[running_table]} target={target_before[running_table]}"
+            )
+        if running_target_count != running_target_distinct:
+            raise HarnessError(f"running table had duplicate target PKs: {target_before[running_table]}")
+        legacy_before = {
+            table: self.sync_legacy_run_spec(run_id, table) for table in tables
+        }
+        if legacy_before != legacy_specs:
+            raise HarnessError(f"legacy run specifications were not installed: {legacy_before!r}")
+
+        resumed = self.run_sync(
+            tables=tables,
+            run_id=run_id,
+            chunk_size=37,
+            parallelism=16,
+            target_host="localhost",
             timeout=240,
         )
-        require_success(resumed, "sync resume")
-        count = self.query(
+        require_success(resumed, "same-run changed-address sync resume")
+        resume_output = "\n".join((resumed.stdout, resumed.stderr)).lower()
+        forbidden_output = [
+            marker
+            for marker in ("run specification", "run_spec", "authoriz")
+            if marker in resume_output
+        ]
+        if forbidden_output:
+            raise HarnessError(
+                f"sync resume entered obsolete run-spec path: {forbidden_output!r}"
+            )
+
+        complete_after = self.sync_row_progress_evidence(run_id, complete_table)
+        running_after = self.sync_row_progress_evidence(run_id, running_table)
+        if complete_after != complete_before:
+            raise HarnessError(
+                "completed table row progress changed during resume: "
+                f"before={complete_before!r} after={complete_after!r}"
+            )
+        if running_after["status"] != "complete":
+            raise HarnessError(f"running table did not complete: {running_after!r}")
+        for counter in (
+            "chunks",
+            "rows_scanned",
+            "inserts_applied",
+            "updates_applied",
+            "deletes_applied",
+        ):
+            if int(running_after[counter]) < int(running_before[counter]):
+                raise HarnessError(
+                    f"running table {counter} regressed: "
+                    f"before={running_before[counter]} after={running_after[counter]}"
+                )
+        if int(running_after["chunks"]) <= int(running_before["chunks"]):
+            raise HarnessError(
+                "running table did not advance from persisted chunks: "
+                f"before={running_before!r} after={running_after!r}"
+            )
+        before_primary_key = int(json.loads(running_before["last_primary_key_json"])[0])
+        after_primary_key = int(json.loads(running_after["last_primary_key_json"])[0])
+        if after_primary_key <= before_primary_key:
+            raise HarnessError(
+                "running table did not advance from persisted cursor: "
+                f"before={before_primary_key} after={after_primary_key}"
+            )
+        if running_after["created_at"] != running_before["created_at"]:
+            raise HarnessError("running table progress was recreated instead of resumed")
+
+        legacy_after = {
+            table: self.sync_legacy_run_spec(run_id, table) for table in tables
+        }
+        if legacy_after != legacy_before:
+            raise HarnessError(
+                f"resume rewrote ignored legacy run specifications: {legacy_after!r}"
+            )
+
+        final_states = {
+            table: (
+                self.sync_table_state(self.source, table),
+                self.sync_table_state(self.target, table),
+            )
+            for table in tables
+        }
+        for table, (source_state, target_state) in final_states.items():
+            if source_state != target_state:
+                raise HarnessError(
+                    f"same-run resume left table `{table}` divergent: "
+                    f"source={source_state} target={target_state}"
+                )
+            if source_state[0] != source_state[1]:
+                raise HarnessError(f"same-run resume left duplicate PKs in `{table}`: {source_state}")
+
+        run_identity = self.admin_query(
             self.target,
-            "SELECT COUNT(*) FROM sync_resume;",
-            user=TARGET_USER,
-            password=TARGET_PASSWORD,
+            "SELECT COUNT(DISTINCT run_id),MIN(run_id),MAX(run_id),COUNT(*) "
+            "FROM cdc.sync_runs WHERE run_id LIKE 'sync-resume%';",
         ).strip()
-        if count != "4000":
-            raise HarnessError(f"sync resume did not converge: {count}")
-        print("sync_resume_ok same_run_id=true changed_spec_rejected=true rows=4000")
+        if run_identity != "1\tsync-resume\tsync-resume\t6":
+            raise HarnessError(f"sync resume created unexpected run identity: {run_identity!r}")
+        stages = self.admin_query(
+            self.target,
+            "SELECT stage,status,COUNT(*) FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} GROUP BY stage,status "
+            "ORDER BY FIELD(stage,'prerequisite_schema','rows','final_constraints'),status;",
+        ).splitlines()
+        expected_stages = [
+            "prerequisite_schema\tcomplete\t2",
+            "rows\tcomplete\t2",
+            "final_constraints\tcomplete\t2",
+        ]
+        if stages != expected_stages:
+            raise HarnessError(f"sync resume final stage progress mismatch: {stages!r}")
+        nonterminal = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND status IN ('running','error');",
+        ).strip()
+        if nonterminal != "0":
+            raise HarnessError(f"sync resume retained nonterminal progress rows: {nonterminal}")
+
+        print(
+            "sync_resume_ok same_run_id=true target_address_changed=true "
+            "parallelism=16 completed_table_preserved=true running_table_resumed=true"
+        )
 
     def run_writable_column_generated_metadata(self) -> None:
         assert self.source and self.target

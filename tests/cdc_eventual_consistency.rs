@@ -199,10 +199,12 @@ args = harness._sync_args(
     run_id='sync-test',
     chunk_size=500,
     parallelism=4,
+    target_host='localhost',
     target_ca_file=pathlib.Path('/tmp/target-ca.pem'),
 )
 assert args[1] == 'sync'
 assert '--source-tls-ca-file' not in args
+assert args[args.index('--target-host') + 1] == 'localhost'
 assert args[args.index('--target-tls-ca-file') + 1] == '/tmp/target-ca.pem'
 assert args[args.index('--progress-table') + 1] == 'cdc.sync_runs'
 assert args[args.index('--run-id') + 1] == 'sync-test'
