@@ -9,6 +9,14 @@ must change when the source incarnation changes. Runtime validates the
 pre-created table and source-scoped row; it does not create or repair the
 control plane.
 
+Unified synchronization uses a separate durable boundary in `cdc.sync_runs`,
+keyed only by `(run_id, stage, table_name)`. Resume resolves endpoints, TLS,
+current table scope and definitions, chunk size, parallelism, and progress
+settings fresh. Omitted rows remain untouched, completed selected rows skip,
+running row progress resumes from its cursor and counters, and newly selected
+tables create missing stages. The legacy `run_spec_json` column is ignored and
+never migrated or rewritten.
+
 ## Lost-binlog recovery control plane
 
 `recover-lost-binlog` is the availability-first, incident-scoped transition for

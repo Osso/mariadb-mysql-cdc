@@ -33,7 +33,7 @@ mariadb-mysql-cdc
 Usage:
   mariadb-mysql-cdc plan
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
-  mariadb-mysql-cdc sync --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --table TABLE [--table TABLE ...] (--run-id ID | --run-id-prefix PREFIX) [--authorize-old-run-spec-sha256 SHA256] [options]
+  mariadb-mysql-cdc sync --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --table TABLE [--table TABLE ...] (--run-id ID | --run-id-prefix PREFIX) [options]
   mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
   mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
@@ -83,10 +83,8 @@ Sync options:
   --chunk-size ROWS               Rows per locked chunk. Defaults to 1000.
   --parallelism WORKERS           Concurrent table workers. Defaults to 1.
   --progress-table TABLE          Staged progress table. Defaults to cdc.sync_runs.
-  --run-id ID                     Exact immutable run identity.
-  --run-id-prefix PREFIX          Deterministic immutable run identity namespace.
-  --authorize-old-run-spec-sha256 SHA256
-                                  Authorize one exact persisted run-spec migration.
+  --run-id ID                     Exact durable progress identity.
+  --run-id-prefix PREFIX          Deterministic durable progress identity namespace.
 
 Apply options:
   --source-host HOST              MariaDB source host.
@@ -110,7 +108,7 @@ Apply options:
   --stop-never-slave-server-id ID MariaDB --stop-never slave server_id. Generated when omitted.
 
 Sync catalog options:
-  --run-id-prefix PREFIX          Fresh immutable identity namespace for this catalog attempt.
+  --run-id-prefix PREFIX          Durable progress identity namespace for this catalog run.
 
 ";
 

@@ -104,7 +104,6 @@ fn progress(table: &str, inserts: u64, updates: u64, deletes: u64) -> SyncChunkP
     SyncChunkProgress {
         run_id: "resync-stream:source-incarnation".to_string(),
         table: table.to_string(),
-        run_spec_json: "{}".to_string(),
         last_primary_key: None,
         complete: true,
         chunks: 1,

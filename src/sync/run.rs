@@ -30,7 +30,6 @@ pub(crate) fn run_mysql_sync_table(
     let table_name = table.name.clone();
     let chunk = SyncChunkConfig {
         run_id: identity.run_id.clone(),
-        run_spec_json: identity.run_spec_json.clone(),
         target_database: config.target.database.clone(),
         table: table.clone(),
         chunk_size: config.chunk_size,

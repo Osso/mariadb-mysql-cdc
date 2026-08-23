@@ -1364,14 +1364,6 @@ struct SyncStageTargetEvidence {
     canonical_foreign_keys: Vec<CanonicalForeignKey>,
 }
 
-pub(crate) fn read_sync_target_inventory(
-    target: &crate::live::TargetMySqlConfig,
-) -> Result<SchemaInventory, String> {
-    let config = inventory_config_target(target);
-    let reader = MariaDbInventoryReader::new(config);
-    read_sync_target_inventory_with_reader(target, &reader)
-}
-
 fn read_sync_target_inventory_with_reader(
     target: &crate::live::TargetMySqlConfig,
     reader: &MariaDbInventoryReader,

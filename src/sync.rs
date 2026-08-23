@@ -5,15 +5,10 @@ mod mysql;
 mod orchestrate;
 mod progress;
 mod run;
-mod run_spec_migration;
 mod sql;
 
 #[cfg(test)]
 pub(crate) use chunk::sync_next_chunk;
-#[cfg(test)]
-pub(crate) use config::{
-    AdditiveRunSpecTableChange, SyncRunSpec, plan_additive_run_spec_migration,
-};
 pub(crate) use config::{DEFAULT_SYNC_PROGRESS_TABLE, SyncConfig, validate_sync_config};
 #[cfg(test)]
 pub(crate) use config::{SyncRunIdentity, build_sync_run_identity, sync_table_from_inventory};
@@ -35,9 +30,7 @@ pub(crate) use mysql::{
 };
 #[cfg(test)]
 pub(crate) use orchestrate::{
-    SyncRunExecutor, continue_after_sync_run_spec_migration, format_sync_run_spec_migration_audit,
-    read_sync_run_spec_migration_target_inventory, run_optional_sync_run_spec_migration,
-    run_sync_orchestration, sync_tables_from_source_inventory,
+    SyncRunExecutor, run_sync_orchestration, sync_tables_from_source_inventory,
 };
 pub(crate) use orchestrate::{run_mysql_sync, run_mysql_sync_with_evidence};
 #[cfg(test)]
@@ -47,15 +40,6 @@ pub(crate) use progress::{
 };
 #[cfg(test)]
 pub(crate) use run::{run_sync_tables_bounded, sync_table_to_completion};
-#[cfg(test)]
-pub(crate) use run_spec_migration::{
-    LockedSyncProgressRow, SyncRunSpecMigrationDecision, SyncRunSpecMigrationExecutor,
-    decide_locked_run_spec_migration,
-};
-#[cfg(test)]
-pub(crate) use run_spec_migration::{
-    SyncRunSpecMigrationOutcome, SyncRunSpecMigrationRequest, run_locked_sync_run_spec_migration,
-};
 #[cfg(test)]
 pub(crate) use sql::{
     build_exact_primary_key_select_statement, build_lock_table_write_sql,

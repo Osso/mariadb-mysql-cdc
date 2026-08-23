@@ -358,7 +358,6 @@ fn sync_mysql_adapter_maps_rows_progress_without_changing_identity() {
     assert_eq!(running_row.run_id, running.run_id);
     assert_eq!(running_row.stage, SyncStage::Rows);
     assert_eq!(running_row.table_name, running.table);
-    assert_eq!(running_row.run_spec_json, running.run_spec_json);
     assert_eq!(running_row.last_primary_key, running.last_primary_key);
     assert_eq!(running_row.status, SyncProgressStatus::Running);
     assert_eq!(running_row.last_error, None);
@@ -467,7 +466,6 @@ fn chunk_progress(complete: bool) -> SyncChunkProgress {
     SyncChunkProgress {
         run_id: "sync-run-42".to_string(),
         table: "episodes".to_string(),
-        run_spec_json: r#"{"chunk_size":250,"tables":["episodes"]}"#.to_string(),
         last_primary_key: Some(strings(["7"])),
         complete,
         chunks: 3,

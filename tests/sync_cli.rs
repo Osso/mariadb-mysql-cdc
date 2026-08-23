@@ -16,8 +16,7 @@ fn help_documents_one_unified_sync_command() {
         .collect::<Vec<_>>();
     assert_eq!(sync_usage.len(), 1, "unexpected sync usage:\n{help}");
     assert!(help.contains("Synchronize target schemas and table rows from source."));
-    assert!(help.contains("--authorize-old-run-spec-sha256 SHA256"));
-    assert!(help.contains("Authorize one exact persisted run-spec migration."));
+    assert!(!help.contains("authorize-old-run-spec"));
     for obsolete in [
         "catchup-snapshot",
         "catchup-progress",
@@ -114,7 +113,13 @@ fn sync_accepts_unified_scope_progress_and_parallelism_options() {
 
 #[test]
 fn sync_rejects_obsolete_partial_behavior_flags() {
-    for flag in ["--phase", "--mode", "--copy", "--insert-conflict-policy"] {
+    for flag in [
+        "--phase",
+        "--mode",
+        "--copy",
+        "--insert-conflict-policy",
+        "--authorize-old-run-spec-sha256",
+    ] {
         let output = run(&["sync", flag, "value"]);
 
         assert_eq!(output.status.code(), Some(2));

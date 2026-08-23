@@ -140,7 +140,6 @@ fn sync_orchestrator_replays_running_error_and_partially_complete_stage() {
         saved_stage_statuses(&progress),
         [
             ("prerequisite_schema", "beta", "running"),
-            ("prerequisite_schema", "alpha", "complete"),
             ("prerequisite_schema", "beta", "complete"),
             ("final_constraints", "alpha", "running"),
             ("final_constraints", "beta", "running"),
@@ -236,20 +235,42 @@ fn sync_orchestrator_preserves_schema_error_and_appends_error_save_failure() {
 }
 
 #[test]
-fn sync_orchestrator_rejects_progress_identity_before_any_action() {
+fn sync_orchestrator_uses_only_run_stage_and_table_progress_identity() {
     let (config, evidence, tables, identity) = fixture();
-    let mut mismatched = stage_row(
-        &identity,
-        SyncStage::PrerequisiteSchema,
-        "alpha",
-        SyncProgressStatus::Complete,
-        None,
-    );
-    mismatched.run_spec_json = "{}".to_string();
-    let mut progress = MemoryRunProgress::with_rows([mismatched]);
+    let rows = [
+        stage_row(
+            &identity,
+            SyncStage::PrerequisiteSchema,
+            "alpha",
+            SyncProgressStatus::Complete,
+            None,
+        ),
+        stage_row(
+            &identity,
+            SyncStage::PrerequisiteSchema,
+            "beta",
+            SyncProgressStatus::Complete,
+            None,
+        ),
+        stage_row(
+            &identity,
+            SyncStage::FinalConstraints,
+            "alpha",
+            SyncProgressStatus::Complete,
+            None,
+        ),
+        stage_row(
+            &identity,
+            SyncStage::FinalConstraints,
+            "beta",
+            SyncProgressStatus::Complete,
+            None,
+        ),
+    ];
+    let mut progress = MemoryRunProgress::with_rows(rows);
     let mut executor = RecordingSyncExecutor::default();
 
-    let error = run_sync_orchestration(
+    run_sync_orchestration(
         &config,
         &identity,
         &evidence,
@@ -257,14 +278,115 @@ fn sync_orchestrator_rejects_progress_identity_before_any_action() {
         &mut executor,
         &mut progress,
     )
-    .expect_err("mismatched stage progress");
+    .expect("completed rows are identified by run, stage, and table");
+
+    assert_eq!(executor.events, ["rows"]);
+    assert!(progress.saves.is_empty());
+}
+
+#[test]
+fn sync_orchestrator_resumes_run_id_with_changed_invocation_and_scope() {
+    let (mut config, _, _, identity) = fixture();
+    let omitted_prerequisite = stage_row(
+        &identity,
+        SyncStage::PrerequisiteSchema,
+        "beta",
+        SyncProgressStatus::Complete,
+        None,
+    );
+    let omitted_final = stage_row(
+        &identity,
+        SyncStage::FinalConstraints,
+        "beta",
+        SyncProgressStatus::Complete,
+        None,
+    );
+    let mut progress = MemoryRunProgress::with_rows([
+        stage_row(
+            &identity,
+            SyncStage::PrerequisiteSchema,
+            "alpha",
+            SyncProgressStatus::Complete,
+            None,
+        ),
+        omitted_prerequisite.clone(),
+        stage_row(
+            &identity,
+            SyncStage::FinalConstraints,
+            "alpha",
+            SyncProgressStatus::Complete,
+            None,
+        ),
+        omitted_final.clone(),
+    ]);
+
+    config.source.host = "replacement-source.example".to_string();
+    config.target.host = "10.20.30.40".to_string();
+    config.target.database = "replacement-target".to_string();
+    config.target.tls_ca_file = "/tmp/replacement-ca.pem".to_string();
+    config.chunk_size = 17;
+    config.parallelism = 16;
+    config.progress_table = "other.sync_progress".to_string();
+    config.tables = vec!["alpha".to_string(), "gamma".to_string()];
+    let evidence = SchemaSourceEvidence {
+        inventory: SchemaInventory {
+            schema: "replacement-source".to_string(),
+            tables: vec![table_inventory("alpha"), table_inventory("gamma")],
+            indexes: vec![],
+            foreign_keys: vec![],
+            views: vec![],
+            triggers: vec![],
+            routines: vec![],
+            events: vec![],
+        },
+        checks: vec![],
+        canonical_foreign_keys: vec![],
+    };
+    let tables = sync_tables_from_source_inventory(&evidence.inventory, &config.tables)
+        .expect("changed current table scope");
+    let mut executor = RecordingSyncExecutor::default();
+
+    run_sync_orchestration(
+        &config,
+        &identity,
+        &evidence,
+        tables,
+        &mut executor,
+        &mut progress,
+    )
+    .expect("resume changed invocation under the same run id");
 
     assert_eq!(
-        error,
-        "sync prerequisite_schema progress run specification mismatch for table `alpha`"
+        executor.events,
+        ["schema:prerequisite_schema", "rows", "schema:final_constraints"]
     );
-    assert!(executor.events.is_empty());
-    assert!(progress.saves.is_empty());
+    assert_eq!(
+        progress
+            .saves
+            .iter()
+            .map(|row| {
+                (
+                    row.stage.as_str(),
+                    row.table_name.as_str(),
+                    row.status.as_str(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("prerequisite_schema", "gamma", "running"),
+            ("prerequisite_schema", "gamma", "complete"),
+            ("final_constraints", "gamma", "running"),
+            ("final_constraints", "gamma", "complete"),
+        ]
+    );
+    assert_eq!(
+        progress.rows.get(&("prerequisite_schema".to_string(), "beta".to_string())),
+        Some(&omitted_prerequisite)
+    );
+    assert_eq!(
+        progress.rows.get(&("final_constraints".to_string(), "beta".to_string())),
+        Some(&omitted_final)
+    );
 }
 
 #[test]
@@ -518,7 +640,6 @@ fn fixture_config() -> SyncConfig {
         progress_table: "cdc.sync_runs".to_string(),
         run_id: Some("sync-run-42".to_string()),
         run_id_prefix: None,
-        authorized_old_run_spec_sha256: None,
     }
 }
 
@@ -566,7 +687,6 @@ fn stage_row(
         run_id: identity.run_id.clone(),
         stage,
         table_name: table.to_string(),
-        run_spec_json: identity.run_spec_json.clone(),
         last_primary_key: None,
         chunks: 0,
         rows_scanned: 0,
@@ -585,7 +705,6 @@ fn completed_progress(identity: &SyncRunIdentity, table: &str) -> SyncChunkProgr
     SyncChunkProgress {
         run_id: identity.run_id.clone(),
         table: table.to_string(),
-        run_spec_json: identity.run_spec_json.clone(),
         last_primary_key: Some(vec!["done".to_string()]),
         complete: true,
         chunks: 1,

@@ -217,7 +217,7 @@ is not a supported health check.
 
 The staged `sync` command is the only standalone synchronization entry point. It
 runs prerequisite schema convergence, source-authoritative locked row chunks, and
-final constraint convergence under one immutable run identity. Schema work is not
+final constraint convergence under one durable progress run ID. Schema work is not
 available as a separate `sync-schema` command; `sync-catalog`, `resync-stream`, and
 `recover-lost-binlog` route through the same staged engine.
 
@@ -264,22 +264,20 @@ cargo run -- sync-catalog \
   --catalog syncable-tables.json --run-id-prefix catalog-20260722
 ```
 
-`sync` derives table columns and primary-key ordering from source inventory. Repeat
-`--table` for a closed source scope and provide exactly one immutable `--run-id`
-or `--run-id-prefix`; the progress table defaults to `cdc.sync_runs`. The command
-runs prerequisite schema convergence, source-authoritative locked row chunks, and
-final constraint convergence as one staged operation.
+`sync` derives table columns and primary-key ordering from the current source
+inventory. Repeat `--table` for the current scope and provide exactly one `--run-id`
+or `--run-id-prefix`; the progress table defaults to `cdc.sync_runs`. The run ID
+alone selects durable progress. Source and target addresses, databases, TLS
+configuration, selected tables, current table definitions, chunk size, parallelism,
+and progress invocation settings are resolved fresh on every invocation and do not
+require authorization or progress migration.
 
-`--authorize-old-run-spec-sha256 <64-lowercase-hex>` is an explicit recovery-only
-option for an exact `--run-id`. It authorizes migration from that one persisted
-run-spec hash only when endpoints, settings, ordered scope, primary keys, primary-key
-ordering, and existing writable-column order are unchanged; current source and
-target schemas must agree, and each changed table must have no rows-stage progress.
-The command locks and revalidates every run row in one serializable transaction,
-updates only `run_spec_json`, verifies affected/current row counts, and rolls back
-on any failure without retrying the transaction. A retry after commit is a no-write
-`already_current` result. Authorization is not serialized into the run identity,
-and it is not a general run-spec compatibility bypass.
+Progress remains keyed by `(run_id, stage, table_name)`. Existing rows for omitted
+tables remain untouched, newly selected tables create missing stage rows, completed
+current-table rows stay complete, and running row progress resumes from its stored
+cursor and counters. The physical `run_spec_json` column remains only for schema
+compatibility with existing deployments: readers ignore it, new rows store `{}`,
+and duplicate-key progress updates do not rewrite existing legacy values.
 
 The removed
 `catchup-progress`, `sync-progress`, standalone `sync-schema`, and `drift-check`
@@ -300,7 +298,6 @@ python3 scripts/cdc-integration-harness.py --scenario insert-duplicate-idempoten
 python3 scripts/cdc-integration-harness.py --scenario missing-fk-parent-auto-insert
 python3 scripts/cdc-integration-harness.py --scenario missing-fk-nested-parent-auto-insert
 python3 scripts/cdc-integration-harness.py --scenario missing-fk-superseded-insert
-python3 scripts/cdc-integration-harness.py --scenario sync-authorized-additive-spec-migration
 ```
 
 The serial proofs cover divergent-target INSERT `1062` continuation, nested
@@ -376,8 +373,9 @@ waits until the unified staged run completes or fails. Every catalog table is
 mapped into one `SyncConfig` with the configured source and target, ordered table
 scope, chunk size, bounded catalog parallelism, progress table, and shared
 non-empty `--run-id-prefix`. Unless `--progress-table` overrides it,
-sync-catalog uses `cdc.sync_runs`. Unified sync derives one immutable run identity
-and persists schema-stage, row-stage, and final-constraint progress there.
+sync-catalog uses `cdc.sync_runs`. Its prefix derives one stable run ID independent
+of invocation settings, and unified sync persists schema-stage, row-stage, and
+final-constraint progress there.
 
 The unified run owns prerequisite schema convergence, locked source-authoritative
 row chunks, bounded row workers, and final constraint convergence. The removed

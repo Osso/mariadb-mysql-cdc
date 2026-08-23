@@ -20,7 +20,6 @@ fn sync_runner_resumes_and_runs_chunks_until_durable_completion() {
     let mut progress = MemoryProgress::with_progress(SyncChunkProgress {
         run_id: chunk.run_id.clone(),
         table: table.name.clone(),
-        run_spec_json: chunk.run_spec_json.clone(),
         last_primary_key: Some(strings(["5"])),
         complete: false,
         chunks: 4,
@@ -295,7 +294,6 @@ fn config_and_identity(
         progress_table: "cdc.sync_runs".to_string(),
         run_id: Some("sync-run-42".to_string()),
         run_id_prefix: None,
-        authorized_old_run_spec_sha256: None,
     };
     let identity = build_sync_run_identity(&config, tables.to_vec()).expect("sync run identity");
     (config, identity)
@@ -304,7 +302,6 @@ fn config_and_identity(
 fn chunk_config(table: &SyncTable) -> SyncChunkConfig {
     SyncChunkConfig {
         run_id: "sync-run-42".to_string(),
-        run_spec_json: r#"{"tables":["episodes"]}"#.to_string(),
         target_database: "target-db".to_string(),
         table: table.clone(),
         chunk_size: 1,
@@ -315,7 +312,6 @@ fn completed_progress(identity: &SyncRunIdentity, table: &str) -> SyncChunkProgr
     SyncChunkProgress {
         run_id: identity.run_id.clone(),
         table: table.to_string(),
-        run_spec_json: identity.run_spec_json.clone(),
         last_primary_key: Some(strings(["9"])),
         complete: true,
         chunks: 1,

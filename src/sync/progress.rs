@@ -25,7 +25,7 @@ pub(crate) fn build_sync_progress_select_sql(
     table_name: &str,
 ) -> String {
     format!(
-        "SELECT run_id, stage, table_name, run_spec_json, COALESCE(last_primary_key_json, ''), chunks, rows_scanned, inserts_applied, updates_applied, deletes_applied, status, COALESCE(last_error, ''), DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s.%f'), COALESCE(DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s.%f'), '') FROM {} WHERE run_id = {} AND stage = {} AND table_name = {} LIMIT 1",
+        "SELECT run_id, stage, table_name, COALESCE(last_primary_key_json, ''), chunks, rows_scanned, inserts_applied, updates_applied, deletes_applied, status, COALESCE(last_error, ''), DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s.%f'), COALESCE(DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s.%f'), '') FROM {} WHERE run_id = {} AND stage = {} AND table_name = {} LIMIT 1",
         quote_identifier_path(table),
         quote_sql_literal(run_id),
         quote_sql_literal(stage.as_str()),
@@ -46,7 +46,7 @@ pub(crate) fn build_sync_progress_upsert_sql(
             string_param(&progress.run_id),
             string_param(progress.stage.as_str()),
             string_param(&progress.table_name),
-            string_param(&progress.run_spec_json),
+            string_param("{}"),
             optional_json_param(progress.last_primary_key.as_ref()),
             Value::UInt(progress.chunks),
             Value::UInt(progress.rows_scanned),
@@ -63,30 +63,28 @@ pub(crate) fn build_sync_progress_upsert_sql(
 pub(crate) fn parse_sync_progress_row(output: &str) -> Result<SyncProgressRow, String> {
     let line = output.trim_end_matches(['\r', '\n']);
     let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != 15 {
+    if fields.len() != 14 {
         return Err(format!(
-            "sync progress row has {} fields, expected 15",
+            "sync progress row has {} fields, expected 14",
             fields.len()
         ));
     }
 
-    validate_json("run specification", fields[3])?;
     Ok(SyncProgressRow {
         run_id: fields[0].to_string(),
         stage: SyncStage::parse(fields[1])?,
         table_name: fields[2].to_string(),
-        run_spec_json: fields[3].to_string(),
-        last_primary_key: parse_optional_cursor(fields[4])?,
-        chunks: parse_count("chunks", fields[5])?,
-        rows_scanned: parse_count("rows_scanned", fields[6])?,
-        inserts: parse_count("inserts_applied", fields[7])?,
-        updates: parse_count("updates_applied", fields[8])?,
-        deletes: parse_count("deletes_applied", fields[9])?,
-        status: SyncProgressStatus::parse(fields[10])?,
-        last_error: optional_string(fields[11]),
-        created_at: fields[12].to_string(),
-        updated_at: fields[13].to_string(),
-        completed_at: optional_string(fields[14]),
+        last_primary_key: parse_optional_cursor(fields[3])?,
+        chunks: parse_count("chunks", fields[4])?,
+        rows_scanned: parse_count("rows_scanned", fields[5])?,
+        inserts: parse_count("inserts_applied", fields[6])?,
+        updates: parse_count("updates_applied", fields[7])?,
+        deletes: parse_count("deletes_applied", fields[8])?,
+        status: SyncProgressStatus::parse(fields[9])?,
+        last_error: optional_string(fields[10]),
+        created_at: fields[11].to_string(),
+        updated_at: fields[12].to_string(),
+        completed_at: optional_string(fields[13]),
     })
 }
 
@@ -97,12 +95,6 @@ fn parse_optional_cursor(value: &str) -> Result<Option<Vec<String>>, String> {
     serde_json::from_str::<Vec<String>>(value)
         .map(Some)
         .map_err(|error| format!("invalid sync progress cursor JSON: {error}"))
-}
-
-fn validate_json(field: &str, value: &str) -> Result<(), String> {
-    serde_json::from_str::<serde_json::Value>(value)
-        .map(|_| ())
-        .map_err(|error| format!("invalid sync progress {field} JSON: {error}"))
 }
 
 fn parse_count(field: &str, value: &str) -> Result<u64, String> {

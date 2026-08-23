@@ -1,304 +1,57 @@
-use crate::inventory::{ColumnInventory, GeneratedColumn, SchemaInventory, TableInventory};
+use crate::inventory::{ColumnInventory, GeneratedColumn, TableInventory};
 use crate::sync::{
-    SyncConfig, SyncPrimaryKeyOrdering, SyncRunSpec, SyncTable, build_sync_run_identity,
-    plan_additive_run_spec_migration, sync_table_from_inventory, validate_sync_config,
+    SyncConfig, SyncPrimaryKeyOrdering, SyncTable, build_sync_run_identity,
+    sync_table_from_inventory, validate_sync_config,
 };
 
 #[test]
-fn sync_config_builds_sorted_secret_free_spec_and_preserves_exact_run_id() {
+fn sync_config_preserves_exact_run_id_across_invocation_changes() {
     let config = exact_run_config();
-    let identity = build_sync_run_identity(
+    let first = build_sync_run_identity(
         &config,
         vec![sync_table("zeta", "zeta_id"), sync_table("alpha", "alpha_id")],
     )
-    .expect("valid exact sync run");
+    .expect("first exact run identity");
 
-    assert_eq!(identity.run_id, "sync-run-42");
-    assert_eq!(identity.run_spec.tables[0].name, "alpha");
-    assert_eq!(identity.run_spec.tables[1].name, "zeta");
-    assert_eq!(identity.run_spec.source.host, "source-host");
-    assert_eq!(identity.run_spec.source.port, 3307);
-    assert_eq!(identity.run_spec.source.database, "source_database");
-    assert_eq!(identity.run_spec.target.host, "target-host");
-    assert_eq!(identity.run_spec.target.port, 25060);
-    assert_eq!(identity.run_spec.target.database, "target_database");
-    assert_eq!(identity.run_spec.chunk_size, 500);
-    assert_eq!(identity.run_spec.parallelism, 4);
-    assert_eq!(identity.run_spec.progress_table, "cdc.sync_runs");
-    assert_eq!(
-        identity.run_spec_json,
-        serde_json::to_string(&identity.run_spec).expect("serialize run spec")
-    );
-    for secret in [
-        "source-secret",
-        "target-secret",
-        "/tmp/target-ca.pem",
-        "source-user",
-        "target-user",
-    ] {
-        assert!(
-            !identity.run_spec_json.contains(secret),
-            "run specification leaked `{secret}`: {}",
-            identity.run_spec_json
-        );
-    }
+    let mut changed = config;
+    changed.source.host = "replacement-source.example".to_string();
+    changed.source.database = "replacement_source".to_string();
+    changed.target.host = "10.20.30.40".to_string();
+    changed.target.database = "replacement_target".to_string();
+    changed.target.tls_ca_file = "/tmp/replacement-ca.pem".to_string();
+    changed.chunk_size = 37;
+    changed.parallelism = 16;
+    changed.progress_table = "other.sync_progress".to_string();
+    changed.tables = strings(["replacement"]);
+    let changed_tables = vec![sync_table("replacement", "replacement_id")];
+    let resumed = build_sync_run_identity(&changed, changed_tables).expect("changed invocation");
+
+    assert_eq!(first.run_id, "sync-run-42");
+    assert_eq!(resumed, first);
 }
 
 #[test]
-fn sync_config_derives_stable_domain_separated_run_ids_from_every_immutable_input() {
+fn sync_config_derives_run_id_from_prefix_only() {
     let config = prefixed_run_config();
     let tables = vec![sync_table("alpha", "alpha_id"), sync_table("zeta", "zeta_id")];
     let first = build_sync_run_identity(&config, tables.clone()).expect("first identity");
-    let reordered = build_sync_run_identity(
-        &config,
-        vec![sync_table("zeta", "zeta_id"), sync_table("alpha", "alpha_id")],
-    )
-    .expect("reordered identity");
 
-    assert_eq!(first, reordered);
-    assert!(first.run_id.starts_with("sync-v1-"));
-    assert_eq!(first.run_id.len(), "sync-v1-".len() + 64);
+    let mut changed = config;
+    changed.source.host = "replacement-source.example".to_string();
+    changed.target.host = "10.20.30.40".to_string();
+    changed.target.database = "replacement_target".to_string();
+    changed.target.tls_ca_file = "/tmp/replacement-ca.pem".to_string();
+    changed.chunk_size = 37;
+    changed.parallelism = 16;
+    changed.progress_table = "other.sync_progress".to_string();
+    changed.tables = strings(["replacement"]);
+    let changed_tables = vec![sync_table("replacement", "replacement_id")];
+    let resumed = build_sync_run_identity(&changed, changed_tables).expect("changed invocation");
+
+    assert_eq!(resumed, first);
+    assert!(first.run_id.starts_with("sync-v2-"));
+    assert_eq!(first.run_id.len(), "sync-v2-".len() + 64);
     assert!(first.run_id.len() <= 128);
-
-    let mut variants = Vec::new();
-
-    let mut changed = config.clone();
-    changed.source.host = "other-source".to_string();
-    variants.push(build_sync_run_identity(&changed, tables.clone()).expect("source variant"));
-
-    let mut changed = config.clone();
-    changed.target.database = "other_target".to_string();
-    variants.push(build_sync_run_identity(&changed, tables.clone()).expect("target variant"));
-
-    let mut changed = config.clone();
-    changed.chunk_size += 1;
-    variants.push(build_sync_run_identity(&changed, tables.clone()).expect("chunk variant"));
-
-    let mut changed = config.clone();
-    changed.parallelism += 1;
-    variants.push(build_sync_run_identity(&changed, tables.clone()).expect("parallel variant"));
-
-    let mut changed = config.clone();
-    changed.progress_table = "other.sync_runs".to_string();
-    variants.push(build_sync_run_identity(&changed, tables.clone()).expect("progress variant"));
-
-    let mut changed_tables = tables;
-    changed_tables[0].columns.push("title".to_string());
-    variants.push(build_sync_run_identity(&config, changed_tables).expect("table variant"));
-
-    for variant in variants {
-        assert_ne!(variant.run_id, first.run_id);
-    }
-}
-
-#[test]
-fn sync_additive_run_spec_migration_accepts_compatible_added_writable_columns() {
-    let (persisted, current, source, target) = compatible_additive_migration();
-
-    let plan = plan_additive_run_spec_migration(&persisted, &current, &source, &target)
-        .expect("compatible additive migration");
-
-    assert_eq!(plan.changed_tables.len(), 1);
-    assert_eq!(plan.changed_tables[0].table, "alpha");
-    assert_eq!(
-        plan.changed_tables[0].added_columns,
-        strings(["direct_seen_at", "sync_seen_at"])
-    );
-}
-
-#[test]
-fn sync_additive_run_spec_migration_rejects_endpoint_setting_and_scope_drift() {
-    let (persisted, current, source, target) = compatible_additive_migration();
-    let mut variants = Vec::new();
-
-    let mut changed = current.clone();
-    changed.source.host = "other-source".to_string();
-    variants.push(("source endpoint changed", changed));
-
-    let mut changed = current.clone();
-    changed.target.database = "other-target".to_string();
-    variants.push(("target endpoint changed", changed));
-
-    let mut changed = current.clone();
-    changed.chunk_size += 1;
-    variants.push(("chunk size changed", changed));
-
-    let mut changed = current.clone();
-    changed.parallelism += 1;
-    variants.push(("parallelism changed", changed));
-
-    let mut changed = current.clone();
-    changed.progress_table = "other.sync_runs".to_string();
-    variants.push(("progress table changed", changed));
-
-    let mut changed = current;
-    changed
-        .tables
-        .push(migration_sync_table("gamma", &["id", "value"]));
-    variants.push(("table scope or order changed", changed));
-
-    for (expected, changed) in variants {
-        assert_eq!(
-            plan_additive_run_spec_migration(&persisted, &changed, &source, &target)
-                .expect_err(expected),
-            format!("additive run-spec migration {expected}")
-        );
-    }
-}
-
-#[test]
-fn sync_additive_run_spec_migration_rejects_removed_or_reordered_writable_columns() {
-    let (persisted, _, _, _) = compatible_additive_migration();
-
-    let removed = migration_spec(vec![
-        migration_sync_table("alpha", &["id", "direct_seen_at"]),
-        migration_sync_table("beta", &["id", "value"]),
-    ]);
-    let removed_inventory = migration_inventory(vec![
-        migration_inventory_table(
-            "alpha",
-            &["id"],
-            &[("id", "bigint unsigned"), ("direct_seen_at", "timestamp")],
-        ),
-        migration_inventory_table(
-            "beta",
-            &["id"],
-            &[("id", "bigint unsigned"), ("value", "varchar(255)")],
-        ),
-    ]);
-    assert_eq!(
-        plan_additive_run_spec_migration(
-            &persisted,
-            &removed,
-            &removed_inventory,
-            &removed_inventory,
-        )
-        .expect_err("removed column"),
-        "additive run-spec migration table `alpha` removed writable columns: value"
-    );
-
-    let reordered = migration_spec(vec![
-        migration_sync_table("alpha", &["value", "id", "direct_seen_at"]),
-        migration_sync_table("beta", &["id", "value"]),
-    ]);
-    let reordered_inventory = migration_inventory(vec![
-        migration_inventory_table(
-            "alpha",
-            &["id"],
-            &[
-                ("value", "varchar(255)"),
-                ("id", "bigint unsigned"),
-                ("direct_seen_at", "timestamp"),
-            ],
-        ),
-        migration_inventory_table(
-            "beta",
-            &["id"],
-            &[("id", "bigint unsigned"), ("value", "varchar(255)")],
-        ),
-    ]);
-    assert_eq!(
-        plan_additive_run_spec_migration(
-            &persisted,
-            &reordered,
-            &reordered_inventory,
-            &reordered_inventory,
-        )
-        .expect_err("reordered columns"),
-        "additive run-spec migration table `alpha` reordered existing writable columns"
-    );
-}
-
-#[test]
-fn sync_additive_run_spec_migration_rejects_primary_key_and_ordering_drift() {
-    let (persisted, current, source, target) = compatible_additive_migration();
-
-    let mut changed_key = current.clone();
-    changed_key.tables[0].primary_key = strings(["value"]);
-    let mut key_source = source.clone();
-    key_source.tables[0].primary_key = strings(["value"]);
-    let mut key_target = target.clone();
-    key_target.tables[0].primary_key = strings(["value"]);
-    assert_eq!(
-        plan_additive_run_spec_migration(
-            &persisted,
-            &changed_key,
-            &key_source,
-            &key_target,
-        )
-        .expect_err("primary-key drift"),
-        "additive run-spec migration table `alpha` primary key changed"
-    );
-
-    let mut changed_ordering = current;
-    changed_ordering.tables[0].primary_key_ordering = vec![
-        SyncPrimaryKeyOrdering::Enum(strings(["one", "two"])),
-    ];
-    let mut ordering_source = source;
-    ordering_source.tables[0].columns[0].column_type = "enum('one','two')".to_string();
-    ordering_source.tables[0].columns[0].data_type = "enum".to_string();
-    let ordering_target = ordering_source.clone();
-    assert_eq!(
-        plan_additive_run_spec_migration(
-            &persisted,
-            &changed_ordering,
-            &ordering_source,
-            &ordering_target,
-        )
-        .expect_err("primary-key ordering drift"),
-        "additive run-spec migration table `alpha` primary-key ordering changed"
-    );
-}
-
-#[test]
-fn sync_additive_run_spec_migration_rejects_missing_or_incompatible_target() {
-    let (persisted, current, source, mut target) = compatible_additive_migration();
-    target.tables.retain(|table| table.name != "alpha");
-    assert_eq!(
-        plan_additive_run_spec_migration(&persisted, &current, &source, &target)
-            .expect_err("missing target"),
-        "additive run-spec migration target table `alpha` is missing"
-    );
-
-    let (_, current, source, mut target) = compatible_additive_migration();
-    target
-        .tables
-        .iter_mut()
-        .find(|table| table.name == "alpha")
-        .expect("alpha target")
-        .columns
-        .retain(|column| column.name != "sync_seen_at");
-    assert_eq!(
-        plan_additive_run_spec_migration(&persisted, &current, &source, &target)
-            .expect_err("incompatible target"),
-        "additive run-spec migration table `alpha` current source and target schemas are incompatible"
-    );
-}
-
-#[test]
-fn sync_additive_run_spec_migration_rejects_no_additive_change() {
-    let persisted = migration_spec(vec![
-        migration_sync_table("alpha", &["id", "value"]),
-        migration_sync_table("beta", &["id", "value"]),
-    ]);
-    let inventory = migration_inventory(vec![
-        migration_inventory_table(
-            "alpha",
-            &["id"],
-            &[("id", "bigint unsigned"), ("value", "varchar(255)")],
-        ),
-        migration_inventory_table(
-            "beta",
-            &["id"],
-            &[("id", "bigint unsigned"), ("value", "varchar(255)")],
-        ),
-    ]);
-
-    assert_eq!(
-        plan_additive_run_spec_migration(&persisted, &persisted, &inventory, &inventory)
-            .expect_err("no additive change"),
-        "additive run-spec migration has no added writable columns"
-    );
 }
 
 #[test]
@@ -492,93 +245,6 @@ fn sync_table_conversion_rejects_invalid_primary_keys_and_duplicate_columns() {
     );
 }
 
-fn compatible_additive_migration() -> (
-    SyncRunSpec,
-    SyncRunSpec,
-    SchemaInventory,
-    SchemaInventory,
-) {
-    let persisted = migration_spec(vec![
-        migration_sync_table("alpha", &["id", "value"]),
-        migration_sync_table("beta", &["id", "value"]),
-    ]);
-    let current = migration_spec(vec![
-        migration_sync_table(
-            "alpha",
-            &["id", "direct_seen_at", "value", "sync_seen_at"],
-        ),
-        migration_sync_table("beta", &["id", "value"]),
-    ]);
-    let inventory = migration_inventory(vec![
-        migration_inventory_table(
-            "alpha",
-            &["id"],
-            &[
-                ("id", "bigint unsigned"),
-                ("direct_seen_at", "timestamp"),
-                ("value", "varchar(255)"),
-                ("sync_seen_at", "timestamp"),
-            ],
-        ),
-        migration_inventory_table(
-            "beta",
-            &["id"],
-            &[("id", "bigint unsigned"), ("value", "varchar(255)")],
-        ),
-    ]);
-    (persisted, current, inventory.clone(), inventory)
-}
-
-fn migration_spec(tables: Vec<SyncTable>) -> SyncRunSpec {
-    build_sync_run_identity(&exact_run_config(), tables)
-        .expect("migration run specification")
-        .run_spec
-}
-
-fn migration_sync_table(name: &str, columns: &[&str]) -> SyncTable {
-    SyncTable {
-        name: name.to_string(),
-        primary_key: strings(["id"]),
-        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
-        columns: columns.iter().map(|column| (*column).to_string()).collect(),
-    }
-}
-
-fn migration_inventory(tables: Vec<TableInventory>) -> SchemaInventory {
-    SchemaInventory {
-        schema: "source_database".to_string(),
-        tables,
-        indexes: Vec::new(),
-        foreign_keys: Vec::new(),
-        views: Vec::new(),
-        triggers: Vec::new(),
-        routines: Vec::new(),
-        events: Vec::new(),
-    }
-}
-
-fn migration_inventory_table(
-    name: &str,
-    primary_key: &[&str],
-    columns: &[(&str, &str)],
-) -> TableInventory {
-    TableInventory {
-        name: name.to_string(),
-        table_type: "BASE TABLE".to_string(),
-        engine: Some("InnoDB".to_string()),
-        collation: Some("utf8mb4_0900_ai_ci".to_string()),
-        primary_key: primary_key
-            .iter()
-            .map(|column| (*column).to_string())
-            .collect(),
-        columns: columns
-            .iter()
-            .enumerate()
-            .map(|(index, (name, column_type))| column(name, index as u32 + 1, column_type, None))
-            .collect(),
-    }
-}
-
 fn exact_run_config() -> SyncConfig {
     SyncConfig {
         source: crate::mysql_config::MySqlConnectionConfig {
@@ -603,7 +269,6 @@ fn exact_run_config() -> SyncConfig {
         progress_table: "cdc.sync_runs".to_string(),
         run_id: Some("sync-run-42".to_string()),
         run_id_prefix: None,
-        authorized_old_run_spec_sha256: None,
     }
 }
 

@@ -9,7 +9,8 @@ MariaDB and MySQL differ in SQL, metadata, and binlog behavior.
 
 1. Converge target schema from committed source evidence.
 2. Synchronize source-authoritative rows in target-WRITE-locked primary-key
-   chunks under one immutable run identity.
+   chunks under one durable progress run ID; resolve invocation configuration fresh
+   on every resume.
 3. Consume MariaDB ROW/FULL binlog events with ordered target commits and
    checkpoints; do not serve traffic from an unproven target.
 

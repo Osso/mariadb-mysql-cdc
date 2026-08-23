@@ -13,12 +13,12 @@ Classification compares writable columns, generated-column support, character se
 
 ## Unified execution
 
-`sync-catalog` maps every catalog entry into one unified `SyncConfig` and invokes one run. The run uses the configured source and target, ordered table names, chunk size, bounded catalog parallelism, progress table, and shared non-empty `--run-id-prefix`. Unified sync derives one immutable run identity and persists staged progress in `cdc.sync_runs`.
+`sync-catalog` maps every catalog entry into one unified `SyncConfig` and invokes one run. The run uses the current source and target, ordered table names, chunk size, bounded catalog parallelism, progress table, and shared non-empty `--run-id-prefix`. Unified sync derives the durable run ID from the prefix alone and persists staged progress by `(run_id, stage, table_name)` in `cdc.sync_runs`; invocation or catalog changes require no authorization or progress migration.
 
 The unified run owns prerequisite schema convergence, locked source-authoritative row chunks, bounded row workers, and final constraint convergence. The removed catalog-specific dependency scheduler, admission locks, child run IDs, target-only repair verification, and per-table progress handling are not part of this path. Catalog FK metadata still controls which tables are classified as syncable; it does not create separate child runs.
 
 ## Failure and recovery
 
-A unified run failure is recorded through `cdc.sync_runs` and returned by `sync-catalog`. Resume behavior follows the unified run identity and staged progress contract; the catalog JSON is not mutated. Both `resync-stream` and `recover-lost-binlog` use the same unified sync engine; recovery-specific identity and progress remain distinct.
+A unified run failure is recorded through `cdc.sync_runs` and returned by `sync-catalog`. Resume behavior follows the durable run ID and staged progress contract: omitted tables remain untouched, completed selected rows skip, running rows resume, and newly selected tables create missing stages. The catalog JSON is not mutated. Both `resync-stream` and `recover-lost-binlog` use the same unified sync engine; recovery-specific run IDs and progress remain distinct.
 
 The non-syncable catalog is operator input only. Full-dump execution and automatic deployment are outside this command.

@@ -198,7 +198,7 @@ fn sync_mysql_contract_selects_and_upserts_exact_progress_identity() {
             SyncStage::Rows,
             "episodes",
         ),
-        "SELECT run_id, stage, table_name, run_spec_json, COALESCE(last_primary_key_json, ''), chunks, rows_scanned, inserts_applied, updates_applied, deletes_applied, status, COALESCE(last_error, ''), DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s.%f'), COALESCE(DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s.%f'), '') FROM `cdc`.`sync_runs` WHERE run_id = 'sync-run-42' AND stage = 'rows' AND table_name = 'episodes' LIMIT 1"
+        "SELECT run_id, stage, table_name, COALESCE(last_primary_key_json, ''), chunks, rows_scanned, inserts_applied, updates_applied, deletes_applied, status, COALESCE(last_error, ''), DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s.%f'), COALESCE(DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s.%f'), '') FROM `cdc`.`sync_runs` WHERE run_id = 'sync-run-42' AND stage = 'rows' AND table_name = 'episodes' LIMIT 1"
     );
 
     let upsert = build_sync_progress_upsert_sql("cdc.sync_runs", &progress);
@@ -212,7 +212,7 @@ fn sync_mysql_contract_selects_and_upserts_exact_progress_identity() {
             bytes("sync-run-42"),
             bytes("rows"),
             bytes("episodes"),
-            bytes(r#"{"chunk_size":250,"tables":["episodes"]}"#),
+            bytes("{}"),
             bytes(r#"["7","live"]"#),
             Value::UInt(3),
             Value::UInt(750),
@@ -224,12 +224,13 @@ fn sync_mysql_contract_selects_and_upserts_exact_progress_identity() {
             Value::NULL,
         ]
     );
+    assert!(!upsert.sql.contains("run_spec_json = new.run_spec_json"));
 }
 
 #[test]
-fn sync_mysql_contract_parses_concrete_progress_and_rejects_malformed_rows() {
+fn sync_mysql_contract_parses_progress_without_loading_legacy_run_spec() {
     let parsed = parse_sync_progress_row(
-        "sync-run-42\trows\tepisodes\t{\"chunk_size\":250,\"tables\":[\"episodes\"]}\t[\"7\",\"live\"]\t3\t750\t4\t5\t6\trunning\t\t2026-08-17 12:00:00.123456\t2026-08-17 12:05:00.654321\t",
+        "sync-run-42\trows\tepisodes\t[\"7\",\"live\"]\t3\t750\t4\t5\t6\trunning\t\t2026-08-17 12:00:00.123456\t2026-08-17 12:05:00.654321\t",
     )
     .expect("valid staged progress row");
 
@@ -239,23 +240,19 @@ fn sync_mysql_contract_parses_concrete_progress_and_rejects_malformed_rows() {
         ("field count", "sync-run-42\trows\tepisodes"),
         (
             "stage",
-            "sync-run-42\tcopy\tepisodes\t{}\t\t0\t0\t0\t0\t0\trunning\t\t2026-08-17 12:00:00.000000\t2026-08-17 12:00:00.000000\t",
+            "sync-run-42\tcopy\tepisodes\t\t0\t0\t0\t0\t0\trunning\t\t2026-08-17 12:00:00.000000\t2026-08-17 12:00:00.000000\t",
         ),
         (
             "status",
-            "sync-run-42\trows\tepisodes\t{}\t\t0\t0\t0\t0\t0\tdone\t\t2026-08-17 12:00:00.000000\t2026-08-17 12:00:00.000000\t",
-        ),
-        (
-            "run spec JSON",
-            "sync-run-42\trows\tepisodes\t{broken\t\t0\t0\t0\t0\t0\trunning\t\t2026-08-17 12:00:00.000000\t2026-08-17 12:00:00.000000\t",
+            "sync-run-42\trows\tepisodes\t\t0\t0\t0\t0\t0\tdone\t\t2026-08-17 12:00:00.000000\t2026-08-17 12:00:00.000000\t",
         ),
         (
             "cursor JSON",
-            "sync-run-42\trows\tepisodes\t{}\t[\"7\"\t0\t0\t0\t0\t0\trunning\t\t2026-08-17 12:00:00.000000\t2026-08-17 12:00:00.000000\t",
+            "sync-run-42\trows\tepisodes\t[\"7\"\t0\t0\t0\t0\t0\trunning\t\t2026-08-17 12:00:00.000000\t2026-08-17 12:00:00.000000\t",
         ),
         (
             "numeric field",
-            "sync-run-42\trows\tepisodes\t{}\t\tnot-a-count\t0\t0\t0\t0\trunning\t\t2026-08-17 12:00:00.000000\t2026-08-17 12:00:00.000000\t",
+            "sync-run-42\trows\tepisodes\t\tnot-a-count\t0\t0\t0\t0\trunning\t\t2026-08-17 12:00:00.000000\t2026-08-17 12:00:00.000000\t",
         ),
     ] {
         assert!(
@@ -335,7 +332,6 @@ fn progress_row() -> SyncProgressRow {
         run_id: "sync-run-42".to_string(),
         stage: SyncStage::Rows,
         table_name: "episodes".to_string(),
-        run_spec_json: r#"{"chunk_size":250,"tables":["episodes"]}"#.to_string(),
         last_primary_key: Some(strings(["7", "live"])),
         chunks: 3,
         rows_scanned: 750,

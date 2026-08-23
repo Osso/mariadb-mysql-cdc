@@ -188,7 +188,6 @@ fn progress(
     SyncChunkProgress {
         run_id: run_id.to_string(),
         table: table.to_string(),
-        run_spec_json: "{}".to_string(),
         last_primary_key: None,
         complete,
         chunks: 1,

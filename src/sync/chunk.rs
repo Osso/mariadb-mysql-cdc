@@ -88,7 +88,6 @@ fn load_progress(
         None => Ok(SyncChunkProgress {
             run_id: config.run_id.clone(),
             table: config.table.name.clone(),
-            run_spec_json: config.run_spec_json.clone(),
             last_primary_key: None,
             complete: false,
             chunks: 0,
@@ -114,12 +113,6 @@ fn validate_progress_identity(
         return Err(format!(
             "loaded sync progress table mismatch for run `{}`: expected `{}`, found `{}`",
             config.run_id, config.table.name, progress.table
-        ));
-    }
-    if progress.run_spec_json != config.run_spec_json {
-        return Err(format!(
-            "loaded sync progress run specification mismatch for run `{}` table `{}`: expected `{}`, found `{}`",
-            config.run_id, config.table.name, config.run_spec_json, progress.run_spec_json
         ));
     }
     Ok(())

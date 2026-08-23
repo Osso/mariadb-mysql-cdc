@@ -13,7 +13,6 @@ pub(crate) struct SyncTable {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SyncChunkConfig {
     pub(crate) run_id: String,
-    pub(crate) run_spec_json: String,
     pub(crate) target_database: String,
     pub(crate) table: SyncTable,
     pub(crate) chunk_size: usize,
@@ -97,7 +96,6 @@ impl SyncUniqueOwnerAction {
 pub(crate) struct SyncChunkProgress {
     pub(crate) run_id: String,
     pub(crate) table: String,
-    pub(crate) run_spec_json: String,
     pub(crate) last_primary_key: Option<Vec<String>>,
     pub(crate) complete: bool,
     pub(crate) chunks: u64,
@@ -164,7 +162,6 @@ pub(crate) struct SyncProgressRow {
     pub(crate) run_id: String,
     pub(crate) stage: SyncStage,
     pub(crate) table_name: String,
-    pub(crate) run_spec_json: String,
     pub(crate) last_primary_key: Option<Vec<String>>,
     pub(crate) chunks: u64,
     pub(crate) rows_scanned: u64,
