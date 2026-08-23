@@ -8,7 +8,7 @@ Scope evidence: [full-catalog-sync-scope-20260819.md](full-catalog-sync-scope-20
 
 Durable progress is identified only by run ID `full-catalog-sync-20260819-01`. The values below describe the initial invocation, not immutable run state. On resume, source/target endpoint, address or domain, current table scope/definitions, chunk size, parallelism, and other invocation settings may change without authorization or run-spec migration. The physical `run_spec_json` column is ignored legacy evidence; historical distinct-spec counts are observations, not completion gates.
 
-Commit `e2d1fa5` implements this run-ID-only behavior. At this documentation revision it has not yet been built, deployed, or independently verified.
+Commit `e2d1fa5` introduced this run-ID-only behavior. At that historical documentation revision it had not yet been built, deployed, or independently verified. The later disposable `sync-resume` proof completed at `5aca33f`: the same exact run ID resumed from target `127.0.0.1` to `localhost`, changed chunk size `10→37` and parallelism `1→16`, preserved completed progress byte-for-byte, resumed the running cursor, left legacy specs unchanged, and finished six complete stage rows with matching source/target counts, distinct-primary-key counts, and checksums. Evidence ledger: `/tmp/claude/cdc-sync-resume-proof-ledger.md`.
 
 - Run ID: `full-catalog-sync-20260819-01`
 - Job: `ops/mariadb-mysql-cdc-sync-full-20260819-01`

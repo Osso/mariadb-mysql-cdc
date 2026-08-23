@@ -17,7 +17,10 @@ the previous location. Resume resolves endpoints, TLS, current table scope and
 definitions, chunk size, and parallelism fresh. Omitted rows remain untouched,
 completed selected rows skip, running row progress resumes from its cursor and
 counters, and newly selected tables create missing stages. The legacy
-`run_spec_json` column is ignored and never migrated or rewritten.
+`run_spec_json` column is ignored and never migrated or rewritten. `--run-id-prefix`
+retains backward-compatible `sync-v1` generation from serialized invocation/table
+input; use an exact `--run-id` for mutable resume because changing that input changes
+the derived prefix ID.
 
 ## Lost-binlog recovery control plane
 

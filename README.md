@@ -272,7 +272,10 @@ option locates that store, so changing it selects a different store rather than 
 rows from the previous location. Source and target addresses, databases, TLS
 configuration, selected tables, current table definitions, chunk size, and parallelism
 are resolved fresh on every invocation and do not require authorization or progress
-migration.
+migration. `--run-id-prefix` remains only for backward-compatible `sync-v1` generation
+from the prefix plus serialized invocation/table input; it is not the recommended
+mutable-resume path. Use an exact `--run-id` to resume the same progress across those
+changes.
 
 Progress remains keyed by `(run_id, stage, table_name)`. Existing rows for omitted
 tables remain untouched, newly selected tables create missing stage rows, completed
