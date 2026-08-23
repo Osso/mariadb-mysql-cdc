@@ -378,9 +378,9 @@ waits until the unified staged run completes or fails. Every catalog table is
 mapped into one `SyncConfig` with the configured source and target, ordered table
 scope, chunk size, bounded catalog parallelism, progress table, and shared
 non-empty `--run-id-prefix`. Unless `--progress-table` overrides it,
-sync-catalog uses `cdc.sync_runs`. Its prefix derives one stable run ID independent
-of invocation settings, and unified sync persists schema-stage, row-stage, and
-final-constraint progress there.
+sync-catalog uses `cdc.sync_runs`. Its prefix derives the backward-compatible `sync-v1` run ID from the prefix plus
+serialized invocation/table input, and unified sync persists schema-stage, row-stage,
+and final-constraint progress there.
 
 The unified run owns prerequisite schema convergence, locked source-authoritative
 row chunks, bounded row workers, and final constraint convergence. The removed
