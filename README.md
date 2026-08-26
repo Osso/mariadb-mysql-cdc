@@ -227,6 +227,16 @@ and produce representative primary keys; independent tables continue, while
 dependent operations are skipped. The staged run persists progress in
 `cdc.sync_runs` and fails closed if final structural convergence is not achieved.
 
+## FK orphan repair
+
+`repair-fk-orphans` is a separate, bounded source-authoritative tool for the four
+allowlisted historical composite-FK orphan sets. It requires an exact
+`--expected-orphans` count, defaults to `--batch-size 50` and `--limit 1000`, and
+never writes staged progress, stream checkpoints, DDL journals, or run-spec state.
+Run one case at a time and proceed sequentially only after the previous case has
+committed, verified zero remaining orphans, and produced terminal evidence. The
+full CLI contract is [bounded FK orphan repair](docs/specs/fk-orphan-repair.md).
+
 ## Commands
 
 ```bash
