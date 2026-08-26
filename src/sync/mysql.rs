@@ -30,7 +30,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod query;
 mod unique_owner;
 
-use query::{decode_optional_exact_row, mysql_rows_to_strings, query_statement_rows_as_strings};
+pub(crate) use query::{
+    decode_optional_exact_row, mysql_rows_to_strings, query_statement_rows_as_strings,
+};
 pub(crate) use unique_owner::{
     SyncUniqueIndexColumn, build_sync_insert_failure, format_unique_owner_reconciliation_event,
     resolve_sync_unique_index,
@@ -59,7 +61,7 @@ pub(crate) struct MySqlSyncProgressStore {
     progress_table: String,
 }
 
-fn open_sync_connection(opts: Opts) -> mysql::Result<Conn> {
+pub(crate) fn open_sync_connection(opts: Opts) -> mysql::Result<Conn> {
     retry_sync_connection_construction(
         || Conn::new(opts.clone()),
         thread::sleep,

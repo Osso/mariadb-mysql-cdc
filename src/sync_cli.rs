@@ -66,7 +66,7 @@ fn apply_sync_option(config: &mut SyncConfig, flag: &str, value: &str) -> Result
     Ok(())
 }
 
-fn apply_source_option(
+pub(crate) fn apply_source_option(
     source: &mut crate::mysql_config::MySqlConnectionConfig,
     flag: &str,
     value: &str,
@@ -82,7 +82,7 @@ fn apply_source_option(
     Ok(true)
 }
 
-fn apply_target_option(
+pub(crate) fn apply_target_option(
     target: &mut live::TargetMySqlConfig,
     flag: &str,
     value: &str,

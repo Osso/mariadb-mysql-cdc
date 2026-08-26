@@ -34,6 +34,17 @@ fn help_documents_one_unified_sync_command() {
 }
 
 #[test]
+fn help_documents_bounded_fk_orphan_repair() {
+    let output = run(&["--help"]);
+
+    assert!(output.status.success());
+    assert!(stderr(&output).is_empty());
+    let help = stdout(&output);
+    assert!(help.contains("mariadb-mysql-cdc repair-fk-orphans "));
+    assert!(help.contains("Repair one allowlisted target FK orphan set from exact source rows."));
+}
+
+#[test]
 fn obsolete_sync_command_names_are_rejected_without_dispatch() {
     for obsolete in [
         "catchup-snapshot",

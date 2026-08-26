@@ -1,5 +1,6 @@
 mod chunk;
 mod config;
+mod fk_orphan_repair;
 mod model;
 mod mysql;
 mod orchestrate;
@@ -12,6 +13,7 @@ pub(crate) use chunk::sync_next_chunk;
 pub(crate) use config::{DEFAULT_SYNC_PROGRESS_TABLE, SyncConfig, validate_sync_config};
 #[cfg(test)]
 pub(crate) use config::{SyncRunIdentity, build_sync_run_identity, sync_table_from_inventory};
+pub(crate) use fk_orphan_repair::run_fk_orphan_repair_command;
 pub(crate) use model::SyncChunkProgress;
 #[cfg(test)]
 pub(crate) use model::{

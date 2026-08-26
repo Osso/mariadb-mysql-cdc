@@ -6,7 +6,7 @@ use crate::target::SqlStatement;
 use mysql::prelude::Queryable;
 use mysql::{Conn, Params};
 
-pub(super) fn decode_optional_exact_row(
+pub(crate) fn decode_optional_exact_row(
     table: &SyncTable,
     rows: Vec<Vec<Option<String>>>,
     endpoint: &str,
@@ -22,7 +22,7 @@ pub(super) fn decode_optional_exact_row(
     }
 }
 
-pub(super) fn query_statement_rows_as_strings(
+pub(crate) fn query_statement_rows_as_strings(
     conn: &mut Conn,
     statement: &SqlStatement,
     operation: &str,
@@ -33,7 +33,7 @@ pub(super) fn query_statement_rows_as_strings(
     Ok(mysql_rows_to_strings(rows))
 }
 
-pub(super) fn mysql_rows_to_strings(rows: Vec<mysql::Row>) -> Vec<Vec<Option<String>>> {
+pub(crate) fn mysql_rows_to_strings(rows: Vec<mysql::Row>) -> Vec<Vec<Option<String>>> {
     rows.into_iter()
         .map(|row| row.unwrap().into_iter().map(value_to_string).collect())
         .collect()

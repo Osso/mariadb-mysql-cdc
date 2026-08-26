@@ -34,6 +34,7 @@ Usage:
   mariadb-mysql-cdc plan
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
   mariadb-mysql-cdc sync --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --table TABLE [--table TABLE ...] (--run-id ID | --run-id-prefix PREFIX) [options]
+  mariadb-mysql-cdc repair-fk-orphans --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --case CASE --expected-orphans COUNT [options]
   mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
   mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
@@ -46,6 +47,8 @@ Commands:
   plan    Print the current migration tool design.
   probe   Read source binlog coordinates and classify MariaDB binlog events.
   sync    Synchronize target schemas and table rows from source.
+  repair-fk-orphans
+          Repair one allowlisted target FK orphan set from exact source rows.
   table-catalog
           Write deterministic syncable and non-syncable table catalogs ordered by estimated source rows.
   sync-catalog
@@ -67,6 +70,12 @@ Probe options:
   --binlog-file FILE          Override SHOW MASTER STATUS binlog file.
   --start-position POSITION   Override SHOW MASTER STATUS position.
   --stop-position POSITION    Stop reading at a binlog position.
+FK orphan repair options:
+  --case CASE                     Allowlisted repair case: artists-favorites, comics, phrases-suggestions, or forums-replies.
+  --expected-orphans COUNT       Exact target orphan count required before mutation.
+  --batch-size ROWS              Target rows per locked batch. Defaults to 50; maximum 100.
+  --limit ROWS                   Maximum target orphan identities. Defaults to 1000; maximum 1000.
+
 Sync options:
   --source-host HOST              MariaDB source host.
   --source-port PORT              MariaDB source port. Defaults to 3306.
@@ -121,6 +130,7 @@ fn main() {
         Some("plan") => print_plan(),
         Some("probe") => run_probe_command(args.collect()),
         Some("sync") => sync_cli::run_sync_command(args.collect(), USAGE),
+        Some("repair-fk-orphans") => sync::run_fk_orphan_repair_command(args.collect(), USAGE),
         Some("table-catalog") => table_catalog::run_table_catalog_command(args.collect(), USAGE),
         Some("sync-catalog") => table_catalog::run_sync_catalog_command(args.collect(), USAGE),
         Some("recover-lost-binlog") => run_recover_lost_binlog_command(args.collect()),
