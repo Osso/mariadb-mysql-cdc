@@ -34,6 +34,70 @@ fn sync_mysql_contract_selects_keyset_windows_in_source_primary_key_order() {
 }
 
 #[test]
+fn sync_mysql_contract_projects_and_binds_bit_columns_as_unsigned_numbers() {
+    let table = bit_mutation_table();
+    let request = SyncChunkReadRequest {
+        start_after: None,
+        end_at: None,
+        limit: 3,
+    };
+    assert_eq!(
+        build_sync_select_sql(&table, &request),
+        "SELECT `id`, CAST(`premium_only` AS UNSIGNED) AS `premium_only`, CAST(`flags` AS UNSIGNED) AS `flags`, CAST(`mask` AS UNSIGNED) AS `mask`, `payload` FROM `bit_widgets` ORDER BY `id` LIMIT 3"
+    );
+
+    let rows = [
+        bit_row("1", "0", "0", "0", "source-one"),
+        DatabaseRow {
+            primary_key: strings(["2"]),
+            values: BTreeMap::from([
+                ("id".to_string(), Some("2".to_string())),
+                ("premium_only".to_string(), None),
+                ("flags".to_string(), None),
+                ("mask".to_string(), None),
+                ("payload".to_string(), Some("source-two".to_string())),
+            ]),
+        },
+    ];
+    let insert = build_strict_insert_statement(&table, &rows).expect("BIT insert");
+    assert_eq!(
+        insert.sql,
+        "INSERT INTO `bit_widgets` (`id`, `premium_only`, `flags`, `mask`, `payload`) VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)"
+    );
+    assert_eq!(
+        insert.params,
+        vec![
+            bytes("1"), Value::UInt(0), Value::UInt(0), Value::UInt(0), bytes("source-one"),
+            bytes("2"), Value::NULL, Value::NULL, Value::NULL, bytes("source-two"),
+        ]
+    );
+
+    let update = build_strict_update_rows_statement(
+        &table,
+        &[bit_row(
+            "3",
+            "1",
+            "257",
+            "18446744073709551615",
+            "source-three",
+        )],
+    )
+    .expect("BIT update");
+    assert_eq!(
+        update.sql,
+        "UPDATE `bit_widgets` SET `premium_only` = CASE WHEN `id` = ? THEN ? ELSE `premium_only` END, `flags` = CASE WHEN `id` = ? THEN ? ELSE `flags` END, `mask` = CASE WHEN `id` = ? THEN ? ELSE `mask` END, `payload` = CASE WHEN `id` = ? THEN ? ELSE `payload` END WHERE `id` IN (?) ORDER BY `id`"
+    );
+    assert_eq!(
+        update.params,
+        vec![
+            bytes("3"), Value::UInt(1), bytes("3"), Value::UInt(257),
+            bytes("3"), Value::UInt(18_446_744_073_709_551_615), bytes("3"), bytes("source-three"),
+            bytes("3"),
+        ]
+    );
+}
+
+#[test]
 fn sync_mysql_contract_builds_only_the_quoted_target_write_lock() {
     let sql = build_lock_table_write_sql("target`db", "episodes`current");
 
@@ -76,7 +140,8 @@ fn sync_mysql_contract_builds_unique_owner_exact_reads_without_relaxed_mutations
     );
     assert_eq!(owner.params, vec![bytes("token-a"), bytes("page-a")]);
 
-    let insert = build_strict_insert_statement(&table, std::slice::from_ref(&intended));
+    let insert = build_strict_insert_statement(&table, std::slice::from_ref(&intended))
+        .expect("strict unique-owner insert");
     let mutation_sql = insert.sql.to_ascii_uppercase();
     for forbidden in ["INSERT IGNORE", "ON DUPLICATE KEY UPDATE", "REPLACE"] {
         assert!(
@@ -99,7 +164,8 @@ fn sync_mysql_contract_builds_strict_insert_mutations() {
     let table = mutation_table();
     let row = row("7", "live", "Now");
 
-    let insert = build_strict_insert_statement(&table, std::slice::from_ref(&row));
+    let insert = build_strict_insert_statement(&table, std::slice::from_ref(&row))
+        .expect("strict insert");
     assert_eq!(
         insert.sql,
         "INSERT INTO `episodes` (`id`, `status`, `title`) VALUES (?, ?, ?)"
@@ -123,7 +189,7 @@ fn sync_mysql_contract_builds_bounded_batched_strict_updates_and_deletes() {
     let table = mutation_table();
     let rows = [row("7", "live", "Now"), row("8", "archived", "Later")];
 
-    let update = build_strict_update_rows_statement(&table, &rows);
+    let update = build_strict_update_rows_statement(&table, &rows).expect("strict update");
     assert_eq!(
         update.sql,
         "UPDATE `episodes` SET `status` = CASE WHEN `id` = ? THEN ? WHEN `id` = ? THEN ? ELSE `status` END, `title` = CASE WHEN `id` = ? THEN ? WHEN `id` = ? THEN ? ELSE `title` END WHERE `id` IN (?, ?) ORDER BY `id`"
@@ -148,7 +214,8 @@ fn sync_mysql_contract_builds_bounded_batched_strict_updates_and_deletes() {
     let delete = build_strict_delete_rows_statement(
         &delete_table,
         &[strings(["7", "2"]), strings(["8", "1"])],
-    );
+    )
+    .expect("strict delete");
     assert_eq!(
         delete.sql,
         "DELETE FROM `episode_revisions` WHERE (`series_id`, `revision`) IN ((?, ?), (?, ?))"
@@ -271,6 +338,7 @@ fn ordered_table() -> SyncTable {
             SyncPrimaryKeyOrdering::Enum(strings(["draft", "live", "archived"])),
         ],
         columns: strings(["series_id", "state", "title"]),
+        bit_columns: Vec::new(),
     }
 }
 
@@ -280,6 +348,30 @@ fn mutation_table() -> SyncTable {
         primary_key: strings(["id"]),
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "status", "title"]),
+        bit_columns: Vec::new(),
+    }
+}
+
+fn bit_mutation_table() -> SyncTable {
+    SyncTable {
+        name: "bit_widgets".to_string(),
+        primary_key: strings(["id"]),
+        primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
+        columns: strings(["id", "premium_only", "flags", "mask", "payload"]),
+        bit_columns: strings(["premium_only", "flags", "mask"]),
+    }
+}
+
+fn bit_row(id: &str, premium_only: &str, flags: &str, mask: &str, payload: &str) -> DatabaseRow {
+    DatabaseRow {
+        primary_key: strings([id]),
+        values: BTreeMap::from([
+            ("id".to_string(), Some(id.to_string())),
+            ("premium_only".to_string(), Some(premium_only.to_string())),
+            ("flags".to_string(), Some(flags.to_string())),
+            ("mask".to_string(), Some(mask.to_string())),
+            ("payload".to_string(), Some(payload.to_string())),
+        ]),
     }
 }
 
@@ -289,6 +381,7 @@ fn unique_mutation_table() -> SyncTable {
         primary_key: strings(["id"]),
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "token", "page", "payload"]),
+        bit_columns: Vec::new(),
     }
 }
 
@@ -301,6 +394,7 @@ fn composite_delete_table() -> SyncTable {
             SyncPrimaryKeyOrdering::Native,
         ],
         columns: strings(["series_id", "revision", "title"]),
+        bit_columns: Vec::new(),
     }
 }
 

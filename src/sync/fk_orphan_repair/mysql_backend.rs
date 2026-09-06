@@ -196,8 +196,10 @@ impl FkOrphanRepairBackend for MySqlFkOrphanRepairBackend {
         metadata: &RepairMetadata,
         child: &DatabaseRow,
     ) -> Result<(), String> {
-        let statement =
-            build_strict_update_rows_statement(&metadata.target_child, std::slice::from_ref(child));
+        let statement = build_strict_update_rows_statement(
+            &metadata.target_child,
+            std::slice::from_ref(child),
+        )?;
         execute_exact_target_mutation(&mut self.target, statement, "update target repair child")
     }
 
@@ -207,7 +209,7 @@ impl FkOrphanRepairBackend for MySqlFkOrphanRepairBackend {
         primary_key: &[String],
     ) -> Result<(), String> {
         let statement =
-            build_strict_delete_rows_statement(&metadata.target_child, &[primary_key.to_vec()]);
+            build_strict_delete_rows_statement(&metadata.target_child, &[primary_key.to_vec()])?;
         execute_exact_target_mutation(&mut self.target, statement, "delete target repair child")
     }
 
@@ -631,6 +633,7 @@ mod tests {
                 .map(|_| SyncPrimaryKeyOrdering::Native)
                 .collect(),
             columns: strings(primary_key),
+            bit_columns: Vec::new(),
         }
     }
 }

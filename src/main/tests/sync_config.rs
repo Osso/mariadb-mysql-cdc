@@ -174,8 +174,34 @@ fn sync_table_conversion_preserves_order_excludes_generated_columns_and_parses_e
                 SyncPrimaryKeyOrdering::Enum(strings(["draft", "live", "archived"])),
             ],
             columns: strings(["id", "state", "title"]),
+            bit_columns: Vec::new(),
         }
     );
+}
+
+#[test]
+fn sync_table_conversion_marks_non_generated_bit_columns() {
+    let table = inventory_table(
+        vec!["id"],
+        vec![
+            column("id", 1, "bigint unsigned", None),
+            column("premium_only", 2, "bit(1)", None),
+            column("flags", 3, "BIT(9)", None),
+            column(
+                "generated_mask",
+                4,
+                "bit(64)",
+                Some(GeneratedColumn {
+                    expression: "0".to_string(),
+                    generation_kind: "STORED GENERATED".to_string(),
+                }),
+            ),
+        ],
+    );
+
+    let sync_table = sync_table_from_inventory(&table).expect("sync table");
+    assert_eq!(sync_table.columns, strings(["id", "premium_only", "flags"]));
+    assert_eq!(sync_table.bit_columns, strings(["premium_only", "flags"]));
 }
 
 #[test]
@@ -284,6 +310,7 @@ fn sync_table(name: &str, primary_key: &str) -> SyncTable {
         primary_key: vec![primary_key.to_string()],
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: vec![primary_key.to_string()],
+        bit_columns: Vec::new(),
     }
 }
 

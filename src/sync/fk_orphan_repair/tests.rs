@@ -313,6 +313,7 @@ fn sync_table(name: &str, primary_key: &[&str]) -> SyncTable {
             .map(|_| super::super::model::SyncPrimaryKeyOrdering::Native)
             .collect(),
         columns,
+        bit_columns: Vec::new(),
     }
 }
 

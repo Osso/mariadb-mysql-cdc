@@ -56,6 +56,7 @@ SCENARIOS = (
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
     ScenarioSpec("sync-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-wide-update", True),
+    ScenarioSpec("sync-bit-values", True),
     ScenarioSpec("sync-resume", True),
     ScenarioSpec("sync-progress-least-privilege", True),
     ScenarioSpec("writable-column-generated-metadata", True),
@@ -3210,6 +3211,71 @@ class Harness:
             raise HarnessError(f"wide sync progress mismatch: {progress!r}")
         print("sync_wide_update_ok rows=129 updates=129 chunks=1")
 
+    def run_sync_bit_values(self) -> None:
+        assert self.source and self.target
+        table = "sync_bit_values"
+        schema = (
+            f"DROP TABLE IF EXISTS {table}; "
+            f"CREATE TABLE {table} ("
+            "id BIGINT NOT NULL PRIMARY KEY, "
+            "premium_only BIT(1) NULL, "
+            "flags BIT(9) NULL, "
+            "mask BIT(64) NULL, "
+            "payload VARCHAR(64) NOT NULL"
+            ") ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema)
+
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table} (id,premium_only,flags,mask,payload) VALUES "
+            "(1,b'0',b'000000000',0x0000000000000000,'source-one'),"
+            "(3,b'0',b'100000001',0xFFFFFFFFFFFFFFFF,'source-three'),"
+            "(4,b'1',b'011111111',0x0100000000000000,'source-four'),"
+            "(5,b'1',b'111111111',0x8000000000000000,'source-five'),"
+            "(6,NULL,NULL,NULL,'source-six');",
+        )
+        self.admin_sql(
+            self.target,
+            f"INSERT INTO {table} (id,premium_only,flags,mask,payload) VALUES "
+            "(1,b'0',b'000000000',0x0000000000000000,'target-one'),"
+            "(2,b'1',b'000000001',0x0000000000000001,'target-only'),"
+            "(3,b'1',b'000000000',0x0000000000000000,'target-three'),"
+            "(5,b'0',b'000000000',0x0000000000000000,'target-five'),"
+            "(6,b'1',b'000000001',0x0000000000000001,'target-six');",
+        )
+
+        run_id = "sync-bit-values"
+        result = self.run_sync(tables=[table], run_id=run_id, chunk_size=3)
+        require_success(result, "sync BIT values")
+        select = (
+            f"SELECT id,COALESCE(HEX(premium_only),'NULL'),"
+            f"COALESCE(CAST(premium_only AS UNSIGNED),'NULL'),"
+            f"COALESCE(HEX(flags),'NULL'),COALESCE(CAST(flags AS UNSIGNED),'NULL'),"
+            f"COALESCE(HEX(mask),'NULL'),COALESCE(CAST(mask AS UNSIGNED),'NULL'),payload "
+            f"FROM {table} ORDER BY id;"
+        )
+        source_rows = self.admin_query(self.source, select).splitlines()
+        target_rows = self.admin_query(self.target, select).splitlines()
+        if target_rows != source_rows:
+            raise HarnessError(
+                "sync BIT values did not roundtrip exact hexadecimal/numeric values: "
+                f"source={source_rows!r} target={target_rows!r}"
+            )
+        if len(target_rows) != 5:
+            raise HarnessError(f"sync BIT values has wrong row count: {target_rows!r}")
+        progress = self.admin_query(
+            self.target,
+            "SELECT status,last_primary_key_json,chunks,rows_scanned,inserts_applied,"
+            "updates_applied,deletes_applied FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='rows' "
+            f"AND table_name={sql_literal(table)};",
+        ).strip()
+        if progress != 'complete\t["6"]\t3\t5\t1\t4\t1':
+            raise HarnessError(f"sync BIT values progress mismatch: {progress!r}")
+        print("sync_bit_values_ok rows=5 updates=4 inserts=1 deletes=1 chunks=3")
+
     def stop_sync_process(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is None:
             process.kill()
@@ -3698,6 +3764,8 @@ class Harness:
             self.run_sync_unique_owner_rollback_resume()
         elif scenario == "sync-wide-update":
             self.run_sync_wide_update()
+        elif scenario == "sync-bit-values":
+            self.run_sync_bit_values()
         elif scenario == "sync-resume":
             self.run_sync_resume()
         elif scenario == "sync-progress-least-privilege":

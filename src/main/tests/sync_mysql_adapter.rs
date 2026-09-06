@@ -171,8 +171,8 @@ fn sync_mysql_adapter_batches_strict_mutations_within_placeholder_limits() {
     assert_eq!(strict_update_batch_capacity(&table), 128);
     assert_eq!(strict_delete_batch_capacity(&table), 128);
 
-    let updates = build_strict_update_batches(&table, &rows);
-    let deletes = build_strict_delete_batches(&table, &primary_keys);
+    let updates = build_strict_update_batches(&table, &rows).expect("update batches");
+    let deletes = build_strict_delete_batches(&table, &primary_keys).expect("delete batches");
 
     assert_eq!(updates.len(), 2);
     assert_eq!(deletes.len(), 2);
@@ -193,8 +193,12 @@ fn sync_mysql_adapter_batches_strict_mutations_within_placeholder_limits() {
         );
     }
 
-    assert!(build_strict_update_batches(&table, &[]).is_empty());
-    assert!(build_strict_delete_batches(&table, &[]).is_empty());
+    assert!(build_strict_update_batches(&table, &[])
+        .expect("empty update batches")
+        .is_empty());
+    assert!(build_strict_delete_batches(&table, &[])
+        .expect("empty delete batches")
+        .is_empty());
 
     let wide_table = wide_mutation_table(1_000);
     assert_eq!(strict_insert_batch_capacity(&wide_table), 65);
@@ -399,6 +403,7 @@ fn mutation_table() -> SyncTable {
         primary_key: strings(["id"]),
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "status", "title"]),
+        bit_columns: Vec::new(),
     }
 }
 
@@ -436,6 +441,7 @@ fn wide_mutation_table(column_count: usize) -> SyncTable {
         primary_key: strings(["id"]),
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns,
+        bit_columns: Vec::new(),
     }
 }
 
@@ -447,6 +453,7 @@ fn wide_primary_key_table(column_count: usize) -> SyncTable {
         name: "wide_keys".to_string(),
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native; column_count],
         columns: primary_key.clone(),
+        bit_columns: Vec::new(),
         primary_key,
     }
 }

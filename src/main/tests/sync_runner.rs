@@ -329,6 +329,7 @@ fn table(name: &str) -> SyncTable {
         primary_key: strings(["id"]),
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "title"]),
+        bit_columns: Vec::new(),
     }
 }
 

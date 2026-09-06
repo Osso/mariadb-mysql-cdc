@@ -8,6 +8,8 @@ pub(crate) struct SyncTable {
     pub(crate) primary_key: Vec<String>,
     pub(crate) primary_key_ordering: Vec<SyncPrimaryKeyOrdering>,
     pub(crate) columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) bit_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

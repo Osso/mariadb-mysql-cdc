@@ -24,7 +24,7 @@ the run ID. Operator usage belongs in the sync runbook.
 
 ### Source scope and execution
 
-- [x] Convert the selected current source inventory into deterministic table definitions.
+- [x] Convert the selected current source inventory into deterministic table definitions, including writable `BIT` metadata while omitting empty metadata from backward-compatible `sync-v1` ID serialization.
 - [x] Reject an empty or duplicated selection and reject a selected child whose same-schema source parent is outside the current selection.
 - [x] Invoke bounded row workers between the two schema stages.
 - [x] Expose the staged orchestration through one `sync` CLI. Removed progress, standalone schema, drift-check, catchup-snapshot, sync-table, and repair-drift command names are rejected as unknown commands rather than aliased.
@@ -46,6 +46,7 @@ the run ID. Operator usage belongs in the sync runbook.
 - [x] Reconcile a different-primary-key owner to its complete current source row, or delete it when that source primary key is absent. Fail closed when the current source owner still owns the intended unique identity or its primary key or column set disagrees.
 - [x] Verify each owner mutation and intended source row, then retry only the failed insert batch plus untouched remaining insert rows. Repeated conflict keys fail rather than retry indefinitely; any repair, retry, verification, or commit failure rolls back the locked chunk and leaves durable progress unchanged.
 - [x] Commit the target chunk before persisting progress. Emit secret-free reconciliation audits only after successful commit; discard pending audits on rollback or commit failure. Keep counters tied to planned source operations without changing live CDC duplicate handling.
+- [x] Round-trip every writable `BIT` column as an unsigned integer for source/target reads and target mutation bindings, preserving `NULL` and values through `BIT(64)` for strict inserts and CASE updates.
 
 ### Connection construction retry
 
@@ -89,7 +90,8 @@ the run ID. Operator usage belongs in the sync runbook.
 - `src/main/tests/sync_orchestrator.rs` — stage order, changed-invocation resume, omitted/new/complete table behavior, run/stage/table validation, error persistence, and row-failure cutoff.
 - `src/main/tests/sync_runner.rs` — bounded deterministic table execution, current parallelism/scope validation, completion behavior, and no retry of row-chunk failures.
 - `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering, bounded target-page reconciliation, changed-chunk-size resume, checkpoint boundary, strict secondary-unique owner repair, rollback, retry, verification, and post-commit audit behavior.
-- `src/main/tests/sync_mysql_adapter.rs` and `src/main/tests/sync_mysql_contract.rs` — adapter and SQL contracts, including ignored legacy run specs, strict insert batching, exact owner/index reads, fail-closed index handling, and bounded connectivity-only connection construction retry.
+- `src/main/tests/sync_mysql_adapter.rs` and `src/main/tests/sync_mysql_contract.rs` — adapter and SQL contracts, including numeric `BIT` projection/binding, ignored legacy run specs, strict insert batching, exact owner/index reads, fail-closed index handling, and bounded connectivity-only connection construction retry.
+- `scripts/cdc-integration-harness.py` — disposable MariaDB-to-MySQL `sync-bit-values` proof for unchanged `BIT(1)` zero updates, flips, `BIT(9)`, `BIT(64)`, `NULL`, inserts, deletes, and pagination.
 - `src/main/tests/resync_unified.rs` — resync run ID, all-table mapping, and changed-table reporting.
 - `src/main/tests/lost_binlog_unified.rs` — recovery run ID, source-only proof evidence, exact progress scope, and incomplete/wrong-run rejection.
 - `scripts/cdc-integration-harness.py` scenario `sync-unique-owner-rollback-resume`, with `tests/cdc_eventual_consistency.rs` wrapper — real MariaDB-to-MySQL strict insert rollback/resume and progress-boundary proof.

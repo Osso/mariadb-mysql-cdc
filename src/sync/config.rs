@@ -75,6 +75,12 @@ pub(crate) fn sync_table_from_inventory(table: &TableInventory) -> Result<SyncTa
         .filter(|column| column.generated.is_none())
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
+    let bit_columns = table
+        .columns
+        .iter()
+        .filter(|column| column.generated.is_none() && column.data_type.eq_ignore_ascii_case("bit"))
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
     let primary_key_ordering = table
         .primary_key
         .iter()
@@ -94,6 +100,7 @@ pub(crate) fn sync_table_from_inventory(table: &TableInventory) -> Result<SyncTa
         primary_key: table.primary_key.clone(),
         primary_key_ordering,
         columns,
+        bit_columns,
     })
 }
 

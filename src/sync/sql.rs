@@ -5,7 +5,7 @@ use crate::target::SqlStatement;
 use mysql::Value;
 
 pub(crate) fn build_sync_select_sql(table: &SyncTable, request: &SyncChunkReadRequest) -> String {
-    let columns = quote_ident_list(&table.columns);
+    let columns = sync_select_columns(table);
     let order_by = primary_key_order_by(&table.primary_key, &table.primary_key_ordering);
     let predicates = sync_bound_predicates(table, request);
     let bounds = if predicates.is_empty() {
@@ -35,11 +35,11 @@ pub(crate) fn build_exact_primary_key_select_statement(
     Ok(SqlStatement {
         sql: format!(
             "SELECT {} FROM {} WHERE {} LIMIT 2",
-            quote_ident_list(&table.columns),
+            sync_select_columns(table),
             quote_ident(&table.name),
             primary_key_predicates(&table.primary_key).join(" AND ")
         ),
-        params: primary_key.iter().cloned().map(string_param).collect(),
+        params: primary_key_params(table, primary_key, "exact primary key")?,
     })
 }
 
@@ -61,7 +61,7 @@ pub(crate) fn build_unique_owner_select_statement(
             index.name, table.name
         ));
     }
-    let params = required_non_null_values(intended, &index.columns, "unique index")?;
+    let params = required_non_null_values(table, intended, &index.columns, "unique index")?;
     let predicates = index
         .columns
         .iter()
@@ -71,7 +71,7 @@ pub(crate) fn build_unique_owner_select_statement(
     Ok(SqlStatement {
         sql: format!(
             "SELECT {} FROM {} WHERE {predicates} LIMIT 2",
-            quote_ident_list(&table.columns),
+            sync_select_columns(table),
             quote_ident(&table.name)
         ),
         params,
@@ -89,65 +89,70 @@ pub(crate) fn build_lock_table_write_sql(database: &str, table: &str) -> String 
 pub(crate) fn build_strict_insert_statement(
     table: &SyncTable,
     rows: &[DatabaseRow],
-) -> SqlStatement {
+) -> Result<SqlStatement, String> {
     let columns = quote_ident_list(&table.columns);
     let placeholders = row_placeholders(table.columns.len(), rows.len());
     let params = rows
         .iter()
-        .flat_map(|row| ordered_values(row, &table.columns))
+        .map(|row| ordered_values(table, row, &table.columns))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .collect();
-    SqlStatement {
+    Ok(SqlStatement {
         sql: format!(
             "INSERT INTO {} ({columns}) VALUES {placeholders}",
             quote_ident(&table.name)
         ),
         params,
-    }
+    })
 }
 
 pub(crate) fn build_strict_update_rows_statement(
     table: &SyncTable,
     rows: &[DatabaseRow],
-) -> SqlStatement {
+) -> Result<SqlStatement, String> {
     let changed_columns = non_primary_columns(table);
     let assignments = changed_columns
         .iter()
-        .map(|column| strict_case_assignment(column, &table.primary_key, rows.len()))
+        .map(|column| strict_case_assignment(table, column, rows.len()))
         .collect::<Vec<_>>()
         .join(", ");
     let row_filter = primary_key_row_filter(&table.primary_key, rows.len());
     let order_by = quote_ident_list(&table.primary_key);
-    let params = ordered_update_params(&changed_columns, rows);
-    SqlStatement {
+    let params = ordered_update_params(table, &changed_columns, rows)?;
+    Ok(SqlStatement {
         sql: format!(
             "UPDATE {} SET {assignments} WHERE {row_filter} ORDER BY {order_by}",
             quote_ident(&table.name)
         ),
         params,
-    }
+    })
 }
 
 pub(crate) fn build_strict_delete_rows_statement(
     table: &SyncTable,
     primary_keys: &[Vec<String>],
-) -> SqlStatement {
-    SqlStatement {
+) -> Result<SqlStatement, String> {
+    let params = primary_keys
+        .iter()
+        .map(|primary_key| primary_key_params(table, primary_key, "delete primary key"))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok(SqlStatement {
         sql: format!(
             "DELETE FROM {} WHERE {}",
             quote_ident(&table.name),
             primary_key_row_filter(&table.primary_key, primary_keys.len())
         ),
-        params: primary_keys
-            .iter()
-            .flatten()
-            .cloned()
-            .map(string_param)
-            .collect(),
-    }
+        params,
+    })
 }
 
-fn strict_case_assignment(column: &str, primary_key: &[String], row_count: usize) -> String {
-    let predicate = primary_key_predicates(primary_key).join(" AND ");
+fn strict_case_assignment(table: &SyncTable, column: &str, row_count: usize) -> String {
+    let predicate = primary_key_predicates(&table.primary_key).join(" AND ");
     let cases = std::iter::repeat_n(format!("WHEN {predicate} THEN ?"), row_count)
         .collect::<Vec<_>>()
         .join(" ");
@@ -172,23 +177,30 @@ fn primary_key_row_filter(primary_key: &[String], row_count: usize) -> String {
     )
 }
 
-fn ordered_update_params(changed_columns: &[String], rows: &[DatabaseRow]) -> Vec<Value> {
-    let changed_values = changed_columns.iter().flat_map(|column| {
-        rows.iter().flat_map(|row| {
-            let mut params = row
-                .primary_key
-                .iter()
-                .cloned()
-                .map(string_param)
-                .collect::<Vec<_>>();
-            params.extend(ordered_values(row, std::slice::from_ref(column)));
-            params
-        })
-    });
-    let filter_values = rows
-        .iter()
-        .flat_map(|row| row.primary_key.iter().cloned().map(string_param));
-    changed_values.chain(filter_values).collect()
+fn ordered_update_params(
+    table: &SyncTable,
+    changed_columns: &[String],
+    rows: &[DatabaseRow],
+) -> Result<Vec<Value>, String> {
+    let mut params = Vec::new();
+    for column in changed_columns {
+        for row in rows {
+            params.extend(primary_key_params(
+                table,
+                &row.primary_key,
+                "update primary key",
+            )?);
+            params.extend(ordered_values(table, row, std::slice::from_ref(column))?);
+        }
+    }
+    for row in rows {
+        params.extend(primary_key_params(
+            table,
+            &row.primary_key,
+            "update filter primary key",
+        )?);
+    }
+    Ok(params)
 }
 
 fn sync_bound_predicates(table: &SyncTable, request: &SyncChunkReadRequest) -> Vec<String> {
@@ -313,6 +325,7 @@ fn primary_key_predicates(primary_key: &[String]) -> Vec<String> {
 }
 
 fn required_non_null_values(
+    table: &SyncTable,
     row: &DatabaseRow,
     columns: &[String],
     label: &str,
@@ -320,29 +333,90 @@ fn required_non_null_values(
     columns
         .iter()
         .map(|column| {
-            row.values
+            let value = row
+                .values
                 .get(column)
                 .ok_or_else(|| format!("{label} column `{column}` is absent"))?
                 .clone()
-                .map(string_param)
-                .ok_or_else(|| format!("{label} column `{column}` is NULL"))
+                .ok_or_else(|| format!("{label} column `{column}` is NULL"))?;
+            parameter_value(table, column, value)
         })
         .collect()
 }
 
-fn ordered_values(row: &DatabaseRow, columns: &[String]) -> Vec<Value> {
+fn ordered_values(
+    table: &SyncTable,
+    row: &DatabaseRow,
+    columns: &[String],
+) -> Result<Vec<Value>, String> {
     columns
         .iter()
         .map(|column| match row.values.get(column).cloned().flatten() {
-            Some(value) => string_param(value),
-            None => Value::NULL,
+            Some(value) => parameter_value(table, column, value),
+            None => Ok(Value::NULL),
         })
         .collect()
+}
+
+fn primary_key_params(
+    table: &SyncTable,
+    primary_key: &[String],
+    label: &str,
+) -> Result<Vec<Value>, String> {
+    if primary_key.len() != table.primary_key.len() {
+        return Err(format!(
+            "{label} width mismatch for `{}`: expected {}, found {}",
+            table.name,
+            table.primary_key.len(),
+            primary_key.len()
+        ));
+    }
+    table
+        .primary_key
+        .iter()
+        .zip(primary_key)
+        .map(|(column, value)| parameter_value(table, column, value.clone()))
+        .collect()
+}
+
+fn parameter_value(table: &SyncTable, column: &str, value: String) -> Result<Value, String> {
+    if table
+        .bit_columns
+        .iter()
+        .any(|bit_column| bit_column == column)
+    {
+        return value.parse::<u64>().map(Value::UInt).map_err(|error| {
+            format!(
+                "BIT column `{column}` in `{}` has invalid unsigned value `{value}`: {error}",
+                table.name
+            )
+        });
+    }
+    Ok(string_param(value))
 }
 
 fn row_placeholders(column_count: usize, row_count: usize) -> String {
     let row = format!("({})", vec!["?"; column_count].join(", "));
     vec![row; row_count].join(", ")
+}
+
+fn sync_select_columns(table: &SyncTable) -> String {
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            if table.bit_columns.contains(column) {
+                format!(
+                    "CAST({} AS UNSIGNED) AS {}",
+                    quote_ident(column),
+                    quote_ident(column)
+                )
+            } else {
+                quote_ident(column)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn string_param(value: String) -> Value {

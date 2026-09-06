@@ -1417,6 +1417,7 @@ fn config(chunk_size: usize) -> SyncChunkConfig {
             primary_key: vec!["id".to_string()],
             primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
             columns: vec!["id".to_string(), "name".to_string()],
+            bit_columns: Vec::new(),
         },
         chunk_size,
     }
@@ -1436,6 +1437,7 @@ fn unique_config(chunk_size: usize) -> SyncChunkConfig {
                 "page".to_string(),
                 "payload".to_string(),
             ],
+            bit_columns: Vec::new(),
         },
         chunk_size,
     }

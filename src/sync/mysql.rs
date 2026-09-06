@@ -262,14 +262,14 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
     }
 
     fn delete_rows(&mut self, primary_keys: &[Vec<String>]) -> Result<(), String> {
-        for statement in build_strict_delete_batches(&self.table, primary_keys) {
+        for statement in build_strict_delete_batches(&self.table, primary_keys)? {
             self.execute_statement(statement)?;
         }
         Ok(())
     }
 
     fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
-        for statement in build_strict_update_batches(&self.table, rows) {
+        for statement in build_strict_update_batches(&self.table, rows)? {
             self.execute_statement(statement)?;
         }
         Ok(())
@@ -278,7 +278,18 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
     fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncInsertFailure> {
         let capacity = strict_insert_batch_capacity(&self.table);
         for (batch_index, batch) in rows.chunks(capacity).enumerate() {
-            let statement = build_strict_insert_statement(&self.table, batch);
+            let statement = match build_strict_insert_statement(&self.table, batch) {
+                Ok(statement) => statement,
+                Err(message) => {
+                    return Err(build_sync_insert_failure(
+                        rows,
+                        batch_index * capacity,
+                        batch.len(),
+                        None,
+                        message,
+                    ));
+                }
+            };
             let result = self
                 .conn
                 .exec_drop(&statement.sql, Params::Positional(statement.params));
@@ -544,7 +555,7 @@ fn bounded_mutation_capacity(placeholders_per_row: usize) -> usize {
 pub(crate) fn build_strict_update_batches(
     table: &SyncTable,
     rows: &[DatabaseRow],
-) -> Vec<SqlStatement> {
+) -> Result<Vec<SqlStatement>, String> {
     rows.chunks(strict_update_batch_capacity(table))
         .map(|batch| build_strict_update_rows_statement(table, batch))
         .collect()
@@ -553,7 +564,7 @@ pub(crate) fn build_strict_update_batches(
 pub(crate) fn build_strict_delete_batches(
     table: &SyncTable,
     primary_keys: &[Vec<String>],
-) -> Vec<SqlStatement> {
+) -> Result<Vec<SqlStatement>, String> {
     primary_keys
         .chunks(strict_delete_batch_capacity(table))
         .map(|batch| build_strict_delete_rows_statement(table, batch))
