@@ -157,9 +157,8 @@ fn apply_source_window(
         .last()
         .map(|row| row.primary_key.clone())
         .expect("non-empty source window");
-    let target_rows = read_complete_target_window(config, start_after, &end_at, target)?;
-    let changes = chunk_changes(&config.table, &source_rows, &target_rows);
-    apply_changes(&config.table.name, source, target, &changes)?;
+    let changes = reconcile_target_pages(config, start_after, &end_at, &source_rows, target)?;
+    apply_source_changes(&config.table.name, source, target, &changes)?;
 
     progress.last_primary_key = Some(end_at);
     progress.complete = false;
@@ -167,13 +166,19 @@ fn apply_source_window(
     Ok(progress)
 }
 
-fn read_complete_target_window(
+fn reconcile_target_pages(
     config: &SyncChunkConfig,
     mut start_after: Option<Vec<String>>,
     end_at: &[String],
+    source_rows: &[DatabaseRow],
     target: &mut impl SyncChunkTargetSession,
-) -> Result<Vec<DatabaseRow>, String> {
-    let mut target_rows = Vec::new();
+) -> Result<ChunkChanges, String> {
+    let mut source_by_key = index_rows(source_rows);
+    let mut changes = ChunkChanges {
+        deletes: 0,
+        updates: Vec::new(),
+        inserts: Vec::new(),
+    };
     loop {
         let page = target
             .read_rows(&SyncChunkReadRequest {
@@ -184,11 +189,47 @@ fn read_complete_target_window(
             .map_err(|error| format!("read target chunk for `{}`: {error}", config.table.name))?;
         let page_is_complete = page.len() < config.chunk_size;
         start_after = page.last().map(|row| row.primary_key.clone());
-        target_rows.extend(page);
+        let page_changes = reconcile_target_page(&config.table, &mut source_by_key, &page);
+        delete_target_only_rows(&config.table.name, target, &page_changes.deletes)?;
+        changes.deletes += page_changes.deletes.len();
+        changes.updates.extend(page_changes.updates);
         if page_is_complete {
-            return Ok(target_rows);
+            changes.inserts = source_by_key.into_values().cloned().collect();
+            return Ok(changes);
         }
     }
+}
+
+fn reconcile_target_page(
+    table: &SyncTable,
+    source_by_key: &mut BTreeMap<Vec<String>, &DatabaseRow>,
+    target_rows: &[DatabaseRow],
+) -> TargetPageChanges {
+    let mut deletes = Vec::new();
+    let mut updates = Vec::new();
+    for target_row in target_rows {
+        let Some(source_row) = source_by_key.remove(&target_row.primary_key) else {
+            deletes.push(target_row.primary_key.clone());
+            continue;
+        };
+        if rows_diverge(table, source_row, target_row) {
+            updates.push(source_row.clone());
+        }
+    }
+    TargetPageChanges { deletes, updates }
+}
+
+fn delete_target_only_rows(
+    table: &str,
+    target: &mut impl SyncChunkTargetSession,
+    primary_keys: &[Vec<String>],
+) -> Result<(), String> {
+    if primary_keys.is_empty() {
+        return Ok(());
+    }
+    target
+        .delete_rows(primary_keys)
+        .map_err(|error| format!("delete target-only rows from `{table}`: {error}"))
 }
 
 fn apply_target_tail(
@@ -224,66 +265,19 @@ fn apply_target_tail(
 }
 
 struct ChunkChanges {
-    deletes: Vec<Vec<String>>,
+    deletes: usize,
     updates: Vec<DatabaseRow>,
     inserts: Vec<DatabaseRow>,
 }
 
-fn chunk_changes(
-    table: &SyncTable,
-    source_rows: &[DatabaseRow],
-    target_rows: &[DatabaseRow],
-) -> ChunkChanges {
-    let source_by_key = index_rows(source_rows);
-    let target_by_key = index_rows(target_rows);
-    ChunkChanges {
-        deletes: target_only_primary_keys(target_rows, &source_by_key),
-        updates: divergent_source_rows(table, source_rows, &target_by_key),
-        inserts: missing_source_rows(source_rows, &target_by_key),
-    }
+struct TargetPageChanges {
+    deletes: Vec<Vec<String>>,
+    updates: Vec<DatabaseRow>,
 }
 
 fn index_rows(rows: &[DatabaseRow]) -> BTreeMap<Vec<String>, &DatabaseRow> {
     rows.iter()
         .map(|row| (row.primary_key.clone(), row))
-        .collect()
-}
-
-fn target_only_primary_keys(
-    target_rows: &[DatabaseRow],
-    source_by_key: &BTreeMap<Vec<String>, &DatabaseRow>,
-) -> Vec<Vec<String>> {
-    target_rows
-        .iter()
-        .filter(|row| !source_by_key.contains_key(&row.primary_key))
-        .map(|row| row.primary_key.clone())
-        .collect()
-}
-
-fn divergent_source_rows(
-    table: &SyncTable,
-    source_rows: &[DatabaseRow],
-    target_by_key: &BTreeMap<Vec<String>, &DatabaseRow>,
-) -> Vec<DatabaseRow> {
-    source_rows
-        .iter()
-        .filter(|row| {
-            target_by_key
-                .get(&row.primary_key)
-                .is_some_and(|target| rows_diverge(table, row, target))
-        })
-        .cloned()
-        .collect()
-}
-
-fn missing_source_rows(
-    source_rows: &[DatabaseRow],
-    target_by_key: &BTreeMap<Vec<String>, &DatabaseRow>,
-) -> Vec<DatabaseRow> {
-    source_rows
-        .iter()
-        .filter(|row| !target_by_key.contains_key(&row.primary_key))
-        .cloned()
         .collect()
 }
 
@@ -295,17 +289,12 @@ fn rows_diverge(table: &SyncTable, source: &DatabaseRow, target: &DatabaseRow) -
         .any(|column| source.values.get(column) != target.values.get(column))
 }
 
-fn apply_changes(
+fn apply_source_changes(
     table: &str,
     source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
     changes: &ChunkChanges,
 ) -> Result<(), String> {
-    if !changes.deletes.is_empty() {
-        target
-            .delete_rows(&changes.deletes)
-            .map_err(|error| format!("delete target-only rows from `{table}`: {error}"))?;
-    }
     if !changes.updates.is_empty() {
         target
             .update_rows(&changes.updates)
@@ -504,7 +493,7 @@ fn record_progress(progress: &mut SyncChunkProgress, source_rows: usize, changes
     progress.rows_scanned += source_rows as u64;
     progress.inserts += changes.inserts.len() as u64;
     progress.updates += changes.updates.len() as u64;
-    progress.deletes += changes.deletes.len() as u64;
+    progress.deletes += changes.deletes as u64;
 }
 
 fn rollback_and_unlock(target: &mut impl SyncChunkTargetSession, primary_error: String) -> String {

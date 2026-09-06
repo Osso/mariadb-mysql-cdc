@@ -67,6 +67,7 @@ enum FailurePoint {
     SourceRead,
     TargetRead,
     Delete,
+    DeleteSecondPage,
     Update,
     Insert,
     InsertUniqueConflict,
@@ -147,6 +148,7 @@ struct RecordingTargetSession {
     honor_read_bounds: bool,
     failure: Option<FailurePoint>,
     pending_audits: Vec<Event>,
+    delete_attempts: usize,
     events: Events,
 }
 
@@ -159,6 +161,7 @@ impl RecordingTargetSession {
             honor_read_bounds: false,
             failure: None,
             pending_audits: Vec::new(),
+            delete_attempts: 0,
             events,
         }
     }
@@ -290,7 +293,10 @@ impl SyncChunkTargetSession for RecordingTargetSession {
         self.events
             .borrow_mut()
             .push(Event::Delete(primary_keys.to_vec()));
-        if self.failure == Some(FailurePoint::Delete) {
+        self.delete_attempts += 1;
+        if self.failure == Some(FailurePoint::Delete)
+            || (self.failure == Some(FailurePoint::DeleteSecondPage) && self.delete_attempts == 2)
+        {
             return Err("injected delete failure".to_string());
         }
         self.pending_rows
@@ -917,6 +923,39 @@ fn dense_target_window_is_fully_reconciled_before_durable_completion() {
     assert!(complete.complete);
     assert_rows_equal(&target.visible_rows, &expected_rows);
     assert_eq!(progress.durable, Some(complete));
+}
+
+#[test]
+fn later_target_page_delete_failure_rolls_back_all_rows_and_preserves_cursor() {
+    let events = events();
+    let source_rows = vec![row("2", "source-two"), row("4", "source-four")];
+    let initial_target = vec![
+        row("1", "target-only-one"),
+        row("2", "old-two"),
+        row("3", "target-only-three"),
+        row("4", "source-four"),
+    ];
+    let mut source = RecordingSource::new(source_rows, Rc::clone(&events));
+    let mut target = RecordingTargetSession::new(initial_target.clone(), Rc::clone(&events))
+        .with_bounded_reads()
+        .fail_at(FailurePoint::DeleteSecondPage);
+    let mut progress = RecordingProgressStore::new(Rc::clone(&events));
+
+    let error = sync_next_chunk(&config(2), &mut source, &mut target, &mut progress)
+        .expect_err("a later target-page delete must fail the whole chunk");
+
+    assert!(error.contains("delete target-only rows"), "{error}");
+    assert_rows_equal(&target.visible_rows, &initial_target);
+    assert_eq!(progress.durable, None);
+    let recorded = events.borrow();
+    assert!(!recorded.contains(&Event::Commit));
+    assert!(!recorded
+        .iter()
+        .any(|event| matches!(event, Event::ProgressSave { .. })));
+    assert_eq!(
+        &recorded[recorded.len() - 2..],
+        [Event::Rollback, Event::Unlock]
+    );
 }
 
 #[test]

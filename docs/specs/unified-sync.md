@@ -40,6 +40,7 @@ the run ID. Operator usage belongs in the sync runbook.
 ### Strict row mutations and secondary-unique repair
 
 - [x] Keep unified-sync row mutations source-authoritative and strict: normal missing-row work uses plain batched `INSERT`; never use `INSERT IGNORE`, upsert, `REPLACE`, or a fallback engine.
+- [x] Reconcile each bounded source window through target keyset pages without retaining the complete target window: delete each page's target-only keys in the locked transaction, retain only source-bounded divergent/missing rows, then apply updates and inserts after all target-only deletes succeed.
 - [x] On a strict insert `1062`, reconcile only the named full-column, non-`PRIMARY` secondary unique index reported by MySQL. The target session keeps the existing table `WRITE` lock and transaction, resolves exactly one owner per intended row with NULL-safe `<=>` predicates, and exact-reads that owner primary key from the current source.
 - [x] Require contiguous metadata for every full indexed column. Prefixed columns, expression columns, `PRIMARY`, absent or ambiguous index metadata, absent or ambiguous owner evidence, and NULL-valued unique identities fail closed.
 - [x] Reconcile a different-primary-key owner to its complete current source row, or delete it when that source primary key is absent. Fail closed when the current source owner still owns the intended unique identity or its primary key or column set disagrees.
@@ -87,7 +88,7 @@ the run ID. Operator usage belongs in the sync runbook.
 - `src/main/tests/sync_config.rs` — exact-ID preservation, backward-compatible `sync-v1` prefix derivation, current-invocation validation, and source-inventory table conversion.
 - `src/main/tests/sync_orchestrator.rs` — stage order, changed-invocation resume, omitted/new/complete table behavior, run/stage/table validation, error persistence, and row-failure cutoff.
 - `src/main/tests/sync_runner.rs` — bounded deterministic table execution, current parallelism/scope validation, completion behavior, and no retry of row-chunk failures.
-- `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering, changed-chunk-size resume, checkpoint boundary, strict secondary-unique owner repair, rollback, retry, verification, and post-commit audit behavior.
+- `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering, bounded target-page reconciliation, changed-chunk-size resume, checkpoint boundary, strict secondary-unique owner repair, rollback, retry, verification, and post-commit audit behavior.
 - `src/main/tests/sync_mysql_adapter.rs` and `src/main/tests/sync_mysql_contract.rs` — adapter and SQL contracts, including ignored legacy run specs, strict insert batching, exact owner/index reads, fail-closed index handling, and bounded connectivity-only connection construction retry.
 - `src/main/tests/resync_unified.rs` — resync run ID, all-table mapping, and changed-table reporting.
 - `src/main/tests/lost_binlog_unified.rs` — recovery run ID, source-only proof evidence, exact progress scope, and incomplete/wrong-run rejection.
