@@ -32,6 +32,7 @@ SMALL_ROWS = 60_000
 SOURCE_LARGE_FIRST_ROWS = 1_000
 SOURCE_LARGE_LAST_ROWS = 9_000
 TARGET_LARGE_ROWS = 164_764
+TARGET_INSERT_BATCH_ROWS = 20_000
 LARGE_BODY_BYTES = 13_312
 MEMORY_LIMIT = "2g"
 
@@ -166,21 +167,35 @@ def seed_source(harness: Harness) -> None:
     )
 
 
-def seed_target(harness: Harness) -> None:
+def insert_target_rows(harness: Harness, count: int, offset: int, kind: str) -> None:
     assert harness.target
-    all_large = numbered_rows(TARGET_LARGE_ROWS, SMALL_ROWS)
-    small = numbered_rows(SMALL_ROWS)
+    rows = numbered_rows(count, offset)
+    body = "CONCAT('small-',id)" if kind == "small" else large_body("id")
     harness.admin_sql(
         harness.target,
-        fixture_schema() + "INSERT INTO memory_rows (id,body,kind) "
-        f"SELECT id,CONCAT('small-',id),'small' FROM ({small}) AS generated_numbers;"
-        + "INSERT INTO memory_rows (id,body,kind) "
-        f"SELECT id,{large_body('id')},'large' FROM ({all_large}) AS generated_numbers;"
-        + "UPDATE memory_rows SET body='target-stale-small' WHERE id=1;"
-        + "UPDATE memory_rows SET body='target-stale-large' WHERE id=60001;"
-        + "GRANT LOCK TABLES ON globalcomix.* TO 'cdc_stream'@'%';"
-        + "GRANT CREATE ON cdc.* TO 'cdc_stream'@'%';"
-        + "GRANT SELECT,INSERT,UPDATE ON cdc.sync_runs TO 'cdc_stream'@'%';",
+        "INSERT INTO memory_rows (id,body,kind) "
+        f"SELECT id,{body},{sql_literal(kind)} FROM ({rows}) AS generated_numbers;",
+    )
+
+
+def seed_target(harness: Harness) -> None:
+    assert harness.target
+    harness.admin_sql(harness.target, fixture_schema())
+    insert_target_rows(harness, SMALL_ROWS, 0, "small")
+    for offset in range(0, TARGET_LARGE_ROWS, TARGET_INSERT_BATCH_ROWS):
+        insert_target_rows(
+            harness,
+            min(TARGET_INSERT_BATCH_ROWS, TARGET_LARGE_ROWS - offset),
+            SMALL_ROWS + offset,
+            "large",
+        )
+    harness.admin_sql(
+        harness.target,
+        "UPDATE memory_rows SET body='target-stale-small' WHERE id=1;"
+        "UPDATE memory_rows SET body='target-stale-large' WHERE id=60001;"
+        "GRANT LOCK TABLES ON globalcomix.* TO 'cdc_stream'@'%';"
+        "GRANT CREATE ON cdc.* TO 'cdc_stream'@'%';"
+        "GRANT SELECT,INSERT,UPDATE ON cdc.sync_runs TO 'cdc_stream'@'%';",
     )
 
 
@@ -513,6 +528,7 @@ def main() -> int:
         "target_fixture": {
             "small_matched_prefix_rows": SMALL_ROWS,
             "large_target_rows": TARGET_LARGE_ROWS,
+            "target_insert_batch_rows": TARGET_INSERT_BATCH_ROWS,
             "large_source_first_rows": SOURCE_LARGE_FIRST_ROWS,
             "large_source_last_rows": SOURCE_LARGE_LAST_ROWS,
             "large_body_bytes": LARGE_BODY_BYTES,
