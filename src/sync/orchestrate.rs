@@ -92,7 +92,11 @@ pub(crate) fn run_mysql_sync_with_evidence(
     validate_sync_config(&config)?;
     let tables = sync_tables_from_source_inventory(&evidence.inventory, &config.tables)?;
     let identity = build_sync_run_identity(&config, tables.clone())?;
-    let mut progress = MySqlSyncProgressStore::new(&config.target, config.progress_table.clone())?;
+    let mut progress = MySqlSyncProgressStore::new(
+        &config.target,
+        config.progress_table.clone(),
+        config.coordinator_session_wait_timeout_seconds,
+    )?;
     let mut executor = MySqlSyncRunExecutor;
     run_sync_orchestration(
         &config,

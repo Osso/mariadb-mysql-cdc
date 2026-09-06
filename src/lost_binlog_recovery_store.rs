@@ -213,6 +213,12 @@ impl MySqlLostBinlogRecoveryStore {
         })
     }
 
+    pub fn extend_session_wait_timeout(&self, seconds: u32) -> Result<(), String> {
+        self.executor
+            .extend_session_wait_timeout(seconds)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn ensure(&self) -> Result<(), String> {
         let sql = format!(
             "SELECT recovery_id FROM {} LIMIT 0",

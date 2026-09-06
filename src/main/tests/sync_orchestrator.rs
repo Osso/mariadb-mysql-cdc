@@ -637,6 +637,7 @@ fn fixture_config() -> SyncConfig {
         chunk_size: 100,
         parallelism: 2,
         progress_table: "cdc.sync_runs".to_string(),
+        coordinator_session_wait_timeout_seconds: None,
         run_id: Some("sync-run-42".to_string()),
         run_id_prefix: None,
     }

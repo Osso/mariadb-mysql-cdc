@@ -39,10 +39,12 @@ pub(crate) fn run_mysql_sync_table(
     let mut target = MySqlSyncTargetSession::new(&config.target, table).map_err(|error| {
         format!("connect locked target session for sync table `{table_name}`: {error}")
     })?;
-    let mut progress = MySqlSyncProgressStore::new(&config.target, config.progress_table.clone())
-        .map_err(|error| {
-        format!("connect progress store for sync table `{table_name}`: {error}")
-    })?;
+    let mut progress = MySqlSyncProgressStore::new(
+        &config.target,
+        config.progress_table.clone(),
+        config.coordinator_session_wait_timeout_seconds,
+    )
+    .map_err(|error| format!("connect progress store for sync table `{table_name}`: {error}"))?;
     sync_table_to_completion(&chunk, &mut source, &mut target, &mut progress)
 }
 

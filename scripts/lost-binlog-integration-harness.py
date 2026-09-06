@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep", action="store_true", help="keep disposable containers on failure"
     )
+    parser.add_argument(
+        "--coordinator-idle-timeout",
+        action="store_true",
+        help="prove recovery coordinator sessions survive a short server idle limit",
+    )
     return parser.parse_args()
 
 
@@ -91,19 +96,49 @@ def recovery_args(harness: Harness, binary: Path, authorization: Path) -> list[s
     ]
 
 
+def recovery_environment() -> dict[str, str]:
+    return {
+        **os.environ,
+        "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+        "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
+    }
+
+
 def run_recovery(harness: Harness, authorization: Path) -> h.CommandResult:
     binary = harness._sync_binary()
     return run(
         recovery_args(harness, binary, authorization),
         cwd=REPO,
-        env={
-            **os.environ,
-            "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-            "CDC_TARGET_PASSWORD": TARGET_PASSWORD,
-        },
+        env=recovery_environment(),
         timeout=240,
         check=False,
     )
+
+
+def start_recovery(
+    harness: Harness, authorization: Path
+) -> tuple[subprocess.Popen[str], Path]:
+    binary = harness._sync_binary()
+    log = harness.tempdir / "lost-binlog-recovery.log"
+    output = log.open("w")
+    process = subprocess.Popen(
+        recovery_args(harness, binary, authorization),
+        cwd=REPO,
+        env=recovery_environment(),
+        stdout=output,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    setattr(process, "_cdc_log", output)
+    return process, log
+
+
+def finish_recovery(process: subprocess.Popen[str], log: Path) -> h.CommandResult:
+    process.wait(timeout=120)
+    output = getattr(process, "_cdc_log", None)
+    if output is not None:
+        output.close()
+    return h.CommandResult(tuple(process.args), process.returncode, log.read_text(), "")
 
 
 def wait_for_pending_barrier(
@@ -166,6 +201,47 @@ def assert_checkpoint(harness: Harness, expected: dict[str, object]) -> None:
         raise HarnessError(
             f"checkpoint changed unexpectedly: expected={expected!r} actual={actual!r}"
         )
+
+
+def wait_for_recovery_prepared(harness: Harness, timeout: float = 30) -> None:
+    assert harness.target
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = harness.admin_query(
+            harness.target,
+            "SELECT status FROM cdc.stream_recovery_records "
+            f"WHERE recovery_id={sql_literal(RECOVERY_ID)};",
+        ).strip()
+        if status == "prepared":
+            return
+        time.sleep(0.05)
+    raise HarnessError("recovery did not reach prepared state before idle timeout")
+
+
+def set_recovery_endpoint_global_wait_timeout(harness: Harness, seconds: int) -> None:
+    assert harness.source and harness.target
+    sql = (
+        f"SET GLOBAL wait_timeout={seconds}; SET GLOBAL interactive_timeout={seconds};"
+    )
+    harness.admin_sql(harness.source, sql)
+    harness.admin_sql(harness.target, sql)
+
+
+def wait_for_recovery_rows_running(harness: Harness, timeout: float = 30) -> None:
+    assert harness.target
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = harness.admin_query(
+            harness.target,
+            "SELECT rows_scanned FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(RECOVERY_ID)} AND stage='rows' AND status='running';",
+        ).strip()
+        if rows and int(rows) >= 10_000:
+            return
+        time.sleep(0.05)
+    raise HarnessError(
+        "recovery did not start an active row worker before idle timeout"
+    )
 
 
 def assert_no_recovery_records(harness: Harness) -> None:
@@ -280,6 +356,75 @@ def assert_committed_transition(
     ).strip()
     if journal != "translation_pending":
         raise HarnessError(f"historical journal barrier was not preserved: {journal!r}")
+
+
+def run_coordinator_idle_timeout_scenario(binary: Path | None, keep: bool) -> None:
+    with Harness(REPO, binary, keep) as harness:
+        harness.prepare()
+        assert harness.source and harness.target
+        harness.admin_sql(
+            harness.source,
+            "CREATE TABLE accounts (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL, "
+            "KEY idx_payload (payload)) ENGINE=InnoDB;"
+            "INSERT INTO accounts VALUES (1,'source-current');"
+            "INSERT INTO accounts SELECT seq + 1, CONCAT('source-', seq) FROM seq_1_to_250000;",
+        )
+        harness.admin_sql(
+            harness.target,
+            "CREATE TABLE accounts (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL, "
+            "KEY idx_payload (payload)) ENGINE=InnoDB;"
+            "INSERT INTO accounts VALUES (1,'target-divergent');"
+            "GRANT LOCK TABLES ON globalcomix.* TO 'cdc_stream'@'%';"
+            "GRANT CREATE ON cdc.* TO 'cdc_stream'@'%';"
+            "GRANT SELECT,INSERT,UPDATE ON cdc.sync_runs TO 'cdc_stream'@'%';",
+        )
+        harness.admin_sql_file(
+            harness.target, REPO / "docs/stream-recovery-records-bootstrap.sql"
+        )
+        start = harness.coordinate()
+        harness.write_checkpoint(start)
+        checkpoint = harness.checkpoint()
+        harness.admin_sql(
+            harness.source,
+            "ALTER TABLE accounts RENAME INDEX idx_payload TO idx_payload_renamed;",
+        )
+        blocked, _log = harness.start_stream(start, label="idle-timeout-blocked")
+        barrier = wait_for_pending_barrier(harness, blocked)
+        terminate_stream(harness, blocked)
+        harness.admin_sql(
+            harness.target,
+            "ALTER TABLE accounts RENAME INDEX idx_payload TO idx_payload_renamed;",
+        )
+        purge_checkpoint_history(harness, start)
+        authorization = harness.tempdir / "recovery.json"
+        write_authorization(authorization, checkpoint, barrier, mismatch=False)
+        set_recovery_endpoint_global_wait_timeout(harness, 2)
+        process, log = start_recovery(harness, authorization)
+        try:
+            wait_for_recovery_prepared(harness)
+            wait_for_recovery_rows_running(harness)
+            time.sleep(3)
+            set_recovery_endpoint_global_wait_timeout(harness, 28800)
+            result = finish_recovery(process, log)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        require_success(result, "recovery across coordinator idle timeout")
+        assert_committed_transition(harness, checkpoint, barrier)
+        recovered_count = harness.admin_query(
+            harness.target, "SELECT COUNT(*) FROM accounts;"
+        ).strip()
+        if recovered_count != "250001":
+            raise HarnessError(
+                "recovery did not reconcile all active worker rows after coordinator idle timeout: "
+                f"{recovered_count!r}"
+            )
+        if harness.checkpoint() == checkpoint:
+            raise HarnessError(
+                "recovery did not advance checkpoint after coordinator idle timeout"
+            )
+        print("coordinator_idle_timeout_green_ok")
 
 
 def run_scenario(binary: Path | None, keep: bool) -> None:
@@ -416,7 +561,10 @@ def run_scenario(binary: Path | None, keep: bool) -> None:
 def main() -> int:
     args = parse_args()
     try:
-        run_scenario(args.binary, args.keep)
+        if args.coordinator_idle_timeout:
+            run_coordinator_idle_timeout_scenario(args.binary, args.keep)
+        else:
+            run_scenario(args.binary, args.keep)
     except HarnessSkip as error:
         print(f"harness_skip prerequisite={error}")
         return 0

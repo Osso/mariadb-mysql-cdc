@@ -17,7 +17,8 @@ use super::sql::{
 use crate::database_row::DatabaseRow;
 use crate::live::TargetMySqlConfig;
 use crate::mysql_client::{
-    PersistentMySqlSource, sync_source_opts, sync_target_opts, value_to_string,
+    PersistentMySqlSource, extend_session_wait_timeout, sync_source_opts, sync_target_opts,
+    value_to_string,
 };
 use crate::mysql_config::MySqlConnectionConfig;
 use crate::target::SqlStatement;
@@ -397,11 +398,18 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
 }
 
 impl MySqlSyncProgressStore {
-    pub(crate) fn new(config: &TargetMySqlConfig, progress_table: String) -> Result<Self, String> {
+    pub(crate) fn new(
+        config: &TargetMySqlConfig,
+        progress_table: String,
+        coordinator_session_wait_timeout_seconds: Option<u32>,
+    ) -> Result<Self, String> {
         let opts = sync_target_opts(config)?;
         let mut conn = open_sync_connection(opts)
             .map_err(|error| format!("failed to connect to sync progress mysql: {error}"))?;
         initialize_target_session(&mut conn)?;
+        if let Some(seconds) = coordinator_session_wait_timeout_seconds {
+            extend_session_wait_timeout(&mut conn, seconds, "recovery sync progress")?;
+        }
         let mut store = Self {
             conn,
             progress_table,

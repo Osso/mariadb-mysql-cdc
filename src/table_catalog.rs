@@ -365,6 +365,7 @@ pub(crate) fn sync_config_from_catalog(
         chunk_size: config.chunk_size,
         parallelism: MAX_CATALOG_CONCURRENCY,
         progress_table: config.progress_table.clone(),
+        coordinator_session_wait_timeout_seconds: None,
         run_id: None,
         run_id_prefix: Some(config.run_id_prefix.clone()),
     }

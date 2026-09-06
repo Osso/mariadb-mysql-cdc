@@ -100,6 +100,15 @@ pub(crate) fn open_stream_source(
         .map_err(|error| TargetExecuteError::new(error.to_string()))
 }
 
+pub(crate) fn extend_session_wait_timeout(
+    conn: &mut Conn,
+    seconds: u32,
+    connection_name: &str,
+) -> Result<(), String> {
+    conn.query_drop(format!("SET SESSION wait_timeout = {seconds}"))
+        .map_err(|error| format!("extend {connection_name} session wait_timeout: {error}"))
+}
+
 impl PersistentMySqlSource {
     pub(crate) fn from_sync_connection(conn: Conn) -> Self {
         Self {
@@ -146,6 +155,11 @@ impl PersistentMySqlSource {
             .db_name(Some(config.database.clone()))
             .prefer_socket(false);
         Self::new_with_opts(Opts::from(apply_mysql_connection_liveness(builder)))
+    }
+
+    pub(crate) fn extend_session_wait_timeout(&self, seconds: u32) -> Result<(), MySqlSourceError> {
+        extend_session_wait_timeout(&mut self.conn.borrow_mut(), seconds, "recovery source")
+            .map_err(MySqlSourceError::new)
     }
 
     pub(crate) fn query_rows_as_strings(
@@ -277,6 +291,16 @@ impl PersistentTargetExecutor {
         self.with_connection(|conn| {
             conn.query(build_target_column_select_sql(table))
                 .map_err(target_query_error)
+        })
+    }
+
+    pub(crate) fn extend_session_wait_timeout(
+        &self,
+        seconds: u32,
+    ) -> Result<(), TargetExecuteError> {
+        self.with_connection(|conn| {
+            extend_session_wait_timeout(conn, seconds, "recovery target")
+                .map_err(TargetExecuteError::new)
         })
     }
 

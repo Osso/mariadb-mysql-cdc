@@ -14,6 +14,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+const RECOVERY_COORDINATOR_WAIT_TIMEOUT_SECONDS: u32 = 604_800;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct LostBinlogBarrier {
     pub source_identity: String,
@@ -503,6 +505,7 @@ pub(crate) fn resync_sync_config(
             chunk_size: config.chunk_size,
             parallelism: config.parallelism,
             progress_table: &config.progress_table,
+            coordinator_session_wait_timeout_seconds: None,
             run_id: format!("resync-stream:{}", config.source_identity),
         },
     )
@@ -546,6 +549,12 @@ fn prepare_recovery_context(
         config.recovery_table.clone(),
     )?;
     store.ensure()?;
+    source
+        .extend_session_wait_timeout(RECOVERY_COORDINATOR_WAIT_TIMEOUT_SECONDS)
+        .map_err(|error| format!("configure recovery source lifetime: {error}"))?;
+    store
+        .extend_session_wait_timeout(RECOVERY_COORDINATOR_WAIT_TIMEOUT_SECONDS)
+        .map_err(|error| format!("configure recovery target lifetime: {error}"))?;
     Ok(RecoveryPreparation {
         request,
         source,
@@ -702,6 +711,9 @@ pub(crate) fn recovery_sync_config(
             chunk_size: config.chunk_size,
             parallelism: 1,
             progress_table: &config.progress_table,
+            coordinator_session_wait_timeout_seconds: Some(
+                RECOVERY_COORDINATOR_WAIT_TIMEOUT_SECONDS,
+            ),
             run_id: request.recovery_id.clone(),
         },
     )
@@ -711,6 +723,7 @@ struct FullScopeSyncRun<'a> {
     chunk_size: usize,
     parallelism: usize,
     progress_table: &'a str,
+    coordinator_session_wait_timeout_seconds: Option<u32>,
     run_id: String,
 }
 
@@ -731,6 +744,7 @@ fn full_scope_sync_config(
         chunk_size: run.chunk_size,
         parallelism: run.parallelism,
         progress_table: run.progress_table.to_string(),
+        coordinator_session_wait_timeout_seconds: run.coordinator_session_wait_timeout_seconds,
         run_id: Some(run.run_id),
         run_id_prefix: None,
     }

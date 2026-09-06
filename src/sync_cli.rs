@@ -42,6 +42,7 @@ fn default_sync_config() -> SyncConfig {
         chunk_size: 1000,
         parallelism: 1,
         progress_table: DEFAULT_SYNC_PROGRESS_TABLE.to_string(),
+        coordinator_session_wait_timeout_seconds: None,
         run_id: None,
         run_id_prefix: None,
     }

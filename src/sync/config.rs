@@ -18,6 +18,7 @@ pub(crate) struct SyncConfig {
     pub(crate) chunk_size: usize,
     pub(crate) parallelism: usize,
     pub(crate) progress_table: String,
+    pub(crate) coordinator_session_wait_timeout_seconds: Option<u32>,
     pub(crate) run_id: Option<String>,
     pub(crate) run_id_prefix: Option<String>,
 }
