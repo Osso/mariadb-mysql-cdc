@@ -419,6 +419,12 @@ place. This documents code behavior only; deployment and production execution
 are not claimed. The non-syncable catalog is classification/operator input only;
 full-dump execution is out of scope.
 
+`resume-lost-binlog` accepts the original authorization for an interrupted
+`prepared` recovery. It retains that recovery's captured binlog boundary, run ID,
+and completed/partial table progress. Exact authorization, unchanged source scope,
+and retained original binlog history are required; unsafe states are rejected
+without substituting a newer boundary or a fresh scan.
+
 ## TLS policy
 
 The live GlobalComix source MariaDB (`source-mariadb.example` /

@@ -38,6 +38,7 @@ Usage:
   mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
   mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
+  mariadb-mysql-cdc resume-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
   mariadb-mysql-cdc resync-stream --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity NEW_ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
   mariadb-mysql-cdc resolve-comics-releases-views-conflicts --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --run-id ID [--batch-size ROWS]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -55,6 +56,8 @@ Commands:
           Apply a syncable table catalog through unified staged synchronization.
   recover-lost-binlog
           Execute one authorization-file-scoped lost-binlog recovery with a source-consistent full-scope repair and immutable audit record.
+  resume-lost-binlog
+          Resume an authorized prepared recovery at its original boundary and durable table progress.
   resolve-comics-releases-views-conflicts
           Verify exact unresolved child and referenced UTM rows, then resolve only equal conflicts.
   apply-binlog
@@ -133,7 +136,13 @@ fn main() {
         Some("repair-fk-orphans") => sync::run_fk_orphan_repair_command(args.collect(), USAGE),
         Some("table-catalog") => table_catalog::run_table_catalog_command(args.collect(), USAGE),
         Some("sync-catalog") => table_catalog::run_sync_catalog_command(args.collect(), USAGE),
-        Some("recover-lost-binlog") => run_recover_lost_binlog_command(args.collect()),
+        Some("recover-lost-binlog") => run_lost_binlog_command(
+            args.collect(),
+            lost_binlog_recovery::run_recover_lost_binlog,
+        ),
+        Some("resume-lost-binlog") => {
+            run_lost_binlog_command(args.collect(), lost_binlog_recovery::run_resume_lost_binlog)
+        }
         Some("resync-stream") => run_resync_stream_command(args.collect()),
         Some("resolve-comics-releases-views-conflicts") => {
             run_targeted_conflict_resolution_command(args.collect())
@@ -215,7 +224,11 @@ fn resync_config_from_apply(
     }
 }
 
-fn run_recover_lost_binlog_command(args: Vec<String>) {
+type LostBinlogCommand = fn(
+    &lost_binlog_recovery::RecoverLostBinlogConfig,
+) -> Result<lost_binlog_recovery::RecoverLostBinlogReport, String>;
+
+fn run_lost_binlog_command(args: Vec<String>, execute: LostBinlogCommand) {
     let config = match parse_recover_lost_binlog_config(args) {
         Ok(config) => config,
         Err(error) => {
@@ -223,7 +236,7 @@ fn run_recover_lost_binlog_command(args: Vec<String>) {
             std::process::exit(2);
         }
     };
-    match lost_binlog_recovery::run_recover_lost_binlog(&config) {
+    match execute(&config) {
         Ok(report) => print_recovery_report(&report),
         Err(error) => {
             eprintln!("{error}");
