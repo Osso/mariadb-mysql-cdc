@@ -97,7 +97,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="record only the expected a73919c cgroup OOM RED result",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--candidate-only",
+        action="store_true",
+        help="run candidate GREEN after a separately recorded identical-cap RED",
+    )
+    args = parser.parse_args()
+    if args.baseline_only and args.candidate_only:
+        parser.error("--baseline-only and --candidate-only are mutually exclusive")
+    return args
 
 
 def sha256(path: Path) -> str:
@@ -540,17 +548,18 @@ def main() -> int:
     baseline_harness: Harness | None = None
     candidate_harness: Harness | None = None
     try:
-        baseline_harness, checkpoint, _barrier, recovery_id, baseline_result = run_case(
-            baseline, evidence_dir, "baseline", args.keep
-        )
-        assert_baseline_failure(
-            baseline_harness, checkpoint, recovery_id, baseline_result
-        )
-        baseline_harness.__exit__(None, None, None)
-        baseline_harness = None
-        if args.baseline_only:
-            print(f"sync_memory_baseline_red_ok evidence_dir={evidence_dir}")
-            return 0
+        if not args.candidate_only:
+            baseline_harness, checkpoint, _barrier, recovery_id, baseline_result = (
+                run_case(baseline, evidence_dir, "baseline", args.keep)
+            )
+            assert_baseline_failure(
+                baseline_harness, checkpoint, recovery_id, baseline_result
+            )
+            baseline_harness.__exit__(None, None, None)
+            baseline_harness = None
+            if args.baseline_only:
+                print(f"sync_memory_baseline_red_ok evidence_dir={evidence_dir}")
+                return 0
 
         assert candidate is not None
         candidate_harness, checkpoint, barrier, recovery_id, candidate_result = (
