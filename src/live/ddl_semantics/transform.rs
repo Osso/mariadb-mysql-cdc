@@ -12,6 +12,13 @@ use std::collections::BTreeSet;
 
 pub const DDL_TRANSFORMATION_VERSION: &str = "mariadb-mysql8-v1";
 
+type ParsedAlterOptions = (Option<ParsedAlterAlgorithm>, Option<ParsedAlterLock>);
+type ParsedAlterBody = (
+    Vec<ParsedAlterClause>,
+    Option<ParsedAlterAlgorithm>,
+    Option<ParsedAlterLock>,
+);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DdlTransformation {
     pub version: &'static str,
@@ -1727,14 +1734,7 @@ fn parse_production_alter_body(
     quoted_flags: &[bool],
     table: &str,
     literals: Vec<String>,
-) -> Result<
-    (
-        Vec<ParsedAlterClause>,
-        Option<ParsedAlterAlgorithm>,
-        Option<ParsedAlterLock>,
-    ),
-    String,
-> {
+) -> Result<ParsedAlterBody, String> {
     let mut literals = literals.into_iter();
     let mut clauses = Vec::new();
     let mut index = 3;
@@ -1758,7 +1758,7 @@ fn parse_production_alter_body(
 fn parse_alter_options(
     tokens: &[String],
     index: usize,
-) -> Result<Option<(Option<ParsedAlterAlgorithm>, Option<ParsedAlterLock>)>, String> {
+) -> Result<Option<ParsedAlterOptions>, String> {
     if !tokens[index].eq_ignore_ascii_case("ALGORITHM") {
         return Ok(None);
     }
