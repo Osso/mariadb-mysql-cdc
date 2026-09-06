@@ -1685,9 +1685,7 @@ class Harness:
                     is_visible,
                     comic_is_visible,
                     lang_id,
-                    published_time,
-                    comic_id,
-                    id
+                    published_time
                 )
             ) ENGINE=InnoDB;
             INSERT INTO releases VALUES
@@ -1833,8 +1831,11 @@ class Harness:
             "ALTER TABLE accounts ADD UNIQUE KEY uq_accounts_email_prefix (email(8));",
         )
         pending_stop = self.coordinate()
-        pending_result = self.run_stream(no_op_stop, pending_stop)
-        require_translation_pending_termination(pending_result)
+        pending_process, pending_log = self.start_stream(no_op_stop, pending_stop)
+        try:
+            self.wait_for_pending_ddl(pending_process, pending_log, "uq_accounts_email_prefix")
+        finally:
+            self.stop_sync_process(pending_process)
         pending_index = self.admin_query(
             self.target,
             "SELECT COUNT(*) FROM information_schema.statistics "
@@ -1874,6 +1875,26 @@ class Harness:
             f"production_alter_table_ok coordinate={no_op_stop.file}:{no_op_stop.position} "
             "journal_rows=5 unique_parity=true drop_column=true drop_noop=true "
             "pending_unique_option=true"
+        )
+
+    def wait_for_pending_ddl(
+        self, process: subprocess.Popen[str], log: Path, statement_marker: str
+    ) -> None:
+        deadline = time.monotonic() + 30
+        query = (
+            "SELECT status FROM cdc.ddl_replay_journal WHERE raw_sql LIKE "
+            f"{sql_literal('%' + statement_marker + '%')} "
+            "ORDER BY event_start_position DESC LIMIT 1;"
+        )
+        while process.poll() is None and time.monotonic() < deadline:
+            status = self.admin_query(self.target, query).strip()
+            if status == "translation_pending":
+                if process.poll() is not None:
+                    raise HarnessError(f"pending DDL process exited: {log.read_text()}")
+                return
+            time.sleep(0.05)
+        raise HarnessError(
+            f"process did not stay live with pending DDL: {log.read_text()}"
         )
 
     def run_create_table_crash_restart(self) -> None:
