@@ -61,10 +61,8 @@ fn supports_content_sections_seen_columns_instant(ast: &ParsedAlterTableAst) -> 
     {
         return false;
     }
-    let [
-        ParsedAlterClause::AddColumn(direct_seen),
-        ParsedAlterClause::AddColumn(sync_seen),
-    ] = ast.clauses.as_slice()
+    let [ParsedAlterClause::AddColumn(direct_seen), ParsedAlterClause::AddColumn(sync_seen)] =
+        ast.clauses.as_slice()
     else {
         return false;
     };
@@ -80,10 +78,8 @@ fn supports_content_sections_seen_columns_instant(ast: &ParsedAlterTableAst) -> 
 }
 
 fn supports_releases_downloads_sort_rebuild(ast: &ParsedAlterTableAst) -> bool {
-    let [
-        ParsedAlterClause::DropIndex(dropped),
-        ParsedAlterClause::AddKey(added),
-    ] = ast.clauses.as_slice()
+    let [ParsedAlterClause::DropIndex(dropped), ParsedAlterClause::AddKey(added)] =
+        ast.clauses.as_slice()
     else {
         return false;
     };
@@ -319,7 +315,8 @@ pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableA
     })
 }
 
-const HOME_FEED_ARTIST_BLACKLIST_CREATE: &str = "CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\
+const HOME_FEED_ARTIST_BLACKLIST_CREATE: &str =
+    "CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\
     `id` INT(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, \
     `artist_id` MEDIUMINT(8) UNSIGNED NOT NULL, \
     `reason` VARCHAR(255) DEFAULT NULL, \
@@ -1892,18 +1889,8 @@ fn parse_add_key_clause(
     let mut column_index = key_index + 3;
     loop {
         let column = require_identifier(tokens, column_index, "added key column")?;
-        column_index += 1;
-        let order = match tokens.get(column_index).map(String::as_str) {
-            Some(value) if value.eq_ignore_ascii_case("ASC") => {
-                column_index += 1;
-                "ASC"
-            }
-            Some(value) if value.eq_ignore_ascii_case("DESC") => {
-                column_index += 1;
-                "DESC"
-            }
-            _ => "ASC",
-        };
+        let (order, next_index) = parse_key_part_order(tokens, column_index + 1);
+        column_index = next_index;
         key_parts.push(ParsedIndexKeyPart {
             column,
             prefix_length: None,
@@ -1931,6 +1918,14 @@ fn parse_add_key_clause(
                 ));
             }
         }
+    }
+}
+
+fn parse_key_part_order(tokens: &[String], index: usize) -> (&'static str, usize) {
+    match tokens.get(index).map(String::as_str) {
+        Some(value) if value.eq_ignore_ascii_case("ASC") => ("ASC", index + 1),
+        Some(value) if value.eq_ignore_ascii_case("DESC") => ("DESC", index + 1),
+        _ => ("ASC", index),
     }
 }
 
