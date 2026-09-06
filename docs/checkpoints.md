@@ -73,8 +73,10 @@ refused.
 Bootstrap `cdc.stream_recovery_records`, its immutability guards, and its
 trigger-inventory procedure with `docs/stream-recovery-records-bootstrap.sql`
 while stream writers are stopped. This control plane is required by every stream
-startup: the stream validates the table and both DDL/recovery trigger-inventory
-procedures. Missing objects or grants fail startup; there is no legacy fallback.
+startup: the stream validates the DDL journal contract through its inventory
+procedure and requires access to the recovery table. The recovery inventory
+procedure supports bootstrap/operator inspection. Missing required objects or
+grants fail startup; there is no legacy fallback.
 
 Startup selects unresolved journal barriers by a literal source identity prefix
 followed by `#server-id=` and any server ID. The SQL `LIKE` predicate uses `=` as
@@ -86,6 +88,23 @@ suppress a barrier.
 
 This documentation records the control-plane contract only; production
 execution, restart health, and post-transition `verified` evidence remain open.
+
+### Prepared recovery resume
+
+`resume-lost-binlog` continues only an existing `prepared` recovery matching its
+original authorization and unchanged old checkpoint/barrier. It retains the
+original captured coordinate, recovery ID, immutable evidence, and
+`cdc.sync_runs` completed/partial progress. It acquires the same
+`cdc-stream:<target_database>` lease as live streaming and fresh recovery.
+Current source scope/schema must match the prepared evidence; the original
+binlog file/position must remain available before work and immediately before
+commit. Complete exact-scope progress and the existing atomic CAS remain required.
+
+Resume never recaptures a boundary, resets progress, abandons the record, or
+substitutes a fresh scan. Missing, terminal, mismatched, changed-scope, or
+expired-boundary state is refused. `recover-lost-binlog` remains fresh-only and
+rejects an already-used ID. Post-capture changes to completed tables or scanned
+prefixes are applied later by streaming from the retained original boundary.
 
 ## Automatic DDL journal
 

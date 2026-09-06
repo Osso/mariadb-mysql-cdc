@@ -140,6 +140,23 @@ def run_resume(harness, authorization: Path):
     )
 
 
+def start_resume(harness, authorization: Path):
+    args = base.recovery_args(harness, harness._sync_binary(), authorization)
+    args[1] = "resume-lost-binlog"
+    log = harness.tempdir / "prepared-resume.log"
+    output = log.open("w")
+    process = subprocess.Popen(
+        args,
+        cwd=REPO,
+        env=base.recovery_environment(),
+        stdout=output,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    setattr(process, "_cdc_log", output)
+    return process, log
+
+
 def assert_refused(harness, authorization: Path, markers: tuple[str, ...]) -> None:
     before = read_control_state(harness)
     result = run_resume(harness, authorization)
@@ -184,6 +201,7 @@ def run_resume_case(binary: Path | None, keep: bool) -> None:
         mismatched = harness.tempdir / "mismatched-authorization.json"
         mismatched.write_text(json.dumps(bad))
         assert_refused(harness, mismatched, ("checkpoint", "authorized"))
+        assert_held_stream_lease_refuses_resume(harness, authorization)
 
         harness.admin_sql(
             harness.source,
@@ -245,39 +263,135 @@ def run_resume_case(binary: Path | None, keep: bool) -> None:
         )
 
 
-def wait_for_fixture_table_lock(harness, blocker) -> None:
+def wait_for_fixture_table_lock(harness, blocker) -> int:
     deadline = time.monotonic() + 15
     while blocker.poll() is None and time.monotonic() < deadline:
+        owner = harness.admin_query(
+            harness.target,
+            "SELECT t.PROCESSLIST_ID FROM performance_schema.metadata_locks l "
+            "JOIN performance_schema.threads t ON t.THREAD_ID=l.OWNER_THREAD_ID "
+            "WHERE l.OBJECT_SCHEMA='globalcomix' AND l.OBJECT_NAME='b_rows' "
+            "AND l.LOCK_STATUS='GRANTED' AND t.PROCESSLIST_USER='root' LIMIT 1;",
+        ).strip()
+        if owner:
+            return int(owner)
+        time.sleep(0.05)
+    raise base.HarnessError("fixture did not acquire the target table lock")
+
+
+def start_table_blocker(harness):
+    process = harness.start_query(
+        harness.target,
+        "LOCK TABLES globalcomix.b_rows WRITE; DO SLEEP(90); UNLOCK TABLES;",
+        user="root",
+        password=base.h.ADMIN_PASSWORD,
+    )
+    return process, wait_for_fixture_table_lock(harness, process)
+
+
+def release_blocker(harness, process, connection_id: int) -> None:
+    harness.admin_sql(harness.target, f"KILL CONNECTION {connection_id};")
+    kill_process(process)
+
+
+def assert_held_stream_lease_refuses_resume(harness, authorization: Path) -> None:
+    lease = "SHA2('cdc-stream:globalcomix',256)"
+    blocker = harness.start_query(
+        harness.target,
+        f"SELECT GET_LOCK({lease},0); DO SLEEP(90);",
+        user="root",
+        password=base.h.ADMIN_PASSWORD,
+    )
+    owner = None
+    try:
+        deadline = time.monotonic() + 15
+        while blocker.poll() is None and time.monotonic() < deadline:
+            value = harness.admin_query(
+                harness.target, f"SELECT IS_USED_LOCK({lease});"
+            ).strip()
+            if value != "NULL":
+                owner = int(value)
+                break
+            time.sleep(0.05)
+        if owner is None:
+            raise base.HarnessError("fixture failed to hold the live-stream lease")
+        assert_refused(harness, authorization, ("lease",))
+    finally:
+        if owner is not None:
+            release_blocker(harness, blocker, owner)
+        else:
+            kill_process(blocker)
+
+
+def wait_for_resume_work(harness, process, log: Path) -> None:
+    deadline = time.monotonic() + 30
+    while process.poll() is None and time.monotonic() < deadline:
         count = harness.admin_query(
             harness.target,
             "SELECT COUNT(*) FROM performance_schema.metadata_locks l "
             "JOIN performance_schema.threads t ON t.THREAD_ID=l.OWNER_THREAD_ID "
             "WHERE l.OBJECT_SCHEMA='globalcomix' AND l.OBJECT_NAME='b_rows' "
-            "AND l.LOCK_STATUS='GRANTED' AND t.PROCESSLIST_USER='root';",
+            "AND l.LOCK_STATUS='PENDING' AND t.PROCESSLIST_USER='cdc_stream';",
         ).strip()
         if int(count) > 0:
             return
         time.sleep(0.05)
-    raise base.HarnessError("fixture did not acquire the target table lock")
+    raise base.HarnessError(
+        f"resume did not reach blocked sync work: {log.read_text()}"
+    )
+
+
+def assert_boundary_expiry_before_commit(
+    harness, authorization: Path, prepared: dict
+) -> None:
+    old_checkpoint = harness.checkpoint()
+    blocker, owner = start_table_blocker(harness)
+    process, log = start_resume(harness, authorization)
+    try:
+        wait_for_resume_work(harness, process, log)
+        original = prepared["new_checkpoint"]
+        base.purge_checkpoint_history(
+            harness,
+            base.Coordinate(original["source_file"], original["source_position"]),
+        )
+    except BaseException:
+        kill_process(process)
+        raise
+    finally:
+        release_blocker(harness, blocker, owner)
+    try:
+        result = base.finish_recovery(process, log)
+    finally:
+        kill_process(process)
+    if result.returncode != 1 or "no longer retained" not in result.stdout:
+        raise base.HarnessError(
+            f"late binlog expiry did not refuse commit: {result.stdout}"
+        )
+    base.assert_checkpoint(harness, old_checkpoint)
+    if read_prepared(harness) != prepared:
+        raise base.HarnessError(
+            "late binlog expiry changed the immutable prepared record"
+        )
+    finished = harness.admin_query(
+        harness.target, "SELECT COUNT(*) FROM cdc.sync_runs WHERE status='complete';"
+    ).strip()
+    if finished != "6":
+        raise base.HarnessError(
+            f"late expiry was not exercised after full staged work: {finished}"
+        )
 
 
 def run_refusal_case(binary: Path | None, keep: bool) -> None:
     with base.Harness(REPO, binary, keep) as harness:
         harness.prepare()
         authorization, old_checkpoint = seed_fixture(harness, 100)
-        blocker = harness.start_query(
-            harness.target,
-            "LOCK TABLES globalcomix.b_rows WRITE; DO SLEEP(90); UNLOCK TABLES;",
-            user="root",
-            password=base.h.ADMIN_PASSWORD,
-        )
-        wait_for_fixture_table_lock(harness, blocker)
+        blocker, owner = start_table_blocker(harness)
         process, _ = base.start_recovery(harness, authorization)
         try:
             base.wait_for_recovery_prepared(harness)
         finally:
             kill_process(process)
-            kill_process(blocker)
+            release_blocker(harness, blocker, owner)
         base.assert_checkpoint(harness, old_checkpoint)
         prepared = read_prepared(harness)
         harness.admin_sql(
@@ -286,14 +400,11 @@ def run_refusal_case(binary: Path | None, keep: bool) -> None:
         )
         assert_refused(harness, authorization, ("scope changed",))
         harness.admin_sql(harness.source, "DROP TABLE changed_scope;")
-        original = prepared["new_checkpoint"]
-        base.purge_checkpoint_history(
-            harness,
-            base.Coordinate(original["source_file"], original["source_position"]),
-        )
+        assert_boundary_expiry_before_commit(harness, authorization, prepared)
         assert_refused(harness, authorization, ("no longer retained",))
         print(
-            "prepared_resume_refusals_ok changed_scope=true expired_boundary=true state_unchanged=true"
+            "prepared_resume_refusals_ok changed_scope=true expired_before_work=true "
+            "expired_before_commit=true checkpoint_unchanged=true"
         )
 
 

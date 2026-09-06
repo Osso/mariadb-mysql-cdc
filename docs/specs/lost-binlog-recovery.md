@@ -36,7 +36,7 @@
 - [x] Lock the checkpoint, exact barrier, new recovery ID, and exact-barrier recovery owner in one preparation transaction.
 - [x] When a separately authorized recovery ID replaces a `prepared` owner for the exact checkpoint, barrier, and source identity, atomically mark only the old row `abandoned` with server-generated `abandoned_at` and evidence binding both recovery IDs, operator, reason, checkpoint, barrier, source identity, and both attempts' scopes, then insert the replacement `prepared` row.
 - [x] Preserve all old identity, scope, and prepared-evidence fields during abandonment; refuse committed, verified, abandoned, duplicate-ID, or checkpoint/barrier/source-mismatched owners. The replacement records its actual current scope and need not equal the abandoned owner's scope.
-- [x] Revalidate the exact checkpoint, barrier, source identity, and prepared recovery record in the target transaction; after a prepared failure, reject reuse and require a separately authorized new recovery ID.
+- [x] Revalidate the exact checkpoint, barrier, source identity, and prepared recovery record in the target transaction. Continue an interrupted record only through explicit, validated prepared recovery resume; abandoning or replacing it requires a separately authorized new recovery ID.
 - [x] Require complete exact unified run/table progress proof and unchanged source scope before atomically updating the checkpoint, superseding the exact barrier, and marking the recovery `committed`.
 - [x] Preserve the historical journal row; active-barrier selection excludes only the exact committed or verified recovery identity and barrier coordinates/raw-SQL hash; abandoned history never suppresses the journal barrier.
 - [x] Roll back the transition on checkpoint/recovery commit failure.
@@ -59,7 +59,7 @@
 
 ## Implementation inventory
 
-- `src/lost_binlog_recovery.rs` — authorization, per-attempt source-scope validation, committed-state boundary, reconciliation orchestration, and atomic transition.
+- `src/lost_binlog_recovery.rs` — authorization, per-attempt source-scope validation, fresh recovery, validated prepared recovery resume at the original boundary, reconciliation orchestration, and atomic transition.
 - `src/lost_binlog_recovery_store.rs` — target-side CAS reads, exact-barrier owner locking, immutable prepared insert, abandoned replacement transition, checkpoint update, commit, and exact barrier exclusion.
 - `scripts/lost-binlog-integration-harness.py` — disposable exact-authorization refusal, full-scope reconciliation, unresolved-barrier no-overtake, committed recovery, and post-recovery replay proof.
 - `src/mysql_client.rs` — non-locking MariaDB coordinate capture.
@@ -70,6 +70,9 @@
 - `docs/stream-recovery-records-abandoned-replacement-migration.sql` — target-only live-schema migration with duplicate-owner preflight and prepared-row postflight.
 
 ## Tests asserting this spec
+
+- `scripts/resume-recovery-integration-harness.py` — hard-kill/restart with a completed table and partial row cursor; unchanged prepared identity/boundary; post-capture changes replayed from that original boundary; authorization, changed-scope, expired-boundary, and terminal-state refusal.
+- `tests/lost_binlog_resume_cli.rs` — explicit resume command/help and authorization validation before connection.
 
 - `src/lost_binlog_recovery.rs` and `src/main/tests/lost_binlog_unified.rs` — captured source evidence reuse, unified run configuration, exact run/table progress proof, unchanged-scope proof, replacement owner abandonment, rollback/refusal cases, exact old-state validation, duplicate/non-advancing refusal, and exact historical-barrier supersession.
 - `src/sync/chunk.rs`, `src/sync/orchestrate.rs`, and `src/sync_schema.rs` — locked chunk boundaries, staged schema/row progress, and final-constraint behavior.

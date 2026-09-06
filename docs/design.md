@@ -137,8 +137,8 @@ coordinate, source scope, operator, reason, and source-only preparation
 evidence. Recovery proof requires exactly one complete progress result for each
 captured source table under the exact recovery ID, with no missing, unexpected,
 duplicate, incomplete, or mismatched rows. Before the final target transaction,
-recovery rechecks only the source scope hash; target final inventory and
-post-write drift scans are not used. A separately authorized replacement may
+recovery rechecks the source scope hash and original binlog-boundary retention;
+target final inventory and post-write drift scans are not used. A separately authorized replacement may
 atomically mark the exact prepared owner `abandoned` with server-generated
 evidence and insert a new `prepared` owner for the same exact checkpoint,
 barrier, and source identity. The replacement records its own current scope;
@@ -148,6 +148,11 @@ journal barrier. Only `committed` or `verified` ownership excludes that exact
 barrier, and both are terminal. This transition skips purged source history; it
 is not replay proof and does not claim production completion until restart
 health and subsequent verification are recorded.
+
+An interrupted prepared recovery can continue through explicit
+`resume-lost-binlog`, preserving its original boundary and durable run rather
+than creating another snapshot. See the [resume control-plane contract](checkpoints.md#prepared-recovery-resume)
+for identity, scope, retention, and refusal gates.
 
 ## Resync stream
 

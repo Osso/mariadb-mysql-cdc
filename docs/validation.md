@@ -45,10 +45,16 @@ optional `start_after` primary key, and limit so row-level reports can be paged.
    successful reconciliation. Proof requires exactly one complete progress
    result for every expected source table, with no missing, unexpected,
    duplicate, incomplete, or wrong-run rows. The source scope hash is rechecked
-   before commit. The target is not re-inventoried and no post-write drift scan
+   before commit, together with retention of the original binlog boundary.
+   The target is not re-inventoried and no post-write drift scan
    is performed. The captured coordinate remains the replay boundary: source
    commits after it remain eligible for stream replay after checkpoint
    advancement.
+
+Explicit prepared recovery resume adds the [resume identity, scope, and retention gates](checkpoints.md#prepared-recovery-resume)
+without weakening exact durable progress proof. Its process-kill harness also
+proves that completed tables and scanned prefixes are not rescanned, while their
+post-capture changes remain replayable from the original boundary.
 
 Every recovery record retains its immutable old checkpoint, exact historical
 barrier, source identity, its own scope hash, operator, reason, and preparation
