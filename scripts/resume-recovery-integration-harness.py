@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -23,7 +24,7 @@ spec.loader.exec_module(base)
 ROW_COUNT = 250_000
 
 
-def seed_fixture(harness, rows: int) -> tuple[Path, dict]:
+def seed_fixture(harness, rows: int, parallelism: int = 1) -> tuple[Path, dict]:
     schema = (
         "CREATE TABLE a_done (id BIGINT NOT NULL PRIMARY KEY, "
         "payload VARCHAR(64) NOT NULL, KEY idx_payload(payload)) ENGINE=InnoDB;"
@@ -44,6 +45,14 @@ def seed_fixture(harness, rows: int) -> tuple[Path, dict]:
         "GRANT CREATE ON cdc.* TO 'cdc_stream'@'%';"
         "GRANT SELECT,INSERT,UPDATE ON cdc.sync_runs TO 'cdc_stream'@'%';",
     )
+    if parallelism == 2:
+        for name in ("c_rows", "d_rows"):
+            statement = f"CREATE TABLE {name} LIKE b_rows;"
+            harness.admin_sql(harness.source, statement)
+            harness.admin_sql(harness.target, statement)
+            harness.admin_sql(
+                harness.source, f"INSERT INTO {name} SELECT * FROM b_rows;"
+            )
     start = harness.coordinate()
     harness.write_checkpoint(start)
     checkpoint = harness.checkpoint()
@@ -132,9 +141,11 @@ def wait_for_partial_rows(harness, process, log: Path) -> None:
     )
 
 
-def run_resume(harness, authorization: Path):
+def run_resume(harness, authorization: Path, parallelism: int = 1):
     args = base.recovery_args(harness, harness._sync_binary(), authorization)
     args[1] = "resume-lost-binlog"
+    if parallelism != 1:
+        args.extend(["--parallelism", str(parallelism)])
     return base.run(
         args, cwd=REPO, env=base.recovery_environment(), timeout=240, check=False
     )
@@ -181,10 +192,48 @@ def assert_payload(harness, table: str, expected: str) -> None:
         )
 
 
-def run_resume_case(binary: Path | None, keep: bool) -> None:
+def wait_for_two_workers(harness, future) -> None:
+    deadline = time.monotonic() + 60
+    while not future.done() and time.monotonic() < deadline:
+        counts = harness.admin_query(
+            harness.target,
+            "SELECT COUNT(DISTINCT l.OBJECT_NAME),COUNT(DISTINCT l.OWNER_THREAD_ID) "
+            "FROM performance_schema.metadata_locks l "
+            "JOIN performance_schema.threads t ON t.THREAD_ID=l.OWNER_THREAD_ID "
+            "WHERE l.OBJECT_SCHEMA='globalcomix' AND l.OBJECT_NAME IN ('c_rows','d_rows') "
+            "AND l.LOCK_STATUS='PENDING' AND l.LOCK_TYPE='SHARED_NO_READ_WRITE' "
+            "AND t.PROCESSLIST_USER='cdc_stream';",
+        ).strip()
+        if counts == "2\t2":
+            return
+        time.sleep(0.05)
+    if future.done():
+        result = future.result()
+        raise base.HarnessError(
+            f"two workers not observed: {result.stdout}{result.stderr}"
+        )
+    raise base.HarnessError(
+        "two independent table workers did not reach the database barrier"
+    )
+
+
+def resume_with_two_workers(harness, authorization: Path):
+    blocker, owner = start_table_blocker(harness, ("c_rows", "d_rows"))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_resume, harness, authorization, 2)
+        try:
+            wait_for_two_workers(harness, future)
+        finally:
+            release_blocker(harness, blocker, owner)
+        result = future.result(timeout=240)
+    print("parallel_resume_overlap tables=2 independent_worker_connections=2")
+    return result
+
+
+def run_resume_case(binary: Path | None, keep: bool, parallelism: int) -> None:
     with base.Harness(REPO, binary, keep) as harness:
         harness.prepare()
-        authorization, old_checkpoint = seed_fixture(harness, ROW_COUNT)
+        authorization, old_checkpoint = seed_fixture(harness, ROW_COUNT, parallelism)
         process, log = base.start_recovery(harness, authorization)
         try:
             wait_for_partial_rows(harness, process, log)
@@ -209,8 +258,23 @@ def run_resume_case(binary: Path | None, keep: bool) -> None:
             "UPDATE b_rows SET payload='changed-prefix' WHERE id=1;"
             f"INSERT INTO b_rows VALUES ({ROW_COUNT + 1},'after-capture-tail');",
         )
-        resumed = run_resume(harness, authorization)
+        resumed = (
+            resume_with_two_workers(harness, authorization)
+            if parallelism == 2
+            else run_resume(harness, authorization)
+        )
         base.require_success(resumed, "prepared recovery resume")
+        if parallelism == 2:
+            for name in ("c_rows", "d_rows"):
+                expected = f"{ROW_COUNT}\t{ROW_COUNT * 512}"
+                actual = harness.admin_query(
+                    harness.target,
+                    f"SELECT COUNT(*),SUM(OCTET_LENGTH(payload)) FROM {name};",
+                ).strip()
+                if actual != expected:
+                    raise base.HarnessError(
+                        f"parallel table {name} did not converge: {actual}"
+                    )
         report = json.loads(resumed.stdout)
         if report["new_checkpoint"] != prepared["new_checkpoint"]:
             raise base.HarnessError("resume replaced the original captured boundary")
@@ -263,15 +327,17 @@ def run_resume_case(binary: Path | None, keep: bool) -> None:
         )
 
 
-def wait_for_fixture_table_lock(harness, blocker) -> int:
+def wait_for_fixture_table_lock(harness, blocker, tables: tuple[str, ...]) -> int:
     deadline = time.monotonic() + 15
+    names = ",".join(base.sql_literal(name) for name in tables)
     while blocker.poll() is None and time.monotonic() < deadline:
         owner = harness.admin_query(
             harness.target,
             "SELECT t.PROCESSLIST_ID FROM performance_schema.metadata_locks l "
             "JOIN performance_schema.threads t ON t.THREAD_ID=l.OWNER_THREAD_ID "
-            "WHERE l.OBJECT_SCHEMA='globalcomix' AND l.OBJECT_NAME='b_rows' "
-            "AND l.LOCK_STATUS='GRANTED' AND t.PROCESSLIST_USER='root' LIMIT 1;",
+            f"WHERE l.OBJECT_SCHEMA='globalcomix' AND l.OBJECT_NAME IN ({names}) "
+            "AND l.LOCK_STATUS='GRANTED' AND t.PROCESSLIST_USER='root' "
+            f"GROUP BY t.PROCESSLIST_ID HAVING COUNT(DISTINCT l.OBJECT_NAME)={len(tables)} LIMIT 1;",
         ).strip()
         if owner:
             return int(owner)
@@ -279,14 +345,15 @@ def wait_for_fixture_table_lock(harness, blocker) -> int:
     raise base.HarnessError("fixture did not acquire the target table lock")
 
 
-def start_table_blocker(harness):
+def start_table_blocker(harness, tables: tuple[str, ...] = ("b_rows",)):
+    names = ",".join(f"globalcomix.{name} WRITE" for name in tables)
     process = harness.start_query(
         harness.target,
-        "LOCK TABLES globalcomix.b_rows WRITE; DO SLEEP(90); UNLOCK TABLES;",
+        f"LOCK TABLES {names}; DO SLEEP(120); UNLOCK TABLES;",
         user="root",
         password=base.h.ADMIN_PASSWORD,
     )
-    return process, wait_for_fixture_table_lock(harness, process)
+    return process, wait_for_fixture_table_lock(harness, process, tables)
 
 
 def release_blocker(harness, process, connection_id: int) -> None:
@@ -412,11 +479,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--parallelism", type=int, choices=(1, 2), default=1)
     parser.add_argument("--case", choices=("resume", "refusals", "all"), default="all")
     args = parser.parse_args()
     try:
         if args.case in ("resume", "all"):
-            run_resume_case(args.binary, args.keep)
+            run_resume_case(args.binary, args.keep, args.parallelism)
         if args.case in ("refusals", "all"):
             run_refusal_case(args.binary, args.keep)
     except base.HarnessError as error:
