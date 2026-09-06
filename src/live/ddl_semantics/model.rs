@@ -86,17 +86,52 @@ pub struct ParsedDropColumnAst {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedDropIndexAst {
+    pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParsedAlterAlgorithm {
+    Inplace,
+    Instant,
+}
+
+impl ParsedAlterAlgorithm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inplace => "inplace",
+            Self::Instant => "instant",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParsedAlterLock {
+    None,
+}
+
+impl ParsedAlterLock {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsedAlterClause {
     AddColumn(ParsedAddColumnAst),
     AddKey(ParsedIndexAst),
     DropColumn(ParsedDropColumnAst),
+    DropIndex(ParsedDropIndexAst),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedAlterTableAst {
     pub table: String,
     pub clauses: Vec<ParsedAlterClause>,
-    pub algorithm_instant: bool,
+    pub algorithm: Option<ParsedAlterAlgorithm>,
+    pub lock: Option<ParsedAlterLock>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

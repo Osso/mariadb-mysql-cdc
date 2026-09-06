@@ -2244,6 +2244,142 @@ fn production_alter_rejects_quoted_unsigned_keyword() {
     ));
 }
 
+const RELEASES_DOWNLOADS_SORT_DDL: &str =
+    include_str!("../../../fixtures/ddl/alter-releases-downloads-sort.sql");
+
+#[test]
+fn releases_downloads_sort_rebuild_transforms_to_deterministic_mysql8_sql() {
+    let transformation = transform_production_alter_table(RELEASES_DOWNLOADS_SORT_DDL)
+        .expect("observed releases index rebuild must translate");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `releases` DROP INDEX `idx_downloads_sort`, ADD KEY `idx_downloads_sort` (`is_deleted`, `is_published`, `is_visible`, `comic_is_visible`, `lang_id`, `published_time` DESC, `comic_id`, `id`), ALGORITHM=INPLACE, LOCK=NONE"
+        )
+    );
+}
+
+#[test]
+fn releases_downloads_sort_rebuild_records_drop_then_descending_replacement_post_state() {
+    let operation = parse_ddl_operation(RELEASES_DOWNLOADS_SORT_DDL)
+        .expect("observed releases index rebuild must parse");
+    let target = releases_downloads_sort_target();
+
+    let evidence = build_semantic_evidence(&operation, &target, &target)
+        .expect("target index rebuild must derive post-state from its typed AST");
+    let pre_state: serde_json::Value =
+        serde_json::from_str(&evidence.pre_state).expect("pre-state JSON");
+    let post_state: serde_json::Value =
+        serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
+
+    assert_eq!(
+        pre_state["indexes"][0]["columns"][5]["order"], "ASC",
+        "fenced pre-state retains the historical target ordering"
+    );
+    assert_eq!(
+        post_state["indexes"][0]["columns"][5]["order"], "DESC",
+        "post-state retains the source descending key part"
+    );
+    assert_eq!(
+        post_state["indexes"][0]["columns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+}
+
+fn releases_downloads_sort_target() -> SemanticSchemaSnapshot {
+    let columns = [
+        "is_deleted",
+        "is_published",
+        "is_visible",
+        "comic_is_visible",
+        "lang_id",
+        "published_time",
+        "comic_id",
+        "id",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, name)| ColumnInventory {
+        name: name.to_string(),
+        ordinal_position: (index + 1) as u32,
+        column_type: "tinyint".to_string(),
+        data_type: "tinyint".to_string(),
+        is_nullable: false,
+        character_set: None,
+        collation: None,
+        default_value: Some("0".to_string()),
+        extra: String::new(),
+        comment: String::new(),
+        generated: None,
+    })
+    .collect();
+    let old_index_columns = [
+        "is_deleted",
+        "is_published",
+        "is_visible",
+        "comic_is_visible",
+        "lang_id",
+        "published_time",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, name)| IndexColumnInventory {
+        name: name.to_string(),
+        sequence: (index + 1) as u32,
+        prefix_length: None,
+        collation: Some("A".to_string()),
+        order: "ASC".to_string(),
+    })
+    .collect();
+    SemanticSchemaSnapshot {
+        inventory: SchemaInventory {
+            schema: "globalcomix".to_string(),
+            tables: vec![TableInventory {
+                name: "releases".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                engine: Some("InnoDB".to_string()),
+                collation: Some("utf8mb4_unicode_ci".to_string()),
+                primary_key: vec!["id".to_string()],
+                columns,
+            }],
+            indexes: vec![IndexInventory {
+                table: "releases".to_string(),
+                name: "idx_downloads_sort".to_string(),
+                unique: false,
+                index_type: "BTREE".to_string(),
+                visible: true,
+                comment: None,
+                columns: old_index_columns,
+            }],
+            foreign_keys: Vec::new(),
+            views: Vec::new(),
+            triggers: Vec::new(),
+            routines: Vec::new(),
+            events: Vec::new(),
+        },
+        table_runtime: std::collections::BTreeMap::new(),
+    }
+}
+
+#[test]
+fn releases_downloads_sort_rebuild_near_misses_remain_unsupported() {
+    for sql in [
+        RELEASES_DOWNLOADS_SORT_DDL.replace("`releases`", "`releases_history`"),
+        RELEASES_DOWNLOADS_SORT_DDL.replace("LOCK=NONE", "LOCK=SHARED"),
+        RELEASES_DOWNLOADS_SORT_DDL.replace("ALGORITHM=INPLACE", "ALGORITHM=COPY"),
+        RELEASES_DOWNLOADS_SORT_DDL.replace("`id` ASC", "`id` DESC"),
+    ] {
+        assert!(
+            !supports_production_alter_table(&sql),
+            "near-miss ALTER was admitted: {sql}"
+        );
+    }
+}
+
 #[test]
 fn rename_column_if_exists_fails_closed_when_old_and_new_columns_both_exist() {
     let columns = ["arc_start_order", "deprecated_arc_start_order"]

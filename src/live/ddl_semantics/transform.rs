@@ -1,6 +1,7 @@
 use super::model::{
-    ParsedAddColumnAst, ParsedAlterClause, ParsedAlterTableAst, ParsedCreateColumnAst,
-    ParsedCreateTableAst, ParsedDropColumnAst, ParsedIndexAst, ParsedIndexKeyPart,
+    ParsedAddColumnAst, ParsedAlterAlgorithm, ParsedAlterClause, ParsedAlterLock,
+    ParsedAlterTableAst, ParsedCreateColumnAst, ParsedCreateTableAst, ParsedDropColumnAst,
+    ParsedDropIndexAst, ParsedIndexAst, ParsedIndexKeyPart,
 };
 use super::tokenizer::{
     ddl_contains_comments, split_one_leading_mysql_line_comment,
@@ -29,22 +30,28 @@ pub fn supports_production_alter_table(source_sql: &str) -> bool {
 }
 
 fn supports_parsed_production_alter(ast: &ParsedAlterTableAst) -> bool {
-    supports_existing_production_alter(ast) || supports_content_sections_seen_columns_instant(ast)
+    supports_existing_production_alter(ast)
+        || supports_content_sections_seen_columns_instant(ast)
+        || supports_releases_downloads_sort_rebuild(ast)
 }
 
 fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
-    !ast.algorithm_instant
+    ast.algorithm.is_none()
+        && ast.lock.is_none()
         && ast.clauses.iter().all(|clause| match clause {
             ParsedAlterClause::AddColumn(column) => {
                 !column.if_not_exists && column.data_type != "timestamp"
             }
             ParsedAlterClause::AddKey(_) => true,
-            ParsedAlterClause::DropColumn(_) => false,
+            ParsedAlterClause::DropColumn(_) | ParsedAlterClause::DropIndex(_) => false,
         })
 }
 
 fn supports_content_sections_seen_columns_instant(ast: &ParsedAlterTableAst) -> bool {
-    if ast.table != "content_sections_events_raw" || !ast.algorithm_instant {
+    if ast.table != "content_sections_events_raw"
+        || ast.algorithm != Some(ParsedAlterAlgorithm::Instant)
+        || ast.lock.is_some()
+    {
         return false;
     }
     let [
@@ -63,6 +70,52 @@ fn supports_content_sections_seen_columns_instant(ast: &ParsedAlterTableAst) -> 
         "sync_seen_at",
         "When ContentSectionsEventSyncService (Mixpanel Export) first saw it",
     )
+}
+
+fn supports_releases_downloads_sort_rebuild(ast: &ParsedAlterTableAst) -> bool {
+    let [
+        ParsedAlterClause::DropIndex(dropped),
+        ParsedAlterClause::AddKey(added),
+    ] = ast.clauses.as_slice()
+    else {
+        return false;
+    };
+    ast.table == "releases"
+        && ast.algorithm == Some(ParsedAlterAlgorithm::Inplace)
+        && ast.lock == Some(ParsedAlterLock::None)
+        && dropped.name == "idx_downloads_sort"
+        && added == &releases_downloads_sort_index()
+}
+
+fn releases_downloads_sort_index() -> ParsedIndexAst {
+    let columns = [
+        ("is_deleted", "ASC"),
+        ("is_published", "ASC"),
+        ("is_visible", "ASC"),
+        ("comic_is_visible", "ASC"),
+        ("lang_id", "ASC"),
+        ("published_time", "DESC"),
+        ("comic_id", "ASC"),
+        ("id", "ASC"),
+    ];
+    ParsedIndexAst {
+        create: true,
+        name: "idx_downloads_sort".to_string(),
+        table: "releases".to_string(),
+        unique: false,
+        index_type: "BTREE".to_string(),
+        visible: true,
+        comment: None,
+        key_parts: columns
+            .into_iter()
+            .map(|(column, order)| ParsedIndexKeyPart {
+                column: column.to_string(),
+                prefix_length: None,
+                order: order.to_string(),
+                collation: Some(if order == "DESC" { "D" } else { "A" }.to_string()),
+            })
+            .collect(),
+    }
 }
 
 fn is_exact_seen_column(column: &ParsedAddColumnAst, name: &str, comment: &str) -> bool {
@@ -102,8 +155,14 @@ fn render_production_alter_table(ast: &ParsedAlterTableAst) -> String {
         .iter()
         .map(render_production_alter_clause)
         .collect::<Vec<_>>();
-    if ast.algorithm_instant {
-        clauses.push("ALGORITHM=INSTANT".to_string());
+    if let Some(algorithm) = ast.algorithm {
+        clauses.push(format!(
+            "ALGORITHM={}",
+            algorithm.as_str().to_ascii_uppercase()
+        ));
+    }
+    if let Some(lock) = ast.lock {
+        clauses.push(format!("LOCK={}", lock.as_str().to_ascii_uppercase()));
     }
     format!(
         "ALTER TABLE {} {}",
@@ -118,6 +177,9 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
         ParsedAlterClause::AddKey(index) => render_add_key(index),
         ParsedAlterClause::DropColumn(column) => {
             format!("DROP COLUMN {}", quote_identifier(&column.name))
+        }
+        ParsedAlterClause::DropIndex(index) => {
+            format!("DROP INDEX {}", quote_identifier(&index.name))
         }
     }
 }
@@ -146,7 +208,14 @@ fn render_add_key(index: &ParsedIndexAst) -> String {
     let columns = index
         .key_parts
         .iter()
-        .map(|part| quote_identifier(&part.column))
+        .map(|part| {
+            let column = quote_identifier(&part.column);
+            if part.order == "DESC" {
+                format!("{column} DESC")
+            } else {
+                column
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let key_kind = if index.unique { "UNIQUE KEY" } else { "KEY" };
@@ -1535,7 +1604,8 @@ fn parse_supported_drop_procedure(source_sql: &str) -> Result<String, String> {
 
 pub fn supports_drop_columns_if_exists(source_sql: &str) -> bool {
     parse_production_alter_table_ast(source_sql).is_ok_and(|ast| {
-        !ast.algorithm_instant
+        ast.algorithm.is_none()
+            && ast.lock.is_none()
             && ast
                 .clauses
                 .iter()
@@ -1548,7 +1618,8 @@ pub fn transform_drop_columns_if_exists(
     target_columns: &BTreeSet<String>,
 ) -> Result<DdlTransformation, String> {
     let ast = parse_production_alter_table_ast(source_sql)?;
-    if ast.algorithm_instant
+    if ast.algorithm.is_some()
+        || ast.lock.is_some()
         || !ast
             .clauses
             .iter()
@@ -1641,12 +1712,13 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
     require_keyword(&tokens, 1, "TABLE")?;
     let table = require_identifier(&tokens, 2, "ALTER TABLE name")?;
     let literals = extract_single_quoted_literals(source_sql)?;
-    let (clauses, algorithm_instant) =
+    let (clauses, algorithm, lock) =
         parse_production_alter_body(&tokens, &quoted_flags, &table, literals)?;
     Ok(ParsedAlterTableAst {
         table,
         clauses,
-        algorithm_instant,
+        algorithm,
+        lock,
     })
 }
 
@@ -1655,41 +1727,59 @@ fn parse_production_alter_body(
     quoted_flags: &[bool],
     table: &str,
     literals: Vec<String>,
-) -> Result<(Vec<ParsedAlterClause>, bool), String> {
+) -> Result<
+    (
+        Vec<ParsedAlterClause>,
+        Option<ParsedAlterAlgorithm>,
+        Option<ParsedAlterLock>,
+    ),
+    String,
+> {
     let mut literals = literals.into_iter();
     let mut clauses = Vec::new();
     let mut index = 3;
     while index < tokens.len() {
-        if parse_instant_algorithm_option(tokens, index)?.is_some() {
-            return Ok((require_alter_clauses(clauses)?, true));
+        if let Some((algorithm, lock)) = parse_alter_options(tokens, index)? {
+            return Ok((require_alter_clauses(clauses)?, algorithm, lock));
         }
         let (clause, next_index) =
             parse_production_alter_clause(tokens, quoted_flags, index, table, &mut literals)?;
         clauses.push(clause);
         index = next_index;
         if index == tokens.len() {
-            return Ok((clauses, false));
+            return Ok((clauses, None, None));
         }
         require_keyword(tokens, index, ",")?;
         index += 1;
     }
-    Ok((require_alter_clauses(clauses)?, false))
+    Ok((require_alter_clauses(clauses)?, None, None))
 }
 
-fn parse_instant_algorithm_option(
+fn parse_alter_options(
     tokens: &[String],
     index: usize,
-) -> Result<Option<usize>, String> {
+) -> Result<Option<(Option<ParsedAlterAlgorithm>, Option<ParsedAlterLock>)>, String> {
     if !tokens[index].eq_ignore_ascii_case("ALGORITHM") {
         return Ok(None);
     }
     require_keyword(tokens, index + 1, "=")?;
-    require_keyword(tokens, index + 2, "INSTANT")?;
+    let algorithm = match tokens.get(index + 2).map(String::as_str) {
+        Some(value) if value.eq_ignore_ascii_case("INSTANT") => ParsedAlterAlgorithm::Instant,
+        Some(value) if value.eq_ignore_ascii_case("INPLACE") => ParsedAlterAlgorithm::Inplace,
+        actual => return Err(format!("unsupported ALTER TABLE algorithm {actual:?}")),
+    };
     let next_index = index + 3;
-    if next_index != tokens.len() {
-        return Err("ALGORITHM=INSTANT must be the final ALTER TABLE option".to_string());
+    if next_index == tokens.len() {
+        return Ok(Some((Some(algorithm), None)));
     }
-    Ok(Some(next_index))
+    require_keyword(tokens, next_index, ",")?;
+    require_keyword(tokens, next_index + 1, "LOCK")?;
+    require_keyword(tokens, next_index + 2, "=")?;
+    require_keyword(tokens, next_index + 3, "NONE")?;
+    if next_index + 4 != tokens.len() {
+        return Err("ALTER TABLE options must be final".to_string());
+    }
+    Ok(Some((Some(algorithm), Some(ParsedAlterLock::None))))
 }
 
 fn require_alter_clauses(
@@ -1714,7 +1804,7 @@ fn parse_production_alter_clause(
         .as_deref()
     {
         Some("ADD") => parse_production_add_clause(tokens, quoted_flags, index, table, literals),
-        Some("DROP") => parse_drop_column_clause(tokens, index),
+        Some("DROP") => parse_drop_alter_clause(tokens, index),
         actual => Err(format!(
             "unsupported production ALTER TABLE clause {actual:?}"
         )),
@@ -1802,13 +1892,24 @@ fn parse_add_key_clause(
     let mut column_index = key_index + 3;
     loop {
         let column = require_identifier(tokens, column_index, "added key column")?;
+        column_index += 1;
+        let order = match tokens.get(column_index).map(String::as_str) {
+            Some(value) if value.eq_ignore_ascii_case("ASC") => {
+                column_index += 1;
+                "ASC"
+            }
+            Some(value) if value.eq_ignore_ascii_case("DESC") => {
+                column_index += 1;
+                "DESC"
+            }
+            _ => "ASC",
+        };
         key_parts.push(ParsedIndexKeyPart {
             column,
             prefix_length: None,
-            order: "ASC".to_string(),
-            collation: Some("A".to_string()),
+            order: order.to_string(),
+            collation: Some(if order == "DESC" { "D" } else { "A" }.to_string()),
         });
-        column_index += 1;
         match tokens.get(column_index).map(String::as_str) {
             Some(",") => column_index += 1,
             Some(")") => {
@@ -2045,11 +2146,24 @@ fn extract_single_quoted_literals(source_sql: &str) -> Result<Vec<String>, Strin
     Ok(literals)
 }
 
-fn parse_drop_column_clause(
+fn parse_drop_alter_clause(
     tokens: &[String],
     index: usize,
 ) -> Result<(ParsedAlterClause, usize), String> {
     require_keyword(tokens, index, "DROP")?;
+    match tokens.get(index + 1).map(String::as_str) {
+        Some(kind) if kind.eq_ignore_ascii_case("COLUMN") => {
+            parse_drop_column_clause(tokens, index)
+        }
+        Some(kind) if kind.eq_ignore_ascii_case("INDEX") => parse_drop_index_clause(tokens, index),
+        actual => Err(format!("unsupported DROP ALTER TABLE clause {actual:?}")),
+    }
+}
+
+fn parse_drop_column_clause(
+    tokens: &[String],
+    index: usize,
+) -> Result<(ParsedAlterClause, usize), String> {
     require_keyword(tokens, index + 1, "COLUMN")?;
     require_keyword(tokens, index + 2, "IF")?;
     require_keyword(tokens, index + 3, "EXISTS")?;
@@ -2060,6 +2174,18 @@ fn parse_drop_column_clause(
             if_exists: true,
         }),
         index + 5,
+    ))
+}
+
+fn parse_drop_index_clause(
+    tokens: &[String],
+    index: usize,
+) -> Result<(ParsedAlterClause, usize), String> {
+    require_keyword(tokens, index + 1, "INDEX")?;
+    let name = require_identifier(tokens, index + 2, "dropped index")?;
+    Ok((
+        ParsedAlterClause::DropIndex(ParsedDropIndexAst { name }),
+        index + 3,
     ))
 }
 

@@ -434,14 +434,21 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                 "name": column.name,
                 "if_exists": column.if_exists,
             }),
+            ParsedAlterClause::DropIndex(index) => json!({
+                "kind": "drop_index",
+                "name": index.name,
+            }),
         })
         .collect::<Vec<_>>();
     let mut value = json!({
         "table": ast.table,
         "clauses": clauses,
     });
-    if ast.algorithm_instant {
-        value["algorithm"] = json!("instant");
+    if let Some(algorithm) = ast.algorithm {
+        value["algorithm"] = json!(algorithm.as_str());
+    }
+    if let Some(lock) = ast.lock {
+        value["lock"] = json!(lock.as_str());
     }
     value
 }
@@ -518,6 +525,7 @@ fn apply_alter_clause(
         ParsedAlterClause::AddColumn(column) => apply_add_column(expected, &ast.table, column),
         ParsedAlterClause::AddKey(index) => apply_add_key(expected, index),
         ParsedAlterClause::DropColumn(column) => apply_drop_column(expected, &ast.table, column),
+        ParsedAlterClause::DropIndex(index) => apply_drop_index(expected, &ast.table, index),
     }
 }
 
@@ -683,6 +691,25 @@ fn apply_drop_column(
     table.columns.remove(position);
     for (index, item) in table.columns.iter_mut().enumerate() {
         item.ordinal_position = (index + 1) as u32;
+    }
+    Ok(())
+}
+
+fn apply_drop_index(
+    expected: &mut SemanticSchemaSnapshot,
+    table_name: &str,
+    index: &super::model::ParsedDropIndexAst,
+) -> Result<(), String> {
+    let before = expected.inventory.indexes.len();
+    expected.inventory.indexes.retain(|target_index| {
+        !target_index.table.eq_ignore_ascii_case(table_name)
+            || !target_index.name.eq_ignore_ascii_case(&index.name)
+    });
+    if expected.inventory.indexes.len() == before {
+        return Err(format!(
+            "DROP INDEX target `{table_name}` lacks `{}`",
+            index.name
+        ));
     }
     Ok(())
 }
