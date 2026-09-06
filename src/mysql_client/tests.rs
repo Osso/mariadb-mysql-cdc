@@ -46,6 +46,39 @@ fn parses_mariadb_master_status_row_shape() {
 }
 
 #[test]
+fn parses_mariadb_show_binary_logs_rows() {
+    let files = parse_binlog_files(vec![
+        vec![
+            Some("mysqld-bin.000122".to_string()),
+            Some("123".to_string()),
+        ],
+        vec![
+            Some("mysqld-bin.000123".to_string()),
+            Some("456".to_string()),
+        ],
+    ])
+    .expect("SHOW BINARY LOGS rows");
+
+    assert_eq!(
+        files,
+        [
+            ("mysqld-bin.000122".to_string(), 123),
+            ("mysqld-bin.000123".to_string(), 456)
+        ]
+    );
+}
+
+#[test]
+fn rejects_invalid_mariadb_show_binary_logs_rows() {
+    assert_eq!(
+        parse_binlog_files(vec![vec![Some("mysqld-bin.000123".to_string()), None]])
+            .expect_err("missing binary log size")
+            .to_string(),
+        "MariaDB binary log size is missing"
+    );
+}
+
+#[test]
 fn rejects_invalid_mariadb_master_status_shapes() {
     let cases = [
         (Vec::new(), "MariaDB binlog coordinate is missing"),

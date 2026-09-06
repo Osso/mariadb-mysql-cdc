@@ -190,6 +190,11 @@ impl PersistentMySqlSource {
         let rows = self.query_rows_as_strings(binlog_coordinate_query())?;
         parse_binlog_coordinate_checkpoint(rows)
     }
+
+    pub(crate) fn read_binlog_files(&self) -> Result<Vec<(String, u64)>, MySqlSourceError> {
+        let rows = self.query_rows_as_strings("SHOW BINARY LOGS")?;
+        parse_binlog_files(rows)
+    }
 }
 
 fn binlog_coordinate_query() -> &'static str {
@@ -225,6 +230,33 @@ fn parse_binlog_coordinate_position(row: &[Option<String>]) -> Result<u64, MySql
                 "invalid MariaDB binlog coordinate position: {error}"
             ))
         })
+}
+
+fn parse_binlog_files(
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<Vec<(String, u64)>, MySqlSourceError> {
+    rows.into_iter()
+        .map(|row| {
+            let file = required_binlog_file_value(&row, 0, "file")?;
+            let size = required_binlog_file_value(&row, 1, "size")?
+                .parse::<u64>()
+                .map_err(|error| {
+                    MySqlSourceError::new(format!("invalid MariaDB binary log size: {error}"))
+                })?;
+            Ok((file, size))
+        })
+        .collect()
+}
+
+fn required_binlog_file_value(
+    row: &[Option<String>],
+    index: usize,
+    field: &str,
+) -> Result<String, MySqlSourceError> {
+    row.get(index)
+        .and_then(Clone::clone)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| MySqlSourceError::new(format!("MariaDB binary log {field} is missing")))
 }
 
 fn required_binlog_coordinate_value(
