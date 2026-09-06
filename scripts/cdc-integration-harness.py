@@ -1668,6 +1668,140 @@ class Harness:
             raise HarnessError(f"production ALTER TABLE checkpoint mismatch: {checkpoint}")
         supported_checkpoint = checkpoint
 
+        releases_schema = """
+            CREATE TABLE releases (
+                id BIGINT NOT NULL PRIMARY KEY,
+                is_deleted TINYINT NOT NULL,
+                is_published TINYINT NOT NULL,
+                is_visible TINYINT NOT NULL,
+                comic_is_visible TINYINT NOT NULL,
+                lang_id BIGINT NOT NULL,
+                published_time DATETIME NOT NULL,
+                comic_id BIGINT NOT NULL,
+                title VARCHAR(64) NOT NULL,
+                KEY idx_downloads_sort (
+                    is_deleted,
+                    is_published,
+                    is_visible,
+                    comic_is_visible,
+                    lang_id,
+                    published_time,
+                    comic_id,
+                    id
+                )
+            ) ENGINE=InnoDB;
+            INSERT INTO releases VALUES
+                (1, 0, 1, 1, 1, 1, '2026-08-28 12:00:00', 11, 'first'),
+                (2, 0, 1, 1, 1, 1, '2026-08-28 13:00:00', 10, 'second'),
+                (3, 1, 0, 0, 0, 2, '2026-08-28 14:00:00', 12, 'third');
+        """
+        self.admin_sql(self.source, releases_schema)
+        self.admin_sql(self.target, releases_schema)
+        releases_start = self.coordinate()
+        self.write_checkpoint(releases_start)
+        self.admin_sql(
+            self.source,
+            """
+            ALTER TABLE releases
+              DROP INDEX idx_downloads_sort,
+              ADD INDEX idx_downloads_sort (
+                is_deleted,
+                is_published,
+                is_visible,
+                comic_is_visible,
+                lang_id,
+                published_time DESC,
+                comic_id ASC,
+                id ASC
+              ),
+              ALGORITHM=INPLACE,
+              LOCK=NONE;
+            """,
+        )
+        releases_stop = self.coordinate()
+        releases_process, releases_log = self.start_stream(releases_start, releases_stop)
+        deadline = time.monotonic() + 30
+        while releases_process.poll() is None and time.monotonic() < deadline:
+            pending = self.query(
+                self.target,
+                "SELECT status FROM cdc.ddl_replay_journal "
+                "WHERE raw_sql LIKE 'ALTER TABLE releases%idx_downloads_sort%' "
+                "ORDER BY event_start_position DESC LIMIT 1;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            if pending == "translation_pending":
+                self.stop_sync_process(releases_process)
+                raise HarnessError(
+                    "production releases index rebuild persisted translation_pending; "
+                    f"translator upgrade required: {releases_log.read_text()}"
+                )
+            time.sleep(0.05)
+        if releases_process.poll() is None:
+            self.stop_sync_process(releases_process)
+            raise HarnessError(
+                "production releases index rebuild did not finish or persist a translation-pending barrier: "
+                f"{releases_log.read_text()}"
+            )
+        releases_result = self.finish_stream(releases_process)
+        require_success(releases_result, "production releases index rebuild replay")
+        releases_rows = self.query(
+            self.target,
+            "SELECT id,is_deleted,is_published,is_visible,comic_is_visible,lang_id,"
+            "DATE_FORMAT(published_time, '%Y-%m-%d %H:%i:%s'),comic_id,title "
+            "FROM releases ORDER BY id;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).splitlines()
+        expected_releases_rows = [
+            "1\t0\t1\t1\t1\t1\t2026-08-28 12:00:00\t11\tfirst",
+            "2\t0\t1\t1\t1\t1\t2026-08-28 13:00:00\t10\tsecond",
+            "3\t1\t0\t0\t0\t2\t2026-08-28 14:00:00\t12\tthird",
+        ]
+        if releases_rows != expected_releases_rows:
+            raise HarnessError(f"production releases index rebuild changed rows: {releases_rows!r}")
+        releases_index = self.query(
+            self.target,
+            "SELECT seq_in_index,column_name,collation FROM information_schema.statistics "
+            "WHERE table_schema='globalcomix' AND table_name='releases' "
+            "AND index_name='idx_downloads_sort' ORDER BY seq_in_index;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).splitlines()
+        expected_releases_index = [
+            "1\tis_deleted\tA",
+            "2\tis_published\tA",
+            "3\tis_visible\tA",
+            "4\tcomic_is_visible\tA",
+            "5\tlang_id\tA",
+            "6\tpublished_time\tD",
+            "7\tcomic_id\tA",
+            "8\tid\tA",
+        ]
+        if releases_index != expected_releases_index:
+            raise HarnessError(
+                f"production releases index rebuild metadata mismatch: {releases_index!r}"
+            )
+        releases_journal = self.query(
+            self.target,
+            "SELECT status FROM cdc.ddl_replay_journal "
+            "WHERE raw_sql LIKE 'ALTER TABLE releases%idx_downloads_sort%' "
+            "ORDER BY event_start_position DESC LIMIT 1;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).strip()
+        if releases_journal != "checkpointed":
+            raise HarnessError(
+                f"production releases index rebuild journal mismatch: {releases_journal!r}"
+            )
+        releases_checkpoint = self.checkpoint()
+        if releases_checkpoint.get("source_file") != releases_stop.file or int(
+            releases_checkpoint.get("source_position", 0)
+        ) != releases_stop.position:
+            raise HarnessError(
+                f"production releases index rebuild checkpoint mismatch: {releases_checkpoint}"
+            )
+
         self.admin_sql(self.source, "ALTER TABLE accounts DROP COLUMN IF EXISTS handle;")
         no_op_stop = self.coordinate()
         no_op_result = self.run_stream(stop, no_op_stop)
