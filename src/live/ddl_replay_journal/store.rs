@@ -28,6 +28,8 @@ pub trait DdlReplayJournal {
     fn checkpoint_transition_statement(&self, event: &DdlEvent) -> Result<SqlStatement, String>;
 }
 
+const RECOVERY_TABLE: &str = "cdc.stream_recovery_records";
+
 pub struct MySqlDdlReplayJournal {
     target: TargetMySqlConfig,
     table: String,
@@ -47,6 +49,19 @@ impl MySqlDdlReplayJournal {
             .query_drop(target_session_init_command())
             .map_err(mysql_error)?;
         Ok(connection)
+    }
+
+    fn ensure_recovery_table(&self, connection: &mut Conn) -> Result<(), String> {
+        let sql = format!(
+            "SELECT recovery_id FROM {} LIMIT 0",
+            quote_identifier_path(RECOVERY_TABLE)
+        );
+        connection.query_drop(sql).map_err(|error| {
+            format!(
+                "stream recovery table is unavailable: {}",
+                mysql_error(error)
+            )
+        })
     }
 
     fn transition(
@@ -73,6 +88,7 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
         let constraints = query_journal_constraints(&mut conn, schema, table)?;
         let checks = query_journal_status_checks(&mut conn, schema, table)?;
         let triggers = query_journal_trigger_inventory(&mut conn, &self.table)?;
+        self.ensure_recovery_table(&mut conn)?;
         validate_journal_runtime_contract(JournalRuntimeContract {
             expected_schema: schema,
             expected_table: table,
@@ -89,6 +105,7 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
             .connect()?
             .query_first::<(String, u64, String), _>(build_barrier_select_sql(
                 &self.table,
+                RECOVERY_TABLE,
                 source_identity,
             ))
             .map_err(mysql_error)?;
@@ -353,16 +370,21 @@ pub fn build_prepare_sql(table: &str, event: &DdlEvent, evidence: &DdlSemanticEv
     )
 }
 
-pub fn build_barrier_select_sql(journal_table: &str, source_identity: &str) -> String {
+pub fn build_barrier_select_sql(
+    journal_table: &str,
+    recovery_table: &str,
+    source_identity: &str,
+) -> String {
     let escaped_identity = source_identity
         .replace('=', "==")
         .replace('%', "=%")
         .replace('_', "=_");
-    let pattern = format!("{escaped_identity}#server-id=%");
+    let pattern = format!("{escaped_identity}#server-id==%");
     format!(
-        "SELECT binlog_file,event_start_position,status FROM {} WHERE source_identity LIKE {} ESCAPE '=' AND status IN ('translation_pending','prepared','blocked') ORDER BY binlog_file,event_start_position LIMIT 1",
+        "SELECT journal.binlog_file,journal.event_start_position,journal.status FROM {} journal WHERE journal.source_identity LIKE {} ESCAPE '=' AND journal.status IN ('translation_pending','prepared','blocked') AND NOT EXISTS (SELECT 1 FROM {} recovery WHERE recovery.status IN ('committed','verified') AND recovery.old_barrier_source_identity = journal.source_identity AND recovery.old_barrier_file = journal.binlog_file AND recovery.old_barrier_start_position = journal.event_start_position AND recovery.old_barrier_end_position = journal.event_end_position AND recovery.old_barrier_raw_sql_sha256 = SHA2(journal.raw_sql, 256)) ORDER BY journal.binlog_file,journal.event_start_position LIMIT 1",
         quote_identifier_path(journal_table),
         quote_sql_literal(&pattern),
+        quote_identifier_path(recovery_table),
     )
 }
 

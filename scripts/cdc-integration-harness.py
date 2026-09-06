@@ -296,16 +296,31 @@ class Harness:
 
     def _bootstrap_endpoints(self) -> None:
         assert self.source and self.target
-        self.admin_sql_file(self.source, self.repo / "fixtures/cdc-harness-source-bootstrap.sql")
-        self.admin_sql_file(self.target, self.repo / "fixtures/cdc-harness-target-bootstrap.sql")
+        self.admin_sql_file(
+            self.source, self.repo / "fixtures/cdc-harness-source-bootstrap.sql"
+        )
+        self.admin_sql_file(
+            self.target, self.repo / "fixtures/cdc-harness-target-bootstrap.sql"
+        )
+        self.admin_sql_file(
+            self.target, self.repo / "docs/stream-recovery-records-bootstrap.sql"
+        )
 
-    def _assert_endpoint_tls(self, endpoint: Endpoint, user: str, password: str, label: str) -> None:
-        values = self.query(endpoint, "SHOW STATUS LIKE 'Ssl_cipher';", user=user, password=password)
+    def _assert_endpoint_tls(
+        self, endpoint: Endpoint, user: str, password: str, label: str
+    ) -> None:
+        values = self.query(
+            endpoint, "SHOW STATUS LIKE 'Ssl_cipher';", user=user, password=password
+        )
         rows = [line.split("\t", 1) for line in values.splitlines() if "\t" in line]
         cipher = next((value for name, value in rows if name == "Ssl_cipher"), "")
         if not cipher:
-            raise HarnessError(f"{label} TLS identity/cipher validation was not observable: {values!r}")
-        print(f"endpoint_tls_diagnostics label={label} port={endpoint.port} cipher={cipher}")
+            raise HarnessError(
+                f"{label} TLS identity/cipher validation was not observable: {values!r}"
+            )
+        print(
+            f"endpoint_tls_diagnostics label={label} port={endpoint.port} cipher={cipher}"
+        )
 
     def _assert_source_grants(self) -> None:
         assert self.source
@@ -351,7 +366,15 @@ class Harness:
             application_grant,
             (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.stream_checkpoint"),
             (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.ddl_replay_journal"),
-            (frozenset({"EXECUTE"}), "PROCEDURE cdc.ddl_replay_journal_trigger_inventory"),
+            (frozenset({"SELECT", "INSERT", "UPDATE"}), "cdc.stream_recovery_records"),
+            (
+                frozenset({"EXECUTE"}),
+                "PROCEDURE cdc.ddl_replay_journal_trigger_inventory",
+            ),
+            (
+                frozenset({"EXECUTE"}),
+                "PROCEDURE cdc.stream_recovery_records_trigger_inventory",
+            ),
         }
         sync_application_grant = (
             application_grant[0].union({"LOCK TABLES"}),

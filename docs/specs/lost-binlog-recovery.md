@@ -23,7 +23,7 @@
 - [x] Require every expected source table to have exactly one complete progress result for the exact recovery ID; missing, unexpected, duplicate, incomplete, or differently identified rows fail closed.
 - [x] Recheck the captured source scope hash before checkpoint transition; a changed source scope blocks proof.
 - [x] Refuse checkpoint transition when unified stage execution or exact run/table progress proof fails.
-- [ ] Prove the complete live CLI path against disposable production-shaped endpoints, including checkpoint bootstrap, unified progress, restart health, and recovery proof; production execution is not claimed.
+- [x] Prove the complete CLI path against disposable MariaDB/MySQL endpoints: bootstrap, exact authorization refusal, full current scope with a non-PK generated column, committed recovery, preserved historical barrier, and post-transition restart/row replay. Production execution is not claimed.
 
 ### Durable transition
 
@@ -40,7 +40,8 @@
 
 ### Verification
 
-- [ ] Restart the stream immediately after a committed transition and prove readiness, checkpoint advancement, and restart cessation.
+- [x] Prove against disposable endpoints that a committed exact recovery preserves its historical journal row yet permits a later stream row and checkpoint advancement.
+- [ ] Restart the production stream immediately after a committed transition and prove readiness, checkpoint advancement, and restart cessation.
 - [ ] Persist measured post-transition schema/data validation and mark recovery `verified` only at zero unresolved drift.
 - [ ] Execute the recovery in production. This branch documentation does not claim that it happened.
 
@@ -55,6 +56,7 @@
 
 - `src/lost_binlog_recovery.rs` — authorization, per-attempt source-scope validation, committed-state boundary, reconciliation orchestration, and atomic transition.
 - `src/lost_binlog_recovery_store.rs` — target-side CAS reads, exact-barrier owner locking, immutable prepared insert, abandoned replacement transition, checkpoint update, commit, and exact barrier exclusion.
+- `scripts/lost-binlog-integration-harness.py` — disposable exact-authorization refusal, full-scope reconciliation, unresolved-barrier no-overtake, committed recovery, and post-recovery replay proof.
 - `src/mysql_client.rs` — non-locking MariaDB coordinate capture.
 - `src/inventory/reader.rs` — committed source metadata reads.
 - `src/sync/orchestrate.rs`, `src/sync/run.rs`, and `src/sync/chunk.rs` — unified prerequisite schema, locked source-authoritative row chunks, durable progress, and final constraints.

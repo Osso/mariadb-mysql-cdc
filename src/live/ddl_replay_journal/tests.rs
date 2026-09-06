@@ -376,11 +376,17 @@ fn unresolved_entry_blocks_later_source_events() {
 }
 
 #[test]
-fn startup_barrier_query_is_source_scoped_and_ordered() {
-    let sql = build_barrier_select_sql("cdc.ddl_replay_journal", "prod%_source");
+fn startup_barrier_query_escapes_source_identity_and_excludes_committed_recovery() {
+    let sql = build_barrier_select_sql(
+        "cdc.ddl_replay_journal",
+        "cdc.stream_recovery_records",
+        "prod%_source",
+    );
     assert!(sql.contains("status IN ('translation_pending','prepared','blocked')"));
-    assert!(sql.contains("prod=%=_source#server-id=%"));
+    assert!(sql.contains("prod=%=_source#server-id==%"));
     assert!(sql.contains("ESCAPE '='"));
-    assert!(sql.contains("ORDER BY binlog_file,event_start_position LIMIT 1"));
-    assert!(!sql.contains("stream_recovery_records"));
+    assert!(sql.contains("stream_recovery_records"));
+    assert!(sql.contains("recovery.status IN ('committed','verified')"));
+    assert!(sql.contains("recovery.old_barrier_raw_sql_sha256 = SHA2(journal.raw_sql, 256)"));
+    assert!(sql.contains("ORDER BY journal.binlog_file,journal.event_start_position LIMIT 1"));
 }

@@ -20,7 +20,9 @@ RECOVERY_ID = "lost-binlog-harness-recovery-01"
 
 
 def load_harness_module() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("cdc_integration_harness", HARNESS_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "cdc_integration_harness", HARNESS_PATH
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load harness helpers from {HARNESS_PATH}")
     module = importlib.util.module_from_spec(spec)
@@ -47,7 +49,9 @@ sql_literal = h.sql_literal
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, help="built mariadb-mysql-cdc binary")
-    parser.add_argument("--keep", action="store_true", help="keep disposable containers on failure")
+    parser.add_argument(
+        "--keep", action="store_true", help="keep disposable containers on failure"
+    )
     return parser.parse_args()
 
 
@@ -102,7 +106,9 @@ def run_recovery(harness: Harness, authorization: Path) -> h.CommandResult:
     )
 
 
-def wait_for_pending_barrier(harness: Harness, process: subprocess.Popen[str]) -> dict[str, str]:
+def wait_for_pending_barrier(
+    harness: Harness, process: subprocess.Popen[str]
+) -> dict[str, str]:
     assert harness.target
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
@@ -116,11 +122,28 @@ def wait_for_pending_barrier(harness: Harness, process: subprocess.Popen[str]) -
         if rows:
             fields = rows[0].split("\t")
             if len(fields) == 6:
-                return dict(zip(("source_identity", "binlog_file", "start", "end", "raw_sql", "status"), fields, strict=True))
+                return dict(
+                    zip(
+                        (
+                            "source_identity",
+                            "binlog_file",
+                            "start",
+                            "end",
+                            "raw_sql",
+                            "status",
+                        ),
+                        fields,
+                        strict=True,
+                    )
+                )
         if process.poll() is not None:
-            raise HarnessError(f"stream exited before translation-pending journal write: {harness.process_output(process)}")
+            raise HarnessError(
+                f"stream exited before translation-pending journal write: {harness.process_output(process)}"
+            )
         time.sleep(0.2)
-    raise HarnessError(f"stream did not persist translation-pending barrier: {harness.process_output(process)}")
+    raise HarnessError(
+        f"stream did not persist translation-pending barrier: {harness.process_output(process)}"
+    )
 
 
 def terminate_stream(harness: Harness, process: subprocess.Popen[str]) -> None:
@@ -129,7 +152,9 @@ def terminate_stream(harness: Harness, process: subprocess.Popen[str]) -> None:
         process.wait(timeout=15)
     except subprocess.TimeoutExpired as error:
         process.kill()
-        raise HarnessError("stream did not terminate after durable barrier capture") from error
+        raise HarnessError(
+            "stream did not terminate after durable barrier capture"
+        ) from error
     log = getattr(process, "_cdc_log", None)
     if log is not None:
         log.close()
@@ -138,20 +163,34 @@ def terminate_stream(harness: Harness, process: subprocess.Popen[str]) -> None:
 def assert_checkpoint(harness: Harness, expected: dict[str, object]) -> None:
     actual = harness.checkpoint()
     if actual != expected:
-        raise HarnessError(f"checkpoint changed unexpectedly: expected={expected!r} actual={actual!r}")
+        raise HarnessError(
+            f"checkpoint changed unexpectedly: expected={expected!r} actual={actual!r}"
+        )
 
 
 def assert_no_recovery_records(harness: Harness) -> None:
     assert harness.target
-    count = harness.admin_query(harness.target, "SELECT COUNT(*) FROM cdc.stream_recovery_records;").strip()
+    count = harness.admin_query(
+        harness.target, "SELECT COUNT(*) FROM cdc.stream_recovery_records;"
+    ).strip()
     if count != "0":
-        raise HarnessError(f"rejected authorization created recovery state: records={count}")
+        raise HarnessError(
+            f"rejected authorization created recovery state: records={count}"
+        )
 
 
-def write_authorization(path: Path, checkpoint: dict[str, object], barrier: dict[str, str], *, mismatch: bool) -> None:
+def write_authorization(
+    path: Path,
+    checkpoint: dict[str, object],
+    barrier: dict[str, str],
+    *,
+    mismatch: bool,
+) -> None:
     expected_checkpoint = dict(checkpoint)
     if mismatch:
-        expected_checkpoint["source_position"] = int(expected_checkpoint["source_position"]) + 1
+        expected_checkpoint["source_position"] = (
+            int(expected_checkpoint["source_position"]) + 1
+        )
     request = {
         "recovery_id": RECOVERY_ID if not mismatch else f"{RECOVERY_ID}-mismatch",
         "checkpoint_name": f"stream-binlog:{SOURCE_IDENTITY}",
@@ -178,32 +217,48 @@ def purge_checkpoint_history(harness: Harness, checkpoint: Coordinate) -> None:
     if retained.file == checkpoint.file:
         raise HarnessError(f"source did not rotate after FLUSH BINARY LOGS: {retained}")
     for _ in range(10):
-        harness.admin_sql(harness.source, f"PURGE BINARY LOGS TO {sql_literal(retained.file)};")
+        harness.admin_sql(
+            harness.source, f"PURGE BINARY LOGS TO {sql_literal(retained.file)};"
+        )
         logs = harness.admin_query(harness.source, "SHOW BINARY LOGS;")
         if checkpoint.file not in logs:
             return
         time.sleep(0.2)
-    raise HarnessError(f"checkpoint binlog remained after purge: checkpoint={checkpoint.file} logs={logs!r}")
+    raise HarnessError(
+        f"checkpoint binlog remained after purge: checkpoint={checkpoint.file} logs={logs!r}"
+    )
 
 
 def assert_reconciled_rows(harness: Harness) -> None:
     assert harness.target
-    accounts = harness.admin_query(harness.target, "SELECT id,payload FROM accounts ORDER BY id;").strip()
-    if accounts != "1\tsource-current":
-        raise HarnessError(f"source-authoritative accounts reconciliation failed: {accounts!r}")
-    generated = harness.admin_query(harness.target, "SELECT id,base,doubled FROM generated_values ORDER BY id;").strip()
+    accounts = harness.admin_query(
+        harness.target, "SELECT id,payload FROM accounts ORDER BY id;"
+    ).strip()
+    if accounts != "1\tsource-current\n3\tbarrier-must-win":
+        raise HarnessError(
+            f"source-authoritative accounts reconciliation failed: {accounts!r}"
+        )
+    generated = harness.admin_query(
+        harness.target, "SELECT id,base,doubled FROM generated_values ORDER BY id;"
+    ).strip()
     if generated != "1\t7\t14":
         raise HarnessError(f"generated-column reconciliation failed: {generated!r}")
 
 
-def assert_committed_transition(harness: Harness, checkpoint: dict[str, object], barrier: dict[str, str]) -> None:
+def assert_committed_transition(
+    harness: Harness, checkpoint: dict[str, object], barrier: dict[str, str]
+) -> None:
     assert harness.target
-    row = harness.admin_query(
-        harness.target,
-        "SELECT status,old_checkpoint_json,old_barrier_file,old_barrier_start_position,"
-        "old_barrier_end_position,old_barrier_raw_sql FROM cdc.stream_recovery_records "
-        f"WHERE recovery_id={sql_literal(RECOVERY_ID)};",
-    ).strip().split("\t", 5)
+    row = (
+        harness.admin_query(
+            harness.target,
+            "SELECT status,old_checkpoint_json,old_barrier_file,old_barrier_start_position,"
+            "old_barrier_end_position,old_barrier_raw_sql FROM cdc.stream_recovery_records "
+            f"WHERE recovery_id={sql_literal(RECOVERY_ID)};",
+        )
+        .strip()
+        .split("\t", 5)
+    )
     if len(row) != 6:
         raise HarnessError(f"missing committed recovery record: {row!r}")
     status, old_checkpoint_json, file, start, end, raw_sql = row
@@ -252,23 +307,59 @@ def run_scenario(binary: Path | None, keep: bool) -> None:
             "GRANT CREATE ON cdc.* TO 'cdc_stream'@'%';"
             "GRANT SELECT,INSERT,UPDATE ON cdc.sync_runs TO 'cdc_stream'@'%';",
         )
-        harness.admin_sql_file(harness.target, REPO / "docs/stream-recovery-records-bootstrap.sql")
+        harness.admin_sql_file(
+            harness.target, REPO / "docs/stream-recovery-records-bootstrap.sql"
+        )
 
         start = harness.coordinate()
         harness.write_checkpoint(start)
         checkpoint = harness.checkpoint()
-        harness.admin_sql(harness.source, "ALTER TABLE accounts RENAME INDEX idx_payload TO idx_payload_renamed;")
+        harness.admin_sql(
+            harness.source,
+            "ALTER TABLE accounts RENAME INDEX idx_payload TO idx_payload_renamed;",
+        )
         blocked, _log = harness.start_stream(start, label="lost-binlog-blocked")
         barrier = wait_for_pending_barrier(harness, blocked)
         terminate_stream(harness, blocked)
+        assert_checkpoint(harness, checkpoint)
+
+        harness.admin_sql(
+            harness.source, "INSERT INTO accounts VALUES (3,'barrier-must-win');"
+        )
+        future_checkpoint = harness.coordinate()
+        harness.write_checkpoint(future_checkpoint)
+        blocked_resume = harness.run_stream(future_checkpoint, future_checkpoint)
+        blocked_output = f"{blocked_resume.stdout}\n{blocked_resume.stderr}"
+        if (
+            blocked_resume.returncode == 0
+            or "automatic DDL barrier" not in blocked_output
+        ):
+            raise HarnessError(
+                "uncommitted recovery did not prevent startup from overtaking its journal barrier: "
+                f"{blocked_output}"
+            )
+        target_future_row = harness.admin_query(
+            harness.target,
+            "SELECT COUNT(*) FROM accounts WHERE id=3;",
+        ).strip()
+        if target_future_row != "0":
+            raise HarnessError(
+                "startup applied a source row beyond the unresolved DDL barrier"
+            )
+        harness.write_checkpoint(start)
         assert_checkpoint(harness, checkpoint)
         purge_checkpoint_history(harness, start)
 
         mismatch = harness.tempdir / "recovery-mismatch.json"
         write_authorization(mismatch, checkpoint, barrier, mismatch=True)
         rejected = run_recovery(harness, mismatch)
-        if rejected.returncode == 0 or "checkpoint" not in f"{rejected.stdout}\n{rejected.stderr}".lower():
-            raise HarnessError(f"mismatched recovery authorization was accepted: {rejected}")
+        if (
+            rejected.returncode == 0
+            or "checkpoint" not in f"{rejected.stdout}\n{rejected.stderr}".lower()
+        ):
+            raise HarnessError(
+                f"mismatched recovery authorization was accepted: {rejected}"
+            )
         assert_checkpoint(harness, checkpoint)
         assert_no_recovery_records(harness)
 
@@ -277,24 +368,44 @@ def run_scenario(binary: Path | None, keep: bool) -> None:
         recovered = run_recovery(harness, authorization)
         require_success(recovered, "lost-binlog recovery")
         report = json.loads(recovered.stdout)
-        if report.get("recovery_id") != RECOVERY_ID or report.get("compared_tables") != 2:
+        if (
+            report.get("recovery_id") != RECOVERY_ID
+            or report.get("compared_tables") != 2
+        ):
             raise HarnessError(f"unexpected recovery report: {report!r}")
         assert_reconciled_rows(harness)
         assert_committed_transition(harness, checkpoint, barrier)
         durable_recovery_checkpoint = harness.checkpoint()
         if durable_recovery_checkpoint["source_file"] == start.file:
-            raise HarnessError(f"recovery did not advance beyond purged checkpoint: {durable_recovery_checkpoint!r}")
+            raise HarnessError(
+                f"recovery did not advance beyond purged checkpoint: {durable_recovery_checkpoint!r}"
+            )
 
-        harness.admin_sql(harness.source, "INSERT INTO accounts VALUES (3,'post-recovery');")
+        harness.admin_sql(
+            harness.source, "INSERT INTO accounts VALUES (4,'post-recovery');"
+        )
         stop = harness.coordinate()
-        resumed = harness.run_stream(Coordinate(str(durable_recovery_checkpoint["source_file"]), int(durable_recovery_checkpoint["source_position"])), stop)
+        resumed = harness.run_stream(
+            Coordinate(
+                str(durable_recovery_checkpoint["source_file"]),
+                int(durable_recovery_checkpoint["source_position"]),
+            ),
+            stop,
+        )
         require_success(resumed, "post-recovery stream restart")
-        rows = harness.admin_query(harness.target, "SELECT id,payload FROM accounts ORDER BY id;").strip()
-        if rows != "1\tsource-current\n3\tpost-recovery":
+        rows = harness.admin_query(
+            harness.target, "SELECT id,payload FROM accounts ORDER BY id;"
+        ).strip()
+        if rows != "1\tsource-current\n3\tbarrier-must-win\n4\tpost-recovery":
             raise HarnessError(f"post-recovery DML was not streamed: {rows!r}")
         final_checkpoint = harness.checkpoint()
-        if final_checkpoint["source_file"] != stop.file or int(final_checkpoint["source_position"]) != stop.position:
-            raise HarnessError(f"stream did not advance checkpoint after recovery: expected={stop} actual={final_checkpoint!r}")
+        if (
+            final_checkpoint["source_file"] != stop.file
+            or int(final_checkpoint["source_position"]) != stop.position
+        ):
+            raise HarnessError(
+                f"stream did not advance checkpoint after recovery: expected={stop} actual={final_checkpoint!r}"
+            )
         print(
             "lost_binlog_recovery_ok "
             f"recovery_id={RECOVERY_ID} repaired_tables={report['repaired_tables']} "

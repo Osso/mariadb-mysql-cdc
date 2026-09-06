@@ -106,6 +106,9 @@ identity matching stops immediately.
   recovery.
 - [x] A Kubernetes restart must resume from the same durable checkpoint as an
   in-process reconnect.
+- [x] Require the audited recovery control plane at stream startup. An unresolved
+  exact DDL barrier blocks a durable checkpoint beyond it; an exact committed or
+  verified recovery record alone excludes its preserved historical barrier.
 
 ### Observability
 
