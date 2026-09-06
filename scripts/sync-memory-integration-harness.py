@@ -173,9 +173,9 @@ def seed_target(harness: Harness) -> None:
     harness.admin_sql(
         harness.target,
         fixture_schema() + "INSERT INTO memory_rows (id,body,kind) "
-        f"SELECT id,CONCAT('small-',id),'small' FROM ({small}) AS rows;"
+        f"SELECT id,CONCAT('small-',id),'small' FROM ({small}) AS generated_numbers;"
         + "INSERT INTO memory_rows (id,body,kind) "
-        f"SELECT id,{large_body('id')},'large' FROM ({all_large}) AS rows;"
+        f"SELECT id,{large_body('id')},'large' FROM ({all_large}) AS generated_numbers;"
         + "UPDATE memory_rows SET body='target-stale-small' WHERE id=1;"
         + "UPDATE memory_rows SET body='target-stale-large' WHERE id=60001;"
         + "GRANT LOCK TABLES ON globalcomix.* TO 'cdc_stream'@'%';"
