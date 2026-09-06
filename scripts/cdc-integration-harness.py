@@ -1873,8 +1873,8 @@ class Harness:
             )
         print(
             f"production_alter_table_ok coordinate={no_op_stop.file}:{no_op_stop.position} "
-            "journal_rows=5 unique_parity=true drop_column=true drop_noop=true "
-            "pending_unique_option=true"
+            "checkpointed_ddl_rows=6 unique_parity=true drop_column=true drop_noop=true "
+            "releases_index_rebuild=true pending_unique_option=true"
         )
 
     def wait_for_pending_ddl(
