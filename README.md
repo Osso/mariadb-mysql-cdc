@@ -109,7 +109,15 @@ post-state by applying that AST to a fenced target pre-state, without requiring 
 live source head at the historical event coordinate. The rename slice uses target
 column pre-state, emits deterministic MySQL 8 SQL without `IF EXISTS`, treats
 absent old columns as a proven no-op, and fails closed when old and new columns
-coexist. Broader types/options and full ALTER TABLE remain unsupported.
+coexist. One exact `releases` index-rebuild ALTER is also admitted: `DROP INDEX
+idx_downloads_sort`, then the observed eight-part replacement `ADD INDEX` with
+`published_time DESC`, `comic_id ASC`, and `id ASC`, followed by
+`ALGORITHM=INPLACE, LOCK=NONE`. It preserves typed drop/add clauses, key-part
+direction, and options; every variation remains `translation_pending`. Targeted
+unit and structured-stream tests pass. Disposable MariaDB/MySQL replay is
+currently blocked by a pre-existing `production-alter-table` harness timeout;
+no deployment or recovery success is claimed. Broader types/options and full
+`ALTER TABLE` remain unsupported.
 
 For admitted `CREATE TABLE`, source schema charset/collation are read only between
 exact event-coordinate fences and persisted in immutable evidence; generated SQL

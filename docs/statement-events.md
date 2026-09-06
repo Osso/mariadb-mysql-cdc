@@ -30,9 +30,13 @@ Automatic DDL admission currently has these narrow slices:
   MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
   clauses. Multiple admitted clauses are rendered in source order
   as deterministic MySQL 8 SQL; source `ADD INDEX` is emitted as target `ADD
-  KEY`. The slice also admits `DROP COLUMN IF EXISTS` with
-  ASCII-case-insensitive target matching, one emitted drop per matched target spelling,
-  and absent or repeated case-variant no-ops; this path records a
+  KEY`. One exact `releases` index-rebuild form also admits `DROP INDEX
+  idx_downloads_sort`, the observed eight-part replacement with `published_time
+  DESC`, `comic_id ASC`, and `id ASC`, then `ALGORITHM=INPLACE, LOCK=NONE`.
+  It preserves typed clauses, key-part direction, and options; every variation
+  remains a translation boundary. The slice also admits `DROP COLUMN IF EXISTS`
+  with ASCII-case-insensitive target matching, one emitted drop per matched target
+  spelling, and absent or repeated case-variant no-ops; this path records a
   canonical typed clause AST,
   emits deterministic MySQL 8 SQL, and derives expected post-state from fenced
   target pre-state plus the event AST without requiring the historical source
@@ -93,8 +97,12 @@ backtick-qualified names), generated names, `IF EXISTS`, unique/fulltext/spatial
 invisible forms, and unmodeled options. Unqualified backtick identifiers are
 tokenized; their real-MySQL coverage remains unchecked. The production ALTER
 parser does not imply broader `ALTER TABLE` support: types, defaults, clauses,
-and index options outside the observed slice remain translation boundaries. The
-rename translator removes `IF EXISTS`; absent old columns become a proven no-op,
+and index options outside the observed slice remain translation boundaries.
+Targeted unit and structured-stream coverage for the exact directional-index
+shape passes. Its disposable MariaDB/MySQL `production-alter-table` extension
+is blocked by a pre-existing scenario timeout, so it is not integration,
+deployment, recovery, or live-stream proof. The rename translator removes
+`IF EXISTS`; absent old columns become a proven no-op,
 while old/new coexistence fails closed.
 
 Other table DDL and unsupported `ALTER TABLE` forms, views, other routine DDL,

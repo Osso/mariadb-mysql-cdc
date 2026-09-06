@@ -235,8 +235,13 @@ column removal and its absent-column no-op, five `checkpointed` journal rows wit
 stream checkpoint. Focused parser and structured-stream replay tests cover the
 production `FLOAT UNSIGNED NOT NULL DEFAULT 0` form. A neighboring unique-prefix
 option remains `translation_pending` with no target index and no checkpoint
-advancement. This is implemented-slice proof only, not full ALTER TABLE coverage,
-a full compatibility matrix, or deployment proof.
+advancement. Targeted unit and structured-stream tests also cover the exact
+`releases` `idx_downloads_sort` DROP/ADD rebuild with directional key parts and
+`ALGORITHM=INPLACE, LOCK=NONE`. Its disposable MariaDB/MySQL harness extension
+is blocked by a pre-existing `production-alter-table` scenario timeout. No
+integration, deployment, recovery, or live-stream success is claimed. This is
+implemented-slice proof only, not full ALTER TABLE coverage, a full
+compatibility matrix, or deployment proof.
 
 ## Transformation/evidence failure
 

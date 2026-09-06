@@ -92,8 +92,11 @@ unquoted type grammar
 `DEFAULT 0`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY`,
 MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
 clauses. Multiple admitted clauses render in source order as
-deterministic MySQL 8 SQL; source `ADD INDEX` emits as target `ADD KEY`. The
-slice also admits `DROP COLUMN IF EXISTS` with
+deterministic MySQL 8 SQL; source `ADD INDEX` emits as target `ADD KEY`. One
+exact `releases` index-rebuild shape also admits `DROP INDEX idx_downloads_sort`,
+the observed eight-part replacement index with `published_time DESC`,
+`comic_id ASC`, and `id ASC`, then `ALGORITHM=INPLACE, LOCK=NONE`; every
+variation remains `translation_pending`. The slice also admits `DROP COLUMN IF EXISTS` with
 ASCII-case-insensitive target matching, one emitted drop per matched target spelling,
 and absent or repeated case-variant no-ops; and the production-observed unqualified
 multi-clause `ALTER TABLE ... RENAME COLUMN IF EXISTS ...` form. For the
@@ -162,9 +165,12 @@ index parity, duplicate rejection, translated column removal, and an absent-colu
 no-op, and requires all five journal rows plus the final supported-event source
 checkpoint to be `checkpointed`. It then proves
 an unsupported unique-prefix option remains `translation_pending` without target
-execution or checkpoint advancement. It proves only
-the implemented observed ALTER slice, not full ALTER TABLE coverage, a full matrix,
-or deployment readiness.
+execution or checkpoint advancement. Targeted unit and structured-stream tests
+cover the exact `releases` directional-index admission, but its disposable
+MariaDB/MySQL harness extension is currently blocked by a pre-existing scenario
+timeout. No deployment, recovery, or live-stream success follows from that unit
+proof. It proves only the implemented observed ALTER slice, not full ALTER TABLE
+coverage, a full matrix, or deployment readiness.
 
 ## Bootstrap
 

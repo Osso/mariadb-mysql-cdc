@@ -226,6 +226,11 @@ The current slice is covered by:
       final supported-event checkpoint; an unsupported
       unique-prefix option remains `translation_pending` with zero target
       execution and unchanged checkpoint.
+- [x] `src/live/ddl_semantics/tests.rs` and
+      `src/live/structured_stream/tests/ddl_replay.rs` — exact `releases`
+      `idx_downloads_sort` DROP/ADD directional-index AST, deterministic target
+      SQL/evidence, rejection of changed shape, and replay promotion from the
+      durable pending row.
 
 These tests prove only the observed ALTER slice, the exact fixture CREATE TABLE
 admission, the identity-scoped source-only `CREATE PROCEDURE` form, the generic
@@ -244,6 +249,11 @@ transformation contract, a full MariaDB/MySQL matrix, or deployment safety.
       and MySQL 8 transformation pipeline.
 - [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
       retired manual DDL ledger without restoring manual replay.
+- [ ] Restore the pre-existing `production-alter-table` harness path, then run
+      its new exact `releases` directional-index case against disposable
+      MariaDB/MySQL. Current unit/structured-stream proof passes; the integration
+      extension times out before its new assertions and proves neither deployment
+      nor recovery.
 - [ ] Build the broader production-derived DDL corpus and real MariaDB/MySQL 8
       parity matrix; the current five-event ALTER scenario plus one exact CREATE
       fixture crash/restart scenario remains only a slice proof.
@@ -259,7 +269,8 @@ transformation contract, a full MariaDB/MySQL matrix, or deployment safety.
 - Index-only automatic replay as the target DDL architecture.
 - Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`, exact guarded
   two-column `TIMESTAMP ... ALGORITHM=INSTANT`, `ADD KEY`/MariaDB `ADD INDEX`,
-  `ADD UNIQUE KEY`, and `DROP COLUMN IF EXISTS` forms.
+  `ADD UNIQUE KEY`, `DROP COLUMN IF EXISTS`, and exact `releases`
+  directional-index rebuild forms.
 - Additional column types, defaults, clauses, algorithm options, index options,
   and DDL families not listed in the implemented slice.
 - Silently dropping, weakening, or approximating parsed DDL clauses.
