@@ -70,8 +70,20 @@ ownership, which is terminal. Any failed validation or commit rolls back both
 replacement steps. Duplicate recovery IDs and non-advancing coordinates are
 refused.
 
-Bootstrap `cdc.stream_recovery_records` and its immutability guards with
-`docs/stream-recovery-records-bootstrap.sql` while stream writers are stopped.
+Bootstrap `cdc.stream_recovery_records`, its immutability guards, and its
+trigger-inventory procedure with `docs/stream-recovery-records-bootstrap.sql`
+while stream writers are stopped. This control plane is required by every stream
+startup: the stream validates the table and both DDL/recovery trigger-inventory
+procedures. Missing objects or grants fail startup; there is no legacy fallback.
+
+Startup selects unresolved journal barriers by a literal source identity prefix
+followed by `#server-id=` and any server ID. The SQL `LIKE` predicate uses `=` as
+its escape character, so the literal separator is encoded as `#server-id==%`.
+A preserved historical journal barrier is excluded only when a recovery row has
+status `committed` or `verified` and exactly matches its source identity, file,
+start/end coordinates, and raw-SQL hash. Prepared or abandoned recoveries never
+suppress a barrier.
+
 This documentation records the control-plane contract only; production
 execution, restart health, and post-transition `verified` evidence remain open.
 

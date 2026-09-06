@@ -34,8 +34,19 @@ GRANT SELECT, INSERT, UPDATE
     ON cdc.ddl_replay_journal
     TO 'cdc_stream'@'%';
 
+-- Required at stream startup. Apply docs/stream-recovery-records-bootstrap.sql
+-- before starting the stream; missing table, triggers, procedure, or grants fail
+-- startup. No compatibility fallback exists.
+GRANT SELECT, INSERT, UPDATE
+    ON cdc.stream_recovery_records
+    TO 'cdc_stream'@'%';
+
 GRANT EXECUTE
     ON PROCEDURE cdc.ddl_replay_journal_trigger_inventory
+    TO 'cdc_stream'@'%';
+
+GRANT EXECUTE
+    ON PROCEDURE cdc.stream_recovery_records_trigger_inventory
     TO 'cdc_stream'@'%';
 
 -- Historical cdc.row_conflicts objects belong to the independent evidence
@@ -46,13 +57,13 @@ GRANT EXECUTE
 -- GRANTS or a second grant-policy allowlist for each generated statement.
 -- * global scope: USAGE only;
 -- * exact checkpoint SELECT/INSERT/UPDATE;
--- * exact journal SELECT/INSERT/UPDATE;
--- * EXECUTE only on the DDL-journal trigger-inventory procedure;
+-- * exact journal and recovery-record SELECT/INSERT/UPDATE;
+-- * EXECUTE only on the DDL-journal and recovery-record trigger-inventory procedures;
 -- * no GRANT OPTION, PROXY, roles, ALL, global mutation, schema-wide cdc
 --   mutation/object creation, historical sync progress, or conflict-ledger access.
 --
--- Startup calls the exact definer-safe DDL-journal procedure and validates its
--- returned trigger rows. Event handling executes known internal operations
+-- Startup calls the exact definer-safe DDL-journal and recovery-record procedures
+-- and validates their returned trigger rows. Event handling executes known internal operations
 -- directly and surfaces database errors; it does not rerun grant validation.
 -- Admin/resolver credentials independently review SHOW CREATE PROCEDURE and
 -- actual trigger rows; runtime does not require routine metadata privileges or
