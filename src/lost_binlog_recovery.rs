@@ -542,6 +542,7 @@ pub struct RecoverLostBinlogConfig {
     pub recovery_table: String,
     pub progress_table: String,
     pub chunk_size: usize,
+    pub parallelism: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -866,7 +867,7 @@ pub(crate) fn recovery_sync_config(
         source_inventory,
         FullScopeSyncRun {
             chunk_size: config.chunk_size,
-            parallelism: 1,
+            parallelism: config.parallelism,
             progress_table: &config.progress_table,
             coordinator_session_wait_timeout_seconds: Some(
                 RECOVERY_COORDINATOR_WAIT_TIMEOUT_SECONDS,

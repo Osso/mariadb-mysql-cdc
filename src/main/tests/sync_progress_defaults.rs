@@ -8,6 +8,7 @@ fn sync_progress_defaults_use_the_unified_table_for_recovery_callers() {
         apply.clone(),
         "authorization.json".to_string(),
         "source-db".to_string(),
+        1,
     );
     let resync = resync_config_from_apply(apply, "source-db".to_string(), 4);
 

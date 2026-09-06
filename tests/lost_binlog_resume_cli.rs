@@ -8,7 +8,35 @@ fn help_documents_explicit_prepared_recovery_resume() {
         .expect("run CLI help");
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
-    assert!(help.contains("resume-lost-binlog --authorization-file PATH"));
+    assert!(help.contains(
+        "recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]"
+    ));
+    assert!(help.contains(
+        "resume-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]"
+    ));
+}
+
+#[test]
+fn lost_binlog_commands_reject_invalid_parallelism_before_authorization_or_connections() {
+    for command in ["recover-lost-binlog", "resume-lost-binlog"] {
+        for value in ["0", "not-a-number"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_mariadb-mysql-cdc"))
+                .args([command, "--parallelism", value])
+                .output()
+                .expect("run lost-binlog command with invalid parallelism");
+
+            assert_eq!(output.status.code(), Some(2), "{command} {value}");
+            let error = String::from_utf8(output.stderr).expect("UTF-8 error");
+            assert!(
+                error.contains("--parallelism"),
+                "{command} {value}: {error}"
+            );
+            assert!(
+                !error.contains("--authorization-file is required"),
+                "{command} {value}: {error}"
+            );
+        }
+    }
 }
 
 #[test]

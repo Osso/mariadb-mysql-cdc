@@ -411,7 +411,9 @@ source evidence set, a fixed `resync-stream:<source_identity>` run identity, and
 target-inventory drift scan.
 `recover-lost-binlog` now uses the same staged engine with one captured source
 evidence set, exact `recovery_id` progress across every source table, and
-`cdc.sync_runs` progress. Prepared evidence is source-only. Recovery proof
+`cdc.sync_runs` progress. `--parallelism WORKERS` defaults to `1`; a resume may
+select a different positive worker count without changing its recovery identity,
+boundary, or durable progress. Prepared evidence is source-only. Recovery proof
 requires complete exact run/table progress plus an unchanged source scope; it
 does not capture a target final inventory or run a post-write drift scan. The stream lease, authorization,
 checkpoint/barrier revalidation, and atomic recovery transaction remain in

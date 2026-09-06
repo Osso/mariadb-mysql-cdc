@@ -37,8 +37,8 @@ Usage:
   mariadb-mysql-cdc repair-fk-orphans --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --case CASE --expected-orphans COUNT [options]
   mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
-  mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
-  mariadb-mysql-cdc resume-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
+  mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
+  mariadb-mysql-cdc resume-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
   mariadb-mysql-cdc resync-stream --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity NEW_ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
   mariadb-mysql-cdc resolve-comics-releases-views-conflicts --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --run-id ID [--batch-size ROWS]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -246,8 +246,9 @@ fn run_lost_binlog_command(args: Vec<String>, execute: LostBinlogCommand) {
 }
 
 fn parse_recover_lost_binlog_config(
-    args: Vec<String>,
+    mut args: Vec<String>,
 ) -> Result<lost_binlog_recovery::RecoverLostBinlogConfig, String> {
+    let parallelism = take_optional_nonzero_usize(&mut args, "--parallelism", 1)?;
     let (authorization_file, apply_args) = take_required_option(args, "--authorization-file")?;
     let apply = parse_apply_binlog_config(apply_args)?;
     let source_database = apply
@@ -259,6 +260,7 @@ fn parse_recover_lost_binlog_config(
         apply,
         authorization_file,
         source_database,
+        parallelism,
     ))
 }
 
@@ -266,6 +268,7 @@ fn recovery_config_from_apply(
     apply: live::ApplyBinlogConfig,
     authorization_file: String,
     source_database: String,
+    parallelism: usize,
 ) -> lost_binlog_recovery::RecoverLostBinlogConfig {
     lost_binlog_recovery::RecoverLostBinlogConfig {
         source: crate::mysql_config::MySqlConnectionConfig {
@@ -283,6 +286,7 @@ fn recovery_config_from_apply(
         recovery_table: lost_binlog_recovery_store::DEFAULT_RECOVERY_TABLE.to_string(),
         progress_table: sync::DEFAULT_SYNC_PROGRESS_TABLE.to_string(),
         chunk_size: 10_000,
+        parallelism,
     }
 }
 

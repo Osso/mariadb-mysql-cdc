@@ -16,7 +16,7 @@
 - [x] Acquire the same `cdc-stream:{target.database}` lease used by live streaming before recovery state changes.
 - [x] Capture the MariaDB binlog coordinate with ordinary non-locking source reads; source recovery must not require `FLUSH TABLES WITH READ LOCK`, `UNLOCK TABLES`, `LOCK TABLES`, or `RELOAD`.
 - [x] Reconcile normally committed source rows and schema evidence without a long-lived cross-table transaction or repeatable-read snapshot.
-- [x] Invoke one unified staged sync for every source-table in the captured inventory, using run ID `recovery_id`, parallelism `1`, and the configured `cdc.sync_runs` progress table.
+- [x] Invoke one unified staged sync for every source-table in the captured inventory, using run ID `recovery_id`, configured `--parallelism` (default `1`), and the configured `cdc.sync_runs` progress table.
 - [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
 - [x] Use the unified stages for prerequisite schema convergence, target-WRITE-locked source-authoritative chunks, durable per-stage/per-table progress, and final constraint convergence.
 - [x] Set only recovery-owned source/target coordinator and sync-progress sessions to `SESSION wait_timeout=604800` before long reconciliation. This matches the seven-day recovery Job deadline; it does not change server-global timeouts, normal stream/sync sessions, CLI configuration, or reconnect behavior.
@@ -30,7 +30,7 @@
 
 - [x] Insert an immutable `prepared` recovery record containing old state, new coordinate, source identity, scope, operator, reason, and evidence.
 - [x] Resume only an existing `prepared` record with the same recovery ID, operator, reason, old checkpoint, barrier, source identity, scope, and immutable prepared evidence. Omitted authorization scope/evidence bind to the stored values; supplied values must match.
-- [x] Resume reuses the original run ID and captured coordinate without a new boundary capture, replacement ID, abandonment, checkpoint reset, or full-rescan fallback.
+- [x] Resume reuses the original run ID, captured coordinate, and durable table progress without a new boundary capture, replacement ID, abandonment, checkpoint reset, or full-rescan fallback. Each invocation may select `--parallelism` independently.
 - [x] Before reconciliation and again immediately before checkpoint commit, require the original captured file and position to remain present in `SHOW BINARY LOGS`; a missing or shorter file fails without checkpoint/progress mutation.
 - [x] Before reconstructing source evidence, require the current complete InnoDB inventory hash and both stored prepared-evidence hashes to match the immutable prepared scope.
 - [x] Lock the checkpoint, exact barrier, new recovery ID, and exact-barrier recovery owner in one preparation transaction.

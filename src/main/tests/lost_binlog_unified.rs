@@ -1,3 +1,4 @@
+use super::set_env;
 use crate::checkpoint::{Checkpoint, LastEvent};
 use crate::inventory::{ColumnInventory, SchemaInventory, TableInventory};
 use crate::live::TargetMySqlConfig;
@@ -6,6 +7,7 @@ use crate::lost_binlog_recovery::{
     recovery_reconciliation_proof, recovery_sync_config,
 };
 use crate::mysql_config::MySqlConnectionConfig;
+use crate::parse_recover_lost_binlog_config;
 use crate::sync::SyncChunkProgress;
 use std::path::PathBuf;
 
@@ -21,10 +23,24 @@ fn recovery_builds_one_unified_full_scope_configuration() {
     assert_eq!(unified.target.host, config.target.host);
     assert_eq!(unified.tables, ["parents", "children"]);
     assert_eq!(unified.chunk_size, 500);
-    assert_eq!(unified.parallelism, 1);
+    assert_eq!(unified.parallelism, 2);
     assert_eq!(unified.progress_table, "control.sync_runs");
     assert_eq!(unified.run_id.as_deref(), Some("recovery-42"));
     assert_eq!(unified.run_id_prefix, None);
+}
+
+#[test]
+fn recovery_parser_defaults_and_accepts_explicit_table_parallelism() {
+    set_env("CDC_RECOVERY_SOURCE_PASSWORD", "source-password");
+    set_env("CDC_RECOVERY_TARGET_PASSWORD", "target-password");
+
+    let default = parse_recover_lost_binlog_config(recovery_args(&[]))
+        .expect("default recovery configuration");
+    assert_eq!(default.parallelism, 1);
+
+    let configured = parse_recover_lost_binlog_config(recovery_args(&["--parallelism", "2"]))
+        .expect("parallel recovery configuration");
+    assert_eq!(configured.parallelism, 2);
 }
 
 #[test]
@@ -110,7 +126,38 @@ fn recovery_config() -> RecoverLostBinlogConfig {
         recovery_table: "cdc.stream_recovery_records".to_string(),
         progress_table: "control.sync_runs".to_string(),
         chunk_size: 500,
+        parallelism: 2,
     }
+}
+
+fn recovery_args(extra: &[&str]) -> Vec<String> {
+    let mut args = [
+        "--authorization-file",
+        "authorization.json",
+        "--source-host",
+        "source-db",
+        "--source-user",
+        "source-user",
+        "--source-password-env",
+        "CDC_RECOVERY_SOURCE_PASSWORD",
+        "--source-database",
+        "source-schema",
+        "--source-identity",
+        "source-1",
+        "--target-host",
+        "target-db",
+        "--target-user",
+        "target-user",
+        "--target-password-env",
+        "CDC_RECOVERY_TARGET_PASSWORD",
+        "--target-database",
+        "target-schema",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    args.extend(extra.iter().map(|value| (*value).to_string()));
+    args
 }
 
 fn recovery_request() -> LostBinlogRecoveryRequest {
