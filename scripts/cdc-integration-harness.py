@@ -3727,6 +3727,27 @@ class Harness:
             f"ALTER TABLE `{child}` ADD CONSTRAINT `{child}_parent_fk` "
             f"FOREIGN KEY(parent_id) REFERENCES `{parent}`(id);",
         )
+        # Row workers use LOCK TABLES WRITE, incompatible with our MDL holders.
+        # Stop at the final-stage entry first, without editing persisted progress.
+        self.admin_sql(
+            self.target,
+            "DELIMITER //\n"
+            "CREATE TRIGGER cdc.pause_schema_fixture BEFORE INSERT ON cdc.sync_runs "
+            "FOR EACH ROW BEGIN IF NEW.stage='final_constraints' THEN "
+            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='schema fixture final entry'; "
+            "END IF; END//\nDELIMITER ;\n",
+        )
+        try:
+            seeded = self.run_sync(
+                tables=tables, run_id=run_id, chunk_size=1, parallelism=2
+            )
+            if (
+                seeded.returncode == 0
+                or "schema fixture final entry" not in seeded.stdout + seeded.stderr
+            ):
+                raise HarnessError(f"final-stage entry fixture failed: {seeded}")
+        finally:
+            self.admin_sql(self.target, "DROP TRIGGER cdc.pause_schema_fixture;")
         self.reset_target_general_log()
         blockers = {}
         process = None
@@ -3922,8 +3943,7 @@ class Harness:
             self.setup_sync_accounts(table)
 
         complete_values = ",".join(
-            f"({index}, 'complete-{index}', 'source-{index}')"
-            for index in range(1, 31)
+            f"({index}, 'complete-{index}', 'source-{index}')" for index in range(1, 31)
         )
         running_values = ",".join(
             f"({index}, 'running-{index}', 'source-{index}')"
