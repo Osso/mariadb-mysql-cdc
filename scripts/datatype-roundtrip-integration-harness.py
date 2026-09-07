@@ -18,18 +18,15 @@ import json
 import sys
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 EXISTING_HARNESS = Path(__file__).with_name("cdc-integration-harness.py")
-DEFAULT_BINARY = Path("/tmp/claude/cdc-bit-parallel-candidate-c2becb5")
-EXPECTED_BINARY_SHA256 = (
-    "441b04f17948813aa64258dda35ecbc309fb03ab0883aecc46ffb57e69356286"
-)
 METADATA_PATH = REPO / "docs/local/datatype-audit-source-columns-20260907.json"
-DEFAULT_JSON_REPORT = REPO / "docs/local/datatype-audit-baseline-20260907.json"
-DEFAULT_MARKDOWN_REPORT = REPO / "docs/local/datatype-audit-baseline-20260907.md"
+DEFAULT_JSON_REPORT = REPO / "docs/local/datatype-audit-report.json"
+DEFAULT_MARKDOWN_REPORT = REPO / "docs/local/datatype-audit-report.md"
 
 
 def load_existing_harness() -> Any:
@@ -115,7 +112,7 @@ def text_case(family: str, definition: str) -> Case:
         columns=columns(("value", definition, "hex")),
         source_initial=((text_value("initial"),), (text_value("before-case"),)),
         source_updates=(
-            (1, (text_value("unicode ☃ quotes ' \" slash\\ NUL\x00end"),)),
+            (1, (text_value("unicode ☃ 😀 quotes ' \" slash\\ NUL\x00end"),)),
             (3, (text_value("CASE value"),)),
         ),
         source_inserts=(
@@ -242,11 +239,22 @@ CASES = (
     ),
     Case(
         family="enum",
-        columns=columns(("value", "ENUM('','ordinary','1','2') NULL", "enum")),
-        source_initial=(("'ordinary'",), ("''",)),
-        source_updates=((1, ("'2'",)), (3, ("0",))),
-        source_inserts=((4, ("'1'",)), (5, ("''",)), (6, ("NULL",))),
-        target_initial=((1, ("'1'",)), (2, ("'ordinary'",)), (3, ("'ordinary'",))),
+        columns=columns(
+            ("value", "ENUM('','ordinary','1','2') NULL", "enum"),
+            (
+                "public_time_delta",
+                "ENUM('1','2','3','4','5','6','7','8','9','10','11','12','13','14') NULL",
+                "enum",
+            ),
+        ),
+        source_initial=(("'ordinary'", "'1'"), ("''", "'2'")),
+        source_updates=((1, ("'2'", "'14'")), (3, ("0", "0"))),
+        source_inserts=((4, ("'1'", "'1'")), (5, ("''", "'2'")), (6, ("NULL", "NULL"))),
+        target_initial=(
+            (1, ("'1'", "'2'")),
+            (2, ("'ordinary'", "'3'")),
+            (3, ("'ordinary'", "'4'")),
+        ),
         source_legacy_sql_mode=True,
     ),
     Case(
@@ -514,20 +522,17 @@ def binary_revision(binary: Path) -> dict[str, str]:
     if not binary.is_file():
         raise HarnessError(f"audit binary missing: {binary}")
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    if digest != EXPECTED_BINARY_SHA256:
-        raise HarnessError(
-            f"audit binary hash mismatch: expected={EXPECTED_BINARY_SHA256} actual={digest}"
-        )
     return {"path": str(binary), "sha256": digest}
 
 
 def report_markdown(report: dict[str, Any]) -> str:
     lines = [
-        "# Datatype round-trip baseline — 2026-09-07",
+        f"# Datatype round-trip audit — {report['audit_date']}",
         "",
         f"- revision: `{report['git_revision']}`",
         f"- binary: `{report['binary']['path']}` ({report['binary']['sha256']})",
-        f"- source metadata: `{METADATA_PATH.relative_to(REPO)}`",
+        f"- source metadata: `{report['metadata_path']}`",
+        f"- scope: {report['scope']}",
         "- source-only legacy SQL mode: `sql_mode=''` for DATE/DATETIME/TIMESTAMP zero or partial-zero fixtures and ENUM index 0; target runtime and sync mode unchanged.",
         "",
         "| family | observed columns | result | durable progress | error |",
@@ -555,7 +560,11 @@ def report_markdown(report: dict[str, Any]) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--metadata", type=Path, default=METADATA_PATH)
+    parser.add_argument(
+        "--family", action="append", choices=sorted(case.family for case in CASES)
+    )
     parser.add_argument("--json-report", type=Path, default=DEFAULT_JSON_REPORT)
     parser.add_argument("--markdown-report", type=Path, default=DEFAULT_MARKDOWN_REPORT)
     parser.add_argument(
@@ -566,22 +575,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    type_counts = metadata_type_counts(METADATA_PATH)
+    type_counts = metadata_type_counts(args.metadata)
     validate_case_coverage(type_counts)
+    cases = [case for case in CASES if not args.family or case.family in args.family]
     revision = existing.run(["git", "rev-parse", "HEAD"], cwd=REPO).stdout.strip()
     report: dict[str, Any] = {
-        "audit_date": "2026-09-07",
+        "audit_date": datetime.now(timezone.utc).date().isoformat(),
         "git_revision": revision,
         "binary": binary_revision(args.binary),
-        "metadata_path": str(METADATA_PATH.relative_to(REPO)),
+        "metadata_path": str(args.metadata),
         "source_type_counts": type_counts,
-        "case_count": len(CASES),
+        "scope": "selected families only"
+        if args.family
+        else "all observed source datatype families",
+        "case_count": len(cases),
         "legacy_source_sql_mode": "sql_mode='' only while seeding temporal zero/partial-zero values and ENUM index 0; target unchanged",
         "results": [],
     }
     with Harness(REPO, args.binary, args.keep) as harness:
         harness.prepare()
-        for case in CASES:
+        for case in cases:
             try:
                 result = audit_case(harness, case)
             except (
