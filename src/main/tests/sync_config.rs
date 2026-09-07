@@ -332,7 +332,7 @@ fn sync_table_conversion_projects_and_binds_enum_ordinals_and_mediumblob_bytes()
         ..table.clone()
     };
     assert_eq!(
-        build_sync_run_identity(&prefixed_run_config(), vec![table])
+        build_sync_run_identity(&prefixed_run_config(), vec![table.clone()])
             .expect("runtime enum/blob sync-v1 identity"),
         build_sync_run_identity(&prefixed_run_config(), vec![legacy_table])
             .expect("legacy sync-v1 identity")
