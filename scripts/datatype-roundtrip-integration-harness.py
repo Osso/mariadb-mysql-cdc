@@ -132,7 +132,9 @@ def text_case(family: str, definition: str) -> Case:
 
 
 def text_value(value: str) -> str:
-    return f"CONVERT(0x{value.encode('utf-8').hex()} USING utf8mb4)"
+    encoded = value.encode("utf-8").hex()
+    literal = "X''" if not encoded else f"0x{encoded}"
+    return f"CONVERT({literal} USING utf8mb4)"
 
 
 CASES = (
