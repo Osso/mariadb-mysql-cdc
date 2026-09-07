@@ -3207,9 +3207,9 @@ class Harness:
         ).strip()
         if drift != "0":
             raise HarnessError(f"wide sync left divergent rows: {drift}")
-        if progress != 'complete	["129"]	129	1':
+        if progress != 'complete	["129"]	129	2':
             raise HarnessError(f"wide sync progress mismatch: {progress!r}")
-        print("sync_wide_update_ok rows=129 updates=129 chunks=1")
+        print("sync_wide_update_ok rows=129 updates=129 chunks=2")
 
     def run_sync_bit_values(self) -> None:
         assert self.source and self.target
@@ -3247,8 +3247,6 @@ class Harness:
         )
 
         run_id = "sync-bit-values"
-        result = self.run_sync(tables=[table], run_id=run_id, chunk_size=3)
-        require_success(result, "sync BIT values")
         select = (
             f"SELECT id,COALESCE(HEX(premium_only),'NULL'),"
             f"COALESCE(CAST(premium_only AS UNSIGNED),'NULL'),"
@@ -3256,6 +3254,9 @@ class Harness:
             f"COALESCE(HEX(mask),'NULL'),COALESCE(CAST(mask AS UNSIGNED),'NULL'),payload "
             f"FROM {table} ORDER BY id;"
         )
+        self.assert_sync_bit_rollback(table, run_id, select)
+        result = self.run_sync(tables=[table], run_id=run_id, chunk_size=3)
+        require_success(result, "sync BIT values")
         source_rows = self.admin_query(self.source, select).splitlines()
         target_rows = self.admin_query(self.target, select).splitlines()
         if target_rows != source_rows:
@@ -3274,7 +3275,41 @@ class Harness:
         ).strip()
         if progress != 'complete\t["6"]\t3\t5\t1\t4\t1':
             raise HarnessError(f"sync BIT values progress mismatch: {progress!r}")
-        print("sync_bit_values_ok rows=5 updates=4 inserts=1 deletes=1 chunks=3")
+        print(
+            "sync_bit_values_ok rows=5 updates=4 inserts=1 deletes=1 chunks=3 rollback=true"
+        )
+
+    def assert_sync_bit_rollback(self, table: str, run_id: str, select: str) -> None:
+        before = self.admin_query(self.target, select)
+        self.admin_sql(
+            self.target,
+            f"CREATE TRIGGER reject_bit_update BEFORE UPDATE ON {table} FOR EACH ROW "
+            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected BIT update rollback';",
+        )
+        try:
+            failed = self.run_sync(tables=[table], run_id=run_id, chunk_size=3)
+            error = failed.stdout + failed.stderr
+            if failed.returncode == 0 or "injected BIT update rollback" not in error:
+                raise HarnessError(
+                    f"BIT rollback fixture did not reach its update failure: {error}"
+                )
+            if self.admin_query(self.target, select) != before:
+                raise HarnessError(
+                    "failed BIT update did not roll back preceding target-only deletion"
+                )
+            advanced = self.admin_query(
+                self.target,
+                "SELECT COUNT(*) FROM cdc.sync_runs "
+                f"WHERE run_id={sql_literal(run_id)} AND stage='rows' AND "
+                "(last_primary_key_json IS NOT NULL OR chunks<>0 OR rows_scanned<>0 "
+                "OR inserts_applied<>0 OR updates_applied<>0 OR deletes_applied<>0);",
+            ).strip()
+            if advanced != "0":
+                raise HarnessError(
+                    f"failed BIT update advanced durable row progress: {advanced}"
+                )
+        finally:
+            self.admin_sql(self.target, "DROP TRIGGER reject_bit_update;")
 
     def stop_sync_process(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is None:
