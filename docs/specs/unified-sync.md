@@ -40,6 +40,8 @@ the run ID. Operator usage belongs in the sync runbook.
 ### Strict row mutations and secondary-unique repair
 
 - [x] Keep unified-sync row mutations source-authoritative and strict: normal missing-row work uses plain batched `INSERT`; never use `INSERT IGNORE`, upsert, `REPLACE`, or a fallback engine.
+- [ ] Bound retained projected-row payload to 64 MiB per source/target read page as well as the requested row limit. Preserve a single larger row intact; this budget is not a universal process-memory or row-size limit.
+- [ ] Distinguish a byte-limited partial page from exhausted data. Continue from the last retained primary key without skipping rows, and do not complete target-tail cleanup while more rows remain.
 - [x] Reconcile each bounded source window through target keyset pages without retaining the complete target window: delete each page's target-only keys in the locked transaction, retain only source-bounded divergent/missing rows, then apply updates and inserts after all target-only deletes succeed.
 - [x] On a strict insert or update `1062`, reconcile only the named full-column, non-`PRIMARY` secondary unique index reported by MySQL. The target session keeps the existing table `WRITE` lock and transaction, resolves exactly one different-primary-key owner per conflicting intended row with NULL-safe `<=>` predicates (ignoring already-correct same-primary-key ownership within an update batch), and exact-reads that owner primary key from the current source.
 - [x] Require contiguous metadata for every full indexed column. Prefixed columns, expression columns, `PRIMARY`, absent or ambiguous index metadata, absent or ambiguous owner evidence, and NULL-valued unique identities fail closed.

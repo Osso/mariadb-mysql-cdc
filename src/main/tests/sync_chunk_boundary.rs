@@ -1,6 +1,6 @@
 use crate::database_row::DatabaseRow;
 use crate::sync::{
-    SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
+    SyncChunkConfig, SyncChunkPage, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
     SyncChunkSource, SyncChunkTargetSession, SyncMutationFailure, SyncPrimaryKeyOrdering, SyncTable,
     SyncUniqueIndex, SyncUniqueOwnerAction, SyncUniqueOwnerConflict, sync_next_chunk,
 };
@@ -121,7 +121,7 @@ impl SyncChunkSource for RecordingSource {
     fn read_rows(
         &mut self,
         request: &SyncChunkReadRequest,
-    ) -> Result<Vec<DatabaseRow>, String> {
+    ) -> Result<SyncChunkPage, String> {
         self.events.borrow_mut().push(Event::SourceRead {
             start_after: request.start_after.clone(),
             end_at: request.end_at.clone(),
@@ -130,7 +130,11 @@ impl SyncChunkSource for RecordingSource {
         if self.failure == Some(FailurePoint::SourceRead) {
             return Err("injected source read failure".to_string());
         }
-        Ok(self.reads.pop_front().unwrap_or_default())
+        let rows = self.reads.pop_front().unwrap_or_default();
+        Ok(SyncChunkPage {
+            has_more: rows.len() == request.limit,
+            rows,
+        })
     }
 
     fn read_row_by_primary_key(
@@ -271,7 +275,7 @@ impl SyncChunkTargetSession for RecordingTargetSession {
     fn read_rows(
         &mut self,
         request: &SyncChunkReadRequest,
-    ) -> Result<Vec<DatabaseRow>, String> {
+    ) -> Result<SyncChunkPage, String> {
         self.events.borrow_mut().push(Event::TargetRead {
             start_after: request.start_after.clone(),
             end_at: request.end_at.clone(),
@@ -280,13 +284,17 @@ impl SyncChunkTargetSession for RecordingTargetSession {
         if self.failure == Some(FailurePoint::TargetRead) {
             return Err("injected target read failure".to_string());
         }
-        if let Some(rows) = self.read_batches.pop_front() {
-            return Ok(rows);
-        }
-        if self.honor_read_bounds {
-            return Ok(self.bounded_read(request));
-        }
-        Ok(self.pending_rows.clone())
+        let rows = if let Some(rows) = self.read_batches.pop_front() {
+            rows
+        } else if self.honor_read_bounds {
+            self.bounded_read(request)
+        } else {
+            self.pending_rows.clone()
+        };
+        Ok(SyncChunkPage {
+            has_more: rows.len() == request.limit || !self.read_batches.is_empty(),
+            rows,
+        })
     }
 
     fn delete_rows(&mut self, primary_keys: &[Vec<String>]) -> Result<(), String> {

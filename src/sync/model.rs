@@ -182,8 +182,14 @@ pub(crate) struct SyncProgressRow {
     pub(crate) completed_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyncChunkPage {
+    pub(crate) rows: Vec<DatabaseRow>,
+    pub(crate) has_more: bool,
+}
+
 pub(crate) trait SyncChunkSource {
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String>;
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<SyncChunkPage, String>;
 
     fn read_row_by_primary_key(
         &mut self,
@@ -196,7 +202,7 @@ pub(crate) trait SyncChunkSource {
 pub(crate) trait SyncChunkTargetSession {
     fn set_autocommit(&mut self, enabled: bool) -> Result<(), String>;
     fn lock_table_write(&mut self, database: &str, table: &str) -> Result<(), String>;
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String>;
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<SyncChunkPage, String>;
     fn delete_rows(&mut self, primary_keys: &[Vec<String>]) -> Result<(), String>;
     fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure>;
     fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure>;

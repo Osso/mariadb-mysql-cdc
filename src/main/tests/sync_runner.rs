@@ -2,7 +2,7 @@ use crate::live::TargetMySqlConfig;
 use crate::mysql_config::MySqlConnectionConfig;
 use crate::database_row::DatabaseRow;
 use crate::sync::{
-    SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
+    SyncChunkConfig, SyncChunkPage, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
     SyncChunkSource, SyncChunkTargetSession, SyncConfig, SyncMutationFailure,
     SyncPrimaryKeyOrdering, SyncRunIdentity,
     SyncTable, build_sync_run_identity, run_sync_tables_bounded, sync_table_to_completion,
@@ -159,9 +159,9 @@ struct EmptySource {
 }
 
 impl SyncChunkSource for EmptySource {
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<SyncChunkPage, String> {
         self.requests.push(request.clone());
-        Ok(Vec::new())
+        Ok(SyncChunkPage { rows: Vec::new(), has_more: false })
     }
 }
 
@@ -192,9 +192,10 @@ impl SyncChunkTargetSession for TailTarget {
         Ok(())
     }
 
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<SyncChunkPage, String> {
         self.read_requests.push(request.clone());
-        Ok(self.tail_rows.pop_front().unwrap_or_default())
+        let rows = self.tail_rows.pop_front().unwrap_or_default();
+        Ok(SyncChunkPage { has_more: rows.len() == request.limit || !self.tail_rows.is_empty(), rows })
     }
 
     fn delete_rows(&mut self, primary_keys: &[Vec<String>]) -> Result<(), String> {

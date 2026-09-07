@@ -131,7 +131,8 @@ fn apply_locked_chunk(
             end_at: None,
             limit: config.chunk_size,
         })
-        .map_err(|error| format!("read source chunk for `{}`: {error}", config.table.name))?;
+        .map_err(|error| format!("read source chunk for `{}`: {error}", config.table.name))?
+        .rows;
 
     let next_progress = if source_rows.is_empty() {
         apply_target_tail(config, progress, start_after, target)?
@@ -187,9 +188,9 @@ fn reconcile_target_pages(
                 limit: config.chunk_size,
             })
             .map_err(|error| format!("read target chunk for `{}`: {error}", config.table.name))?;
-        let page_is_complete = page.len() < config.chunk_size;
-        start_after = page.last().map(|row| row.primary_key.clone());
-        let page_changes = reconcile_target_page(&config.table, &mut source_by_key, &page);
+        let page_is_complete = !page.has_more;
+        start_after = page.rows.last().map(|row| row.primary_key.clone());
+        let page_changes = reconcile_target_page(&config.table, &mut source_by_key, &page.rows);
         delete_target_only_rows(&config.table.name, target, &page_changes.deletes)?;
         changes.deletes += page_changes.deletes.len();
         changes.updates.extend(page_changes.updates);
@@ -246,6 +247,7 @@ fn apply_target_tail(
         })
         .map_err(|error| format!("read target tail for `{}`: {error}", config.table.name))?;
     let primary_keys = target_rows
+        .rows
         .iter()
         .map(|row| row.primary_key.clone())
         .collect::<Vec<_>>();
@@ -258,9 +260,9 @@ fn apply_target_tail(
         })?;
     }
 
-    progress.complete = target_rows.len() < config.chunk_size;
+    progress.complete = !target_rows.has_more;
     progress.chunks += 1;
-    progress.deletes += target_rows.len() as u64;
+    progress.deletes += target_rows.rows.len() as u64;
     Ok(progress)
 }
 

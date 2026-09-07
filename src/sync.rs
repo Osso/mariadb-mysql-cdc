@@ -17,7 +17,7 @@ pub(crate) use fk_orphan_repair::run_fk_orphan_repair_command;
 pub(crate) use model::SyncChunkProgress;
 #[cfg(test)]
 pub(crate) use model::{
-    SyncChunkConfig, SyncChunkProgressStore, SyncChunkReadRequest, SyncChunkSource,
+    SyncChunkConfig, SyncChunkPage, SyncChunkProgressStore, SyncChunkReadRequest, SyncChunkSource,
     SyncChunkTargetSession, SyncMutationFailure, SyncPrimaryKeyOrdering, SyncProgressRow,
     SyncProgressStatus, SyncRunProgressStore, SyncStage, SyncTable, SyncUniqueIndex,
     SyncUniqueOwnerAction, SyncUniqueOwnerConflict,
