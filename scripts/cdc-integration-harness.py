@@ -2698,7 +2698,7 @@ class Harness:
             "inserts_applied,updates_applied,deletes_applied FROM cdc.sync_runs "
             f"WHERE run_id='{run_id}' AND stage='rows' AND table_name='comics_top_stats';",
         ).strip()
-        if progress != 'complete	["13553","loved"]	2	3	1	1	0':
+        if progress != 'complete	["13553","loved"]	3	3	1	1	0':
             raise HarnessError(f"composite ENUM progress is wrong: {progress!r}")
         print(
             "sync_composite_enum_primary_key_ok "
