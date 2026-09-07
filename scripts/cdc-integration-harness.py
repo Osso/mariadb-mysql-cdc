@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -3794,6 +3795,28 @@ class Harness:
                     f"ALTER overlap occurred before all row stages completed: {row_before}"
                 )
 
+            paused_connection = int(
+                self.admin_query(
+                    self.target,
+                    "SELECT PROCESSLIST_ID FROM performance_schema.threads "
+                    f"WHERE PROCESSLIST_USER='{SYNC_TARGET_USER}' "
+                    f"AND PROCESSLIST_INFO LIKE 'ALTER TABLE `{independent}`%';",
+                ).strip()
+            )
+            process.send_signal(signal.SIGSTOP)
+            pause_deadline = time.monotonic() + 10
+            while True:
+                client_status = Path(f"/proc/{process.pid}/status").read_text()
+                client_state = next(
+                    line
+                    for line in client_status.splitlines()
+                    if line.startswith("State:")
+                )
+                if "T (stopped)" in client_state:
+                    break
+                if time.monotonic() >= pause_deadline:
+                    raise HarnessError(f"client did not stop: {client_state}")
+                time.sleep(0.05)
             self.release_schema_metadata_blocker(blockers.pop(independent))
             independent_constraint = f"{independent}\tCHECK\t{independent}_positive"
             constraint_count_sql = (
@@ -3802,6 +3825,24 @@ class Harness:
                 "AND CONSTRAINT_TYPE='CHECK';"
             )
             self.wait_for_schema_fixture(constraint_count_sql, "1", process, log_path)
+            self.wait_for_schema_fixture(
+                "SELECT PROCESSLIST_COMMAND FROM performance_schema.threads "
+                f"WHERE PROCESSLIST_ID={paused_connection};",
+                "Sleep",
+                process,
+                log_path,
+            )
+            client_state = next(
+                line
+                for line in Path(f"/proc/{process.pid}/status").read_text().splitlines()
+                if line.startswith("State:")
+            )
+            if "T (stopped)" not in client_state:
+                raise HarnessError(f"client resumed unexpectedly: {client_state}")
+            print(
+                f"schema_paused_handoff pid={process.pid} client_state={client_state!r} "
+                f"connection={paused_connection} server_command=Sleep constraint={independent_constraint!r}"
+            )
             self.wait_for_schema_fixture(pending_sql, parent, process, log_path)
             # A free worker must not launch the child before its blocked parent finishes.
             child_submissions = self.admin_query(
