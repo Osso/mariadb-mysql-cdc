@@ -752,8 +752,8 @@ impl ByteBoundedRowCollector {
 
     fn finish(self, has_more: bool) -> SyncChunkPage {
         SyncChunkPage {
+            has_more: has_more || self.rows.len() == self.row_limit,
             rows: self.rows,
-            has_more,
         }
     }
 }
