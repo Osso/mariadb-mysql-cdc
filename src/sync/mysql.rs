@@ -690,16 +690,24 @@ fn query_sync_page_rows(
         let row = row.map_err(|error| format!("{endpoint} mysql row read failed: {error}"))?;
         let decoded = decode_sync_row(table, mysql_row_to_strings(row))?;
         if !collector.can_retain(&decoded) {
-            while let Some(discarded) = rows.next() {
-                discarded.map_err(|error| {
-                    format!("{endpoint} mysql row read failed after byte boundary: {error}")
-                })?;
-            }
+            drain_unretained_rows(rows.by_ref(), endpoint)?;
             return Ok(collector.finish(true));
         }
         collector.retain(decoded);
     }
     Ok(collector.finish(false))
+}
+
+fn drain_unretained_rows(
+    rows: impl Iterator<Item = mysql::Result<mysql::Row>>,
+    endpoint: &str,
+) -> Result<(), String> {
+    for row in rows {
+        row.map_err(|error| {
+            format!("{endpoint} mysql row read failed after byte boundary: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 fn mysql_row_to_strings(row: mysql::Row) -> Vec<Option<String>> {
