@@ -150,6 +150,7 @@ struct RecordingTargetSession {
     pending_rows: Vec<DatabaseRow>,
     read_batches: VecDeque<Vec<DatabaseRow>>,
     honor_read_bounds: bool,
+    short_pages: bool,
     failure: Option<FailurePoint>,
     pending_audits: Vec<Event>,
     delete_attempts: usize,
@@ -163,11 +164,17 @@ impl RecordingTargetSession {
             pending_rows: rows,
             read_batches: VecDeque::new(),
             honor_read_bounds: false,
+            short_pages: false,
             failure: None,
             pending_audits: Vec::new(),
             delete_attempts: 0,
             events,
         }
+    }
+
+    fn with_short_pages(mut self) -> Self {
+        self.short_pages = true;
+        self
     }
 
     fn with_read_batches(
@@ -292,7 +299,8 @@ impl SyncChunkTargetSession for RecordingTargetSession {
             self.pending_rows.clone()
         };
         Ok(SyncChunkPage {
-            has_more: rows.len() == request.limit || !self.read_batches.is_empty(),
+            has_more: rows.len() == request.limit
+                || (self.short_pages && !self.read_batches.is_empty()),
             rows,
         })
     }
@@ -916,7 +924,8 @@ fn short_byte_limited_target_pages_preserve_the_whole_source_window() {
         [first.clone(), second.clone(), expected.clone()].concat(),
         Rc::clone(&events),
     )
-    .with_read_batches([first, second, expected.clone()]);
+    .with_read_batches([first, second, expected.clone()])
+    .with_short_pages();
     let mut progress = RecordingProgressStore::new(events);
 
     let result = sync_next_chunk(&config(10), &mut source, &mut target, &mut progress)
@@ -938,7 +947,8 @@ fn short_byte_limited_target_tail_does_not_finish_before_remaining_rows() {
         [first.clone(), second.clone()].concat(),
         Rc::clone(&events),
     )
-    .with_read_batches([first, second]);
+    .with_read_batches([first, second])
+    .with_short_pages();
     let mut progress = RecordingProgressStore::new(events);
 
     let partial = sync_next_chunk(&config(10), &mut source, &mut target, &mut progress)
