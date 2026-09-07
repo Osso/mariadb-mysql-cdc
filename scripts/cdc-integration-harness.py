@@ -2725,6 +2725,8 @@ class Harness:
         ):
             table = f"sync_enum_{suffix}_rows"
             self.seed_sync_enum_evolution(table, labels)
+            if suffix == "remove":
+                self.admin_sql(self.target, f"DELETE FROM `{table}` WHERE id=4;")
             snapshot_sql = f"SELECT id,status,status+0 FROM `{table}` ORDER BY id;"
             before = self.admin_query(self.target, snapshot_sql)
             result = self.run_sync(
