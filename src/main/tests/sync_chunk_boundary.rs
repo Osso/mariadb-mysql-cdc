@@ -898,6 +898,52 @@ fn a_short_source_chunk_requires_a_later_locked_empty_source_tail_chunk() {
 }
 
 #[test]
+fn short_byte_limited_target_pages_preserve_the_whole_source_window() {
+    let events = events();
+    let expected = vec![row("4", "four")];
+    let first = vec![row("1", "target-only-one")];
+    let second = vec![row("3", "target-only-three")];
+    let mut source = RecordingSource::new(expected.clone(), Rc::clone(&events));
+    let mut target = RecordingTargetSession::new(
+        [first.clone(), second.clone(), expected.clone()].concat(),
+        Rc::clone(&events),
+    )
+    .with_read_batches([first, second, expected.clone()]);
+    let mut progress = RecordingProgressStore::new(events);
+
+    let result = sync_next_chunk(&config(10), &mut source, &mut target, &mut progress)
+        .expect("all byte-limited pages reconciled");
+
+    assert_rows_equal(&target.visible_rows, &expected);
+    assert_eq!(result.deletes, 2);
+    assert_eq!(result.inserts, 0);
+    assert_eq!(result.last_primary_key, Some(keys(["4"])));
+}
+
+#[test]
+fn short_byte_limited_target_tail_does_not_finish_before_remaining_rows() {
+    let events = events();
+    let first = vec![row("1", "target-only-one")];
+    let second = vec![row("2", "target-only-two")];
+    let mut source = RecordingSource::scripted([Vec::new(), Vec::new()], Rc::clone(&events));
+    let mut target = RecordingTargetSession::new(
+        [first.clone(), second.clone()].concat(),
+        Rc::clone(&events),
+    )
+    .with_read_batches([first, second]);
+    let mut progress = RecordingProgressStore::new(events);
+
+    let partial = sync_next_chunk(&config(10), &mut source, &mut target, &mut progress)
+        .expect("first tail page");
+    assert!(!partial.complete);
+    let complete = sync_next_chunk(&config(10), &mut source, &mut target, &mut progress)
+        .expect("remaining tail page");
+    assert!(complete.complete);
+    assert!(target.visible_rows.is_empty());
+    assert_eq!(complete.deletes, 2);
+}
+
+#[test]
 fn dense_target_window_is_fully_reconciled_before_durable_completion() {
     let events = events();
     let expected_rows = vec![row("1", "one"), row("4", "four")];
