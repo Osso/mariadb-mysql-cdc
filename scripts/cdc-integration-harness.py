@@ -3652,9 +3652,10 @@ class Harness:
     ) -> tuple[subprocess.Popen[str], int]:
         assert self.target
         marker = f"schema_fixture_{table}"
+        sleeping_query = f"SELECT SLEEP(240),{sql_literal(marker)}"
         process = self.start_query(
             self.target,
-            f"START TRANSACTION; SELECT id FROM `{table}`; SELECT /* {marker} */ SLEEP(240);",
+            f"START TRANSACTION; SELECT id FROM `{table}`; {sleeping_query};",
             user="root",
             password=ADMIN_PASSWORD,
         )
@@ -3663,7 +3664,7 @@ class Harness:
             connection = self.admin_query(
                 self.target,
                 "SELECT PROCESSLIST_ID FROM performance_schema.threads "
-                f"WHERE PROCESSLIST_INFO LIKE 'SELECT /* {marker} */%';",
+                f"WHERE PROCESSLIST_INFO={sql_literal(sleeping_query)};",
             ).strip()
             if connection:
                 return process, int(connection)
