@@ -455,7 +455,7 @@ fn hex_bytes_parameter_value(
     column: &str,
     value: &str,
 ) -> Result<Value, String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(format!(
             "MEDIUMBLOB column `{column}` in `{}` has invalid hexadecimal value `{value}`",
             table.name
