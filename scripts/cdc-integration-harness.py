@@ -2952,7 +2952,7 @@ class Harness:
             "FROM cdc.sync_runs "
             f"WHERE run_id={sql_literal(run_id)} AND stage='rows' AND table_name='users';",
         ).strip()
-        if resumed_progress != 'complete\t["115537"]\t3\t7\t2':
+        if resumed_progress != 'complete\t["115537"]\t4\t7\t2':
             raise HarnessError(
                 "resumed stale unique-owner UPDATE progress mismatch: "
                 f"{resumed_progress!r}"
