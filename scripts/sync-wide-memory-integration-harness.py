@@ -57,6 +57,9 @@ def seed(harness: object) -> None:
                 )
     harness.admin_sql(
         harness.target,
+        "GRANT LOCK TABLES ON globalcomix.* TO 'cdc_stream'@'%';"
+        "GRANT CREATE ON cdc.* TO 'cdc_stream'@'%';"
+        "GRANT SELECT,INSERT,UPDATE ON cdc.sync_runs TO 'cdc_stream'@'%';"
         "DELETE FROM memory_rows_peer WHERE id=30005; "
         f"INSERT INTO memory_rows_peer VALUES(30006,{body_expression('30006', 'extra')},'wide');",
     )
