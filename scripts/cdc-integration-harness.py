@@ -3119,7 +3119,7 @@ class Harness:
         schema = (
             f"DROP TABLE IF EXISTS {table}; "
             f"CREATE TABLE {table} ("
-            "id INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "id CHAR(3) NOT NULL PRIMARY KEY, "
             "token VARCHAR(64) NOT NULL, "
             "page VARCHAR(64) NOT NULL, "
             "payload VARCHAR(64) NOT NULL, "
@@ -3129,12 +3129,17 @@ class Harness:
         for endpoint in (self.source, self.target):
             self.admin_sql(endpoint, schema)
         source_rows = [
-            (row_id, f"token-{row_id:03}", f"page-{row_id:03}", f"payload-{row_id:03}")
+            (
+                f"{row_id:03}",
+                f"token-{row_id:03}",
+                f"page-{row_id:03}",
+                f"payload-{row_id:03}",
+            )
             for row_id in range(1, 131)
         ]
-        source_rows.append((200, "token-200", "page-200", "payload-200"))
+        source_rows.append(("200", "token-200", "page-200", "payload-200"))
         values = ",".join(
-            f"({row_id},{sql_literal(token)},{sql_literal(page)},{sql_literal(payload)})"
+            f"({sql_literal(row_id)},{sql_literal(token)},{sql_literal(page)},{sql_literal(payload)})"
             for row_id, token, page, payload in source_rows
         )
         self.admin_sql(self.source, f"INSERT INTO {table} VALUES {values};")
