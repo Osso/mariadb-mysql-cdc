@@ -51,6 +51,8 @@ SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
     ScenarioSpec("sync-tls", True),
     ScenarioSpec("sync-composite-enum-primary-key", True),
+    ScenarioSpec("sync-enum-append", True),
+    ScenarioSpec("sync-enum-incompatible", True),
     ScenarioSpec("sync-fk-parent-insert", True),
     ScenarioSpec("sync-fk-parent-update", True),
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
@@ -2646,6 +2648,106 @@ class Harness:
             "cdc_schema_create_only=true"
         )
 
+    def seed_sync_enum_evolution(self, table: str, source_labels: list[str]) -> None:
+        assert self.source and self.target
+        original = ["success_with_facts", "success_empty", "excluded", "failed"]
+        for endpoint, labels, collation in (
+            (self.source, source_labels, "utf8mb4_uca1400_ai_ci"),
+            (self.target, original, "utf8mb4_0900_ai_ci"),
+        ):
+            declaration = ",".join(sql_literal(label) for label in labels)
+            self.admin_sql(
+                endpoint,
+                f"CREATE TABLE `{table}` (id INT PRIMARY KEY, "
+                f"status ENUM({declaration}) NOT NULL) "
+                f"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE={collation};",
+            )
+            values = ",".join(
+                f"({index},{sql_literal(label)})"
+                for index, label in enumerate(labels[:4], 1)
+            )
+            self.admin_sql(endpoint, f"INSERT INTO `{table}` VALUES {values};")
+
+    def run_sync_enum_append(self) -> None:
+        assert self.source and self.target
+        table = "sync_enum_append_rows"
+        run_id = "sync-enum-append"
+        labels = ["success_with_facts", "success_empty", "excluded", "failed", "stale"]
+        self.seed_sync_enum_evolution(table, labels)
+        result = self.run_sync(tables=[table], run_id=run_id, chunk_size=2)
+        require_success(result, "append ENUM label through staged sync")
+        snapshot_sql = f"SELECT id,status,status+0 FROM `{table}` ORDER BY id;"
+        expected = "\n".join(
+            f"{i}\t{label}\t{i}" for i, label in enumerate(labels[:4], 1)
+        )
+        if self.admin_query(self.target, snapshot_sql).strip() != expected:
+            raise HarnessError("ENUM append changed original labels or ordinals")
+        progress_sql = (
+            "SELECT stage,status,last_primary_key_json,chunks,rows_scanned,updated_at "
+            f"FROM cdc.sync_runs WHERE run_id={sql_literal(run_id)} ORDER BY stage;"
+        )
+        before = self.admin_query(self.target, progress_sql)
+        stages = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND status='complete';",
+        ).strip()
+        if stages != "3":
+            raise HarnessError(f"ENUM append did not complete all stages: {stages}")
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, f"INSERT INTO `{table}` VALUES (5,'stale');")
+            if (
+                self.admin_query(
+                    endpoint, f"SELECT status,status+0 FROM `{table}` WHERE id=5;"
+                ).strip()
+                != "stale\t5"
+            ):
+                raise HarnessError(
+                    "appended ENUM label is not writable with ordinal five"
+                )
+        resumed = self.run_sync(tables=[table], run_id=run_id, chunk_size=2)
+        require_success(resumed, "same-run ENUM append resume")
+        if self.admin_query(self.target, progress_sql) != before:
+            raise HarnessError("same-run ENUM append resume rewrote completed progress")
+        expected += "\n5\tstale\t5"
+        if self.admin_query(self.target, snapshot_sql).strip() != expected:
+            raise HarnessError("same-run ENUM append resume changed stored labels")
+        print(
+            "sync_enum_append_ok original_ordinals=4 appended_ordinal=5 stages=3 progress_preserved=true"
+        )
+
+    def run_sync_enum_incompatible(self) -> None:
+        assert self.target
+        original = ["success_with_facts", "success_empty", "excluded", "failed"]
+        for suffix, labels in (
+            ("reorder", [original[1], original[0], *original[2:]]),
+            ("remove", original[:3]),
+        ):
+            table = f"sync_enum_{suffix}_rows"
+            self.seed_sync_enum_evolution(table, labels)
+            snapshot_sql = f"SELECT id,status,status+0 FROM `{table}` ORDER BY id;"
+            before = self.admin_query(self.target, snapshot_sql)
+            result = self.run_sync(
+                tables=[table], run_id=f"sync-enum-{suffix}", chunk_size=2
+            )
+            if result.returncode == 0:
+                raise HarnessError(f"incompatible ENUM {suffix} unexpectedly succeeded")
+            if self.admin_query(self.target, snapshot_sql) != before:
+                raise HarnessError(f"incompatible ENUM {suffix} mutated target rows")
+            self.admin_sql(self.target, f"INSERT INTO `{table}` VALUES (10,'failed');")
+            if (
+                self.admin_query(
+                    self.target, f"SELECT status,status+0 FROM `{table}` WHERE id=10;"
+                ).strip()
+                != "failed\t4"
+            ):
+                raise HarnessError(
+                    f"incompatible ENUM {suffix} changed target declaration"
+                )
+        print(
+            "sync_enum_incompatible_ok reorder=refused remove=refused target_unchanged=true"
+        )
+
     def run_sync_composite_enum_primary_key(self) -> None:
         assert self.source and self.target
         create_table = (
@@ -3938,6 +4040,10 @@ class Harness:
             self.run_strict_secondary_btree()
         elif scenario == "sync-tls":
             self.run_sync_tls()
+        elif scenario == "sync-enum-append":
+            self.run_sync_enum_append()
+        elif scenario == "sync-enum-incompatible":
+            self.run_sync_enum_incompatible()
         elif scenario == "sync-composite-enum-primary-key":
             self.run_sync_composite_enum_primary_key()
         elif scenario == "sync-fk-parent-insert":
