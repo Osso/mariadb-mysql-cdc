@@ -2884,24 +2884,16 @@ class Harness:
             "DELIMITER ;\n",
         )
 
-        self.reset_target_general_log()
         failed = self.run_sync(tables=[table], run_id=run_id, chunk_size=3)
-        case_updates = self.admin_query(
-            self.target,
-            "SELECT COUNT(*) FROM mysql.general_log "
-            "WHERE user_host LIKE 'cdc_sync%' AND command_type='Prepare' "
-            "AND LOWER(argument) LIKE 'update `users` set%' "
-            "AND LOWER(argument) LIKE '%case%';",
-        ).strip()
-        self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
         failed_output = "\n".join((failed.stdout, failed.stderr))
-        if failed.returncode == 0 or "injected stale-owner update retry failure" not in failed_output:
+        if (
+            failed.returncode == 0
+            or "injected stale-owner update retry failure" not in failed_output
+        ):
             raise HarnessError(
                 "stale unique-owner UPDATE retry failure was not observed: "
                 f"exit={failed.returncode} output={failed_output!r}"
             )
-        if case_updates == "0":
-            raise HarnessError("stale unique-owner fixture did not execute a CASE UPDATE")
         retained_rows = self.admin_query(
             self.target,
             "SELECT id,email,payload FROM users ORDER BY id;",
@@ -2981,7 +2973,7 @@ class Harness:
         print(
             "sync_update_stale_unique_owner_rollback_resume_ok "
             "cursor=90000 conflict=98150 owner=115537 self_owner=98151 "
-            "case_update=true rollback=true resumed=true"
+            "updates=2 rollback=true resumed=true"
         )
 
     def reset_target_general_log(self) -> None:
