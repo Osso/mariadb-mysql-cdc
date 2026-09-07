@@ -1,6 +1,7 @@
 use crate::database_row::DatabaseRow;
 pub(crate) use crate::primary_key_ordering::PrimaryKeyOrdering as SyncPrimaryKeyOrdering;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct SyncTable {
@@ -10,6 +11,10 @@ pub(crate) struct SyncTable {
     pub(crate) columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) bit_columns: Vec<String>,
+    #[serde(skip)]
+    pub(crate) enum_columns: BTreeMap<String, Vec<String>>,
+    #[serde(skip)]
+    pub(crate) mediumblob_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

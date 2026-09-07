@@ -314,6 +314,8 @@ fn sync_table(name: &str, primary_key: &[&str]) -> SyncTable {
             .collect(),
         columns,
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 

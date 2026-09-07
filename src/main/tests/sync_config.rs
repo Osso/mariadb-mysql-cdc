@@ -1,8 +1,14 @@
+use crate::database_row::DatabaseRow;
 use crate::inventory::{ColumnInventory, GeneratedColumn, TableInventory};
 use crate::sync::{
-    SyncConfig, SyncPrimaryKeyOrdering, SyncTable, build_sync_run_identity,
-    sync_table_from_inventory, validate_sync_config,
+    SyncConfig, SyncPrimaryKeyOrdering, SyncTable, build_exact_primary_key_select_statement,
+    build_strict_insert_statement, build_strict_update_rows_statement, build_sync_run_identity,
+    build_sync_select_sql,
+    build_unique_owner_select_statement, decode_sync_rows, sync_table_from_inventory,
+    validate_sync_config,
 };
+use mysql::Value;
+use std::collections::BTreeMap;
 
 #[test]
 fn sync_config_preserves_exact_run_id_across_invocation_changes() {
@@ -175,6 +181,11 @@ fn sync_table_conversion_preserves_order_excludes_generated_columns_and_parses_e
             ],
             columns: strings(["id", "state", "title"]),
             bit_columns: Vec::new(),
+            enum_columns: BTreeMap::from([(
+                "state".to_string(),
+                strings(["draft", "live", "archived"]),
+            )]),
+            mediumblob_columns: Vec::new(),
         }
     );
 }
@@ -202,6 +213,143 @@ fn sync_table_conversion_marks_non_generated_bit_columns() {
     let sync_table = sync_table_from_inventory(&table).expect("sync table");
     assert_eq!(sync_table.columns, strings(["id", "premium_only", "flags"]));
     assert_eq!(sync_table.bit_columns, strings(["premium_only", "flags"]));
+}
+
+#[test]
+fn sync_table_conversion_projects_and_binds_enum_ordinals_and_mediumblob_bytes() {
+    let table = inventory_table(
+        vec!["id", "state"],
+        vec![
+            column("id", 1, "bigint", None),
+            column("state", 2, "enum('draft','live')", None),
+            column("status", 3, "enum('','0','live')", None),
+            column("args", 4, "mediumblob", None),
+        ],
+    );
+    let table = sync_table_from_inventory(&table).expect("sync table");
+
+    assert_eq!(
+        build_sync_select_sql(
+            &table,
+            &crate::sync::SyncChunkReadRequest {
+                start_after: None,
+                end_at: None,
+                limit: 3,
+            },
+        ),
+        "SELECT `id`, CAST(`state` AS UNSIGNED) AS `state`, CAST(`status` AS UNSIGNED) AS `status`, HEX(`args`) AS `args` FROM `episodes` ORDER BY `id`, FIELD(`state`, 'draft', 'live') LIMIT 3"
+    );
+
+    let decoded = decode_sync_rows(
+        &table,
+        vec![
+            vec![
+                Some("7".to_string()),
+                Some("2".to_string()),
+                Some("0".to_string()),
+                Some("00FF".to_string()),
+            ],
+            vec![
+                Some("8".to_string()),
+                Some("1".to_string()),
+                Some("1".to_string()),
+                Some(String::new()),
+            ],
+            vec![
+                Some("9".to_string()),
+                Some("2".to_string()),
+                Some("2".to_string()),
+                None,
+            ],
+        ],
+    )
+    .expect("decoded rows");
+
+    assert_eq!(decoded[0].primary_key, strings(["7", "live"]));
+    assert_eq!(decoded[0].values["state"], Some("2".to_string()));
+    assert_eq!(decoded[0].values["status"], Some("0".to_string()));
+    assert_eq!(decoded[0].values["args"], Some("00FF".to_string()));
+    assert_eq!(decoded[1].values["status"], Some("1".to_string()));
+    assert_eq!(decoded[1].values["args"], Some(String::new()));
+    assert_eq!(decoded[2].values["status"], Some("2".to_string()));
+    assert_eq!(decoded[2].values["args"], None);
+
+    let insert = build_strict_insert_statement(&table, &decoded).expect("strict insert");
+    assert_eq!(
+        insert.params,
+        vec![
+            Value::Bytes(b"7".to_vec()),
+            Value::UInt(2),
+            Value::UInt(0),
+            Value::Bytes(vec![0, 255]),
+            Value::Bytes(b"8".to_vec()),
+            Value::UInt(1),
+            Value::UInt(1),
+            Value::Bytes(Vec::new()),
+            Value::Bytes(b"9".to_vec()),
+            Value::UInt(2),
+            Value::UInt(2),
+            Value::NULL,
+        ]
+    );
+
+    let update = build_strict_update_rows_statement(&table, &decoded[..1])
+        .expect("strict update");
+    assert_eq!(
+        update.params,
+        vec![
+            Value::Bytes(b"7".to_vec()),
+            Value::UInt(2),
+            Value::UInt(0),
+            Value::Bytes(b"7".to_vec()),
+            Value::UInt(2),
+            Value::Bytes(vec![0, 255]),
+            Value::Bytes(b"7".to_vec()),
+            Value::UInt(2),
+        ]
+    );
+
+    let exact = build_exact_primary_key_select_statement(&table, &decoded[0].primary_key)
+        .expect("exact enum primary key");
+    assert_eq!(exact.params, vec![Value::Bytes(b"7".to_vec()), Value::UInt(2)]);
+    assert!(exact.sql.starts_with("SELECT `id`, CAST(`state` AS UNSIGNED) AS `state`, CAST(`status` AS UNSIGNED) AS `status`, HEX(`args`) AS `args`"));
+
+    let unique_owner = build_unique_owner_select_statement(
+        &table,
+        &crate::sync::SyncUniqueIndex {
+            name: "args_unique".to_string(),
+            columns: strings(["args"]),
+        },
+        &decoded[0],
+    )
+    .expect("blob unique owner");
+    assert_eq!(unique_owner.params, vec![Value::Bytes(vec![0, 255])]);
+    assert!(unique_owner.sql.starts_with("SELECT `id`, CAST(`state` AS UNSIGNED) AS `state`, CAST(`status` AS UNSIGNED) AS `status`, HEX(`args`) AS `args`"));
+
+    let legacy_table = SyncTable {
+        enum_columns: BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
+        ..table.clone()
+    };
+    assert_eq!(
+        build_sync_run_identity(&prefixed_run_config(), vec![table])
+            .expect("runtime enum/blob sync-v1 identity"),
+        build_sync_run_identity(&prefixed_run_config(), vec![legacy_table])
+            .expect("legacy sync-v1 identity")
+    );
+
+    let invalid_hex = DatabaseRow {
+        primary_key: strings(["10", "draft"]),
+        values: BTreeMap::from([
+            ("id".to_string(), Some("10".to_string())),
+            ("state".to_string(), Some("1".to_string())),
+            ("status".to_string(), Some("2".to_string())),
+            ("args".to_string(), Some("0".to_string())),
+        ]),
+    };
+    assert!(build_strict_insert_statement(&table, &[invalid_hex])
+        .expect_err("odd-length blob hex")
+        .contains("invalid hexadecimal"));
 }
 
 #[test]
@@ -311,6 +459,8 @@ fn sync_table(name: &str, primary_key: &str) -> SyncTable {
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: vec![primary_key.to_string()],
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 

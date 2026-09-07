@@ -404,6 +404,8 @@ fn mutation_table() -> SyncTable {
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "status", "title"]),
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 
@@ -442,6 +444,8 @@ fn wide_mutation_table(column_count: usize) -> SyncTable {
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns,
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 
@@ -454,6 +458,8 @@ fn wide_primary_key_table(column_count: usize) -> SyncTable {
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native; column_count],
         columns: primary_key.clone(),
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
         primary_key,
     }
 }

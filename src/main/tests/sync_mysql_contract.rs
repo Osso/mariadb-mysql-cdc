@@ -339,6 +339,8 @@ fn ordered_table() -> SyncTable {
         ],
         columns: strings(["series_id", "state", "title"]),
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 
@@ -349,6 +351,8 @@ fn mutation_table() -> SyncTable {
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "status", "title"]),
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 
@@ -359,6 +363,8 @@ fn bit_mutation_table() -> SyncTable {
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "premium_only", "flags", "mask", "payload"]),
         bit_columns: strings(["premium_only", "flags", "mask"]),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 
@@ -382,6 +388,8 @@ fn unique_mutation_table() -> SyncTable {
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "token", "page", "payload"]),
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 
@@ -395,6 +403,8 @@ fn composite_delete_table() -> SyncTable {
         ],
         columns: strings(["series_id", "revision", "title"]),
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 

@@ -634,6 +634,8 @@ mod tests {
                 .collect(),
             columns: strings(primary_key),
             bit_columns: Vec::new(),
+            enum_columns: std::collections::BTreeMap::new(),
+            mediumblob_columns: Vec::new(),
         }
     }
 }

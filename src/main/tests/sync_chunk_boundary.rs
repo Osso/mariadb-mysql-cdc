@@ -1418,6 +1418,8 @@ fn config(chunk_size: usize) -> SyncChunkConfig {
             primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
             columns: vec!["id".to_string(), "name".to_string()],
             bit_columns: Vec::new(),
+            enum_columns: std::collections::BTreeMap::new(),
+            mediumblob_columns: Vec::new(),
         },
         chunk_size,
     }
@@ -1438,6 +1440,8 @@ fn unique_config(chunk_size: usize) -> SyncChunkConfig {
                 "payload".to_string(),
             ],
             bit_columns: Vec::new(),
+            enum_columns: std::collections::BTreeMap::new(),
+            mediumblob_columns: Vec::new(),
         },
         chunk_size,
     }

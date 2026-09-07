@@ -330,6 +330,8 @@ fn table(name: &str) -> SyncTable {
         primary_key_ordering: vec![SyncPrimaryKeyOrdering::Native],
         columns: strings(["id", "title"]),
         bit_columns: Vec::new(),
+        enum_columns: std::collections::BTreeMap::new(),
+        mediumblob_columns: Vec::new(),
     }
 }
 

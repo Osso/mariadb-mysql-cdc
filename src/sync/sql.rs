@@ -375,11 +375,35 @@ fn primary_key_params(
         .primary_key
         .iter()
         .zip(primary_key)
-        .map(|(column, value)| parameter_value(table, column, value.clone()))
+        .map(|(column, value)| primary_key_parameter_value(table, column, value))
         .collect()
 }
 
+fn primary_key_parameter_value(
+    table: &SyncTable,
+    column: &str,
+    value: &str,
+) -> Result<Value, String> {
+    let Some(labels) = table.enum_columns.get(column) else {
+        return parameter_value(table, column, value.to_string());
+    };
+    let ordinal = labels
+        .iter()
+        .position(|label| label == value)
+        .map(|index| u64::try_from(index + 1).expect("ENUM label index fits u64"))
+        .ok_or_else(|| {
+            format!(
+                "ENUM primary-key column `{column}` in `{}` has undeclared label `{value}`",
+                table.name
+            )
+        })?;
+    Ok(Value::UInt(ordinal))
+}
+
 fn parameter_value(table: &SyncTable, column: &str, value: String) -> Result<Value, String> {
+    if table.enum_columns.contains_key(column) {
+        return enum_ordinal_parameter_value(table, column, &value);
+    }
     if table
         .bit_columns
         .iter()
@@ -392,7 +416,78 @@ fn parameter_value(table: &SyncTable, column: &str, value: String) -> Result<Val
             )
         });
     }
+    if table
+        .mediumblob_columns
+        .iter()
+        .any(|blob_column| blob_column == column)
+    {
+        return hex_bytes_parameter_value(table, column, &value);
+    }
     Ok(string_param(value))
+}
+
+fn enum_ordinal_parameter_value(
+    table: &SyncTable,
+    column: &str,
+    value: &str,
+) -> Result<Value, String> {
+    let labels = table
+        .enum_columns
+        .get(column)
+        .expect("ENUM metadata exists for an ENUM column");
+    let ordinal = value.parse::<u64>().map_err(|error| {
+        format!(
+            "ENUM column `{column}` in `{}` has invalid internal index `{value}`: {error}",
+            table.name
+        )
+    })?;
+    if ordinal > labels.len() as u64 {
+        return Err(format!(
+            "ENUM column `{column}` in `{}` has internal index `{ordinal}` outside its declaration",
+            table.name
+        ));
+    }
+    Ok(Value::UInt(ordinal))
+}
+
+fn hex_bytes_parameter_value(
+    table: &SyncTable,
+    column: &str,
+    value: &str,
+) -> Result<Value, String> {
+    if value.len() % 2 != 0 {
+        return Err(format!(
+            "MEDIUMBLOB column `{column}` in `{}` has invalid hexadecimal value `{value}`",
+            table.name
+        ));
+    }
+    let bytes = value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(decode_hex_byte)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|()| {
+            format!(
+                "MEDIUMBLOB column `{column}` in `{}` has invalid hexadecimal value `{value}`",
+                table.name
+            )
+        })?;
+    Ok(Value::Bytes(bytes))
+}
+
+fn decode_hex_byte(pair: &[u8]) -> Result<u8, ()> {
+    let high = decode_hex_digit(pair[0])?;
+    let low = decode_hex_digit(pair[1])?;
+    Ok(high << 4 | low)
+}
+
+fn decode_hex_digit(value: u8) -> Result<u8, ()> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(()),
+    }
 }
 
 fn row_placeholders(column_count: usize, row_count: usize) -> String {
@@ -405,12 +500,14 @@ fn sync_select_columns(table: &SyncTable) -> String {
         .columns
         .iter()
         .map(|column| {
-            if table.bit_columns.contains(column) {
+            if table.enum_columns.contains_key(column) || table.bit_columns.contains(column) {
                 format!(
                     "CAST({} AS UNSIGNED) AS {}",
                     quote_ident(column),
                     quote_ident(column)
                 )
+            } else if table.mediumblob_columns.contains(column) {
+                format!("HEX({}) AS {}", quote_ident(column), quote_ident(column))
             } else {
                 quote_ident(column)
             }

@@ -511,7 +511,7 @@ fn decode_sync_row(table: &SyncTable, fields: Vec<Option<String>>) -> Result<Dat
     let primary_key = table
         .primary_key
         .iter()
-        .map(|column| required_primary_key_value(column, &values))
+        .map(|column| required_primary_key_value(table, column, &values))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(DatabaseRow {
         primary_key,
@@ -520,15 +520,37 @@ fn decode_sync_row(table: &SyncTable, fields: Vec<Option<String>>) -> Result<Dat
 }
 
 fn required_primary_key_value(
+    table: &SyncTable,
     column: &str,
     values: &BTreeMap<String, Option<String>>,
 ) -> Result<String, String> {
     let value = values
         .get(column)
         .ok_or_else(|| format!("primary-key column `{column}` was not selected"))?;
-    value
-        .clone()
-        .ok_or_else(|| format!("primary-key column `{column}` was NULL"))
+    let value = value
+        .as_deref()
+        .ok_or_else(|| format!("primary-key column `{column}` was NULL"))?;
+    let Some(labels) = table.enum_columns.get(column) else {
+        return Ok(value.to_string());
+    };
+    let ordinal = value.parse::<usize>().map_err(|error| {
+        format!(
+            "ENUM primary-key column `{column}` in `{}` has invalid internal index `{value}`: {error}",
+            table.name
+        )
+    })?;
+    if ordinal == 0 {
+        return Err(format!(
+            "ENUM primary-key column `{column}` in `{}` has internal index 0 without a label cursor",
+            table.name
+        ));
+    }
+    labels.get(ordinal - 1).cloned().ok_or_else(|| {
+        format!(
+            "ENUM primary-key column `{column}` in `{}` has internal index `{ordinal}` outside its declaration",
+            table.name
+        )
+    })
 }
 
 pub(crate) fn strict_insert_batch_capacity(table: &SyncTable) -> usize {

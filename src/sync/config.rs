@@ -4,7 +4,7 @@ use crate::live::TargetMySqlConfig;
 use crate::mysql_config::MySqlConnectionConfig;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SYNC_RUN_ID_V1_DOMAIN: &[u8] = b"mariadb-mysql-cdc:sync-run-id:v1\0";
 const MAX_SYNC_RUN_ID_BYTES: usize = 128;
@@ -81,6 +81,22 @@ pub(crate) fn sync_table_from_inventory(table: &TableInventory) -> Result<SyncTa
         .filter(|column| column.generated.is_none() && column.data_type.eq_ignore_ascii_case("bit"))
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
+    let enum_columns = table
+        .columns
+        .iter()
+        .filter_map(|column| {
+            crate::sql_type::parse_enum_column_type(&column.column_type)
+                .map(|labels| (column.name.clone(), labels))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mediumblob_columns = table
+        .columns
+        .iter()
+        .filter(|column| {
+            column.generated.is_none() && column.data_type.eq_ignore_ascii_case("mediumblob")
+        })
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
     let primary_key_ordering = table
         .primary_key
         .iter()
@@ -101,6 +117,8 @@ pub(crate) fn sync_table_from_inventory(table: &TableInventory) -> Result<SyncTa
         primary_key_ordering,
         columns,
         bit_columns,
+        enum_columns,
+        mediumblob_columns,
     })
 }
 

@@ -24,7 +24,7 @@ the run ID. Operator usage belongs in the sync runbook.
 
 ### Source scope and execution
 
-- [x] Convert the selected current source inventory into deterministic table definitions, including writable `BIT` metadata while omitting empty metadata from backward-compatible `sync-v1` ID serialization.
+- [x] Convert the selected current source inventory into deterministic table definitions, including writable `BIT`, `ENUM`, and `MEDIUMBLOB` runtime metadata while omitting runtime metadata from backward-compatible `sync-v1` ID serialization.
 - [x] Reject an empty or duplicated selection and reject a selected child whose same-schema source parent is outside the current selection.
 - [x] Invoke bounded row workers between the two schema stages.
 - [x] Expose the staged orchestration through one `sync` CLI. Removed progress, standalone schema, drift-check, catchup-snapshot, sync-table, and repair-drift command names are rejected as unknown commands rather than aliased.
@@ -47,6 +47,8 @@ the run ID. Operator usage belongs in the sync runbook.
 - [x] Verify each owner mutation and intended source row, then retry only the failed insert batch plus untouched remaining insert rows. Repeated conflict keys fail rather than retry indefinitely; any repair, retry, verification, or commit failure rolls back the locked chunk and leaves durable progress unchanged.
 - [x] Commit the target chunk before persisting progress. Emit secret-free reconciliation audits only after successful commit; discard pending audits on rollback or commit failure. Keep counters tied to planned source operations without changing live CDC duplicate handling.
 - [x] Round-trip every writable `BIT` column as an unsigned integer for source/target reads and target mutation bindings, preserving `NULL` and values through `BIT(64)` for strict inserts and CASE updates.
+- [x] Round-trip every writable `ENUM` column by internal index and bind it as an unsigned integer, preserving index zero, declared empty labels, numeric labels, and `NULL`; enum primary-key cursors retain declaration labels.
+- [x] Round-trip every writable `MEDIUMBLOB` column through lossless hexadecimal read projection and strict byte bindings, preserving `NULL`, empty values, and invalid UTF-8.
 
 ### Connection construction retry
 
@@ -75,7 +77,8 @@ the run ID. Operator usage belongs in the sync runbook.
 - `src/sync/orchestrate.rs` — stage ordering, run/stage/table progress validation, resumable stage persistence, source-scope selection, and production executor wiring.
 - `src/sync/run.rs` — bounded deterministic row-table execution.
 - `src/sync/chunk.rs` — locked source/target chunk mutation and run/table progress boundary.
-- `src/sync/mysql.rs` — source, locked target-session, and separate progress-store adapters.
+- `src/sync/mysql.rs` — source, locked target-session, separate progress-store adapters, and enum primary-key cursor reconstruction.
+- `src/sync/sql.rs` — metadata-aware projections and strict bindings for `BIT`, `ENUM`, and `MEDIUMBLOB` columns.
 - `src/sync/progress.rs` — `cdc.sync_runs` SQL plus legacy-column-neutral progress serialization.
 - `src/sync_schema.rs` — source evidence reads plus prerequisite and final schema-stage planning/execution.
 - `src/table_catalog.rs` — catalog validation and one-run `SyncConfig` mapping for `sync-catalog`.
@@ -86,7 +89,7 @@ the run ID. Operator usage belongs in the sync runbook.
 
 - `tests/sync_cli.rs` — unified help/dispatch, obsolete-command rejection, accepted options, and obsolete authorization-flag rejection.
 - `src/main/tests/sync_cli_config.rs` — endpoint, scope, defaults, runtime options, and exclusive run-ID parsing.
-- `src/main/tests/sync_config.rs` — exact-ID preservation, backward-compatible `sync-v1` prefix derivation, current-invocation validation, and source-inventory table conversion.
+- `src/main/tests/sync_config.rs` — exact-ID preservation, runtime metadata-neutral `sync-v1` derivation, source-inventory conversion, and audited `ENUM`/`MEDIUMBLOB` SQL and binding fidelity.
 - `src/main/tests/sync_orchestrator.rs` — stage order, changed-invocation resume, omitted/new/complete table behavior, run/stage/table validation, error persistence, and row-failure cutoff.
 - `src/main/tests/sync_runner.rs` — bounded deterministic table execution, current parallelism/scope validation, completion behavior, and no retry of row-chunk failures.
 - `src/main/tests/sync_chunk_boundary.rs` — locked chunk ordering, bounded target-page reconciliation, changed-chunk-size resume, checkpoint boundary, strict secondary-unique owner repair, rollback, retry, verification, and post-commit audit behavior.
