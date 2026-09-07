@@ -3857,6 +3857,21 @@ mod tests {
     }
 
     #[test]
+    fn enum_append_preserves_existing_ordinals_without_data_preflight() {
+        let mut target = column("status", "enum('success','failed')", false);
+        target.character_set = Some("utf8mb4".to_string());
+        target.collation = Some("utf8mb4_0900_ai_ci".to_string());
+        let mut source = target.clone();
+        source.column_type = "enum('success','failed','stale')".to_string();
+        source.collation = Some("utf8mb4_uca1400_ai_ci".to_string());
+        assert!(!column_change_requires_data_preflight(&source, &target));
+        source.column_type = "enum('failed','success','stale')".to_string();
+        assert!(column_change_requires_data_preflight(&source, &target));
+        source.column_type = "enum('success')".to_string();
+        assert!(column_change_requires_data_preflight(&source, &target));
+    }
+
+    #[test]
     fn an_equivalent_collation_needs_no_data_preflight() {
         let mut source = column("alignment", "varchar(16)", true);
         source.character_set = Some("utf8mb4".to_string());
