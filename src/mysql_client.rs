@@ -110,12 +110,6 @@ pub(crate) fn extend_session_wait_timeout(
 }
 
 impl PersistentMySqlSource {
-    pub(crate) fn from_sync_connection(conn: Conn) -> Self {
-        Self {
-            conn: RefCell::new(conn),
-        }
-    }
-
     pub fn new(config: &MySqlConnectionConfig) -> Result<Self, MySqlSourceError> {
         Self::new_with_tls_ca(config, None)
     }
@@ -167,15 +161,6 @@ impl PersistentMySqlSource {
         sql: &str,
     ) -> Result<Vec<Vec<Option<String>>>, MySqlSourceError> {
         self.query_and_decode_rows(|conn| conn.query(sql))
-    }
-
-    pub(crate) fn query_statement_rows_as_strings(
-        &self,
-        statement: &SqlStatement,
-    ) -> Result<Vec<Vec<Option<String>>>, MySqlSourceError> {
-        self.query_and_decode_rows(|conn| {
-            conn.exec(&statement.sql, Params::Positional(statement.params.clone()))
-        })
     }
 
     fn query_and_decode_rows(
