@@ -64,7 +64,7 @@ the run ID. Operator usage belongs in the sync runbook.
 ### Schema and progress contracts
 
 - [x] Reuse the prerequisite schema stage that removes blocking target constraints and converges structure before row work.
-- [x] Allow source ENUM declarations to append labels after every existing target label in unchanged order, with unchanged charset, equivalent mapped collation, generated expression and compatible nullability. Preserve existing ordinals; reordered or removed labels still require explicit conversion proof.
+- [x] Automatically converge only source ENUM declarations that append labels after every existing target label in unchanged order, with unchanged charset, equivalent mapped collation, generated expression, and compatible nullability. Preserve existing ordinals; reject reordered or removed labels rather than broadening conversion.
 - [x] Reuse the final-constraint stage after row work and fail closed on remaining structural drift.
 - [ ] Prove the complete production MySQL path, including source evidence reads, target schema stages, row workers, and `cdc.sync_runs` persistence against disposable endpoints.
 - [x] Remove legacy snapshot, table-sync, repair-drift, run-spec migration, and obsolete progress modules; no fallback engine remains.
