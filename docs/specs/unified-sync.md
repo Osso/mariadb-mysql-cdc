@@ -50,6 +50,8 @@ the run ID. Operator usage belongs in the sync runbook.
 - [x] Round-trip every writable `ENUM` column by internal index and bind it as an unsigned integer, preserving index zero, declared empty labels, numeric labels, and `NULL`; enum primary-key cursors retain declaration labels.
 - [x] Round-trip every writable `MEDIUMBLOB` column through lossless hexadecimal read projection and strict byte bindings, preserving `NULL`, empty values, and invalid UTF-8.
 
+**Datatype audit status.** A disposable MariaDB-to-MySQL baseline over the 19 datatype families currently present in the source inventory passed 17 families. `ENUM` and `MEDIUMBLOB` remain the two fidelity cases under focused verification: the contracts above require `ENUM` ordinal distinction from `NULL` and labels, and byte-exact binary handling. This baseline is not a completed end-to-end GREEN result, deployment assertion, or recovery result.
+
 ### Connection construction retry
 
 - [x] Retry sync connection construction only when `mysql::Error::is_connectivity_error()` classifies the failure as connectivity-related.
