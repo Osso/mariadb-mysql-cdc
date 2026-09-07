@@ -54,6 +54,7 @@ SCENARIOS = (
     ScenarioSpec("sync-fk-parent-insert", True),
     ScenarioSpec("sync-fk-parent-update", True),
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
+    ScenarioSpec("sync-update-stale-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-wide-update", True),
     ScenarioSpec("sync-bit-values", True),
@@ -2830,6 +2831,159 @@ class Harness:
             raise HarnessError(f"child did not converge after parent displacement: {child!r}")
         print("sync_fk_parent_stale_unique_owner_ok constraints_restored=true")
 
+    def run_sync_update_stale_unique_owner_rollback_resume(self) -> None:
+        assert self.source and self.target
+        table = "users"
+        run_id = "sync-update-stale-unique-owner-rollback-resume"
+        schema = (
+            f"DROP TABLE IF EXISTS {table}; "
+            f"CREATE TABLE {table} ("
+            "id INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "email VARCHAR(64) NOT NULL, "
+            "payload VARCHAR(64) NOT NULL, "
+            "UNIQUE KEY uq_users_email (email)"
+            ") ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO users VALUES "
+            "(1, 'anchor-1@example.test', 'anchor-1'), "
+            "(2, 'anchor-2@example.test', 'anchor-2'), "
+            "(90000, 'anchor-90000@example.test', 'anchor-90000'), "
+            "(98150, 'wanted@example.test', 'source-98150'), "
+            "(98151, 'self-owned@example.test', 'source-98151'), "
+            "(98152, 'anchor-98152@example.test', 'anchor-98152'), "
+            "(115537, 'later-owner-current@example.test', 'source-115537');",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO users VALUES "
+            "(1, 'anchor-1@example.test', 'anchor-1'), "
+            "(2, 'anchor-2@example.test', 'anchor-2'), "
+            "(90000, 'anchor-90000@example.test', 'anchor-90000'), "
+            "(98150, 'old-98150@example.test', 'target-98150'), "
+            "(98151, 'self-owned@example.test', 'target-98151'), "
+            "(98152, 'anchor-98152@example.test', 'anchor-98152'), "
+            "(115537, 'wanted@example.test', 'target-stale-owner');",
+        )
+        self.admin_sql(
+            self.target,
+            "DELIMITER //\n"
+            "CREATE TRIGGER users_owner_repaired AFTER UPDATE ON users FOR EACH ROW\n"
+            "BEGIN\n"
+            "  IF NEW.id=115537 THEN SET @sync_owner_repaired=1; END IF;\n"
+            "END//\n"
+            "CREATE TRIGGER users_retry_failure BEFORE UPDATE ON users FOR EACH ROW\n"
+            "BEGIN\n"
+            "  IF NEW.id=98150 AND COALESCE(@sync_owner_repaired,0)=1 THEN\n"
+            "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected stale-owner update retry failure';\n"
+            "  END IF;\n"
+            "END//\n"
+            "DELIMITER ;\n",
+        )
+
+        self.reset_target_general_log()
+        failed = self.run_sync(tables=[table], run_id=run_id, chunk_size=3)
+        case_updates = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM mysql.general_log "
+            "WHERE user_host LIKE 'cdc_sync%' AND command_type='Prepare' "
+            "AND LOWER(argument) LIKE 'update `users` set%' "
+            "AND LOWER(argument) LIKE '%case%';",
+        ).strip()
+        self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
+        failed_output = "\n".join((failed.stdout, failed.stderr))
+        if failed.returncode == 0 or "injected stale-owner update retry failure" not in failed_output:
+            raise HarnessError(
+                "stale unique-owner UPDATE retry failure was not observed: "
+                f"exit={failed.returncode} output={failed_output!r}"
+            )
+        if case_updates == "0":
+            raise HarnessError("stale unique-owner fixture did not execute a CASE UPDATE")
+        retained_rows = self.admin_query(
+            self.target,
+            "SELECT id,email,payload FROM users ORDER BY id;",
+        ).strip()
+        expected_retained_rows = (
+            "1\tanchor-1@example.test\tanchor-1\n"
+            "2\tanchor-2@example.test\tanchor-2\n"
+            "90000\tanchor-90000@example.test\tanchor-90000\n"
+            "98150\told-98150@example.test\ttarget-98150\n"
+            "98151\tself-owned@example.test\ttarget-98151\n"
+            "98152\tanchor-98152@example.test\tanchor-98152\n"
+            "115537\twanted@example.test\ttarget-stale-owner"
+        )
+        if retained_rows != expected_retained_rows:
+            raise HarnessError(
+                "failed stale unique-owner UPDATE did not roll back target rows: "
+                f"{retained_rows!r}"
+            )
+        failed_progress = self.admin_query(
+            self.target,
+            "SELECT status,last_primary_key_json,chunks,rows_scanned,inserts_applied,"
+            "updates_applied,deletes_applied,IF(last_error IS NULL,'<NULL>',last_error) "
+            "FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='rows' AND table_name='users';",
+        ).strip()
+        if failed_progress != 'running\t["90000"]\t1\t3\t0\t0\t0\t<NULL>':
+            raise HarnessError(
+                "failed stale unique-owner UPDATE did not retain only the prior page: "
+                f"{failed_progress!r}"
+            )
+        if self.sync_unique_owner_audits(failed):
+            raise HarnessError("rolled-back stale unique-owner UPDATE emitted an audit")
+
+        self.admin_sql(
+            self.target,
+            "DROP TRIGGER users_retry_failure; DROP TRIGGER users_owner_repaired;",
+        )
+        resumed = self.run_sync(tables=[table], run_id=run_id, chunk_size=3)
+        require_success(resumed, "resumed stale unique-owner UPDATE sync")
+        source_rows = self.admin_query(
+            self.source,
+            "SELECT id,email,payload FROM users ORDER BY id;",
+        ).strip()
+        target_rows = self.admin_query(
+            self.target,
+            "SELECT id,email,payload FROM users ORDER BY id;",
+        ).strip()
+        if target_rows != source_rows:
+            raise HarnessError(
+                "resumed stale unique-owner UPDATE did not converge source rows: "
+                f"source={source_rows!r} target={target_rows!r}"
+            )
+        resumed_progress = self.admin_query(
+            self.target,
+            "SELECT status,last_primary_key_json,chunks,rows_scanned,updates_applied "
+            "FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='rows' AND table_name='users';",
+        ).strip()
+        if resumed_progress != 'complete\t["115537"]\t3\t7\t2':
+            raise HarnessError(
+                "resumed stale unique-owner UPDATE progress mismatch: "
+                f"{resumed_progress!r}"
+            )
+        audits = self.sync_unique_owner_audits(resumed)
+        expected_audit = {
+            "event": "sync_unique_owner_reconciliation",
+            "table": "users",
+            "index": "uq_users_email",
+            "action": "update",
+            "intended_primary_key": ["98150"],
+            "owner_primary_key": ["115537"],
+        }
+        if audits != [expected_audit]:
+            raise HarnessError(
+                f"unexpected stale unique-owner UPDATE audits: {audits!r}"
+            )
+        print(
+            "sync_update_stale_unique_owner_rollback_resume_ok "
+            "cursor=90000 conflict=98150 owner=115537 self_owner=98151 "
+            "case_update=true rollback=true resumed=true"
+        )
+
     def reset_target_general_log(self) -> None:
         assert self.target
         self.admin_sql(
@@ -3795,6 +3949,8 @@ class Harness:
             self.run_sync_fk_parent_convergence(update_existing_child=True)
         elif scenario == "sync-fk-parent-stale-unique-owner":
             self.run_sync_fk_parent_stale_unique_owner()
+        elif scenario == "sync-update-stale-unique-owner-rollback-resume":
+            self.run_sync_update_stale_unique_owner_rollback_resume()
         elif scenario == "sync-unique-owner-rollback-resume":
             self.run_sync_unique_owner_rollback_resume()
         elif scenario == "sync-wide-update":
