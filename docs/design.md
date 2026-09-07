@@ -126,9 +126,13 @@ non-locking reads. It does not execute `FLUSH TABLES WITH READ LOCK`,
 `UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and does not keep
 a cross-table repeatable-read transaction open. The captured evidence is reused
 by one unified staged sync for every source table with run ID `recovery_id`,
-the caller-selected parallelism and `cdc.sync_runs` progress. Unified sync owns prerequisite
-schema convergence, target-WRITE-locked source-authoritative row chunks, durable
-stage/table progress, and final constraint convergence.
+the caller-selected parallelism and `cdc.sync_runs` progress. Parallelism bounds
+independent table workers in both schema stages and the row stage; per-table
+statement order, the constraint-drop barrier, and selected-parent dependencies
+remain ordered. Unified sync owns prerequisite schema convergence,
+target-WRITE-locked source-authoritative row chunks, durable stage/table progress,
+and final constraint convergence. A running recovery is not hot-reloaded after an
+image update.
 
 Each source and target keyset read retains at most 64 MiB of decoded projected
 payload and the requested row limit. A page retains one oversized row rather

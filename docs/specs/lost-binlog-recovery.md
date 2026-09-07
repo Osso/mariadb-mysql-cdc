@@ -16,7 +16,7 @@
 - [x] Acquire the same `cdc-stream:{target.database}` lease used by live streaming before recovery state changes.
 - [x] Capture the MariaDB binlog coordinate with ordinary non-locking source reads; source recovery must not require `FLUSH TABLES WITH READ LOCK`, `UNLOCK TABLES`, `LOCK TABLES`, or `RELOAD`.
 - [x] Reconcile normally committed source rows and schema evidence without a long-lived cross-table transaction or repeatable-read snapshot.
-- [x] Invoke one unified staged sync for every source-table in the captured inventory, using run ID `recovery_id`, configured `--parallelism` (default `1`), and the configured `cdc.sync_runs` progress table.
+- [x] Invoke one unified staged sync for every source-table in the captured inventory, using run ID `recovery_id`, configured `--parallelism` (default `1`) for independent schema-table and row workers, and the configured `cdc.sync_runs` progress table. Per-table statement order, the constraint-drop barrier, and selected-parent dependencies remain ordered. A running recovery is not hot-reloaded after an image update.
 - [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
 - [x] Use the unified stages for prerequisite schema convergence, target-WRITE-locked source-authoritative chunks, durable per-stage/per-table progress, and final constraint convergence.
 - [x] Set only recovery-owned source/target coordinator and sync-progress sessions to `SESSION wait_timeout=604800` before long reconciliation. This matches the seven-day recovery Job deadline; it does not change server-global timeouts, normal stream/sync sessions, CLI configuration, or reconnect behavior.

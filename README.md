@@ -225,8 +225,11 @@ is not a supported health check.
 
 The staged `sync` command is the only standalone synchronization entry point. It
 runs prerequisite schema convergence, source-authoritative locked row chunks, and
-final constraint convergence under one durable progress run ID. Schema work is not
-available as a separate `sync-schema` command; `sync-catalog`, `resync-stream`, and
+final constraint convergence under one durable progress run ID. `--parallelism`
+bounds independent table workers in both schema stages and row synchronization;
+statements within a table remain ordered, constraint drops finish before additions,
+and selected child tables wait for their parents. Schema work is not available as a
+separate `sync-schema` command; `sync-catalog`, `resync-stream`, and
 `recover-lost-binlog` route through the same staged engine.
 
 Before a potentially lossy column change, the prerequisite schema stage checks
@@ -411,9 +414,12 @@ source evidence set, a fixed `resync-stream:<source_identity>` run identity, and
 target-inventory drift scan.
 `recover-lost-binlog` now uses the same staged engine with one captured source
 evidence set, exact `recovery_id` progress across every source table, and
-`cdc.sync_runs` progress. `--parallelism WORKERS` defaults to `1`; a resume may
-select a different positive worker count without changing its recovery identity,
-boundary, or durable progress. Prepared evidence is source-only. Recovery proof
+`cdc.sync_runs` progress. `--parallelism WORKERS` defaults to `1` and bounds
+independent schema-table workers as well as row workers; a resume may select a
+different positive worker count without changing its recovery identity, boundary,
+or durable progress. A running recovery keeps its existing binary and worker
+behavior; deploying a newer image does not hot-reload it. Prepared evidence is
+source-only. Recovery proof
 requires complete exact run/table progress plus an unchanged source scope; it
 does not capture a target final inventory or run a post-write drift scan. The stream lease, authorization,
 checkpoint/barrier revalidation, and atomic recovery transaction remain in
