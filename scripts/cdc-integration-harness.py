@@ -3921,17 +3921,49 @@ class Harness:
             self.target,
             "SELECT COUNT(*) FROM mysql.general_log "
             f"WHERE user_host LIKE '{SYNC_TARGET_USER}%' "
+            "AND command_type IN ('Query','Execute') "
             f"AND argument LIKE 'ALTER TABLE `{independent}`%';",
         ).strip()
         if independent_alters != "1":
             raise HarnessError(
                 f"resume repeated already-applied independent DDL: {independent_alters}"
             )
+        self.assert_schema_fixture_statement_order(tables)
         print(
-            "sync_schema_parallel_resume_ok overlap=2 dependency_order=true "
+            "sync_schema_parallel_resume_ok overlap=2 dependency_order=true per_table_order=true "
             "same_run=true completed_rows_preserved=true committed_ddl_preserved=true "
             "constraints=5 rows=6 check_and_fk_enforced=true"
         )
+
+    def assert_schema_fixture_statement_order(self, tables: list[str]) -> None:
+        assert self.target
+        child, parent, independent = tables
+        expected = {
+            child: [f"{child}_positive", f"{child}_parent_fk"],
+            parent: [f"{parent}_positive", f"{parent}_positive", f"{parent}_upper"],
+            independent: [f"{independent}_positive"],
+        }
+        # Observe executed database commands, not Prepare records or generated plans.
+        # The first parent attempt was killed while waiting; resume must retry it
+        # before applying the parent's second constraint.
+        records = self.admin_query(
+            self.target,
+            "SELECT argument FROM mysql.general_log "
+            f"WHERE user_host LIKE '{SYNC_TARGET_USER}%' "
+            "AND command_type IN ('Query','Execute') AND argument LIKE 'ALTER TABLE%' "
+            "ORDER BY event_time;",
+        ).splitlines()
+        observed = {table: [] for table in tables}
+        for statement in records:
+            for table in tables:
+                names = {name for name in expected[table] if f"`{name}`" in statement}
+                if len(names) == 1:
+                    observed[table].append(names.pop())
+        if observed != expected:
+            raise HarnessError(
+                f"per-table ALTER execution order mismatch: {observed!r}; records={records!r}"
+            )
+        print(f"schema_parallel_statement_order observed={observed!r}")
 
     def run_sync_resume(self) -> None:
         assert self.source and self.target
