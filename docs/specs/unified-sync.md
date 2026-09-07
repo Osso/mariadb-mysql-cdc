@@ -24,7 +24,7 @@ the run ID. Operator usage belongs in the sync runbook.
 
 ### Source scope and execution
 
-- [x] Convert the selected current source inventory into deterministic table definitions, including writable `BIT`, `ENUM`, and `MEDIUMBLOB` runtime metadata while omitting runtime metadata from backward-compatible `sync-v1` ID serialization.
+- [x] Convert the selected current source inventory into deterministic table definitions, including writable `BIT`, `ENUM`, and `MEDIUMBLOB` runtime metadata. Omit new `ENUM` and `MEDIUMBLOB` metadata from backward-compatible `sync-v1` ID serialization; retain existing `BIT` serialization.
 - [x] Reject an empty or duplicated selection and reject a selected child whose same-schema source parent is outside the current selection.
 - [x] Invoke bounded row workers between the two schema stages.
 - [x] Expose the staged orchestration through one `sync` CLI. Removed progress, standalone schema, drift-check, catchup-snapshot, sync-table, and repair-drift command names are rejected as unknown commands rather than aliased.
@@ -47,10 +47,10 @@ the run ID. Operator usage belongs in the sync runbook.
 - [x] Verify each owner mutation and intended source row, then retry only the failed insert batch plus untouched remaining insert rows. Repeated conflict keys fail rather than retry indefinitely; any repair, retry, verification, or commit failure rolls back the locked chunk and leaves durable progress unchanged.
 - [x] Commit the target chunk before persisting progress. Emit secret-free reconciliation audits only after successful commit; discard pending audits on rollback or commit failure. Keep counters tied to planned source operations without changing live CDC duplicate handling.
 - [x] Round-trip every writable `BIT` column as an unsigned integer for source/target reads and target mutation bindings, preserving `NULL` and values through `BIT(64)` for strict inserts and CASE updates.
-- [x] Round-trip every writable `ENUM` column by internal index and bind it as an unsigned integer, preserving index zero, declared empty labels, numeric labels, and `NULL`; enum primary-key cursors retain declaration labels.
+- [x] Round-trip every writable `ENUM` column by internal index and bind it as an unsigned integer, preserving index zero, declared empty labels, numeric labels, and `NULL`; enum primary-key cursors retain declaration labels. An index-zero ENUM primary key fails explicitly because it has no unambiguous label cursor.
 - [x] Round-trip every writable `MEDIUMBLOB` column through lossless hexadecimal read projection and strict byte bindings, preserving `NULL`, empty values, and invalid UTF-8.
 
-**Datatype audit status.** A disposable MariaDB-to-MySQL baseline over the 19 datatype families currently present in the source inventory passed 17 families. `ENUM` and `MEDIUMBLOB` remain the two fidelity cases under focused verification: the contracts above require `ENUM` ordinal distinction from `NULL` and labels, and byte-exact binary handling. This baseline is not a completed end-to-end GREEN result, deployment assertion, or recovery result.
+**Datatype audit status.** A disposable MariaDB-to-MySQL audit passed representative fixtures for all 19 datatype families in the observed source inventory at revision `0e1fd4e`. The prior baseline passed 17 families and failed `ENUM` ordinal distinction and `MEDIUMBLOB` byte fidelity. The passing audit exercises strict insert/update, target-only deletion, NULL and empty distinctions, and multiple pages. It does not prove every possible value, index-zero ENUM primary keys, or production recovery completion.
 
 ### Connection construction retry
 
