@@ -799,6 +799,12 @@ mod tests {
     }
 
     #[test]
+    fn a_full_sql_row_limit_requires_another_page() {
+        let page = collect_byte_bounded_rows(vec![row("1", "a"), row("2", "b")], 2, 100);
+        assert!(page.has_more);
+    }
+
+    #[test]
     fn byte_budget_keeps_one_oversized_row() {
         let oversized = row("1", "abcdef");
 
