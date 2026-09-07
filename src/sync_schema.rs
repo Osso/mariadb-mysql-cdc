@@ -2398,6 +2398,9 @@ fn column_change_requires_data_preflight(
         {
             return true;
         }
+        if source_type == "enum" && enum_labels_are_appended(source, target) {
+            return false;
+        }
         if let Some((source_length, target_length)) =
             varchar_length(source).zip(varchar_length(target))
         {
@@ -2424,6 +2427,16 @@ fn column_change_requires_data_preflight(
         .is_none_or(|(source_rank, target_rank)| {
             is_unsigned(source) != is_unsigned(target) || source_rank < target_rank
         })
+}
+
+fn enum_labels_are_appended(source: &ColumnInventory, target: &ColumnInventory) -> bool {
+    let Some(source_labels) = crate::sql_type::parse_enum_column_type(&source.column_type) else {
+        return false;
+    };
+    let Some(target_labels) = crate::sql_type::parse_enum_column_type(&target.column_type) else {
+        return false;
+    };
+    source_labels.len() > target_labels.len() && source_labels.starts_with(&target_labels)
 }
 
 fn normalized_data_type(column: &ColumnInventory) -> String {
