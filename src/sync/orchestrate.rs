@@ -374,7 +374,14 @@ impl SyncRunExecutor for MySqlSyncRunExecutor {
             SyncStage::FinalConstraints => SyncSchemaStageKind::FinalConstraints,
             SyncStage::Rows => return Err("rows are not a schema stage".to_string()),
         };
-        run_sync_schema_stage(evidence, &config.target, &config.tables, schema_stage).map(|_| ())
+        run_sync_schema_stage(
+            evidence,
+            &config.target,
+            &config.tables,
+            schema_stage,
+            config.parallelism,
+        )
+        .map(|_| ())
     }
 
     fn run_rows(

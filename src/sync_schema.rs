@@ -160,6 +160,10 @@ impl Ord for CheckConstraint {
     }
 }
 
+#[cfg(test)]
+#[path = "sync_schema_parallel_tests.rs"]
+mod parallel_tests;
+
 pub(crate) trait SchemaStatementExecutor {
     fn execute(&mut self, table: &str, sql: &str) -> Result<(), String>;
 }
@@ -961,14 +965,19 @@ fn index_prerequisites(
     prerequisites
 }
 
-pub(crate) fn execute_sync_schema_stage_plan(
+pub(crate) fn execute_sync_schema_stage_plan<E: SchemaStatementExecutor>(
     plan: SchemaConvergencePlan,
-    executor: &mut dyn SchemaStatementExecutor,
+    parallelism: usize,
+    connect: &(impl Fn() -> Result<E, String> + Sync),
 ) -> SchemaConvergenceReport {
+    assert!(
+        parallelism > 0,
+        "schema parallelism must be greater than zero"
+    );
     let (constraint_drops, mut remaining) = split_constraint_drop_plan(plan);
-    let drop_report = execute_schema_plan_statements(constraint_drops, executor);
+    let drop_report = execute_schema_plan_statements(constraint_drops, parallelism, connect);
     apply_constraint_drop_failures(&drop_report, &mut remaining);
-    let remaining_report = execute_schema_plan_statements(remaining, executor);
+    let remaining_report = execute_schema_plan_statements(remaining, parallelism, connect);
     let report = merge_sync_schema_stage_reports(drop_report, remaining_report);
     let total = report.tables.len();
     for (position, table) in report.tables.iter().enumerate() {
@@ -1069,17 +1078,12 @@ fn merge_sync_schema_stage_reports(
     }
 }
 
-fn execute_schema_plan_statements(
+fn execute_schema_plan_statements<E: SchemaStatementExecutor>(
     plan: SchemaConvergencePlan,
-    executor: &mut dyn SchemaStatementExecutor,
+    parallelism: usize,
+    connect: &(impl Fn() -> Result<E, String> + Sync),
 ) -> SchemaConvergenceReport {
-    let mut table_status = BTreeMap::new();
-    let mut reports = Vec::new();
-    for table in plan.tables {
-        let report = execute_table_plan(table, &table_status, executor);
-        table_status.insert(report.table.clone(), report.status);
-        reports.push(report);
-    }
+    let reports = execute_schema_tables(plan.tables, parallelism, connect);
     let overall_status = overall_schema_status(&reports);
     SchemaConvergenceReport {
         transformation_version: DDL_TRANSFORMATION_VERSION.to_string(),
@@ -1089,6 +1093,120 @@ fn execute_schema_plan_statements(
         error: (overall_status != OverallSchemaStatus::Converged)
             .then(|| "one or more selected tables remain divergent".to_string()),
         tables: reports,
+    }
+}
+
+fn execute_schema_tables<E: SchemaStatementExecutor>(
+    tables: Vec<TableSchemaPlan>,
+    parallelism: usize,
+    connect: &(impl Fn() -> Result<E, String> + Sync),
+) -> Vec<TableSchemaReport> {
+    let selected = tables
+        .iter()
+        .map(|table| table.table.clone())
+        .collect::<BTreeSet<_>>();
+    let mut pending = tables.into_iter().enumerate().collect::<BTreeMap<_, _>>();
+    let mut statuses = BTreeMap::new();
+    let mut reports = BTreeMap::new();
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut active = 0;
+        while !pending.is_empty() || active > 0 {
+            while active < parallelism {
+                let Some(position) = next_ready_schema_table(&pending, &selected, &statuses) else {
+                    break;
+                };
+                let table = pending.remove(&position).expect("ready table exists");
+                let sender = sender.clone();
+                let statuses = &statuses;
+                // Copy only this table's completed dependencies, not the changing scheduler state.
+                let dependencies = table
+                    .dependencies
+                    .iter()
+                    .filter_map(|name| statuses.get(name).map(|status| (name.clone(), *status)))
+                    .collect();
+                scope.spawn(move || {
+                    let report = connect_and_execute_schema_table(table, &dependencies, connect);
+                    sender
+                        .send((position, report))
+                        .expect("schema coordinator remains alive");
+                });
+                active += 1;
+            }
+            if active == 0 {
+                reject_pending_schema_cycles(&mut pending, &mut reports);
+                break;
+            }
+            let (position, report) = receiver
+                .recv()
+                .expect("schema worker must report completion");
+            statuses.insert(report.table.clone(), report.status);
+            reports.insert(position, report);
+            active -= 1;
+        }
+    });
+    reports.into_values().collect()
+}
+
+fn next_ready_schema_table(
+    pending: &BTreeMap<usize, TableSchemaPlan>,
+    selected: &BTreeSet<String>,
+    statuses: &BTreeMap<String, TableSchemaStatus>,
+) -> Option<usize> {
+    pending
+        .iter()
+        .find(|(_, table)| {
+            table.status == TableSchemaStatus::Failed
+                || table.dependencies.iter().all(|dependency| {
+                    !selected.contains(dependency) || statuses.contains_key(dependency)
+                })
+        })
+        .map(|(position, _)| *position)
+}
+
+fn connect_and_execute_schema_table<E: SchemaStatementExecutor>(
+    table: TableSchemaPlan,
+    statuses: &BTreeMap<String, TableSchemaStatus>,
+    connect: &(impl Fn() -> Result<E, String> + Sync),
+) -> TableSchemaReport {
+    let failed = failed_dependencies(&table, statuses);
+    let mut report = table_report(&table, failed.clone());
+    if !failed.is_empty() {
+        report.status = TableSchemaStatus::Skipped;
+        return report;
+    }
+    if report.status == TableSchemaStatus::Failed {
+        return report;
+    }
+    if table.statements.is_empty() {
+        report.status = TableSchemaStatus::Converged;
+        return report;
+    }
+    match connect() {
+        Ok(mut executor) => execute_table_plan(table, statuses, &mut executor),
+        Err(error) => {
+            report.status = TableSchemaStatus::Failed;
+            report.blockers.push(format!(
+                "connect target for schema table `{}`: {error}",
+                table.table
+            ));
+            report
+        }
+    }
+}
+
+fn reject_pending_schema_cycles(
+    pending: &mut BTreeMap<usize, TableSchemaPlan>,
+    reports: &mut BTreeMap<usize, TableSchemaReport>,
+) {
+    for (position, table) in std::mem::take(pending) {
+        let mut report = table_report(&table, vec![]);
+        report.status = TableSchemaStatus::Failed;
+        report.blockers.push(format!(
+            "selected schema dependency cycle blocks `{}`",
+            table.table
+        ));
+        reports.insert(position, report);
     }
 }
 
@@ -1348,14 +1466,18 @@ pub(crate) fn run_sync_schema_stage(
     target: &crate::live::TargetMySqlConfig,
     selected: &[String],
     stage: SyncSchemaStageKind,
+    parallelism: usize,
 ) -> Result<SchemaConvergenceReport, String> {
+    if parallelism == 0 {
+        return Err("schema parallelism must be greater than zero".to_string());
+    }
     let current = read_sync_stage_target_evidence(target)?;
     let preflight = MySqlCoercionPreflight {
         config: inventory_config_target(target),
         schema: target.database.clone(),
     };
     let plan = stage.plan(evidence, &current, selected, &preflight)?;
-    execute_sync_schema_stage(target, plan, stage.label())
+    execute_sync_schema_stage(target, plan, stage.label(), parallelism)
 }
 
 struct SyncStageTargetEvidence {
@@ -1395,11 +1517,14 @@ fn execute_sync_schema_stage(
     target: &crate::live::TargetMySqlConfig,
     plan: SchemaConvergencePlan,
     stage: &str,
+    parallelism: usize,
 ) -> Result<SchemaConvergenceReport, String> {
-    let executor = crate::mysql_client::PersistentTargetExecutor::new(target)
-        .map_err(|error| format!("connect target for unified sync {stage}: {error}"))?;
-    let mut executor = MySqlSchemaExecutor { executor };
-    let report = execute_sync_schema_stage_plan(plan, &mut executor);
+    let connect = || {
+        crate::mysql_client::PersistentTargetExecutor::new(target)
+            .map(|executor| MySqlSchemaExecutor { executor })
+            .map_err(|error| format!("connect target for unified sync {stage}: {error}"))
+    };
+    let report = execute_sync_schema_stage_plan(plan, parallelism, &connect);
     if report.overall_status != OverallSchemaStatus::Converged {
         return Err(format!("unified sync {stage} stage did not converge"));
     }
@@ -4469,9 +4594,11 @@ mod tests {
                 ],
             }],
         };
-        let mut executor = RecordingExecutor::failing_sql("ADD COLUMN `broken`");
-
-        let report = execute_schema_plan_statements(plan, &mut executor);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(RecordingExecutor::failing_sql(
+            "ADD COLUMN `broken`",
+        )));
+        let report = execute_schema_plan_statements(plan, 1, &|| Ok(shared.clone()));
+        let executor = shared.lock().unwrap();
 
         assert_eq!(executor.executed.len(), 2);
         assert!(executor.executed[1].contains("independent"));
@@ -4503,9 +4630,10 @@ mod tests {
                 ),
             ],
         };
-        let mut executor = RecordingExecutor::failing("parents");
-
-        let report = execute_schema_plan_statements(plan, &mut executor);
+        let shared =
+            std::sync::Arc::new(std::sync::Mutex::new(RecordingExecutor::failing("parents")));
+        let report = execute_schema_plan_statements(plan, 1, &|| Ok(shared.clone()));
+        let executor = shared.lock().unwrap();
 
         assert_eq!(report.tables[0].status, TableSchemaStatus::Failed);
         assert_eq!(report.tables[1].status, TableSchemaStatus::Skipped);
@@ -4634,8 +4762,10 @@ mod tests {
             .expect("CHECK addition");
         assert_eq!(check.prerequisites, vec!["column:accounts.balance"]);
 
-        let mut executor = RecordingExecutor::failing_sql("MODIFY COLUMN `balance`");
-        let report = execute_schema_plan_statements(plan, &mut executor);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(RecordingExecutor::failing_sql(
+            "MODIFY COLUMN `balance`",
+        )));
+        let report = execute_schema_plan_statements(plan, 1, &|| Ok(shared.clone()));
         assert!(report.tables[0].executions.iter().any(|execution| {
             execution
                 .sql
@@ -4708,8 +4838,10 @@ mod tests {
             ]
         );
 
-        let mut executor = RecordingExecutor::failing_sql("DROP FOREIGN KEY");
-        let report = execute_schema_plan_statements(plan, &mut executor);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(RecordingExecutor::failing_sql(
+            "DROP FOREIGN KEY",
+        )));
+        let report = execute_schema_plan_statements(plan, 1, &|| Ok(shared.clone()));
         let check_execution = report.tables[0]
             .executions
             .iter()
@@ -5330,13 +5462,15 @@ mod tests {
                 vec!["ALTER TABLE `items` ADD COLUMN `label` VARCHAR(64)"],
             )],
         };
-        let mut executor = RecordingExecutor {
+        let executor = RecordingExecutor {
             fail_table: None,
             fail_sql: None,
             executed: vec![],
         };
 
-        let report = execute_sync_schema_stage_plan(plan, &mut executor);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(executor));
+        let report = execute_sync_schema_stage_plan(plan, 1, &|| Ok(shared.clone()));
+        let executor = shared.lock().unwrap();
 
         assert_eq!(
             executor.executed,
@@ -5365,13 +5499,15 @@ mod tests {
             target_fingerprint: "target".to_string(),
             tables: vec![parent, child],
         };
-        let mut executor = RecordingExecutor {
+        let executor = RecordingExecutor {
             fail_table: None,
             fail_sql: None,
             executed: vec![],
         };
 
-        let report = execute_sync_schema_stage_plan(plan, &mut executor);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(executor));
+        let report = execute_sync_schema_stage_plan(plan, 1, &|| Ok(shared.clone()));
+        let executor = shared.lock().unwrap();
 
         assert_eq!(
             executor.executed,
@@ -5630,6 +5766,12 @@ mod tests {
                 fail_sql: Some(sql.to_string()),
                 executed: vec![],
             }
+        }
+    }
+
+    impl SchemaStatementExecutor for std::sync::Arc<std::sync::Mutex<RecordingExecutor>> {
+        fn execute(&mut self, table: &str, sql: &str) -> Result<(), String> {
+            self.lock().unwrap().execute(table, sql)
         }
     }
 
