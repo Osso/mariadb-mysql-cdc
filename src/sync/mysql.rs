@@ -1,8 +1,8 @@
 use super::model::{
-    SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest, SyncChunkSource,
-    SyncChunkTargetSession, SyncMutationFailure, SyncProgressRow, SyncProgressStatus,
-    SyncRunProgressStore, SyncStage, SyncTable, SyncUniqueIndex, SyncUniqueOwnerAction,
-    SyncUniqueOwnerConflict,
+    SyncChunkPage, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
+    SyncChunkSource, SyncChunkTargetSession, SyncMutationFailure, SyncProgressRow,
+    SyncProgressStatus, SyncRunProgressStore, SyncStage, SyncTable, SyncUniqueIndex,
+    SyncUniqueOwnerAction, SyncUniqueOwnerConflict,
 };
 use super::progress::{
     build_create_sync_progress_schema_sql, build_create_sync_progress_table_sql,
@@ -17,8 +17,7 @@ use super::sql::{
 use crate::database_row::DatabaseRow;
 use crate::live::TargetMySqlConfig;
 use crate::mysql_client::{
-    PersistentMySqlSource, extend_session_wait_timeout, sync_source_opts, sync_target_opts,
-    value_to_string,
+    extend_session_wait_timeout, sync_source_opts, sync_target_opts, value_to_string,
 };
 use crate::mysql_config::MySqlConnectionConfig;
 use crate::target::SqlStatement;
@@ -44,9 +43,11 @@ const MYSQL_MAX_PREPARED_STATEMENT_PLACEHOLDERS: usize = 65_535;
 const MAX_SYNC_MUTATION_ROWS_PER_STATEMENT: usize = 128;
 const MAX_SYNC_CONNECTION_RETRIES: u32 = 4;
 const INITIAL_SYNC_CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(100);
+// Bounds retained decoded row payloads, not MySQL wire bytes or a single oversized row.
+const MAX_SYNC_PAGE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) struct MySqlSyncSource {
-    source: PersistentMySqlSource,
+    conn: Conn,
     table: SyncTable,
 }
 
@@ -117,19 +118,13 @@ impl MySqlSyncSource {
         let opts = sync_source_opts(config)?;
         let conn = open_sync_connection(opts)
             .map_err(|error| format!("failed to connect to source mysql: {error}"))?;
-        let source = PersistentMySqlSource::from_sync_connection(conn);
-        Ok(Self { source, table })
+        Ok(Self { conn, table })
     }
 }
 
 impl SyncChunkSource for MySqlSyncSource {
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
-        let sql = build_sync_select_sql(&self.table, request);
-        let rows = self
-            .source
-            .query_rows_as_strings(&sql)
-            .map_err(|error| error.to_string())?;
-        decode_sync_rows(&self.table, rows)
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<SyncChunkPage, String> {
+        query_sync_page_rows(&mut self.conn, &self.table, request, "source")
     }
 
     fn read_row_by_primary_key(
@@ -137,10 +132,7 @@ impl SyncChunkSource for MySqlSyncSource {
         primary_key: &[String],
     ) -> Result<Option<DatabaseRow>, String> {
         let statement = build_exact_primary_key_select_statement(&self.table, primary_key)?;
-        let rows = self
-            .source
-            .query_statement_rows_as_strings(&statement)
-            .map_err(|error| error.to_string())?;
+        let rows = query_statement_rows_as_strings(&mut self.conn, &statement, "source exact-row")?;
         decode_optional_exact_row(&self.table, rows, "source")
     }
 }
@@ -171,10 +163,8 @@ impl MySqlSyncTargetSession {
             .map_err(|error| format!("target mysql session command `{sql}` failed: {error}"))
     }
 
-    fn query_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
-        let sql = build_sync_select_sql(&self.table, request);
-        let rows = query_rows_as_strings(&mut self.conn, &sql, "target")?;
-        decode_sync_rows(&self.table, rows)
+    fn query_rows(&mut self, request: &SyncChunkReadRequest) -> Result<SyncChunkPage, String> {
+        query_sync_page_rows(&mut self.conn, &self.table, request, "target")
     }
 
     fn query_statement_rows(
@@ -283,7 +273,7 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
         self.execute_control(&sql)
     }
 
-    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String> {
+    fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<SyncChunkPage, String> {
         self.query_rows(request)
     }
 
@@ -679,15 +669,41 @@ fn initialize_target_session(conn: &mut Conn) -> Result<(), String> {
         .map_err(|error| format!("initialize target mysql session: {error}"))
 }
 
-fn query_rows_as_strings(
+fn query_sync_page_rows(
     conn: &mut Conn,
-    sql: &str,
+    table: &SyncTable,
+    request: &SyncChunkReadRequest,
     endpoint: &str,
-) -> Result<Vec<Vec<Option<String>>>, String> {
-    let rows = conn
-        .query::<mysql::Row, _>(sql)
+) -> Result<SyncChunkPage, String> {
+    let sql = build_sync_select_sql(table, request);
+    let mut result = conn
+        .query_iter(sql)
         .map_err(|error| format!("{endpoint} mysql query failed: {error}"))?;
-    Ok(mysql_rows_to_strings(rows))
+    let Some(mut rows) = result.iter() else {
+        return Ok(SyncChunkPage {
+            rows: Vec::new(),
+            has_more: false,
+        });
+    };
+    let mut collector = ByteBoundedRowCollector::new(request.limit, MAX_SYNC_PAGE_PAYLOAD_BYTES);
+    while let Some(row) = rows.next() {
+        let row = row.map_err(|error| format!("{endpoint} mysql row read failed: {error}"))?;
+        let decoded = decode_sync_row(table, mysql_row_to_strings(row))?;
+        if !collector.can_retain(&decoded) {
+            while let Some(discarded) = rows.next() {
+                discarded.map_err(|error| {
+                    format!("{endpoint} mysql row read failed after byte boundary: {error}")
+                })?;
+            }
+            return Ok(collector.finish(true));
+        }
+        collector.retain(decoded);
+    }
+    Ok(collector.finish(false))
+}
+
+fn mysql_row_to_strings(row: mysql::Row) -> Vec<Option<String>> {
+    row.unwrap().into_iter().map(value_to_string).collect()
 }
 
 fn mysql_row_to_tsv(row: mysql::Row) -> String {
@@ -697,4 +713,105 @@ fn mysql_row_to_tsv(row: mysql::Row) -> String {
         .map(|value| value.unwrap_or_default())
         .collect::<Vec<_>>()
         .join("\t")
+}
+
+struct ByteBoundedRowCollector {
+    rows: Vec<DatabaseRow>,
+    retained_bytes: usize,
+    row_limit: usize,
+    byte_budget: usize,
+}
+
+impl ByteBoundedRowCollector {
+    fn new(row_limit: usize, byte_budget: usize) -> Self {
+        Self {
+            rows: Vec::new(),
+            retained_bytes: 0,
+            row_limit,
+            byte_budget,
+        }
+    }
+
+    fn can_retain(&self, row: &DatabaseRow) -> bool {
+        if self.rows.len() == self.row_limit {
+            return false;
+        }
+        self.rows.is_empty()
+            || self
+                .retained_bytes
+                .saturating_add(projected_row_payload_bytes(row))
+                <= self.byte_budget
+    }
+
+    fn retain(&mut self, row: DatabaseRow) {
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(projected_row_payload_bytes(&row));
+        self.rows.push(row);
+    }
+
+    fn finish(self, has_more: bool) -> SyncChunkPage {
+        SyncChunkPage {
+            rows: self.rows,
+            has_more,
+        }
+    }
+}
+
+#[cfg(test)]
+fn collect_byte_bounded_rows(
+    rows: impl IntoIterator<Item = DatabaseRow>,
+    row_limit: usize,
+    byte_budget: usize,
+) -> SyncChunkPage {
+    let mut collector = ByteBoundedRowCollector::new(row_limit, byte_budget);
+    for row in rows {
+        if !collector.can_retain(&row) {
+            return collector.finish(true);
+        }
+        collector.retain(row);
+    }
+    collector.finish(false)
+}
+
+fn projected_row_payload_bytes(row: &DatabaseRow) -> usize {
+    row.values
+        .values()
+        .flatten()
+        .map(String::len)
+        .fold(0, usize::saturating_add)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_byte_bounded_rows;
+    use crate::database_row::DatabaseRow;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn byte_budget_keeps_the_next_row_for_the_next_cursor() {
+        let rows = vec![row("1", "aaaa"), row("2", "bbbb")];
+
+        let page = collect_byte_bounded_rows(rows, 10, 5);
+
+        assert_eq!(page.rows, vec![row("1", "aaaa")]);
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn byte_budget_keeps_one_oversized_row() {
+        let oversized = row("1", "abcdef");
+
+        let page = collect_byte_bounded_rows(vec![oversized.clone()], 10, 5);
+
+        assert_eq!(page.rows, vec![oversized]);
+        assert!(!page.has_more);
+    }
+
+    fn row(id: &str, payload: &str) -> DatabaseRow {
+        DatabaseRow {
+            primary_key: vec![id.to_string()],
+            values: BTreeMap::from([("payload".to_string(), Some(payload.to_string()))]),
+        }
+    }
 }
