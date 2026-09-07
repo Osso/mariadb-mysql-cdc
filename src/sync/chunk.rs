@@ -1,6 +1,6 @@
 use super::model::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
-    SyncChunkSource, SyncChunkTargetSession, SyncInsertFailure, SyncTable, SyncUniqueOwnerAction,
+    SyncChunkSource, SyncChunkTargetSession, SyncMutationFailure, SyncTable, SyncUniqueOwnerAction,
     SyncUniqueOwnerConflict,
 };
 use crate::database_row::DatabaseRow;
@@ -295,19 +295,34 @@ fn apply_source_changes(
     target: &mut impl SyncChunkTargetSession,
     changes: &ChunkChanges,
 ) -> Result<(), String> {
-    if !changes.updates.is_empty() {
-        target
-            .update_rows(&changes.updates)
-            .map_err(|error| format!("update divergent rows in `{table}`: {error}"))?;
-    }
-    apply_strict_inserts(table, source, target, &changes.inserts)
+    apply_strict_mutations(
+        table,
+        source,
+        target,
+        &changes.updates,
+        MutationKind::Update,
+    )?;
+    apply_strict_mutations(
+        table,
+        source,
+        target,
+        &changes.inserts,
+        MutationKind::Insert,
+    )
 }
 
-fn apply_strict_inserts(
+#[derive(Clone, Copy)]
+enum MutationKind {
+    Insert,
+    Update,
+}
+
+fn apply_strict_mutations(
     table: &str,
     source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
     rows: &[DatabaseRow],
+    kind: MutationKind,
 ) -> Result<(), String> {
     if rows.is_empty() {
         return Ok(());
@@ -315,9 +330,9 @@ fn apply_strict_inserts(
     let mut pending_rows = rows.to_vec();
     let mut reconciled_conflicts = BTreeSet::new();
     let mut reconciled_intended_rows = BTreeMap::new();
-    while let Some(failure) = try_strict_insert(table, target, &pending_rows)? {
+    while let Some(failure) = try_strict_mutation(table, target, &pending_rows, kind)? {
         pending_rows = failure.retry_rows();
-        inspect_and_reconcile_insert_failure(
+        inspect_and_reconcile_mutation_failure(
             table,
             source,
             target,
@@ -330,28 +345,33 @@ fn apply_strict_inserts(
         let rows = reconciled_intended_rows.into_values().collect::<Vec<_>>();
         target
             .verify_rows(&rows)
-            .map_err(|error| format!("verify reconciled inserts in `{table}`: {error}"))?;
+            .map_err(|error| format!("verify reconciled rows in `{table}`: {error}"))?;
     }
     Ok(())
 }
 
-fn try_strict_insert(
+fn try_strict_mutation(
     table: &str,
     target: &mut impl SyncChunkTargetSession,
     rows: &[DatabaseRow],
-) -> Result<Option<SyncInsertFailure>, String> {
-    match target.insert_rows(rows) {
+    kind: MutationKind,
+) -> Result<Option<SyncMutationFailure>, String> {
+    let (result, operation) = match kind {
+        MutationKind::Insert => (target.insert_rows(rows), "insert missing rows into"),
+        MutationKind::Update => (target.update_rows(rows), "update divergent rows in"),
+    };
+    match result {
         Ok(()) => Ok(None),
         Err(failure) if failure.mysql_code == Some(1062) => Ok(Some(failure)),
-        Err(failure) => Err(format!("insert missing rows into `{table}`: {failure}")),
+        Err(failure) => Err(format!("{operation} `{table}`: {failure}")),
     }
 }
 
-fn inspect_and_reconcile_insert_failure(
+fn inspect_and_reconcile_mutation_failure(
     table: &str,
     source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
-    failure: &SyncInsertFailure,
+    failure: &SyncMutationFailure,
     reconciled_conflicts: &mut BTreeSet<(String, Vec<String>, Vec<String>)>,
     reconciled_intended_rows: &mut BTreeMap<Vec<String>, DatabaseRow>,
 ) -> Result<(), String> {

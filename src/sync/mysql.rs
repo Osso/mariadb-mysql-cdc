@@ -1,6 +1,6 @@
 use super::model::{
     SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest, SyncChunkSource,
-    SyncChunkTargetSession, SyncInsertFailure, SyncProgressRow, SyncProgressStatus,
+    SyncChunkTargetSession, SyncMutationFailure, SyncProgressRow, SyncProgressStatus,
     SyncRunProgressStore, SyncStage, SyncTable, SyncUniqueIndex, SyncUniqueOwnerAction,
     SyncUniqueOwnerConflict,
 };
@@ -35,7 +35,7 @@ pub(crate) use query::{
     decode_optional_exact_row, mysql_rows_to_strings, query_statement_rows_as_strings,
 };
 pub(crate) use unique_owner::{
-    SyncUniqueIndexColumn, build_sync_insert_failure, format_unique_owner_reconciliation_event,
+    SyncUniqueIndexColumn, build_sync_mutation_failure, format_unique_owner_reconciliation_event,
     resolve_sync_unique_index,
 };
 use unique_owner::{mysql_error_code, validate_unique_owner, verify_exact_row};
@@ -191,6 +191,32 @@ impl MySqlSyncTargetSession {
         decode_optional_exact_row(&self.table, rows, "target")
     }
 
+    fn execute_mutation_batches(
+        &mut self,
+        rows: &[DatabaseRow],
+        capacity: usize,
+        build: fn(&SyncTable, &[DatabaseRow]) -> Result<SqlStatement, String>,
+    ) -> Result<(), SyncMutationFailure> {
+        for (batch_index, batch) in rows.chunks(capacity).enumerate() {
+            let start = batch_index * capacity;
+            let statement = build(&self.table, batch).map_err(|message| {
+                build_sync_mutation_failure(rows, start, batch.len(), None, message)
+            })?;
+            self.conn
+                .exec_drop(&statement.sql, Params::Positional(statement.params))
+                .map_err(|error| {
+                    build_sync_mutation_failure(
+                        rows,
+                        start,
+                        batch.len(),
+                        mysql_error_code(&error),
+                        format!("target mysql statement failed: {error}"),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
     fn load_unique_index(&mut self, error: &str) -> Result<SyncUniqueIndex, String> {
         let statement = build_unique_index_columns_statement(&self.database, &self.table.name);
         let rows = self
@@ -268,48 +294,25 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
         Ok(())
     }
 
-    fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
-        for statement in build_strict_update_batches(&self.table, rows)? {
-            self.execute_statement(statement)?;
-        }
-        Ok(())
+    fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure> {
+        self.execute_mutation_batches(
+            rows,
+            strict_update_batch_capacity(&self.table),
+            build_strict_update_rows_statement,
+        )
     }
 
-    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncInsertFailure> {
-        let capacity = strict_insert_batch_capacity(&self.table);
-        for (batch_index, batch) in rows.chunks(capacity).enumerate() {
-            let statement = match build_strict_insert_statement(&self.table, batch) {
-                Ok(statement) => statement,
-                Err(message) => {
-                    return Err(build_sync_insert_failure(
-                        rows,
-                        batch_index * capacity,
-                        batch.len(),
-                        None,
-                        message,
-                    ));
-                }
-            };
-            let result = self
-                .conn
-                .exec_drop(&statement.sql, Params::Positional(statement.params));
-            if let Err(error) = result {
-                let batch_start = batch_index * capacity;
-                return Err(build_sync_insert_failure(
-                    rows,
-                    batch_start,
-                    batch.len(),
-                    mysql_error_code(&error),
-                    format!("target mysql statement failed: {error}"),
-                ));
-            }
-        }
-        Ok(())
+    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure> {
+        self.execute_mutation_batches(
+            rows,
+            strict_insert_batch_capacity(&self.table),
+            build_strict_insert_statement,
+        )
     }
 
     fn inspect_unique_owner_conflicts(
         &mut self,
-        failure: &SyncInsertFailure,
+        failure: &SyncMutationFailure,
     ) -> Result<Vec<SyncUniqueOwnerConflict>, String> {
         if failure.mysql_code != Some(1062) {
             return Err(failure.message.clone());
@@ -321,6 +324,9 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
             let Some(owner) = self.query_unique_owner(&index, intended)? else {
                 continue;
             };
+            if owner.primary_key == intended.primary_key {
+                continue;
+            }
             validate_unique_owner(&self.table.name, &index, intended, &owner)?;
             if !owner_primary_keys.insert(owner.primary_key.clone()) {
                 return Err(format!(
@@ -350,7 +356,8 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
     ) -> Result<(), String> {
         match action {
             SyncUniqueOwnerAction::Update(row) => {
-                self.update_rows(std::slice::from_ref(row))?;
+                self.update_rows(std::slice::from_ref(row))
+                    .map_err(|error| error.to_string())?;
                 verify_exact_row(
                     self.query_exact_row(&conflict.owner.primary_key)?,
                     Some(row),
@@ -381,7 +388,7 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
             verify_exact_row(
                 self.query_exact_row(&expected.primary_key)?,
                 Some(expected),
-                "inserted intended row",
+                "mutated intended row",
             )?;
         }
         Ok(())
@@ -574,6 +581,7 @@ fn bounded_mutation_capacity(placeholders_per_row: usize) -> usize {
     capacity.clamp(1, MAX_SYNC_MUTATION_ROWS_PER_STATEMENT)
 }
 
+#[cfg(test)]
 pub(crate) fn build_strict_update_batches(
     table: &SyncTable,
     rows: &[DatabaseRow],

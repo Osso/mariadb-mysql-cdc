@@ -2,7 +2,7 @@ use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkProgress, SyncPrimaryKeyOrdering, SyncProgressStatus, SyncStage, SyncTable,
     SyncUniqueIndex, SyncUniqueIndexColumn, SyncUniqueOwnerAction, SyncUniqueOwnerConflict,
-    build_strict_delete_batches, build_strict_update_batches, build_sync_insert_failure,
+    build_strict_delete_batches, build_strict_update_batches, build_sync_mutation_failure,
     decode_sync_rows, format_unique_owner_reconciliation_event,
     resolve_sync_unique_index, retry_sync_connection_construction, strict_delete_batch_capacity,
     strict_insert_batch_capacity, strict_update_batch_capacity, sync_chunk_progress_from_row,
@@ -214,7 +214,7 @@ fn sync_mysql_adapter_retains_unique_owner_failed_batch_and_remaining_insert_row
         .map(|index| row(&index.to_string(), "live", "Now"))
         .collect::<Vec<_>>();
 
-    let failure = build_sync_insert_failure(
+    let failure = build_sync_mutation_failure(
         &rows,
         128,
         128,

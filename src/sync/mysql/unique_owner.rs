@@ -1,5 +1,5 @@
 use super::super::model::{
-    SyncInsertFailure, SyncUniqueIndex, SyncUniqueOwnerAction, SyncUniqueOwnerConflict,
+    SyncMutationFailure, SyncUniqueIndex, SyncUniqueOwnerAction, SyncUniqueOwnerConflict,
 };
 use crate::database_row::DatabaseRow;
 use crate::target::duplicate_index_from_error;
@@ -111,19 +111,19 @@ fn resolve_full_unique_index_column(
         .ok_or_else(|| format!("unique index `{index}` has an expression column for `{table}`"))
 }
 
-pub(crate) fn build_sync_insert_failure(
+pub(crate) fn build_sync_mutation_failure(
     rows: &[DatabaseRow],
     failed_batch_start: usize,
     failed_batch_len: usize,
     mysql_code: Option<u16>,
     message: String,
-) -> SyncInsertFailure {
+) -> SyncMutationFailure {
     let failed_batch_end = failed_batch_start + failed_batch_len;
     assert!(
         failed_batch_end <= rows.len(),
         "failed insert batch is in bounds"
     );
-    SyncInsertFailure {
+    SyncMutationFailure {
         mysql_code,
         message,
         failed_batch: rows[failed_batch_start..failed_batch_end].to_vec(),

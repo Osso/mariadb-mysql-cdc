@@ -33,14 +33,14 @@ pub(crate) struct SyncChunkReadRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SyncInsertFailure {
+pub(crate) struct SyncMutationFailure {
     pub(crate) mysql_code: Option<u16>,
     pub(crate) message: String,
     pub(crate) failed_batch: Vec<DatabaseRow>,
     pub(crate) remaining_rows: Vec<DatabaseRow>,
 }
 
-impl SyncInsertFailure {
+impl SyncMutationFailure {
     pub(crate) fn retry_rows(&self) -> Vec<DatabaseRow> {
         self.failed_batch
             .iter()
@@ -50,7 +50,7 @@ impl SyncInsertFailure {
     }
 }
 
-impl std::fmt::Display for SyncInsertFailure {
+impl std::fmt::Display for SyncMutationFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
     }
@@ -198,12 +198,12 @@ pub(crate) trait SyncChunkTargetSession {
     fn lock_table_write(&mut self, database: &str, table: &str) -> Result<(), String>;
     fn read_rows(&mut self, request: &SyncChunkReadRequest) -> Result<Vec<DatabaseRow>, String>;
     fn delete_rows(&mut self, primary_keys: &[Vec<String>]) -> Result<(), String>;
-    fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String>;
-    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncInsertFailure>;
+    fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure>;
+    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure>;
 
     fn inspect_unique_owner_conflicts(
         &mut self,
-        _failure: &SyncInsertFailure,
+        _failure: &SyncMutationFailure,
     ) -> Result<Vec<SyncUniqueOwnerConflict>, String> {
         Err("secondary unique-owner inspection is unavailable".to_string())
     }

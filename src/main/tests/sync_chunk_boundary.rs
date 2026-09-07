@@ -1,7 +1,7 @@
 use crate::database_row::DatabaseRow;
 use crate::sync::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
-    SyncChunkSource, SyncChunkTargetSession, SyncInsertFailure, SyncPrimaryKeyOrdering, SyncTable,
+    SyncChunkSource, SyncChunkTargetSession, SyncMutationFailure, SyncPrimaryKeyOrdering, SyncTable,
     SyncUniqueIndex, SyncUniqueOwnerAction, SyncUniqueOwnerConflict, sync_next_chunk,
 };
 use std::cell::RefCell;
@@ -184,9 +184,9 @@ impl RecordingTargetSession {
         self
     }
 
-    fn take_insert_failure(&mut self, rows: &[DatabaseRow]) -> Option<SyncInsertFailure> {
+    fn take_insert_failure(&mut self, rows: &[DatabaseRow]) -> Option<SyncMutationFailure> {
         if self.failure == Some(FailurePoint::Insert) {
-            return Some(SyncInsertFailure {
+            return Some(SyncMutationFailure {
                 mysql_code: None,
                 message: "injected insert failure".to_string(),
                 failed_batch: rows.to_vec(),
@@ -214,7 +214,7 @@ impl RecordingTargetSession {
             }
             failure => failure,
         };
-        Some(SyncInsertFailure {
+        Some(SyncMutationFailure {
             mysql_code: Some(1062),
             message: "target mysql statement failed: MySqlError { ERROR 1062 (23000): Duplicate entry 'token-a-page-a' for key 'widgets.uidx_token_page' }".to_string(),
             failed_batch: rows.to_vec(),
@@ -304,12 +304,17 @@ impl SyncChunkTargetSession for RecordingTargetSession {
         Ok(())
     }
 
-    fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), String> {
+    fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure> {
         self.events
             .borrow_mut()
             .push(Event::Update(primary_keys(rows)));
         if self.failure == Some(FailurePoint::Update) {
-            return Err("injected update failure".to_string());
+            return Err(SyncMutationFailure {
+                mysql_code: None,
+                message: "injected update failure".to_string(),
+                failed_batch: rows.to_vec(),
+                remaining_rows: Vec::new(),
+            });
         }
         for row in rows {
             let target = self
@@ -322,7 +327,7 @@ impl SyncChunkTargetSession for RecordingTargetSession {
         Ok(())
     }
 
-    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncInsertFailure> {
+    fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure> {
         self.events
             .borrow_mut()
             .push(Event::Insert(primary_keys(rows)));
@@ -335,7 +340,7 @@ impl SyncChunkTargetSession for RecordingTargetSession {
 
     fn inspect_unique_owner_conflicts(
         &mut self,
-        failure: &SyncInsertFailure,
+        failure: &SyncMutationFailure,
     ) -> Result<Vec<SyncUniqueOwnerConflict>, String> {
         let index = SyncUniqueIndex {
             name: "uidx_token_page".to_string(),
