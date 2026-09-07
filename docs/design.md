@@ -126,9 +126,18 @@ non-locking reads. It does not execute `FLUSH TABLES WITH READ LOCK`,
 `UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and does not keep
 a cross-table repeatable-read transaction open. The captured evidence is reused
 by one unified staged sync for every source table with run ID `recovery_id`,
-parallelism `1`, and `cdc.sync_runs` progress. Unified sync owns prerequisite
+the caller-selected parallelism and `cdc.sync_runs` progress. Unified sync owns prerequisite
 schema convergence, target-WRITE-locked source-authoritative row chunks, durable
-stage/table progress, and final constraint convergence. Commits after the
+stage/table progress, and final constraint convergence.
+
+Each source and target keyset read retains at most 64 MiB of decoded projected
+payload and the requested row limit. A page retains one oversized row rather
+than truncating or rejecting it. The budget excludes MySQL wire buffering and
+that one row, so it is not a universal process-memory bound. A byte-limited
+page and a page that reaches the requested SQL row limit both report continuation;
+row processing resumes from the retained last primary key. The reader drains
+unretained result rows and reports drain errors. Target-tail cleanup completes
+only after an exhausted page, not merely a short retained page. Commits after the
 captured coordinate remain in the binlog and are replayed by the stream after
 recovery advances the checkpoint.
 
