@@ -61,6 +61,7 @@ SCENARIOS = (
     ScenarioSpec("sync-wide-update", True),
     ScenarioSpec("sync-bit-values", True),
     ScenarioSpec("sync-resume", True),
+    ScenarioSpec("sync-schema-parallel-resume", True),
     ScenarioSpec("sync-progress-least-privilege", True),
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("production-alter-table", True),
@@ -3630,6 +3631,286 @@ class Harness:
             f"AND table_name={sql_literal(table)};",
         ).strip()
 
+    def wait_for_schema_fixture(
+        self, sql: str, expected: str, process: subprocess.Popen[str], log_path: Path
+    ) -> str:
+        assert self.target
+        deadline = time.monotonic() + 30
+        while True:
+            actual = self.admin_query(self.target, sql).strip()
+            if actual == expected:
+                return actual
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise HarnessError(
+                    f"schema fixture boundary missing: expected={expected!r} actual={actual!r} "
+                    f"process_exit={process.poll()} log={log_path.read_text()}"
+                )
+            time.sleep(0.1)
+
+    def start_schema_metadata_blocker(
+        self, table: str
+    ) -> tuple[subprocess.Popen[str], int]:
+        assert self.target
+        marker = f"schema_fixture_{table}"
+        process = self.start_query(
+            self.target,
+            f"START TRANSACTION; SELECT id FROM `{table}`; SELECT /* {marker} */ SLEEP(240);",
+            user="root",
+            password=ADMIN_PASSWORD,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            connection = self.admin_query(
+                self.target,
+                "SELECT PROCESSLIST_ID FROM performance_schema.threads "
+                f"WHERE PROCESSLIST_INFO LIKE 'SELECT /* {marker} */%';",
+            ).strip()
+            if connection:
+                return process, int(connection)
+            if process.poll() is not None:
+                break
+            time.sleep(0.1)
+        process.kill()
+        process.wait(timeout=10)
+        raise HarnessError(
+            f"metadata blocker did not acquire transaction lock on {table}"
+        )
+
+    def release_schema_metadata_blocker(
+        self, blocker: tuple[subprocess.Popen[str], int]
+    ) -> None:
+        assert self.target
+        process, connection = blocker
+        self.admin_sql(self.target, f"KILL CONNECTION {connection};")
+        process.wait(timeout=10)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+    def schema_fixture_constraints(self) -> str:
+        assert self.target
+        return self.admin_query(
+            self.target,
+            "SELECT TABLE_NAME,CONSTRAINT_TYPE,CONSTRAINT_NAME "
+            "FROM information_schema.TABLE_CONSTRAINTS "
+            f"WHERE CONSTRAINT_SCHEMA='{APP_SCHEMA}' "
+            "AND TABLE_NAME LIKE 'schema_parallel_%' AND CONSTRAINT_TYPE<>'PRIMARY KEY' "
+            "ORDER BY TABLE_NAME,CONSTRAINT_NAME;",
+        ).strip()
+
+    def run_sync_schema_parallel_resume(self) -> None:
+        assert self.source and self.target
+        run_id = "sync-schema-parallel-resume"
+        child, parent, independent = (
+            "schema_parallel_a_child",
+            "schema_parallel_b_parent",
+            "schema_parallel_c_independent",
+        )
+        tables = [child, parent, independent]
+        for endpoint in (self.source, self.target):
+            for table in (parent, independent, child):
+                self.admin_sql(
+                    endpoint,
+                    f"CREATE TABLE `{table}` (id INT PRIMARY KEY, parent_id INT NOT NULL, "
+                    "value INT NOT NULL, KEY parent_idx(parent_id)) ENGINE=InnoDB;",
+                )
+        for table in tables:
+            self.admin_sql(
+                self.source,
+                f"INSERT INTO `{table}` VALUES (1,1,10),(2,2,20); "
+                f"ALTER TABLE `{table}` ADD CONSTRAINT `{table}_positive` CHECK(value>0);",
+            )
+        self.admin_sql(
+            self.source,
+            f"ALTER TABLE `{parent}` ADD CONSTRAINT `{parent}_upper` CHECK(value<100); "
+            f"ALTER TABLE `{child}` ADD CONSTRAINT `{child}_parent_fk` "
+            f"FOREIGN KEY(parent_id) REFERENCES `{parent}`(id);",
+        )
+        self.reset_target_general_log()
+        blockers = {}
+        process = None
+        pending_sql = (
+            "SELECT GROUP_CONCAT(DISTINCT m.OBJECT_NAME ORDER BY m.OBJECT_NAME) "
+            "FROM performance_schema.metadata_locks m "
+            "JOIN performance_schema.threads t ON t.THREAD_ID=m.OWNER_THREAD_ID "
+            f"WHERE t.PROCESSLIST_USER='{SYNC_TARGET_USER}' "
+            "AND t.PROCESSLIST_INFO LIKE 'ALTER TABLE%' AND m.LOCK_STATUS='PENDING' "
+            f"AND m.OBJECT_SCHEMA='{APP_SCHEMA}';"
+        )
+        try:
+            for table in tables:
+                blockers[table] = self.start_schema_metadata_blocker(table)
+            process, log_path = self.start_sync(
+                tables=tables, run_id=run_id, chunk_size=1, parallelism=2
+            )
+            self.wait_for_schema_fixture(
+                pending_sql, f"{parent},{independent}", process, log_path
+            )
+            sessions = (
+                self.admin_query(
+                    self.target,
+                    "SELECT PROCESSLIST_ID,PROCESSLIST_STATE FROM performance_schema.threads "
+                    f"WHERE PROCESSLIST_USER='{SYNC_TARGET_USER}' "
+                    "AND PROCESSLIST_INFO LIKE 'ALTER TABLE%' ORDER BY PROCESSLIST_ID;",
+                )
+                .strip()
+                .splitlines()
+            )
+            if len(sessions) != 2 or any(
+                "metadata lock" not in row for row in sessions
+            ):
+                raise HarnessError(
+                    f"expected exactly two metadata-blocked ALTER sessions: {sessions}"
+                )
+            print(f"schema_parallel_overlap parallelism=2 sessions={sessions!r}")
+            row_before = {
+                table: self.sync_row_progress_evidence(run_id, table)
+                for table in tables
+            }
+            if any(row["status"] != "complete" for row in row_before.values()):
+                raise HarnessError(
+                    f"ALTER overlap occurred before all row stages completed: {row_before}"
+                )
+
+            self.release_schema_metadata_blocker(blockers.pop(independent))
+            independent_constraint = f"{independent}\tCHECK\t{independent}_positive"
+            constraint_count_sql = (
+                "SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS "
+                f"WHERE CONSTRAINT_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='{independent}' "
+                "AND CONSTRAINT_TYPE='CHECK';"
+            )
+            self.wait_for_schema_fixture(constraint_count_sql, "1", process, log_path)
+            self.wait_for_schema_fixture(pending_sql, parent, process, log_path)
+            # A free worker must not launch the child before its blocked parent finishes.
+            child_submissions = self.admin_query(
+                self.target,
+                "SELECT COUNT(*) FROM mysql.general_log "
+                f"WHERE user_host LIKE '{SYNC_TARGET_USER}%' "
+                f"AND argument LIKE 'ALTER TABLE `{child}`%';",
+            ).strip()
+            if (
+                child_submissions != "0"
+                or self.schema_fixture_constraints() != independent_constraint
+            ):
+                raise HarnessError("dependent child ran before its parent converged")
+            self.stop_sync_process(process)
+            process = None
+            # SIGKILL closes the client; explicitly terminate its blocked server statement
+            # before resume, rather than letting a disconnected DDL finish after lock release.
+            remaining = self.admin_query(
+                self.target,
+                "SELECT PROCESSLIST_ID FROM performance_schema.threads "
+                f"WHERE PROCESSLIST_USER='{SYNC_TARGET_USER}' AND PROCESSLIST_INFO LIKE 'ALTER TABLE%';",
+            ).splitlines()
+            for connection in remaining:
+                self.admin_sql(self.target, f"KILL CONNECTION {int(connection)};")
+            stage_before = self.admin_query(
+                self.target,
+                "SELECT stage,status,COUNT(*) FROM cdc.sync_runs "
+                f"WHERE run_id='{run_id}' GROUP BY stage,status ORDER BY stage,status;",
+            ).strip()
+            if "final_constraints\trunning\t3" not in stage_before:
+                raise HarnessError(
+                    f"did not interrupt the final schema stage: {stage_before!r}"
+                )
+            print(
+                f"schema_parallel_interrupted stages={stage_before!r} constraints={independent_constraint!r}"
+            )
+
+            process, log_path = self.start_sync(
+                tables=tables, run_id=run_id, chunk_size=1, parallelism=2
+            )
+            self.wait_for_schema_fixture(pending_sql, parent, process, log_path)
+            self.release_schema_metadata_blocker(blockers.pop(parent))
+            self.wait_for_schema_fixture(pending_sql, child, process, log_path)
+            parent_constraints = self.schema_fixture_constraints().splitlines()
+            expected_partial = [
+                f"{parent}\tCHECK\t{parent}_positive",
+                f"{parent}\tCHECK\t{parent}_upper",
+                independent_constraint,
+            ]
+            if parent_constraints != expected_partial:
+                raise HarnessError(
+                    f"child started before all parent statements completed: {parent_constraints}"
+                )
+            self.release_schema_metadata_blocker(blockers.pop(child))
+            process.wait(timeout=90)
+            if process.returncode:
+                raise HarnessError(
+                    f"schema-stage resume failed: {log_path.read_text()}"
+                )
+            self.stop_sync_process(process)
+            process = None
+            self.assert_schema_parallel_resumed(tables, run_id, row_before)
+        finally:
+            if process is not None:
+                self.stop_sync_process(process)
+            for blocker in blockers.values():
+                self.release_schema_metadata_blocker(blocker)
+
+    def assert_schema_parallel_resumed(
+        self, tables: list[str], run_id: str, row_before: dict[str, dict[str, str]]
+    ) -> None:
+        assert self.source and self.target
+        child, parent, independent = tables
+        expected = sorted(
+            [
+                f"{child}\tFOREIGN KEY\t{child}_parent_fk",
+                f"{child}\tCHECK\t{child}_positive",
+                f"{parent}\tCHECK\t{parent}_positive",
+                f"{parent}\tCHECK\t{parent}_upper",
+                f"{independent}\tCHECK\t{independent}_positive",
+            ],
+            key=lambda row: (row.split("\t")[0], row.split("\t")[2]),
+        )
+        if self.schema_fixture_constraints().splitlines() != expected:
+            raise HarnessError(
+                f"resume constraints differ: {self.schema_fixture_constraints()!r}"
+            )
+        for table in tables:
+            for endpoint in (self.source, self.target):
+                data = self.admin_query(
+                    endpoint, f"SELECT id,parent_id,value FROM `{table}` ORDER BY id;"
+                ).strip()
+                if data != "1\t1\t10\n2\t2\t20":
+                    raise HarnessError(f"schema resume corrupted {table}: {data!r}")
+            if self.sync_row_progress_evidence(run_id, table) != row_before[table]:
+                raise HarnessError(
+                    f"schema resume replayed completed row progress for {table}"
+                )
+            self.assert_admin_sql_rejected(
+                self.target, f"INSERT INTO `{table}` VALUES (3,1,-1);", "3819"
+            )
+        self.assert_admin_sql_rejected(
+            self.target, f"INSERT INTO `{parent}` VALUES (3,1,100);", "3819"
+        )
+        self.assert_admin_sql_rejected(
+            self.target, f"INSERT INTO `{child}` VALUES (3,999,10);", "1452"
+        )
+        stages = self.admin_query(
+            self.target,
+            "SELECT stage,status,COUNT(*) FROM cdc.sync_runs "
+            f"WHERE run_id='{run_id}' GROUP BY stage,status ORDER BY stage,status;",
+        ).strip()
+        expected_stages = "final_constraints\tcomplete\t3\nprerequisite_schema\tcomplete\t3\nrows\tcomplete\t3"
+        if stages != expected_stages:
+            raise HarnessError(f"schema resume stages not complete: {stages!r}")
+        independent_alters = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM mysql.general_log "
+            f"WHERE user_host LIKE '{SYNC_TARGET_USER}%' "
+            f"AND argument LIKE 'ALTER TABLE `{independent}`%';",
+        ).strip()
+        if independent_alters != "1":
+            raise HarnessError(
+                f"resume repeated already-applied independent DDL: {independent_alters}"
+            )
+        print(
+            "sync_schema_parallel_resume_ok overlap=2 dependency_order=true "
+            "same_run=true completed_rows_preserved=true committed_ddl_preserved=true "
+            "constraints=5 rows=6 check_and_fk_enforced=true"
+        )
+
     def run_sync_resume(self) -> None:
         assert self.source and self.target
         run_id = "sync-resume"
@@ -4064,6 +4345,8 @@ class Harness:
             self.run_sync_bit_values()
         elif scenario == "sync-resume":
             self.run_sync_resume()
+        elif scenario == "sync-schema-parallel-resume":
+            self.run_sync_schema_parallel_resume()
         elif scenario == "sync-progress-least-privilege":
             self.run_sync_progress_least_privilege()
         elif scenario == "writable-column-generated-metadata":
