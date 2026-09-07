@@ -191,6 +191,47 @@ fn sync_table_conversion_preserves_order_excludes_generated_columns_and_parses_e
 }
 
 #[test]
+fn sync_table_uses_declaration_order_for_numeric_enum_primary_key_pages() {
+    let table = inventory_table(
+        vec!["id", "statistic"],
+        vec![
+            column("id", 1, "bigint", None),
+            column("statistic", 2, "enum('10','2','1')", None),
+            column("payload", 3, "varchar(255)", None),
+        ],
+    );
+    let table = sync_table_from_inventory(&table).expect("sync table");
+    let first_page = decode_sync_rows(
+        &table,
+        vec![vec![
+            Some("7".to_string()),
+            Some("2".to_string()),
+            Some("first".to_string()),
+        ]],
+    )
+    .expect("first page");
+
+    assert_eq!(first_page[0].primary_key, strings(["7", "2"]));
+    assert_eq!(
+        build_sync_select_sql(
+            &table,
+            &crate::sync::SyncChunkReadRequest {
+                start_after: Some(first_page[0].primary_key.clone()),
+                end_at: Some(strings(["9", "1"])),
+                limit: 2,
+            },
+        ),
+        "SELECT `id`, CAST(`statistic` AS UNSIGNED) AS `statistic`, `payload` FROM `episodes` WHERE ((`id` > '7') OR (`id` = '7' AND FIELD(`statistic`, '10', '2', '1') > FIELD('2', '10', '2', '1'))) AND NOT ((`id` > '9') OR (`id` = '9' AND FIELD(`statistic`, '10', '2', '1') > FIELD('1', '10', '2', '1'))) ORDER BY `id`, FIELD(`statistic`, '10', '2', '1') LIMIT 2"
+    );
+    assert_eq!(
+        build_exact_primary_key_select_statement(&table, &first_page[0].primary_key)
+            .expect("numeric enum primary key")
+            .params,
+        vec![Value::Bytes(b"7".to_vec()), Value::UInt(2)]
+    );
+}
+
+#[test]
 fn sync_table_conversion_marks_non_generated_bit_columns() {
     let table = inventory_table(
         vec!["id"],
