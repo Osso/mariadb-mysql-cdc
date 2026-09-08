@@ -615,7 +615,7 @@ fn repair_source_present(
     report: &mut FkOrphanRepairReport,
 ) -> Result<(), String> {
     let source_parent =
-        validate_repair_parents(spec, metadata, primary_key, &source_child, backend)?;
+        reconcile_repair_parent(spec, metadata, primary_key, &source_child, backend)?;
     // Parent CASCADE may already have changed this child inside the batch.
     let target_before = if spec.restores_comics_parent() {
         backend
@@ -637,7 +637,7 @@ fn repair_source_present(
     )
 }
 
-fn validate_repair_parents(
+fn reconcile_repair_parent(
     spec: &RepairCaseSpec,
     metadata: &RepairMetadata,
     primary_key: &[String],
