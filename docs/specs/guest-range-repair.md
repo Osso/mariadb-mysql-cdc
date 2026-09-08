@@ -33,11 +33,12 @@ A bounded, insert-only repair for an explicitly supplied inclusive `guests.guest
 ## Tests asserting this spec
 - `src/sync/guest_range_repair/tests.rs`: multi-page full-value insert/rerun, source count mismatch, differing existing rows, missing parent, corrupt readback, commit failure, invalid bounds/batch limits.
 - `src/sync/guest_range_repair/mysql_backend.rs` tests: canonical FK, PK/engine/type/nullability/width/collation parity, binary SQL parameter preservation.
+- `scripts/cdc-integration-harness.py` scenario `repair-guest-range`: disposable MariaDB-to-MySQL fixture for an exact inclusive range, binary/ENUM values, `guests → utms`, untouched sessions/control-plane sentinels, rollback, and rerun behavior.
 - September 8, 2026: `cargo test --bin mariadb-mysql-cdc guest_range_repair:: -- --nocapture` passed 11 tests at `f9749a1`, no warnings. Core stub tests, metadata width rejection, and binary parameter preservation each had preceding failing evidence. This is seam proof, not live database proof.
 
 ## Known gaps (current cycle)
-- [ ] Parent integration owns CLI wiring and database-backed proof of SQL, transaction/lock semantics, canonical metadata, and post-repair child FK validation.
-- [ ] Database harness must prove byte preservation after observed VARBINARY corruption; SQL-bound byte regression supplements but does not replace this boundary test.
+- [ ] Run the disposable `repair-guest-range` harness scenario against the integrated command; fixture coverage does not establish live-range execution.
+- [ ] Independently verify a live exact-range repair before claiming CDC recovery progress; live execution has not occurred.
 
 ## Out of scope
 - Production identifiers, hardcoded repair ranges, deployment, broad verification, and broker operations.

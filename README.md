@@ -67,6 +67,18 @@ stream manifest, then commit or push it. A failed gate may leave the candidate i
 the registry but leaves ops reconciliation unchanged. Unified sync Jobs remain
 reviewed and managed separately; `deploy.sh` does not create or update them.
 
+## Bounded target repairs
+
+`repair-guest-range` restores one explicitly supplied inclusive `guests.guest_id`
+range from the source. It requires the exact expected row count and uses batches
+of at most 1,000 rows. It inserts missing full guest rows only; equal rows make a
+rerun safe and any differing existing target row fails closed. It validates the
+required `guests → utms` relationship without changing `sessions` or CDC
+control-plane tables. See [guest range repair](docs/specs/guest-range-repair.md).
+
+`repair-fk-orphans` remains a separate, allowlisted repair with its own 1,000-row
+orphan limit. See [FK orphan repair](docs/specs/fk-orphan-repair.md).
+
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in
