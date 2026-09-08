@@ -3826,8 +3826,10 @@ class Harness:
             else "comic_id" + (f",`{child_col}`" if child_col else "")
         )
         ddl = (
-            "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS releases,comics_langs,comics; SET FOREIGN_KEY_CHECKS=1;"
-            f"CREATE TABLE comics (id BIGINT PRIMARY KEY{parent_extra}, payload MEDIUMBLOB NOT NULL, state ENUM('','live') NOT NULL, UNIQUE KEY parent_key ({parent_key}));"
+            "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS releases,comics_langs,comics,artists; SET FOREIGN_KEY_CHECKS=1;"
+            "CREATE TABLE artists (id BIGINT PRIMARY KEY,name VARCHAR(32) NOT NULL,payload MEDIUMBLOB NOT NULL,state ENUM('','live') NOT NULL,UNIQUE KEY artist_key(id,name));"
+            f"CREATE TABLE comics (id BIGINT PRIMARY KEY{parent_extra}, payload MEDIUMBLOB NOT NULL, state ENUM('','live') NOT NULL,artist_id BIGINT NOT NULL,artist_name VARCHAR(32) NOT NULL, UNIQUE KEY parent_key ({parent_key}),"
+            "CONSTRAINT comics_ibfk_5 FOREIGN KEY(artist_id,artist_name) REFERENCES artists(id,name) ON UPDATE CASCADE ON DELETE RESTRICT);"
             f"CREATE TABLE `{child}` (id BIGINT PRIMARY KEY,comic_id BIGINT NOT NULL{child_extra},"
             f"CONSTRAINT `{constraint}` FOREIGN KEY ({child_key}) REFERENCES comics ({parent_key}) ON UPDATE CASCADE ON DELETE RESTRICT);"
         )
@@ -3835,8 +3837,17 @@ class Harness:
         fk_clause = f"CONSTRAINT `{constraint}` FOREIGN KEY ({child_key}) REFERENCES comics ({parent_key}) ON UPDATE CASCADE ON DELETE RESTRICT"
         self.admin_sql(self.target, ddl.replace("," + fk_clause, ""))
         values = lambda key, value: (
-            f"({key}" + (f",'{value}'" if parent_col else "") + ",X'00FF80','live')"
+            f"({key}"
+            + (f",'{value}'" if parent_col else "")
+            + f",X'00FF80','live',{key + 10},'artist{key}')"
         )
+        artist_missing = "(11,'artist1',X'00FE81','')"
+        artist_existing = "(12,'artist2',X'FF0082','live')"
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO artists VALUES {artist_missing},{artist_existing};",
+        )
+        self.admin_sql(self.target, f"INSERT INTO artists VALUES {artist_existing};")
         self.admin_sql(
             self.source,
             "INSERT INTO comics VALUES "
@@ -3863,13 +3874,31 @@ class Harness:
         snapshot_sql = (
             f"SELECT * FROM `{child}` ORDER BY id; SELECT id"
             + (f",`{parent_col}`" if parent_col else "")
-            + ",HEX(payload),state+0 FROM comics ORDER BY id;"
+            + ",HEX(payload),state+0,artist_id,artist_name FROM comics ORDER BY id;"
+            "SELECT id,name,HEX(payload),state+0 FROM artists ORDER BY id;"
         )
-        before = self.admin_query(self.target, snapshot_sql)
         source_before = self.admin_query(self.source, snapshot_sql)
         self.admin_sql(
             self.target,
-            f"DELIMITER $$\nCREATE TRIGGER repair_fail BEFORE UPDATE ON `{child}` FOR EACH ROW BEGIN IF NEW.id=2 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='repair child write blocked'; END IF; END$$\nDELIMITER ;\n",
+            "INSERT INTO artists VALUES (11,'wrong-artist',X'AA','live');",
+        )
+        mismatch_before = self.admin_query(self.target, snapshot_sql)
+        mismatch = self.run_repair_fk_case(case, 3)
+        if mismatch.returncode == 0:
+            raise HarnessError(f"{case} accepted existing artist key mismatch")
+        if self.admin_query(self.target, snapshot_sql) != mismatch_before:
+            raise HarnessError(f"{case} mutated rows on artist key mismatch refusal")
+        self.admin_sql(self.target, "DELETE FROM artists WHERE id=11;")
+        before = self.admin_query(self.target, snapshot_sql)
+        self.admin_sql(
+            self.target,
+            f"DELIMITER $$\nCREATE TRIGGER repair_fail BEFORE UPDATE ON `{child}` FOR EACH ROW BEGIN "
+            "IF NEW.id=2 THEN "
+            "IF NOT EXISTS(SELECT 1 FROM artists WHERE id=11 AND name='artist1' AND payload=X'00FE81' AND state+0=1) "
+            "OR NOT EXISTS(SELECT 1 FROM comics WHERE id=1 AND artist_id=11 AND artist_name='artist1') "
+            f"OR NOT EXISTS(SELECT 1 FROM `{child}` WHERE id=1 AND comic_id=1) THEN "
+            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='repair ancestor ordering missing'; END IF; "
+            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='repair child write blocked'; END IF; END$$\nDELIMITER ;\n",
         )
         failed = self.run_repair_fk_case(case, 3)
         if failed.returncode == 0 or "repair child write blocked" not in failed.stderr:
@@ -3877,7 +3906,9 @@ class Harness:
                 f"{case} did not reach post-parent rollback boundary: {failed}"
             )
         if self.admin_query(self.target, snapshot_sql) != before:
-            raise HarnessError(f"{case} leaked parent/child mutation after rollback")
+            raise HarnessError(
+                f"{case} leaked artist/parent/child mutation after rollback"
+            )
         self.admin_sql(self.target, "DROP TRIGGER repair_fail;")
         repaired = self.run_repair_fk_case(case, 3)
         require_success(repaired, case)
@@ -3892,6 +3923,8 @@ class Harness:
         ):
             raise HarnessError(f"{case} source/target exact row fidelity mismatch")
         require_success(self.run_repair_fk_case(case, 0), case + " idempotence")
+        if self.admin_query(self.target, snapshot_sql) != source_before:
+            raise HarnessError(f"{case} idempotent rerun changed exact rows")
         self.admin_sql(self.target, f"ALTER TABLE `{child}` ADD {fk_clause};")
         if parent_col:
             self.admin_sql(
@@ -3914,7 +3947,7 @@ class Harness:
             "1452",
         )
         print(
-            f"repair_parent_case_pass case={case} updated=2 deleted=1 rollback=exact idempotent=true"
+            f"repair_parent_case_pass case={case} updated=2 deleted=1 artist_comic_child_order=true rollback=exact idempotent=true artist_key_mismatch=refused"
         )
 
     def repair_artists_favorites_fixture(self) -> None:
