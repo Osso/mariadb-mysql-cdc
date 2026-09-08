@@ -105,15 +105,12 @@ impl FkOrphanRepairBackend for MySqlFkOrphanRepairBackend {
             .target
             .query::<mysql::Row, _>(&sql)
             .map_err(|error| format!("query target FK orphan identities: {error}"))?;
-        let primary_keys =
-            decode_primary_keys(&metadata.target_child, mysql_rows_to_strings(rows))?;
-        if primary_keys.len() > limit {
-            return Err(format!(
-                "target FK orphan count for `{}` exceeds limit {limit}",
-                spec.name
-            ));
-        }
-        Ok(primary_keys)
+        decode_primary_keys(
+            spec,
+            &metadata.target_child,
+            mysql_rows_to_strings(rows),
+            limit,
+        )
     }
 
     fn begin_batch(
@@ -495,9 +492,8 @@ fn build_orphan_keys_sql(spec: &RepairCaseSpec, child: &SyncTable, limit: usize)
         "{} IS NULL",
         qualified(spec.parent_table, spec.parent_primary_key[0])
     );
-    let order_by = qualified_columns(spec.child_table, &child.primary_key);
     format!(
-        "SELECT {selected_primary_key} FROM {} LEFT JOIN {} ON {join} WHERE {non_null} AND {missing_parent} ORDER BY {order_by} LIMIT {limit}",
+        "SELECT {selected_primary_key} FROM {} LEFT JOIN {} ON {join} WHERE {non_null} AND {missing_parent} LIMIT {limit}",
         quote_ident(spec.child_table),
         quote_ident(spec.parent_table),
     )
@@ -600,10 +596,19 @@ fn qualified(table: &str, column: &str) -> String {
 }
 
 fn decode_primary_keys(
+    spec: &RepairCaseSpec,
     table: &SyncTable,
     rows: Vec<Vec<Option<String>>>,
+    limit: usize,
 ) -> Result<Vec<Vec<String>>, String> {
-    rows.into_iter()
+    if rows.len() > limit {
+        return Err(format!(
+            "target FK orphan count for `{}` exceeds limit {limit}",
+            spec.name
+        ));
+    }
+    let mut primary_keys = rows
+        .into_iter()
         .map(|row| {
             if row.len() != table.primary_key.len() {
                 return Err(format!(
@@ -625,7 +630,9 @@ fn decode_primary_keys(
                 })
                 .collect()
         })
-        .collect()
+        .collect::<Result<Vec<Vec<String>>, String>>()?;
+    primary_keys.sort();
+    Ok(primary_keys)
 }
 
 fn parent_primary_key(
@@ -679,15 +686,45 @@ mod tests {
     use crate::sync::model::SyncPrimaryKeyOrdering;
 
     #[test]
-    fn orphan_query_is_bounded_and_uses_exact_allowlisted_join() {
+    fn orphan_candidates_are_deterministic_across_unordered_rows() {
+        let table = sync_table("children", &["id", "lang"]);
+        let expected = vec![
+            strings(&["10", "en"]),
+            strings(&["2", "en"]),
+            strings(&["2", "fr"]),
+        ];
+        for keys in [
+            vec![vec!["2", "fr"], vec!["10", "en"], vec!["2", "en"]],
+            vec![vec!["2", "en"], vec!["2", "fr"], vec!["10", "en"]],
+        ] {
+            let rows = keys
+                .into_iter()
+                .map(|key| key.into_iter().map(|v| Some(v.to_string())).collect())
+                .collect();
+            assert_eq!(
+                decode_primary_keys(
+                    &super::super::FkOrphanRepairCase::PhrasesSuggestions.spec(),
+                    &table,
+                    rows,
+                    3
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_candidates_reject_overflow_instead_of_returning_a_subset() {
         let spec = super::super::FkOrphanRepairCase::PhrasesSuggestions.spec();
-        let child = sync_table(spec.child_table, spec.child_primary_key);
-
-        let sql = build_orphan_keys_sql(&spec, &child, 2);
-
+        let child = sync_table("children", &["id"]);
+        let rows = ["3", "1", "2"]
+            .into_iter()
+            .map(|id| vec![Some(id.to_string())])
+            .collect();
         assert_eq!(
-            sql,
-            "SELECT `phrases_suggestions`.`id`, `phrases_suggestions`.`lang`, `phrases_suggestions`.`author_id` FROM `phrases_suggestions` LEFT JOIN `users` ON `phrases_suggestions`.`author_id` = `users`.`id` AND `phrases_suggestions`.`author_username` = `users`.`name` WHERE `phrases_suggestions`.`author_id` IS NOT NULL AND `phrases_suggestions`.`author_username` IS NOT NULL AND `users`.`id` IS NULL ORDER BY `phrases_suggestions`.`id`, `phrases_suggestions`.`lang`, `phrases_suggestions`.`author_id` LIMIT 2"
+            decode_primary_keys(&spec, &child, rows, 2).unwrap_err(),
+            format!("target FK orphan count for `{}` exceeds limit 2", spec.name)
         );
     }
 
