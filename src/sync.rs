@@ -1,6 +1,7 @@
 mod chunk;
 mod config;
 mod fk_orphan_repair;
+pub(crate) mod guest_range_repair;
 mod model;
 mod mysql;
 mod orchestrate;

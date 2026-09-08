@@ -34,6 +34,13 @@ fn help_documents_one_unified_sync_command() {
 }
 
 #[test]
+fn help_documents_exact_guest_range_repair() {
+    let output = run(&["--help"]);
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("mariadb-mysql-cdc repair-guest-range "));
+}
+
+#[test]
 fn help_documents_bounded_fk_orphan_repair() {
     let output = run(&["--help"]);
 

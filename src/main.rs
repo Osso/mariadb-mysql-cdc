@@ -34,6 +34,7 @@ Usage:
   mariadb-mysql-cdc plan
   mariadb-mysql-cdc probe --host HOST --user USER --password-env ENV [options]
   mariadb-mysql-cdc sync --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --table TABLE [--table TABLE ...] (--run-id ID | --run-id-prefix PREFIX) [options]
+  mariadb-mysql-cdc repair-guest-range --start-guest-id ID --end-guest-id ID --expected-rows COUNT [connection options] [--batch-size COUNT]
   mariadb-mysql-cdc repair-fk-orphans --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --case CASE --expected-orphans COUNT [options]
   mariadb-mysql-cdc table-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --syncable-output PATH --non-syncable-output PATH
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
@@ -133,6 +134,9 @@ fn main() {
         Some("plan") => print_plan(),
         Some("probe") => run_probe_command(args.collect()),
         Some("sync") => sync_cli::run_sync_command(args.collect(), USAGE),
+        Some("repair-guest-range") => {
+            sync::guest_range_repair::run_guest_range_repair_command(args.collect(), USAGE)
+        }
         Some("repair-fk-orphans") => sync::run_fk_orphan_repair_command(args.collect(), USAGE),
         Some("table-catalog") => table_catalog::run_table_catalog_command(args.collect(), USAGE),
         Some("sync-catalog") => table_catalog::run_sync_catalog_command(args.collect(), USAGE),
