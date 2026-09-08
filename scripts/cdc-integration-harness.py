@@ -3854,7 +3854,7 @@ class Harness:
         source_before = self.admin_query(self.source, snapshot_sql)
         self.admin_sql(
             self.target,
-            f"CREATE TRIGGER repair_fail BEFORE UPDATE ON `{child}` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='repair child write blocked';",
+            f"DELIMITER $$\nCREATE TRIGGER repair_fail BEFORE UPDATE ON `{child}` FOR EACH ROW BEGIN IF NEW.id=2 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='repair child write blocked'; END IF; END$$\nDELIMITER ;\n",
         )
         failed = self.run_repair_fk_case(case, 3)
         if failed.returncode == 0 or "repair child write blocked" not in failed.stderr:
@@ -3877,6 +3877,21 @@ class Harness:
         ):
             raise HarnessError(f"{case} source/target exact row fidelity mismatch")
         require_success(self.run_repair_fk_case(case, 0), case + " idempotence")
+        if parent_col:
+            self.admin_sql(
+                self.target,
+                f"UPDATE comics SET `{parent_col}`='cascade-proof' WHERE id=1;",
+            )
+            cascaded = self.admin_query(
+                self.target, f"SELECT `{child_col}` FROM `{child}` WHERE id=1;"
+            ).strip()
+            if cascaded != "cascade-proof":
+                raise HarnessError(
+                    f"{case} ON UPDATE CASCADE not enforced: {cascaded!r}"
+                )
+        self.assert_admin_sql_rejected(
+            self.target, "DELETE FROM comics WHERE id=1;", "1451"
+        )
         self.assert_admin_sql_rejected(
             self.target,
             f"INSERT INTO `{child}` VALUES {row(99, 999, 'missing')};",
