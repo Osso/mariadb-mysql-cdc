@@ -3785,7 +3785,7 @@ class Harness:
                 "releases",
                 "releases_ibfk_format",
                 "comic_format_id",
-                "format_id",
+                "comic_format_id",
             ),
         ]
         for case, child, constraint, child_col, parent_col in cases:
