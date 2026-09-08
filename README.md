@@ -240,13 +240,13 @@ dependent operations are skipped. The staged run persists progress in
 
 ## FK orphan repair
 
-`repair-fk-orphans` is a separate, bounded source-authoritative tool for the four
-allowlisted historical composite-FK orphan sets. It requires an exact
+`repair-fk-orphans` is a separate, bounded source-authoritative target repair for
+four historical child-only cases and ten exact `comics_langs`/`releases` FK cases.
+The ten comics-parent cases may restore only the complete source `comics` row before
+the child; the original four never write parents. Every invocation requires an exact
 `--expected-orphans` count, defaults to `--batch-size 50` and `--limit 1000`, and
 never writes staged progress, stream checkpoints, DDL journals, or run-spec state.
-Run one case at a time and proceed sequentially only after the previous case has
-committed, verified zero remaining orphans, and produced terminal evidence. The
-full CLI contract is [bounded FK orphan repair](docs/specs/fk-orphan-repair.md).
+Run one case at a time only after prior terminal evidence. Details: [spec](docs/specs/fk-orphan-repair.md), [runtime flow](docs/wiki/systems/fk-orphan-repair.md). Live repair requires separate operator authorization.
 
 ## Commands
 

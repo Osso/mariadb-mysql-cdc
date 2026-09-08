@@ -43,7 +43,7 @@ implementation details belong in the [FK orphan repair wiki](../wiki/systems/fk-
 - [x] Only for the allowlisted `comics_langs`/`releases` cases, restore a missing or stale `comics` parent from its complete source row before copying the child. Use strict metadata-aware insert/update with constraints enabled; lock the parent WRITE and child WRITE in the same batch. Re-read the child after parent CASCADE before deciding whether it needs an update.
 - [x] Require exact full-row target parent equality and unchanged source child/parent after restoration. Any mutation or verification failure rolls back the entire batch, including parent and CASCADE changes.
 - [x] When the source child is absent, delete only the exact target child primary-key row; never create or mutate parent rows.
-- [ ] Verify source stability, target child state, target parent identity, and zero remaining selected orphan identities after mutation.
+- [x] Verify source stability, target child state, target parent identity when applicable, and zero remaining selected orphan identities after mutation.
 - [x] Roll back and unlock on batch-start, mutation, verification, commit, or cleanup failure.
 
 ### Durable-state and operations boundary
@@ -67,14 +67,14 @@ implementation details belong in the [FK orphan repair wiki](../wiki/systems/fk-
 
 ## Tests asserting this spec
 
-- `src/sync/fk_orphan_repair/tests.rs` — exact allowlisted identities, source-present update, source-absent delete, invalid source relationship refusal, failed batch cleanup, and zero-orphan idempotence.
-- `src/sync/fk_orphan_repair/mysql_backend.rs` — bounded orphan query, exact allowlisted join, and selected-table lock SQL coverage.
+- `src/sync/fk_orphan_repair/tests.rs` — allowlisted identities, legacy parent-write refusal, parent-first restore, CASCADE rollback, source stability, cleanup, and idempotence.
+- `scripts/cdc-integration-harness.py` scenario `repair-fk-orphans-parents` — disposable MariaDB-to-MySQL proof for all ten comics-parent selectors, strict constraints, complete parent restoration, child repair, source-absent deletion, and unchanged CDC control-plane sentinel/data.
+- `src/sync/fk_orphan_repair/mysql_backend.rs` — bounded orphan query, exact allowlisted join, selected-table locks, and strict target mutations.
 - `tests/sync_cli.rs` — command help and description.
 
-## Known gaps (current cycle)
+## Validation scope
 
-- [ ] Prove all allowlisted cases against disposable production-shaped MariaDB/MySQL endpoints with the exact expected counts and target metadata.
-- [ ] Record production one-shot evidence for sequential execution and zero remaining orphan identities.
+The disposable parent scenario proves the ten exact `comics_langs`/`releases` selectors only. It does not authorize or record a live repair. Production evidence must re-read each selected orphan count, confirm the selected FK is absent, run one case at a time, and retain zero-remaining proof. The original four retain child-only behavior.
 
 ## Out of scope
 

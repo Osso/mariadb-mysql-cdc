@@ -71,3 +71,14 @@ purged history, not proof that the skipped interval was replayed.
 Production execution, restart health, and post-transition `verified` evidence
 remain open until measured and recorded; this document does not claim recovery
 completion.
+
+## FK orphan repair proof boundary
+
+`repair-fk-orphans` is outside staged recovery progress. Its disposable
+`repair-fk-orphans-parents` scenario proves strict, source-authoritative restoration
+for the ten explicit `comics_langs`/`releases` selectors, with constraints enabled
+and no changed CDC control-plane rows. It does not prove a live repair or authorize
+one. A live case must independently re-read its exact bounded count and selected-FK
+absence, retain source/target evidence, and prove zero remaining identities without
+writing recovery progress, checkpoints, journals, or source rows. See the [FK orphan
+repair spec](specs/fk-orphan-repair.md).
