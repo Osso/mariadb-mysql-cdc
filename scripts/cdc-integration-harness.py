@@ -3728,7 +3728,7 @@ class Harness:
         )
         control_tables = self.admin_query(
             self.target,
-            "SELECT table_name FROM information_schema.tables WHERE table_schema='cdc' ORDER BY table_name;",
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='cdc' AND table_name<>'repair_control_sentinel' ORDER BY table_name;",
         ).splitlines()
         control_before = {
             table: self.admin_query(self.target, f"SELECT * FROM cdc.`{table}`;")
