@@ -1,5 +1,7 @@
 use super::*;
 
+type FixtureRows = BTreeMap<Vec<String>, DatabaseRow>;
+
 #[derive(Default)]
 struct FakeBackend {
     source_children: BTreeMap<Vec<String>, DatabaseRow>,
@@ -11,10 +13,7 @@ struct FakeBackend {
     fail_child: bool,
     mutate_source_parent: bool,
     cascade_parent: bool,
-    snapshot: Option<(
-        BTreeMap<Vec<String>, DatabaseRow>,
-        BTreeMap<Vec<String>, DatabaseRow>,
-    )>,
+    snapshot: Option<(FixtureRows, FixtureRows)>,
 }
 
 impl FkOrphanRepairBackend for FakeBackend {
