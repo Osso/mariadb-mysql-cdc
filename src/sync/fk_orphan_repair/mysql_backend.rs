@@ -18,7 +18,7 @@ use crate::sync::mysql::{
 };
 use crate::sync::sql::{
     build_exact_primary_key_select_statement, build_strict_delete_rows_statement,
-    build_strict_update_rows_statement,
+    build_strict_insert_statement, build_strict_update_rows_statement,
 };
 use crate::target::SqlStatement;
 use mysql::prelude::Queryable;
@@ -189,6 +189,21 @@ impl FkOrphanRepairBackend for MySqlFkOrphanRepairBackend {
             &primary_key,
             "target repair parent",
         )
+    }
+
+    fn restore_target_parent(
+        &mut self,
+        metadata: &RepairMetadata,
+        parent: &DatabaseRow,
+        exists: bool,
+    ) -> Result<(), String> {
+        let rows = std::slice::from_ref(parent);
+        let statement = if exists {
+            build_strict_update_rows_statement(&metadata.target_parent, rows)?
+        } else {
+            build_strict_insert_statement(&metadata.target_parent, rows)?
+        };
+        execute_exact_target_mutation(&mut self.target, statement, "restore target repair parent")
     }
 
     fn update_target_child(
@@ -390,6 +405,9 @@ fn validate_case_columns(
             spec.parent_table
         ));
     }
+    if spec.restores_comics_parent() {
+        require_columns(child, &["comic_id"], "explicit comics parent identity")?;
+    }
     require_columns(child, spec.child_foreign_key, "child foreign key")?;
     require_columns(parent, spec.parent_key, "parent key")
 }
@@ -473,11 +491,16 @@ fn non_null_foreign_key_filter(spec: &RepairCaseSpec) -> String {
 
 fn build_lock_tables_sql(database: &str, spec: &RepairCaseSpec) -> String {
     format!(
-        "LOCK TABLES {}.{} WRITE, {}.{} READ",
+        "LOCK TABLES {}.{} WRITE, {}.{} {}",
         quote_ident(database),
         quote_ident(spec.child_table),
         quote_ident(database),
-        quote_ident(spec.parent_table)
+        quote_ident(spec.parent_table),
+        if spec.restores_comics_parent() {
+            "WRITE"
+        } else {
+            "READ"
+        }
     )
 }
 
@@ -542,6 +565,11 @@ fn parent_primary_key(
     child: &DatabaseRow,
     endpoint: &str,
 ) -> Result<Vec<String>, String> {
+    if spec.restores_comics_parent() {
+        return Ok(vec![
+            required_row_value(child, "comic_id", endpoint)?.to_string(),
+        ]);
+    }
     spec.parent_primary_key
         .iter()
         .map(|parent_column| {

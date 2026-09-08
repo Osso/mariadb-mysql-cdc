@@ -44,6 +44,24 @@ pub(super) struct RepairCaseSpec {
     pub(super) delete_rule: &'static str,
 }
 
+impl RepairCaseSpec {
+    pub(super) fn restores_comics_parent(&self) -> bool {
+        matches!(
+            self.name,
+            "comics-langs-category"
+                | "comics-langs-type"
+                | "releases-name"
+                | "releases-type"
+                | "releases-category"
+                | "releases-visibility"
+                | "releases-id"
+                | "releases-slug"
+                | "releases-show-in-list"
+                | "releases-format"
+        )
+    }
+}
+
 impl FkOrphanRepairCase {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
@@ -309,6 +327,12 @@ pub(super) trait FkOrphanRepairBackend {
         metadata: &RepairMetadata,
         child: &DatabaseRow,
     ) -> Result<Option<DatabaseRow>, String>;
+    fn restore_target_parent(
+        &mut self,
+        metadata: &RepairMetadata,
+        parent: &DatabaseRow,
+        exists: bool,
+    ) -> Result<(), String>;
     fn update_target_child(
         &mut self,
         metadata: &RepairMetadata,
@@ -592,6 +616,16 @@ fn repair_source_present(
 ) -> Result<(), String> {
     let source_parent =
         validate_repair_parents(spec, metadata, primary_key, &source_child, backend)?;
+    // Parent CASCADE may already have changed this child inside the batch.
+    let target_before = if spec.restores_comics_parent() {
+        backend
+            .read_target_child(metadata, primary_key)?
+            .ok_or_else(|| {
+                format!("target child disappeared after parent restoration: {primary_key:?}")
+            })?
+    } else {
+        target_before
+    };
     apply_source_child(metadata, target_before, &source_child, backend, report)?;
     verify_repaired_relationship(
         spec,
@@ -614,10 +648,25 @@ fn validate_repair_parents(
         .read_source_parent(spec, metadata, source_child)?
         .ok_or_else(|| format!("source parent is missing for primary key {primary_key:?}"))?;
     validate_child_parent_relationship(spec, source_child, &source_parent, "source")?;
-    let target_parent = backend
-        .read_target_parent(spec, metadata, source_child)?
-        .ok_or_else(|| format!("target parent is missing for primary key {primary_key:?}"))?;
-    validate_parent_identity(spec, &source_parent, &target_parent, primary_key)?;
+    let target_parent = backend.read_target_parent(spec, metadata, source_child)?;
+    if spec.restores_comics_parent() {
+        if target_parent.as_ref() != Some(&source_parent) {
+            backend.restore_target_parent(metadata, &source_parent, target_parent.is_some())?;
+        }
+        if backend
+            .read_target_parent(spec, metadata, source_child)?
+            .as_ref()
+            != Some(&source_parent)
+        {
+            return Err(format!(
+                "target parent verification failed for primary key {primary_key:?}"
+            ));
+        }
+    } else {
+        let target_parent = target_parent
+            .ok_or_else(|| format!("target parent is missing for primary key {primary_key:?}"))?;
+        validate_parent_identity(spec, &source_parent, &target_parent, primary_key)?;
+    }
     Ok(source_parent)
 }
 
@@ -668,6 +717,11 @@ fn verify_repaired_relationship(
     let target_parent_after = backend
         .read_target_parent(spec, metadata, source_child)?
         .ok_or_else(|| format!("target parent disappeared for primary key {primary_key:?}"))?;
+    if spec.restores_comics_parent() && target_parent_after != *source_parent {
+        return Err(format!(
+            "target parent verification failed for primary key {primary_key:?}"
+        ));
+    }
     validate_parent_identity(spec, source_parent, &target_parent_after, primary_key)?;
     validate_child_parent_relationship(spec, source_child, &target_parent_after, "target")
 }

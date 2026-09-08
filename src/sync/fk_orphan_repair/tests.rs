@@ -8,6 +8,13 @@ struct FakeBackend {
     target_parents: BTreeMap<Vec<String>, DatabaseRow>,
     events: Vec<String>,
     fail_begin: bool,
+    fail_child: bool,
+    mutate_source_parent: bool,
+    cascade_parent: bool,
+    snapshot: Option<(
+        BTreeMap<Vec<String>, DatabaseRow>,
+        BTreeMap<Vec<String>, DatabaseRow>,
+    )>,
 }
 
 impl FkOrphanRepairBackend for FakeBackend {
@@ -35,6 +42,7 @@ impl FkOrphanRepairBackend for FakeBackend {
         _spec: &RepairCaseSpec,
         _metadata: &RepairMetadata,
     ) -> Result<(), String> {
+        self.snapshot = Some((self.target_children.clone(), self.target_parents.clone()));
         self.events.push("begin".to_string());
         if self.fail_begin {
             return Err("begin failed".to_string());
@@ -94,11 +102,42 @@ impl FkOrphanRepairBackend for FakeBackend {
             .cloned())
     }
 
+    fn restore_target_parent(
+        &mut self,
+        _metadata: &RepairMetadata,
+        parent: &DatabaseRow,
+        _exists: bool,
+    ) -> Result<(), String> {
+        self.events.push("parent".into());
+        self.target_parents
+            .insert(parent.primary_key.clone(), parent.clone());
+        if self.cascade_parent {
+            for child in self.target_children.values_mut() {
+                if child.values.get("comic_id") == parent.values.get("id") {
+                    child
+                        .values
+                        .insert("comic_name".into(), parent.values["name"].clone());
+                }
+            }
+        }
+        if self.mutate_source_parent {
+            self.source_parents
+                .get_mut(&parent.primary_key)
+                .unwrap()
+                .values
+                .insert("payload".into(), Some("changed".into()));
+        }
+        Ok(())
+    }
+
     fn update_target_child(
         &mut self,
         _metadata: &RepairMetadata,
         child: &DatabaseRow,
     ) -> Result<(), String> {
+        if self.fail_child {
+            return Err("child constraint failure".into());
+        }
         self.events.push("update".to_string());
         self.target_children
             .insert(child.primary_key.clone(), child.clone());
@@ -121,6 +160,10 @@ impl FkOrphanRepairBackend for FakeBackend {
     }
 
     fn rollback_batch(&mut self) -> Result<(), String> {
+        if let Some((children, parents)) = self.snapshot.take() {
+            self.target_children = children;
+            self.target_parents = parents;
+        }
         self.events.push("rollback".to_string());
         Ok(())
     }
@@ -129,6 +172,135 @@ impl FkOrphanRepairBackend for FakeBackend {
         self.events.push("unlock".to_string());
         Ok(())
     }
+}
+
+fn comics_fixture(case: FkOrphanRepairCase, target_parent: Option<DatabaseRow>) -> FakeBackend {
+    let spec = case.spec();
+    let mut source_child = row(
+        &["91".into()],
+        [("id", "91"), ("comic_id", "7"), ("payload", "source")],
+    );
+    let mut source_parent = row(&["7".into()], [("id", "7"), ("payload", "complete parent")]);
+    for (child_column, parent_column) in spec.child_foreign_key.iter().zip(spec.parent_key) {
+        let value = if *parent_column == "id" {
+            "7"
+        } else {
+            "current"
+        };
+        source_child
+            .values
+            .insert((*child_column).into(), Some(value.into()));
+        source_parent
+            .values
+            .insert((*parent_column).into(), Some(value.into()));
+    }
+    let mut target_child = source_child.clone();
+    target_child.values.insert(
+        spec.child_foreign_key.last().unwrap().to_string(),
+        Some("stale".into()),
+    );
+    FakeBackend {
+        source_children: [(source_child.primary_key.clone(), source_child)].into(),
+        source_parents: [(source_parent.primary_key.clone(), source_parent)].into(),
+        target_children: [(target_child.primary_key.clone(), target_child)].into(),
+        target_parents: target_parent
+            .into_iter()
+            .map(|row| (row.primary_key.clone(), row))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn restores_missing_and_stale_comics_parents_before_children() {
+    for case in [
+        FkOrphanRepairCase::ComicsLangsCategory,
+        FkOrphanRepairCase::ReleasesName,
+        FkOrphanRepairCase::ReleasesSlug,
+    ] {
+        for stale in [false, true] {
+            let mut backend = comics_fixture(case, None);
+            if stale {
+                let mut parent = backend.source_parents[&vec!["7".into()]].clone();
+                parent
+                    .values
+                    .insert("payload".into(), Some("stale parent".into()));
+                backend
+                    .target_parents
+                    .insert(parent.primary_key.clone(), parent);
+            }
+            repair_with_backend(&config(case.spec(), 1), &mut backend)
+                .expect("restore parent and child");
+            assert_eq!(backend.target_children, backend.source_children);
+            assert_eq!(backend.target_parents, backend.source_parents);
+        }
+    }
+}
+
+#[test]
+fn parent_restore_rolls_back_on_child_failure_or_source_instability() {
+    for unstable in [false, true] {
+        let case = FkOrphanRepairCase::ReleasesName;
+        let mut backend = comics_fixture(case, None);
+        let children_before = backend.target_children.clone();
+        backend.fail_child = !unstable;
+        backend.mutate_source_parent = unstable;
+        let error = repair_with_backend(&config(case.spec(), 1), &mut backend).unwrap_err();
+        assert!(
+            error.contains(if unstable {
+                "source parent changed"
+            } else {
+                "child constraint failure"
+            }),
+            "{error}"
+        );
+        assert_eq!(backend.target_children, children_before);
+        assert!(backend.target_parents.is_empty());
+        assert!(!backend.events.contains(&"commit".into()));
+    }
+}
+
+#[test]
+fn restored_parent_cascade_can_make_child_update_unnecessary() {
+    let case = FkOrphanRepairCase::ReleasesName;
+    let mut backend = comics_fixture(case, None);
+    backend.cascade_parent = true;
+    backend.fail_child = true;
+    let report = repair_with_backend(&config(case.spec(), 1), &mut backend).unwrap();
+    assert_eq!(report.unchanged, 1);
+    assert_eq!(backend.target_children, backend.source_children);
+    assert_eq!(backend.target_parents, backend.source_parents);
+}
+
+#[test]
+fn correct_parent_is_not_written_and_completed_repair_is_noop() {
+    let case = FkOrphanRepairCase::ComicsLangsCategory;
+    let mut backend = comics_fixture(case, None);
+    backend.target_parents = backend.source_parents.clone();
+    repair_with_backend(&config(case.spec(), 1), &mut backend).unwrap();
+    assert!(!backend.events.contains(&"parent".into()));
+    backend.events.clear();
+    repair_with_backend(&config(case.spec(), 0), &mut backend).unwrap();
+    assert!(backend.events.is_empty());
+}
+
+#[test]
+fn slug_parent_must_match_explicit_comic_id_and_source_slug() {
+    let case = FkOrphanRepairCase::ReleasesSlug;
+    let mut backend = comics_fixture(case, None);
+    backend
+        .source_parents
+        .values_mut()
+        .next()
+        .unwrap()
+        .values
+        .insert("slug".into(), Some("wrong".into()));
+    assert!(
+        repair_with_backend(&config(case.spec(), 1), &mut backend)
+            .unwrap_err()
+            .contains("source FK relationship is invalid")
+    );
+    assert!(backend.target_parents.is_empty());
 }
 
 #[test]
@@ -341,6 +513,11 @@ fn row<const N: usize>(primary_key: &[String], values: [(&str, &str); N]) -> Dat
 }
 
 fn parent_primary_key(spec: &RepairCaseSpec, child: &DatabaseRow) -> Result<Vec<String>, String> {
+    if spec.restores_comics_parent() {
+        return Ok(vec![
+            required_row_value(child, "comic_id", "child")?.to_string(),
+        ]);
+    }
     spec.parent_primary_key
         .iter()
         .map(|parent_column| {

@@ -25,7 +25,7 @@ implementation details belong in the [FK orphan repair wiki](../wiki/systems/fk-
   - `releases-slug`: `releases_ibfk_7`, child `releases(comic_slug)`, parent `comics(slug)`.
   - `releases-show-in-list`: `releases_ibfk_9`, child `releases(comic_id,comic_show_in_list)`, parent `comics(id,show_in_list)`.
   - `releases-format`: `releases_ibfk_format`, child `releases(comic_id,comic_format_id)`, parent `comics(id,comic_format_id)`.
-- The comics-parent cases use child and parent primary key `id`, update `CASCADE`, delete `RESTRICT`. Each relation remains independently discoverable; copying a complete child can resolve overlapping cases, so re-count before subsequent repairs rather than applying redundant mutations. The slug relation does not itself supply parent primary key `id`; backend integration must resolve that identity before mutation.
+- The comics-parent cases use child and parent primary key `id`, update `CASCADE`, delete `RESTRICT`. Each relation remains independently discoverable; copying a complete child can resolve overlapping cases, so re-count before subsequent repairs rather than applying redundant mutations. All comics-parent cases resolve parent `id` explicitly from the source child's `comic_id`. The slug case additionally validates the source `comic_slug`/parent `slug` relationship; no slug lookup fallback is allowed.
 - [ ] Require `--expected-orphans` to equal the exact bounded target orphan count observed before mutation; abort when the count changes.
 - [ ] Default `--batch-size` to 50 and reject values above 100; default `--limit` to 1000 and reject values above 1000. Reject an expected count greater than the limit.
 
@@ -39,7 +39,9 @@ implementation details belong in the [FK orphan repair wiki](../wiki/systems/fk-
 ### Source-authoritative child repair
 
 - [x] Lock only the selected target child and parent tables for each bounded batch, then commit or roll back that batch before releasing the locks.
-- [x] When the source child exists, require the source FK relationship to be valid and the target parent to have the exact source parent identity before copying the complete source child row to the target.
+- [x] For the original four cases, require a valid source FK relationship and an existing target parent with the exact referenced source identity; never restore their parents.
+- [x] Only for the allowlisted `comics_langs`/`releases` cases, restore a missing or stale `comics` parent from its complete source row before copying the child. Use strict metadata-aware insert/update with constraints enabled; lock the parent WRITE and child WRITE in the same batch. Re-read the child after parent CASCADE before deciding whether it needs an update.
+- [x] Require exact full-row target parent equality and unchanged source child/parent after restoration. Any mutation or verification failure rolls back the entire batch, including parent and CASCADE changes.
 - [x] When the source child is absent, delete only the exact target child primary-key row; never create or mutate parent rows.
 - [ ] Verify source stability, target child state, target parent identity, and zero remaining selected orphan identities after mutation.
 - [x] Roll back and unlock on batch-start, mutation, verification, commit, or cleanup failure.
@@ -76,6 +78,6 @@ implementation details belong in the [FK orphan repair wiki](../wiki/systems/fk-
 
 ## Out of scope
 
-- Generic FK repair, arbitrary table or constraint selection, parent-row repair, full-table synchronization, parity sweeps, or fallback mutation engines.
+- Generic FK repair, arbitrary table or constraint selection, parent restoration outside the allowlisted comics-parent cases, full-table synchronization, parity sweeps, or fallback mutation engines.
 - Durable progress, checkpoint, DDL-journal, run-spec, or live-stream state changes.
 - Kubernetes manifests, Flux ownership, image publication, and deployment procedures; those belong to the ops repository.
