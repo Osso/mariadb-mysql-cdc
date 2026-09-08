@@ -288,7 +288,7 @@ fn validate_guests_metadata(
     source: &TableInventory,
     target: &TableInventory,
 ) -> Result<SyncTable, String> {
-    let table = validate_table_pair(source, target)?;
+    let mut table = validate_table_pair(source, target)?;
     if table.name != "guests" || table.primary_key != ["guest_id"] {
         return Err("guests primary key must be exactly guest_id".into());
     }
@@ -306,6 +306,18 @@ fn validate_guests_metadata(
     ) {
         return Err("guest_id must have an integer type".into());
     }
+    // This existing field selects HEX reads and raw byte parameters, despite its narrow name.
+    table.mediumblob_columns = source
+        .columns
+        .iter()
+        .filter(|column| {
+            matches!(
+                column.data_type.as_str(),
+                "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
+            )
+        })
+        .map(|column| column.name.clone())
+        .collect();
     Ok(table)
 }
 
@@ -373,6 +385,46 @@ mod tests {
                 column("guest_hash", "varchar", "varchar(64)", 2),
                 column("utm_id", "bigint", "bigint(20) unsigned", 3),
             ],
+        }
+    }
+
+    #[test]
+    fn binary_guest_values_bind_original_bytes_not_hex_text() {
+        for kind in [
+            "binary",
+            "varbinary",
+            "tinyblob",
+            "blob",
+            "mediumblob",
+            "longblob",
+        ] {
+            let mut inventory = table();
+            inventory.columns[1].data_type = kind.into();
+            inventory.columns[1].column_type = kind.into();
+            let metadata = validate_guests_metadata(&inventory, &inventory).unwrap();
+            let rows = decode_sync_rows(
+                &metadata,
+                vec![vec![
+                    Some("100".into()),
+                    Some("00FF8064".into()),
+                    Some("7".into()),
+                ]],
+            )
+            .unwrap();
+            let statement = build_strict_insert_statement(&metadata, &rows).unwrap();
+            assert_eq!(
+                statement.params[1],
+                mysql::Value::Bytes(vec![0x00, 0xff, 0x80, 0x64]),
+                "{kind}"
+            );
+            let rows =
+                decode_sync_rows(&metadata, vec![vec![Some("101".into()), None, None]]).unwrap();
+            assert_eq!(
+                build_strict_insert_statement(&metadata, &rows)
+                    .unwrap()
+                    .params[1],
+                mysql::Value::NULL
+            );
         }
     }
 

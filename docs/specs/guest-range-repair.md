@@ -16,6 +16,7 @@ A bounded, insert-only repair for an explicitly supplied inclusive `guests.guest
 - [ ] Require each non-null referenced target UTM before copying its guest; retain its shared row lock through the target batch commit. Null UTM references need no parent repair.
 
 ### Mutations and failure
+- [ ] Preserve binary/varbinary and BLOB-family bytes without UTF-8 replacement; null bytes and invalid UTF-8 remain byte-exact.
 - [ ] Insert complete source row values using strict inserts. Equal existing target rows are unchanged; differing rows fail closed without updates, deletes, ignore, upsert, or secondary-key reconciliation.
 - [ ] Bound source pages and target transactions by batch size. Verify contiguous numeric keyset coverage, lock target identities, and compare complete target readback with source snapshot before commit.
 - [ ] Roll back the entire current target batch on failure, including readback/commit errors; report rollback errors alongside the original failure. Prior committed batches remain and exact equal rows make reruns idempotent. Lost commit acknowledgement may leave a committed batch; do not automatically retry mutations.
@@ -34,7 +35,7 @@ A bounded, insert-only repair for an explicitly supplied inclusive `guests.guest
 
 ## Known gaps (current cycle)
 - [ ] Parent integration owns CLI wiring and database-backed proof of SQL, transaction/lock semantics, canonical metadata, and post-repair child FK validation.
-- [ ] Core seam GREEN evidence pending initial implementation commit.
+- [ ] Database harness must prove byte preservation after observed VARBINARY corruption; SQL-bound byte regression supplements but does not replace this boundary test.
 
 ## Out of scope
 - Production identifiers, hardcoded repair ranges, deployment, broad verification, and broker operations.
