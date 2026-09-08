@@ -3876,9 +3876,11 @@ class Harness:
         self.admin_sql(self.target, "INSERT INTO utms VALUES (7,'campaign');")
         self.admin_sql(
             self.target,
+            "DELIMITER //\n"
             "CREATE TRIGGER guest_fail_second_batch BEFORE INSERT ON guests FOR EACH ROW "
             "BEGIN IF NEW.guest_id=103 THEN SIGNAL SQLSTATE '45000' "
-            "SET MESSAGE_TEXT='guest second batch failure'; END IF; END;",
+            "SET MESSAGE_TEXT='guest second batch failure'; END IF; END//\n"
+            "DELIMITER ;\n",
         )
         failed = invoke()
         if failed.returncode == 0:
@@ -3896,10 +3898,12 @@ class Harness:
             )
         self.admin_sql(
             self.target,
-            "DROP TRIGGER guest_fail_second_batch;"
+            "DROP TRIGGER guest_fail_second_batch;\n"
+            "DELIMITER //\n"
             "CREATE TRIGGER guest_preserve_first BEFORE INSERT ON guests FOR EACH ROW "
             "BEGIN IF NEW.guest_id<102 THEN SIGNAL SQLSTATE '45000' "
-            "SET MESSAGE_TEXT='committed rows must be no-op'; END IF; END;",
+            "SET MESSAGE_TEXT='committed rows must be no-op'; END IF; END//\n"
+            "DELIMITER ;\n",
         )
         require_success(invoke(), "guest range rerun after committed batch")
         if self.admin_query(self.target, snapshot_sql) != expected_rows:
