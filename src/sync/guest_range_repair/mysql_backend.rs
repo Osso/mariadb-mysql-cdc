@@ -216,7 +216,11 @@ fn validate_table_pair(
         if table.table_type != "BASE TABLE" || table.engine.as_deref() != Some("InnoDB") {
             return Err(format!("{} must be an InnoDB base table", table.name));
         }
-        if table.columns.iter().any(|c| c.generated.is_some()) {
+        if table
+            .columns
+            .iter()
+            .any(|column| column.generated.is_some())
+        {
             return Err(format!(
                 "{} generated columns cannot be copied as full source values",
                 table.name
@@ -231,24 +235,53 @@ fn validate_table_pair(
         ));
     }
     for (left, right) in source.columns.iter().zip(&target.columns) {
-        let left_type = (
-            &left.data_type,
-            left.column_type.contains("unsigned"),
-            left.is_nullable,
-        );
-        let right_type = (
-            &right.data_type,
-            right.column_type.contains("unsigned"),
-            right.is_nullable,
-        );
-        if left_type != right_type {
-            return Err(format!(
-                "{} column {} source/target type or nullability differs",
-                source.name, left.name
-            ));
-        }
+        validate_column_pair(left, right)?;
     }
     Ok(source_sync)
+}
+
+fn validate_column_pair(
+    left: &crate::inventory::ColumnInventory,
+    right: &crate::inventory::ColumnInventory,
+) -> Result<(), String> {
+    let left_type = (
+        normalized_column_type(left),
+        left.is_nullable,
+        &left.character_set,
+        &left.collation,
+    );
+    let right_type = (
+        normalized_column_type(right),
+        right.is_nullable,
+        &right.character_set,
+        &right.collation,
+    );
+    if left_type != right_type {
+        return Err(format!(
+            "column {} source/target type, nullability, charset or collation differs",
+            left.name
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_column_type(column: &crate::inventory::ColumnInventory) -> String {
+    if !matches!(
+        column.data_type.as_str(),
+        "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+    ) {
+        return column.column_type.clone();
+    }
+    let suffix = column
+        .column_type
+        .strip_prefix(&column.data_type)
+        .unwrap_or(&column.column_type);
+    let suffix = if suffix.starts_with('(') {
+        suffix.split_once(')').map_or(suffix, |(_, rest)| rest)
+    } else {
+        suffix
+    };
+    format!("{}{suffix}", column.data_type)
 }
 
 fn validate_guests_metadata(
@@ -307,4 +340,107 @@ fn validate_guest_fk(
         return Err("guests canonical FK differs from required guests(utm_id) -> utms(id) RESTRICT contract".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::ColumnInventory;
+
+    fn table() -> TableInventory {
+        let column =
+            |name: &str, data_type: &str, column_type: &str, ordinal_position| ColumnInventory {
+                name: name.into(),
+                ordinal_position,
+                data_type: data_type.into(),
+                column_type: column_type.into(),
+                is_nullable: name == "utm_id",
+                character_set: None,
+                collation: None,
+                default_value: None,
+                extra: String::new(),
+                comment: String::new(),
+                generated: None,
+            };
+        TableInventory {
+            name: "guests".into(),
+            table_type: "BASE TABLE".into(),
+            engine: Some("InnoDB".into()),
+            collation: None,
+            primary_key: vec!["guest_id".into()],
+            columns: vec![
+                column("guest_id", "bigint", "bigint(20) unsigned", 1),
+                column("guest_hash", "varchar", "varchar(64)", 2),
+                column("utm_id", "bigint", "bigint(20) unsigned", 3),
+            ],
+        }
+    }
+
+    #[test]
+    fn metadata_rejects_changed_value_width_and_collation() {
+        let source = table();
+        let mut target = source.clone();
+        target.columns[1].column_type = "varchar(32)".into();
+        assert!(validate_guests_metadata(&source, &target).is_err());
+        let mut target = source.clone();
+        target.columns[1].collation = Some("utf8mb4_bin".into());
+        assert!(validate_guests_metadata(&source, &target).is_err());
+    }
+
+    #[test]
+    fn metadata_allows_only_integer_display_width_difference() {
+        let source = table();
+        let mut target = source.clone();
+        target.columns[0].column_type = "bigint unsigned".into();
+        assert!(validate_guests_metadata(&source, &target).is_ok());
+        target.columns[0].column_type = "bigint".into();
+        assert!(validate_guests_metadata(&source, &target).is_err());
+    }
+
+    #[test]
+    fn metadata_rejects_wrong_pk_engine_and_nullability() {
+        let source = table();
+        let mut target = source.clone();
+        target.primary_key = vec!["utm_id".into()];
+        assert!(validate_guests_metadata(&source, &target).is_err());
+        let mut target = source.clone();
+        target.engine = Some("MyISAM".into());
+        assert!(validate_guests_metadata(&source, &target).is_err());
+        let mut target = source.clone();
+        target.columns[2].is_nullable = false;
+        assert!(validate_guests_metadata(&source, &target).is_err());
+    }
+
+    #[test]
+    fn canonical_fk_checks_mapped_name_rules_and_local_parent() {
+        let fk = CanonicalForeignKey {
+            constraint_schema: "fixture".into(),
+            constraint_name: "fk_guests_utm_id".into(),
+            child_schema: "fixture".into(),
+            child_table: "guests".into(),
+            child_columns: vec!["utm_id".into()],
+            parent_schema: "fixture".into(),
+            parent_table: "utms".into(),
+            parent_columns: vec!["id".into()],
+            update_rule: "RESTRICT".into(),
+            delete_rule: "RESTRICT".into(),
+            match_option: "NONE".into(),
+            enforced: true,
+        };
+        assert!(validate_guest_fk("fixture", std::slice::from_ref(&fk), false).is_ok());
+        assert!(validate_guest_fk("fixture", std::slice::from_ref(&fk), true).is_err());
+        let mut mapped = fk;
+        mapped.constraint_name = "guests_fk_guests_utm_id".into();
+        assert!(validate_guest_fk("fixture", std::slice::from_ref(&mapped), true).is_ok());
+        let mut wrong = mapped.clone();
+        wrong.parent_schema = "another".into();
+        assert!(validate_guest_fk("fixture", &[wrong], true).is_err());
+        let mut wrong = mapped.clone();
+        wrong.delete_rule = "CASCADE".into();
+        assert!(validate_guest_fk("fixture", &[wrong], true).is_err());
+        let mut wrong = mapped;
+        wrong.enforced = false;
+        assert!(validate_guest_fk("fixture", &[wrong], true).is_err());
+        assert!(validate_guest_fk("fixture", &[], true).is_err());
+    }
 }
