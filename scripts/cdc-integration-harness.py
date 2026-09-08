@@ -3778,7 +3778,7 @@ class Harness:
         self.admin_sql(
             self.target,
             "CREATE TABLE cdc.guest_repair_sentinel (id INT PRIMARY KEY,payload VARBINARY(64));"
-            "INSERT INTO cdc.guest_repair_sentinel VALUES (1,X'00FF1234');",
+            "INSERT INTO cdc.guest_repair_sentinel VALUES (1,'guest-repair-unchanged');",
         )
         snapshot_sql = (
             "SELECT guest_id,guest_hash,utm_id,HEX(label),HEX(payload),state+0,"
