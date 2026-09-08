@@ -3831,8 +3831,9 @@ class Harness:
             f"CREATE TABLE `{child}` (id BIGINT PRIMARY KEY,comic_id BIGINT NOT NULL{child_extra},"
             f"CONSTRAINT `{constraint}` FOREIGN KEY ({child_key}) REFERENCES comics ({parent_key}) ON UPDATE CASCADE ON DELETE RESTRICT);"
         )
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, ddl)
+        self.admin_sql(self.source, ddl)
+        fk_clause = f"CONSTRAINT `{constraint}` FOREIGN KEY ({child_key}) REFERENCES comics ({parent_key}) ON UPDATE CASCADE ON DELETE RESTRICT"
+        self.admin_sql(self.target, ddl.replace("," + fk_clause, ""))
         values = lambda key, value: (
             f"({key}" + (f",'{value}'" if parent_col else "") + ",X'00FF80','live')"
         )
@@ -3891,6 +3892,7 @@ class Harness:
         ):
             raise HarnessError(f"{case} source/target exact row fidelity mismatch")
         require_success(self.run_repair_fk_case(case, 0), case + " idempotence")
+        self.admin_sql(self.target, f"ALTER TABLE `{child}` ADD {fk_clause};")
         if parent_col:
             self.admin_sql(
                 self.target,
@@ -3922,8 +3924,12 @@ class Harness:
             "CREATE TABLE artists_favorites(id BIGINT PRIMARY KEY,user_id BIGINT NOT NULL,user_username VARCHAR(32) NOT NULL,"
             "CONSTRAINT artists_favorites_ibfk_2 FOREIGN KEY(user_id,user_username) REFERENCES users(id,name) ON UPDATE CASCADE ON DELETE RESTRICT);"
         )
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, ddl + "INSERT INTO users VALUES(1,'fresh');")
+        self.admin_sql(self.source, ddl + "INSERT INTO users VALUES(1,'fresh');")
+        fk_clause = "CONSTRAINT artists_favorites_ibfk_2 FOREIGN KEY(user_id,user_username) REFERENCES users(id,name) ON UPDATE CASCADE ON DELETE RESTRICT"
+        self.admin_sql(
+            self.target,
+            ddl.replace("," + fk_clause, "") + "INSERT INTO users VALUES(1,'fresh');",
+        )
         self.admin_sql(
             self.source,
             "INSERT INTO artists_favorites VALUES "
