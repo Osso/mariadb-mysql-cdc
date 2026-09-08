@@ -367,3 +367,117 @@ fn parent_matches(
             validate_child_parent_relationship(spec, child, parent, "fake").is_ok()
         })
 }
+
+#[test]
+fn comics_relationship_cases_validate_each_denormalized_value() {
+    let cases = [
+        (
+            "comics-langs-category",
+            "ibfk_accl_category",
+            "comics_langs",
+            "comic_category_id",
+            "section_id",
+        ),
+        (
+            "comics-langs-type",
+            "ibfk_accl_type",
+            "comics_langs",
+            "comic_type_id",
+            "comic_type_id",
+        ),
+        (
+            "releases-name",
+            "releases_ibfk_1",
+            "releases",
+            "comic_name",
+            "name",
+        ),
+        (
+            "releases-type",
+            "releases_ibfk_10",
+            "releases",
+            "comic_type_id",
+            "comic_type_id",
+        ),
+        (
+            "releases-category",
+            "releases_ibfk_2",
+            "releases",
+            "comic_category_id",
+            "section_id",
+        ),
+        (
+            "releases-visibility",
+            "releases_ibfk_3",
+            "releases",
+            "comic_is_visible",
+            "is_visible",
+        ),
+        (
+            "releases-id",
+            "releases_ibfk_6",
+            "releases",
+            "comic_id",
+            "id",
+        ),
+        (
+            "releases-slug",
+            "releases_ibfk_7",
+            "releases",
+            "comic_slug",
+            "slug",
+        ),
+        (
+            "releases-show-in-list",
+            "releases_ibfk_9",
+            "releases",
+            "comic_show_in_list",
+            "show_in_list",
+        ),
+        (
+            "releases-format",
+            "releases_ibfk_format",
+            "releases",
+            "comic_format_id",
+            "comic_format_id",
+        ),
+    ];
+    for (name, constraint, table, child_column, parent_column) in cases {
+        let spec = FkOrphanRepairCase::parse(name).expect(name).spec();
+        assert_eq!(spec.constraint_name, constraint);
+        assert_eq!(spec.child_table, table);
+        assert_eq!(spec.child_primary_key, &["id"]);
+        assert_eq!(spec.parent_table, "comics");
+        assert_eq!(spec.parent_primary_key, &["id"]);
+        assert_eq!(
+            (spec.update_rule, spec.delete_rule),
+            ("CASCADE", "RESTRICT")
+        );
+        let mut child = row(
+            &["91".to_string()],
+            [("comic_id", "7"), (child_column, "7")],
+        );
+        let parent = row(&["7".to_string()], [("id", "7"), (parent_column, "7")]);
+        assert!(validate_child_parent_relationship(&spec, &child, &parent, "source").is_ok());
+        child
+            .values
+            .insert(child_column.to_string(), Some("8".to_string()));
+        assert!(
+            validate_child_parent_relationship(&spec, &child, &parent, "source").is_err(),
+            "{name}"
+        );
+        child.values.remove(child_column);
+        assert!(
+            validate_child_parent_relationship(&spec, &child, &parent, "source").is_err(),
+            "{name}"
+        );
+    }
+    for name in [
+        "releases",
+        "comics-langs",
+        "releases-artist",
+        "releases-any",
+    ] {
+        assert!(FkOrphanRepairCase::parse(name).is_err());
+    }
+}
