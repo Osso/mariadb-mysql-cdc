@@ -64,6 +64,7 @@ SCENARIOS = (
     ScenarioSpec("sync-resume", True),
     ScenarioSpec("sync-schema-parallel-resume", True),
     ScenarioSpec("repair-fk-orphans-parents", True),
+    ScenarioSpec("repair-guest-range", True),
     ScenarioSpec("sync-progress-least-privilege", True),
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("production-alter-table", True),
@@ -3701,6 +3702,218 @@ class Harness:
             "ORDER BY TABLE_NAME,CONSTRAINT_NAME;",
         ).strip()
 
+    def run_guest_range_repair(self, expected: int = 6) -> CommandResult:
+        args = self._sync_args(self._sync_binary(), tables=[], run_id="unused")
+        args = args[: args.index("--chunk-size")]
+        args[1] = "repair-guest-range"
+        args.extend(
+            [
+                "--start-guest-id",
+                "100",
+                "--end-guest-id",
+                "105",
+                "--expected-rows",
+                str(expected),
+                "--batch-size",
+                "2",
+            ]
+        )
+        return run(
+            args,
+            cwd=self.repo,
+            env={
+                **os.environ,
+                "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                "CDC_TARGET_PASSWORD": SYNC_TARGET_PASSWORD,
+            },
+            timeout=120,
+            check=False,
+        )
+
+    def run_repair_guest_range(self) -> None:
+        assert self.source and self.target
+        schema = """
+            CREATE TABLE utms (id BIGINT UNSIGNED PRIMARY KEY, label VARCHAR(64));
+            CREATE TABLE guests (
+                guest_id BIGINT UNSIGNED NOT NULL,
+                guest_hash CHAR(32) NOT NULL,
+                utm_id BIGINT UNSIGNED NULL,
+                label VARCHAR(64) CHARACTER SET utf8mb4 NOT NULL,
+                payload VARBINARY(64) NOT NULL,
+                state ENUM('', 'live') NOT NULL,
+                created_at DATETIME(6) NOT NULL,
+                PRIMARY KEY (guest_id),
+                UNIQUE KEY guest_identity (guest_id, guest_hash),
+                CONSTRAINT fk_guests_utm_id FOREIGN KEY (utm_id) REFERENCES utms(id)
+                    ON DELETE RESTRICT ON UPDATE RESTRICT
+            ) ENGINE=InnoDB;
+            CREATE TABLE sessions (
+                session_id BIGINT UNSIGNED PRIMARY KEY,
+                guest_id BIGINT UNSIGNED NOT NULL,
+                guest_hash CHAR(32) NOT NULL
+            ) ENGINE=InnoDB;
+            INSERT INTO utms VALUES (7,'campaign');
+        """
+        self.admin_sql(self.source, schema)
+        self.admin_sql(
+            self.target,
+            schema.replace(
+                "CONSTRAINT fk_guests_utm_id", "CONSTRAINT guests_fk_guests_utm_id"
+            ),
+        )
+        rows = [
+            f"({key},'{key:032x}',{'NULL' if key == 105 else '7'},"
+            f"'guest-é-{key}',X'00FF80{key:02x}',"
+            f"'{'' if key % 2 else 'live'}','2026-01-02 03:04:05.123456')"
+            for key in range(99, 107)
+        ]
+        self.admin_sql(self.source, "INSERT INTO guests VALUES " + ",".join(rows) + ";")
+        self.admin_sql(
+            self.target,
+            "INSERT INTO sessions VALUES "
+            + ",".join(f"({key + 1000},{key},'{key:032x}')" for key in range(100, 106))
+            + ";",
+        )
+        self.write_checkpoint(self.coordinate())
+        self.admin_sql(
+            self.target,
+            "CREATE TABLE cdc.guest_repair_sentinel (id INT PRIMARY KEY,payload VARBINARY(64));"
+            "INSERT INTO cdc.guest_repair_sentinel VALUES (1,X'00FF1234');",
+        )
+        snapshot_sql = (
+            "SELECT guest_id,guest_hash,utm_id,HEX(label),HEX(payload),state+0,"
+            "created_at FROM guests ORDER BY guest_id,guest_hash;"
+        )
+        source_before = self.admin_query(self.source, snapshot_sql)
+        sessions_before = self.admin_query(
+            self.target, "SELECT * FROM sessions ORDER BY session_id;"
+        )
+        utms_before = self.admin_query(self.target, "SELECT * FROM utms ORDER BY id;")
+        control_tables = self.admin_query(
+            self.target,
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='cdc' ORDER BY table_name;",
+        ).splitlines()
+        control_before = {
+            table: sorted(
+                self.admin_query(
+                    self.target, f"SELECT * FROM cdc.`{table}`;"
+                ).splitlines()
+            )
+            for table in control_tables
+        }
+
+        def invoke(expected: int = 6) -> CommandResult:
+            result = self.run_guest_range_repair(expected)
+            tables_after = self.admin_query(
+                self.target,
+                "SELECT table_name FROM information_schema.tables WHERE table_schema='cdc' ORDER BY table_name;",
+            ).splitlines()
+            if tables_after != control_tables:
+                raise HarnessError("guest repair changed CDC table inventory")
+            for table, before in control_before.items():
+                after = sorted(
+                    self.admin_query(
+                        self.target, f"SELECT * FROM cdc.`{table}`;"
+                    ).splitlines()
+                )
+                if after != before:
+                    raise HarnessError(f"guest repair changed CDC table {table}")
+            if self.admin_query(self.source, snapshot_sql) != source_before:
+                raise HarnessError("guest repair changed source rows")
+            if (
+                self.admin_query(
+                    self.target, "SELECT * FROM sessions ORDER BY session_id;"
+                )
+                != sessions_before
+            ):
+                raise HarnessError("guest repair changed existing sessions")
+            return result
+
+        def refuse_without_writes(expected: int, reason: str) -> None:
+            before = self.admin_query(self.target, snapshot_sql)
+            result = invoke(expected)
+            if result.returncode == 0:
+                raise HarnessError(f"guest repair accepted {reason}")
+            if self.admin_query(self.target, snapshot_sql) != before:
+                raise HarnessError(f"guest repair wrote rows despite {reason}")
+
+        expected_rows = self.admin_query(
+            self.source,
+            snapshot_sql.replace(
+                "FROM guests ORDER",
+                "FROM guests WHERE guest_id BETWEEN 100 AND 105 ORDER",
+            ),
+        )
+        require_success(invoke(), "guest range full-row repair")
+        if self.admin_query(self.target, snapshot_sql) != expected_rows:
+            raise HarnessError(
+                "guest range repair did not preserve exact full values/range"
+            )
+        # Existing equal rows must not execute UPDATE or replacement DELETE/INSERT.
+        for event in ("UPDATE", "DELETE", "INSERT"):
+            self.admin_sql(
+                self.target,
+                f"CREATE TRIGGER guest_no_{event.lower()} BEFORE {event} ON guests "
+                "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='equal rows must be no-op';",
+            )
+        require_success(invoke(), "guest range equal-row no-op")
+        for event in ("update", "delete", "insert"):
+            self.admin_sql(self.target, f"DROP TRIGGER guest_no_{event};")
+        self.admin_sql(self.target, "DELETE FROM guests;")
+        refuse_without_writes(7, "source count mismatch")
+        self.admin_sql(
+            self.target,
+            "INSERT INTO guests VALUES "
+            + rows[1]
+            + "; UPDATE guests SET payload=X'AA' WHERE guest_id=100;",
+        )
+        refuse_without_writes(6, "existing target full-row mismatch")
+        self.admin_sql(self.target, "DELETE FROM guests; DELETE FROM utms;")
+        refuse_without_writes(6, "missing target UTM parent")
+        if self.admin_query(self.target, "SELECT COUNT(*) FROM utms;").strip() != "0":
+            raise HarnessError("guest repair unexpectedly inserted missing UTM")
+        self.admin_sql(self.target, "INSERT INTO utms VALUES (7,'campaign');")
+        self.admin_sql(
+            self.target,
+            "CREATE TRIGGER guest_fail_second_batch BEFORE INSERT ON guests FOR EACH ROW "
+            "BEGIN IF NEW.guest_id=103 THEN SIGNAL SQLSTATE '45000' "
+            "SET MESSAGE_TEXT='guest second batch failure'; END IF; END;",
+        )
+        failed = invoke()
+        if failed.returncode == 0:
+            raise HarnessError("guest repair ignored second-batch failure")
+        first_batch = self.admin_query(
+            self.source,
+            snapshot_sql.replace(
+                "FROM guests ORDER",
+                "FROM guests WHERE guest_id BETWEEN 100 AND 101 ORDER",
+            ),
+        )
+        if self.admin_query(self.target, snapshot_sql) != first_batch:
+            raise HarnessError(
+                "guest failure did not preserve batch one and roll back batch two"
+            )
+        self.admin_sql(
+            self.target,
+            "DROP TRIGGER guest_fail_second_batch;"
+            "CREATE TRIGGER guest_preserve_first BEFORE INSERT ON guests FOR EACH ROW "
+            "BEGIN IF NEW.guest_id<102 THEN SIGNAL SQLSTATE '45000' "
+            "SET MESSAGE_TEXT='committed rows must be no-op'; END IF; END;",
+        )
+        require_success(invoke(), "guest range rerun after committed batch")
+        if self.admin_query(self.target, snapshot_sql) != expected_rows:
+            raise HarnessError("guest rerun did not preserve/finish exact source rows")
+        if (
+            self.admin_query(self.target, "SELECT * FROM utms ORDER BY id;")
+            != utms_before
+        ):
+            raise HarnessError("guest repair changed UTM parents")
+        print(
+            "guest_range_ok rows=6 batch_size=2 full_values=exact equal=no-op "
+            "mismatch=refused count=refused missing_utm=refused "
+            "partial_batch=rollback rerun=complete cdc=unchanged"
+        )
+
     def run_repair_fk_case(self, case: str, expected: int) -> CommandResult:
         args = self._sync_args(self._sync_binary(), tables=[], run_id="unused")
         args = args[: args.index("--chunk-size")]
@@ -4730,6 +4943,8 @@ class Harness:
             self.run_sync_resume()
         elif scenario == "repair-fk-orphans-parents":
             self.run_repair_fk_orphans_parents()
+        elif scenario == "repair-guest-range":
+            self.run_repair_guest_range()
         elif scenario == "sync-schema-parallel-resume":
             self.run_sync_schema_parallel_resume()
         elif scenario == "sync-progress-least-privilege":
