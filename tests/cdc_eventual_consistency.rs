@@ -441,6 +441,7 @@ fn harness_scenario_listing_has_behavior_or_explicit_prerequisite() {
         "sync-wide-update",
         "sync-resume",
         "sync-progress-least-privilege",
+        "repair-fk-orphans-parents",
         "missing-fk-nested-parent-auto-insert",
         "prepare-failure",
         "post-ddl-pre-applied",
@@ -458,7 +459,6 @@ fn harness_scenario_listing_has_behavior_or_explicit_prerequisite() {
     for removed_prefix in [
         "catchup-snapshot",
         "sync-table",
-        "repair-",
         "parallel-target-transactions",
     ] {
         assert!(!listed.lines().any(|line| line.starts_with(removed_prefix)));
