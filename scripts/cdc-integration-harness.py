@@ -3726,6 +3726,14 @@ class Harness:
             self.target,
             "CREATE TABLE cdc.repair_control_sentinel (id INT PRIMARY KEY, payload VARBINARY(64)); INSERT INTO cdc.repair_control_sentinel VALUES (1,X'00FF1234');",
         )
+        control_tables = self.admin_query(
+            self.target,
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='cdc' ORDER BY table_name;",
+        ).splitlines()
+        control_before = {
+            table: self.admin_query(self.target, f"SELECT * FROM cdc.`{table}`;")
+            for table in control_tables
+        }
         cases = [
             (
                 "comics-langs-category",
@@ -3783,6 +3791,12 @@ class Harness:
         for case, child, constraint, child_col, parent_col in cases:
             self.repair_parent_fixture(case, child, constraint, child_col, parent_col)
         self.repair_artists_favorites_fixture()
+        for table, expected in control_before.items():
+            if (
+                self.admin_query(self.target, f"SELECT * FROM cdc.`{table}`;")
+                != expected
+            ):
+                raise HarnessError(f"repair changed CDC control-plane table {table}")
         sentinel = self.admin_query(
             self.target, "SELECT id,HEX(payload) FROM cdc.repair_control_sentinel;"
         ).strip()
