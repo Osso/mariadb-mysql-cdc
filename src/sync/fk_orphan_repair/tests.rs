@@ -8,6 +8,11 @@ struct FakeBackend {
     source_parents: BTreeMap<Vec<String>, DatabaseRow>,
     target_children: BTreeMap<Vec<String>, DatabaseRow>,
     target_parents: BTreeMap<Vec<String>, DatabaseRow>,
+    source_artists: FixtureRows,
+    target_artists: FixtureRows,
+    artist_snapshot: FixtureRows,
+    mutate_source_artist: bool,
+    corrupt_inserted_artist: bool,
     events: Vec<String>,
     fail_begin: bool,
     fail_child: bool,
@@ -42,6 +47,7 @@ impl FkOrphanRepairBackend for FakeBackend {
         _metadata: &RepairMetadata,
     ) -> Result<(), String> {
         self.snapshot = Some((self.target_children.clone(), self.target_parents.clone()));
+        self.artist_snapshot = self.target_artists.clone();
         self.events.push("begin".to_string());
         if self.fail_begin {
             return Err("begin failed".to_string());
@@ -101,12 +107,46 @@ impl FkOrphanRepairBackend for FakeBackend {
             .cloned())
     }
 
+    fn read_source_artist(
+        &mut self,
+        _metadata: &ArtistMetadata,
+        primary_key: &[String],
+    ) -> Result<Option<DatabaseRow>, String> {
+        Ok(self.source_artists.get(primary_key).cloned())
+    }
+
+    fn read_target_artist(
+        &mut self,
+        _metadata: &ArtistMetadata,
+        primary_key: &[String],
+    ) -> Result<Option<DatabaseRow>, String> {
+        Ok(self.target_artists.get(primary_key).cloned())
+    }
+
+    fn insert_target_artist(
+        &mut self,
+        _metadata: &ArtistMetadata,
+        artist: &DatabaseRow,
+    ) -> Result<(), String> {
+        self.target_artists
+            .insert(artist.primary_key.clone(), artist.clone());
+        Ok(())
+    }
+
     fn restore_target_parent(
         &mut self,
         _metadata: &RepairMetadata,
         parent: &DatabaseRow,
         _exists: bool,
     ) -> Result<(), String> {
+        validate_child_parent_relationship(
+            &FkOrphanRepairCase::Comics.spec(),
+            parent,
+            self.target_artists
+                .get(&vec![parent.values["artist_id"].clone().unwrap()])
+                .ok_or("missing required target artist")?,
+            "target",
+        )?;
         self.events.push("parent".into());
         self.target_parents
             .insert(parent.primary_key.clone(), parent.clone());
@@ -137,6 +177,22 @@ impl FkOrphanRepairBackend for FakeBackend {
         if self.fail_child {
             return Err("child constraint failure".into());
         }
+        if self.mutate_source_artist {
+            self.source_artists
+                .values_mut()
+                .next()
+                .unwrap()
+                .values
+                .insert("payload".into(), Some("changed".into()));
+        }
+        if self.corrupt_inserted_artist {
+            self.target_artists
+                .values_mut()
+                .next()
+                .unwrap()
+                .values
+                .insert("payload".into(), Some("corrupt".into()));
+        }
         self.events.push("update".to_string());
         self.target_children
             .insert(child.primary_key.clone(), child.clone());
@@ -163,6 +219,7 @@ impl FkOrphanRepairBackend for FakeBackend {
             self.target_children = children;
             self.target_parents = parents;
         }
+        self.target_artists = self.artist_snapshot.clone();
         self.events.push("rollback".to_string());
         Ok(())
     }
@@ -179,7 +236,23 @@ fn comics_fixture(case: FkOrphanRepairCase, target_parent: Option<DatabaseRow>) 
         &["91".into()],
         [("id", "91"), ("comic_id", "7"), ("payload", "source")],
     );
-    let mut source_parent = row(&["7".into()], [("id", "7"), ("payload", "complete parent")]);
+    let mut source_parent = row(
+        &["7".into()],
+        [
+            ("id", "7"),
+            ("payload", "complete parent"),
+            ("artist_id", "34734"),
+            ("artist_name", "publisher"),
+        ],
+    );
+    let artist = row(
+        &["34734".into()],
+        [
+            ("id", "34734"),
+            ("name", "publisher"),
+            ("payload", "complete artist"),
+        ],
+    );
     for (child_column, parent_column) in spec.child_foreign_key.iter().zip(spec.parent_key) {
         let value = if *parent_column == "id" {
             "7"
@@ -199,6 +272,8 @@ fn comics_fixture(case: FkOrphanRepairCase, target_parent: Option<DatabaseRow>) 
         Some("stale".into()),
     );
     FakeBackend {
+        source_artists: [(artist.primary_key.clone(), artist.clone())].into(),
+        target_artists: [(artist.primary_key.clone(), artist)].into(),
         source_children: [(source_child.primary_key.clone(), source_child)].into(),
         source_parents: [(source_parent.primary_key.clone(), source_parent)].into(),
         target_children: [(target_child.primary_key.clone(), target_child)].into(),
@@ -207,6 +282,85 @@ fn comics_fixture(case: FkOrphanRepairCase, target_parent: Option<DatabaseRow>) 
             .map(|row| (row.primary_key.clone(), row))
             .collect(),
         ..Default::default()
+    }
+}
+
+#[test]
+fn inserts_missing_artist_before_comic_and_child() {
+    let case = FkOrphanRepairCase::ComicsLangsCategory;
+    let mut backend = comics_fixture(case, None);
+    backend.target_artists.clear();
+    repair_with_backend(&config(case.spec(), 1), &mut backend).unwrap();
+    assert_eq!(backend.target_artists, backend.source_artists);
+    assert_eq!(backend.target_parents, backend.source_parents);
+    assert_eq!(backend.target_children, backend.source_children);
+}
+
+#[test]
+fn existing_artist_payload_is_not_overwritten() {
+    let case = FkOrphanRepairCase::ReleasesName;
+    let mut backend = comics_fixture(case, None);
+    backend
+        .target_artists
+        .values_mut()
+        .next()
+        .unwrap()
+        .values
+        .insert("payload".into(), Some("unrelated target value".into()));
+    let before = backend.target_artists.clone();
+    repair_with_backend(&config(case.spec(), 1), &mut backend).unwrap();
+    assert_eq!(backend.target_artists, before);
+}
+
+#[test]
+fn artist_failures_roll_back_entire_repair_batch() {
+    for (failure, expected) in [
+        ("missing source", "source artist is missing"),
+        (
+            "source relation",
+            "source comic artist FK relationship is invalid",
+        ),
+        ("identity", "target parent differs from source"),
+        ("unstable", "source artist changed"),
+        ("corrupt", "inserted target artist verification failed"),
+        ("child", "child constraint failure"),
+    ] {
+        let case = FkOrphanRepairCase::ReleasesName;
+        let mut backend = comics_fixture(case, None);
+        backend.target_artists.clear();
+        match failure {
+            "missing source" => backend.source_artists.clear(),
+            "source relation" => {
+                backend
+                    .source_artists
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .values
+                    .insert("name".into(), Some("wrong source publisher".into()));
+            }
+            "identity" => {
+                backend.target_artists = backend.source_artists.clone();
+                backend
+                    .target_artists
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .values
+                    .insert("name".into(), Some("wrong publisher".into()));
+            }
+            "unstable" => backend.mutate_source_artist = true,
+            "corrupt" => backend.corrupt_inserted_artist = true,
+            "child" => backend.fail_child = true,
+            _ => unreachable!(),
+        }
+        let before_artists = backend.target_artists.clone();
+        let before_children = backend.target_children.clone();
+        let error = repair_with_backend(&config(case.spec(), 1), &mut backend).unwrap_err();
+        assert!(error.contains(expected), "{failure}: {error}");
+        assert_eq!(backend.target_artists, before_artists, "{failure}");
+        assert_eq!(backend.target_children, before_children, "{failure}");
+        assert!(backend.target_parents.is_empty(), "{failure}");
     }
 }
 
@@ -275,6 +429,7 @@ fn restored_parent_cascade_can_make_child_update_unnecessary() {
 fn later_failure_rolls_back_prior_parent_and_cascade_changes_in_batch() {
     let case = FkOrphanRepairCase::ReleasesName;
     let mut backend = comics_fixture(case, None);
+    backend.target_artists.clear();
     backend.cascade_parent = true;
     let key = vec!["92".into()];
     let second = row(
@@ -288,6 +443,7 @@ fn later_failure_rolls_back_prior_parent_and_cascade_changes_in_batch() {
     assert!(error.contains("source parent is missing"), "{error}");
     assert_eq!(backend.target_children, before);
     assert!(backend.target_parents.is_empty());
+    assert!(backend.target_artists.is_empty());
 }
 
 #[test]
@@ -509,6 +665,10 @@ fn config(spec: RepairCaseSpec, expected_orphans: usize) -> FkOrphanRepairConfig
 
 fn metadata(spec: &RepairCaseSpec) -> RepairMetadata {
     RepairMetadata {
+        artists: spec.restores_comics_parent().then(|| ArtistMetadata {
+            source: sync_table("artists", &["id"]),
+            target: sync_table("artists", &["id"]),
+        }),
         source_child: sync_table(spec.child_table, spec.child_primary_key),
         target_child: sync_table(spec.child_table, spec.child_primary_key),
         source_parent: sync_table(spec.parent_table, spec.parent_primary_key),

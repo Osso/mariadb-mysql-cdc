@@ -1,6 +1,6 @@
 use super::{
-    FkOrphanRepairBackend, FkOrphanRepairConfig, FkOrphanRepairReport, RepairCaseSpec,
-    RepairMetadata, required_row_value,
+    ArtistMetadata, FkOrphanRepairBackend, FkOrphanRepairCase, FkOrphanRepairConfig,
+    FkOrphanRepairReport, RepairCaseSpec, RepairMetadata, required_row_value,
 };
 use crate::canonical_foreign_key::CanonicalForeignKey;
 use crate::database_row::DatabaseRow;
@@ -191,6 +191,32 @@ impl FkOrphanRepairBackend for MySqlFkOrphanRepairBackend {
         )
     }
 
+    fn read_source_artist(
+        &mut self,
+        metadata: &ArtistMetadata,
+        primary_key: &[String],
+    ) -> Result<Option<DatabaseRow>, String> {
+        self.query_exact_source_row(&metadata.source, primary_key, "source repair artist")
+    }
+
+    fn read_target_artist(
+        &mut self,
+        metadata: &ArtistMetadata,
+        primary_key: &[String],
+    ) -> Result<Option<DatabaseRow>, String> {
+        self.query_exact_target_row(&metadata.target, primary_key, "target repair artist")
+    }
+
+    fn insert_target_artist(
+        &mut self,
+        metadata: &ArtistMetadata,
+        artist: &DatabaseRow,
+    ) -> Result<(), String> {
+        let statement =
+            build_strict_insert_statement(&metadata.target, std::slice::from_ref(artist))?;
+        execute_exact_target_mutation(&mut self.target, statement, "insert missing target artist")
+    }
+
     fn restore_target_parent(
         &mut self,
         metadata: &RepairMetadata,
@@ -249,7 +275,7 @@ fn read_repair_metadata(
     let source_reader = MariaDbInventoryReader::new(source_inventory_config(source));
     let (source_child, source_foreign_keys) =
         read_scoped_table(&source_reader, &source.database, spec.child_table)?;
-    let (source_parent, _) =
+    let (source_parent, source_parent_foreign_keys) =
         read_scoped_table(&source_reader, &source.database, spec.parent_table)?;
     validate_source_foreign_key(&source.database, spec, &source_foreign_keys)?;
 
@@ -263,11 +289,48 @@ fn read_repair_metadata(
     validate_table_pair(spec.parent_table, &source_parent, &target_parent)?;
     validate_case_columns(spec, &source_child, &source_parent)?;
 
+    let artists = if spec.restores_comics_parent() {
+        Some(read_artist_metadata(
+            source,
+            target,
+            &source_parent,
+            &source_parent_foreign_keys,
+        )?)
+    } else {
+        None
+    };
     Ok(RepairMetadata {
+        artists,
         source_child,
         target_child,
         source_parent,
         target_parent,
+    })
+}
+
+fn read_artist_metadata(
+    source: &crate::mysql_config::MySqlConnectionConfig,
+    target: &crate::live::TargetMySqlConfig,
+    comics: &SyncTable,
+    comics_foreign_keys: &[CanonicalForeignKey],
+) -> Result<ArtistMetadata, String> {
+    let spec = FkOrphanRepairCase::Comics.spec();
+    validate_source_foreign_key(&source.database, &spec, comics_foreign_keys)?;
+    let source_reader = MariaDbInventoryReader::new(source_inventory_config(source));
+    let (source_artist, foreign_keys) =
+        read_scoped_table(&source_reader, &source.database, "artists")?;
+    if !foreign_keys.is_empty() {
+        return Err(
+            "source artists has unexpected foreign keys; ancestor repair is not recursive".into(),
+        );
+    }
+    let target_reader = MariaDbInventoryReader::new(target_inventory_config(target));
+    let (target_artist, _) = read_scoped_table(&target_reader, &target.database, "artists")?;
+    validate_table_pair("artists", &source_artist, &target_artist)?;
+    validate_case_columns(&spec, comics, &source_artist)?;
+    Ok(ArtistMetadata {
+        source: source_artist,
+        target: target_artist,
     })
 }
 
@@ -490,17 +553,22 @@ fn non_null_foreign_key_filter(spec: &RepairCaseSpec) -> String {
 }
 
 fn build_lock_tables_sql(database: &str, spec: &RepairCaseSpec) -> String {
+    if spec.restores_comics_parent() {
+        return format!(
+            "LOCK TABLES {}.`artists` WRITE, {}.`comics` WRITE, {}.{} WRITE",
+            quote_ident(database),
+            quote_ident(database),
+            quote_ident(database),
+            quote_ident(spec.child_table),
+        );
+    }
     format!(
         "LOCK TABLES {}.{} WRITE, {}.{} {}",
         quote_ident(database),
         quote_ident(spec.child_table),
         quote_ident(database),
         quote_ident(spec.parent_table),
-        if spec.restores_comics_parent() {
-            "WRITE"
-        } else {
-            "READ"
-        }
+        "READ"
     )
 }
 

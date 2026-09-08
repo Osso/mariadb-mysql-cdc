@@ -273,6 +273,18 @@ pub(super) struct RepairMetadata {
     pub(super) target_child: SyncTable,
     pub(super) source_parent: SyncTable,
     pub(super) target_parent: SyncTable,
+    pub(super) artists: Option<ArtistMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ArtistMetadata {
+    pub(super) source: SyncTable,
+    pub(super) target: SyncTable,
+}
+
+struct RepairedArtist {
+    source: DatabaseRow,
+    inserted: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -327,6 +339,21 @@ pub(super) trait FkOrphanRepairBackend {
         metadata: &RepairMetadata,
         child: &DatabaseRow,
     ) -> Result<Option<DatabaseRow>, String>;
+    fn read_source_artist(
+        &mut self,
+        metadata: &ArtistMetadata,
+        primary_key: &[String],
+    ) -> Result<Option<DatabaseRow>, String>;
+    fn read_target_artist(
+        &mut self,
+        metadata: &ArtistMetadata,
+        primary_key: &[String],
+    ) -> Result<Option<DatabaseRow>, String>;
+    fn insert_target_artist(
+        &mut self,
+        metadata: &ArtistMetadata,
+        artist: &DatabaseRow,
+    ) -> Result<(), String>;
     fn restore_target_parent(
         &mut self,
         metadata: &RepairMetadata,
@@ -614,7 +641,7 @@ fn repair_source_present(
     backend: &mut impl FkOrphanRepairBackend,
     report: &mut FkOrphanRepairReport,
 ) -> Result<(), String> {
-    let source_parent =
+    let (source_parent, artist) =
         reconcile_repair_parent(spec, metadata, primary_key, &source_child, backend)?;
     // Parent CASCADE may already have changed this child inside the batch.
     let target_before = if spec.restores_comics_parent() {
@@ -634,7 +661,11 @@ fn repair_source_present(
         &source_child,
         &source_parent,
         backend,
-    )
+    )?;
+    if let Some(artist) = artist {
+        verify_repaired_artist(require_artist_metadata(metadata)?, &artist, backend)?;
+    }
+    Ok(())
 }
 
 fn reconcile_repair_parent(
@@ -643,11 +674,20 @@ fn reconcile_repair_parent(
     primary_key: &[String],
     source_child: &DatabaseRow,
     backend: &mut impl FkOrphanRepairBackend,
-) -> Result<DatabaseRow, String> {
+) -> Result<(DatabaseRow, Option<RepairedArtist>), String> {
     let source_parent = backend
         .read_source_parent(spec, metadata, source_child)?
         .ok_or_else(|| format!("source parent is missing for primary key {primary_key:?}"))?;
     validate_child_parent_relationship(spec, source_child, &source_parent, "source")?;
+    let artist = if spec.restores_comics_parent() {
+        Some(restore_missing_artist(
+            require_artist_metadata(metadata)?,
+            &source_parent,
+            backend,
+        )?)
+    } else {
+        None
+    };
     let target_parent = backend.read_target_parent(spec, metadata, source_child)?;
     if spec.restores_comics_parent() {
         if target_parent.as_ref() != Some(&source_parent) {
@@ -667,7 +707,64 @@ fn reconcile_repair_parent(
             .ok_or_else(|| format!("target parent is missing for primary key {primary_key:?}"))?;
         validate_parent_identity(spec, &source_parent, &target_parent, primary_key)?;
     }
-    Ok(source_parent)
+    Ok((source_parent, artist))
+}
+
+fn require_artist_metadata(metadata: &RepairMetadata) -> Result<&ArtistMetadata, String> {
+    metadata
+        .artists
+        .as_ref()
+        .ok_or_else(|| "validated artists metadata is missing".into())
+}
+
+fn restore_missing_artist(
+    metadata: &ArtistMetadata,
+    comic: &DatabaseRow,
+    backend: &mut impl FkOrphanRepairBackend,
+) -> Result<RepairedArtist, String> {
+    let key = vec![required_row_value(comic, "artist_id", "source comic")?.to_string()];
+    let source = backend
+        .read_source_artist(metadata, &key)?
+        .ok_or_else(|| format!("source artist is missing for primary key {key:?}"))?;
+    let spec = FkOrphanRepairCase::Comics.spec();
+    validate_child_parent_relationship(&spec, comic, &source, "source comic artist")?;
+    let target = backend.read_target_artist(metadata, &key)?;
+    let inserted = target.is_none();
+    if let Some(target) = target {
+        validate_parent_identity(&spec, &source, &target, &comic.primary_key)?;
+    } else {
+        backend.insert_target_artist(metadata, &source)?;
+    }
+    let artist = RepairedArtist { source, inserted };
+    verify_repaired_artist(metadata, &artist, backend)?;
+    Ok(artist)
+}
+
+fn verify_repaired_artist(
+    metadata: &ArtistMetadata,
+    artist: &RepairedArtist,
+    backend: &mut impl FkOrphanRepairBackend,
+) -> Result<(), String> {
+    let key = &artist.source.primary_key;
+    if backend.read_source_artist(metadata, key)?.as_ref() != Some(&artist.source) {
+        return Err(format!(
+            "source artist changed during repair for primary key {key:?}"
+        ));
+    }
+    let target = backend
+        .read_target_artist(metadata, key)?
+        .ok_or_else(|| format!("target artist disappeared for primary key {key:?}"))?;
+    if artist.inserted && target != artist.source {
+        return Err(format!(
+            "inserted target artist verification failed for primary key {key:?}"
+        ));
+    }
+    validate_parent_identity(
+        &FkOrphanRepairCase::Comics.spec(),
+        &artist.source,
+        &target,
+        key,
+    )
 }
 
 fn apply_source_child(

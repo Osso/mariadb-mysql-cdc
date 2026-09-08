@@ -38,9 +38,12 @@ implementation details belong in the [FK orphan repair wiki](../wiki/systems/fk-
 
 ### Source-authoritative child repair
 
-- [x] Lock only the selected target child and parent tables for each bounded batch, then commit or roll back that batch before releasing the locks.
+- [x] Lock only the selected target child and parent tables, plus `artists` for the ten comics-parent cases, for each bounded batch; commit or roll back before releasing locks.
 - [x] For the original four cases, require a valid source FK relationship and an existing target parent with the exact referenced source identity; never restore their parents.
 - [x] Only for the allowlisted `comics_langs`/`releases` cases, restore a missing or stale `comics` parent from its complete source row before copying the child. Use strict metadata-aware insert/update with constraints enabled; lock the parent WRITE and child WRITE in the same batch. Re-read the child after parent CASCADE before deciding whether it needs an update.
+- [ ] Only for the ten comics-parent cases, validate source `comics_ibfk_5`: `comics(artist_id,artist_name)` → `artists(id,name)`, update `CASCADE`, delete `RESTRICT`, enforced. Validate source/target artists writable metadata and primary key `id`; reject source artists with FKs rather than recurse.
+- [ ] Before comic/child mutation, require source artist identity to match the comic. Insert the complete source artist only when its target primary key is missing; require an existing target artist's `id,name` to match, without updating other artist fields. Fail closed on mismatched identity.
+- [ ] For those cases, acquire `artists WRITE`, `comics WRITE`, selected child `WRITE` in that deterministic order. Verify unchanged complete source artist and exact inserted target artist after restoration and child mutation; existing target artists require identity equality only. Any failure rolls back all artist, comic, child, and CASCADE changes in the batch.
 - [x] Require exact full-row target parent equality and unchanged source child/parent after restoration. Any mutation or verification failure rolls back the entire batch, including parent and CASCADE changes.
 - [x] When the source child is absent, delete only the exact target child primary-key row; never create or mutate parent rows.
 - [x] Verify source stability, target child state, target parent identity when applicable, and zero remaining selected orphan identities after mutation.
@@ -74,10 +77,10 @@ implementation details belong in the [FK orphan repair wiki](../wiki/systems/fk-
 
 ## Validation scope
 
-The disposable parent scenario proves the ten exact `comics_langs`/`releases` selectors only. It does not authorize or record a live repair. Production evidence must re-read each selected orphan count, confirm the selected FK is absent, run one case at a time, and retain zero-remaining proof. The original four retain child-only behavior.
+The disposable parent scenario proves the ten exact `comics_langs`/`releases` selectors only. It does not authorize or record a live repair. Production evidence must re-read each selected orphan count, confirm the selected FK is absent, run one case at a time, and retain zero-remaining proof. The original four retain child-only behavior. Missing-artist runtime tests cover insertion ordering, existing-row preservation, identity/source-stability/exact-row failures, and whole-batch rollback. Disposable database proof of the artist ancestor boundary remains separate; unit tests do not prove MySQL locking or constraint behavior.
 
 ## Out of scope
 
-- Generic FK repair, arbitrary table or constraint selection, parent restoration outside the allowlisted comics-parent cases, full-table synchronization, parity sweeps, or fallback mutation engines.
+- Generic FK repair, arbitrary table or constraint selection, parent restoration outside the allowlisted comics-parent cases and their explicit missing-artist ancestor, full-table synchronization, parity sweeps, or fallback mutation engines.
 - Durable progress, checkpoint, DDL-journal, run-spec, or live-stream state changes.
 - Kubernetes manifests, Flux ownership, image publication, and deployment procedures; those belong to the ops repository.
