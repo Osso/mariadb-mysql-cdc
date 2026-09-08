@@ -273,6 +273,63 @@ fn restored_parent_cascade_can_make_child_update_unnecessary() {
 }
 
 #[test]
+fn later_failure_rolls_back_prior_parent_and_cascade_changes_in_batch() {
+    let case = FkOrphanRepairCase::ReleasesName;
+    let mut backend = comics_fixture(case, None);
+    backend.cascade_parent = true;
+    let key = vec!["92".into()];
+    let second = row(
+        &key,
+        [("id", "92"), ("comic_id", "8"), ("comic_name", "missing")],
+    );
+    backend.source_children.insert(key.clone(), second.clone());
+    backend.target_children.insert(key, second);
+    let before = backend.target_children.clone();
+    let error = repair_with_backend(&config(case.spec(), 2), &mut backend).unwrap_err();
+    assert!(error.contains("source parent is missing"), "{error}");
+    assert_eq!(backend.target_children, before);
+    assert!(backend.target_parents.is_empty());
+}
+
+#[test]
+fn comics_source_absent_child_is_deleted_without_restoring_parent() {
+    let case = FkOrphanRepairCase::ReleasesName;
+    let mut backend = comics_fixture(case, None);
+    backend.source_children.clear();
+    let report = repair_with_backend(&config(case.spec(), 1), &mut backend).unwrap();
+    assert_eq!(report.deleted, 1);
+    assert!(backend.target_children.is_empty());
+    assert!(backend.target_parents.is_empty());
+}
+
+#[test]
+fn legacy_cases_refuse_missing_or_stale_target_parent() {
+    for stale in [false, true] {
+        let spec = FkOrphanRepairCase::ArtistsFavorites.spec();
+        let key = vec!["1".into()];
+        let mut backend = FakeBackend::default();
+        backend
+            .source_children
+            .insert(key.clone(), child(&key, "7", "Current"));
+        backend
+            .target_children
+            .insert(key.clone(), child(&key, "7", "Orphan"));
+        backend
+            .source_parents
+            .insert(vec!["7".into()], parent("7", "Current"));
+        if stale {
+            backend
+                .target_parents
+                .insert(vec!["7".into()], parent("7", "Old"));
+        }
+        let before = backend.target_parents.clone();
+        assert!(repair_with_backend(&config(spec, 1), &mut backend).is_err());
+        assert_eq!(backend.target_parents, before);
+        assert!(!backend.events.contains(&"parent".into()));
+    }
+}
+
+#[test]
 fn correct_parent_is_not_written_and_completed_repair_is_noop() {
     let case = FkOrphanRepairCase::ComicsLangsCategory;
     let mut backend = comics_fixture(case, None);
