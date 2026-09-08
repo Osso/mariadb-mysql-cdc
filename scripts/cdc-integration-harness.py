@@ -3733,12 +3733,13 @@ class Harness:
     def run_repair_guest_range(self) -> None:
         assert self.source and self.target
         schema = """
-            CREATE TABLE utms (id BIGINT UNSIGNED PRIMARY KEY, label VARCHAR(64));
+            CREATE TABLE utms (id BIGINT UNSIGNED PRIMARY KEY, label VARCHAR(64))
+                DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
             CREATE TABLE guests (
                 guest_id BIGINT UNSIGNED NOT NULL,
                 guest_hash CHAR(32) NOT NULL,
                 utm_id BIGINT UNSIGNED NULL,
-                label VARCHAR(64) CHARACTER SET utf8mb4 NOT NULL,
+                label VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
                 payload VARBINARY(64) NOT NULL,
                 state ENUM('', 'live') NOT NULL,
                 created_at DATETIME(6) NOT NULL,
@@ -3746,7 +3747,7 @@ class Harness:
                 UNIQUE KEY guest_identity (guest_id, guest_hash),
                 CONSTRAINT fk_guests_utm_id FOREIGN KEY (utm_id) REFERENCES utms(id)
                     ON DELETE RESTRICT ON UPDATE RESTRICT
-            ) ENGINE=InnoDB;
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
             CREATE TABLE sessions (
                 session_id BIGINT UNSIGNED PRIMARY KEY,
                 guest_id BIGINT UNSIGNED NOT NULL,
