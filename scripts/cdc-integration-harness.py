@@ -63,6 +63,7 @@ SCENARIOS = (
     ScenarioSpec("sync-bit-values", True),
     ScenarioSpec("sync-resume", True),
     ScenarioSpec("sync-schema-parallel-resume", True),
+    ScenarioSpec("repair-fk-orphans-parents", True),
     ScenarioSpec("sync-progress-least-privilege", True),
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("production-alter-table", True),
@@ -3700,6 +3701,226 @@ class Harness:
             "ORDER BY TABLE_NAME,CONSTRAINT_NAME;",
         ).strip()
 
+    def run_repair_fk_case(self, case: str, expected: int) -> CommandResult:
+        args = self._sync_args(self._sync_binary(), tables=[], run_id="unused")
+        args = args[: args.index("--chunk-size")]
+        args[1] = "repair-fk-orphans"
+        args.extend(
+            ["--case", case, "--expected-orphans", str(expected), "--batch-size", "50"]
+        )
+        return run(
+            args,
+            cwd=self.repo,
+            env={
+                **os.environ,
+                "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                "CDC_TARGET_PASSWORD": SYNC_TARGET_PASSWORD,
+            },
+            timeout=120,
+            check=False,
+        )
+
+    def run_repair_fk_orphans_parents(self) -> None:
+        assert self.source and self.target
+        self.admin_sql(
+            self.target,
+            "CREATE TABLE cdc.repair_control_sentinel (id INT PRIMARY KEY, payload VARBINARY(64)); INSERT INTO cdc.repair_control_sentinel VALUES (1,X'00FF1234');",
+        )
+        cases = [
+            (
+                "comics-langs-category",
+                "comics_langs",
+                "ibfk_accl_category",
+                "comic_category_id",
+                "section_id",
+            ),
+            (
+                "comics-langs-type",
+                "comics_langs",
+                "ibfk_accl_type",
+                "comic_type_id",
+                "comic_type_id",
+            ),
+            ("releases-name", "releases", "releases_ibfk_1", "comic_name", "name"),
+            (
+                "releases-type",
+                "releases",
+                "releases_ibfk_10",
+                "comic_type_id",
+                "comic_type_id",
+            ),
+            (
+                "releases-category",
+                "releases",
+                "releases_ibfk_2",
+                "comic_category_id",
+                "section_id",
+            ),
+            (
+                "releases-visibility",
+                "releases",
+                "releases_ibfk_3",
+                "comic_is_visible",
+                "is_visible",
+            ),
+            ("releases-id", "releases", "releases_ibfk_6", None, None),
+            ("releases-slug", "releases", "releases_ibfk_7", "comic_slug", "slug"),
+            (
+                "releases-show-in-list",
+                "releases",
+                "releases_ibfk_9",
+                "comic_show_in_list",
+                "show_in_list",
+            ),
+            (
+                "releases-format",
+                "releases",
+                "releases_ibfk_format",
+                "comic_format_id",
+                "format_id",
+            ),
+        ]
+        for case, child, constraint, child_col, parent_col in cases:
+            self.repair_parent_fixture(case, child, constraint, child_col, parent_col)
+        self.repair_artists_favorites_fixture()
+        sentinel = self.admin_query(
+            self.target, "SELECT id,HEX(payload) FROM cdc.repair_control_sentinel;"
+        ).strip()
+        if sentinel != "1\t00FF1234":
+            raise HarnessError(f"repair changed control-plane sentinel: {sentinel!r}")
+
+    def repair_parent_fixture(
+        self,
+        case: str,
+        child: str,
+        constraint: str,
+        child_col: str | None,
+        parent_col: str | None,
+    ) -> None:
+        assert self.source and self.target
+        parent_extra = f", `{parent_col}` VARCHAR(32) NOT NULL" if parent_col else ""
+        child_extra = f", `{child_col}` VARCHAR(32) NOT NULL" if child_col else ""
+        slug = case == "releases-slug"
+        parent_key = (
+            f"`{parent_col}`"
+            if slug
+            else "id" + (f",`{parent_col}`" if parent_col else "")
+        )
+        child_key = (
+            f"`{child_col}`"
+            if slug
+            else "comic_id" + (f",`{child_col}`" if child_col else "")
+        )
+        ddl = (
+            "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS releases,comics_langs,comics; SET FOREIGN_KEY_CHECKS=1;"
+            f"CREATE TABLE comics (id BIGINT PRIMARY KEY{parent_extra}, payload MEDIUMBLOB NOT NULL, state ENUM('','live') NOT NULL, UNIQUE KEY parent_key ({parent_key}));"
+            f"CREATE TABLE `{child}` (id BIGINT PRIMARY KEY,comic_id BIGINT NOT NULL{child_extra},"
+            f"CONSTRAINT `{constraint}` FOREIGN KEY ({child_key}) REFERENCES comics ({parent_key}) ON UPDATE CASCADE ON DELETE RESTRICT);"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, ddl)
+        values = lambda key, value: (
+            f"({key}" + (f",'{value}'" if parent_col else "") + ",X'00FF80','live')"
+        )
+        self.admin_sql(
+            self.source,
+            "INSERT INTO comics VALUES "
+            + values(1, "fresh1")
+            + ","
+            + values(2, "fresh2")
+            + ";",
+        )
+
+        def row(key: int, comic: int, value: str) -> str:
+            return f"({key},{comic}" + (f",'{value}'" if child_col else "") + ")"
+
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO `{child}` VALUES {row(1, 1, 'fresh1')},{row(2, 2, 'fresh2')};",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO comics VALUES "
+            + values(2, "stale")
+            + "; SET FOREIGN_KEY_CHECKS=0;"
+            f"INSERT INTO `{child}` VALUES {row(1, 999, 'orphan1')},{row(2, 998, 'orphan2')},{row(3, 997, 'orphan3')}; SET FOREIGN_KEY_CHECKS=1;",
+        )
+        snapshot_sql = (
+            f"SELECT * FROM `{child}` ORDER BY id; SELECT id"
+            + (f",`{parent_col}`" if parent_col else "")
+            + ",HEX(payload),state+0 FROM comics ORDER BY id;"
+        )
+        before = self.admin_query(self.target, snapshot_sql)
+        source_before = self.admin_query(self.source, snapshot_sql)
+        self.admin_sql(
+            self.target,
+            f"CREATE TRIGGER repair_fail BEFORE UPDATE ON `{child}` FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='repair child write blocked';",
+        )
+        failed = self.run_repair_fk_case(case, 3)
+        if failed.returncode == 0 or "repair child write blocked" not in failed.stderr:
+            raise HarnessError(
+                f"{case} did not reach post-parent rollback boundary: {failed}"
+            )
+        if self.admin_query(self.target, snapshot_sql) != before:
+            raise HarnessError(f"{case} leaked parent/child mutation after rollback")
+        self.admin_sql(self.target, "DROP TRIGGER repair_fail;")
+        repaired = self.run_repair_fk_case(case, 3)
+        require_success(repaired, case)
+        if (
+            "planned=3 examined=3 updated=2 deleted=1" not in repaired.stdout
+            or "remaining=0" not in repaired.stdout
+        ):
+            raise HarnessError(f"{case} wrong repair counts: {repaired.stdout}")
+        if (
+            self.admin_query(self.target, snapshot_sql) != source_before
+            or self.admin_query(self.source, snapshot_sql) != source_before
+        ):
+            raise HarnessError(f"{case} source/target exact row fidelity mismatch")
+        require_success(self.run_repair_fk_case(case, 0), case + " idempotence")
+        self.assert_admin_sql_rejected(
+            self.target,
+            f"INSERT INTO `{child}` VALUES {row(99, 999, 'missing')};",
+            "1452",
+        )
+        print(
+            f"repair_parent_case_pass case={case} updated=2 deleted=1 rollback=exact idempotent=true"
+        )
+
+    def repair_artists_favorites_fixture(self) -> None:
+        assert self.source and self.target
+        ddl = (
+            "CREATE TABLE users (id BIGINT PRIMARY KEY,name VARCHAR(32) NOT NULL,UNIQUE KEY user_name(id,name));"
+            "CREATE TABLE artists_favorites(id BIGINT PRIMARY KEY,user_id BIGINT NOT NULL,user_username VARCHAR(32) NOT NULL,"
+            "CONSTRAINT artists_favorites_ibfk_2 FOREIGN KEY(user_id,user_username) REFERENCES users(id,name) ON UPDATE CASCADE ON DELETE RESTRICT);"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, ddl + "INSERT INTO users VALUES(1,'fresh');")
+        self.admin_sql(
+            self.source,
+            "INSERT INTO artists_favorites VALUES "
+            + ",".join(f"({i},1,'fresh')" for i in range(1, 8))
+            + ";",
+        )
+        self.admin_sql(
+            self.target,
+            "SET FOREIGN_KEY_CHECKS=0; INSERT INTO artists_favorites VALUES "
+            + ",".join(f"({i},1,'stale')" for i in range(1, 30))
+            + "; SET FOREIGN_KEY_CHECKS=1;",
+        )
+        result = self.run_repair_fk_case("artists-favorites", 29)
+        require_success(result, "artists-favorites")
+        if "planned=29 examined=29 updated=7 deleted=22" not in result.stdout:
+            raise HarnessError(f"artists-favorites counts: {result.stdout}")
+        for table in ("users", "artists_favorites"):
+            if self.admin_query(
+                self.target, f"SELECT * FROM {table} ORDER BY id;"
+            ) != self.admin_query(self.source, f"SELECT * FROM {table} ORDER BY id;"):
+                raise HarnessError(f"artists-favorites parity {table}")
+        require_success(
+            self.run_repair_fk_case("artists-favorites", 0),
+            "artists-favorites idempotence",
+        )
+
     def run_sync_schema_parallel_resume(self) -> None:
         assert self.source and self.target
         run_id = "sync-schema-parallel-resume"
@@ -4439,6 +4660,8 @@ class Harness:
             self.run_sync_bit_values()
         elif scenario == "sync-resume":
             self.run_sync_resume()
+        elif scenario == "repair-fk-orphans-parents":
+            self.run_repair_fk_orphans_parents()
         elif scenario == "sync-schema-parallel-resume":
             self.run_sync_schema_parallel_resume()
         elif scenario == "sync-progress-least-privilege":
