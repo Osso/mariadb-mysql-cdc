@@ -48,31 +48,7 @@ impl GuestRangeRepairConfig {
     pub(crate) fn from_args(args: Vec<String>) -> Result<Self, String> {
         let mut source = MySqlConnectionConfig::default();
         let mut target = TargetMySqlConfig::default();
-        let mut options = std::collections::BTreeMap::new();
-        let mut pairs = args.chunks_exact(2);
-        for pair in &mut pairs {
-            let (flag, value) = (pair[0].as_str(), pair[1].as_str());
-            if crate::sync_cli::apply_source_option(&mut source, flag, value)?
-                || crate::sync_cli::apply_target_option(&mut target, flag, value)?
-            {
-                continue;
-            }
-            if !matches!(
-                flag,
-                "--start-guest-id" | "--end-guest-id" | "--expected-rows" | "--batch-size"
-            ) {
-                return Err(format!("unknown repair-guest-range option: {flag}"));
-            }
-            let number = value
-                .parse::<u64>()
-                .map_err(|_| format!("invalid {flag}: {value}"))?;
-            if options.insert(flag, number).is_some() {
-                return Err(format!("{flag} may be specified only once"));
-            }
-        }
-        if let Some(flag) = pairs.remainder().first() {
-            return Err(format!("{flag} needs a value"));
-        }
+        let options = parse_options(&args, &mut source, &mut target)?;
         let required = |flag| {
             options
                 .get(flag)
@@ -91,6 +67,43 @@ impl GuestRangeRepairConfig {
         validate_config(&config)?;
         Ok(config)
     }
+}
+
+fn parse_options<'a>(
+    args: &'a [String],
+    source: &mut MySqlConnectionConfig,
+    target: &mut TargetMySqlConfig,
+) -> Result<std::collections::BTreeMap<&'a str, u64>, String> {
+    let mut options = std::collections::BTreeMap::new();
+    let mut pairs = args.chunks_exact(2);
+    for pair in &mut pairs {
+        let (flag, value) = (pair[0].as_str(), pair[1].as_str());
+        if crate::sync_cli::apply_source_option(source, flag, value)?
+            || crate::sync_cli::apply_target_option(target, flag, value)?
+        {
+            continue;
+        }
+        let number = parse_range_option(flag, value)?;
+        if options.insert(flag, number).is_some() {
+            return Err(format!("{flag} may be specified only once"));
+        }
+    }
+    if let Some(flag) = pairs.remainder().first() {
+        return Err(format!("{flag} needs a value"));
+    }
+    Ok(options)
+}
+
+fn parse_range_option(flag: &str, value: &str) -> Result<u64, String> {
+    if !matches!(
+        flag,
+        "--start-guest-id" | "--end-guest-id" | "--expected-rows" | "--batch-size"
+    ) {
+        return Err(format!("unknown repair-guest-range option: {flag}"));
+    }
+    value
+        .parse()
+        .map_err(|_| format!("invalid {flag}: {value}"))
 }
 
 fn validate_bounds(config: &GuestRangeRepairConfig) -> Result<(), String> {
