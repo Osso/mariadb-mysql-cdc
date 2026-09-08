@@ -12,12 +12,12 @@ A bounded, insert-only repair for an explicitly supplied inclusive `guests.guest
 ### Preconditions and consistency
 - [ ] Require exact source count/minimum/maximum before target writes. Read count and bounded keyset pages from one read-only repeatable-read source snapshot; copied values represent that snapshot, not necessarily the latest concurrently changed source values.
 - [ ] Require source/target InnoDB base tables with matching typed row metadata, integer PK exactly `guest_id`, and no generated columns. Require compatible `utms` metadata and PK exactly `id`.
-- [ ] Validate exactly one enforced canonical FK `guests(utm_id)` → local `utms(id)`, with RESTRICT update/delete and NONE match. Accept the canonical source name and its normal mapped target name respectively.
+- [x] Validate exactly one enforced canonical FK `guests(utm_id)` → local `utms(id)`, with RESTRICT update/delete and NONE match. Accept the canonical source name and its normal mapped target name respectively.
 - [ ] Require each non-null referenced target UTM before copying its guest; retain its shared row lock through the target batch commit. Null UTM references need no parent repair.
 
 ### Mutations and failure
 - [ ] Preserve binary/varbinary and BLOB-family bytes without UTF-8 replacement; null bytes and invalid UTF-8 remain byte-exact.
-- [ ] Insert complete source row values using strict inserts. Equal existing target rows are unchanged; differing rows fail closed without updates, deletes, ignore, upsert, or secondary-key reconciliation.
+- [x] Insert complete source row values using strict inserts. Equal existing target rows are unchanged; differing rows fail closed without updates, deletes, ignore, upsert, or secondary-key reconciliation. Core row-state seams assert this; database proof remains below.
 - [ ] Bound source pages and target transactions by batch size. Verify contiguous numeric keyset coverage, lock target identities, and compare complete target readback with source snapshot before commit.
 - [ ] Roll back the entire current target batch on failure, including readback/commit errors; report rollback errors alongside the original failure. Prior committed batches remain and exact equal rows make reruns idempotent. Lost commit acknowledgement may leave a committed batch; do not automatically retry mutations.
 
@@ -32,6 +32,8 @@ A bounded, insert-only repair for an explicitly supplied inclusive `guests.guest
 
 ## Tests asserting this spec
 - `src/sync/guest_range_repair/tests.rs`: multi-page full-value insert/rerun, source count mismatch, differing existing rows, missing parent, corrupt readback, commit failure, invalid bounds/batch limits.
+- `src/sync/guest_range_repair/mysql_backend.rs` tests: canonical FK, PK/engine/type/nullability/width/collation parity, binary SQL parameter preservation.
+- September 8, 2026: `cargo test --bin mariadb-mysql-cdc guest_range_repair:: -- --nocapture` passed 11 tests at `f9749a1`, no warnings. Core stub tests, metadata width rejection, and binary parameter preservation each had preceding failing evidence. This is seam proof, not live database proof.
 
 ## Known gaps (current cycle)
 - [ ] Parent integration owns CLI wiring and database-backed proof of SQL, transaction/lock semantics, canonical metadata, and post-repair child FK validation.
