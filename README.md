@@ -467,10 +467,19 @@ and completed/partial table progress. Exact authorization, unchanged source scop
 and retained original binlog history are required; unsafe states are rejected
 without substituting a newer boundary or a fresh scan. `activate-lost-binlog`
 accepts only an authorized existing prepared record at that exact retained boundary
-when prerequisite and `Rows` progress are complete. It read-only loads progress,
-performs no DDL, source/target data read or write, rescan, new boundary capture,
-or source-configuration change, and leaves final FK progress untouched. Its atomic
-commit records `schema_converged=false` and `final_constraints_deferred=true`.
+when prerequisite and `Rows` progress are complete. It derives the original table
+scope only when the persisted prerequisite and `Rows` table-name sets are nonempty
+and identical, reconstructs current inventory only for that scope and its FK
+children, and requires its exact immutable prepared inventory hash both before
+activation and immediately before the atomic commit. It audits current source
+tables outside that recorded scope as `additional_source_tables`; it does not claim
+them synchronized, and their changes remain eligible for replay from the same
+original boundary. Changed definitions or a wrong original scope fail closed.
+Activation does not require a binlog table-creation scan. It read-only loads
+progress, performs no DDL, source/target data read or write, rescan, new boundary
+capture, or source-configuration change, and leaves final FK progress untouched.
+Its atomic commit records `schema_converged=false` and
+`final_constraints_deferred=true`.
 
 ## TLS policy
 
