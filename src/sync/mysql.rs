@@ -510,6 +510,25 @@ impl MySqlSyncProgressStore {
         })
     }
 
+    pub(crate) fn stage_table_names(
+        &mut self,
+        run_id: &str,
+        stage: SyncStage,
+    ) -> Result<Vec<String>, String> {
+        let sql = format!(
+            "SELECT table_name FROM {} WHERE run_id = ? AND stage = ? ORDER BY table_name",
+            crate::mysql_support::quote_identifier_path(&self.progress_table)
+        );
+        self.conn
+            .exec(sql, (run_id, stage.as_str()))
+            .map_err(|error| {
+                format!(
+                    "read sync progress table names for run `{run_id}` stage `{}`: {error}",
+                    stage.as_str()
+                )
+            })
+    }
+
     fn ensure(&mut self) -> Result<(), String> {
         if let Some(sql) = build_create_sync_progress_schema_sql(&self.progress_table) {
             self.execute_progress_sql(&sql)?;

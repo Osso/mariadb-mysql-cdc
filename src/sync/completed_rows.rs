@@ -5,6 +5,36 @@ use super::model::{
 
 use super::mysql::{MySqlSyncProgressStore, sync_chunk_progress_from_row};
 
+pub(crate) fn read_recorded_recovery_tables(config: &SyncConfig) -> Result<Vec<String>, String> {
+    let run_id = require_explicit_run_id(config.run_id.as_deref())?;
+    super::config::validate_sync_config(config)?;
+    let mut store = MySqlSyncProgressStore::open_existing(
+        &config.target,
+        config.progress_table.clone(),
+        config.coordinator_session_wait_timeout_seconds,
+    )?;
+    let prerequisite = store.stage_table_names(run_id, SyncStage::PrerequisiteSchema)?;
+    let rows = store.stage_table_names(run_id, SyncStage::Rows)?;
+    validate_recorded_recovery_tables(prerequisite, rows)
+}
+
+fn validate_recorded_recovery_tables(
+    prerequisite: Vec<String>,
+    rows: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let prerequisite: std::collections::BTreeSet<_> = prerequisite.into_iter().collect();
+    let rows: std::collections::BTreeSet<_> = rows.into_iter().collect();
+    if prerequisite.is_empty() || rows.is_empty() {
+        return Err(
+            "recorded recovery requires nonempty prerequisite_schema and rows table sets".into(),
+        );
+    }
+    if prerequisite != rows {
+        return Err("recorded recovery prerequisite_schema and rows table sets differ".into());
+    }
+    Ok(rows.into_iter().collect())
+}
+
 pub(crate) fn load_completed_recovery_rows(
     config: &SyncConfig,
 ) -> Result<Vec<SyncChunkProgress>, String> {
@@ -111,6 +141,29 @@ mod tests {
 
     fn store(rows: Vec<SyncProgressRow>) -> Store {
         Store(rows.into_iter().map(|row| Ok(Some(row))).collect())
+    }
+
+    #[test]
+    fn recorded_tables_require_identical_nonempty_sets_and_sort_names() {
+        let names = |values: &[&str]| values.iter().map(|name| (*name).to_string()).collect();
+        assert_eq!(
+            validate_recorded_recovery_tables(
+                names(&["pages", "books"]),
+                names(&["books", "pages"])
+            )
+            .unwrap(),
+            names(&["books", "pages"])
+        );
+        for (schema, rows) in [
+            (vec![], vec![]),
+            (names(&["books"]), vec![]),
+            (vec![], names(&["books"])),
+            (names(&["books"]), names(&["pages"])),
+            (names(&["books", "pages"]), names(&["books"])),
+            (names(&["books"]), names(&["books", "pages"])),
+        ] {
+            assert!(validate_recorded_recovery_tables(schema, rows).is_err());
+        }
     }
 
     #[test]
