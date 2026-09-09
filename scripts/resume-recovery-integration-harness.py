@@ -475,14 +475,196 @@ def run_refusal_case(binary: Path | None, keep: bool) -> None:
         )
 
 
+def activation_snapshot(harness) -> tuple:
+    """Capture complete control rows, payloads and actual constraint definitions."""
+    snapshots = [read_control_state(harness)]
+    for table in ("sync_runs", "sync_runs_phases"):
+        snapshots.append(
+            harness.admin_query(
+                harness.target, f"SELECT * FROM cdc.{table} ORDER BY 1,2,3;"
+            )
+        )
+    for server in (harness.source, harness.target):
+        for table in ("a_done", "b_rows"):
+            snapshots.append(
+                harness.admin_query(server, f"SELECT * FROM {table} ORDER BY id;")
+            )
+            snapshots.append(harness.admin_query(server, f"SHOW CREATE TABLE {table};"))
+    return tuple(snapshots)
+
+
+def run_activation(harness, authorization: Path):
+    args = base.recovery_args(harness, harness._sync_binary(), authorization)
+    args[1] = "activate-lost-binlog"
+    return base.run(
+        args, cwd=REPO, env=base.recovery_environment(), timeout=30, check=False
+    )
+
+
+def assert_activation_refused(harness, authorization: Path, marker: str) -> None:
+    before = activation_snapshot(harness)
+    result = run_activation(harness, authorization)
+    output = result.stdout + result.stderr
+    if result.returncode != 1 or marker.lower() not in output.lower():
+        raise base.HarnessError(
+            f"unexpected activation refusal: {result.returncode}: {output}"
+        )
+    if activation_snapshot(harness) != before:
+        raise base.HarnessError(
+            "refused activation mutated durable state/data/constraints"
+        )
+
+
+def run_activation_case(binary: Path | None, keep: bool) -> None:
+    with base.Harness(REPO, binary, keep) as harness:
+        harness.prepare()
+        authorization, old_checkpoint = seed_fixture(harness, 100)
+        blocker, owner = start_table_blocker(harness)
+        process, _ = base.start_recovery(harness, authorization)
+        try:
+            base.wait_for_recovery_prepared(harness)
+        finally:
+            kill_process(process)
+            release_blocker(harness, blocker, owner)
+        prepared = read_prepared(harness)
+        base.assert_checkpoint(harness, old_checkpoint)
+        run_id = base.sql_literal(base.RECOVERY_ID)
+        harness.admin_sql_file(
+            harness.target, REPO / "docs/sync-phase-progress-bootstrap.sql"
+        )
+        # This slice tests activation of persisted evidence, not execution of row sync.
+        harness.admin_sql(
+            harness.target, f"DELETE FROM cdc.sync_runs WHERE run_id={run_id};"
+        )
+        for stage in ("prerequisite_schema", "rows"):
+            for table in ("a_done", "b_rows"):
+                harness.admin_sql(
+                    harness.target,
+                    "INSERT INTO cdc.sync_runs(run_id,stage,table_name,run_spec_json,status) "
+                    f"VALUES({run_id},'{stage}','{table}','{{}}','complete');",
+                )
+        # Pending final constraints are absent; errored final constraints remain errored.
+        harness.admin_sql(
+            harness.target,
+            "INSERT INTO cdc.sync_runs(run_id,stage,table_name,run_spec_json,status,last_error) "
+            f"VALUES({run_id},'final_constraints','b_rows','{{}}','error','fixture deferred');",
+        )
+        for stage in ("rows", "prerequisite_schema"):
+            where = f"run_id={run_id} AND stage='{stage}' AND table_name='b_rows'"
+            harness.admin_sql(
+                harness.target, f"DELETE FROM cdc.sync_runs WHERE {where};"
+            )
+            assert_activation_refused(harness, authorization, stage)
+            harness.admin_sql(
+                harness.target,
+                "INSERT INTO cdc.sync_runs(run_id,stage,table_name,run_spec_json,status) "
+                f"VALUES({run_id},'{stage}','b_rows','{{}}','running');",
+            )
+            assert_activation_refused(harness, authorization, stage)
+            harness.admin_sql(
+                harness.target,
+                f"UPDATE cdc.sync_runs SET status='complete' WHERE {where};",
+            )
+
+        harness.admin_sql(
+            harness.target,
+            f"UPDATE cdc.stream_recovery_records SET status='abandoned' WHERE recovery_id={run_id};",
+        )
+        assert_activation_refused(harness, authorization, "prepared")
+        harness.admin_sql(
+            harness.target,
+            f"UPDATE cdc.stream_recovery_records SET status='prepared' WHERE recovery_id={run_id};",
+        )
+
+        # A real transactional failure, after activation reaches its commit writes.
+        harness.admin_sql(
+            harness.target,
+            "CREATE TRIGGER cdc.reject_activation BEFORE UPDATE ON cdc.stream_recovery_records "
+            "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='activation commit injection';",
+        )
+        try:
+            assert_activation_refused(
+                harness, authorization, "activation commit injection"
+            )
+        finally:
+            harness.admin_sql(harness.target, "DROP TRIGGER cdc.reject_activation;")
+
+        harness.admin_sql(
+            harness.source, "UPDATE a_done SET payload='after-prepare' WHERE id=1;"
+        )
+        original = prepared["new_checkpoint"]
+        if harness.coordinate() == base.Coordinate(
+            original["source_file"], original["source_position"]
+        ):
+            raise base.HarnessError(
+                "fixture failed to advance source beyond prepared boundary"
+            )
+        before = activation_snapshot(harness)
+        result = run_activation(harness, authorization)
+        base.require_success(
+            result, "activate prepared recovery with deferred constraints"
+        )
+        report = json.loads(result.stdout)
+        if report["new_checkpoint"] != original:
+            raise base.HarnessError(
+                "activation report replaced original prepared boundary"
+            )
+        committed = read_prepared(harness)
+        if committed != {**prepared, "status": "committed"}:
+            raise base.HarnessError(
+                f"activation changed prepared identity/evidence: {committed}"
+            )
+        checkpoint = harness.checkpoint()
+        for field in ("source_file", "source_position"):
+            if checkpoint[field] != original[field]:
+                raise base.HarnessError(
+                    f"activation committed wrong checkpoint {field}"
+                )
+        evidence = json.loads(
+            harness.admin_query(
+                harness.target,
+                "SELECT committed_evidence_json FROM cdc.stream_recovery_records "
+                f"WHERE recovery_id={run_id};",
+            ).strip()
+        )
+        if (
+            evidence.get("final_constraints_deferred") is not True
+            or evidence.get("schema_converged") is not False
+        ):
+            raise base.HarnessError(
+                f"activation evidence hides deferred constraints: {evidence}"
+            )
+        after = activation_snapshot(harness)
+        if before[1:] != after[1:]:
+            raise base.HarnessError(
+                "activation mutated progress, source/target rows or constraint DDL"
+            )
+        count = harness.admin_query(
+            harness.target, "SELECT COUNT(*) FROM cdc.stream_recovery_records;"
+        ).strip()
+        if count != "1":
+            raise base.HarnessError(
+                f"activation created another recovery record: {count}"
+            )
+        print(
+            "activation_ok refusals=missing_and_incomplete_rows_and_prerequisite "
+            "original_boundary=true same_record=true deferred_constraints=true "
+            "data_progress_ddl_unchanged=true commit_failure_rollback=true"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--parallelism", type=int, choices=(1, 2), default=1)
-    parser.add_argument("--case", choices=("resume", "refusals", "all"), default="all")
+    parser.add_argument(
+        "--case", choices=("resume", "refusals", "activation", "all"), default="all"
+    )
     args = parser.parse_args()
     try:
+        if args.case == "activation":
+            run_activation_case(args.binary, args.keep)
         if args.case in ("resume", "all"):
             run_resume_case(args.binary, args.keep, args.parallelism)
         if args.case in ("refusals", "all"):
