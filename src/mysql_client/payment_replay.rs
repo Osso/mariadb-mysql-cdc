@@ -1,4 +1,4 @@
-use super::{InsertConflictPolicy, PersistentTargetExecutor};
+use super::PersistentTargetExecutor;
 use crate::mysql_support::quote_ident;
 use crate::target::{TargetExecuteError, TargetRowChange, TargetRowChangeKind};
 use mysql::prelude::Queryable;
@@ -33,7 +33,7 @@ impl PersistentTargetExecutor {
         change: &TargetRowChange,
         error: &TargetExecuteError,
     ) -> Result<bool, TargetExecuteError> {
-        if self.insert_conflict_policy != InsertConflictPolicy::ReplaceDivergentPk
+        if !self.payment_replay_enabled
             || change.kind != TargetRowChangeKind::Insert
             || change.table != "payments"
             || error.mysql_code() != Some(1644)

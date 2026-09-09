@@ -62,6 +62,7 @@ pub struct PersistentTargetExecutor {
     conn: SharedTargetConnection,
     source: Option<Rc<PersistentMySqlSource>>,
     insert_conflict_policy: InsertConflictPolicy,
+    payment_replay_enabled: bool,
 }
 
 pub(crate) fn sync_source_opts(source: &MySqlConnectionConfig) -> Result<Opts, String> {
@@ -279,6 +280,8 @@ impl PersistentTargetExecutor {
             InsertConflictPolicy::Error,
         )?;
         executor.source = Some(Rc::new(open_stream_source(config)?));
+        executor.payment_replay_enabled =
+            config.target.insert_conflict_policy == InsertConflictPolicy::ReplaceDivergentPk;
         Ok(executor)
     }
 
@@ -291,6 +294,7 @@ impl PersistentTargetExecutor {
             conn: Rc::new(RefCell::new(Some(conn))),
             source: None,
             insert_conflict_policy,
+            payment_replay_enabled: false,
         })
     }
 
