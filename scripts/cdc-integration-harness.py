@@ -55,6 +55,7 @@ SCENARIOS = (
     ScenarioSpec("sync-enum-append", True),
     ScenarioSpec("sync-enum-incompatible", True),
     ScenarioSpec("sync-constraints-preserved", True),
+    ScenarioSpec("sync-parent-only-constraints-preserved", True),
     ScenarioSpec("sync-fk-parent-insert", True),
     ScenarioSpec("sync-fk-parent-update", True),
     ScenarioSpec("sync-fk-restrict-key-transition", True),
@@ -2820,7 +2821,7 @@ class Harness:
             "rows_scanned=3 inserts=1 updates=1 deletes=0"
         )
 
-    def run_sync_constraints_preserved(self) -> None:
+    def run_sync_constraints_preserved(self, parent_only: bool = False) -> None:
         assert self.source and self.target
         for endpoint in (self.source, self.target):
             self.admin_sql(
@@ -2838,7 +2839,7 @@ class Harness:
             f"REVOKE ALTER ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
         )
         result = self.run_sync(
-            tables=["preserve_parent", "preserve_child"],
+            tables=["preserve_parent"] if parent_only else ["preserve_parent", "preserve_child"],
             run_id="sync-constraints-preserved",
             parallelism=2,
         )
@@ -5105,6 +5106,8 @@ class Harness:
             self.run_sync_enum_incompatible()
         elif scenario == "sync-composite-enum-primary-key":
             self.run_sync_composite_enum_primary_key()
+        elif scenario == "sync-parent-only-constraints-preserved":
+            self.run_sync_constraints_preserved(parent_only=True)
         elif scenario == "sync-constraints-preserved":
             self.run_sync_constraints_preserved()
         elif scenario == "sync-fk-parent-insert":

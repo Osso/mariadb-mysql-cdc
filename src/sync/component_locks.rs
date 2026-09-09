@@ -3,8 +3,8 @@
 use crate::inventory::SchemaInventory;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Return the sorted undirected FK component containing `table`.
-/// Inventory must include inbound FKs from unselected tables in this schema.
+/// Return the selected portion of the undirected FK component containing `table`.
+/// Unselected children do not expand row-mutation scope.
 pub fn selected_fk_component(
     inventory: &SchemaInventory,
     selected: &[String],
@@ -19,9 +19,7 @@ pub fn selected_fk_component(
     let mut pending = vec![table];
     while let Some(current) = pending.pop() {
         if !selected.contains(current) {
-            return Err(format!(
-                "FK component for {table} reaches unselected table {current}"
-            ));
+            continue;
         }
         if !visited.insert(current) {
             continue;
@@ -179,14 +177,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_inbound_and_outbound_scope_escape_including_transitive_edges() {
+    fn does_not_expand_component_into_unselected_tables() {
         for edges in [
             vec![("a", "catalog", "b"), ("b", "catalog", "outside")],
             vec![("a", "catalog", "b"), ("outside", "catalog", "b")],
         ] {
             assert_eq!(
                 selected_fk_component(&inventory(&edges), &names(&["a", "b"]), "a"),
-                Err("FK component for a reaches unselected table outside".into())
+                Ok(names(&["a", "b"]))
             );
         }
     }
