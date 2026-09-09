@@ -1957,7 +1957,11 @@ fn append_canonical_foreign_key_plan(
         );
         let drops = target_keys
             .iter()
-            .filter(|target_key| !source_keys.contains(target_key))
+            .filter(|target_key| {
+                !source_keys.iter().any(|source_key| {
+                    canonical_foreign_keys_semantically_equal(source_key, target_key)
+                })
+            })
             .filter_map(|key| {
                 translate_for_table(
                     table,
@@ -1975,7 +1979,11 @@ fn append_canonical_foreign_key_plan(
             .collect::<Vec<_>>();
         let additions = source_keys
             .iter()
-            .filter(|source_key| !target_keys.contains(source_key))
+            .filter(|source_key| {
+                !target_keys.iter().any(|target_key| {
+                    canonical_foreign_keys_semantically_equal(source_key, target_key)
+                })
+            })
             .filter_map(|key| {
                 let object = format!("foreign_key:{}.{}", table.table, key.constraint_name);
                 let statement = translate_for_table(
@@ -1994,6 +2002,22 @@ fn append_canonical_foreign_key_plan(
         table.statements.splice(0..0, drops);
         table.statements.extend(additions);
     }
+}
+
+fn canonical_foreign_keys_semantically_equal(
+    left: &CanonicalForeignKey,
+    right: &CanonicalForeignKey,
+) -> bool {
+    left.child_schema == right.child_schema
+        && left.child_table == right.child_table
+        && left.child_columns == right.child_columns
+        && left.parent_schema == right.parent_schema
+        && left.parent_table == right.parent_table
+        && left.parent_columns == right.parent_columns
+        && left.update_rule == right.update_rule
+        && left.delete_rule == right.delete_rule
+        && left.match_option == right.match_option
+        && left.enforced == right.enforced
 }
 
 fn canonical_foreign_key_prerequisites(
@@ -3726,6 +3750,94 @@ mod tests {
             })
             .count();
         assert_eq!(foreign_key_statements, 0);
+    }
+
+    fn canonical_fk_plan(target_key: CanonicalForeignKey) -> Vec<String> {
+        let source = inventory(
+            vec![
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("parent_id", "bigint", false),
+                    ],
+                    vec!["id"],
+                ),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![foreign_key("children", "parents")],
+        );
+        let mut target = source.clone();
+        target.foreign_keys[0].name = target_key.constraint_name.clone();
+        target.foreign_keys[0].columns = target_key.child_columns.clone();
+        target.foreign_keys[0].referenced_columns = target_key.parent_columns.clone();
+        let mut plan = plan_schema_convergence(
+            &source,
+            &target,
+            &["parents".to_string(), "children".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .expect("schema plan");
+        append_canonical_foreign_key_plan(
+            &mut plan,
+            &source,
+            &[canonical_foreign_key("fk_children_parents")],
+            &[target_key],
+            "globalcomix",
+        );
+        assert!(plan.tables.iter().all(|table| table.blockers.is_empty()));
+        plan.tables
+            .into_iter()
+            .flat_map(|table| table.statements.into_iter().map(|statement| statement.sql))
+            .collect()
+    }
+
+    #[test]
+    fn canonical_fk_name_only_preserves_target_without_ddl() {
+        for name in [
+            "fk_children_parents",
+            "legacy_parent_fk",
+            "children_fk_children_parents",
+        ] {
+            assert_eq!(
+                canonical_fk_plan(canonical_foreign_key(name)),
+                Vec::<String>::new(),
+                "target name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_fk_semantic_drift_replaces_actual_target_once() {
+        let original = canonical_foreign_key("legacy_parent_fk");
+        let mut update = original.clone();
+        update.update_rule = "CASCADE".to_string();
+        let mut delete = original.clone();
+        delete.delete_rule = "CASCADE".to_string();
+        let mut child_columns = original.clone();
+        child_columns.child_columns = vec!["id".to_string()];
+        let mut parent_columns = original.clone();
+        parent_columns.parent_columns = vec!["parent_id".to_string()];
+        let mut match_option = original.clone();
+        match_option.match_option = "FULL".to_string();
+        let mut enforced = original;
+        enforced.enforced = false;
+        for target in [
+            update,
+            delete,
+            child_columns,
+            parent_columns,
+            match_option,
+            enforced,
+        ] {
+            assert_eq!(
+                canonical_fk_plan(target),
+                vec![
+                    "ALTER TABLE `children` DROP FOREIGN KEY `legacy_parent_fk`",
+                    "ALTER TABLE `children` ADD CONSTRAINT `children_fk_children_parents` FOREIGN KEY (`parent_id`) REFERENCES `parents` (`id`) ON UPDATE RESTRICT ON DELETE RESTRICT",
+                ]
+            );
+        }
     }
 
     #[test]
