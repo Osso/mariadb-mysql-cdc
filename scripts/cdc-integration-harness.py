@@ -57,6 +57,8 @@ SCENARIOS = (
     ScenarioSpec("sync-constraints-preserved", True),
     ScenarioSpec("sync-fk-parent-insert", True),
     ScenarioSpec("sync-fk-parent-update", True),
+    ScenarioSpec("sync-fk-restrict-key-transition", True),
+    ScenarioSpec("sync-fk-restrict-key-transition-reparent", True),
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
     ScenarioSpec("sync-update-stale-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-unique-owner-rollback-resume", True),
@@ -2848,6 +2850,90 @@ class Harness:
             raise HarnessError(f"preserved child rows differ: {rows!r}")
         print("sync_constraints_preserved=true alter_privilege=false")
 
+    def run_sync_fk_restrict_key_transition(self, reparent: bool = False) -> None:
+        assert self.source and self.target
+        run_id = "sync-fk-restrict-key-transition" + ("-reparent" if reparent else "")
+        schema = (
+            "DROP TABLE IF EXISTS favorite_notes; DROP TABLE IF EXISTS favorites; "
+            "DROP TABLE IF EXISTS users; "
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL, "
+            "UNIQUE KEY uq_users_id_name (id,name)) ENGINE=InnoDB; "
+            "CREATE TABLE favorites (id INT PRIMARY KEY, user_id INT NOT NULL, "
+            "user_name VARCHAR(64) NOT NULL, "
+            "CONSTRAINT fk_favorites_user FOREIGN KEY (user_id,user_name) "
+            "REFERENCES users(id,name) ON UPDATE RESTRICT ON DELETE RESTRICT) "
+            "ENGINE=InnoDB; "
+            "CREATE TABLE favorite_notes (id INT PRIMARY KEY, favorite_id INT NOT NULL, "
+            "CONSTRAINT fk_notes_favorite FOREIGN KEY (favorite_id) "
+            "REFERENCES favorites(id) ON UPDATE RESTRICT ON DELETE RESTRICT) "
+            "ENGINE=InnoDB; "
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema)
+        desired_child = "10,2,'other'" if reparent else "10,1,'new'"
+        # Construct valid source state directly: this fixture represents target drift.
+        self.admin_sql(
+            self.source,
+            "INSERT INTO users VALUES (1,'new'),(2,'other'); "
+            f"INSERT INTO favorites VALUES ({desired_child}); "
+            "INSERT INTO favorite_notes VALUES (100,10);",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO users VALUES (1,'old'),(2,'other'); "
+            "INSERT INTO favorites VALUES (10,1,'old'); "
+            "INSERT INTO favorite_notes VALUES (100,10);",
+        )
+        probes = [
+            "UPDATE users SET name='blocked' WHERE id=1;",
+            "DELETE FROM users WHERE id=1;",
+            "UPDATE favorites SET id=11 WHERE id=10;",
+            "DELETE FROM favorites WHERE id=10;",
+        ]
+        for sql in probes:
+            self.assert_admin_sql_rejected(self.target, sql, "1451")
+        self.admin_sql(
+            self.target,
+            f"REVOKE ALTER ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
+        )
+        result = self.run_sync(
+            tables=["users", "favorites", "favorite_notes"],
+            run_id=run_id,
+            chunk_size=1,
+            parallelism=2,
+            timeout=60,
+        )
+        print(f"{run_id} exit={result.returncode}\n{result.stdout}\n{result.stderr}")
+        require_success(result, f"{run_id} with RESTRICT and no ALTER privilege")
+        expected = {
+            "users": "1\tnew\n2\tother",
+            "favorites": "10\t2\tother" if reparent else "10\t1\tnew",
+            "favorite_notes": "100\t10",
+        }
+        for table, rows in expected.items():
+            for endpoint in (self.source, self.target):
+                actual = self.admin_query(
+                    endpoint, f"SELECT * FROM `{table}` ORDER BY id;"
+                ).strip()
+                if actual != rows:
+                    raise HarnessError(
+                        f"{run_id} {endpoint.container} {table}: {actual!r} != {rows!r}"
+                    )
+        parent_id = 2 if reparent else 1
+        for sql in (
+            f"UPDATE users SET name='blocked' WHERE id={parent_id};",
+            f"DELETE FROM users WHERE id={parent_id};",
+            "UPDATE favorites SET id=11 WHERE id=10;",
+            "DELETE FROM favorites WHERE id=10;",
+        ):
+            self.assert_admin_sql_rejected(self.target, sql, "1451")
+        for sql in (
+            "INSERT INTO favorites VALUES (20,99,'missing');",
+            "INSERT INTO favorite_notes VALUES (200,99);",
+        ):
+            self.assert_admin_sql_rejected(self.target, sql, "1452")
+        print(f"{run_id}_ok exact_rows=true fk_enforced=true alter_privilege=false")
+
     def run_sync_fk_parent_convergence(self, update_existing_child: bool = False) -> None:
         assert self.source and self.target
         run_id = "sync-fk-parent-update" if update_existing_child else "sync-fk-parent-insert"
@@ -4970,6 +5056,10 @@ class Harness:
             self.run_sync_fk_parent_convergence()
         elif scenario == "sync-fk-parent-update":
             self.run_sync_fk_parent_convergence(update_existing_child=True)
+        elif scenario == "sync-fk-restrict-key-transition":
+            self.run_sync_fk_restrict_key_transition()
+        elif scenario == "sync-fk-restrict-key-transition-reparent":
+            self.run_sync_fk_restrict_key_transition(reparent=True)
         elif scenario == "sync-fk-parent-stale-unique-owner":
             self.run_sync_fk_parent_stale_unique_owner()
         elif scenario == "sync-update-stale-unique-owner-rollback-resume":
