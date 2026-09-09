@@ -70,6 +70,7 @@ SCENARIOS = (
     ScenarioSpec("sync-wide-update", True),
     ScenarioSpec("sync-bit-values", True),
     ScenarioSpec("sync-resume", True),
+    ScenarioSpec("sync-legacy-complete-resume", True),
     ScenarioSpec("sync-schema-parallel-resume", True),
     ScenarioSpec("repair-fk-orphans-parents", True),
     ScenarioSpec("repair-guest-range", True),
@@ -4814,6 +4815,142 @@ class Harness:
             )
         print(f"schema_parallel_statement_order observed={observed!r}")
 
+    def run_sync_legacy_complete_resume(self) -> None:
+        assert self.source and self.target
+        run_id = "sync-legacy-complete-resume"
+        tables = ["legacy_parent", "legacy_child"]
+        for endpoint, row_id, label in (
+            (self.source, 1, "source"),
+            (self.target, 2, "target"),
+        ):
+            self.admin_sql(
+                endpoint,
+                "CREATE TABLE legacy_parent (id INT PRIMARY KEY, label VARCHAR(32) NOT NULL) "
+                "ENGINE=InnoDB; "
+                "CREATE TABLE legacy_child (id INT PRIMARY KEY, parent_id INT NOT NULL, "
+                "label VARCHAR(32) NOT NULL, CONSTRAINT legacy_child_parent "
+                "FOREIGN KEY (parent_id) REFERENCES legacy_parent(id), "
+                "CONSTRAINT legacy_child_positive CHECK (id > 0)) ENGINE=InnoDB; "
+                f"INSERT INTO legacy_parent VALUES ({row_id},'{label}-parent'); "
+                f"INSERT INTO legacy_child VALUES ({row_id},{row_id},'{label}-child');",
+            )
+        for index, table in enumerate(tables, start=1):
+            for stage in ("prerequisite_schema", "rows"):
+                self.admin_sql(
+                    self.target,
+                    "INSERT INTO cdc.sync_runs "
+                    "(run_id,stage,table_name,run_spec_json,last_primary_key_json,"
+                    "chunks,rows_scanned,inserts_applied,updates_applied,deletes_applied,"
+                    "status,last_error,created_at,updated_at,completed_at) VALUES "
+                    f"({sql_literal(run_id)},{sql_literal(stage)},{sql_literal(table)},"
+                    f"'{json.dumps({'legacy': table, 'stage': stage})}','[{100 + index}]',"
+                    f"{index + 10},{index + 1000},{index + 20},{index + 30},{index + 40},"
+                    "'complete',NULL,'2026-07-01 01:02:03.123456',"
+                    "'2026-07-02 02:03:04.234567','2026-07-02 02:03:04.234567');",
+                )
+        self.admin_sql(
+            self.target,
+            "DROP TABLE cdc.sync_runs_phases; "
+            f"REVOKE SELECT, INSERT, UPDATE ON cdc.sync_runs_phases FROM '{SYNC_TARGET_USER}'@'%';",
+        )
+        legacy_query = (
+            "SELECT * FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} "
+            "AND stage IN ('prerequisite_schema','rows') ORDER BY stage,table_name;"
+        )
+        legacy_before = self.admin_query(self.target, legacy_query)
+        if len(legacy_before.splitlines()) != 4:
+            raise HarnessError(
+                f"legacy fixture must contain four full records: {legacy_before!r}"
+            )
+        data_before = {
+            (endpoint.container, table): self.admin_query(
+                endpoint, f"SELECT * FROM `{table}` ORDER BY id;"
+            )
+            for endpoint in (self.source, self.target)
+            for table in tables
+        }
+        for table in tables:
+            if (
+                data_before[(self.source.container, table)]
+                == data_before[(self.target.container, table)]
+            ):
+                raise HarnessError(f"legacy fixture must deliberately differ: {table}")
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "SET GLOBAL general_log=OFF; TRUNCATE TABLE mysql.general_log; "
+                "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;",
+            )
+        try:
+            result = self.run_sync(
+                tables=tables, run_id=run_id, parallelism=2, timeout=90
+            )
+        finally:
+            for endpoint in (self.source, self.target):
+                self.admin_sql(endpoint, "SET GLOBAL general_log=OFF;")
+        print(f"legacy_complete_sync_stdout:\n{result.stdout}")
+        print(f"legacy_complete_sync_stderr:\n{result.stderr}")
+        require_success(
+            result, "legacy completed rows resume without phase table/grant"
+        )
+        legacy_after = self.admin_query(self.target, legacy_query)
+        if legacy_after != legacy_before:
+            raise HarnessError(
+                f"full legacy records changed: before={legacy_before!r} after={legacy_after!r}"
+            )
+        for endpoint in (self.source, self.target):
+            for table in tables:
+                actual = self.admin_query(
+                    endpoint, f"SELECT * FROM `{table}` ORDER BY id;"
+                )
+                if actual != data_before[(endpoint.container, table)]:
+                    raise HarnessError(
+                        f"legacy resume changed {endpoint.container}.{table}: {actual!r}"
+                    )
+            user = SOURCE_USER if endpoint == self.source else SYNC_TARGET_USER
+            statements = self.admin_query(
+                endpoint,
+                "SELECT argument FROM mysql.general_log "
+                f"WHERE user_host LIKE '{user}%' "
+                "AND command_type IN ('Query','Execute','Prepare') ORDER BY event_time;",
+            ).splitlines()
+            if not statements:
+                raise HarnessError(
+                    f"missing database query evidence: {endpoint.container}"
+                )
+            for statement in statements:
+                normalized = statement.replace("`", "").lower()
+                if "sync_runs_phases" in normalized or any(
+                    re.search(
+                        rf"\b(?:from|join|update|into)\s+(?:{APP_SCHEMA}\.)?{table}\b",
+                        normalized,
+                    )
+                    for table in tables
+                ):
+                    raise HarnessError(
+                        f"legacy resume accessed phase table or application rows: {endpoint.container}: {statement}"
+                    )
+        phases = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA='cdc' AND TABLE_NAME='sync_runs_phases';",
+        ).strip()
+        final = self.admin_query(
+            self.target,
+            "SELECT table_name,status FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='final_constraints' ORDER BY table_name;",
+        ).strip()
+        if phases != "0" or final != "legacy_child\tcomplete\nlegacy_parent\tcomplete":
+            raise HarnessError(
+                f"legacy final constraints/phase absence failed: final={final!r} phases={phases}"
+            )
+        print(
+            "sync_legacy_complete_resume_ok legacy_full_records_unchanged=4 "
+            "source_and_target_data_unchanged=true row_access=0 phase_access=0 "
+            "phase_table_absent=true final_constraints_complete=2"
+        )
+
     def run_sync_resume(self) -> None:
         assert self.source and self.target
         run_id = "sync-resume"
@@ -5263,6 +5400,8 @@ class Harness:
             self.run_sync_bit_values()
         elif scenario == "sync-resume":
             self.run_sync_resume()
+        elif scenario == "sync-legacy-complete-resume":
+            self.run_sync_legacy_complete_resume()
         elif scenario == "repair-fk-orphans-parents":
             self.run_repair_fk_orphans_parents()
         elif scenario == "repair-guest-range":
