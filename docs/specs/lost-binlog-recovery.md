@@ -18,7 +18,7 @@
 - [x] Reconcile normally committed source rows and schema evidence without a long-lived cross-table transaction or repeatable-read snapshot.
 - [x] Invoke one unified staged sync for every source-table in the captured inventory, using run ID `recovery_id`, configured `--parallelism` (default `1`) for independent schema-table and row workers, and the configured `cdc.sync_runs` progress table. Per-table statement order, the constraint-drop barrier, and selected-parent dependencies remain ordered. A running recovery is not hot-reloaded after an image update.
 - [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
-- [x] Use the unified stages for prerequisite schema convergence, target-WRITE-locked source-authoritative chunks, durable per-stage/per-table progress, and final constraint convergence.
+- [x] Use the unified stages for prerequisite schema convergence, source-authoritative chunks locked across their selected FK component before source reads, durable per-stage/per-table progress, and final constraint convergence. Completed legacy row progress remains reused unchanged on a same-ID resume.
 - [x] Set only recovery-owned source/target coordinator and sync-progress sessions to `SESSION wait_timeout=604800` before long reconciliation. This matches the seven-day recovery Job deadline; it does not change server-global timeouts, normal stream/sync sessions, CLI configuration, or reconnect behavior.
 - [x] Keep prepared evidence source-only: scope hash, source schema fingerprint, and source table count; no target inventory is captured for preparation proof.
 - [x] Require every expected source table to have exactly one complete progress result for the exact recovery ID; missing, unexpected, duplicate, incomplete, or differently identified rows fail closed.
@@ -41,7 +41,7 @@
 - [x] Preserve the historical journal row; active-barrier selection excludes only the exact committed or verified recovery identity and barrier coordinates/raw-SQL hash; abandoned history never suppresses the journal barrier.
 - [x] Roll back the transition on checkpoint/recovery commit failure.
 - [x] Fail closed on interruption or error before proof/commit: no checkpoint or barrier transition is allowed without complete proof and exact CAS revalidation.
-- [ ] Verify interrupted full-scope reconciliation and live stream restart behavior.
+- [ ] Verify interrupted full-scope reconciliation and live stream restart behavior. In particular, prove same-prepared recovery reuse of completed legacy rows and crash/retry behavior across phase cursor persistence before deploying the phased constraint-preserving path.
 
 ### Verification
 
