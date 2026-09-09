@@ -626,7 +626,7 @@ fn plan_table(
     plan.statements.extend(
         key_actions
             .iter()
-            .filter(|statement| is_drop_statement(statement))
+            .filter(|statement| key_drop_precedes_columns(statement))
             .cloned(),
     );
     for column in target_table.columns.iter().rev() {
@@ -691,7 +691,7 @@ fn plan_table(
     plan.statements.extend(
         key_actions
             .into_iter()
-            .filter(|statement| !is_drop_statement(statement)),
+            .filter(|statement| !key_drop_precedes_columns(statement)),
     );
     plan.statements.extend(
         constraint_actions
@@ -699,6 +699,10 @@ fn plan_table(
             .filter(|statement| !is_drop_statement(statement)),
     );
     Ok(plan)
+}
+
+fn key_drop_precedes_columns(statement: &PlannedSchemaStatement) -> bool {
+    is_drop_statement(statement) && statement.prerequisites.is_empty()
 }
 
 fn plan_keys(
