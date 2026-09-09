@@ -96,6 +96,12 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 - `missing-fk-superseded-insert` replays a historical `(comic_id, comic_format_id)`
   child after the source and preconverged target parent changed format, proving
   current-child substitution and exact serial checkpoint completion.
+- `users-update-snapshot-ahead-replay` replays a historical `users.name` update
+  into a target preloaded with the current source state. It proves the narrow
+  no-op requires an unchanged numeric key, full current source/target event-row
+  equality, and matching different historical-name owners; mismatched current
+  source state and an absent source event row retain rollback and checkpoint
+  behavior.
 
 ## Out of scope
 
