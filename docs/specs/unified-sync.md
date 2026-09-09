@@ -64,9 +64,11 @@ the run ID. Operator usage belongs in the sync runbook.
 
 ### Schema and progress contracts
 
-- [x] Reuse the prerequisite schema stage that removes blocking target constraints and converges structure before row work.
+- [x] Preserve existing target foreign keys and CHECK constraints when prerequisite structural convergence is empty. This avoids routine constraint rebuilds for unchanged tables.
+- [x] For actual prerequisite structural changes, retain the existing constraint-drop behavior; this intermediate planner change does not claim selective structural dependency analysis.
 - [x] Automatically converge only source ENUM declarations that append labels after every existing target label in unchanged order, with unchanged charset, equivalent mapped collation, generated expression, and compatible nullability. Preserve existing ordinals; reject reordered or removed labels rather than broadening conversion.
-- [x] Reuse the final-constraint stage after row work and fail closed on remaining structural drift.
+- [x] Reuse the final-constraint stage after row work to apply constraint definition differences and fail closed on remaining structural drift.
+- [ ] Integrate dependency-aware row phases before relying on preserved foreign keys for parent/child mutations. This intermediate planner behavior is not deployed and does not complete constraint-preserving synchronization.
 - [ ] Prove the complete production MySQL path, including source evidence reads, target schema stages, row workers, and `cdc.sync_runs` persistence against disposable endpoints.
 - [x] Remove legacy snapshot, table-sync, repair-drift, run-spec migration, and obsolete progress modules; no fallback engine remains.
 
