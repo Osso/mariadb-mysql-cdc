@@ -107,8 +107,16 @@ impl MySqlSyncTargetSession {
             },
         )
         .map_err(|error| format!("coordinated unique-owner replacement: {error:?}"))?;
+        self.verify_and_record_owner_replacement(conflict)?;
+        Ok(true)
+    }
+
+    fn verify_and_record_owner_replacement(
+        &mut self,
+        conflict: &SyncUniqueOwnerConflict,
+    ) -> Result<(), String> {
         verify_exact_row(
-            self.query_exact_row(&owner.pk)?,
+            self.query_exact_row(&conflict.owner.primary_key)?,
             None,
             "replaced unique owner",
         )?;
@@ -123,7 +131,7 @@ impl MySqlSyncTargetSession {
                 conflict,
                 &SyncUniqueOwnerAction::Delete,
             ));
-        Ok(true)
+        Ok(())
     }
 
     pub(super) fn repair_insert_prerequisites(
