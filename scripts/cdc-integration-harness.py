@@ -65,6 +65,9 @@ SCENARIOS = (
     ScenarioSpec("sync-fk-restrict-key-transition-new-child", True),
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
     ScenarioSpec("sync-fk-source-absent-unique-owner", True),
+    ScenarioSpec("sync-fk-existing-owner-replacement", True),
+    ScenarioSpec("sync-fk-deleted-dependents", True),
+    ScenarioSpec("sync-fk-cascade-key-transition", True),
     ScenarioSpec("sync-update-stale-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-wide-update", True),
@@ -2858,6 +2861,80 @@ class Harness:
             raise HarnessError(f"preserved child rows differ: {rows!r}")
         print("sync_constraints_preserved=true alter_privilege=false")
 
+    def run_sync_fk_transition_variant(self, mode: str) -> None:
+        assert self.source and self.target
+        action = "CASCADE" if mode == "cascade" else "RESTRICT"
+        schema = (
+            "CREATE TABLE parents (id INT PRIMARY KEY,name VARCHAR(20) NOT NULL,"
+            "email VARCHAR(30) NOT NULL UNIQUE,UNIQUE KEY uq_id_name(id,name)) ENGINE=InnoDB; "
+            "CREATE TABLE children (id INT PRIMARY KEY,parent_id INT NOT NULL,"
+            "parent_name VARCHAR(20) NOT NULL,CONSTRAINT children_parent "
+            "FOREIGN KEY(parent_id,parent_name) REFERENCES parents(id,name) "
+            f"ON UPDATE {action} ON DELETE RESTRICT) ENGINE=InnoDB; "
+            "CREATE TABLE notes (id INT PRIMARY KEY,child_id INT NOT NULL,"
+            "CONSTRAINT notes_child FOREIGN KEY(child_id) REFERENCES children(id) "
+            "ON UPDATE RESTRICT ON DELETE RESTRICT) ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema)
+        if mode == "update-replacement":
+            self.admin_sql(
+                self.target,
+                "INSERT INTO parents VALUES(1,'owner','wanted'),(2,'old','other'); "
+                "INSERT INTO children VALUES(10,1,'owner'),(11,2,'old'); "
+                "INSERT INTO notes VALUES(100,10),(101,11);",
+            )
+            self.admin_sql(
+                self.source,
+                "INSERT INTO parents VALUES(2,'new','wanted'); "
+                "INSERT INTO children VALUES(10,2,'new'),(11,2,'new'); "
+                "INSERT INTO notes VALUES(100,10),(101,11);",
+            )
+            expected = {
+                "parents": "2\tnew\twanted",
+                "children": "10\t2\tnew\n11\t2\tnew",
+                "notes": "100\t10\n101\t11",
+            }
+        else:
+            self.admin_sql(
+                self.target,
+                "INSERT INTO parents VALUES(1,'old','wanted'); "
+                "INSERT INTO children VALUES(10,1,'old'); INSERT INTO notes VALUES(100,10);",
+            )
+            self.admin_sql(self.source, "INSERT INTO parents VALUES(1,'new','wanted');")
+            expected = {"parents": "1\tnew\twanted", "children": "", "notes": ""}
+            if mode == "cascade":
+                self.admin_sql(
+                    self.source,
+                    "INSERT INTO children VALUES(10,1,'new'); INSERT INTO notes VALUES(100,10);",
+                )
+                self.admin_sql(
+                    self.target,
+                    "CREATE TRIGGER prevent_child_delete BEFORE DELETE ON children "
+                    "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='cascade must not delete child';",
+                )
+                expected.update({"children": "10\t1\tnew", "notes": "100\t10"})
+        self.admin_sql(
+            self.target,
+            f"REVOKE ALTER ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
+        )
+        result = self.run_sync(
+            tables=["parents", "children", "notes"],
+            run_id="sync-fk-" + mode,
+            chunk_size=1,
+            parallelism=2,
+            timeout=60,
+        )
+        require_success(result, "coordinated FK " + mode)
+        for endpoint in (self.source, self.target):
+            self.assert_key_transition_rows(endpoint, expected)
+        self.assert_admin_sql_rejected(
+            self.target, "INSERT INTO children VALUES(99,99,'missing');", "1452"
+        )
+        print(
+            f"sync_fk_{mode}_ok exact_rows=true fk_enforced=true alter_privilege=false"
+        )
+
     def assert_key_transition_rows(
         self, endpoint: Endpoint, expected: dict[str, str]
     ) -> None:
@@ -3329,10 +3406,20 @@ class Harness:
             "FROM cdc.sync_runs "
             f"WHERE run_id={sql_literal(run_id)} AND stage='rows' AND table_name='users';",
         ).strip()
-        if failed_progress != 'running\t["90000"]\t1\t3\t0\t0\t0\t<NULL>':
+        if failed_progress:
             raise HarnessError(
-                "failed stale unique-owner UPDATE did not retain only the prior page: "
-                f"{failed_progress!r}"
+                f"incomplete phases finalized legacy Rows: {failed_progress!r}"
+            )
+        failed_phase = self.admin_query(
+            self.target,
+            "SELECT complete,last_primary_key_json,chunks,rows_scanned,inserts,updates,deletes "
+            "FROM cdc.sync_runs_phases "
+            f"WHERE run_id={sql_literal(run_id)} AND phase='update_divergent' AND table_name='users';",
+        ).strip()
+        if failed_phase != '0\t["90000"]\t1\t3\t0\t0\t0':
+            raise HarnessError(
+                "failed stale unique-owner UPDATE did not retain only the prior phase page: "
+                f"{failed_phase!r}"
             )
         if self.sync_unique_owner_audits(failed):
             raise HarnessError("rolled-back stale unique-owner UPDATE emitted an audit")
@@ -3362,7 +3449,7 @@ class Harness:
             "FROM cdc.sync_runs "
             f"WHERE run_id={sql_literal(run_id)} AND stage='rows' AND table_name='users';",
         ).strip()
-        if resumed_progress != 'complete\t["115537"]\t4\t7\t2':
+        if resumed_progress != 'complete\t["115537"]\t12\t21\t2':
             raise HarnessError(
                 "resumed stale unique-owner UPDATE progress mismatch: "
                 f"{resumed_progress!r}"
@@ -3673,7 +3760,7 @@ class Harness:
             "updates_applied,deletes_applied FROM cdc.sync_runs "
             f"WHERE run_id={sql_literal(run_id)} AND stage='rows' AND table_name={sql_literal(table)};",
         ).strip()
-        if progress != 'complete\t["200"]\t3\t131\t130\t0\t0':
+        if progress != 'complete\t["200"]\t9\t393\t130\t0\t0':
             raise HarnessError(f"resumed unique-owner progress mismatch: {progress!r}")
         if resumed_sequence != ["first", "second", "second"]:
             raise HarnessError(
@@ -3697,7 +3784,7 @@ class Harness:
             if secret in encoded_audit:
                 raise HarnessError(f"reconciliation audit leaked {secret!r}: {encoded_audit}")
         print(
-            "sync_unique_owner_rollback_resume_ok rows=131 chunks=3 inserts=130 "
+            "sync_unique_owner_rollback_resume_ok rows=131 chunks=9 inserts=130 "
             "failed_sequence=first,second,second resumed_sequence=first,second,second "
             f"failed_transaction={','.join(failed_transaction)} "
             f"resumed_transaction={','.join(resumed_transaction)} audits=1"
@@ -5389,6 +5476,12 @@ class Harness:
             self.run_sync_fk_restrict_key_transition("new-child")
         elif scenario == "sync-fk-parent-stale-unique-owner":
             self.run_sync_fk_parent_stale_unique_owner()
+        elif scenario == "sync-fk-existing-owner-replacement":
+            self.run_sync_fk_transition_variant("update-replacement")
+        elif scenario == "sync-fk-deleted-dependents":
+            self.run_sync_fk_transition_variant("deleted-dependents")
+        elif scenario == "sync-fk-cascade-key-transition":
+            self.run_sync_fk_transition_variant("cascade")
         elif scenario == "sync-fk-source-absent-unique-owner":
             self.run_sync_fk_source_absent_unique_owner()
         elif scenario == "sync-update-stale-unique-owner-rollback-resume":
