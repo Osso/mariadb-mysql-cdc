@@ -592,6 +592,11 @@ def run_activation_case(binary: Path | None, keep: bool) -> None:
             raise base.HarnessError(
                 "fixture failed to advance source beyond prepared boundary"
             )
+        harness.admin_sql(
+            harness.source,
+            "CREATE TABLE after_prepare (id INT PRIMARY KEY) ENGINE=InnoDB; "
+            "INSERT INTO after_prepare VALUES (7);",
+        )
         before = activation_snapshot(harness)
         result = run_activation(harness, authorization)
         base.require_success(
@@ -627,6 +632,14 @@ def run_activation_case(binary: Path | None, keep: bool) -> None:
             raise base.HarnessError(
                 f"activation evidence hides deferred constraints: {evidence}"
             )
+        if evidence.get("additional_source_tables") != ["after_prepare"]:
+            raise base.HarnessError(f"later source table missing from activation audit: {evidence}")
+        later_progress = harness.admin_query(
+            harness.target,
+            "SELECT COUNT(*) FROM cdc.sync_runs WHERE table_name='after_prepare';",
+        ).strip()
+        if later_progress != "0":
+            raise base.HarnessError("activation pretended to synchronize the later table")
         after = activation_snapshot(harness)
         if before[1:] != after[1:]:
             raise base.HarnessError(

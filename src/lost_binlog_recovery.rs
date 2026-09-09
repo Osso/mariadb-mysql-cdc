@@ -656,7 +656,8 @@ pub fn run_activate_lost_binlog(
         store,
     } = open_recovery_context(config)?;
     store.acquire_stream_lease(&recovery_stream_lease_name(&config.target.database))?;
-    let prepared = load_prepared_resume_snapshot(config, source.as_ref(), &store, &authorization)?;
+    let (prepared, additional_source_tables) =
+        load_prepared_activation_snapshot(config, source.as_ref(), &store, &authorization)?;
     let sync_config = recovery_sync_config(
         config,
         &prepared.request,
@@ -670,10 +671,20 @@ pub fn run_activate_lost_binlog(
         &rows,
     )?;
     require_retained_prepared_boundary(source.as_ref(), &prepared.prepared)?;
-    require_unchanged_source_scope(
-        source.as_ref(),
-        &config.source.database,
-        &prepared.scope_hash,
+    let original_tables = prepared
+        .source_evidence
+        .inventory
+        .tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect::<BTreeSet<_>>();
+    let current_original = retain_inventory_scope(
+        read_source_inventory(source.as_ref(), &config.source.database)?,
+        &original_tables,
+    );
+    validate_resume_source_scope(
+        &prepared.prepared,
+        &inventory_scope_hash(&current_original)?,
     )?;
     let proof = LostBinlogReconciliationProof {
         recovery_id: prepared.request.recovery_id.clone(),
@@ -691,6 +702,7 @@ pub fn run_activate_lost_binlog(
             "data_converged": true,
             "schema_converged": false,
             "final_constraints_deferred": true,
+            "additional_source_tables": additional_source_tables,
             "prepared_boundary": prepared.prepared.new_checkpoint,
         })
         .to_string(),
@@ -829,6 +841,55 @@ fn run_prepared_recovery_resume(
     let rows =
         crate::sync::run_mysql_sync_with_evidence(sync_config, prepared.source_evidence.clone())?;
     commit_anchored_recovery(config, source.as_ref(), &store, prepared, rows)
+}
+
+fn retain_inventory_scope(
+    mut inventory: SchemaInventory,
+    tables: &BTreeSet<String>,
+) -> SchemaInventory {
+    inventory
+        .tables
+        .retain(|table| tables.contains(&table.name));
+    inventory
+        .foreign_keys
+        .retain(|key| tables.contains(&key.table));
+    inventory
+}
+
+fn load_prepared_activation_snapshot(
+    config: &RecoverLostBinlogConfig,
+    source: &PersistentMySqlSource,
+    store: &MySqlLostBinlogRecoveryStore,
+    authorization: &LostBinlogRecoveryRequest,
+) -> Result<(PreparedRecoverySnapshot, Vec<String>), String> {
+    let resumed = resume_prepared_recovery(store, authorization)?;
+    require_retained_prepared_boundary(source, &resumed.prepared)?;
+    let current = read_source_inventory(source, &config.source.database)?;
+    let current_config = recovery_sync_config(config, &resumed.request, &current);
+    let original_tables = crate::sync::read_recorded_recovery_tables(&current_config)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let additional = current
+        .tables
+        .iter()
+        .filter(|table| !original_tables.contains(&table.name))
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    let inventory = retain_inventory_scope(current, &original_tables);
+    validate_transactional_scope(&inventory)?;
+    let scope_hash = inventory_scope_hash(&inventory)?;
+    validate_resume_source_scope(&resumed.prepared, &scope_hash)?;
+    let source_evidence =
+        read_source_evidence_for_inventory(source, &config.source.database, inventory)?;
+    Ok((
+        PreparedRecoverySnapshot {
+            request: resumed.request,
+            prepared: resumed.prepared,
+            source_evidence,
+            scope_hash,
+        },
+        additional,
+    ))
 }
 
 fn load_prepared_resume_snapshot(
