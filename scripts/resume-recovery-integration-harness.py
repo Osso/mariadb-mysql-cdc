@@ -579,15 +579,18 @@ def run_activation_case(binary: Path | None, keep: bool) -> None:
         # A real transactional failure, after activation reaches its commit writes.
         harness.admin_sql(
             harness.target,
-            "CREATE TRIGGER cdc.reject_activation BEFORE UPDATE ON cdc.stream_recovery_records "
-            "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='activation commit injection';",
+            "ALTER TABLE cdc.stream_recovery_records ADD CONSTRAINT activation_commit_injection "
+            "CHECK (status <> 'committed');",
         )
         try:
             assert_activation_refused(
-                harness, authorization, "activation commit injection"
+                harness, authorization, "activation_commit_injection"
             )
         finally:
-            harness.admin_sql(harness.target, "DROP TRIGGER cdc.reject_activation;")
+            harness.admin_sql(
+                harness.target,
+                "ALTER TABLE cdc.stream_recovery_records DROP CHECK activation_commit_injection;",
+            )
 
         harness.admin_sql(
             harness.source, "UPDATE a_done SET payload='after-prepare' WHERE id=1;"
