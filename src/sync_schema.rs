@@ -340,10 +340,23 @@ pub(crate) fn plan_sync_prerequisite_schema(
 ) -> Result<SchemaConvergencePlan, String> {
     validate_sync_stage_selection(&evidence.inventory, selected)?;
     let mut plan = plan_schema_convergence(&evidence.inventory, target, selected, preflight)?;
+    append_check_constraint_plan(
+        &mut plan,
+        &evidence.inventory,
+        &evidence.checks,
+        target_checks,
+    );
+    append_canonical_foreign_key_plan(
+        &mut plan,
+        &evidence.inventory,
+        &evidence.canonical_foreign_keys,
+        target_canonical_foreign_keys,
+        &target.schema,
+    );
     for table in &mut plan.tables {
-        table
-            .statements
-            .retain(|statement| statement.phase != SchemaPhase::Constraints);
+        table.statements.retain(|statement| {
+            statement.phase != SchemaPhase::Constraints || is_constraint_drop_statement(statement)
+        });
         if table.statements.is_empty()
             || preserves_existing_structure(&evidence.inventory, target, &table.table)
         {
@@ -355,7 +368,16 @@ pub(crate) fn plan_sync_prerequisite_schema(
             target_checks,
             target_canonical_foreign_keys,
         )?;
-        table.statements.splice(0..0, drops);
+        let mut planned_drops = table
+            .statements
+            .iter()
+            .filter(|statement| is_constraint_drop_statement(statement))
+            .map(|statement| statement.sql.clone())
+            .collect::<BTreeSet<_>>();
+        let additional_drops = drops
+            .into_iter()
+            .filter(|statement| planned_drops.insert(statement.sql.clone()));
+        table.statements.splice(0..0, additional_drops);
     }
     Ok(plan)
 }
@@ -5381,7 +5403,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_unchanged_structure_preserves_constraints_until_final_diff() {
+    fn unified_unchanged_structure_removes_obsolete_constraints_before_rows() {
         let source = inventory(
             vec![
                 table(
@@ -5426,7 +5448,17 @@ mod tests {
                 .flat_map(|table| &table.statements)
                 .map(|statement| statement.sql.as_str())
                 .collect::<Vec<_>>();
-            assert_eq!(prerequisite_sql, Vec::<&str>::new());
+            if changed_definition {
+                assert_eq!(
+                    prerequisite_sql,
+                    vec![
+                        "ALTER TABLE `children` DROP FOREIGN KEY `children_fk_children_parents`",
+                        "ALTER TABLE `children` DROP CHECK `children_positive_parent`",
+                    ]
+                );
+            } else {
+                assert_eq!(prerequisite_sql, Vec::<&str>::new());
+            }
 
             let final_plan = plan_sync_final_constraints(
                 &evidence,
@@ -5454,6 +5486,102 @@ mod tests {
                 assert!(sql.contains("`parent_id` > 0"));
             } else {
                 assert_eq!(final_sql, Vec::<&str>::new());
+            }
+        }
+    }
+
+    #[test]
+    fn unified_prerequisite_removes_only_obsolete_constraints() {
+        for destructive in [false, true] {
+            for changed_check in [false, true] {
+                let source = inventory(
+                    vec![
+                        table(
+                            "children",
+                            vec![
+                                column("id", "bigint", false),
+                                column("parent_id", "bigint", false),
+                            ],
+                            vec!["id"],
+                        ),
+                        table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+                    ],
+                    vec![foreign_key("children", "parents")],
+                );
+                let mut target = source.clone();
+                target.foreign_keys[0].name = "children_fk_children_parents".to_string();
+                if destructive {
+                    target.tables[0]
+                        .columns
+                        .push(column("legacy", "bigint", true));
+                }
+                let evidence = SchemaSourceEvidence {
+                    inventory: source,
+                    checks: vec![check("children", "positive_parent", "`parent_id` > 0")],
+                    canonical_foreign_keys: vec![canonical_foreign_key("fk_children_parents")],
+                };
+                let mut target_checks = target_check_constraints(&evidence.checks);
+                let obsolete_check = if changed_check {
+                    target_checks[0].clause = "`parent_id` >= 0".to_string();
+                    "children_positive_parent"
+                } else {
+                    target_checks.push(check("children", "obsolete", "`parent_id` < 10"));
+                    "obsolete"
+                };
+                let mut obsolete_key = canonical_foreign_key("obsolete_fk");
+                obsolete_key.delete_rule = "CASCADE".to_string();
+                let plan = plan_sync_prerequisite_schema(
+                    &evidence,
+                    &target,
+                    &target_checks,
+                    &[
+                        canonical_foreign_key("children_fk_children_parents"),
+                        obsolete_key,
+                    ],
+                    &["parents".to_string(), "children".to_string()],
+                    &FixtureCoercionPreflight::default(),
+                )
+                .expect("obsolete constraint prerequisite plan");
+                let child = plan
+                    .tables
+                    .iter()
+                    .find(|table| table.table == "children")
+                    .unwrap();
+                let drops = child
+                    .statements
+                    .iter()
+                    .filter(|statement| is_constraint_drop_statement(statement))
+                    .map(|statement| statement.sql.clone())
+                    .collect::<BTreeSet<_>>();
+                let mut expected = BTreeSet::from([
+                    "ALTER TABLE `children` DROP FOREIGN KEY `obsolete_fk`".to_string(),
+                    format!("ALTER TABLE `children` DROP CHECK `{obsolete_check}`"),
+                ]);
+                if destructive {
+                    expected.insert(
+                        "ALTER TABLE `children` DROP FOREIGN KEY `children_fk_children_parents`"
+                            .to_string(),
+                    );
+                    expected.insert(
+                        "ALTER TABLE `children` DROP CHECK `children_positive_parent`".to_string(),
+                    );
+                }
+                assert_eq!(drops, expected);
+                assert_eq!(
+                    child
+                        .statements
+                        .iter()
+                        .filter(|statement| is_constraint_drop_statement(statement))
+                        .count(),
+                    drops.len()
+                );
+                assert!(
+                    child
+                        .statements
+                        .iter()
+                        .filter(|statement| statement.phase == SchemaPhase::Constraints)
+                        .all(is_constraint_drop_statement)
+                );
             }
         }
     }
