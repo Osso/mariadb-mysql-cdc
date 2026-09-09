@@ -5674,7 +5674,9 @@ mod tests {
             canonical_foreign_keys: vec![canonical_foreign_key("fk_children_parents")],
         };
         let target_checks = vec![check("children", "obsolete_check", "`id` > 0")];
-        let target_foreign_keys = vec![canonical_foreign_key("obsolete_fk")];
+        let mut obsolete_fk = canonical_foreign_key("obsolete_fk");
+        obsolete_fk.delete_rule = "CASCADE".to_string();
+        let target_foreign_keys = vec![obsolete_fk];
 
         let plan = plan_sync_final_constraints(
             &evidence,
