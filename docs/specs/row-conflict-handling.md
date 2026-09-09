@@ -15,7 +15,10 @@ Native ROW/FULL streaming treats the MariaDB source as authoritative and the MyS
 
 ### Other row errors
 
-- [x] Propagate MySQL `1062` from ROW `UPDATE` or `DELETE`.
+- [x] Propagate MySQL `1062` from ROW `UPDATE` or `DELETE`, except the narrow already-current `users` update proof below.
+- [x] With configured `replace-divergent-pk`, accept a `users` UPDATE `1062` on the single-column `name` unique index only when its numeric before/after `id` is unchanged, source/target mapped columns match, and the entire locked target event row exactly equals its current source row (nonnegative Int/UInt representations may compare equal; NULL and bytes remain exact).
+- [x] Lock the historical name's target owner and require exactly one identical, different-ID owner on source. Historical after-image values need not equal current source values. Do not mutate either owner or alter checkpoint handling; success follows the existing transaction commit path.
+- [x] Missing, ambiguous, changed-key, metadata-mismatched, or unequal proof preserves the original error; proof-query errors propagate. This exception performs no generic owner reconciliation.
 - [x] On MySQL `1452` from ROW `INSERT` or `UPDATE`, resolve the exact target constraint and fetch the exact same-schema parent row from the source.
 - [x] Insert and recursively repair the parent chain inside the current target transaction, then retry the blocked row.
 - [x] When an older native INSERT's exact parent key is absent, load its current source row by primary key.

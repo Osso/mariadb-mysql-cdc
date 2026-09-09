@@ -22,6 +22,7 @@ mod payment_replay;
 mod query;
 #[cfg(test)]
 mod tests;
+mod users_update_replay;
 
 #[cfg(test)]
 use connection::{NetworkTimeouts, apply_network_timeouts};
@@ -63,6 +64,7 @@ pub struct PersistentTargetExecutor {
     source: Option<Rc<PersistentMySqlSource>>,
     insert_conflict_policy: InsertConflictPolicy,
     payment_replay_enabled: bool,
+    users_update_replay_enabled: bool,
 }
 
 pub(crate) fn sync_source_opts(source: &MySqlConnectionConfig) -> Result<Opts, String> {
@@ -282,6 +284,7 @@ impl PersistentTargetExecutor {
         executor.source = Some(Rc::new(open_stream_source(config)?));
         executor.payment_replay_enabled =
             config.target.insert_conflict_policy == InsertConflictPolicy::ReplaceDivergentPk;
+        executor.users_update_replay_enabled = executor.payment_replay_enabled;
         Ok(executor)
     }
 
@@ -295,6 +298,7 @@ impl PersistentTargetExecutor {
             source: None,
             insert_conflict_policy,
             payment_replay_enabled: false,
+            users_update_replay_enabled: false,
         })
     }
 
@@ -436,6 +440,13 @@ impl missing_foreign_key::MissingForeignKeyRepairExecutor for SerialRowChangeExe
         }
         match result {
             Err(error) if self.target.prove_existing_payment_replay(change, &error)? => Ok(()),
+            Err(error)
+                if self
+                    .target
+                    .prove_current_users_update_replay(change, &error)? =>
+            {
+                Ok(())
+            }
             result => result,
         }
     }
