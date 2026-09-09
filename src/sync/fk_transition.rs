@@ -86,7 +86,8 @@ pub fn transition<B: Backend>(
     old: &Row,
     limits: Limits,
 ) -> Result<(), Error<B::Error>> {
-    let (order, keys) = discover_transition(backend, root, Some(current), old, limits)?;
+    let TransitionPlan { order, keys } =
+        discover_transition(backend, root, Some(current), old, limits)?;
     detach(backend, &order, &keys)?;
     check_parents(backend, root, current)?;
     backend.update(root, current).map_err(Error::Backend)?;
@@ -106,7 +107,8 @@ pub fn replace_source_absent_owner<B: Backend>(
 ) -> Result<(), Error<B::Error>> {
     let (old_key, old_row) = old_owner;
     let (intended_key, desired) = intended;
-    let (order, keys) = discover_transition(backend, old_key, None, old_row, limits)?;
+    let TransitionPlan { order, keys } =
+        discover_transition(backend, old_key, None, old_row, limits)?;
     detach(backend, &order, &keys)?;
     backend.delete(old_key).map_err(Error::Backend)?;
     check_parents(backend, intended_key, desired)?;
@@ -122,13 +124,18 @@ pub fn replace_source_absent_owner<B: Backend>(
     restore(backend, &order, &keys)
 }
 
+struct TransitionPlan {
+    order: Vec<String>,
+    keys: BTreeSet<RowKey>,
+}
+
 fn discover_transition<B: Backend>(
     backend: &mut B,
     root: &RowKey,
     current: Option<&Row>,
     old: &Row,
     limits: Limits,
-) -> Result<(Vec<String>, BTreeSet<RowKey>), Error<B::Error>> {
+) -> Result<TransitionPlan, Error<B::Error>> {
     if limits.page_rows == 0 || limits.max_keys == 0 {
         return Err(Error::WorkLimit);
     }
@@ -142,7 +149,7 @@ fn discover_transition<B: Backend>(
         &mut order,
     )?;
     let keys = discover(backend, root, current, old, limits, &schema)?;
-    Ok((order, keys))
+    Ok(TransitionPlan { order, keys })
 }
 
 fn detach<B: Backend>(
