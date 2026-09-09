@@ -59,6 +59,7 @@ SCENARIOS = (
     ScenarioSpec("sync-fk-parent-insert", True),
     ScenarioSpec("sync-fk-parent-update", True),
     ScenarioSpec("sync-fk-restrict-key-transition", True),
+    ScenarioSpec("sync-fk-restrict-key-transition-cursor-resume", True),
     ScenarioSpec("sync-fk-restrict-key-transition-reparent", True),
     ScenarioSpec("sync-fk-restrict-key-transition-rollback-resume", True),
     ScenarioSpec("sync-fk-restrict-key-transition-new-child", True),
@@ -2839,7 +2840,9 @@ class Harness:
             f"REVOKE ALTER ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
         )
         result = self.run_sync(
-            tables=["preserve_parent"] if parent_only else ["preserve_parent", "preserve_child"],
+            tables=["preserve_parent"]
+            if parent_only
+            else ["preserve_parent", "preserve_child"],
             run_id="sync-constraints-preserved",
             parallelism=2,
         )
@@ -2914,6 +2917,39 @@ class Harness:
             self.target,
             f"REVOKE ALTER ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
         )
+        if variant == "cursor-resume":
+            self.admin_sql(
+                self.target,
+                "CREATE TABLE transition_audit (id INT AUTO_INCREMENT PRIMARY KEY, child_id INT); "
+                "CREATE TRIGGER favorites_restore_audit AFTER INSERT ON favorites "
+                "FOR EACH ROW INSERT INTO transition_audit(child_id) VALUES (NEW.id);\n"
+                "DELIMITER //\n"
+                "CREATE TRIGGER cdc.phase_cursor_failure BEFORE INSERT ON cdc.sync_runs_phases "
+                "FOR EACH ROW BEGIN IF NEW.phase='update_divergent' AND NEW.table_name='users' THEN "
+                "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected phase cursor failure'; "
+                "END IF; END//\nDELIMITER ;\n",
+            )
+            failed = self.run_sync(
+                tables=["users", "favorites", "favorite_notes"],
+                run_id=run_id,
+                chunk_size=1,
+                parallelism=2,
+                timeout=60,
+            )
+            if (
+                failed.returncode == 0
+                or "injected phase cursor failure" not in failed.stderr
+            ):
+                raise HarnessError(f"phase cursor failure not reached: {failed.stderr}")
+            self.assert_key_transition_rows(
+                self.target,
+                {
+                    "users": "1\tnew\n2\tother",
+                    "favorites": "10\t1\tnew",
+                    "favorite_notes": "100\t10",
+                },
+            )
+            self.admin_sql(self.target, "DROP TRIGGER cdc.phase_cursor_failure;")
         if variant == "rollback-resume":
             failure_message = "injected key transition restoration failure"
             self.admin_sql(
@@ -2975,6 +3011,14 @@ class Harness:
             expected["favorites"] += "\n11\t1\tnew"
         for endpoint in (self.source, self.target):
             self.assert_key_transition_rows(endpoint, expected)
+        if variant == "cursor-resume":
+            audit = self.admin_query(
+                self.target, "SELECT COUNT(*) FROM transition_audit;"
+            ).strip()
+            if audit != "1":
+                raise HarnessError(
+                    f"resume repeated committed restoration: audit rows={audit}"
+                )
         parent_id = 2 if reparent else 1
         for sql in (
             f"UPDATE users SET name='blocked' WHERE id={parent_id};",
@@ -5114,6 +5158,8 @@ class Harness:
             self.run_sync_fk_parent_convergence()
         elif scenario == "sync-fk-parent-update":
             self.run_sync_fk_parent_convergence(update_existing_child=True)
+        elif scenario == "sync-fk-restrict-key-transition-cursor-resume":
+            self.run_sync_fk_restrict_key_transition(variant="cursor-resume")
         elif scenario == "sync-fk-restrict-key-transition":
             self.run_sync_fk_restrict_key_transition()
         elif scenario == "sync-fk-restrict-key-transition-reparent":
