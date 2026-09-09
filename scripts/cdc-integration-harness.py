@@ -56,6 +56,7 @@ SCENARIOS = (
     ScenarioSpec("sync-enum-incompatible", True),
     ScenarioSpec("sync-constraints-preserved", True),
     ScenarioSpec("sync-obsolete-check", True),
+    ScenarioSpec("sync-legacy-column-valid-fk", True),
     ScenarioSpec("sync-equivalent-check-name", True),
     ScenarioSpec("sync-parent-only-constraints-preserved", True),
     ScenarioSpec("sync-fk-parent-insert", True),
@@ -2874,6 +2875,109 @@ class Harness:
             )
         print(f"sync_check_convergence_ok obsolete={obsolete} exact_rows=true")
 
+    def run_sync_legacy_column_valid_fk(self) -> None:
+        assert self.source and self.target
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "CREATE TABLE parents (id INT PRIMARY KEY) ENGINE=InnoDB; "
+                "CREATE TABLE children (id INT PRIMARY KEY, parent_id INT NOT NULL, "
+                "extra_valid_column VARCHAR(32) NOT NULL, "
+                "CONSTRAINT children_parent FOREIGN KEY (parent_id) REFERENCES parents(id) "
+                "ON UPDATE RESTRICT ON DELETE RESTRICT) ENGINE=InnoDB; "
+                "INSERT INTO parents VALUES (7),(19); "
+                "INSERT INTO children VALUES (11,7,'keep-alpha'),(23,19,'keep-beta');",
+            )
+        self.admin_sql(
+            self.target,
+            "ALTER TABLE children ADD COLUMN legacy_column INT NOT NULL DEFAULT 42; "
+            f"REVOKE REFERENCES ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
+        )
+        columns_query = (
+            "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,"
+            "EXTRA,COLLATION_NAME FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME IN ('parents','children') "
+            "AND COLUMN_NAME <> 'legacy_column' ORDER BY TABLE_NAME,ORDINAL_POSITION;"
+        )
+        fk_query = (
+            "SELECT k.TABLE_NAME,k.CONSTRAINT_NAME,k.COLUMN_NAME,k.ORDINAL_POSITION,"
+            "k.REFERENCED_TABLE_SCHEMA,k.REFERENCED_TABLE_NAME,k.REFERENCED_COLUMN_NAME,"
+            "r.UPDATE_RULE,r.DELETE_RULE FROM information_schema.KEY_COLUMN_USAGE k "
+            "JOIN information_schema.REFERENTIAL_CONSTRAINTS r "
+            "ON r.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND r.TABLE_NAME=k.TABLE_NAME "
+            "AND r.CONSTRAINT_NAME=k.CONSTRAINT_NAME "
+            f"WHERE k.TABLE_SCHEMA='{APP_SCHEMA}' AND k.TABLE_NAME='children' "
+            "ORDER BY k.CONSTRAINT_NAME,k.ORDINAL_POSITION;"
+        )
+        columns_before = self.admin_query(self.target, columns_query)
+        fk_before = self.admin_query(self.target, fk_query)
+        if len(columns_before.splitlines()) != 4 or len(fk_before.splitlines()) != 1:
+            raise HarnessError(
+                "legacy-column fixture must have four valid columns and one FK"
+            )
+        self.reset_target_general_log()
+        try:
+            result = self.run_sync(
+                tables=["parents", "children"],
+                run_id="legacy-column-valid-fk",
+                chunk_size=1,
+                timeout=90,
+            )
+        finally:
+            self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
+        statements = self.admin_query(
+            self.target,
+            "SELECT argument FROM mysql.general_log "
+            f"WHERE user_host LIKE '{SYNC_TARGET_USER}%' "
+            "AND command_type IN ('Query','Execute') "
+            "AND argument REGEXP '^[[:space:]]*(ALTER|DROP|CREATE|TRUNCATE|RENAME)[[:space:]]' "
+            "ORDER BY event_time;",
+        ).splitlines()
+        print(f"legacy_column_executed_ddl={json.dumps(statements)}")
+        require_success(result, "legacy column cleanup with REFERENCES revoked")
+        normalized = [
+            " ".join(statement.replace("`", "").lower().rstrip(";").split())
+            for statement in statements
+        ]
+        expected_ddl = f"alter table {APP_SCHEMA}.children drop column legacy_column"
+        if normalized not in (
+            [expected_ddl],
+            [expected_ddl.replace(f"{APP_SCHEMA}.", "")],
+        ):
+            raise HarnessError(
+                f"cleanup executed DDL other than legacy column removal: {statements!r}"
+            )
+        if self.admin_query(self.target, columns_query) != columns_before:
+            raise HarnessError("cleanup changed valid column definitions")
+        if self.admin_query(self.target, fk_query) != fk_before:
+            raise HarnessError("cleanup changed the valid FK definition")
+        legacy_count = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='children' "
+            "AND COLUMN_NAME='legacy_column';",
+        ).strip()
+        if legacy_count != "0":
+            raise HarnessError(f"legacy column remains: {legacy_count}")
+        self.assert_admin_sql_rejected(
+            self.target,
+            "INSERT INTO children (id,parent_id,extra_valid_column) VALUES (99,999,'invalid');",
+            "1452",
+        )
+        for endpoint in (self.source, self.target):
+            self.assert_key_transition_rows(
+                endpoint,
+                {
+                    "parents": "7\n19",
+                    "children": "11\t7\tkeep-alpha\n23\t19\tkeep-beta",
+                },
+            )
+        print(
+            "sync_legacy_column_valid_fk_ok legacy_removed=true valid_columns=4 "
+            "exact_rows=4 fk_unchanged=true invalid_child_rejected=true "
+            "references_privilege=false executed_ddl=1 valid_column_drops=0"
+        )
+
     def run_sync_constraints_preserved(self, parent_only: bool = False) -> None:
         assert self.source and self.target
         for endpoint in (self.source, self.target):
@@ -5505,6 +5609,8 @@ class Harness:
             self.run_sync_composite_enum_primary_key()
         elif scenario == "sync-parent-only-constraints-preserved":
             self.run_sync_constraints_preserved(parent_only=True)
+        elif scenario == "sync-legacy-column-valid-fk":
+            self.run_sync_legacy_column_valid_fk()
         elif scenario == "sync-obsolete-check":
             self.run_sync_check_convergence(obsolete=True)
         elif scenario == "sync-equivalent-check-name":
