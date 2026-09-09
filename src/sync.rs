@@ -1,10 +1,13 @@
 mod chunk;
 mod config;
+mod dependency_order;
 mod fk_orphan_repair;
 pub(crate) mod guest_range_repair;
 mod model;
 mod mysql;
 mod orchestrate;
+mod phase_progress;
+mod phased_run;
 mod progress;
 mod run;
 mod sql;

@@ -7,7 +7,7 @@ use super::model::{
     SyncTable,
 };
 use super::mysql::MySqlSyncProgressStore;
-use super::run::run_mysql_sync_tables;
+use super::phased_run::run_mysql_sync_phases;
 use crate::inventory::SchemaInventory;
 use crate::sync_schema::{
     SchemaSourceEvidence, SyncSchemaStageKind, read_sync_source_evidence, run_sync_schema_stage,
@@ -97,7 +97,9 @@ pub(crate) fn run_mysql_sync_with_evidence(
         config.progress_table.clone(),
         config.coordinator_session_wait_timeout_seconds,
     )?;
-    let mut executor = MySqlSyncRunExecutor;
+    let mut executor = MySqlSyncRunExecutor {
+        inventory: &evidence.inventory,
+    };
     run_sync_orchestration(
         &config,
         &identity,
@@ -360,9 +362,11 @@ fn stage_progress_row(
     }
 }
 
-struct MySqlSyncRunExecutor;
+struct MySqlSyncRunExecutor<'a> {
+    inventory: &'a SchemaInventory,
+}
 
-impl SyncRunExecutor for MySqlSyncRunExecutor {
+impl SyncRunExecutor for MySqlSyncRunExecutor<'_> {
     fn run_schema_stage(
         &mut self,
         config: &SyncConfig,
@@ -390,6 +394,6 @@ impl SyncRunExecutor for MySqlSyncRunExecutor {
         identity: &SyncRunIdentity,
         tables: Vec<SyncTable>,
     ) -> Result<Vec<SyncChunkProgress>, String> {
-        run_mysql_sync_tables(config, identity, tables)
+        run_mysql_sync_phases(config, identity, tables, self.inventory)
     }
 }

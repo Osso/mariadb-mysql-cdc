@@ -1,13 +1,15 @@
+#[cfg(test)]
 use super::chunk::sync_next_chunk;
 use super::config::{SyncConfig, SyncRunIdentity};
+#[cfg(test)]
 use super::model::{
-    SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkSource,
-    SyncChunkTargetSession, SyncTable,
+    SyncChunkConfig, SyncChunkProgressStore, SyncChunkSource, SyncChunkTargetSession,
 };
-use super::mysql::{MySqlSyncProgressStore, MySqlSyncSource, MySqlSyncTargetSession};
+use super::model::{SyncChunkProgress, SyncTable};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+#[cfg(test)]
 pub(crate) fn sync_table_to_completion(
     config: &SyncChunkConfig,
     source: &mut impl SyncChunkSource,
@@ -20,40 +22,6 @@ pub(crate) fn sync_table_to_completion(
             return Ok(progress);
         }
     }
-}
-
-pub(crate) fn run_mysql_sync_table(
-    config: &SyncConfig,
-    identity: &SyncRunIdentity,
-    table: SyncTable,
-) -> Result<SyncChunkProgress, String> {
-    let table_name = table.name.clone();
-    let chunk = SyncChunkConfig {
-        run_id: identity.run_id.clone(),
-        target_database: config.target.database.clone(),
-        table: table.clone(),
-        chunk_size: config.chunk_size,
-    };
-    let mut source = MySqlSyncSource::new(&config.source, table.clone())
-        .map_err(|error| format!("connect source for sync table `{table_name}`: {error}"))?;
-    let mut target = MySqlSyncTargetSession::new(&config.target, table).map_err(|error| {
-        format!("connect locked target session for sync table `{table_name}`: {error}")
-    })?;
-    let mut progress = MySqlSyncProgressStore::new(
-        &config.target,
-        config.progress_table.clone(),
-        config.coordinator_session_wait_timeout_seconds,
-    )
-    .map_err(|error| format!("connect progress store for sync table `{table_name}`: {error}"))?;
-    sync_table_to_completion(&chunk, &mut source, &mut target, &mut progress)
-}
-
-pub(crate) fn run_mysql_sync_tables(
-    config: &SyncConfig,
-    identity: &SyncRunIdentity,
-    tables: Vec<SyncTable>,
-) -> Result<Vec<SyncChunkProgress>, String> {
-    run_sync_tables_bounded(config, identity, tables, run_mysql_sync_table)
 }
 
 pub(crate) fn run_sync_tables_bounded<F>(
