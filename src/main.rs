@@ -40,6 +40,7 @@ Usage:
   mariadb-mysql-cdc sync-catalog --source-host HOST --source-user USER --source-password-env ENV --source-database DB --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --catalog PATH --run-id-prefix PREFIX [options]
   mariadb-mysql-cdc recover-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
   mariadb-mysql-cdc resume-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
+  mariadb-mysql-cdc activate-lost-binlog --authorization-file PATH --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB
   mariadb-mysql-cdc resync-stream --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity NEW_ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB [--parallelism WORKERS]
   mariadb-mysql-cdc resolve-comics-releases-views-conflicts --source-host HOST --source-user USER --source-password-env ENV --source-database DB --source-identity ID --target-host HOST --target-user USER --target-password-env ENV --target-database DB --target-tls-ca-file PATH --run-id ID [--batch-size ROWS]
   mariadb-mysql-cdc apply-binlog --source-host HOST --source-user USER --source-password-env ENV --target-host HOST --target-user USER --target-password-env ENV --target-database DB [options]
@@ -59,6 +60,8 @@ Commands:
           Execute one authorization-file-scoped lost-binlog recovery with a source-consistent full-scope repair and immutable audit record.
   resume-lost-binlog
           Resume an authorized prepared recovery at its original boundary and durable table progress.
+  activate-lost-binlog
+          Activate an existing prepared boundary after prerequisite schema and rows are complete; final constraints remain deferred.
   resolve-comics-releases-views-conflicts
           Verify exact unresolved child and referenced UTM rows, then resolve only equal conflicts.
   apply-binlog
@@ -147,6 +150,10 @@ fn main() {
         Some("resume-lost-binlog") => {
             run_lost_binlog_command(args.collect(), lost_binlog_recovery::run_resume_lost_binlog)
         }
+        Some("activate-lost-binlog") => run_lost_binlog_command(
+            args.collect(),
+            lost_binlog_recovery::run_activate_lost_binlog,
+        ),
         Some("resync-stream") => run_resync_stream_command(args.collect()),
         Some("resolve-comics-releases-views-conflicts") => {
             run_targeted_conflict_resolution_command(args.collect())

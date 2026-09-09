@@ -1,4 +1,5 @@
 mod chunk;
+mod completed_rows;
 mod component_locks;
 mod config;
 mod dependency_order;
@@ -16,6 +17,7 @@ mod sql;
 
 #[cfg(test)]
 pub(crate) use chunk::sync_next_chunk;
+pub(crate) use completed_rows::load_completed_recovery_rows;
 pub(crate) use config::{DEFAULT_SYNC_PROGRESS_TABLE, SyncConfig, validate_sync_config};
 #[cfg(test)]
 pub(crate) use config::{SyncRunIdentity, build_sync_run_identity, sync_table_from_inventory};

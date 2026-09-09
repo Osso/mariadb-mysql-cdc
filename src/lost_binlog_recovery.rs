@@ -275,7 +275,14 @@ where
     S: LostBinlogRecoveryStore,
 {
     validate_reconciliation_proof(request, proof)?;
+    commit_validated_recovery(store, request, proof)
+}
 
+fn commit_validated_recovery<S: LostBinlogRecoveryStore>(
+    store: &S,
+    request: &LostBinlogRecoveryRequest,
+    proof: &LostBinlogReconciliationProof,
+) -> Result<(), String> {
     run_recovery_transaction(store, || {
         require_expected_recovery_state(store, request)?;
         let prepared = store
@@ -638,6 +645,66 @@ pub fn run_resume_lost_binlog(
     run_prepared_recovery_resume(config, preparation)
 }
 
+/// Activate only an already completed data reconciliation. Final constraint work
+/// remains independent; neither its progress nor application rows are changed.
+pub fn run_activate_lost_binlog(
+    config: &RecoverLostBinlogConfig,
+) -> Result<RecoverLostBinlogReport, String> {
+    let RecoveryPreparation {
+        request: authorization,
+        source,
+        store,
+    } = open_recovery_context(config)?;
+    store.acquire_stream_lease(&recovery_stream_lease_name(&config.target.database))?;
+    let prepared = load_prepared_resume_snapshot(config, source.as_ref(), &store, &authorization)?;
+    let sync_config = recovery_sync_config(
+        config,
+        &prepared.request,
+        &prepared.source_evidence.inventory,
+    );
+    let rows = crate::sync::load_completed_recovery_rows(&sync_config)?;
+    let (repaired_tables, compared_tables) = validate_completed_recovery_scope(
+        &prepared.request,
+        &prepared.scope_hash,
+        &prepared.source_evidence.inventory,
+        &rows,
+    )?;
+    require_retained_prepared_boundary(source.as_ref(), &prepared.prepared)?;
+    require_unchanged_source_scope(
+        source.as_ref(),
+        &config.source.database,
+        &prepared.scope_hash,
+    )?;
+    let proof = LostBinlogReconciliationProof {
+        recovery_id: prepared.request.recovery_id.clone(),
+        source_identity: prepared.request.expected_barrier.source_identity.clone(),
+        scope_hash: prepared.scope_hash.clone(),
+        schema_converged: false,
+        data_converged: true,
+        unsupported_scope: Vec::new(),
+        evidence_json: serde_json::json!({
+            "scope_hash": prepared.scope_hash,
+            "compared_tables": compared_tables,
+            "repaired_tables": repaired_tables,
+            "skipped_tables": [],
+            "prerequisite_schema_converged": true,
+            "data_converged": true,
+            "schema_converged": false,
+            "final_constraints_deferred": true,
+            "prepared_boundary": prepared.prepared.new_checkpoint,
+        })
+        .to_string(),
+    };
+    commit_validated_recovery(&store, &prepared.request, &proof)?;
+    eprintln!("cdc_recovery_activation final_constraints_deferred=true");
+    Ok(recovery_report(
+        &prepared.request,
+        prepared.prepared,
+        &rows,
+        prepared.scope_hash,
+    ))
+}
+
 struct RecoveryPreparation {
     request: LostBinlogRecoveryRequest,
     source: Rc<PersistentMySqlSource>,
@@ -647,6 +714,12 @@ struct RecoveryPreparation {
 fn prepare_recovery_context(
     config: &RecoverLostBinlogConfig,
 ) -> Result<RecoveryPreparation, String> {
+    let preparation = open_recovery_context(config)?;
+    preparation.store.ensure()?;
+    Ok(preparation)
+}
+
+fn open_recovery_context(config: &RecoverLostBinlogConfig) -> Result<RecoveryPreparation, String> {
     let request = read_recovery_authorization(&config.authorization_file)?;
     validate_authorized_source(config, &request)?;
     validate_static_recovery_request(&request)?;
@@ -660,7 +733,6 @@ fn prepare_recovery_context(
         config.journal_table.clone(),
         config.recovery_table.clone(),
     )?;
-    store.ensure()?;
     source
         .extend_session_wait_timeout(RECOVERY_COORDINATOR_WAIT_TIMEOUT_SECONDS)
         .map_err(|error| format!("configure recovery source lifetime: {error}"))?;
@@ -748,21 +820,7 @@ fn run_prepared_recovery_resume(
         store,
     } = preparation;
     store.acquire_stream_lease(&recovery_stream_lease_name(&config.target.database))?;
-    let resumed = resume_prepared_recovery(&store, &authorization)?;
-    require_retained_prepared_boundary(source.as_ref(), &resumed.prepared)?;
-
-    let inventory = read_source_inventory(source.as_ref(), &config.source.database)?;
-    validate_transactional_scope(&inventory)?;
-    let scope_hash = inventory_scope_hash(&inventory)?;
-    validate_resume_source_scope(&resumed.prepared, &scope_hash)?;
-    let source_evidence =
-        read_source_evidence_for_inventory(source.as_ref(), &config.source.database, inventory)?;
-    let prepared = PreparedRecoverySnapshot {
-        request: resumed.request,
-        prepared: resumed.prepared,
-        source_evidence,
-        scope_hash,
-    };
+    let prepared = load_prepared_resume_snapshot(config, source.as_ref(), &store, &authorization)?;
     let sync_config = recovery_sync_config(
         config,
         &prepared.request,
@@ -771,6 +829,28 @@ fn run_prepared_recovery_resume(
     let rows =
         crate::sync::run_mysql_sync_with_evidence(sync_config, prepared.source_evidence.clone())?;
     commit_anchored_recovery(config, source.as_ref(), &store, prepared, rows)
+}
+
+fn load_prepared_resume_snapshot(
+    config: &RecoverLostBinlogConfig,
+    source: &PersistentMySqlSource,
+    store: &MySqlLostBinlogRecoveryStore,
+    authorization: &LostBinlogRecoveryRequest,
+) -> Result<PreparedRecoverySnapshot, String> {
+    let resumed = resume_prepared_recovery(store, authorization)?;
+    require_retained_prepared_boundary(source, &resumed.prepared)?;
+    let inventory = read_source_inventory(source, &config.source.database)?;
+    validate_transactional_scope(&inventory)?;
+    let scope_hash = inventory_scope_hash(&inventory)?;
+    validate_resume_source_scope(&resumed.prepared, &scope_hash)?;
+    let source_evidence =
+        read_source_evidence_for_inventory(source, &config.source.database, inventory)?;
+    Ok(PreparedRecoverySnapshot {
+        request: resumed.request,
+        prepared: resumed.prepared,
+        source_evidence,
+        scope_hash,
+    })
 }
 
 fn require_retained_prepared_boundary(
@@ -927,20 +1007,8 @@ pub(crate) fn recovery_reconciliation_proof(
     source_inventory: &SchemaInventory,
     rows: &[crate::sync::SyncChunkProgress],
 ) -> Result<LostBinlogReconciliationProof, String> {
-    if request.scope_hash != scope_hash {
-        return Err(format!(
-            "unified recovery scope hash mismatch: expected `{}`, found `{scope_hash}`",
-            request.scope_hash
-        ));
-    }
-    let observed_tables = validate_recovery_progress_rows(request, rows)?;
-    let expected_tables = source_inventory
-        .tables
-        .iter()
-        .map(|table| table.name.clone())
-        .collect::<BTreeSet<_>>();
-    require_exact_recovery_progress_scope(&expected_tables, &observed_tables)?;
-    let (repaired_tables, compared_tables) = resync_table_counts(rows);
+    let (repaired_tables, compared_tables) =
+        validate_completed_recovery_scope(request, scope_hash, source_inventory, rows)?;
     Ok(LostBinlogReconciliationProof {
         recovery_id: request.recovery_id.clone(),
         source_identity: request.expected_barrier.source_identity.clone(),
@@ -950,6 +1018,28 @@ pub(crate) fn recovery_reconciliation_proof(
         unsupported_scope: Vec::new(),
         evidence_json: recovery_evidence_json(scope_hash, compared_tables, repaired_tables),
     })
+}
+
+fn validate_completed_recovery_scope(
+    request: &LostBinlogRecoveryRequest,
+    scope_hash: &str,
+    source_inventory: &SchemaInventory,
+    rows: &[crate::sync::SyncChunkProgress],
+) -> Result<(usize, usize), String> {
+    if request.scope_hash != scope_hash {
+        return Err(format!(
+            "unified recovery scope hash mismatch: expected `{}`, found `{scope_hash}`",
+            request.scope_hash
+        ));
+    }
+    let observed = validate_recovery_progress_rows(request, rows)?;
+    let expected = source_inventory
+        .tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect::<BTreeSet<_>>();
+    require_exact_recovery_progress_scope(&expected, &observed)?;
+    Ok(resync_table_counts(rows))
 }
 
 fn validate_recovery_progress_rows(
