@@ -59,9 +59,9 @@ pub trait Backend {
     ) -> Result<Vec<Key>, Self::Error>;
     fn target_row(&mut self, key: &RowKey) -> Result<Option<Row>, Self::Error>;
     fn source_row(&mut self, key: &RowKey) -> Result<Option<Row>, Self::Error>;
-    /// Check ALL outgoing FKs against target, including parents outside traversal.
-    /// NULL-containing FK tuples are satisfied, per SQL semantics.
-    fn missing_parents(
+    /// Ensure outgoing FK parents exist, restoring source-authoritative parents if needed.
+    /// Return unresolved references; NULL-containing tuples are already satisfied.
+    fn ensure_parents(
         &mut self,
         table: &str,
         desired: &Row,
@@ -89,7 +89,7 @@ pub fn transition<B: Backend>(
     let TransitionPlan { order, keys, .. } =
         discover_transition(backend, root, Some(current), old, limits)?;
     detach(backend, &order, &keys)?;
-    check_parents(backend, root, current)?;
+    ensure_parent_rows(backend, root, current)?;
     backend.update(root, current).map_err(Error::Backend)?;
     restore(backend, &order, &keys)
 }
@@ -129,7 +129,7 @@ pub fn replace_source_absent_owner<B: Backend>(
     }
     detach(backend, &order, &keys)?;
     backend.delete(old_key).map_err(Error::Backend)?;
-    check_parents(backend, intended_key, desired)?;
+    ensure_parent_rows(backend, intended_key, desired)?;
     if intended_exists {
         backend
             .update(intended_key, desired)
@@ -197,7 +197,7 @@ fn restore<B: Backend>(
     for table in order.iter().rev() {
         for key in keys.iter().filter(|key| key.table == *table) {
             if let Some(desired) = backend.source_row(key).map_err(Error::Backend)? {
-                check_parents(backend, key, &desired)?;
+                ensure_parent_rows(backend, key, &desired)?;
                 backend.insert(key, &desired).map_err(Error::Backend)?;
             }
         }
@@ -319,13 +319,13 @@ fn read_keys<B: Backend>(
     }
 }
 
-fn check_parents<B: Backend>(
+fn ensure_parent_rows<B: Backend>(
     backend: &mut B,
     child: &RowKey,
     desired: &Row,
 ) -> Result<(), Error<B::Error>> {
     if let Some(parent) = backend
-        .missing_parents(&child.table, desired)
+        .ensure_parents(&child.table, desired)
         .map_err(Error::Backend)?
         .into_iter()
         .next()
@@ -413,7 +413,7 @@ mod tests {
             }
             Ok(self.source.get(key).cloned())
         }
-        fn missing_parents(
+        fn ensure_parents(
             &mut self,
             table: &str,
             desired: &Row,
@@ -491,7 +491,7 @@ mod tests {
             {
                 return Err("unique");
             }
-            if !self.missing_parents(&key.table, desired)?.is_empty() {
+            if !self.ensure_parents(&key.table, desired)?.is_empty() {
                 return Err("parent");
             }
             self.target.insert(key.clone(), desired.clone());

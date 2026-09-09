@@ -526,7 +526,7 @@ impl Backend for TransitionBackend<'_> {
         self.exact(key, true)
     }
 
-    fn missing_parents(
+    fn ensure_parents(
         &mut self,
         table: &str,
         desired: &Row,
