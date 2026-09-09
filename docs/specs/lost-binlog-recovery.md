@@ -1,6 +1,6 @@
 # Lost-binlog recovery
 
-`recover-lost-binlog` is the audited availability-first transition for a stream whose durable MariaDB binlog checkpoint names purged history. It consumes an operator JSON authorization, captures one non-locking MariaDB binlog coordinate plus one committed source evidence set, then runs the unified staged sync for the exact source-table scope before atomically advancing only the authorized stream checkpoint and superseding only the exact historical journal barrier. `resume-lost-binlog` resumes only that same durable prepared transition. Binlog events after the captured coordinate remain eligible for replay after recovery. The implementation is present on this branch; deployment, production execution, restart health, and post-transition verification are not claimed here.
+`recover-lost-binlog` is the audited availability-first transition for a stream whose durable MariaDB binlog checkpoint names purged history. It consumes an operator JSON authorization, captures one non-locking MariaDB binlog coordinate plus one committed source evidence set, then runs the unified staged sync for the exact source-table scope before atomically advancing only the authorized stream checkpoint and superseding only the exact historical journal barrier. `resume-lost-binlog` resumes that full prepared transition; `activate-lost-binlog` may instead commit an already completed prepared recovery while final FK convergence remains deferred. Binlog events after the captured coordinate remain eligible for replay after recovery. The implementation is present on this branch; deployment, production execution, restart health, and post-transition verification are not claimed here.
 
 ## What it must do
 
@@ -38,6 +38,8 @@
 - [x] Preserve all old identity, scope, and prepared-evidence fields during abandonment; refuse committed, verified, abandoned, duplicate-ID, or checkpoint/barrier/source-mismatched owners. The replacement records its actual current scope and need not equal the abandoned owner's scope.
 - [x] Revalidate the exact checkpoint, barrier, source identity, and prepared recovery record in the target transaction. Continue an interrupted record only through explicit, validated prepared recovery resume; abandoning or replacing it requires a separately authorized new recovery ID.
 - [x] Require complete exact unified run/table progress proof and unchanged source scope before atomically updating the checkpoint, superseding the exact barrier, and marking the recovery `committed`.
+- [x] `activate-lost-binlog` accepts only the authorized existing `prepared` record at its exact retained boundary and unchanged source scope. It loads prerequisite and `Rows` completion read-only, requires every expected table complete, performs no DDL, source/target data read or write, rescan, new boundary capture, or source-configuration change, and leaves final-constraint progress untouched.
+- [x] Activation uses the existing atomic checkpoint/recovery-record commit. Its durable proof truthfully records `data_converged=true`, `schema_converged=false`, and `final_constraints_deferred=true`; it does not claim final FK convergence.
 - [x] Preserve the historical journal row; active-barrier selection excludes only the exact committed or verified recovery identity and barrier coordinates/raw-SQL hash; abandoned history never suppresses the journal barrier.
 - [x] Roll back the transition on checkpoint/recovery commit failure.
 - [x] Fail closed on interruption or error before proof/commit: no checkpoint or barrier transition is allowed without complete proof and exact CAS revalidation.
@@ -59,7 +61,7 @@
 
 ## Implementation inventory
 
-- `src/lost_binlog_recovery.rs` — authorization, per-attempt source-scope validation, fresh recovery, validated prepared recovery resume at the original boundary, reconciliation orchestration, and atomic transition.
+- `src/lost_binlog_recovery.rs` — authorization, per-attempt source-scope validation, fresh recovery, validated prepared recovery resume, completed-row activation at the original boundary, reconciliation orchestration, and atomic transition.
 - `src/lost_binlog_recovery_store.rs` — target-side CAS reads, exact-barrier owner locking, immutable prepared insert, abandoned replacement transition, checkpoint update, commit, and exact barrier exclusion.
 - `scripts/lost-binlog-integration-harness.py` — disposable exact-authorization refusal, full-scope reconciliation, unresolved-barrier no-overtake, committed recovery, and post-recovery replay proof.
 - `src/mysql_client.rs` — non-locking MariaDB coordinate capture.
@@ -72,7 +74,7 @@
 
 ## Tests asserting this spec
 
-- `scripts/resume-recovery-integration-harness.py` — hard-kill/restart with a completed table and partial row cursor; unchanged prepared identity/boundary; post-capture changes replayed from that original boundary; authorization, changed-scope, expired-boundary, and terminal-state refusal.
+- `scripts/resume-recovery-integration-harness.py` — hard-kill/restart with a completed table and partial row cursor; completed-row activation; unchanged prepared identity/boundary; post-capture changes replayed from that original boundary; authorization, changed-scope, expired-boundary, terminal-state, and atomic-rollback refusal.
 - `tests/lost_binlog_resume_cli.rs` — explicit resume command/help and authorization validation before connection.
 
 - `src/lost_binlog_recovery.rs` and `src/main/tests/lost_binlog_unified.rs` — captured source evidence reuse, unified run configuration, exact run/table progress proof, unchanged-scope proof, replacement owner abandonment, rollback/refusal cases, exact old-state validation, duplicate/non-advancing refusal, and exact historical-barrier supersession.

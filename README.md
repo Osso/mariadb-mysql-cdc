@@ -465,7 +465,12 @@ full-dump execution is out of scope.
 `prepared` recovery. It retains that recovery's captured binlog boundary, run ID,
 and completed/partial table progress. Exact authorization, unchanged source scope,
 and retained original binlog history are required; unsafe states are rejected
-without substituting a newer boundary or a fresh scan.
+without substituting a newer boundary or a fresh scan. `activate-lost-binlog`
+accepts only an authorized existing prepared record at that exact retained boundary
+when prerequisite and `Rows` progress are complete. It read-only loads progress,
+performs no DDL, source/target data read or write, rescan, new boundary capture,
+or source-configuration change, and leaves final FK progress untouched. Its atomic
+commit records `schema_converged=false` and `final_constraints_deferred=true`.
 
 ## TLS policy
 

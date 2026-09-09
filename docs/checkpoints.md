@@ -95,7 +95,7 @@ suppress a barrier.
 This documentation records the control-plane contract only; production
 execution, restart health, and post-transition `verified` evidence remain open.
 
-### Prepared recovery resume
+### Prepared recovery resume and activation
 
 `resume-lost-binlog` continues only an existing `prepared` recovery matching its
 original authorization and unchanged old checkpoint/barrier. It retains the
@@ -106,11 +106,22 @@ Current source scope/schema must match the prepared evidence; the original
 binlog file/position must remain available before work and immediately before
 commit. Complete exact-scope progress and the existing atomic CAS remain required.
 
+`activate-lost-binlog` is narrower: it accepts only that authorized existing
+`prepared` record when its exact source scope and retained prepared boundary
+still match. It read-only loads prerequisite and `Rows` phase completion and
+requires every expected table complete. It does not run DDL, read or write
+source/target table data, rescan rows, capture a new boundary, change source
+configuration, or alter final-constraint progress. It uses the same atomic
+checkpoint/recovery-record commit as full recovery, with evidence stating
+`schema_converged=false` and `final_constraints_deferred=true`; final FK
+convergence remains background work.
+
 Resume never recaptures a boundary, resets progress, abandons the record, or
-substitutes a fresh scan. Missing, terminal, mismatched, changed-scope, or
-expired-boundary state is refused. `recover-lost-binlog` remains fresh-only and
-rejects an already-used ID. Post-capture changes to completed tables or scanned
-prefixes are applied later by streaming from the retained original boundary.
+substitutes a fresh scan. Activation likewise cannot bypass missing, terminal,
+mismatched, changed-scope, incomplete-progress, or expired-boundary state.
+`recover-lost-binlog` remains fresh-only and rejects an already-used ID.
+Post-capture changes to completed tables or scanned prefixes are applied later
+by streaming from the retained original boundary.
 
 ## Automatic DDL journal
 

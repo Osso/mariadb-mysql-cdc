@@ -166,7 +166,13 @@ health and subsequent verification are recorded.
 
 An interrupted prepared recovery can continue through explicit
 `resume-lost-binlog`, preserving its original boundary and durable run rather
-than creating another snapshot. See the [resume control-plane contract](checkpoints.md#prepared-recovery-resume)
+than creating another snapshot. Once prerequisite and `Rows` phases are complete,
+`activate-lost-binlog` may commit that same prepared recovery before final FK
+convergence. Activation requires the exact authorized prepared record, unchanged
+source scope, and retained original boundary; it reads completion progress only,
+does not run DDL or rescan/read/write table data, and records deferred final
+constraints rather than claiming schema convergence. See the [prepared recovery
+control-plane contract](checkpoints.md#prepared-recovery-resume-and-activation)
 for identity, scope, retention, and refusal gates.
 
 ## Resync stream

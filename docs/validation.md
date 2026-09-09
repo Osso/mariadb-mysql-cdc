@@ -51,10 +51,19 @@ optional `start_after` primary key, and limit so row-level reports can be paged.
    commits after it remain eligible for stream replay after checkpoint
    advancement.
 
-Explicit prepared recovery resume adds the [resume identity, scope, and retention gates](checkpoints.md#prepared-recovery-resume)
+Explicit prepared recovery resume adds the [prepared recovery identity, scope, and retention gates](checkpoints.md#prepared-recovery-resume-and-activation)
 without weakening exact durable progress proof. Its process-kill harness also
 proves that completed tables and scanned prefixes are not rescanned, while their
 post-capture changes remain replayable from the original boundary.
+
+`activate-lost-binlog` is the completed-rows exception to full final-constraint
+convergence: it requires the same authorized existing `prepared` record, exact
+unchanged source scope, retained prepared boundary, and read-only complete
+prerequisite/`Rows` progress. It does not run DDL, access source/target table data,
+rescan, capture a new boundary, modify source configuration, or change final FK
+progress. Its atomic checkpoint/recovery-record transition records
+`data_converged=true`, `schema_converged=false`, and
+`final_constraints_deferred=true`; it is not final schema-convergence evidence.
 
 Every recovery record retains its immutable old checkpoint, exact historical
 barrier, source identity, its own scope hash, operator, reason, and preparation
