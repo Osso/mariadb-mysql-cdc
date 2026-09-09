@@ -7,9 +7,7 @@ use super::model::{
 use super::mysql::{
     MySqlSyncProgressStore, MySqlSyncSource, MySqlSyncTargetSession, open_sync_connection,
 };
-use super::phase_progress::{
-    MySqlPhaseProgressStore, PhaseChunkProgressStore, build_create_sync_phase_progress_table_sql,
-};
+use super::phase_progress::{MySqlPhaseProgressStore, PhaseChunkProgressStore};
 use super::run::run_sync_tables_bounded;
 use crate::inventory::SchemaInventory;
 use crate::mysql_client::sync_target_opts;
@@ -59,10 +57,6 @@ pub(crate) fn run_mysql_sync_phases(
     )
     .map_err(|error| format!("plan child-first row phases: {error:?}"))?;
     let phase_table = format!("{}_phases", config.progress_table);
-    let mut conn = open_sync_connection(sync_target_opts(&config.target)?)
-        .map_err(|error| format!("connect phase progress: {error}"))?;
-    conn.query_drop(build_create_sync_phase_progress_table_sql(&phase_table))
-        .map_err(|error| format!("create phase progress table `{phase_table}`: {error}"))?;
     let mut totals: BTreeMap<String, SyncChunkProgress> = BTreeMap::new();
     for (phase, batches) in [
         (SyncMutationPhase::InsertMissing, &inserts),
