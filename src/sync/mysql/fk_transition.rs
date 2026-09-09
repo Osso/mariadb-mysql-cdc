@@ -443,6 +443,64 @@ fn parent_reference_from_row(
     }))
 }
 
+fn build_dependent_page_statement(
+    table: &SyncTable,
+    relation: &Relation,
+    old: &Row,
+    after: Option<&Key>,
+    limit: usize,
+) -> Result<Option<SqlStatement>, String> {
+    let values = relation
+        .parent_columns
+        .iter()
+        .map(|column| {
+            old.get(column)
+                .cloned()
+                .ok_or_else(|| format!("missing FK parent column `{column}`"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+    let request = SyncChunkReadRequest {
+        start_after: after.cloned(),
+        end_at: None,
+        limit,
+    };
+    build_related_rows_select_statement(table, &relation.child_columns, &values, &request).map(Some)
+}
+
+fn read_dependent_keys(
+    conn: &mut Conn,
+    table: &SyncTable,
+    statement: SqlStatement,
+    byte_limit: usize,
+) -> Result<Vec<Key>, String> {
+    let mut result = conn
+        .exec_iter(&statement.sql, Params::Positional(statement.params))
+        .map_err(|error| format!("read FK dependents in `{}`: {error}", table.name))?;
+    let mut keys = Vec::new();
+    let mut bytes = 0;
+    let mut retain = true;
+    if let Some(rows) = result.iter() {
+        for row in rows {
+            let row = row.map_err(|error| format!("read FK dependent row: {error}"))?;
+            if !retain {
+                continue;
+            }
+            let decoded = decode_sync_row(table, mysql_row_to_strings(row))?;
+            let size = decoded.primary_key.iter().map(String::len).sum::<usize>();
+            if !keys.is_empty() && bytes + size > byte_limit {
+                retain = false;
+                continue;
+            }
+            bytes += size;
+            keys.push(decoded.primary_key);
+        }
+    }
+    Ok(keys)
+}
+
 impl Backend for TransitionBackend<'_> {
     type Error = String;
 
@@ -469,54 +527,11 @@ impl Backend for TransitionBackend<'_> {
         byte_limit: usize,
     ) -> Result<Vec<Key>, String> {
         let table = self.table(&relation.child_table)?;
-        let values = relation
-            .parent_columns
-            .iter()
-            .map(|column| {
-                old.get(column)
-                    .cloned()
-                    .ok_or_else(|| format!("missing FK parent column `{column}`"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if values.iter().any(Option::is_none) {
+        let Some(statement) = build_dependent_page_statement(&table, relation, old, after, limit)?
+        else {
             return Ok(Vec::new());
-        }
-        let request = SyncChunkReadRequest {
-            start_after: after.cloned(),
-            end_at: None,
-            limit,
         };
-        let statement = build_related_rows_select_statement(
-            &table,
-            &relation.child_columns,
-            &values,
-            &request,
-        )?;
-        let mut result = self
-            .target
-            .conn
-            .exec_iter(&statement.sql, Params::Positional(statement.params))
-            .map_err(|error| format!("read FK dependents in `{}`: {error}", table.name))?;
-        let mut keys = Vec::new();
-        let mut bytes = 0;
-        let mut retain = true;
-        if let Some(rows) = result.iter() {
-            for row in rows {
-                let row = row.map_err(|error| format!("read FK dependent row: {error}"))?;
-                if !retain {
-                    continue;
-                }
-                let decoded = decode_sync_row(&table, mysql_row_to_strings(row))?;
-                let size = decoded.primary_key.iter().map(String::len).sum::<usize>();
-                if !keys.is_empty() && bytes + size > byte_limit {
-                    retain = false;
-                    continue;
-                }
-                bytes += size;
-                keys.push(decoded.primary_key);
-            }
-        }
-        Ok(keys)
+        read_dependent_keys(&mut self.target.conn, &table, statement, byte_limit)
     }
 
     fn target_row(&mut self, key: &RowKey) -> Result<Option<Row>, String> {
