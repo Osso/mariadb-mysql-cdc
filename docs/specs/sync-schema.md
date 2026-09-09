@@ -24,9 +24,9 @@ command or separate row-data operation.
 - [x] Render a literal default as the source already spells it, quoting only a bare value, so a MariaDB string or bit literal is never quoted twice.
 - [x] Render every target `CHECK` constraint name as table-qualified for MySQL: prepend the owning table and an underscore unless the source name is already qualified with that table, so an already-qualified name is not doubled. If the rendered name exceeds MySQL's 64-character identifier limit, shorten it deterministically with a collision-resistant digest derived from the constraint kind, table, and canonical source name.
 - [x] Render every target `FOREIGN KEY` constraint name with its child table identity under the same no-double-qualification and deterministic collision-resistant shortening rules. The same source name on different child tables therefore remains distinct.
-- [x] Preserve canonical source constraint identity and source fingerprints as evidence; planning, target introspection, drift comparison, and final verification compare the rendered target constraint identity instead of raw source names.
+- [x] Treat foreign keys as equivalent when child/parent schema, tables, ordered columns, update/delete rules, match option, and enforcement match; a target-only name difference produces no DDL. When semantics differ, drop the actual target constraint name and add the mapped target name only for the new source constraint.
 - [x] Reference a foreign-key parent in the converged schema without a database qualifier so it resolves in the target database; only a genuinely cross-schema parent keeps its qualifier.
-- [x] Maintain actual streamed-DDL parity: a mapping accepted by a staged `sync` schema phase must produce the same translated MySQL semantics as the corresponding streamed DDL operation.
+- [x] Maintain actual streamed-DDL parity for supported common mappings. Semantic foreign-key identity is a staged-sync comparison rule, not a claim that typed live DDL replay supports source `DROP FOREIGN KEY` statements.
 - [x] Have no alternate mapping, compatibility fallback, direct source-DDL execution path, or silent approximation.
 - [x] Fail explicitly on unsupported or ambiguous source constructs.
 
