@@ -49,6 +49,83 @@ impl MySqlSyncTargetSession {
         Ok(())
     }
 
+    pub(super) fn replace_source_absent_unique_owners(
+        &mut self,
+        failure: &mut SyncMutationFailure,
+    ) -> Result<bool, String> {
+        let conflicts = self.inspect_unique_owner_conflicts(failure)?;
+        let mut context = self
+            .transitions
+            .take()
+            .ok_or("FK transitions not configured")?;
+        let result = (|| {
+            let mut replaced = false;
+            for conflict in conflicts {
+                if self.replace_source_absent_unique_owner(&mut context, &conflict)? {
+                    failure
+                        .failed_batch
+                        .retain(|row| row.primary_key != conflict.intended.primary_key);
+                    replaced = true;
+                }
+            }
+            Ok(replaced)
+        })();
+        self.transitions = Some(context);
+        result
+    }
+
+    fn replace_source_absent_unique_owner(
+        &mut self,
+        context: &mut TransitionContext,
+        conflict: &SyncUniqueOwnerConflict,
+    ) -> Result<bool, String> {
+        let owner = RowKey {
+            table: self.table.name.clone(),
+            pk: conflict.owner.primary_key.clone(),
+        };
+        let intended = RowKey {
+            table: self.table.name.clone(),
+            pk: conflict.intended.primary_key.clone(),
+        };
+        let mut backend = TransitionBackend {
+            target: self,
+            context,
+            visiting: BTreeSet::new(),
+        };
+        if backend.source_row(&owner)?.is_some() {
+            return Ok(false);
+        }
+        let intended_exists = backend.target_row(&intended)?.is_some();
+        engine::replace_source_absent_owner(
+            &mut backend,
+            (&owner, &conflict.owner.values),
+            (&intended, &conflict.intended.values),
+            intended_exists,
+            Limits {
+                page_rows: 1000,
+                max_keys: usize::MAX,
+            },
+        )
+        .map_err(|error| format!("coordinated unique-owner replacement: {error:?}"))?;
+        verify_exact_row(
+            self.query_exact_row(&owner.pk)?,
+            None,
+            "replaced unique owner",
+        )?;
+        verify_exact_row(
+            self.query_unique_owner(&conflict.index, &conflict.intended)?,
+            Some(&conflict.intended),
+            "replacement unique owner",
+        )?;
+        self.pending_reconciliation_events
+            .push(format_unique_owner_reconciliation_event(
+                &self.table.name,
+                conflict,
+                &SyncUniqueOwnerAction::Delete,
+            ));
+        Ok(true)
+    }
+
     pub(super) fn repair_insert_prerequisites(
         &mut self,
         rows: &[DatabaseRow],
@@ -115,7 +192,7 @@ impl MySqlSyncTargetSession {
                     &old,
                     Limits {
                         page_rows: 1000,
-                        max_keys: 1_000_000,
+                        max_keys: usize::MAX,
                     },
                 )
                 .map_err(|error| format!("coordinated FK update for `{root_table}`: {error:?}"))?;
@@ -264,7 +341,7 @@ impl TransitionBackend<'_> {
                     old,
                     Limits {
                         page_rows: 1000,
-                        max_keys: 1_000_000,
+                        max_keys: usize::MAX,
                     },
                 )
                 .map_err(|error| {

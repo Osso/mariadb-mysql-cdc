@@ -184,6 +184,41 @@ impl MySqlSyncTargetSession {
         decode_optional_exact_row(&self.table, rows, "target")
     }
 
+    fn execute_mutations_with_owner_replacement(
+        &mut self,
+        rows: &[DatabaseRow],
+        capacity: usize,
+        build: fn(&SyncTable, &[DatabaseRow]) -> Result<SqlStatement, String>,
+        repair_fk_prerequisites: bool,
+    ) -> Result<(), SyncMutationFailure> {
+        let mut pending = rows.to_vec();
+        loop {
+            let mut failure = match self.execute_mutation_batches(
+                &pending,
+                capacity,
+                build,
+                repair_fk_prerequisites,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(failure) => failure,
+            };
+            if failure.mysql_code != Some(1062) || self.transitions.is_none() {
+                return Err(failure);
+            }
+            match self.replace_source_absent_unique_owners(&mut failure) {
+                Ok(true) => pending = failure.retry_rows(),
+                Ok(false) => return Err(failure),
+                Err(message) => {
+                    return Err(SyncMutationFailure {
+                        mysql_code: None,
+                        message,
+                        ..failure
+                    });
+                }
+            }
+        }
+    }
+
     fn execute_mutation_batches(
         &mut self,
         rows: &[DatabaseRow],
@@ -317,7 +352,7 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
     }
 
     fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure> {
-        match self.execute_mutation_batches(
+        match self.execute_mutations_with_owner_replacement(
             rows,
             strict_update_batch_capacity(&self.table),
             build_strict_update_rows_statement,
@@ -329,7 +364,7 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
     }
 
     fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure> {
-        self.execute_mutation_batches(
+        self.execute_mutations_with_owner_replacement(
             rows,
             strict_insert_batch_capacity(&self.table),
             build_strict_insert_statement,
