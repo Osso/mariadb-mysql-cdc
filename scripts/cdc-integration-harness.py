@@ -86,6 +86,11 @@ SCENARIOS = (
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("insert-duplicate-idempotent", True),
+    ScenarioSpec("payment-snapshot-ahead", True),
+    ScenarioSpec("payment-different-pk", True),
+    ScenarioSpec("payment-different-owner", True),
+    ScenarioSpec("payment-source-current-mismatch", True),
+    ScenarioSpec("payment-unrelated-signal", True),
     ScenarioSpec("missing-fk-parent-auto-insert", True),
     ScenarioSpec("missing-fk-nested-parent-auto-insert", True),
     ScenarioSpec("missing-fk-superseded-insert", True),
@@ -1076,6 +1081,171 @@ class Harness:
             "later_same_transaction_row=applied conflict_table=absent "
             f"checkpoint={stop.file}:{stop.position}"
         )
+
+    def run_payment_snapshot_replay(self, scenario: str) -> None:
+        assert self.source and self.target
+        schema = """
+            CREATE TABLE payments (
+                id BIGINT NOT NULL PRIMARY KEY,
+                order_id BIGINT NOT NULL,
+                owner_type_id INT NOT NULL,
+                owner_id BIGINT NOT NULL,
+                payment_service_id INT NOT NULL,
+                transaction_id VARCHAR(64) NULL,
+                authorization_id VARCHAR(64) NULL,
+                original_transaction_id VARCHAR(64) NULL,
+                payload VARCHAR(64) NOT NULL
+            ) ENGINE=InnoDB;
+            CREATE TABLE payment_markers (id INT PRIMARY KEY) ENGINE=InnoDB;
+        """
+        # Exact guard from gc/db/etls/2025/2025-03-20-prevent-duplicate-payments.sql.
+        guard = """
+DELIMITER $$
+CREATE TRIGGER prevent_duplicate_payment_for_ios_google
+    BEFORE INSERT
+    ON payments
+    FOR EACH ROW
+BEGIN
+    IF NEW.payment_service_id IN (8, 9) THEN
+        IF (SELECT COUNT(1)
+            FROM payments
+            WHERE
+                payment_service_id = NEW.payment_service_id
+              AND (
+                (transaction_id = NEW.transaction_id)
+                    OR (transaction_id IS NULL AND NEW.transaction_id IS NULL)
+                )
+              AND (
+                (authorization_id = NEW.authorization_id)
+                    OR (authorization_id IS NULL AND NEW.authorization_id IS NULL)
+                )
+              AND (
+                (original_transaction_id = NEW.original_transaction_id)
+                    OR (original_transaction_id IS NULL AND NEW.original_transaction_id IS NULL)
+                )
+           ) > 0 THEN
+            SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'This external payment has already been applied to a previous order';
+        END IF;
+    END IF;
+END$$
+DELIMITER ;
+"""
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema)
+            self.admin_sql(endpoint, guard)
+        message = "This external payment has already been applied to a previous order"
+        if scenario == "payment-unrelated-signal":
+            message = "Synthetic unrelated payment rejection"
+        target_id = 2 if scenario == "payment-different-pk" else 1
+        target_owner = (
+            "202,2,302" if scenario == "payment-different-owner" else "101,1,301"
+        )
+        # Services 8 and 9 exercise nullable identities in different positions.
+        for service, identity in (
+            (8, "'synthetic-8',NULL,NULL"),
+            (9, "NULL,'synthetic-9','synthetic-original'"),
+        ):
+            self.admin_sql(
+                self.source, "DELETE FROM payments; DELETE FROM payment_markers;"
+            )
+            self.admin_sql(
+                self.target, "DELETE FROM payments; DELETE FROM payment_markers;"
+            )
+            self.admin_sql(
+                self.target,
+                f"INSERT INTO payments VALUES ({target_id},{target_owner},{service},{identity},'current');",
+            )
+            if scenario == "payment-unrelated-signal":
+                self.admin_sql(
+                    self.target,
+                    "DELIMITER $$\nCREATE TRIGGER unrelated_payment_guard BEFORE INSERT "
+                    "ON payments FOR EACH ROW PRECEDES prevent_duplicate_payment_for_ios_google "
+                    "BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+                    f"{sql_literal(message)}; END$$\nDELIMITER ;\n",
+                )
+            before = self.admin_query(
+                self.target, "SELECT * FROM payments ORDER BY id;"
+            )
+            start = self.coordinate()
+            self.write_checkpoint(start)
+            checkpoint_before = self.checkpoint()
+            self.admin_sql(
+                self.source,
+                "START TRANSACTION; INSERT INTO payment_markers VALUES (1); "
+                f"INSERT INTO payments VALUES (1,101,1,301,{service},{identity},'historical'); "
+                "INSERT INTO payment_markers VALUES (2); COMMIT;",
+            )
+            stop = self.coordinate()
+            current = (
+                "source-mismatch"
+                if scenario == "payment-source-current-mismatch"
+                else "current"
+            )
+            self.admin_sql(
+                self.source,
+                f"UPDATE payments SET payload={sql_literal(current)} WHERE id=1;",
+            )
+            args = self._stream_args(self._stream_binary(None), start, stop, None, 0)
+            args.extend(["--insert-conflict-policy", "replace-divergent-pk"])
+            result = run(
+                args,
+                env={
+                    **os.environ,
+                    "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                    "CDC_TARGET_PASSWORD": LIVE_TARGET_PASSWORD,
+                },
+                timeout=90,
+                check=False,
+            )
+            if (
+                self.admin_query(self.target, "SELECT * FROM payments ORDER BY id;")
+                != before
+            ):
+                raise HarnessError(f"{scenario}: target snapshot changed")
+            markers = self.admin_query(
+                self.target, "SELECT id FROM payment_markers ORDER BY id;"
+            ).splitlines()
+            checkpoint = self.checkpoint()
+            if result.returncode:
+                output = result.stdout + result.stderr
+                if "1644" not in output or message not in output:
+                    raise HarnessError(f"{scenario}: wrong failure boundary: {output}")
+                if markers or checkpoint != checkpoint_before:
+                    raise HarnessError(
+                        f"{scenario}: failed transaction committed markers/checkpoint: {markers}, {checkpoint}"
+                    )
+                print(
+                    f"payment_replay_rejected scenario={scenario} service={service} error=1644 markers=rolled_back checkpoint=unchanged",
+                    flush=True,
+                )
+            if scenario == "payment-snapshot-ahead":
+                require_success(result, f"{scenario} service={service}")
+                if (
+                    markers != ["1", "2"]
+                    or checkpoint.get("source_file") != stop.file
+                    or int(checkpoint.get("source_position", 0)) != stop.position
+                ):
+                    raise HarnessError(
+                        f"{scenario}: markers/exact checkpoint not committed: {markers}, {checkpoint}"
+                    )
+            elif result.returncode == 0:
+                raise HarnessError(f"{scenario}: unsafe payment replay acknowledged")
+            self.assert_admin_sql_rejected(
+                self.target,
+                f"INSERT INTO payments VALUES (99,999,1,999,{service},{identity},'probe');",
+                message,
+            )
+            if (
+                self.admin_query(self.target, "SELECT * FROM payments ORDER BY id;")
+                != before
+            ):
+                raise HarnessError(f"{scenario}: trigger probe mutated snapshot")
+            if scenario == "payment-unrelated-signal":
+                self.admin_sql(self.target, "DROP TRIGGER unrelated_payment_guard;")
+            print(
+                f"payment_replay_ok scenario={scenario} service={service} snapshot=unchanged trigger=preserved"
+            )
 
     def run_missing_fk_parent_auto_insert(self) -> None:
         assert self.source and self.target
@@ -5672,6 +5842,8 @@ class Harness:
             self.run_bootstrap_contract()
         elif scenario == "insert-duplicate-idempotent":
             self.run_insert_duplicate_idempotent()
+        elif scenario.startswith("payment-"):
+            self.run_payment_snapshot_replay(scenario)
         elif scenario == "missing-fk-parent-auto-insert":
             self.run_missing_fk_parent_auto_insert()
         elif scenario == "missing-fk-nested-parent-auto-insert":
