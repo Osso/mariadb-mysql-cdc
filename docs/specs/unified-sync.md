@@ -26,7 +26,7 @@ the run ID. Operator usage belongs in the sync runbook.
 
 - [x] Convert the selected current source inventory into deterministic table definitions, including writable `BIT`, `ENUM`, and `MEDIUMBLOB` runtime metadata. Omit new `ENUM` and `MEDIUMBLOB` metadata from backward-compatible `sync-v1` ID serialization; retain existing `BIT` serialization.
 - [x] Reject an empty or duplicated selection and reject a selected child whose same-schema source parent is outside the current selection.
-- [x] Invoke bounded row workers between the two schema stages.
+- [x] Invoke bounded row workers between the two schema stages. For tables without completed legacy `rows` progress, run source-authoritative `insert_missing`, `update_divergent`, then `delete_extras` phases; schedule inserts and updates parent-first and deletes child-first from current same-schema FK inventory. Only unrelated tables share a bounded batch.
 - [x] Apply `--parallelism` to independent schema tables as well as row workers. Preserve statement order within each table, finish all constraint drops before additions, wait for selected parent tables, and block dependents of failed parents. Reject unresolved dependency cycles and retain deterministic report order. Schema workers use independent target sessions; this does not enable hot-reloading an already-running recovery.
 - [x] Expose the staged orchestration through one `sync` CLI. Removed progress, standalone schema, drift-check, catchup-snapshot, sync-table, and repair-drift command names are rejected as unknown commands rather than aliased.
 - [x] Require exactly one `--run-id` or `--run-id-prefix`; default progress persistence to `cdc.sync_runs` and support repeated `--table`, `--chunk-size`, `--parallelism`, and `--progress-table` options.
@@ -68,8 +68,10 @@ the run ID. Operator usage belongs in the sync runbook.
 - [x] For actual prerequisite structural changes, retain the existing constraint-drop behavior; this intermediate planner change does not claim selective structural dependency analysis.
 - [x] Automatically converge only source ENUM declarations that append labels after every existing target label in unchanged order, with unchanged charset, equivalent mapped collation, generated expression, and compatible nullability. Preserve existing ordinals; reject reordered or removed labels rather than broadening conversion.
 - [x] Reuse the final-constraint stage after row work to apply constraint definition differences and fail closed on remaining structural drift.
-- [ ] Integrate dependency-aware row phases before relying on preserved foreign keys for parent/child mutations. This intermediate planner behavior is not deployed and does not complete constraint-preserving synchronization.
-- [ ] Prove the complete production MySQL path, including source evidence reads, target schema stages, row workers, and `cdc.sync_runs` persistence against disposable endpoints.
+- [x] Keep independent phase cursors in an additive target table named `<progress-table>_phases`, keyed by unchanged run ID, table name, and explicit mutation phase. A completed legacy `rows` record is reused unchanged; incomplete legacy cursors do not seed phase cursors. The aggregate legacy `rows` record is written only after all three phases finish.
+- [ ] Prove the integrated phase executor against disposable MariaDB/MySQL endpoints: valid existing FK/CHECK preservation; parent/child insert, reparent, and delete ordering; restart after each phase; phase/legacy progress consistency; and no `ALTER TABLE` for unchanged schemas. No deployment has occurred.
+
+**Known constraint-preserving limits.** Parent-key updates protected by `RESTRICT`, cross-table replacement transitions, FK cycles/self-references, and phase-specific secondary-unique-owner reconciliation are not solved by phased scheduling. They must fail closed or receive separately proven coordinated behavior; they do not authorize routine FK drops.
 - [x] Remove legacy snapshot, table-sync, repair-drift, run-spec migration, and obsolete progress modules; no fallback engine remains.
 
 ## How it works
@@ -83,7 +85,9 @@ the run ID. Operator usage belongs in the sync runbook.
 - `src/sync_cli.rs` — parses current endpoints, scope, runtime, progress location, and run-ID options.
 - `src/sync/config.rs` — validates the current invocation and resolves exact or prefix-derived run IDs.
 - `src/sync/orchestrate.rs` — stage ordering, run/stage/table progress validation, resumable stage persistence, source-scope selection, and production executor wiring.
-- `src/sync/run.rs` — bounded deterministic row-table execution.
+- `src/sync/run.rs` — bounded deterministic row-table execution helper.
+- `src/sync/dependency_order.rs` and `src/sync/phased_run.rs` — deterministic FK dependency batches and integrated parent-first/child-first phase execution.
+- `src/sync/phase_progress.rs` — additive explicit phase cursor storage; it does not alter legacy `cdc.sync_runs` rows.
 - `src/sync/chunk.rs` — locked source/target chunk mutation and run/table progress boundary.
 - `src/sync/mysql.rs` — source, locked target-session, separate progress-store adapters, and enum primary-key cursor reconstruction.
 - `src/sync/sql.rs` — metadata-aware projections and strict bindings for `BIT`, `ENUM`, and `MEDIUMBLOB` columns.
@@ -113,7 +117,7 @@ the run ID. Operator usage belongs in the sync runbook.
 - [x] Prove disposable MariaDB-to-MySQL same-run resume across changed target address and parallelism without restarting completed work through the `sync-resume` scenario.
 - [ ] Prove the complete catalog/resync/recovery MySQL paths against disposable endpoints, including connection-construction and post-connect failure boundaries.
 - [x] Delete legacy production engines, run-spec migration, and obsolete progress paths.
-- [ ] Run full-project tests, Clippy without warning suppression, and final integration verification.
+- [ ] Run full-project tests, Clippy without warning suppression, and final integration verification. The September 9, 2026 phased-row implementation has only focused unit coverage; no disposable end-to-end phase proof or deployment exists.
 
 ## Out of scope
 
