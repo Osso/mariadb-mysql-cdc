@@ -5013,7 +5013,7 @@ mod tests {
         let target_checks = vec![CheckConstraint {
             table: "accounts".to_string(),
             name: "parent_id_valid".to_string(),
-            clause: "(`parent_id` >= 0)".to_string(),
+            clause: "(`parent_id` > 0)".to_string(),
         }];
 
         append_check_constraint_plan(&mut plan, &source_inventory, &source_checks, &target_checks);
