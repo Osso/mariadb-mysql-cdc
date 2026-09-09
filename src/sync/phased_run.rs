@@ -72,7 +72,7 @@ pub(crate) fn run_mysql_sync_phases(
             let selected = batch.iter().map(|name| pending[name].clone()).collect();
             let reports =
                 run_sync_tables_bounded(config, identity, selected, |config, identity, table| {
-                    run_table_phase(config, identity, table, phase, &phase_table)
+                    run_table_phase(config, identity, table, phase, &phase_table, inventory)
                 })?;
             for report in reports {
                 match totals.get_mut(&report.table) {
@@ -105,6 +105,7 @@ fn run_table_phase(
     table: SyncTable,
     phase: SyncMutationPhase,
     phase_table: &str,
+    inventory: &SchemaInventory,
 ) -> Result<SyncChunkProgress, String> {
     let chunk = SyncChunkConfig {
         run_id: identity.run_id.clone(),
@@ -114,6 +115,7 @@ fn run_table_phase(
     };
     let mut source = MySqlSyncSource::new(&config.source, table.clone())?;
     let mut target = MySqlSyncTargetSession::new(&config.target, table)?;
+    target.configure_fk_transitions(&config.source, inventory, &config.tables)?;
     let mut legacy = MySqlSyncProgressStore::new(
         &config.target,
         config.progress_table.clone(),

@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod fk_transition;
 mod query;
 mod unique_owner;
 
@@ -56,6 +57,7 @@ pub(crate) struct MySqlSyncTargetSession {
     database: String,
     table: SyncTable,
     pending_reconciliation_events: Vec<String>,
+    transitions: Option<fk_transition::TransitionContext>,
 }
 
 pub(crate) struct MySqlSyncProgressStore {
@@ -148,6 +150,7 @@ impl MySqlSyncTargetSession {
             database: config.database.clone(),
             table,
             pending_reconciliation_events: Vec::new(),
+            transitions: None,
         })
     }
 
@@ -269,7 +272,14 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
 
     fn lock_table_write(&mut self, database: &str, table: &str) -> Result<(), String> {
         validate_sync_target_lock_identity(&self.database, &self.table.name, database, table)?;
-        let sql = build_lock_table_write_sql(&self.database, &self.table.name);
+        let sql = match &self.transitions {
+            Some(context) => crate::sync::component_locks::build_component_lock_sql(
+                &self.database,
+                &context.component,
+                crate::mysql_support::quote_ident,
+            )?,
+            None => build_lock_table_write_sql(&self.database, &self.table.name),
+        };
         self.execute_control(&sql)
     }
 
@@ -285,11 +295,14 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
     }
 
     fn update_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure> {
-        self.execute_mutation_batches(
+        match self.execute_mutation_batches(
             rows,
             strict_update_batch_capacity(&self.table),
             build_strict_update_rows_statement,
-        )
+        ) {
+            Ok(()) => Ok(()),
+            Err(failure) => self.repair_restricted_updates(failure),
+        }
     }
 
     fn insert_rows(&mut self, rows: &[DatabaseRow]) -> Result<(), SyncMutationFailure> {

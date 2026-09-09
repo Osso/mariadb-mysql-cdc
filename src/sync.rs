@@ -1,7 +1,9 @@
 mod chunk;
+mod component_locks;
 mod config;
 mod dependency_order;
 mod fk_orphan_repair;
+mod fk_transition;
 pub(crate) mod guest_range_repair;
 mod model;
 mod mysql;
