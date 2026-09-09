@@ -566,16 +566,6 @@ def run_activation_case(binary: Path | None, keep: bool) -> None:
                 f"UPDATE cdc.sync_runs SET status='complete' WHERE {where};",
             )
 
-        harness.admin_sql(
-            harness.target,
-            f"UPDATE cdc.stream_recovery_records SET status='abandoned' WHERE recovery_id={run_id};",
-        )
-        assert_activation_refused(harness, authorization, "prepared")
-        harness.admin_sql(
-            harness.target,
-            f"UPDATE cdc.stream_recovery_records SET status='prepared' WHERE recovery_id={run_id};",
-        )
-
         # A real transactional failure, after activation reaches its commit writes.
         harness.admin_sql(
             harness.target,
@@ -649,6 +639,7 @@ def run_activation_case(binary: Path | None, keep: bool) -> None:
             raise base.HarnessError(
                 f"activation created another recovery record: {count}"
             )
+        assert_activation_refused(harness, authorization, "checkpoint mismatch")
         print(
             "activation_ok refusals=missing_and_incomplete_rows_and_prerequisite "
             "original_boundary=true same_record=true deferred_constraints=true "
