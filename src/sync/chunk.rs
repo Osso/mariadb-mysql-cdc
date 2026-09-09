@@ -1,16 +1,21 @@
 use super::model::{
     SyncChunkConfig, SyncChunkProgress, SyncChunkProgressStore, SyncChunkReadRequest,
-    SyncChunkSource, SyncChunkTargetSession, SyncMutationFailure, SyncTable, SyncUniqueOwnerAction,
-    SyncUniqueOwnerConflict,
+    SyncChunkSource, SyncChunkTargetSession, SyncMutationFailure, SyncMutationPhase, SyncTable,
+    SyncUniqueOwnerAction, SyncUniqueOwnerConflict,
 };
 use crate::database_row::DatabaseRow;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) fn sync_next_chunk(
+#[cfg(test)]
+#[path = "chunk_phase_tests.rs"]
+mod phase_tests;
+
+pub(crate) fn sync_next_chunk_with_phase(
     config: &SyncChunkConfig,
     source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
     progress_store: &mut impl SyncChunkProgressStore,
+    phase: SyncMutationPhase,
 ) -> Result<SyncChunkProgress, String> {
     let progress = load_progress(config, progress_store)?;
     if progress.complete {
@@ -18,12 +23,27 @@ pub(crate) fn sync_next_chunk(
     }
 
     prepare_target_chunk(config, target)?;
-    let applied = apply_locked_chunk(config, progress, source, target);
+    let applied = apply_locked_chunk(config, progress, source, target, phase);
     let progress = match applied {
         Ok(progress) => progress,
         Err(error) => return Err(rollback_and_unlock(target, error)),
     };
     save_progress_and_unlock(config, progress, target, progress_store)
+}
+
+pub(crate) fn sync_next_chunk(
+    config: &SyncChunkConfig,
+    source: &mut impl SyncChunkSource,
+    target: &mut impl SyncChunkTargetSession,
+    progress_store: &mut impl SyncChunkProgressStore,
+) -> Result<SyncChunkProgress, String> {
+    sync_next_chunk_with_phase(
+        config,
+        source,
+        target,
+        progress_store,
+        SyncMutationPhase::All,
+    )
 }
 
 fn prepare_target_chunk(
@@ -123,6 +143,7 @@ fn apply_locked_chunk(
     progress: SyncChunkProgress,
     source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
+    phase: SyncMutationPhase,
 ) -> Result<SyncChunkProgress, String> {
     let start_after = progress.last_primary_key.clone();
     let source_rows = source
@@ -135,9 +156,17 @@ fn apply_locked_chunk(
         .rows;
 
     let next_progress = if source_rows.is_empty() {
-        apply_target_tail(config, progress, start_after, target)?
+        apply_target_tail(config, progress, start_after, target, phase)?
     } else {
-        apply_source_window(config, progress, start_after, source_rows, source, target)?
+        apply_source_window(
+            config,
+            progress,
+            start_after,
+            source_rows,
+            source,
+            target,
+            phase,
+        )?
     };
 
     target
@@ -153,13 +182,15 @@ fn apply_source_window(
     source_rows: Vec<DatabaseRow>,
     source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
+    phase: SyncMutationPhase,
 ) -> Result<SyncChunkProgress, String> {
     let end_at = source_rows
         .last()
         .map(|row| row.primary_key.clone())
         .expect("non-empty source window");
-    let changes = reconcile_target_pages(config, start_after, &end_at, &source_rows, target)?;
-    apply_source_changes(&config.table.name, source, target, &changes)?;
+    let changes =
+        reconcile_target_pages(config, start_after, &end_at, &source_rows, target, phase)?;
+    apply_source_changes(&config.table.name, source, target, &changes, phase)?;
 
     progress.last_primary_key = Some(end_at);
     progress.complete = false;
@@ -173,6 +204,7 @@ fn reconcile_target_pages(
     end_at: &[String],
     source_rows: &[DatabaseRow],
     target: &mut impl SyncChunkTargetSession,
+    phase: SyncMutationPhase,
 ) -> Result<ChunkChanges, String> {
     let mut source_by_key = index_rows(source_rows);
     let mut changes = ChunkChanges {
@@ -191,11 +223,17 @@ fn reconcile_target_pages(
         let page_is_complete = !page.has_more;
         start_after = page.rows.last().map(|row| row.primary_key.clone());
         let page_changes = reconcile_target_page(&config.table, &mut source_by_key, &page.rows);
-        delete_target_only_rows(&config.table.name, target, &page_changes.deletes)?;
-        changes.deletes += page_changes.deletes.len();
-        changes.updates.extend(page_changes.updates);
+        if phase.includes(SyncMutationPhase::DeleteExtras) {
+            delete_target_only_rows(&config.table.name, target, &page_changes.deletes)?;
+            changes.deletes += page_changes.deletes.len();
+        }
+        if phase.includes(SyncMutationPhase::UpdateDivergent) {
+            changes.updates.extend(page_changes.updates);
+        }
         if page_is_complete {
-            changes.inserts = source_by_key.into_values().cloned().collect();
+            if phase.includes(SyncMutationPhase::InsertMissing) {
+                changes.inserts = source_by_key.into_values().cloned().collect();
+            }
             return Ok(changes);
         }
     }
@@ -238,6 +276,7 @@ fn apply_target_tail(
     mut progress: SyncChunkProgress,
     start_after: Option<Vec<String>>,
     target: &mut impl SyncChunkTargetSession,
+    phase: SyncMutationPhase,
 ) -> Result<SyncChunkProgress, String> {
     let target_rows = target
         .read_rows(&SyncChunkReadRequest {
@@ -251,7 +290,7 @@ fn apply_target_tail(
         .iter()
         .map(|row| row.primary_key.clone())
         .collect::<Vec<_>>();
-    if !primary_keys.is_empty() {
+    if phase.includes(SyncMutationPhase::DeleteExtras) && !primary_keys.is_empty() {
         target.delete_rows(&primary_keys).map_err(|error| {
             format!(
                 "delete target-only rows from `{}`: {error}",
@@ -262,7 +301,11 @@ fn apply_target_tail(
 
     progress.complete = !target_rows.has_more;
     progress.chunks += 1;
-    progress.deletes += target_rows.rows.len() as u64;
+    if phase.includes(SyncMutationPhase::DeleteExtras) {
+        progress.deletes += target_rows.rows.len() as u64;
+    } else if let Some(last_key) = primary_keys.last() {
+        progress.last_primary_key = Some(last_key.clone());
+    }
     Ok(progress)
 }
 
@@ -296,6 +339,7 @@ fn apply_source_changes(
     source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
     changes: &ChunkChanges,
+    phase: SyncMutationPhase,
 ) -> Result<(), String> {
     apply_strict_mutations(
         table,
@@ -303,6 +347,7 @@ fn apply_source_changes(
         target,
         &changes.updates,
         MutationKind::Update,
+        phase,
     )?;
     apply_strict_mutations(
         table,
@@ -310,6 +355,7 @@ fn apply_source_changes(
         target,
         &changes.inserts,
         MutationKind::Insert,
+        phase,
     )
 }
 
@@ -325,6 +371,7 @@ fn apply_strict_mutations(
     target: &mut impl SyncChunkTargetSession,
     rows: &[DatabaseRow],
     kind: MutationKind,
+    phase: SyncMutationPhase,
 ) -> Result<(), String> {
     if rows.is_empty() {
         return Ok(());
@@ -333,6 +380,11 @@ fn apply_strict_mutations(
     let mut reconciled_conflicts = BTreeSet::new();
     let mut reconciled_intended_rows = BTreeMap::new();
     while let Some(failure) = try_strict_mutation(table, target, &pending_rows, kind)? {
+        if phase != SyncMutationPhase::All {
+            return Err(format!(
+                "strict mutation in `{table}` during {phase:?}: {failure}"
+            ));
+        }
         pending_rows = failure.retry_rows();
         inspect_and_reconcile_mutation_failure(
             table,

@@ -17,6 +17,22 @@ pub(crate) struct SyncTable {
     pub(crate) mediumblob_columns: Vec<String>,
 }
 
+/// Mutation selection for a bounded chunk; callers own phase-specific progress identities.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SyncMutationPhase {
+    #[default]
+    All,
+    InsertMissing,
+    UpdateDivergent,
+    DeleteExtras,
+}
+
+impl SyncMutationPhase {
+    pub(super) fn includes(self, operation: Self) -> bool {
+        self == Self::All || self == operation
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SyncChunkConfig {
     pub(crate) run_id: String,
