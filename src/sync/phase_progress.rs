@@ -98,6 +98,14 @@ impl<'a> MySqlPhaseProgressStore<'a> {
     }
 }
 
+/// The caller executes this DDL explicitly, independently of legacy progress storage.
+pub(crate) fn build_create_sync_phase_progress_table_sql(table: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} (run_id VARBINARY(512) NOT NULL, table_name VARBINARY(1020) NOT NULL, phase VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, last_primary_key_json JSON NULL, complete BOOLEAN NOT NULL DEFAULT FALSE, chunks BIGINT UNSIGNED NOT NULL DEFAULT 0, rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0, inserts BIGINT UNSIGNED NOT NULL DEFAULT 0, updates BIGINT UNSIGNED NOT NULL DEFAULT 0, deletes BIGINT UNSIGNED NOT NULL DEFAULT 0, PRIMARY KEY (run_id, table_name, phase), CHECK (phase IN ('insert_missing', 'update_divergent', 'delete_extras')), CHECK (complete IN (0, 1))) ENGINE=InnoDB",
+        crate::mysql_support::quote_identifier_path(table)
+    )
+}
+
 impl SyncPhaseProgressStore for MySqlPhaseProgressStore<'_> {
     fn load_phase(
         &mut self,
