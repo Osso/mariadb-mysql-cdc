@@ -2931,6 +2931,7 @@ class Harness:
             f"WHERE user_host LIKE '{SYNC_TARGET_USER}%' "
             "AND command_type IN ('Query','Execute') "
             "AND argument REGEXP '^[[:space:]]*(ALTER|DROP|CREATE|TRUNCATE|RENAME)[[:space:]]' "
+            "AND argument REGEXP '(^|[^[:alnum:]_])(parents|children)([^[:alnum:]_]|$)' "
             "ORDER BY event_time;",
         ).splitlines()
         print(f"legacy_column_executed_ddl={json.dumps(statements)}")
