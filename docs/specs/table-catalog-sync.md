@@ -21,8 +21,8 @@ in [the table catalog sync wiki](../wiki/systems/table-catalog-sync.md).
 
 - [x] `sync-catalog` reads the supplied syncable JSON and invokes one unified `sync` run, blocking until the staged operation completes or fails; `table-catalog` only writes catalogs and does not start sync or dump work.
 - [x] Map every catalog table into one unified `SyncConfig` with the current catalog source/target, ordered table names, configured chunk size, bounded catalog parallelism, `cdc.sync_runs` by default (overridable with `--progress-table`), and shared `--run-id-prefix`.
-- [x] Preserve backward-compatible `sync-v1` prefix-derived IDs from the prefix plus serialized invocation/table input and persist staged progress by `(run_id, stage, table_name)` in `cdc.sync_runs`; this prefix path is not the recommended mutable-resume identity. Use an exact `--run-id` to resume the same progress across changed invocation settings or catalog contents; no authorization or progress migration is required.
-- [x] Do not run the removed per-table catalog scheduler, admission locks, child run IDs, dependency gating, target-only repair verification, or per-table progress handling. The unified prerequisite schema stage removes blocking target constraints before row execution; unified bounded row workers then execute the selected scope.
+- [x] Preserve backward-compatible `sync-v1` prefix-derived IDs from the prefix plus serialized invocation/table input and persist aggregate staged progress by `(run_id, stage, table_name)` in `cdc.sync_runs`. Incomplete rows use the additive `<progress-table>_phases` table under the same run ID; completed legacy rows bypass it unchanged. This prefix path is not the recommended mutable-resume identity. Use an exact `--run-id` to resume the same progress across changed invocation settings or catalog contents; no authorization or progress migration is required.
+- [x] Do not run the removed per-table catalog scheduler, admission locks, child run IDs, dependency gating, target-only repair verification, or per-table progress handling. The unified prerequisite schema stage preserves valid constraints for unchanged, additive column/index, and safe ENUM-append work; destructive structural work retains the existing drop path. Unified dependency-aware row phases then execute the selected scope.
 - [x] Read catalog JSON without mutating it and never execute full dumps; the non-syncable catalog is classification/operator input only.
 - [x] Regenerate syncable catalogs after any change to primary-key ordering semantics. Catalog metadata remains validated before it is mapped into unified sync tables.
 
@@ -33,7 +33,7 @@ in [the table catalog sync wiki](../wiki/systems/table-catalog-sync.md).
 ## Implementation inventory
 
 - `src/table_catalog.rs` — catalog models, inventory classification, JSON I/O, CLI parsing, and one-run unified configuration mapping.
-- `src/sync/orchestrate.rs` — unified schema/row/constraint execution and durable `cdc.sync_runs` progress.
+- `src/sync/orchestrate.rs` and `src/sync/phased_run.rs` — unified schema/constraint execution, dependency-aware row phases, and durable aggregate progress.
 - `src/main.rs` — command dispatch and usage text.
 
 ## Tests asserting this spec

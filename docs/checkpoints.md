@@ -9,18 +9,22 @@ must change when the source incarnation changes. Runtime validates the
 pre-created table and source-scoped row; it does not create or repair the
 control plane.
 
-Unified synchronization uses a separate durable boundary in the selected
-progress table, `cdc.sync_runs` by default, keyed by `(run_id, stage,
-table_name)`. Within that store, the run ID alone selects progress. Changing the
-progress-table option selects a different store and does not cross-read rows from
-the previous location. Resume resolves endpoints, TLS, current table scope and
-definitions, chunk size, and parallelism fresh. Omitted rows remain untouched,
-completed selected rows skip, running row progress resumes from its cursor and
-counters, and newly selected tables create missing stages. The legacy
-`run_spec_json` column is ignored and never migrated or rewritten. `--run-id-prefix`
-retains backward-compatible `sync-v1` generation from serialized invocation/table
-input; use an exact `--run-id` for mutable resume because changing that input changes
-the derived prefix ID.
+Unified synchronization stores aggregate stage/table progress in the selected
+progress table, `cdc.sync_runs` by default, keyed by `(run_id, stage, table_name)`.
+For incomplete row work it also requires the additive `<progress-table>_phases`
+table, keyed by the unchanged run ID, table name, and mutation phase. Apply
+[`sync-phase-progress-bootstrap.sql`](sync-phase-progress-bootstrap.sql) before a
+default run; it creates `cdc.sync_runs_phases` and grants only `SELECT`, `INSERT`,
+and `UPDATE` on that table to the deployed sync account. Runtime does not create
+phase storage. A run with all selected legacy `rows` records complete bypasses
+phase-table access; incomplete legacy cursors never seed phases. Changing the
+progress-table option selects different aggregate and phase stores. Resume resolves
+endpoints, TLS, current table scope and definitions, chunk size, and parallelism
+fresh. Omitted rows remain untouched, completed selected rows skip, and newly
+selected tables create missing stages. The legacy `run_spec_json` column is ignored
+and never migrated or rewritten. `--run-id-prefix` retains backward-compatible
+`sync-v1` generation from serialized invocation/table input; use an exact `--run-id`
+for mutable resume because changing that input changes the derived prefix ID.
 
 ## Lost-binlog recovery control plane
 
@@ -49,9 +53,9 @@ A prepared immutable row is inserted into `cdc.stream_recovery_records` with the
 old state, captured coordinate, source identity, that attempt's scope hash,
 operator, reason, and source-only preparation evidence. The captured source
 evidence drives one unified staged sync over every source table under the exact
-recovery ID. Unified prerequisite schema convergence, target-WRITE-locked
-source-authoritative chunks, durable `cdc.sync_runs` stage/table progress, and
-final constraints define successful reconciliation. Proof requires exactly one
+recovery ID. Constraint-preserving prerequisite schema convergence, target component-WRITE-
+locked source-authoritative phases, durable aggregate `cdc.sync_runs` progress and
+additive phase cursors, and final constraints define successful reconciliation. Proof requires exactly one
 complete progress result for every expected source table, with no missing,
 unexpected, duplicate, incomplete, or wrong-run rows. Before the final target
 transaction, recovery rechecks only the captured source scope hash; it does not

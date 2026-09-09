@@ -28,11 +28,13 @@ The production binary is packaged in a fixed, minimal Ubuntu runtime independent
 - [x] Permit registry publication before verification, but edit, commit, and push ops only after both runtime verification and Trivy succeed.
 - [x] Write the verified immutable `repo:tag@sha256:...` reference to the live stream manifest; never admit the mutable tag alone.
 - [x] Leave the ops manifest and commit unchanged when the Trivy gate fails.
+- [x] Before creating a Job that can execute incomplete unified-sync rows, bootstrap the selected `<progress-table>_phases` table and grant only `SELECT`, `INSERT`, and `UPDATE` on it to that Job's target account. The default `cdc.sync_runs_phases` SQL is [`sync-phase-progress-bootstrap.sql`](../sync-phase-progress-bootstrap.sql); image deployment does not create it.
 
 ## How it works
 
 - [README runtime image verification](../../README.md#runtime-image-verification)
 - [README deployment](../../README.md#deployment)
+- [Phase progress bootstrap](../sync-phase-progress-bootstrap.sql)
 
 ## Implementation inventory
 

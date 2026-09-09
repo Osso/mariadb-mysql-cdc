@@ -41,6 +41,13 @@ GRANT SELECT, INSERT, UPDATE
     ON cdc.stream_recovery_records
     TO 'cdc_stream'@'%';
 
+-- Required only when this account runs staged sync or lost-binlog recovery.
+-- Bootstrap the table first with docs/sync-phase-progress-bootstrap.sql.
+-- Keep this exact table grant; do not grant schema-wide cdc privileges.
+GRANT SELECT, INSERT, UPDATE
+    ON cdc.sync_runs_phases
+    TO 'cdc_stream'@'%';
+
 GRANT EXECUTE
     ON PROCEDURE cdc.ddl_replay_journal_trigger_inventory
     TO 'cdc_stream'@'%';
@@ -57,10 +64,11 @@ GRANT EXECUTE
 -- GRANTS or a second grant-policy allowlist for each generated statement.
 -- * global scope: USAGE only;
 -- * exact checkpoint SELECT/INSERT/UPDATE;
--- * exact journal and recovery-record SELECT/INSERT/UPDATE;
+-- * exact journal, recovery-record, and staged phase-progress SELECT/INSERT/UPDATE;
 -- * EXECUTE only on the DDL-journal and recovery-record trigger-inventory procedures;
 -- * no GRANT OPTION, PROXY, roles, ALL, global mutation, schema-wide cdc
---   mutation/object creation, historical sync progress, or conflict-ledger access.
+--   mutation/object creation or conflict-ledger access. Staged phase progress is
+--   restricted to cdc.sync_runs_phases only.
 --
 -- Startup calls the exact definer-safe DDL-journal and recovery-record procedures
 -- and validates their returned trigger rows. Event handling executes known internal operations

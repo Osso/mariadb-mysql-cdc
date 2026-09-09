@@ -126,16 +126,18 @@ non-locking reads. It does not execute `FLUSH TABLES WITH READ LOCK`,
 `UNLOCK TABLES`, or `LOCK TABLES`, does not require `RELOAD`, and does not keep
 a cross-table repeatable-read transaction open. The captured evidence is reused
 by one unified staged sync for every source table with run ID `recovery_id`,
-the caller-selected parallelism and `cdc.sync_runs` progress. Parallelism bounds
-independent table workers in both schema stages and the row stage; per-table
-statement order, the constraint-drop barrier, and selected-parent dependencies
-remain ordered. Unified sync owns prerequisite schema convergence,
-target-WRITE-locked source-authoritative row chunks, durable stage/table progress,
-and final constraint convergence. A running recovery is not hot-reloaded after an
-image update.
+the caller-selected parallelism, aggregate `cdc.sync_runs` progress, and additive
+`cdc.sync_runs_phases` cursors for incomplete rows. Parallelism bounds independent
+schema workers and unrelated row-phase workers; per-table statement order and
+selected-parent dependencies remain ordered. Unified sync owns constraint-
+preserving prerequisite schema convergence, target component-WRITE-locked source-
+authoritative row phases, durable aggregate/phase progress, and final constraint
+convergence. A running recovery is not hot-reloaded after an image update.
 
 Each source and target keyset read retains at most 64 MiB of decoded projected
-payload and the requested row limit. A page retains one oversized row rather
+payload and the requested row limit. Coordinated FK transitions retain primary-key
+work proportional to affected rows; the page budget is not a total process-memory
+bound and recovery does not establish a global source snapshot. A page retains one oversized row rather
 than truncating or rejecting it. The budget excludes MySQL wire buffering and
 that one row, so it is not a universal process-memory bound. A byte-limited
 page and a page that reaches the requested SQL row limit both report continuation;

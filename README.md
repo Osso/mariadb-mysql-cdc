@@ -67,6 +67,13 @@ stream manifest, then commit or push it. A failed gate may leave the candidate i
 the registry but leaves ops reconciliation unchanged. Unified sync Jobs remain
 reviewed and managed separately; `deploy.sh` does not create or update them.
 
+Before creating a Job that can process incomplete rows, apply
+[`docs/sync-phase-progress-bootstrap.sql`](docs/sync-phase-progress-bootstrap.sql)
+with target admin credentials. It adds only the default phase cursor table and
+its table-scoped `SELECT`, `INSERT`, and `UPDATE` grant for `cdc_stream`; it does
+not broaden `cdc.*` privileges. A Job whose selected legacy `rows` entries are all
+complete does not access that phase table.
+
 ## Bounded target repairs
 
 `repair-guest-range` restores one explicitly supplied inclusive `guests.guest_id`
@@ -236,19 +243,25 @@ is not a supported health check.
 ## Schema synchronization
 
 The staged `sync` command is the only standalone synchronization entry point. It
-runs prerequisite schema convergence, source-authoritative locked row chunks, and
-final constraint convergence under one durable progress run ID. `--parallelism`
-bounds independent table workers in both schema stages and row synchronization;
-statements within a table remain ordered, constraint drops finish before additions,
-and selected child tables wait for their parents. Schema work is not available as a
-separate `sync-schema` command; `sync-catalog`, `resync-stream`, and
-`recover-lost-binlog` route through the same staged engine.
+runs prerequisite schema convergence, source-authoritative component-locked row
+phases, and final constraint convergence under one durable progress run ID.
+`--parallelism` bounds independent schema workers and unrelated row workers;
+ordinary inserts/updates are parent-first, deletes child-first, and restrictive
+key transitions coordinate descendants without disabling foreign keys. Schema work
+is not available as a separate `sync-schema` command; `sync-catalog`,
+`resync-stream`, and `recover-lost-binlog` route through the same staged engine.
 
 Before a potentially lossy column change, the prerequisite schema stage checks
 actual target data. Values that would truncate, coerce, or fail block that table
 and produce representative primary keys; independent tables continue, while
-dependent operations are skipped. The staged run persists progress in
-`cdc.sync_runs` and fails closed if final structural convergence is not achieved.
+dependent operations are skipped. The staged run persists aggregate progress in `cdc.sync_runs` and explicit row
+phase cursors in `<progress-table>_phases`. Before a phased run, apply
+[`docs/sync-phase-progress-bootstrap.sql`](docs/sync-phase-progress-bootstrap.sql)
+with target admin credentials. It creates the default `cdc.sync_runs_phases` table
+and grants only `SELECT`, `INSERT`, and `UPDATE` on that table to `cdc_stream`; it
+does not grant schema-wide `cdc` access. A run whose selected legacy `rows` records
+are all complete bypasses phase storage entirely. Final structural convergence still
+fails closed.
 
 ## FK orphan repair
 
@@ -310,12 +323,15 @@ from the prefix plus serialized invocation/table input; it is not the recommende
 mutable-resume path. Use an exact `--run-id` to resume the same progress across those
 changes.
 
-Progress remains keyed by `(run_id, stage, table_name)`. Existing rows for omitted
-tables remain untouched, newly selected tables create missing stage rows, completed
-current-table rows stay complete, and running row progress resumes from its stored
-cursor and counters. The physical `run_spec_json` column remains only for schema
-compatibility with existing deployments: readers ignore it, new rows store `{}`,
-and duplicate-key progress updates do not rewrite existing legacy values.
+Aggregate progress remains keyed by `(run_id, stage, table_name)`. For incomplete
+legacy row work, `<progress-table>_phases` adds independent `insert_missing`,
+`update_divergent`, and `delete_extras` cursors keyed by the unchanged run ID and
+table. Existing rows for omitted tables remain untouched, newly selected tables
+create missing stage rows, completed legacy `rows` records stay complete without
+phase-table access, and incomplete legacy cursors do not seed phases. The physical
+`run_spec_json` column remains only for schema compatibility with existing
+deployments: readers ignore it, new rows store `{}`, and duplicate-key progress
+updates do not rewrite existing legacy values.
 
 The removed
 `catchup-progress`, `sync-progress`, standalone `sync-schema`, and `drift-check`
@@ -415,8 +431,9 @@ sync-catalog uses `cdc.sync_runs`. Its prefix derives the backward-compatible `s
 serialized invocation/table input, and unified sync persists schema-stage, row-stage,
 and final-constraint progress there.
 
-The unified run owns prerequisite schema convergence, locked source-authoritative
-row chunks, bounded row workers, and final constraint convergence. The removed
+The unified run owns constraint-preserving prerequisite schema convergence,
+component-locked source-authoritative row phases, bounded row workers, and final
+constraint convergence. The removed
 catalog-specific dependency scheduler, admission locks, deterministic child run
 IDs, target-only repair verification, and per-table progress handling are not
 used. Catalog FK metadata still classifies syncable scope; it does not create
@@ -425,8 +442,9 @@ source evidence set, a fixed `resync-stream:<source_identity>` run identity, and
 `cdc.sync_runs` progress. It has no legacy repair phases or post-write
 target-inventory drift scan.
 `recover-lost-binlog` now uses the same staged engine with one captured source
-evidence set, exact `recovery_id` progress across every source table, and
-`cdc.sync_runs` progress. `--parallelism WORKERS` defaults to `1` and bounds
+evidence set, exact `recovery_id` progress across every source table, aggregate
+`cdc.sync_runs` progress, and additive `cdc.sync_runs_phases` cursors for incomplete
+rows. `--parallelism WORKERS` defaults to `1` and bounds
 independent schema-table workers as well as row workers; a resume may select a
 different positive worker count without changing its recovery identity, boundary,
 or durable progress. A running recovery keeps its existing binary and worker
