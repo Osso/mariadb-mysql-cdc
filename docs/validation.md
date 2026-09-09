@@ -81,6 +81,24 @@ Production execution, restart health, and post-transition `verified` evidence
 remain open until measured and recorded; this document does not claim recovery
 completion.
 
+## Payment replay evidence
+
+For `replace-divergent-pk`, a known payment-trigger `1644` is acknowledged only
+for services `8` and `9` after a source-current proof: the target row is
+unchanged; exactly one target external-payment owner has the incoming numeric
+primary key; the complete target row equals the current source row, including
+owner and order; and the source external identity equals the incoming identity.
+Any failed check preserves the original error and rolls back the row and
+checkpoint atomically. The trigger remains active and no blanket `1644` ignore
+is allowed. Diagnostics contain numeric primary keys and boolean check results
+only.
+
+Disposable evidence at `/tmp/claude/cdc-payment-policy-green.log` covers
+source-snapshot-ahead markers with unchanged target state and atomic checkpoint
+advancement, plus different-primary-key, different-owner,
+source-current-mismatch, and unrelated-signal negative cases for services `8`
+and `9`.
+
 ## FK orphan repair proof boundary
 
 `repair-fk-orphans` is outside staged recovery progress. Its disposable

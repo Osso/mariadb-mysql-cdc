@@ -18,6 +18,7 @@
 - [x] Reconcile normally committed source rows and schema evidence without a long-lived cross-table transaction or repeatable-read snapshot.
 - [x] Invoke one unified staged sync for every source-table in the captured inventory, using run ID `recovery_id`, configured `--parallelism` (default `1`) for independent schema-table and row workers, and the configured `cdc.sync_runs` progress table plus its additive `cdc.sync_runs_phases` cursor table. Per-table statement order and selected-parent dependencies remain ordered. A running recovery is not hot-reloaded after an image update.
 - [x] Preserve the replay boundary: source commits after the captured coordinate remain eligible for stream binlog replay after recovery advances the checkpoint.
+- [x] Under `replace-divergent-pk`, acknowledge the known `1644` external-payment trigger only for services `8` and `9` when the target row is unchanged, exactly one existing target external-payment owner has the incoming numeric primary key, the complete target row equals the current source row including owner and order, and the current source external identity equals the incoming identity. Otherwise preserve the original error and roll back atomically. Keep the trigger active; do not blanket-ignore `1644`. Diagnostics expose numeric primary keys and boolean checks only.
 - [x] Use the unified stages for constraint-preserving prerequisite schema convergence, source-authoritative chunks locked across their selected FK component before source reads, durable phase and aggregate per-table progress, and final constraint convergence. A same-ID resume reuses completed legacy `rows` progress unchanged without requiring phase-table access.
 - [x] Set only recovery-owned source/target coordinator and sync-progress sessions to `SESSION wait_timeout=604800` before long reconciliation. This matches the seven-day recovery Job deadline; it does not change server-global timeouts, normal stream/sync sessions, CLI configuration, or reconnect behavior.
 - [x] Keep prepared evidence source-only: scope hash, source schema fingerprint, and source table count; no target inventory is captured for preparation proof.
@@ -65,7 +66,8 @@
 - `src/lost_binlog_recovery.rs` — authorization, per-attempt source-scope validation, fresh recovery, validated prepared recovery resume, completed-row activation at the original boundary, reconciliation orchestration, and atomic transition.
 - `src/lost_binlog_recovery_store.rs` — target-side CAS reads, exact-barrier owner locking, immutable prepared insert, abandoned replacement transition, checkpoint update, commit, and exact barrier exclusion.
 - `scripts/lost-binlog-integration-harness.py` — disposable exact-authorization refusal, full-scope reconciliation, unresolved-barrier no-overtake, committed recovery, and post-recovery replay proof.
-- `src/mysql_client.rs` — non-locking MariaDB coordinate capture.
+- `src/mysql_client.rs` — non-locking MariaDB coordinate capture and narrowly scoped payment replay acknowledgement.
+- `src/mysql_client/payment_replay.rs` — source/target identity and full-row proof for acknowledged payment trigger replays.
 - `src/inventory/reader.rs` — committed source metadata reads.
 - `src/sync/orchestrate.rs`, `src/sync/phased_run.rs`, `src/sync/chunk.rs`, and `src/sync/phase_progress.rs` — unified prerequisite schema, component-locked source-authoritative row phases, additive cursor persistence, legacy-progress reuse, and final constraints.
 - `src/sync_schema.rs` — prerequisite and final schema-stage planning/execution.
@@ -81,6 +83,7 @@
 - `src/lost_binlog_recovery.rs` and `src/main/tests/lost_binlog_unified.rs` — captured source evidence reuse, unified run configuration, exact run/table progress proof, unchanged-scope proof, replacement owner abandonment, rollback/refusal cases, exact old-state validation, duplicate/non-advancing refusal, and exact historical-barrier supersession.
 - `src/sync/chunk.rs`, `src/sync/orchestrate.rs`, and `src/sync_schema.rs` — locked chunk boundaries, staged schema/row progress, and final-constraint behavior.
 - `src/lost_binlog_recovery_store.rs` — immutable prepared insert, locked CAS queries, abandoned parsing/replacement SQL, checkpoint update, committed transition, and exact barrier predicates.
+- `scripts/cdc-integration-harness.py` — disposable payment snapshot-ahead proof plus negative different-primary-key, different-owner, source-current-mismatch, and unrelated-signal cases. Evidence: `/tmp/claude/cdc-payment-policy-green.log`.
 
 ## Known gaps (current cycle)
 
