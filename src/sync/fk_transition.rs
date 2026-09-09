@@ -86,7 +86,7 @@ pub fn transition<B: Backend>(
     old: &Row,
     limits: Limits,
 ) -> Result<(), Error<B::Error>> {
-    let TransitionPlan { order, keys } =
+    let TransitionPlan { order, keys, .. } =
         discover_transition(backend, root, Some(current), old, limits)?;
     detach(backend, &order, &keys)?;
     check_parents(backend, root, current)?;
@@ -107,8 +107,26 @@ pub fn replace_source_absent_owner<B: Backend>(
 ) -> Result<(), Error<B::Error>> {
     let (old_key, old_row) = old_owner;
     let (intended_key, desired) = intended;
-    let TransitionPlan { order, keys } =
-        discover_transition(backend, old_key, None, old_row, limits)?;
+    let TransitionPlan {
+        order,
+        mut keys,
+        schema,
+    } = discover_transition(backend, old_key, None, old_row, limits)?;
+    if intended_exists {
+        let intended_old = backend
+            .target_row(intended_key)
+            .map_err(Error::Backend)?
+            .ok_or_else(|| Error::MissingTarget(intended_key.clone()))?;
+        discover(
+            backend,
+            intended_key,
+            Some(desired),
+            &intended_old,
+            limits,
+            &schema,
+            &mut keys,
+        )?;
+    }
     detach(backend, &order, &keys)?;
     backend.delete(old_key).map_err(Error::Backend)?;
     check_parents(backend, intended_key, desired)?;
@@ -127,6 +145,7 @@ pub fn replace_source_absent_owner<B: Backend>(
 struct TransitionPlan {
     order: Vec<String>,
     keys: BTreeSet<RowKey>,
+    schema: BTreeMap<String, Vec<Relation>>,
 }
 
 fn discover_transition<B: Backend>(
@@ -148,8 +167,13 @@ fn discover_transition<B: Backend>(
         &mut BTreeSet::new(),
         &mut order,
     )?;
-    let keys = discover(backend, root, current, old, limits, &schema)?;
-    Ok(TransitionPlan { order, keys })
+    let mut keys = BTreeSet::new();
+    discover(backend, root, current, old, limits, &schema, &mut keys)?;
+    Ok(TransitionPlan {
+        order,
+        keys,
+        schema,
+    })
 }
 
 fn detach<B: Backend>(
@@ -231,8 +255,8 @@ fn discover<B: Backend>(
     old: &Row,
     limits: Limits,
     schema: &BTreeMap<String, Vec<Relation>>,
-) -> Result<BTreeSet<RowKey>, Error<B::Error>> {
-    let mut keys = BTreeSet::new();
+    keys: &mut BTreeSet<RowKey>,
+) -> Result<(), Error<B::Error>> {
     let mut pending = Vec::new();
     for relation in &schema[&root.table] {
         let detach_relation = match current {
@@ -240,7 +264,7 @@ fn discover<B: Backend>(
             None => true,
         };
         if detach_relation {
-            read_keys(backend, relation, old, limits, &mut keys, &mut pending)?;
+            read_keys(backend, relation, old, limits, keys, &mut pending)?;
         }
     }
     while let Some(key) = pending.pop() {
@@ -249,10 +273,10 @@ fn discover<B: Backend>(
             .map_err(Error::Backend)?
             .ok_or_else(|| Error::MissingTarget(key.clone()))?;
         for relation in &schema[&key.table] {
-            read_keys(backend, relation, &row, limits, &mut keys, &mut pending)?;
+            read_keys(backend, relation, &row, limits, keys, &mut pending)?;
         }
     }
-    Ok(keys)
+    Ok(())
 }
 
 fn read_keys<B: Backend>(
@@ -514,6 +538,47 @@ mod tests {
             replace(&mut db, exists, 10).unwrap();
             assert_eq!(db.target, db.source);
         }
+    }
+
+    fn replacement_with_both_subtrees() -> Memory {
+        let mut db = replacement_fixture(true);
+        db.relations
+            .insert("users".into(), vec![relation("favorites")]);
+        db.relations
+            .insert("favorites".into(), vec![relation("notes")]);
+        for (id, before) in [("10", "name"), ("11", "previous")] {
+            db.target.insert(key("favorites", id), row(id, before));
+            db.source.insert(key("favorites", id), row(id, "name"));
+            db.target.insert(key("notes", id), row(id, before));
+            db.source.insert(key("notes", id), row(id, "name"));
+        }
+        db
+    }
+
+    #[test]
+    fn replacement_updates_intended_root_with_children_on_both_roots() {
+        let mut db = replacement_with_both_subtrees();
+        replace(&mut db, true, 4).unwrap();
+        assert_eq!(db.target, db.source);
+    }
+
+    #[test]
+    fn replacement_bounds_combined_subtrees_before_any_write() {
+        let mut db = replacement_with_both_subtrees();
+        let before = db.target.clone();
+        assert_eq!(replace(&mut db, true, 3), Err(Error::WorkLimit));
+        assert_eq!(db.target, before);
+    }
+
+    #[test]
+    fn replacement_missing_intended_target_prevents_any_write() {
+        let mut db = replacement_fixture(false);
+        let before = db.target.clone();
+        assert_eq!(
+            replace(&mut db, true, 10),
+            Err(Error::MissingTarget(key("users", "2")))
+        );
+        assert_eq!(db.target, before);
     }
 
     #[test]
