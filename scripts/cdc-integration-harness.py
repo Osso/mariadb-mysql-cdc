@@ -59,6 +59,8 @@ SCENARIOS = (
     ScenarioSpec("sync-fk-parent-update", True),
     ScenarioSpec("sync-fk-restrict-key-transition", True),
     ScenarioSpec("sync-fk-restrict-key-transition-reparent", True),
+    ScenarioSpec("sync-fk-restrict-key-transition-rollback-resume", True),
+    ScenarioSpec("sync-fk-restrict-key-transition-new-child", True),
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
     ScenarioSpec("sync-update-stale-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-unique-owner-rollback-resume", True),
@@ -2850,9 +2852,22 @@ class Harness:
             raise HarnessError(f"preserved child rows differ: {rows!r}")
         print("sync_constraints_preserved=true alter_privilege=false")
 
-    def run_sync_fk_restrict_key_transition(self, reparent: bool = False) -> None:
+    def assert_key_transition_rows(
+        self, endpoint: Endpoint, expected: dict[str, str]
+    ) -> None:
+        for table, rows in expected.items():
+            actual = self.admin_query(
+                endpoint, f"SELECT * FROM `{table}` ORDER BY id;"
+            ).strip()
+            if actual != rows:
+                raise HarnessError(
+                    f"key transition {endpoint.container} {table}: {actual!r} != {rows!r}"
+                )
+
+    def run_sync_fk_restrict_key_transition(self, variant: str = "") -> None:
         assert self.source and self.target
-        run_id = "sync-fk-restrict-key-transition" + ("-reparent" if reparent else "")
+        reparent = variant == "reparent"
+        run_id = "sync-fk-restrict-key-transition" + (f"-{variant}" if variant else "")
         schema = (
             "DROP TABLE IF EXISTS favorite_notes; DROP TABLE IF EXISTS favorites; "
             "DROP TABLE IF EXISTS users; "
@@ -2875,7 +2890,9 @@ class Harness:
         self.admin_sql(
             self.source,
             "INSERT INTO users VALUES (1,'new'),(2,'other'); "
-            f"INSERT INTO favorites VALUES ({desired_child}); "
+            f"INSERT INTO favorites VALUES ({desired_child})"
+            + (",(11,1,'new')" if variant == "new-child" else "")
+            + "; "
             "INSERT INTO favorite_notes VALUES (100,10);",
         )
         self.admin_sql(
@@ -2896,6 +2913,49 @@ class Harness:
             self.target,
             f"REVOKE ALTER ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
         )
+        if variant == "rollback-resume":
+            failure_message = "injected key transition restoration failure"
+            self.admin_sql(
+                self.target,
+                "DELIMITER //\n"
+                "CREATE TRIGGER favorites_restore_failure BEFORE INSERT ON favorites "
+                "FOR EACH ROW BEGIN IF NEW.id=10 AND NEW.user_name='new' THEN "
+                f"SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='{failure_message}'; "
+                "END IF; END//\nDELIMITER ;\n",
+            )
+            failed = self.run_sync(
+                tables=["users", "favorites", "favorite_notes"],
+                run_id=run_id,
+                chunk_size=1,
+                parallelism=2,
+                timeout=60,
+            )
+            output = f"{failed.stdout}\n{failed.stderr}"
+            if failed.returncode == 0 or failure_message not in output:
+                raise HarnessError(
+                    "restoration failure not observed: "
+                    f"exit={failed.returncode} output={output!r}"
+                )
+            self.assert_key_transition_rows(
+                self.target,
+                {
+                    "users": "1\told\n2\tother",
+                    "favorites": "10\t1\told",
+                    "favorite_notes": "100\t10",
+                },
+            )
+            progress = self.admin_query(
+                self.target,
+                "SELECT status FROM cdc.sync_runs "
+                f"WHERE run_id={sql_literal(run_id)} "
+                "AND stage='rows' AND table_name='users';",
+            ).strip()
+            if not progress or progress == "complete":
+                raise HarnessError(
+                    f"root Rows progress must be incomplete: {progress!r}"
+                )
+            print(f"{run_id}_rollback_ok original_rows=true root_rows={progress}")
+            self.admin_sql(self.target, "DROP TRIGGER favorites_restore_failure;")
         result = self.run_sync(
             tables=["users", "favorites", "favorite_notes"],
             run_id=run_id,
@@ -2910,20 +2970,15 @@ class Harness:
             "favorites": "10\t2\tother" if reparent else "10\t1\tnew",
             "favorite_notes": "100\t10",
         }
-        for table, rows in expected.items():
-            for endpoint in (self.source, self.target):
-                actual = self.admin_query(
-                    endpoint, f"SELECT * FROM `{table}` ORDER BY id;"
-                ).strip()
-                if actual != rows:
-                    raise HarnessError(
-                        f"{run_id} {endpoint.container} {table}: {actual!r} != {rows!r}"
-                    )
+        if variant == "new-child":
+            expected["favorites"] += "\n11\t1\tnew"
+        for endpoint in (self.source, self.target):
+            self.assert_key_transition_rows(endpoint, expected)
         parent_id = 2 if reparent else 1
         for sql in (
             f"UPDATE users SET name='blocked' WHERE id={parent_id};",
             f"DELETE FROM users WHERE id={parent_id};",
-            "UPDATE favorites SET id=11 WHERE id=10;",
+            "UPDATE favorites SET id=12 WHERE id=10;",
             "DELETE FROM favorites WHERE id=10;",
         ):
             self.assert_admin_sql_rejected(self.target, sql, "1451")
@@ -5059,7 +5114,11 @@ class Harness:
         elif scenario == "sync-fk-restrict-key-transition":
             self.run_sync_fk_restrict_key_transition()
         elif scenario == "sync-fk-restrict-key-transition-reparent":
-            self.run_sync_fk_restrict_key_transition(reparent=True)
+            self.run_sync_fk_restrict_key_transition("reparent")
+        elif scenario == "sync-fk-restrict-key-transition-rollback-resume":
+            self.run_sync_fk_restrict_key_transition("rollback-resume")
+        elif scenario == "sync-fk-restrict-key-transition-new-child":
+            self.run_sync_fk_restrict_key_transition("new-child")
         elif scenario == "sync-fk-parent-stale-unique-owner":
             self.run_sync_fk_parent_stale_unique_owner()
         elif scenario == "sync-update-stale-unique-owner-rollback-resume":
