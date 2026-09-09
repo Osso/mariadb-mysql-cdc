@@ -4,6 +4,94 @@ use crate::mysql_support::{quote_ident, quote_sql_literal};
 use crate::target::SqlStatement;
 use mysql::Value;
 
+#[cfg(test)]
+#[path = "relation_sql_tests.rs"]
+mod relation_sql_tests;
+
+pub(crate) fn build_related_rows_select_statement(
+    table: &SyncTable,
+    columns: &[String],
+    values: &[Option<String>],
+    request: &SyncChunkReadRequest,
+) -> Result<SqlStatement, String> {
+    validate_related_rows_request(table, columns, values, request)?;
+    let params = columns
+        .iter()
+        .zip(values)
+        .map(|(column, value)| match value {
+            Some(value) => parameter_value(table, column, value.clone()),
+            None => Ok(Value::NULL),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut predicates = columns
+        .iter()
+        .map(|column| format!("{} <=> ?", quote_ident(column)))
+        .collect::<Vec<_>>();
+    predicates.extend(sync_bound_predicates(table, request));
+    Ok(SqlStatement {
+        sql: format!(
+            "SELECT {} FROM {} WHERE {} ORDER BY {} LIMIT {}",
+            sync_select_columns(table),
+            quote_ident(&table.name),
+            predicates.join(" AND "),
+            primary_key_order_by(&table.primary_key, &table.primary_key_ordering),
+            request.limit
+        ),
+        params,
+    })
+}
+
+fn validate_related_rows_request(
+    table: &SyncTable,
+    columns: &[String],
+    values: &[Option<String>],
+    request: &SyncChunkReadRequest,
+) -> Result<(), String> {
+    if columns.is_empty() || columns.len() != values.len() {
+        return Err(format!(
+            "relation for `{}` requires nonempty columns and matching values",
+            table.name
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for column in columns {
+        if !table.columns.contains(column) {
+            return Err(format!(
+                "relation column `{column}` is absent from `{}`",
+                table.name
+            ));
+        }
+        if !seen.insert(column) {
+            return Err(format!(
+                "duplicate relation column `{column}` for `{}`",
+                table.name
+            ));
+        }
+    }
+    if request.limit == 0 {
+        return Err(format!(
+            "relation read limit for `{}` must be nonzero",
+            table.name
+        ));
+    }
+    for (label, cursor) in [
+        ("start_after", &request.start_after),
+        ("end_at", &request.end_at),
+    ] {
+        if let Some(cursor) = cursor
+            && cursor.len() != table.primary_key.len()
+        {
+            return Err(format!(
+                "relation {label} cursor width mismatch for `{}`: expected {}, found {}",
+                table.name,
+                table.primary_key.len(),
+                cursor.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build_sync_select_sql(table: &SyncTable, request: &SyncChunkReadRequest) -> String {
     let columns = sync_select_columns(table);
     let order_by = primary_key_order_by(&table.primary_key, &table.primary_key_ordering);
