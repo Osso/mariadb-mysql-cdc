@@ -344,6 +344,9 @@ pub(crate) fn plan_sync_prerequisite_schema(
         table
             .statements
             .retain(|statement| statement.phase != SchemaPhase::Constraints);
+        if table.statements.is_empty() {
+            continue;
+        }
         let drops = prerequisite_constraint_drops(
             &table.table,
             target,
@@ -5216,6 +5219,84 @@ mod tests {
         assert_eq!(json[0]["error"], "sample query failed");
         assert_eq!(json[1]["count"], 0);
         assert_eq!(json[1]["status"], "passed");
+    }
+
+    #[test]
+    fn unified_unchanged_structure_preserves_constraints_until_final_diff() {
+        let source = inventory(
+            vec![
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("parent_id", "bigint", false),
+                    ],
+                    vec!["id"],
+                ),
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+            ],
+            vec![foreign_key("children", "parents")],
+        );
+        let mut target = source.clone();
+        target.foreign_keys[0].name = "children_fk_children_parents".to_string();
+        let evidence = SchemaSourceEvidence {
+            inventory: source,
+            checks: vec![check("children", "positive_parent", "`parent_id` > 0")],
+            canonical_foreign_keys: vec![canonical_foreign_key("fk_children_parents")],
+        };
+        let selected = vec!["parents".to_string(), "children".to_string()];
+        for changed_definition in [false, true] {
+            let mut target_checks = target_check_constraints(&evidence.checks);
+            let mut target_keys = vec![canonical_foreign_key("children_fk_children_parents")];
+            if changed_definition {
+                target_checks[0].clause = "`parent_id` >= 0".to_string();
+                target_keys[0].delete_rule = "CASCADE".to_string();
+            }
+            let prerequisite = plan_sync_prerequisite_schema(
+                &evidence,
+                &target,
+                &target_checks,
+                &target_keys,
+                &selected,
+                &FixtureCoercionPreflight::default(),
+            )
+            .expect("unchanged structural schema prerequisite plan");
+            let prerequisite_sql = prerequisite
+                .tables
+                .iter()
+                .flat_map(|table| &table.statements)
+                .map(|statement| statement.sql.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(prerequisite_sql, Vec::<&str>::new());
+
+            let final_plan = plan_sync_final_constraints(
+                &evidence,
+                &target,
+                &target_checks,
+                &target_keys,
+                &selected,
+                &FixtureCoercionPreflight::default(),
+            )
+            .expect("final canonical constraint diff");
+            let final_sql = final_plan
+                .tables
+                .iter()
+                .flat_map(|table| &table.statements)
+                .map(|statement| statement.sql.as_str())
+                .collect::<Vec<_>>();
+            if changed_definition {
+                assert_eq!(final_sql.len(), 4);
+                let sql = final_sql.join("\n");
+                assert!(sql.contains("DROP FOREIGN KEY `children_fk_children_parents`"));
+                assert!(sql.contains("DROP CHECK `children_positive_parent`"));
+                assert!(sql.contains("ADD CONSTRAINT `children_fk_children_parents` FOREIGN KEY"));
+                assert!(sql.contains("ADD CONSTRAINT `children_positive_parent` CHECK"));
+                assert!(sql.contains("RESTRICT"));
+                assert!(sql.contains("`parent_id` > 0"));
+            } else {
+                assert_eq!(final_sql, Vec::<&str>::new());
+            }
+        }
     }
 
     #[test]
