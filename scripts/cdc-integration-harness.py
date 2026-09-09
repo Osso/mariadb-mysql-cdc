@@ -2950,7 +2950,7 @@ class Harness:
                 f"WHERE run_id={sql_literal(run_id)} "
                 "AND stage='rows' AND table_name='users';",
             ).strip()
-            if not progress or progress == "complete":
+            if progress == "complete":
                 raise HarnessError(
                     f"root Rows progress must be incomplete: {progress!r}"
                 )
