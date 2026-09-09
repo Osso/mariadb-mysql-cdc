@@ -27,20 +27,50 @@ pub(crate) fn run_mysql_sync_phases(
         config.progress_table.clone(),
         config.coordinator_session_wait_timeout_seconds,
     )?;
-    let mut completed = Vec::new();
-    let mut pending = BTreeMap::new();
+    let mut work = load_row_work(&mut legacy, identity, tables)?;
+    if !work.pending.is_empty() {
+        let totals = run_pending_phases(config, identity, &work.pending, inventory)?;
+        for report in totals.into_values() {
+            legacy.save(&report)?;
+            work.completed.push(report);
+        }
+    }
+    work.completed
+        .sort_by(|left, right| left.table.cmp(&right.table));
+    Ok(work.completed)
+}
+
+struct RowWork {
+    completed: Vec<SyncChunkProgress>,
+    pending: BTreeMap<String, SyncTable>,
+}
+
+fn load_row_work(
+    progress: &mut impl SyncChunkProgressStore,
+    identity: &SyncRunIdentity,
+    tables: Vec<SyncTable>,
+) -> Result<RowWork, String> {
+    let mut work = RowWork {
+        completed: Vec::new(),
+        pending: BTreeMap::new(),
+    };
     for table in tables {
-        match legacy.load(&identity.run_id, &table.name)? {
-            Some(progress) if progress.complete => completed.push(progress),
+        match progress.load(&identity.run_id, &table.name)? {
+            Some(progress) if progress.complete => work.completed.push(progress),
             _ => {
-                pending.insert(table.name.clone(), table);
+                work.pending.insert(table.name.clone(), table);
             }
         }
     }
-    if pending.is_empty() {
-        completed.sort_by(|left, right| left.table.cmp(&right.table));
-        return Ok(completed);
-    }
+    Ok(work)
+}
+
+fn run_pending_phases(
+    config: &SyncConfig,
+    identity: &SyncRunIdentity,
+    pending: &BTreeMap<String, SyncTable>,
+    inventory: &SchemaInventory,
+) -> Result<BTreeMap<String, SyncChunkProgress>, String> {
     let names = pending.keys().cloned().collect::<Vec<_>>();
     let inserts = plan_dependency_batches(
         &names,
@@ -75,29 +105,31 @@ pub(crate) fn run_mysql_sync_phases(
                 run_sync_tables_bounded(config, identity, selected, |config, identity, table| {
                     run_table_phase(config, identity, table, phase, &phase_table, inventory)
                 })?;
-            for report in reports {
-                match totals.get_mut(&report.table) {
-                    Some(total) => {
-                        total.chunks += report.chunks;
-                        total.rows_scanned += report.rows_scanned;
-                        total.inserts += report.inserts;
-                        total.updates += report.updates;
-                        total.deletes += report.deletes;
-                        total.last_primary_key = report.last_primary_key;
-                    }
-                    None => {
-                        totals.insert(report.table.clone(), report);
-                    }
-                }
+            accumulate_phase_reports(&mut totals, reports);
+        }
+    }
+    Ok(totals)
+}
+
+fn accumulate_phase_reports(
+    totals: &mut BTreeMap<String, SyncChunkProgress>,
+    reports: Vec<SyncChunkProgress>,
+) {
+    for report in reports {
+        match totals.get_mut(&report.table) {
+            Some(total) => {
+                total.chunks += report.chunks;
+                total.rows_scanned += report.rows_scanned;
+                total.inserts += report.inserts;
+                total.updates += report.updates;
+                total.deletes += report.deletes;
+                total.last_primary_key = report.last_primary_key;
+            }
+            None => {
+                totals.insert(report.table.clone(), report);
             }
         }
     }
-    for report in totals.into_values() {
-        legacy.save(&report)?;
-        completed.push(report);
-    }
-    completed.sort_by(|left, right| left.table.cmp(&right.table));
-    Ok(completed)
 }
 
 fn run_table_phase(
