@@ -4843,7 +4843,8 @@ class Harness:
                     "chunks,rows_scanned,inserts_applied,updates_applied,deletes_applied,"
                     "status,last_error,created_at,updated_at,completed_at) VALUES "
                     f"({sql_literal(run_id)},{sql_literal(stage)},{sql_literal(table)},"
-                    f"'{json.dumps({'legacy': table, 'stage': stage})}','[{100 + index}]',"
+                    f"'{json.dumps({'legacy': table, 'stage': stage})}',"
+                    f"'{json.dumps([str(100 + index)])}',"
                     f"{index + 10},{index + 1000},{index + 20},{index + 30},{index + 40},"
                     "'complete',NULL,'2026-07-01 01:02:03.123456',"
                     "'2026-07-02 02:03:04.234567','2026-07-02 02:03:04.234567');",
