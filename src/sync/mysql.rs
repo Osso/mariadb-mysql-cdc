@@ -189,25 +189,47 @@ impl MySqlSyncTargetSession {
         rows: &[DatabaseRow],
         capacity: usize,
         build: fn(&SyncTable, &[DatabaseRow]) -> Result<SqlStatement, String>,
+        repair_fk_prerequisites: bool,
     ) -> Result<(), SyncMutationFailure> {
         for (batch_index, batch) in rows.chunks(capacity).enumerate() {
             let start = batch_index * capacity;
             let statement = build(&self.table, batch).map_err(|message| {
                 build_sync_mutation_failure(rows, start, batch.len(), None, message)
             })?;
-            self.conn
-                .exec_drop(&statement.sql, Params::Positional(statement.params))
-                .map_err(|error| {
-                    build_sync_mutation_failure(
-                        rows,
-                        start,
-                        batch.len(),
-                        mysql_error_code(&error),
-                        format!("target mysql statement failed: {error}"),
-                    )
+            self.execute_mutation_batch(statement, batch, repair_fk_prerequisites)
+                .map_err(|(code, message)| {
+                    build_sync_mutation_failure(rows, start, batch.len(), code, message)
                 })?;
         }
         Ok(())
+    }
+
+    fn execute_mutation_batch(
+        &mut self,
+        statement: SqlStatement,
+        rows: &[DatabaseRow],
+        repair_fk_prerequisites: bool,
+    ) -> Result<(), (Option<u16>, String)> {
+        let result = self
+            .conn
+            .exec_drop(&statement.sql, Params::Positional(statement.params.clone()));
+        let Err(error) = result else {
+            return Ok(());
+        };
+        let code = mysql_error_code(&error);
+        if !repair_fk_prerequisites || !matches!(code, Some(1216 | 1452)) {
+            return Err((code, format!("target mysql statement failed: {error}")));
+        }
+        self.repair_insert_prerequisites(rows)
+            .map_err(|message| (code, message))?;
+        self.conn
+            .exec_drop(&statement.sql, Params::Positional(statement.params))
+            .map_err(|error| {
+                (
+                    mysql_error_code(&error),
+                    format!("target mysql statement failed: {error}"),
+                )
+            })
     }
 
     fn load_unique_index(&mut self, error: &str) -> Result<SyncUniqueIndex, String> {
@@ -299,6 +321,7 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
             rows,
             strict_update_batch_capacity(&self.table),
             build_strict_update_rows_statement,
+            false,
         ) {
             Ok(()) => Ok(()),
             Err(failure) => self.repair_restricted_updates(failure),
@@ -310,6 +333,7 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
             rows,
             strict_insert_batch_capacity(&self.table),
             build_strict_insert_statement,
+            self.transitions.is_some(),
         )
     }
 

@@ -49,6 +49,41 @@ impl MySqlSyncTargetSession {
         Ok(())
     }
 
+    pub(super) fn repair_insert_prerequisites(
+        &mut self,
+        rows: &[DatabaseRow],
+    ) -> Result<(), String> {
+        let mut context = self
+            .transitions
+            .take()
+            .ok_or("FK transitions not configured")?;
+        let table = self.table.name.clone();
+        let result = (|| {
+            let mut backend = TransitionBackend {
+                target: self,
+                context: &mut context,
+                visiting: BTreeSet::new(),
+            };
+            let mut repaired = 0;
+            for row in rows {
+                let key = RowKey {
+                    table: table.clone(),
+                    pk: row.primary_key.clone(),
+                };
+                backend.visiting.insert(key.clone());
+                let result = backend.ensure_required_parents(&table, &row.values);
+                backend.visiting.remove(&key);
+                repaired += result?;
+            }
+            if repaired == 0 {
+                return Err(format!("no missing FK prerequisites found for `{table}`"));
+            }
+            Ok(())
+        })();
+        self.transitions = Some(context);
+        result
+    }
+
     pub(super) fn repair_restricted_updates(
         &mut self,
         failure: SyncMutationFailure,
@@ -63,6 +98,7 @@ impl MySqlSyncTargetSession {
             let mut backend = TransitionBackend {
                 target: self,
                 context: &mut context,
+                visiting: BTreeSet::new(),
             };
             for desired in &rows {
                 let root = RowKey {
@@ -94,6 +130,7 @@ impl MySqlSyncTargetSession {
 struct TransitionBackend<'a> {
     target: &'a mut MySqlSyncTargetSession,
     context: &'a mut TransitionContext,
+    visiting: BTreeSet<RowKey>,
 }
 
 impl TransitionBackend<'_> {
@@ -117,6 +154,133 @@ impl TransitionBackend<'_> {
         Ok(decode_optional_exact_row(&table, rows, "FK transition")?.map(|row| row.values))
     }
 
+    fn read_parent_reference(
+        &mut self,
+        reference: &ParentReference,
+        source: bool,
+    ) -> Result<Option<DatabaseRow>, String> {
+        let table = self.table(&reference.table)?;
+        let values = reference
+            .values
+            .iter()
+            .cloned()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let statement = build_related_rows_select_statement(
+            &table,
+            &reference.columns,
+            &values,
+            &SyncChunkReadRequest {
+                start_after: None,
+                end_at: None,
+                limit: if source { 2 } else { 1 },
+            },
+        )?;
+        let conn = if source {
+            &mut self.context.source
+        } else {
+            &mut self.target.conn
+        };
+        let rows = query_statement_rows_as_strings(conn, &statement, "FK prerequisite exact read")?;
+        decode_optional_exact_row(&table, rows, "FK prerequisite")
+    }
+
+    fn read_missing_parents(
+        &mut self,
+        table: &str,
+        desired: &Row,
+    ) -> Result<Vec<ParentReference>, String> {
+        let references = self
+            .context
+            .foreign_keys
+            .iter()
+            .filter(|key| key.table == table)
+            .map(|key| parent_reference_from_row(key, desired))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut missing = Vec::new();
+        for reference in references.into_iter().flatten() {
+            if self.read_parent_reference(&reference, false)?.is_none() {
+                missing.push(reference);
+            }
+        }
+        Ok(missing)
+    }
+
+    fn ensure_required_parents(&mut self, table: &str, desired: &Row) -> Result<usize, String> {
+        let missing = self.read_missing_parents(table, desired)?;
+        for reference in &missing {
+            self.repair_required_parent(reference)?;
+        }
+        if !self.read_missing_parents(table, desired)?.is_empty() {
+            return Err(format!("FK prerequisites remain missing for `{table}`"));
+        }
+        Ok(missing.len())
+    }
+
+    fn repair_required_parent(&mut self, reference: &ParentReference) -> Result<(), String> {
+        let source = self
+            .read_parent_reference(reference, true)?
+            .ok_or_else(|| format!("source FK parent missing in `{}`", reference.table))?;
+        let key = RowKey {
+            table: reference.table.clone(),
+            pk: source.primary_key.clone(),
+        };
+        if !self.visiting.insert(key.clone()) {
+            return Err(format!("FK prerequisite cycle at {key:?}"));
+        }
+        let result = (|| {
+            self.ensure_required_parents(&key.table, &source.values)?;
+            match self.target_row(&key)? {
+                None => self.write(&key, &source.values, true),
+                Some(old) if old != source.values => {
+                    self.update_required_parent(&key, &source, &old)
+                }
+                Some(_) => Ok(()),
+            }
+        })();
+        self.visiting.remove(&key);
+        result
+    }
+
+    fn update_required_parent(
+        &mut self,
+        key: &RowKey,
+        source: &DatabaseRow,
+        old: &Row,
+    ) -> Result<(), String> {
+        let table = self.table(&key.table)?;
+        let statement = build_strict_update_rows_statement(&table, std::slice::from_ref(source))?;
+        match self
+            .target
+            .conn
+            .exec_drop(&statement.sql, Params::Positional(statement.params))
+        {
+            Ok(()) => self.verify_written(key, &source.values),
+            Err(error) if matches!(mysql_error_code(&error), Some(1217 | 1451)) => {
+                engine::transition(
+                    self,
+                    key,
+                    &source.values,
+                    old,
+                    Limits {
+                        page_rows: 1000,
+                        max_keys: 1_000_000,
+                    },
+                )
+                .map_err(|error| {
+                    format!(
+                        "coordinated FK prerequisite update for `{}`: {error:?}",
+                        key.table
+                    )
+                })
+            }
+            Err(error) => Err(format!(
+                "FK prerequisite update for `{}` failed: {error}",
+                key.table
+            )),
+        }
+    }
+
     fn write(&mut self, key: &RowKey, desired: &Row, insert: bool) -> Result<(), String> {
         let table = self.table(&key.table)?;
         let row = DatabaseRow {
@@ -129,6 +293,10 @@ impl TransitionBackend<'_> {
             build_strict_update_rows_statement(&table, std::slice::from_ref(&row))?
         };
         self.target.execute_statement(statement)?;
+        self.verify_written(key, desired)
+    }
+
+    fn verify_written(&mut self, key: &RowKey, desired: &Row) -> Result<(), String> {
         if self.exact(key, false)?.as_ref() != Some(desired) {
             return Err(format!(
                 "FK transition write readback differs in `{}`",
@@ -137,6 +305,30 @@ impl TransitionBackend<'_> {
         }
         Ok(())
     }
+}
+
+fn parent_reference_from_row(
+    key: &ForeignKeyInventory,
+    desired: &Row,
+) -> Result<Option<ParentReference>, String> {
+    let values = key
+        .columns
+        .iter()
+        .map(|column| {
+            desired
+                .get(column)
+                .cloned()
+                .ok_or_else(|| format!("missing FK child column `{column}`"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+    Ok(Some(ParentReference {
+        table: key.referenced_table.clone(),
+        columns: key.referenced_columns.clone(),
+        values: values.into_iter().map(Option::unwrap).collect(),
+    }))
 }
 
 impl Backend for TransitionBackend<'_> {
@@ -227,54 +419,8 @@ impl Backend for TransitionBackend<'_> {
         table: &str,
         desired: &Row,
     ) -> Result<Vec<ParentReference>, String> {
-        let foreign_keys = self
-            .context
-            .foreign_keys
-            .iter()
-            .filter(|key| key.table == table)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut missing = Vec::new();
-        for key in foreign_keys {
-            let values = key
-                .columns
-                .iter()
-                .map(|column| {
-                    desired
-                        .get(column)
-                        .cloned()
-                        .ok_or_else(|| format!("missing FK child column `{column}`"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if values.iter().any(Option::is_none) {
-                continue;
-            }
-            let parent = self.table(&key.referenced_table)?;
-            let statement = build_related_rows_select_statement(
-                &parent,
-                &key.referenced_columns,
-                &values,
-                &SyncChunkReadRequest {
-                    start_after: None,
-                    end_at: None,
-                    limit: 1,
-                },
-            )?;
-            if query_statement_rows_as_strings(
-                &mut self.target.conn,
-                &statement,
-                "FK parent existence",
-            )?
-            .is_empty()
-            {
-                missing.push(ParentReference {
-                    table: key.referenced_table,
-                    columns: key.referenced_columns,
-                    values: values.into_iter().map(Option::unwrap).collect(),
-                });
-            }
-        }
-        Ok(missing)
+        self.ensure_required_parents(table, desired)?;
+        self.read_missing_parents(table, desired)
     }
 
     fn delete(&mut self, key: &RowKey) -> Result<(), String> {
