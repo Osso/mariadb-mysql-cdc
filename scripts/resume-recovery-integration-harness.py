@@ -594,8 +594,9 @@ def run_activation_case(binary: Path | None, keep: bool) -> None:
             )
         harness.admin_sql(
             harness.source,
-            "CREATE TABLE after_prepare (id INT PRIMARY KEY) ENGINE=InnoDB; "
-            "INSERT INTO after_prepare VALUES (7);",
+            "CREATE TABLE after_prepare (id INT PRIMARY KEY, payload VARCHAR(16), "
+            "KEY idx_payload(payload)) ENGINE=InnoDB; "
+            "INSERT INTO after_prepare VALUES (7,'later');",
         )
         before = activation_snapshot(harness)
         result = run_activation(harness, authorization)

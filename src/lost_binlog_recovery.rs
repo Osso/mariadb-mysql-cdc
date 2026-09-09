@@ -851,8 +851,14 @@ fn retain_inventory_scope(
         .tables
         .retain(|table| tables.contains(&table.name));
     inventory
+        .indexes
+        .retain(|index| tables.contains(&index.table));
+    inventory
         .foreign_keys
         .retain(|key| tables.contains(&key.table));
+    inventory
+        .triggers
+        .retain(|trigger| tables.contains(&trigger.table));
     inventory
 }
 
