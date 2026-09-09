@@ -18,6 +18,7 @@ pub(crate) type SharedTargetConnection = Rc<RefCell<Option<Conn>>>;
 
 mod connection;
 pub(crate) mod missing_foreign_key;
+mod payment_replay;
 mod query;
 #[cfg(test)]
 mod tests;
@@ -344,7 +345,10 @@ impl missing_foreign_key::MissingForeignKeyRepairExecutor for SerialRowChangeExe
         &mut self,
         change: &TargetRowChange,
     ) -> Result<(), TargetExecuteError> {
-        self.target.execute_statement(&change.statement)
+        match self.target.execute_statement(&change.statement) {
+            Err(error) if self.target.prove_existing_payment_replay(change, &error)? => Ok(()),
+            result => result,
+        }
     }
 
     fn load_missing_foreign_key_repair(
