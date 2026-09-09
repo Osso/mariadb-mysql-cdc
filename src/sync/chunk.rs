@@ -31,6 +31,7 @@ pub(crate) fn sync_next_chunk_with_phase(
     save_progress_and_unlock(config, progress, target, progress_store)
 }
 
+#[cfg(test)]
 pub(crate) fn sync_next_chunk(
     config: &SyncChunkConfig,
     source: &mut impl SyncChunkSource,

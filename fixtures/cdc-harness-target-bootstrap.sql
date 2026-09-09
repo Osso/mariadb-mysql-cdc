@@ -268,4 +268,5 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, LO
 GRANT CREATE ON cdc.* TO 'cdc_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.sync_runs TO 'cdc_sync'@'%';
+GRANT SELECT, INSERT, UPDATE ON cdc.sync_runs_phases TO 'cdc_sync'@'%';
 FLUSH PRIVILEGES;
