@@ -483,6 +483,20 @@ impl MySqlSyncProgressStore {
         progress_table: String,
         coordinator_session_wait_timeout_seconds: Option<u32>,
     ) -> Result<Self, String> {
+        let mut store = Self::open_existing(
+            config,
+            progress_table,
+            coordinator_session_wait_timeout_seconds,
+        )?;
+        store.ensure()?;
+        Ok(store)
+    }
+
+    pub(crate) fn open_existing(
+        config: &TargetMySqlConfig,
+        progress_table: String,
+        coordinator_session_wait_timeout_seconds: Option<u32>,
+    ) -> Result<Self, String> {
         let opts = sync_target_opts(config)?;
         let mut conn = open_sync_connection(opts)
             .map_err(|error| format!("failed to connect to sync progress mysql: {error}"))?;
@@ -490,12 +504,10 @@ impl MySqlSyncProgressStore {
         if let Some(seconds) = coordinator_session_wait_timeout_seconds {
             extend_session_wait_timeout(&mut conn, seconds, "recovery sync progress")?;
         }
-        let mut store = Self {
+        Ok(Self {
             conn,
             progress_table,
-        };
-        store.ensure()?;
-        Ok(store)
+        })
     }
 
     fn ensure(&mut self) -> Result<(), String> {
