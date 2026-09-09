@@ -69,12 +69,10 @@ fn normalized_type(kind: &str, definition: &str) -> String {
     if matches!(
         kind,
         "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
-    ) {
-        if let Some((base, width)) = definition.split_once('(') {
-            if let Some((_, suffix)) = width.split_once(')') {
-                return format!("{base}{suffix}");
-            }
-        }
+    ) && let Some((base, width)) = definition.split_once('(')
+        && let Some((_, suffix)) = width.split_once(')')
+    {
+        return format!("{base}{suffix}");
     }
     definition.to_owned()
 }

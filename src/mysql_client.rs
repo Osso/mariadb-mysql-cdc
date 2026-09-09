@@ -433,10 +433,10 @@ impl missing_foreign_key::MissingForeignKeyRepairExecutor for SerialRowChangeExe
         change: &TargetRowChange,
     ) -> Result<(), TargetExecuteError> {
         let result = self.target.execute_statement(&change.statement);
-        if let Err(error) = &result {
-            if let Some(diagnostic) = users_update_duplicate_diagnostic(change, error) {
-                eprintln!("{diagnostic}");
-            }
+        if let Err(error) = &result
+            && let Some(diagnostic) = users_update_duplicate_diagnostic(change, error)
+        {
+            eprintln!("{diagnostic}");
         }
         match result {
             Err(error) if self.target.prove_existing_payment_replay(change, &error)? => Ok(()),
