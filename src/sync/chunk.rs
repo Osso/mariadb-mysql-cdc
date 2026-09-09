@@ -191,7 +191,7 @@ fn apply_source_window(
         .expect("non-empty source window");
     let changes =
         reconcile_target_pages(config, start_after, &end_at, &source_rows, target, phase)?;
-    apply_source_changes(&config.table.name, source, target, &changes, phase)?;
+    apply_source_changes(&config.table.name, source, target, &changes)?;
 
     progress.last_primary_key = Some(end_at);
     progress.complete = false;
@@ -340,7 +340,6 @@ fn apply_source_changes(
     source: &mut impl SyncChunkSource,
     target: &mut impl SyncChunkTargetSession,
     changes: &ChunkChanges,
-    phase: SyncMutationPhase,
 ) -> Result<(), String> {
     apply_strict_mutations(
         table,
@@ -348,7 +347,6 @@ fn apply_source_changes(
         target,
         &changes.updates,
         MutationKind::Update,
-        phase,
     )?;
     apply_strict_mutations(
         table,
@@ -356,7 +354,6 @@ fn apply_source_changes(
         target,
         &changes.inserts,
         MutationKind::Insert,
-        phase,
     )
 }
 
@@ -372,7 +369,6 @@ fn apply_strict_mutations(
     target: &mut impl SyncChunkTargetSession,
     rows: &[DatabaseRow],
     kind: MutationKind,
-    phase: SyncMutationPhase,
 ) -> Result<(), String> {
     if rows.is_empty() {
         return Ok(());
@@ -381,11 +377,6 @@ fn apply_strict_mutations(
     let mut reconciled_conflicts = BTreeSet::new();
     let mut reconciled_intended_rows = BTreeMap::new();
     while let Some(failure) = try_strict_mutation(table, target, &pending_rows, kind)? {
-        if phase != SyncMutationPhase::All {
-            return Err(format!(
-                "strict mutation in `{table}` during {phase:?}: {failure}"
-            ));
-        }
         pending_rows = failure.retry_rows();
         inspect_and_reconcile_mutation_failure(
             table,
