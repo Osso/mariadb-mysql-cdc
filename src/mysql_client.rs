@@ -340,6 +340,85 @@ impl PersistentTargetExecutor {
     }
 }
 
+fn users_update_duplicate_diagnostic(
+    change: &TargetRowChange,
+    error: &TargetExecuteError,
+) -> Option<String> {
+    if change.table != "users"
+        || change.kind != crate::target::TargetRowChangeKind::Update
+        || error.mysql_code() != Some(1062)
+    {
+        return None;
+    }
+    // Generated UPDATE parameters end with the before-image primary-key predicates.
+    let (_, predicates) = change.statement.sql.rsplit_once(" WHERE ")?;
+    let key_count = predicates.split(" AND ").count();
+    let key_start = change.statement.params.len().checked_sub(key_count)?;
+    let numeric_keys = change.statement.params[key_start..]
+        .iter()
+        .filter_map(|value| match value {
+            mysql::Value::Int(value) => Some(value.to_string()),
+            mysql::Value::UInt(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    Some(format!(
+        "cdc_row_error kind=update table=users error_code=1062 numeric_pk=[{}]",
+        numeric_keys.join(",")
+    ))
+}
+
+#[test]
+fn users_update_duplicate_diagnostic_only_numeric_predicate_keys() {
+    use crate::target::TargetRowChangeKind;
+    use mysql::Value;
+    let mut change = TargetRowChange {
+        statement: SqlStatement {
+            sql:
+                "UPDATE `users` SET `name` = ?, `email` = ?, `id` = ? WHERE `id` = ? AND `hash` = ?"
+                    .into(),
+            params: vec![
+                Value::from("private-name"),
+                Value::from("private-email"),
+                Value::UInt(999),
+                Value::UInt(123),
+                Value::from("private-hash"),
+            ],
+        },
+        kind: TargetRowChangeKind::Update,
+        schema: "test".into(),
+        table: "users".into(),
+        values: [("name".into(), Value::from("private-name"))].into(),
+    };
+    let error = TargetExecuteError::from_mysql(1062, "private-error-name");
+    assert_eq!(
+        users_update_duplicate_diagnostic(&change, &error).as_deref(),
+        Some("cdc_row_error kind=update table=users error_code=1062 numeric_pk=[123]")
+    );
+    change.statement.params[3] = Value::Int(-7);
+    assert_eq!(
+        users_update_duplicate_diagnostic(&change, &error).as_deref(),
+        Some("cdc_row_error kind=update table=users error_code=1062 numeric_pk=[-7]")
+    );
+    change.statement.params[3] = Value::from("123");
+    assert_eq!(
+        users_update_duplicate_diagnostic(&change, &error).as_deref(),
+        Some("cdc_row_error kind=update table=users error_code=1062 numeric_pk=[]")
+    );
+    assert!(
+        users_update_duplicate_diagnostic(
+            &change,
+            &TargetExecuteError::from_mysql(1213, "private")
+        )
+        .is_none()
+    );
+    change.kind = TargetRowChangeKind::Insert;
+    assert!(users_update_duplicate_diagnostic(&change, &error).is_none());
+    change.kind = TargetRowChangeKind::Update;
+    change.table = "other".into();
+    assert!(users_update_duplicate_diagnostic(&change, &error).is_none());
+}
+
 struct SerialRowChangeExecutor<'a> {
     target: &'a PersistentTargetExecutor,
 }
@@ -349,7 +428,13 @@ impl missing_foreign_key::MissingForeignKeyRepairExecutor for SerialRowChangeExe
         &mut self,
         change: &TargetRowChange,
     ) -> Result<(), TargetExecuteError> {
-        match self.target.execute_statement(&change.statement) {
+        let result = self.target.execute_statement(&change.statement);
+        if let Err(error) = &result {
+            if let Some(diagnostic) = users_update_duplicate_diagnostic(change, error) {
+                eprintln!("{diagnostic}");
+            }
+        }
+        match result {
             Err(error) if self.target.prove_existing_payment_replay(change, &error)? => Ok(()),
             result => result,
         }
