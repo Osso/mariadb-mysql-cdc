@@ -708,6 +708,7 @@ fn plan_keys(
     target_table: &TableInventory,
 ) -> Result<Vec<PlannedSchemaStatement>, String> {
     let mut statements = Vec::new();
+    let mut renamed_index_drops = Vec::new();
     let source_indexes = indexes_for(source, &source_table.name);
     let target_indexes = indexes_for(target, &target_table.name);
     for target_index in &target_indexes {
@@ -715,7 +716,7 @@ fn plan_keys(
             .iter()
             .any(|source_index| indexes_equal(source_index, target_index))
         {
-            statements.push(translate_statement(
+            let statement = translate_statement(
                 SchemaPhase::Keys,
                 format!(
                     "DROP INDEX `{}` ON `{}`",
@@ -723,7 +724,17 @@ fn plan_keys(
                 ),
                 vec![format!("index:{}.{}", target_table.name, target_index.name)],
                 &[],
-            )?);
+            )?;
+            if let Some(replacement) =
+                renamed_index_replacement(target_index, &source_indexes, &target_indexes)
+            {
+                renamed_index_drops.push(with_prerequisites(
+                    statement,
+                    vec![format!("index:{}.{}", replacement.table, replacement.name)],
+                ));
+            } else {
+                statements.push(statement);
+            }
         }
     }
     if source_table.primary_key != target_table.primary_key {
@@ -783,7 +794,22 @@ fn plan_keys(
             statements.push(with_prerequisites(statement, prerequisites));
         }
     }
+    statements.extend(renamed_index_drops);
     Ok(statements)
+}
+
+fn renamed_index_replacement<'a>(
+    old: &IndexInventory,
+    source: &[&'a IndexInventory],
+    target: &[&IndexInventory],
+) -> Option<&'a IndexInventory> {
+    if source.iter().any(|index| index.name == old.name) {
+        return None;
+    }
+    source.iter().copied().find(|candidate| {
+        let name_is_new = !target.iter().any(|index| index.name == candidate.name);
+        name_is_new && index_definitions_equal(candidate, old)
+    })
 }
 
 fn render_foreign_keys(
@@ -2755,8 +2781,11 @@ fn canonical_sql_expression(expression: &str) -> String {
 }
 
 fn indexes_equal(left: &IndexInventory, right: &IndexInventory) -> bool {
-    left.name == right.name
-        && left.unique == right.unique
+    left.name == right.name && index_definitions_equal(left, right)
+}
+
+fn index_definitions_equal(left: &IndexInventory, right: &IndexInventory) -> bool {
+    left.unique == right.unique
         && left.index_type.eq_ignore_ascii_case(&right.index_type)
         && left.visible == right.visible
         && left.comment == right.comment
@@ -3531,6 +3560,140 @@ mod tests {
             expected_target_table_fingerprint(&source.tables[0]).unwrap(),
             observed_target_table_fingerprint(&target.tables[0]).unwrap()
         );
+    }
+
+    #[test]
+    fn renamed_supporting_index_keeps_old_index_when_creation_fails() {
+        let child = table(
+            "children",
+            vec![column("parent_id", "bigint", false)],
+            vec![],
+        );
+        let mut source = inventory(vec![child.clone()], vec![]);
+        source
+            .indexes
+            .push(index("children", "idx_new", "parent_id"));
+        let mut target = source.clone();
+        target.indexes[0].name = "idx_old".to_string();
+        let mut plan = table_plan("children", vec![]);
+        plan.statements = plan_keys(&source, &target, &child, &child).unwrap();
+        let mut executor = RecordingExecutor::failing_sql("CREATE INDEX");
+        let mut report = table_report(&plan, vec![]);
+        execute_table_statements(&plan, &mut executor, &mut report);
+        assert_eq!(report.status, TableSchemaStatus::Failed);
+        assert_eq!(report.executions.len(), 2);
+        assert_eq!(report.executions[0].status, "failed");
+        assert_eq!(report.executions[1].status, "skipped");
+        assert_eq!(executor.executed.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires CDC_INDEX_RENAME_MYSQL_PROFILE pointing to a disposable MySQL server"]
+    fn renamed_supporting_index_preserves_live_foreign_key() {
+        let profile = std::env::var("CDC_INDEX_RENAME_MYSQL_PROFILE").unwrap();
+        let database = format!("cdc_index_rename_{}", std::process::id());
+        let run_sql = |sql: &str| {
+            std::process::Command::new("mysql-gc")
+                .args(["-s", &profile, "-N", "-B", "-e", sql])
+                .output()
+                .expect("execute mysql-gc")
+        };
+        let setup = run_sql(&format!(
+            "CREATE DATABASE `{database}`; USE `{database}`;
+             CREATE TABLE parents (id BIGINT NOT NULL PRIMARY KEY);
+             CREATE TABLE children (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT NOT NULL,
+                 INDEX idx_old (parent_id),
+                 CONSTRAINT fk_children_parents FOREIGN KEY (parent_id) REFERENCES parents(id));
+             INSERT INTO parents VALUES (1); INSERT INTO children VALUES (1, 1);"
+        ));
+        assert!(
+            setup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+
+        let mut source = inventory(
+            vec![
+                table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+                table(
+                    "children",
+                    vec![
+                        column("id", "bigint", false),
+                        column("parent_id", "bigint", false),
+                    ],
+                    vec!["id"],
+                ),
+            ],
+            vec![foreign_key("children", "parents")],
+        );
+        source
+            .indexes
+            .push(index("children", "idx_new", "parent_id"));
+        let mut target = source.clone();
+        target.indexes[0].name = "idx_old".to_string();
+        let mut plan = plan_schema_convergence(
+            &source,
+            &target,
+            &["parents".to_string(), "children".to_string()],
+            &FixtureCoercionPreflight::default(),
+        )
+        .unwrap();
+        append_canonical_foreign_key_plan(
+            &mut plan,
+            &source,
+            &[canonical_foreign_key("fk_children_parents")],
+            &[canonical_foreign_key("fk_children_parents")],
+            "globalcomix",
+        );
+        let result = std::panic::catch_unwind(|| {
+            for statement in plan.tables.iter().flat_map(|table| &table.statements) {
+                let output = run_sql(&format!("USE `{database}`; {}", statement.sql));
+                assert!(
+                    output.status.success(),
+                    "{}: {}",
+                    statement.sql,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let state = run_sql(&format!(
+                    "USE `{database}`;
+                     SELECT id, parent_id FROM children;
+                     SELECT CONSTRAINT_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS
+                     WHERE CONSTRAINT_SCHEMA = '{database}' AND TABLE_NAME = 'children';"
+                ));
+                assert!(
+                    state.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&state.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&state.stdout),
+                    "1\t1\nfk_children_parents\n"
+                );
+                let orphan = run_sql(&format!(
+                    "USE `{database}`; INSERT INTO children VALUES (2, 999)"
+                ));
+                assert!(!orphan.status.success());
+                assert!(String::from_utf8_lossy(&orphan.stderr).contains("1452"));
+            }
+            let indexes = run_sql(&format!(
+                "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
+                 WHERE TABLE_SCHEMA = '{database}' AND TABLE_NAME = 'children' ORDER BY INDEX_NAME"
+            ));
+            assert!(indexes.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&indexes.stdout),
+                "idx_new\nPRIMARY\n"
+            );
+        });
+        let cleanup = run_sql(&format!("DROP DATABASE `{database}`"));
+        assert!(
+            cleanup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cleanup.stderr)
+        );
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
     }
 
     #[test]
