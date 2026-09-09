@@ -64,6 +64,7 @@ SCENARIOS = (
     ScenarioSpec("sync-fk-restrict-key-transition-rollback-resume", True),
     ScenarioSpec("sync-fk-restrict-key-transition-new-child", True),
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
+    ScenarioSpec("sync-fk-source-absent-unique-owner", True),
     ScenarioSpec("sync-update-stale-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-unique-owner-rollback-resume", True),
     ScenarioSpec("sync-wide-update", True),
@@ -3159,6 +3160,86 @@ class Harness:
             raise HarnessError(f"child did not converge after parent displacement: {child!r}")
         print("sync_fk_parent_stale_unique_owner_ok constraints_restored=true")
 
+    def run_sync_fk_source_absent_unique_owner(self) -> None:
+        assert self.source and self.target
+        run_id = "sync-fk-source-absent-unique-owner"
+        schema = (
+            "DROP TABLE IF EXISTS favorite_notes; DROP TABLE IF EXISTS favorites; "
+            "DROP TABLE IF EXISTS users; "
+            "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(64) NOT NULL, "
+            "UNIQUE KEY uq_users_email (email)) ENGINE=InnoDB; "
+            "CREATE TABLE favorites (id INT PRIMARY KEY, user_id INT NOT NULL, "
+            "CONSTRAINT fk_favorites_user FOREIGN KEY (user_id) REFERENCES users(id) "
+            "ON UPDATE RESTRICT ON DELETE RESTRICT) ENGINE=InnoDB; "
+            "CREATE TABLE favorite_notes (id INT PRIMARY KEY, favorite_id INT NOT NULL, "
+            "CONSTRAINT fk_notes_favorite FOREIGN KEY (favorite_id) "
+            "REFERENCES favorites(id) ON UPDATE RESTRICT ON DELETE RESTRICT) "
+            "ENGINE=InnoDB; "
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema)
+        # The unique owner is absent at source, not merely holding a changed email.
+        self.admin_sql(
+            self.source,
+            "INSERT INTO users VALUES (2,'wanted@example.test'); "
+            "INSERT INTO favorites VALUES (10,2); "
+            "INSERT INTO favorite_notes VALUES (100,10);",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO users VALUES (1,'wanted@example.test'); "
+            "INSERT INTO favorites VALUES (10,1); "
+            "INSERT INTO favorite_notes VALUES (100,10);",
+        )
+        expected = {
+            "users": "2\twanted@example.test",
+            "favorites": "10\t2",
+            "favorite_notes": "100\t10",
+        }
+        self.assert_key_transition_rows(self.source, expected)
+        self.assert_key_transition_rows(
+            self.target,
+            {**expected, "users": "1\twanted@example.test", "favorites": "10\t1"},
+        )
+        self.assert_admin_sql_rejected(
+            self.target, "INSERT INTO users VALUES (2,'wanted@example.test');", "1062"
+        )
+        for sql in (
+            "DELETE FROM users WHERE id=1;",
+            "DELETE FROM favorites WHERE id=10;",
+        ):
+            self.assert_admin_sql_rejected(self.target, sql, "1451")
+        self.admin_sql(
+            self.target,
+            f"REVOKE ALTER ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
+        )
+        result = self.run_sync(
+            tables=["users", "favorites", "favorite_notes"],
+            run_id=run_id,
+            chunk_size=1,
+            timeout=60,
+        )
+        print(f"{run_id} exit={result.returncode}\n{result.stdout}\n{result.stderr}")
+        require_success(result, f"{run_id} with RESTRICT and no ALTER privilege")
+        for endpoint in (self.source, self.target):
+            self.assert_key_transition_rows(endpoint, expected)
+        for sql in (
+            "DELETE FROM users WHERE id=2;",
+            "UPDATE users SET id=3 WHERE id=2;",
+            "DELETE FROM favorites WHERE id=10;",
+            "UPDATE favorites SET id=11 WHERE id=10;",
+        ):
+            self.assert_admin_sql_rejected(self.target, sql, "1451")
+        for sql in (
+            "INSERT INTO favorites VALUES (20,99);",
+            "INSERT INTO favorite_notes VALUES (200,99);",
+        ):
+            self.assert_admin_sql_rejected(self.target, sql, "1452")
+        self.assert_admin_sql_rejected(
+            self.target, "INSERT INTO users VALUES (3,'wanted@example.test');", "1062"
+        )
+        print(f"{run_id}_ok exact_rows=true fk_enforced=true alter_privilege=false")
+
     def run_sync_update_stale_unique_owner_rollback_resume(self) -> None:
         assert self.source and self.target
         table = "users"
@@ -5170,6 +5251,8 @@ class Harness:
             self.run_sync_fk_restrict_key_transition("new-child")
         elif scenario == "sync-fk-parent-stale-unique-owner":
             self.run_sync_fk_parent_stale_unique_owner()
+        elif scenario == "sync-fk-source-absent-unique-owner":
+            self.run_sync_fk_source_absent_unique_owner()
         elif scenario == "sync-update-stale-unique-owner-rollback-resume":
             self.run_sync_update_stale_unique_owner_rollback_resume()
         elif scenario == "sync-unique-owner-rollback-resume":
