@@ -344,7 +344,9 @@ pub(crate) fn plan_sync_prerequisite_schema(
         table
             .statements
             .retain(|statement| statement.phase != SchemaPhase::Constraints);
-        if table.statements.is_empty() {
+        if table.statements.is_empty()
+            || preserves_existing_structure(&evidence.inventory, target, &table.table)
+        {
             continue;
         }
         let drops = prerequisite_constraint_drops(
@@ -411,6 +413,51 @@ fn validate_sync_stage_selection(
         }
     }
     Ok(())
+}
+
+fn preserves_existing_structure(
+    source: &SchemaInventory,
+    target: &SchemaInventory,
+    table: &str,
+) -> bool {
+    let Some(target_table) = target.tables.iter().find(|entry| entry.name == table) else {
+        return true;
+    };
+    let Some(source_table) = source.tables.iter().find(|entry| entry.name == table) else {
+        return false;
+    };
+    if source_table.engine != target_table.engine
+        || source_table.collation.as_deref().map(canonical_collation)
+            != target_table.collation.as_deref().map(canonical_collation)
+        || source_table.primary_key != target_table.primary_key
+    {
+        return false;
+    }
+    let source_columns = column_map(source_table);
+    let columns_preserved = target_table.columns.iter().all(|target_column| {
+        source_columns
+            .get(target_column.name.as_str())
+            .is_some_and(|source_column| column_preserves_constraints(source_column, target_column))
+    });
+    let source_indexes = indexes_for(source, table);
+    let indexes_preserved = indexes_for(target, table).iter().all(|target_index| {
+        source_indexes
+            .iter()
+            .any(|source_index| indexes_equal(source_index, target_index))
+    });
+    columns_preserved && indexes_preserved
+}
+
+fn column_preserves_constraints(source: &ColumnInventory, target: &ColumnInventory) -> bool {
+    if columns_equal(source, target) {
+        return true;
+    }
+    if !enum_labels_are_appended(source, target) {
+        return false;
+    }
+    let mut appended_target = target.clone();
+    appended_target.column_type.clone_from(&source.column_type);
+    columns_equal(source, &appended_target)
 }
 
 fn prerequisite_constraint_drops(
@@ -5407,6 +5454,110 @@ mod tests {
                 assert!(sql.contains("`parent_id` > 0"));
             } else {
                 assert_eq!(final_sql, Vec::<&str>::new());
+            }
+        }
+    }
+
+    #[test]
+    fn unified_prerequisite_preserves_constraints_for_additive_changes() {
+        for change in [
+            "column",
+            "index",
+            "enum",
+            "combined",
+            "remove_column",
+            "replace_index",
+            "reorder_enum",
+            "enum_nullable",
+        ] {
+            let mut target = inventory(
+                vec![
+                    table(
+                        "children",
+                        vec![
+                            column("id", "bigint", false),
+                            column("parent_id", "bigint", false),
+                            column("status", "enum('active','idle')", true),
+                            column("note", "bigint", true),
+                        ],
+                        vec!["id"],
+                    ),
+                    table("parents", vec![column("id", "bigint", false)], vec!["id"]),
+                ],
+                vec![foreign_key("children", "parents")],
+            );
+            target
+                .indexes
+                .push(index("children", "idx_parent", "parent_id"));
+            target.foreign_keys[0].name = "children_fk_children_parents".to_string();
+            let mut source = target.clone();
+            source.foreign_keys[0].name = "fk_children_parents".to_string();
+            match change {
+                "column" => source.tables[0]
+                    .columns
+                    .push(column("extra", "bigint", true)),
+                "index" => source.indexes.push(index("children", "idx_note", "note")),
+                "enum" => {
+                    source.tables[0].columns[2].column_type =
+                        "enum('active','idle','closed')".to_string()
+                }
+                "combined" => {
+                    source.tables[0]
+                        .columns
+                        .push(column("extra", "bigint", true));
+                    source.indexes.push(index("children", "idx_extra", "extra"));
+                    source.tables[0].columns[2].column_type =
+                        "enum('active','idle','closed')".to_string();
+                }
+                "remove_column" => {
+                    source.tables[0].columns.pop();
+                }
+                "replace_index" => source.indexes[0] = index("children", "idx_parent", "note"),
+                "reorder_enum" => {
+                    source.tables[0].columns[2].column_type =
+                        "enum('idle','active','closed')".to_string()
+                }
+                "enum_nullable" => {
+                    source.tables[0].columns[2].column_type =
+                        "enum('active','idle','closed')".to_string();
+                    source.tables[0].columns[2].is_nullable = false;
+                }
+                _ => unreachable!(),
+            }
+            let evidence = SchemaSourceEvidence {
+                inventory: source,
+                checks: vec![check("children", "positive_parent", "`parent_id` > 0")],
+                canonical_foreign_keys: vec![canonical_foreign_key("fk_children_parents")],
+            };
+            let plan = plan_sync_prerequisite_schema(
+                &evidence,
+                &target,
+                &target_check_constraints(&evidence.checks),
+                &[canonical_foreign_key("children_fk_children_parents")],
+                &["parents".to_string(), "children".to_string()],
+                &FixtureCoercionPreflight::default(),
+            )
+            .expect("prerequisite plan");
+            let sql = plan
+                .tables
+                .iter()
+                .flat_map(|table| &table.statements)
+                .map(|statement| statement.sql.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!sql.is_empty(), "{change}: expected structural work");
+            let destructive = matches!(
+                change,
+                "remove_column" | "replace_index" | "reorder_enum" | "enum_nullable"
+            );
+            assert_eq!(
+                sql.contains("DROP FOREIGN KEY"),
+                destructive,
+                "{change}: {sql}"
+            );
+            assert_eq!(sql.contains("DROP CHECK"), destructive, "{change}: {sql}");
+            if !destructive {
+                assert!(!sql.contains("DROP "), "{change}: {sql}");
             }
         }
     }
