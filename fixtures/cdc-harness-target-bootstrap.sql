@@ -268,5 +268,20 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, LO
 GRANT CREATE ON cdc.* TO 'cdc_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.stream_checkpoint TO 'cdc_sync'@'%';
 GRANT SELECT, INSERT, UPDATE ON cdc.sync_runs TO 'cdc_sync'@'%';
+CREATE TABLE IF NOT EXISTS cdc.sync_runs_phases (
+    run_id VARBINARY(512) NOT NULL,
+    table_name VARBINARY(1020) NOT NULL,
+    phase VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    last_primary_key_json JSON NULL,
+    complete BOOLEAN NOT NULL DEFAULT FALSE,
+    chunks BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    rows_scanned BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    inserts BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    updates BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    deletes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, table_name, phase),
+    CHECK (phase IN ('insert_missing', 'update_divergent', 'delete_extras')),
+    CHECK (complete IN (0, 1))
+) ENGINE=InnoDB;
 GRANT SELECT, INSERT, UPDATE ON cdc.sync_runs_phases TO 'cdc_sync'@'%';
 FLUSH PRIVILEGES;
