@@ -15,9 +15,11 @@ For incomplete row work it also requires the additive `<progress-table>_phases`
 table, keyed by the unchanged run ID, table name, and mutation phase. Apply
 [`sync-phase-progress-bootstrap.sql`](sync-phase-progress-bootstrap.sql) before a
 default run; it creates `cdc.sync_runs_phases` and grants only `SELECT`, `INSERT`,
-and `UPDATE` on that table to the deployed sync account. Runtime does not create
-phase storage. A run with all selected legacy `rows` records complete bypasses
-phase-table access; incomplete legacy cursors never seed phases. Changing the
+and `UPDATE` on that table to the deployed sync account. Current runtime also
+executes idempotent `CREATE TABLE IF NOT EXISTS` before incomplete row work, so
+bootstrap does not remove its existing `CREATE ON cdc.*` requirement. A run with
+all selected legacy `rows` records complete bypasses phase-table access; incomplete
+legacy cursors never seed phases. Changing the
 progress-table option selects different aggregate and phase stores. Resume resolves
 endpoints, TLS, current table scope and definitions, chunk size, and parallelism
 fresh. Omitted rows remain untouched, completed selected rows skip, and newly

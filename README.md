@@ -70,9 +70,11 @@ reviewed and managed separately; `deploy.sh` does not create or update them.
 Before creating a Job that can process incomplete rows, apply
 [`docs/sync-phase-progress-bootstrap.sql`](docs/sync-phase-progress-bootstrap.sql)
 with target admin credentials. It adds only the default phase cursor table and
-its table-scoped `SELECT`, `INSERT`, and `UPDATE` grant for `cdc_stream`; it does
-not broaden `cdc.*` privileges. A Job whose selected legacy `rows` entries are all
-complete does not access that phase table.
+its table-scoped `SELECT`, `INSERT`, and `UPDATE` grant for `cdc_stream`. The
+current Job runtime also issues idempotent `CREATE TABLE IF NOT EXISTS` for
+incomplete rows, so bootstrap does not remove its existing `CREATE ON cdc.*`
+requirement; this documentation does not broaden that grant. A Job whose selected
+legacy `rows` entries are all complete does not access that phase table.
 
 ## Bounded target repairs
 
@@ -258,10 +260,12 @@ dependent operations are skipped. The staged run persists aggregate progress in 
 phase cursors in `<progress-table>_phases`. Before a phased run, apply
 [`docs/sync-phase-progress-bootstrap.sql`](docs/sync-phase-progress-bootstrap.sql)
 with target admin credentials. It creates the default `cdc.sync_runs_phases` table
-and grants only `SELECT`, `INSERT`, and `UPDATE` on that table to `cdc_stream`; it
-does not grant schema-wide `cdc` access. A run whose selected legacy `rows` records
-are all complete bypasses phase storage entirely. Final structural convergence still
-fails closed.
+and grants only `SELECT`, `INSERT`, and `UPDATE` on that table to `cdc_stream`.
+Current runtime nevertheless executes idempotent `CREATE TABLE IF NOT EXISTS` before
+incomplete row work, so bootstrap does not remove its existing `CREATE ON cdc.*`
+requirement; this documentation does not broaden that grant. A run whose selected
+legacy `rows` records are all complete bypasses phase storage entirely. Final
+structural convergence still fails closed.
 
 ## FK orphan repair
 

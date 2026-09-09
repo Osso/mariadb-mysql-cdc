@@ -68,7 +68,7 @@
 - `src/sync_schema.rs` — prerequisite and final schema-stage planning/execution.
 - `docs/stream-recovery-records-bootstrap.sql` — recovery-record table, active-barrier identity, guards, inventory procedure, and grants.
 - `docs/stream-recovery-records-abandoned-replacement-migration.sql` — target-only live-schema migration with duplicate-owner preflight and prepared-row postflight.
-- `docs/sync-phase-progress-bootstrap.sql` — additive default phase cursor table and exact target sync-account table grant required before a phased recovery.
+- `docs/sync-phase-progress-bootstrap.sql` — additive default phase cursor table and exact target sync-account phase read/write grant. Current phased runtime still issues idempotent creation, so this bootstrap does not remove its existing separately reviewed `CREATE ON cdc.*` requirement.
 
 ## Tests asserting this spec
 

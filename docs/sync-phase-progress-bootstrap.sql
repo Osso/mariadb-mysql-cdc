@@ -5,6 +5,10 @@
 -- Default --progress-table is cdc.sync_runs, so its phase table is
 -- cdc.sync_runs_phases. For another progress table, create and grant the
 -- corresponding <progress-table>_phases table instead.
+--
+-- Current runtime still executes idempotent CREATE TABLE IF NOT EXISTS before
+-- incomplete row work. This bootstrap proves the intended table/grant shape but
+-- does not remove that existing CREATE ON cdc.* runtime requirement.
 CREATE TABLE IF NOT EXISTS cdc.sync_runs_phases (
     run_id VARBINARY(512) NOT NULL,
     table_name VARBINARY(1020) NOT NULL,
@@ -22,7 +26,8 @@ CREATE TABLE IF NOT EXISTS cdc.sync_runs_phases (
 ) ENGINE=InnoDB;
 
 -- The deployed one-shot sync/recovery runtime uses cdc_stream. Keep this
--- grant table-specific; do not grant schema-wide cdc privileges.
+-- grant table-specific. It covers phase reads/writes, not the current runtime
+-- CREATE TABLE IF NOT EXISTS call described above.
 GRANT SELECT, INSERT, UPDATE
     ON cdc.sync_runs_phases
     TO 'cdc_stream'@'%';
