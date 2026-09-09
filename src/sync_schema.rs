@@ -1875,6 +1875,11 @@ fn checks_by_table(checks: &[CheckConstraint]) -> BTreeMap<String, Vec<CheckCons
     grouped
 }
 
+fn check_constraints_semantically_equal(left: &CheckConstraint, right: &CheckConstraint) -> bool {
+    left.table == right.table
+        && canonical_sql_expression(&left.clause) == canonical_sql_expression(&right.clause)
+}
+
 fn append_check_constraint_plan(
     plan: &mut SchemaConvergencePlan,
     source_inventory: &SchemaInventory,
@@ -1889,7 +1894,11 @@ fn append_check_constraint_plan(
         let foreign_key_drops = same_table_foreign_key_drop_prerequisites(table);
         let drops = target_checks
             .iter()
-            .filter(|target_check| !source_checks.contains(target_check))
+            .filter(|target_check| {
+                !source_checks.iter().any(|source_check| {
+                    check_constraints_semantically_equal(source_check, target_check)
+                })
+            })
             .filter_map(|check| {
                 translate_for_table(
                     table,
@@ -1901,7 +1910,11 @@ fn append_check_constraint_plan(
             .collect::<Vec<_>>();
         let additions = source_checks
             .iter()
-            .filter(|source_check| !target_checks.contains(source_check))
+            .filter(|source_check| {
+                !target_checks.iter().any(|target_check| {
+                    check_constraints_semantically_equal(source_check, target_check)
+                })
+            })
             .filter_map(|check| {
                 let statement = translate_for_table(
                     table,
@@ -5487,6 +5500,51 @@ mod tests {
             } else {
                 assert_eq!(final_sql, Vec::<&str>::new());
             }
+        }
+    }
+
+    #[test]
+    fn unified_name_only_check_difference_preserves_valid_constraint() {
+        let source = inventory(
+            vec![table(
+                "items",
+                vec![column("id", "bigint", false)],
+                vec!["id"],
+            )],
+            vec![],
+        );
+        let evidence = SchemaSourceEvidence {
+            inventory: source.clone(),
+            checks: vec![check("items", "positive", "`id` > 0")],
+            canonical_foreign_keys: vec![],
+        };
+        let target_checks = vec![check("items", "existing_positive", "(`id` > 0)")];
+        let selected = vec!["items".to_string()];
+        let preflight = FixtureCoercionPreflight::default();
+        let prerequisite = plan_sync_prerequisite_schema(
+            &evidence,
+            &source,
+            &target_checks,
+            &[],
+            &selected,
+            &preflight,
+        )
+        .expect("name-only prerequisite plan");
+        let final_plan = plan_sync_final_constraints(
+            &evidence,
+            &source,
+            &target_checks,
+            &[],
+            &selected,
+            &preflight,
+        )
+        .expect("name-only final plan");
+        for plan in [prerequisite, final_plan] {
+            assert!(
+                plan.tables[0].statements.is_empty(),
+                "{:?}",
+                plan.tables[0].statements
+            );
         }
     }
 
