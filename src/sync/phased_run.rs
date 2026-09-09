@@ -38,6 +38,7 @@ pub(crate) fn run_mysql_sync_phases(
         }
     }
     if pending.is_empty() {
+        completed.sort_by(|left, right| left.table.cmp(&right.table));
         return Ok(completed);
     }
     let names = pending.keys().cloned().collect::<Vec<_>>();
