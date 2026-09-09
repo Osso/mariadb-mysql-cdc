@@ -55,6 +55,8 @@ SCENARIOS = (
     ScenarioSpec("sync-enum-append", True),
     ScenarioSpec("sync-enum-incompatible", True),
     ScenarioSpec("sync-constraints-preserved", True),
+    ScenarioSpec("sync-obsolete-check", True),
+    ScenarioSpec("sync-equivalent-check-name", True),
     ScenarioSpec("sync-parent-only-constraints-preserved", True),
     ScenarioSpec("sync-fk-parent-insert", True),
     ScenarioSpec("sync-fk-parent-update", True),
@@ -2827,6 +2829,51 @@ class Harness:
             "rows_scanned=3 inserts=1 updates=1 deletes=0"
         )
 
+    def run_sync_check_convergence(self, obsolete: bool) -> None:
+        assert self.source and self.target
+        source_check = (
+            "" if obsolete else ", CONSTRAINT positive_value CHECK (`value` > 0)"
+        )
+        self.admin_sql(
+            self.source,
+            "CREATE TABLE items (id INT PRIMARY KEY,`value` INT NOT NULL"
+            f"{source_check}) ENGINE=InnoDB; "
+            f"INSERT INTO items VALUES (1,{-1 if obsolete else 1});",
+        )
+        self.admin_sql(
+            self.target,
+            "CREATE TABLE items (id INT PRIMARY KEY,`value` INT NOT NULL, "
+            "CONSTRAINT other_valid_name CHECK (`value` > 0)) ENGINE=InnoDB; "
+            "INSERT INTO items VALUES (1,1);",
+        )
+        if not obsolete:
+            self.admin_sql(
+                self.target,
+                f"REVOKE ALTER ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
+            )
+        result = self.run_sync(
+            tables=["items"], run_id="check-convergence", chunk_size=1
+        )
+        require_success(
+            result,
+            "obsolete CHECK removal" if obsolete else "equivalent CHECK name retention",
+        )
+        expected = "1\t-1" if obsolete else "1\t1"
+        for endpoint in (self.source, self.target):
+            self.assert_key_transition_rows(endpoint, {"items": expected})
+        checks = self.admin_query(
+            self.target,
+            "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS "
+            f"WHERE TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='items' AND CONSTRAINT_TYPE='CHECK';",
+        ).strip()
+        if checks != ("" if obsolete else "other_valid_name"):
+            raise HarnessError(f"CHECK convergence mismatch: {checks!r}")
+        if not obsolete:
+            self.assert_admin_sql_rejected(
+                self.target, "INSERT INTO items VALUES(2,-1);", "3819"
+            )
+        print(f"sync_check_convergence_ok obsolete={obsolete} exact_rows=true")
+
     def run_sync_constraints_preserved(self, parent_only: bool = False) -> None:
         assert self.source and self.target
         for endpoint in (self.source, self.target):
@@ -5458,6 +5505,10 @@ class Harness:
             self.run_sync_composite_enum_primary_key()
         elif scenario == "sync-parent-only-constraints-preserved":
             self.run_sync_constraints_preserved(parent_only=True)
+        elif scenario == "sync-obsolete-check":
+            self.run_sync_check_convergence(obsolete=True)
+        elif scenario == "sync-equivalent-check-name":
+            self.run_sync_check_convergence(obsolete=False)
         elif scenario == "sync-constraints-preserved":
             self.run_sync_constraints_preserved()
         elif scenario == "sync-fk-parent-insert":
