@@ -7,6 +7,22 @@ use crate::sync::fk_transition::{
 };
 use crate::sync::sql::build_related_rows_select_statement;
 
+fn describe_transition_error(error: engine::Error<String>) -> String {
+    match error {
+        engine::Error::Backend(message) => message,
+        engine::Error::Cycle(table) => format!("dependency cycle in `{table}`"),
+        engine::Error::WorkLimit => "transition work limit reached".into(),
+        engine::Error::InvalidPage => "invalid dependent key page".into(),
+        engine::Error::InvalidRelation => "invalid foreign-key relation".into(),
+        engine::Error::MissingColumn(column) => format!("missing column `{column}`"),
+        engine::Error::MissingTarget(key) => format!("target row missing in `{}`", key.table),
+        engine::Error::MissingParent { child, parent } => format!(
+            "required parent in `{}` missing for `{}`",
+            parent.table, child.table,
+        ),
+    }
+}
+
 pub(super) struct TransitionContext {
     source: Conn,
     tables: BTreeMap<String, SyncTable>,
@@ -106,7 +122,12 @@ impl MySqlSyncTargetSession {
                 max_keys: usize::MAX,
             },
         )
-        .map_err(|error| format!("coordinated unique-owner replacement: {error:?}"))?;
+        .map_err(|error| {
+            format!(
+                "coordinated unique-owner replacement: {}",
+                describe_transition_error(error)
+            )
+        })?;
         self.verify_and_record_owner_replacement(conflict)?;
         Ok(true)
     }
@@ -203,7 +224,12 @@ impl MySqlSyncTargetSession {
                         max_keys: usize::MAX,
                     },
                 )
-                .map_err(|error| format!("coordinated FK update for `{root_table}`: {error:?}"))?;
+                .map_err(|error| {
+                    format!(
+                        "coordinated FK update for `{root_table}`: {}",
+                        describe_transition_error(error)
+                    )
+                })?;
             }
             Ok(())
         })();
@@ -311,7 +337,7 @@ impl TransitionBackend<'_> {
             pk: source.primary_key.clone(),
         };
         if !self.visiting.insert(key.clone()) {
-            return Err(format!("FK prerequisite cycle at {key:?}"));
+            return Err(format!("FK prerequisite cycle in `{}`", key.table));
         }
         let result = (|| {
             self.ensure_required_parents(&key.table, &source.values)?;
@@ -354,8 +380,9 @@ impl TransitionBackend<'_> {
                 )
                 .map_err(|error| {
                     format!(
-                        "coordinated FK prerequisite update for `{}`: {error:?}",
-                        key.table
+                        "coordinated FK prerequisite update for `{}`: {}",
+                        key.table,
+                        describe_transition_error(error)
                     )
                 })
             }

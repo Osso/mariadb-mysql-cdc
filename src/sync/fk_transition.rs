@@ -40,7 +40,8 @@ pub enum Error<E> {
     },
 }
 
-/// All reads must share caller-controlled stable source evidence and target locks.
+/// Caller holds target locks across reads and writes. Source reads are current;
+/// this engine does not establish a shared source snapshot.
 /// Keys use backend PK order, not Rust string order. Pages must advance strictly,
 /// contain at most `limit` keys and obey `byte_limit` (one oversized key allowed).
 /// Exact row reads preserve one oversized row, matching the page-budget contract.
