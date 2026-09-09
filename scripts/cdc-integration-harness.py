@@ -54,6 +54,7 @@ SCENARIOS = (
     ScenarioSpec("sync-composite-enum-primary-key", True),
     ScenarioSpec("sync-enum-append", True),
     ScenarioSpec("sync-enum-incompatible", True),
+    ScenarioSpec("sync-constraints-preserved", True),
     ScenarioSpec("sync-fk-parent-insert", True),
     ScenarioSpec("sync-fk-parent-update", True),
     ScenarioSpec("sync-fk-parent-stale-unique-owner", True),
@@ -2814,6 +2815,38 @@ class Harness:
             "rows_scanned=3 inserts=1 updates=1 deletes=0"
         )
 
+    def run_sync_constraints_preserved(self) -> None:
+        assert self.source and self.target
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint,
+                "CREATE TABLE preserve_parent (id INT PRIMARY KEY) ENGINE=InnoDB; "
+                "CREATE TABLE preserve_child (id INT PRIMARY KEY, parent_id INT, "
+                "CONSTRAINT preserve_child_parent FOREIGN KEY (parent_id) "
+                "REFERENCES preserve_parent(id), "
+                "CONSTRAINT preserve_child_positive CHECK (id > 0)) ENGINE=InnoDB; "
+                "INSERT INTO preserve_parent VALUES (1); "
+                "INSERT INTO preserve_child VALUES (1,1);",
+            )
+        self.admin_sql(
+            self.target,
+            f"REVOKE ALTER ON `{APP_SCHEMA}`.* FROM '{SYNC_TARGET_USER}'@'%';",
+        )
+        result = self.run_sync(
+            tables=["preserve_parent", "preserve_child"],
+            run_id="sync-constraints-preserved",
+            parallelism=2,
+        )
+        require_success(
+            result, "sync must preserve valid constraints without ALTER privilege"
+        )
+        rows = self.admin_query(
+            self.target, "SELECT id,parent_id FROM preserve_child;"
+        ).strip()
+        if rows != "1\t1":
+            raise HarnessError(f"preserved child rows differ: {rows!r}")
+        print("sync_constraints_preserved=true alter_privilege=false")
+
     def run_sync_fk_parent_convergence(self, update_existing_child: bool = False) -> None:
         assert self.source and self.target
         run_id = "sync-fk-parent-update" if update_existing_child else "sync-fk-parent-insert"
@@ -4930,6 +4963,8 @@ class Harness:
             self.run_sync_enum_incompatible()
         elif scenario == "sync-composite-enum-primary-key":
             self.run_sync_composite_enum_primary_key()
+        elif scenario == "sync-constraints-preserved":
+            self.run_sync_constraints_preserved()
         elif scenario == "sync-fk-parent-insert":
             self.run_sync_fk_parent_convergence()
         elif scenario == "sync-fk-parent-update":
