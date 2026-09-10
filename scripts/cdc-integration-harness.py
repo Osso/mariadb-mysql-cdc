@@ -84,6 +84,7 @@ SCENARIOS = (
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("create-table-crash-restart", True),
+    ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("insert-duplicate-idempotent", True),
     ScenarioSpec("users-update-snapshot-ahead", True),
@@ -2219,6 +2220,128 @@ DELIMITER ;
             time.sleep(0.05)
         raise HarnessError(
             f"process did not stay live with pending DDL: {log.read_text()}"
+        )
+
+    def run_create_facets_historical_crash_restart(self) -> None:
+        assert self.source and self.target
+        fixture = self.repo / "fixtures/ddl/create-kg-comic-facets.sql"
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.admin_sql(self.source, fixture.read_text())
+        create_stop = self.coordinate()
+        self.admin_sql(
+            self.source,
+            "INSERT INTO kg_comic_facets VALUES "
+            "(17,'genre','adventure',2,3,0.667,1,'extractor-a','vocab-a','2026-09-08 12:00:00');",
+        )
+        rows_stop = self.coordinate()
+        self.admin_sql(
+            self.source,
+            "ALTER TABLE kg_comic_facets MODIFY COLUMN facet_vocab_version VARCHAR(128) NOT NULL;",
+        )
+        alter_stop = self.coordinate()
+        self.admin_sql(
+            self.source,
+            "UPDATE kg_comic_facets SET facet_vocab_version=REPEAT('v',100) WHERE comic_id=17;",
+        )
+        final_stop = self.coordinate()
+
+        def width(endpoint: Endpoint) -> str:
+            return self.admin_query(
+                endpoint,
+                "SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='kg_comic_facets' "
+                "AND COLUMN_NAME='facet_vocab_version';",
+            ).strip()
+
+        if width(self.source) != "128" or width(self.target):
+            raise HarnessError(
+                "historical CREATE setup requires current source128 and absent target"
+            )
+        crashed = self.run_stream(
+            start, create_stop, integration_failpoint="post-ddl-pre-applied"
+        )
+        if (
+            crashed.returncode == 0
+            or "cdc_integration_failpoint" not in crashed.stdout + crashed.stderr
+        ):
+            raise HarnessError(
+                f"historical CREATE did not reach post-DDL crash: {crashed.stdout}\n{crashed.stderr}"
+            )
+        if (
+            self.checkpoint().get("source_position") != start.position
+            or width(self.target) != "80"
+        ):
+            raise HarnessError(
+                "historical CREATE used current source schema or advanced checkpoint"
+            )
+        evidence = (
+            self.admin_query(
+                self.target,
+                "SELECT status,generated_sql,canonical_ast,pre_state,expected_post_state "
+                "FROM cdc.ddl_replay_journal ORDER BY event_start_position;",
+            )
+            .strip()
+            .split("\t")
+        )
+        if len(evidence) != 5 or evidence[0] != "prepared" or not all(evidence[1:]):
+            raise HarnessError(
+                "historical CREATE did not persist complete prepared evidence"
+            )
+        # Generated SQL is the durable external replay contract, not an implementation detail.
+        generated = evidence[1]
+        if (
+            "VARCHAR(80)" not in generated.upper()
+            or "VARCHAR(128)" in generated.upper()
+        ):
+            raise HarnessError(
+                "generated CREATE replaced historical VARCHAR80 with current VARCHAR128"
+            )
+        require_success(
+            self.run_stream(start, create_stop), "historical CREATE prepared restart"
+        )
+        if (
+            width(self.target) != "80"
+            or self.checkpoint().get("source_position") != create_stop.position
+        ):
+            raise HarnessError(
+                "prepared restart lost historical schema or exact checkpoint"
+            )
+        if (
+            self.admin_query(
+                self.target, "SELECT COUNT(*) FROM kg_comic_facets;"
+            ).strip()
+            != "0"
+        ):
+            raise HarnessError("later rows overtook CREATE checkpoint")
+        require_success(
+            self.run_stream(create_stop, rows_stop), "historical CREATE subsequent rows"
+        )
+        if (
+            self.admin_query(
+                self.target, "SELECT comic_id,facet_vocab_version FROM kg_comic_facets;"
+            ).strip()
+            != "17\tvocab-a"
+        ):
+            raise HarnessError("row after historical CREATE did not replay exactly")
+        require_success(
+            self.run_stream(rows_stop, alter_stop), "later VARCHAR128 ALTER"
+        )
+        if width(self.target) != "128":
+            raise HarnessError("later ALTER did not widen historical column")
+        require_success(self.run_stream(alter_stop, final_stop), "post-ALTER wide row")
+        if (
+            self.admin_query(
+                self.target,
+                "SELECT CHAR_LENGTH(facet_vocab_version) FROM kg_comic_facets;",
+            ).strip()
+            != "100"
+        ):
+            raise HarnessError("post-ALTER wide row lost data")
+        if self.checkpoint().get("source_position") != final_stop.position:
+            raise HarnessError("post-ALTER row checkpoint differs")
+        print(
+            "historical_create_restart_ok source_width=128 event_width=80 final_width=128"
         )
 
     def run_create_table_crash_restart(self) -> None:
@@ -5943,6 +6066,8 @@ DELIMITER ;
             self.run_writable_column_generated_metadata()
         elif scenario == "production-alter-table":
             self.run_production_alter_table()
+        elif scenario == "create-facets-historical-crash-restart":
+            self.run_create_facets_historical_crash_restart()
         elif scenario == "create-table-crash-restart":
             self.run_create_table_crash_restart()
         elif scenario == "bootstrap-contract":
