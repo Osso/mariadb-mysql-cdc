@@ -29,6 +29,8 @@ allowlist.
 
 ### Current implemented slice
 
+- [x] Parse `ALTER TABLE <table> MODIFY COLUMN <column> VARCHAR(n) NOT NULL` with canonical positive length and unquoted keywords. Derive post-state from an existing ordinary VARCHAR column, retaining position, primary/secondary indexes and FKs; omitted defaults/comments are removed and charset/collation inherit table defaults. Other MODIFY types/options remain blocked. This covers the historical CREATE harness's later widening, not a separately observed production ALTER event.
+
 - [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`, named `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, and named `ADD UNIQUE KEY` clauses; preserve clause order and render deterministic MySQL 8 SQL with source `ADD INDEX` emitted as target `ADD KEY`.
 - [x] Admit the exact production event at `mysqld-bin.002778:750897987-750898224` (150 raw bytes with CRLF line endings; SHA-256 `ea9f789b158dca0146715bafe9f2712b5945b9c6626411b382347e60e52eb85f`) when its otherwise-supported ALTER has exactly one leading ordinary MySQL `-- ` line comment. Strip that comment only for parsing, then preserve its exact source prefix, including the source line ending, in generated SQL. Embedded comments, executable/version comments, optimizer hints, and all other leading comment forms remain rejected.
 - [x] Convert MariaDB `ALTER TABLE ... DROP COLUMN IF EXISTS ...` into MySQL 8 `DROP COLUMN` clauses by matching target identifiers ASCII-case-insensitively, emitting each matched target spelling once, and treating absent or repeated case-variant clauses as proven no-ops.

@@ -123,6 +123,7 @@ impl ParsedAlterLock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsedAlterClause {
     AddColumn(ParsedAddColumnAst),
+    ModifyVarchar { name: String, column_type: String },
     AddKey(ParsedIndexAst),
     DropColumn(ParsedDropColumnAst),
     DropIndex(ParsedDropIndexAst),

@@ -756,6 +756,49 @@ fn add_varchar_column_expected_state_uses_table_default_encoding() {
 }
 
 #[test]
+fn modify_varchar_not_null_grammar() {
+    let sql = "ALTER TABLE kg_comic_facets MODIFY COLUMN facet_vocab_version VARCHAR(128) NOT NULL";
+    let ast = parse_production_alter_table_ast(sql).expect("observed MODIFY");
+    assert_eq!(ast.table, "kg_comic_facets");
+    assert!(super::transform::supports_production_alter_table(sql));
+    for rejected in [
+        "ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NULL",
+        "ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NOT NULL DEFAULT 'x'",
+        "ALTER TABLE t MODIFY COLUMN c VARCHAR(0128) NOT NULL",
+        "ALTER TABLE t MODIFY COLUMN c DATETIME NOT NULL",
+        "ALTER TABLE t MODIFY COLUMN c `VARCHAR`(128) NOT NULL",
+    ] {
+        assert!(
+            !super::transform::supports_production_alter_table(rejected),
+            "{rejected}"
+        );
+    }
+}
+
+#[test]
+fn modify_varchar_preserves_position_and_indexes() {
+    let target = semantic_snapshot(7, Some(8));
+    let operation =
+        parse_ddl_operation("ALTER TABLE accounts MODIFY COLUMN handle VARCHAR(128) NOT NULL")
+            .expect("MODIFY");
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("evidence");
+    let mut expected = target.clone();
+    let column = &mut expected.inventory.tables[0].columns[1];
+    column.column_type = "varchar(128)".into();
+    column.is_nullable = false;
+    column.character_set = Some("utf8mb4".into());
+    column.collation = Some("utf8mb4_unicode_ci".into());
+    assert_eq!(
+        evidence.expected_post_state,
+        super::canonical::observe_operation_state(&expected, &operation).expect("observed state")
+    );
+    assert_eq!(
+        evidence.generated_sql.as_deref(),
+        Some("ALTER TABLE `accounts` MODIFY COLUMN `handle` VARCHAR(128) NOT NULL")
+    );
+}
+
+#[test]
 fn add_column_evidence_derives_post_state_without_live_source_snapshot() {
     let target = semantic_snapshot(7, Some(8));
     let operation = parse_ddl_operation(

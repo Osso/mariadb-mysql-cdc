@@ -51,7 +51,7 @@ fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
             ParsedAlterClause::AddColumn(column) => {
                 !column.if_not_exists && column.data_type != "timestamp"
             }
-            ParsedAlterClause::AddKey(_) => true,
+            ParsedAlterClause::AddKey(_) | ParsedAlterClause::ModifyVarchar { .. } => true,
             ParsedAlterClause::DropColumn(_) | ParsedAlterClause::DropIndex(_) => false,
         })
 }
@@ -183,6 +183,11 @@ fn render_production_alter_table(ast: &ParsedAlterTableAst) -> String {
 fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
     match clause {
         ParsedAlterClause::AddColumn(column) => render_add_column(column),
+        ParsedAlterClause::ModifyVarchar { name, column_type } => format!(
+            "MODIFY COLUMN {} {} NOT NULL",
+            quote_identifier(name),
+            column_type.to_ascii_uppercase()
+        ),
         ParsedAlterClause::AddKey(index) => render_add_key(index),
         ParsedAlterClause::DropColumn(column) => {
             format!("DROP COLUMN {}", quote_identifier(&column.name))
@@ -1838,10 +1843,40 @@ fn parse_production_alter_clause(
     {
         Some("ADD") => parse_production_add_clause(tokens, quoted_flags, index, table, literals),
         Some("DROP") => parse_drop_alter_clause(tokens, index),
+        Some("MODIFY") => parse_modify_varchar_clause(tokens, quoted_flags, index),
         actual => Err(format!(
             "unsupported production ALTER TABLE clause {actual:?}"
         )),
     }
+}
+
+fn parse_modify_varchar_clause(
+    tokens: &[String],
+    quoted_flags: &[bool],
+    index: usize,
+) -> Result<(ParsedAlterClause, usize), String> {
+    for (offset, keyword) in [(0, "MODIFY"), (1, "COLUMN")] {
+        require_keyword(tokens, index + offset, keyword)?;
+        if quoted_flags.get(index + offset) == Some(&true) {
+            return Err("quoted MODIFY keyword is unsupported".into());
+        }
+    }
+    let name = require_identifier(tokens, index + 2, "modified column")?;
+    let (column_type, data_type, next) =
+        parse_observed_column_type(tokens, quoted_flags, index + 3)?;
+    if data_type != "varchar" {
+        return Err("MODIFY supports only VARCHAR(n) NOT NULL".into());
+    }
+    for (offset, keyword) in [(0, "NOT"), (1, "NULL")] {
+        require_keyword(tokens, next + offset, keyword)?;
+        if quoted_flags.get(next + offset) == Some(&true) {
+            return Err("quoted MODIFY nullability is unsupported".into());
+        }
+    }
+    Ok((
+        ParsedAlterClause::ModifyVarchar { name, column_type },
+        next + 2,
+    ))
 }
 
 fn parse_production_add_clause(

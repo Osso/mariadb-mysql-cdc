@@ -443,6 +443,10 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
         .iter()
         .map(|clause| match clause {
             ParsedAlterClause::AddColumn(column) => canonical_add_column_ast_value(column),
+            ParsedAlterClause::ModifyVarchar { name, column_type } => json!({
+                "kind": "modify_column", "name": name, "column_type": column_type,
+                "data_type": "varchar", "nullable": false,
+            }),
             ParsedAlterClause::AddKey(index) => json!({
                 "kind": "add_key",
                 "index": canonical_index_ast_value(index),
@@ -541,10 +545,46 @@ fn apply_alter_clause(
 ) -> Result<(), String> {
     match clause {
         ParsedAlterClause::AddColumn(column) => apply_add_column(expected, &ast.table, column),
+        ParsedAlterClause::ModifyVarchar { name, column_type } => {
+            apply_modify_varchar(expected, &ast.table, name, column_type)
+        }
         ParsedAlterClause::AddKey(index) => apply_add_key(expected, index),
         ParsedAlterClause::DropColumn(column) => apply_drop_column(expected, &ast.table, column),
         ParsedAlterClause::DropIndex(index) => apply_drop_index(expected, &ast.table, index),
     }
+}
+
+fn apply_modify_varchar(
+    expected: &mut SemanticSchemaSnapshot,
+    table_name: &str,
+    name: &str,
+    column_type: &str,
+) -> Result<(), String> {
+    let table = expected
+        .inventory
+        .tables
+        .iter_mut()
+        .find(|table| table.name == table_name)
+        .ok_or_else(|| format!("MODIFY target table `{table_name}` is missing"))?;
+    let column = table
+        .columns
+        .iter_mut()
+        .find(|column| column.name == name)
+        .ok_or_else(|| format!("MODIFY target column `{table_name}`.`{name}` is missing"))?;
+    if column.data_type != "varchar" || column.generated.is_some() || !column.extra.is_empty() {
+        return Err("MODIFY requires an ordinary existing VARCHAR column".into());
+    }
+    column.column_type = column_type.to_string();
+    column.is_nullable = false;
+    column.default_value = None;
+    column.comment.clear();
+    let collation = table
+        .collation
+        .as_deref()
+        .ok_or_else(|| "MODIFY target has no table collation".to_string())?;
+    column.character_set = Some(collation.split('_').next().unwrap_or(collation).to_string());
+    column.collation = Some(collation.to_string());
+    Ok(())
 }
 
 fn apply_add_column(
