@@ -48,6 +48,18 @@ Automatic DDL admission currently has these narrow slices:
   prepends its exact source prefix, including the source line ending, to the
   generated SQL. Embedded comments, executable/version comments, optimizer
   hints, and all other leading comment forms remain rejected; and
+- the bounded observed `CREATE TABLE IF NOT EXISTS` grammar with ordinary
+  leading block comments and inline `--` comments; `MEDIUMINT`, `SMALLINT`, and
+  `TINYINT UNSIGNED`; canonical `VARCHAR(n)`; exactly `DECIMAL(4,3)`;
+  `TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`;
+  a composite primary key; named composite ordinary keys; `ENGINE=InnoDB`; and
+  `DEFAULT CHARSET=utf8mb4`. The event definition is authoritative: historical
+  `VARCHAR(80)` is not widened from later source metadata. A charset-only CREATE
+  requires MariaDB QueryEvent `Q_CHARACTER_SET_COLLATIONS` context, resolved
+  through the collation-ID catalog and rendered as an explicit MySQL-compatible
+  collation. Missing, malformed, or unsupported context, an existing target
+  table, executable/version comments, hints, embedded block comments, and every
+  unmodeled syntax remain pending; and
 - the exact production `assistant_reply_reports` `CREATE TABLE` event, which
   is admitted only by its exact raw-event hash after the target table has been
   provisioned out of band from the recorded source definition. Replay fences a

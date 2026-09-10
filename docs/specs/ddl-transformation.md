@@ -51,17 +51,15 @@ allowlist.
 - [x] Execute generated SQL in the automatic stream path instead of the MariaDB source SQL.
 - [x] Keep unsupported or semantically blocked DDL durable and observable: persist the journal barrier, leave the checkpoint unchanged, and retry in-process indefinitely without consuming transport retry budget, skipping the event, or falling back to raw source SQL.
 
-This is a production-derived ALTER TABLE slice plus one exact production
-`home_feed_artist_blacklist` CREATE TABLE admission, one exact production
-`assistant_reply_reports` CREATE recovery, one identity-scoped source-only
-CREATE PROCEDURE form, two exact procedure-drop admissions, and one exact
-trigger-drop admission, not full ALTER TABLE, generic CREATE TABLE, general
-routine/trigger DDL, or the full MariaDB-to-MySQL 8
-transformation pipeline. Coordinate-anchored reconstruction
-of historical source schema lineage is explicitly excluded from the current
-cycle. The translator may use only semantics completely represented by the
-admitted event AST and fenced target pre-state; it must not infer unmodeled
-historical source state.
+This is a production-derived ALTER TABLE slice plus bounded typed CREATE TABLE
+admissions, one exact production `assistant_reply_reports` CREATE recovery, one
+identity-scoped source-only CREATE PROCEDURE form, two exact procedure-drop
+admissions, and one exact trigger-drop admission. It is not full ALTER TABLE,
+generic CREATE TABLE, general routine/trigger DDL, or the full
+MariaDB-to-MySQL 8 transformation pipeline. The translator may use only
+semantics represented by the admitted event AST, captured QueryEvent context,
+and fenced target pre-state; it must not infer historical source state from the
+current source schema.
 
 Unsupported or ambiguous DDL syntax enters the durable journal as
 `translation_pending` with sentinel/no execution evidence. It performs no target
@@ -110,8 +108,25 @@ broader DDL coverage and operational proof gaps listed below.
 - [x] Runtime admission executes an admitted grammar form only after the evidence
       gates, validates the exact observed post-state, and checkpoints it.
       Unsupported `CREATE TABLE` variants remain `translation_pending` with zero
-      target DDL and zero checkpoint execution. The exact production blacklist
-      CREATE is the sole additional modeled production form.
+      target DDL and zero checkpoint execution.
+- [x] The observed generic `CREATE TABLE IF NOT EXISTS` family accepts ordinary
+      leading block comments and inline `--` comments; `MEDIUMINT`, `SMALLINT`,
+      and `TINYINT UNSIGNED`; canonical `VARCHAR(n)`; exactly `DECIMAL(4,3)`;
+      `TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`;
+      a composite primary key; named composite ordinary keys; `ENGINE=InnoDB`;
+      and `DEFAULT CHARSET=utf8mb4`. It preserves the event definition, including
+      historical `VARCHAR(80)`, rather than reading a later source definition.
+- [x] For a charset-only CREATE, runtime decodes MariaDB QueryEvent status
+      variables `Q_CHARACTER_SET_COLLATIONS` and resolves the historical
+      `utf8mb4` collation through the source collation-ID catalog. The canonical
+      AST records that context and target SQL renders an explicit MySQL-compatible
+      collation. An absent, malformed, or unsupported context remains
+      `translation_pending`; current schema defaults and a source-coordinate fence
+      are not substitutes.
+- [ ] The observed `kg_comic_facets` event at
+      `mysqld-bin.002994:1005806835-1005808327` is blocked in production pending
+      final integration proof and deployment. Its target pre-state must be absent.
+      Existing-target `CREATE TABLE IF NOT EXISTS` is not admitted as a no-op.
 
 The exact production `assistant_reply_reports` CREATE event is a bounded
 convergence recovery, not generic `CREATE TABLE` support. Its target table must
@@ -124,7 +139,9 @@ target, moving source fence, or schema mismatch remains `translation_pending`
 with no checkpoint advance; operator-authored SQL and manual journal mutation
 are not resolution paths.
 
-No other `CREATE TABLE` syntax is admitted.
+No other `CREATE TABLE` syntax is admitted. Executable/version comments,
+optimizer hints, embedded block comments, unmodeled types/defaults/index forms,
+and an existing target table remain durable barriers.
 
 ### Execution and recovery
 
@@ -170,6 +187,8 @@ No other `CREATE TABLE` syntax is admitted.
   checkpoint barrier.
 - `src/live/ddl_semantics.rs` — dispatches current DDL transformations and
   captures semantic evidence.
+- `src/live/query_charset_context.rs` — fail-closed MariaDB QueryEvent status
+  variable decoder for historical charset/collation context.
 - `src/live/ddl_semantics/transform.rs` — production-derived `ADD COLUMN`,
   the exact guarded two-column `TIMESTAMP ... ALGORITHM=INSTANT` admission,
   `ADD KEY`/MariaDB `ADD INDEX`, `ADD UNIQUE KEY`, generic and exact `DROP PROCEDURE`,
@@ -194,10 +213,10 @@ The current slice is covered by:
       `CREATE PROCEDURE apply_release_move_purchase_repair` form, target-absence
       evidence, and proven no-op behavior,
       typed ALTER AST/post-state behavior and rename boundaries, plus the strict
-      fixture `CREATE TABLE` grammar/typed AST/renderer, fenced source-default
-      evidence, exact-coordinate rejection, explicit charset/collation SQL,
-      deterministic post-state with sorted indexes, exact-grammar rejection, and
-      runtime-admission contract.
+      fixture and observed CREATE TABLE grammars/typed AST/rendering, historical
+      QueryEvent charset-context decoding, fenced source-default evidence where
+      applicable, explicit charset/collation SQL, deterministic post-state with
+      sorted indexes, exact-grammar rejection, and runtime-admission contract.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
       generated SQL and preserves journal/checkpoint ordering for supported
       fixtures; the exact `content_sections_events_raw` barrier emits one unguarded
@@ -213,6 +232,11 @@ The current slice is covered by:
       `existing_translation_pending_tinyint_add_column_is_proven_and_checkpointed`
       assert production translation, exact converged-target proof, divergent
       definition/position rejection, and same-barrier checkpoint recovery.
+- [ ] `scripts/cdc-integration-harness.py --scenario create-facets-historical-crash-restart` —
+      pending final integration proof for the recorded `kg_comic_facets` CREATE:
+      a historical `VARCHAR(80)` despite a later source `VARCHAR(128)`, prepared
+      crash/restart, exact journal-coordinate promotion, target CREATE once, and
+      later DDL in source order.
 - [x] `scripts/cdc-integration-harness.py --scenario create-table-crash-restart` —
       real differing-default MariaDB/MySQL fixture admission, target-absence
       evidence, explicit charset/collation SQL, exact observed post-state,

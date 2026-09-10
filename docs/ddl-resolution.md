@@ -38,6 +38,29 @@ comment or changing any body text changes the hash and remains rejected.
 Every other DDL form enters the same journal as `translation_pending`; no operator-authored
 target SQL is accepted as a resolution path.
 
+### Historical `CREATE TABLE` charset context
+
+The bounded observed `CREATE TABLE IF NOT EXISTS` grammar admits ordinary leading
+block comments and inline `--` comments; unsigned `MEDIUMINT`, `SMALLINT`, and
+`TINYINT`; canonical `VARCHAR(n)`; `DECIMAL(4,3)`; the observed `TIMESTAMP`
+default/on-update form; composite primary and ordinary keys; InnoDB; and
+`DEFAULT CHARSET=utf8mb4`. It uses the event AST, so a historical
+`VARCHAR(80)` remains `VARCHAR(80)` even if the current source table is later
+`VARCHAR(128)`.
+
+When such a CREATE omits `COLLATE`, runtime decodes MariaDB QueryEvent
+`Q_CHARACTER_SET_COLLATIONS` and resolves the historical utf8mb4 collation via
+the source collation-ID catalog before rendering explicit MySQL-compatible SQL.
+It records the resolved context in canonical evidence. Missing, malformed, or
+unsupported context fails closed; current source defaults and a source-coordinate
+fence cannot reconstruct it. The target table must be absent. An existing target
+`CREATE TABLE IF NOT EXISTS` is not a converged no-op in this slice.
+
+As of September 10, 2026, the recorded `kg_comic_facets` CREATE at
+`mysqld-bin.002994:1005806835-1005808327` remains `translation_pending` pending
+final integration proof and deployment. The journal row, coordinate, and
+checkpoint must not be edited manually.
+
 ### Exact production ALTER recovery target
 
 The active recovery target is the exact source event at
