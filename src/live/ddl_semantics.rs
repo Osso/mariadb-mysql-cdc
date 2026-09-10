@@ -433,15 +433,7 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         validate_target_snapshot_consistency(&before, &after)?;
         let mut evidence =
             canonical::build_resolved_create_table_evidence(&operation, &before, &defaults)?;
-        let mut ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast)
-            .map_err(|error| format!("CREATE evidence JSON: {error}"))?;
-        ast["query_charset_context"] = serde_json::json!({
-            "character_set_collations": overrides,
-            "source_collation_id": collation_id,
-            "source_collation": source_collation,
-        });
-        evidence.canonical_ast = serde_json::to_string(&ast)
-            .map_err(|error| format!("CREATE evidence JSON: {error}"))?;
+        record_query_charset_context(&mut evidence, overrides, collation_id, source_collation)?;
         Ok(evidence)
     }
 
@@ -464,6 +456,24 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         })?;
         canonical::expected_create_table_post_state(ast, &defaults)
     }
+}
+
+fn record_query_charset_context(
+    evidence: &mut DdlSemanticEvidence,
+    overrides: Vec<(u16, u16)>,
+    collation_id: u16,
+    source_collation: String,
+) -> Result<(), String> {
+    let mut ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast)
+        .map_err(|error| format!("CREATE evidence JSON: {error}"))?;
+    ast["query_charset_context"] = serde_json::json!({
+        "character_set_collations": overrides,
+        "source_collation_id": collation_id,
+        "source_collation": source_collation,
+    });
+    evidence.canonical_ast =
+        serde_json::to_string(&ast).map_err(|error| format!("CREATE evidence JSON: {error}"))?;
+    Ok(())
 }
 
 fn capture_assistant_reply_reports_create_evidence(
