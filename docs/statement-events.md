@@ -67,6 +67,12 @@ Automatic DDL admission currently has these narrow slices:
   foreign-key equality; equality is a proven no-op, while absent/mismatched
   target state or a moving source fence remains `translation_pending` with no
   checkpoint advance; and
+- the exact `ALTER TABLE <table> MODIFY COLUMN <column> VARCHAR(n) NOT NULL`
+  grammar, with a positive canonical length and unquoted keywords. It derives
+  state from the existing target column, preserves position and existing
+  indexes/FKs, and never drops constraints. Other types/options remain pending;
+  the historical CREATE harness's later widening still awaits its real integration
+  gate; and
 - the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
   COLUMN IF EXISTS ...` form, which is token-parsed and transformed from target
   column pre-state into deterministic MySQL 8 SQL. Exactly one leading ordinary

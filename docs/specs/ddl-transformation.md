@@ -125,10 +125,15 @@ broader DDL coverage and operational proof gaps listed below.
       collation. An absent, malformed, or unsupported context remains
       `translation_pending`; current schema defaults and a source-coordinate fence
       are not substitutes.
-- [ ] The observed `kg_comic_facets` event at
-      `mysqld-bin.002994:1005806835-1005808327` is blocked in production pending
-      final integration proof and deployment. Its target pre-state must be absent.
-      Existing-target `CREATE TABLE IF NOT EXISTS` is not admitted as a no-op.
+- [x] Parser/admission proof covers the observed `kg_comic_facets` CREATE at
+      `mysqld-bin.002994:1005806835-1005808327`: 98 targeted tests and a real
+      historical `VARCHAR(80)` crash/restart/row-replay harness passed. Production
+      deployment remains pending; its target pre-state must be absent. Existing-target
+      `CREATE TABLE IF NOT EXISTS` is not admitted as a no-op.
+- [ ] The bounded `MODIFY COLUMN <name> VARCHAR(positive canonical n) NOT NULL`
+      renderer preserves target column order and existing indexes/FKs without drops.
+      Unit/renderer proof exists, but the historical CREATE harness's later widening
+      still needs its real integration gate; no deployment is claimed.
 
 The exact production `assistant_reply_reports` CREATE event is a bounded
 convergence recovery, not generic `CREATE TABLE` support. Its target table must
