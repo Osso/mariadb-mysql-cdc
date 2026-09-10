@@ -51,6 +51,16 @@ pub trait DdlSemanticInventory {
         source_file: &str,
         event_end_position: u64,
     ) -> Result<DdlSemanticEvidence, String>;
+    fn capture_evidence_with_query_context(
+        &self,
+        sql: &str,
+        source_file: &str,
+        event_end_position: u64,
+        _status_variables: &[u8],
+    ) -> Result<DdlSemanticEvidence, String> {
+        self.capture_evidence(sql, source_file, event_end_position)
+    }
+
     fn observe_target_state(&self, sql: &str) -> Result<String, String>;
     fn expected_target_state(&self, sql: &str) -> Result<String, String>;
 }
@@ -379,6 +389,60 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
             source_file,
             event_end_position,
         )
+    }
+
+    fn capture_evidence_with_query_context(
+        &self,
+        sql: &str,
+        source_file: &str,
+        event_end_position: u64,
+        status_variables: &[u8],
+    ) -> Result<DdlSemanticEvidence, String> {
+        let operation = parse_semantic_operation(sql)?;
+        let Some(ast) = operation.create_table_ast.as_ref() else {
+            return self.capture_evidence(sql, source_file, event_end_position);
+        };
+        if ast.character_set.as_deref() != Some("utf8mb4") || ast.collation.is_some() {
+            return self.capture_evidence(sql, source_file, event_end_position);
+        }
+        let context = super::query_charset_context::decode_query_charset_context(status_variables)
+            .map_err(|error| format!("historical CREATE charset context: {error}"))?;
+        let overrides = context
+            .character_set_collations
+            .ok_or_else(|| "historical CREATE charset override map is absent".to_string())?;
+        // MariaDB identifies utf8mb4 by its primary collation ID, 45.
+        let collation_id = overrides
+            .iter()
+            .find(|(from, _)| *from == 45)
+            .map(|(_, to)| *to)
+            .unwrap_or(45);
+        let mut defaults = self
+            .source
+            .read_collation_identity(collation_id)
+            .map_err(|error| format!("historical collation identity: {error}"))?;
+        if defaults.character_set != "utf8mb4" {
+            return Err("historical collation does not belong to utf8mb4".to_string());
+        }
+        if defaults.collation.starts_with("uca1400_") {
+            defaults.collation = format!("utf8mb4_{}", defaults.collation);
+        }
+        let source_collation = defaults.collation.clone();
+        defaults.collation = crate::sync_schema::canonical_collation(&defaults.collation);
+        let before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+        let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+        validate_target_snapshot_consistency(&before, &after)?;
+        let mut evidence =
+            canonical::build_resolved_create_table_evidence(&operation, &before, &defaults)?;
+        let mut ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast)
+            .map_err(|error| format!("CREATE evidence JSON: {error}"))?;
+        ast["query_charset_context"] = serde_json::json!({
+            "character_set_collations": overrides,
+            "source_collation_id": collation_id,
+            "source_collation": source_collation,
+        });
+        evidence.canonical_ast = serde_json::to_string(&ast)
+            .map_err(|error| format!("CREATE evidence JSON: {error}"))?;
+        Ok(evidence)
     }
 
     fn observe_target_state(&self, sql: &str) -> Result<String, String> {

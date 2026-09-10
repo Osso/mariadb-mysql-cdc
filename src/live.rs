@@ -15,6 +15,7 @@ pub(crate) mod ddl_semantics;
 mod insert_conflict;
 mod mysql_cli;
 mod progress;
+mod query_charset_context;
 mod reconnect;
 #[cfg(test)]
 mod repair;

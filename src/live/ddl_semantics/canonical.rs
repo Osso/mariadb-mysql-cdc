@@ -29,6 +29,18 @@ pub fn build_fenced_create_table_evidence(
         )?;
     }
     let defaults = explicit_defaults.as_ref().unwrap_or(defaults);
+    build_resolved_create_table_evidence(operation, target, defaults)
+}
+
+pub(crate) fn build_resolved_create_table_evidence(
+    operation: &DdlOperation,
+    target: &SemanticSchemaSnapshot,
+    defaults: &crate::inventory::SchemaDefaults,
+) -> Result<DdlSemanticEvidence, String> {
+    let ast = operation
+        .create_table_ast
+        .as_ref()
+        .ok_or_else(|| "typed CREATE TABLE AST is missing".to_string())?;
     let pre_state = canonical_pre_state(operation, target)?;
     if pre_state != canonical_absent_state() {
         return Err(format!(
@@ -1116,7 +1128,8 @@ fn canonical_rename_observed_state(
 }
 
 pub fn supports_automatic_semantic_recovery(operation: &DdlOperation) -> bool {
-    operation.family == DdlFamily::Index
+    (operation.family == DdlFamily::Index
         && operation.object_kind == DdlObjectKind::Index
-        && operation.index_ast.is_some()
+        && operation.index_ast.is_some())
+        || (operation.family == DdlFamily::Table && operation.create_table_ast.is_some())
 }

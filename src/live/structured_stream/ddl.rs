@@ -209,7 +209,8 @@ where
     let create_table_requires_evidence_sql = parse_ddl_operation(&ddl_event.raw_sql)
         .is_ok_and(|operation| operation.create_table_ast.is_some());
     let (transformation, mut evidence) = if create_table_requires_evidence_sql {
-        let evidence = capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event)?;
+        let evidence =
+            capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event, event)?;
         let target_sql = evidence.generated_sql.clone().ok_or_else(|| {
             ApplyBinlogError::Statement(
                 "CREATE TABLE evidence is missing deterministic generated SQL".to_string(),
@@ -230,7 +231,8 @@ where
                 return Err(ApplyBinlogError::DdlBlocked(error));
             }
         };
-        let evidence = capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event)?;
+        let evidence =
+            capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event, event)?;
         (transformation, evidence)
     };
     let transformation = suppress_target_sql_for_converged_state(transformation, &evidence);
@@ -305,15 +307,21 @@ pub(super) fn capture_automatic_ddl_evidence<S, J>(
     semantic_inventory: &S,
     journal: &J,
     ddl_event: &DdlEvent,
+    event: &BinlogEvent,
 ) -> Result<DdlSemanticEvidence, ApplyBinlogError>
 where
     S: DdlSemanticInventory,
     J: DdlReplayJournal,
 {
-    match semantic_inventory.capture_evidence(
+    let status_variables = match event {
+        BinlogEvent::QueryEvent(query) => query.status_variables.as_slice(),
+        _ => &[],
+    };
+    match semantic_inventory.capture_evidence_with_query_context(
         &ddl_event.raw_sql,
         &ddl_event.binlog_file,
         ddl_event.event_end_position,
+        status_variables,
     ) {
         Ok(evidence) => Ok(evidence),
         Err(error) => {

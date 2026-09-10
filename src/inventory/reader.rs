@@ -378,6 +378,21 @@ impl MariaDbInventoryReader {
         parse_schema_defaults(row)
     }
 
+    pub fn read_collation_identity(&self, id: u16) -> Result<SchemaDefaults, InventoryError> {
+        let rows = self.query_rows(
+            InventoryQueryStage::SchemaDefaults,
+            "collation identity",
+            &format!("SELECT CHARACTER_SET_NAME, COLLATION_NAME FROM information_schema.COLLATION_CHARACTER_SET_APPLICABILITY WHERE ID = {id}"),
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(InventoryError::new(format!(
+                "expected one collation identity for {id}, found {}",
+                rows.len()
+            )));
+        };
+        parse_schema_defaults(row)
+    }
+
     pub fn read_source_master_coordinate(&self) -> Result<SourceMasterCoordinate, InventoryError> {
         let rows = self.query_rows(
             InventoryQueryStage::MasterCoordinate,
