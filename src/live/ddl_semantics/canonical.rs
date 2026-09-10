@@ -396,7 +396,11 @@ fn expected_create_column_extra(column: &super::model::ParsedCreateColumnAst) ->
         .as_deref()
         .is_some_and(|value| value.eq_ignore_ascii_case("CURRENT_TIMESTAMP"))
     {
-        return "DEFAULT_GENERATED".to_string();
+        return if column.on_update_current_timestamp {
+            "DEFAULT_GENERATED on update CURRENT_TIMESTAMP".to_string()
+        } else {
+            "DEFAULT_GENERATED".to_string()
+        };
     }
     String::new()
 }
@@ -404,12 +408,14 @@ fn expected_create_column_extra(column: &super::model::ParsedCreateColumnAst) ->
 fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::Value {
     json!({
         "name": ast.name,
+        "if_not_exists": ast.if_not_exists,
         "columns": ast.columns.iter().map(|column| json!({
             "name": column.name,
             "column_type": column.column_type,
             "nullable": column.nullable,
             "default_sql": column.default_sql,
             "auto_increment": column.auto_increment,
+            "on_update_current_timestamp": column.on_update_current_timestamp,
         })).collect::<Vec<_>>(),
         "primary_key": ast.primary_key,
         "indexes": ast.indexes.iter().map(canonical_index_ast_value).collect::<Vec<_>>(),

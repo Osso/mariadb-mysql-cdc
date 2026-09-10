@@ -10,6 +10,8 @@ use super::tokenizer::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+mod observed_create;
+
 pub const DDL_TRANSFORMATION_VERSION: &str = "mariadb-mysql8-v1";
 
 type ParsedAlterOptions = (Option<ParsedAlterAlgorithm>, Option<ParsedAlterLock>);
@@ -237,6 +239,9 @@ fn quote_string_literal(value: &str) -> String {
 }
 
 pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableAst, String> {
+    if let Ok(ast) = observed_create::parse(source_sql) {
+        return Ok(ast);
+    }
     let source_sql = strip_leading_ordinary_ddl_comments(source_sql)?;
     if ddl_contains_comments(source_sql) {
         return Err("fixture CREATE TABLE comments are not supported".to_string());
@@ -310,6 +315,7 @@ pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableA
     }
     Ok(ParsedCreateTableAst {
         name,
+        if_not_exists: false,
         columns,
         primary_key,
         indexes,
@@ -336,6 +342,7 @@ fn parse_home_feed_artist_blacklist_create(
     }
     Ok(Some(ParsedCreateTableAst {
         name: "home_feed_artist_blacklist".to_string(),
+        if_not_exists: true,
         columns: home_feed_artist_blacklist_columns(),
         primary_key: vec!["id".to_string()],
         indexes: vec![home_feed_artist_blacklist_index()],
@@ -398,6 +405,7 @@ fn create_column(
         nullable,
         default_sql: default_sql.map(str::to_string),
         auto_increment,
+        on_update_current_timestamp: false,
     }
 }
 
@@ -443,6 +451,7 @@ fn parse_fixture_table_column(
             nullable: false,
             default_sql: None,
             auto_increment: false,
+            on_update_current_timestamp: false,
         },
         primary,
         next_index,
@@ -1345,6 +1354,13 @@ pub fn transform_fixture_create_table_with_defaults(
 ) -> Result<DdlTransformation, String> {
     validate_schema_default_identifier(&defaults.character_set, "character set")?;
     validate_schema_default_identifier(&defaults.collation, "collation")?;
+    if ast
+        .character_set
+        .as_ref()
+        .is_some_and(|charset| !charset.eq_ignore_ascii_case(&defaults.character_set))
+    {
+        return Err("CREATE charset differs from resolved defaults".to_string());
+    }
     transform_fixture_create_table_ast(ast, Some(defaults))
 }
 
@@ -1390,8 +1406,13 @@ fn render_create_column(column: &ParsedCreateColumnAst) -> String {
     } else {
         ""
     };
+    let on_update = if column.on_update_current_timestamp {
+        " ON UPDATE CURRENT_TIMESTAMP"
+    } else {
+        ""
+    };
     format!(
-        "{} {} {nullability}{default}{auto_increment}",
+        "{} {} {nullability}{default}{on_update}{auto_increment}",
         quote_identifier(&column.name),
         column.column_type.to_ascii_uppercase()
     )
@@ -1416,6 +1437,17 @@ fn render_create_schema_defaults(
         (ast.character_set.as_deref(), ast.collation.as_deref())
     {
         return format!(" DEFAULT CHARACTER SET={character_set} COLLATE={collation}");
+    }
+    if let Some(character_set) = ast.character_set.as_deref() {
+        return defaults.map_or_else(
+            || format!(" DEFAULT CHARACTER SET={character_set}"),
+            |defaults| {
+                format!(
+                    " DEFAULT CHARACTER SET={character_set} COLLATE={}",
+                    defaults.collation
+                )
+            },
+        );
     }
     defaults.map_or_else(String::new, |defaults| {
         format!(

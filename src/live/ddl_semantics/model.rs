@@ -54,11 +54,13 @@ pub struct ParsedCreateColumnAst {
     pub nullable: bool,
     pub default_sql: Option<String>,
     pub auto_increment: bool,
+    pub on_update_current_timestamp: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedCreateTableAst {
     pub name: String,
+    pub if_not_exists: bool,
     pub columns: Vec<ParsedCreateColumnAst>,
     pub primary_key: Vec<String>,
     pub indexes: Vec<ParsedIndexAst>,
