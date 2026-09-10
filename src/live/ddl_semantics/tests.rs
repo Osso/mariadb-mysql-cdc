@@ -793,7 +793,12 @@ fn modify_varchar_preserves_position_and_indexes() {
         super::canonical::observe_operation_state(&expected, &operation).expect("observed state")
     );
     assert_eq!(
-        evidence.generated_sql.as_deref(),
+        super::transform::transform_production_alter_table(
+            "ALTER TABLE accounts MODIFY COLUMN handle VARCHAR(128) NOT NULL"
+        )
+        .expect("render")
+        .target_sql
+        .as_deref(),
         Some("ALTER TABLE `accounts` MODIFY COLUMN `handle` VARCHAR(128) NOT NULL")
     );
 }
