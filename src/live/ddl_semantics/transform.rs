@@ -1354,10 +1354,11 @@ pub fn transform_fixture_create_table_with_defaults(
 ) -> Result<DdlTransformation, String> {
     validate_schema_default_identifier(&defaults.character_set, "character set")?;
     validate_schema_default_identifier(&defaults.collation, "collation")?;
-    if ast
-        .character_set
-        .as_ref()
-        .is_some_and(|charset| !charset.eq_ignore_ascii_case(&defaults.character_set))
+    if ast.collation.is_none()
+        && ast
+            .character_set
+            .as_ref()
+            .is_some_and(|charset| !charset.eq_ignore_ascii_case(&defaults.character_set))
     {
         return Err("CREATE charset differs from resolved defaults".to_string());
     }
