@@ -217,7 +217,7 @@ impl Parser {
     }
 }
 
-fn remove_ordinary_comments(sql: &str) -> Result<String, String> {
+pub(super) fn remove_ordinary_comments(sql: &str) -> Result<String, String> {
     let sql = strip_leading_ordinary_ddl_comments(sql)?;
     let chars = sql.chars().collect::<Vec<_>>();
     let mut result = String::new();

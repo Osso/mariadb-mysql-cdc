@@ -776,6 +776,50 @@ fn modify_varchar_not_null_grammar() {
 }
 
 #[test]
+fn modify_varchar_ordinary_comments() {
+    let sql = include_str!("../../../fixtures/ddl/modify-kg-comic-facets.sql");
+    let expected =
+        "ALTER TABLE `kg_comic_facets` MODIFY COLUMN `facet_vocab_version` VARCHAR(128) NOT NULL";
+    for input in [
+        sql.to_string(),
+        sql.replace("VARCHAR(128)", "VARCHAR(128) -- width\n"),
+    ] {
+        assert_eq!(
+            super::transform::transform_production_alter_table(&input)
+                .expect("ordinary MODIFY comments")
+                .target_sql
+                .as_deref(),
+            Some(expected)
+        );
+        assert!(
+            parse_ddl_operation(&input)
+                .expect("operation")
+                .alter_table_ast
+                .is_some()
+        );
+    }
+    for prefix in [
+        "/*!50000 SET sql_mode='' */",
+        "/*M! SET sql_mode='' */",
+        "/*+ hint */",
+    ] {
+        assert!(!super::transform::supports_production_alter_table(
+            &format!("{prefix} {sql}")
+        ));
+    }
+    for input in [
+        "/* ordinary */ ALTER TABLE t ADD COLUMN c VARCHAR(128) DEFAULT NULL",
+        "/* ordinary */ ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NOT NULL, ADD KEY idx(c)",
+        "/* ordinary */ ALTER TABLE t MODIFY COLUMN c VARCHAR(128) /*! NOT NULL */",
+    ] {
+        assert!(
+            !super::transform::supports_production_alter_table(input),
+            "{input}"
+        );
+    }
+}
+
+#[test]
 fn modify_varchar_preserves_position_and_indexes() {
     let target = semantic_snapshot(7, Some(8));
     let operation =

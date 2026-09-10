@@ -1742,16 +1742,16 @@ fn rename_columns_if_exists_sql(source_sql: &str) -> Result<(Option<&str>, &str)
     Ok((leading_comment, statement_sql))
 }
 
-fn production_alter_sql(source_sql: &str) -> Result<&str, String> {
-    let (_, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
-    if ddl_contains_comments(statement_sql) {
-        return Err("production ALTER TABLE comments are not supported".to_string());
-    }
-    Ok(statement_sql)
-}
-
 pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterTableAst, String> {
-    let source_sql = production_alter_sql(source_sql)?;
+    let (_, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
+    let modify_comments = ddl_contains_comments(statement_sql);
+    let stripped;
+    let source_sql = if modify_comments {
+        stripped = observed_create::remove_ordinary_comments(source_sql)?;
+        stripped.as_str()
+    } else {
+        statement_sql
+    };
     let (tokens, quoted_flags) = tokenize_ddl_with_quoted_flags(source_sql)?;
     require_keyword(&tokens, 0, "ALTER")?;
     require_keyword(&tokens, 1, "TABLE")?;
@@ -1759,6 +1759,15 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
     let literals = extract_single_quoted_literals(source_sql)?;
     let (clauses, algorithm, lock) =
         parse_production_alter_body(&tokens, &quoted_flags, &table, literals)?;
+    if modify_comments
+        && (algorithm.is_some()
+            || lock.is_some()
+            || !clauses
+                .iter()
+                .all(|clause| matches!(clause, ParsedAlterClause::ModifyVarchar { .. })))
+    {
+        return Err("ordinary ALTER comments require only modeled MODIFY clauses".to_string());
+    }
     Ok(ParsedAlterTableAst {
         table,
         clauses,

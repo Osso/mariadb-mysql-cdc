@@ -2237,7 +2237,7 @@ DELIMITER ;
         rows_stop = self.coordinate()
         self.admin_sql(
             self.source,
-            "ALTER TABLE kg_comic_facets MODIFY COLUMN facet_vocab_version VARCHAR(128) NOT NULL;",
+            (self.repo / "fixtures/ddl/modify-kg-comic-facets.sql").read_text(),
         )
         alter_stop = self.coordinate()
         self.admin_sql(
