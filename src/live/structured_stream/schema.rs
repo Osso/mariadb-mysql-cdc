@@ -368,11 +368,18 @@ fn enum_column_indexes(table_map: &MysqlCdcTableMapEvent) -> Vec<usize> {
     table_map
         .column_types
         .iter()
+        .zip(&table_map.column_metadata)
         .enumerate()
-        .filter_map(|(index, column_type)| {
-            (*column_type == MYSQL_COLUMN_TYPE_ENUM).then_some(index)
+        .filter_map(|(index, (column_type, metadata))| {
+            is_enum_column(*column_type, *metadata).then_some(index)
         })
         .collect()
+}
+
+fn is_enum_column(column_type: u8, metadata: u16) -> bool {
+    column_type == MYSQL_COLUMN_TYPE_ENUM
+        || (column_type == MYSQL_COLUMN_TYPE_STRING
+            && metadata >> 8 == u16::from(MYSQL_COLUMN_TYPE_ENUM))
 }
 
 pub(super) fn set_columns_from_metadata(
