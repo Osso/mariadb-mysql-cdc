@@ -1417,10 +1417,13 @@ fn render_create_column(column: &ParsedCreateColumnAst) -> String {
     } else {
         ""
     };
+    let column_type = match column.column_type.strip_prefix("enum(") {
+        Some(labels) => format!("ENUM({labels}"),
+        None => column.column_type.to_ascii_uppercase(),
+    };
     format!(
-        "{} {} {nullability}{default}{on_update}{auto_increment}",
+        "{} {column_type} {nullability}{default}{on_update}{auto_increment}",
         quote_identifier(&column.name),
-        column.column_type.to_ascii_uppercase()
     )
 }
 

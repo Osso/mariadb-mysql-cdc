@@ -345,7 +345,11 @@ pub(crate) fn expected_create_table_post_state(
                 crate::inventory::ColumnInventory {
                     name: column.name.clone(),
                     ordinal_position: (index + 1) as u32,
-                    column_type: column.column_type.to_ascii_lowercase(),
+                    column_type: if data_type == "enum" {
+                        format!("enum{}", &column.column_type[4..])
+                    } else {
+                        column.column_type.to_ascii_lowercase()
+                    },
                     data_type,
                     is_nullable: column.nullable,
                     character_set,
@@ -403,18 +407,16 @@ fn expected_create_column_extra(column: &super::model::ParsedCreateColumnAst) ->
     if column.auto_increment {
         return "auto_increment".to_string();
     }
-    if column
+    let generated_default = column
         .default_sql
         .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("CURRENT_TIMESTAMP"))
-    {
-        return if column.on_update_current_timestamp {
-            "DEFAULT_GENERATED on update CURRENT_TIMESTAMP".to_string()
-        } else {
-            "DEFAULT_GENERATED".to_string()
-        };
+        .is_some_and(|value| value.eq_ignore_ascii_case("CURRENT_TIMESTAMP"));
+    match (generated_default, column.on_update_current_timestamp) {
+        (true, true) => "DEFAULT_GENERATED on update CURRENT_TIMESTAMP".to_string(),
+        (true, false) => "DEFAULT_GENERATED".to_string(),
+        (false, true) => "on update CURRENT_TIMESTAMP".to_string(),
+        (false, false) => String::new(),
     }
-    String::new()
 }
 
 fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::Value {

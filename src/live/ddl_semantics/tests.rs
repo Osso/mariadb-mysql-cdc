@@ -1621,6 +1621,117 @@ fn fixture_create_table_evidence_captures_fenced_source_defaults_and_explicit_sq
     );
 }
 
+fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
+    use super::model::{ParsedCreateColumnAst, ParsedCreateTableAst};
+    ParsedCreateTableAst {
+        name: "shelves".into(),
+        if_not_exists: true,
+        columns: vec![
+            ParsedCreateColumnAst {
+                name: "id".into(),
+                column_type: "int unsigned".into(),
+                nullable: false,
+                default_sql: None,
+                auto_increment: true,
+                on_update_current_timestamp: false,
+            },
+            ParsedCreateColumnAst {
+                name: "kind".into(),
+                column_type: "enum('Western','manGa','can''t')".into(),
+                nullable: false,
+                default_sql: None,
+                auto_increment: false,
+                on_update_current_timestamp: false,
+            },
+            ParsedCreateColumnAst {
+                name: "updated_at".into(),
+                column_type: "timestamp".into(),
+                nullable: true,
+                default_sql: None,
+                auto_increment: false,
+                on_update_current_timestamp: true,
+            },
+            ParsedCreateColumnAst {
+                name: "created_at".into(),
+                column_type: "timestamp".into(),
+                nullable: false,
+                default_sql: Some("CURRENT_TIMESTAMP".into()),
+                auto_increment: false,
+                on_update_current_timestamp: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+        indexes: Vec::new(),
+        engine: "InnoDB".into(),
+        character_set: Some("utf8mb4".into()),
+        collation: Some("utf8mb4_unicode_ci".into()),
+    }
+}
+
+#[test]
+fn create_enum_labels_retain_case_in_rendered_sql() {
+    let ast = create_enum_timestamp_ast();
+    let defaults = crate::inventory::SchemaDefaults {
+        character_set: "utf8mb4".into(),
+        collation: "utf8mb4_unicode_ci".into(),
+    };
+    let rendered = super::transform::transform_fixture_create_table_with_defaults(&ast, &defaults)
+        .expect("render CREATE");
+    assert_eq!(
+        rendered.target_sql.as_deref(),
+        Some(
+            "CREATE TABLE `shelves` (`id` INT UNSIGNED NOT NULL AUTO_INCREMENT, `kind` ENUM('Western','manGa','can''t') NOT NULL, `updated_at` TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP, `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        )
+    );
+}
+
+#[test]
+fn create_enum_labels_retain_case_in_expected_inventory() {
+    let ast = create_enum_timestamp_ast();
+    let defaults = crate::inventory::SchemaDefaults {
+        character_set: "utf8mb4".into(),
+        collation: "utf8mb4_unicode_ci".into(),
+    };
+    let state: serde_json::Value = serde_json::from_str(
+        &super::canonical::expected_create_table_post_state(&ast, &defaults)
+            .expect("expected state"),
+    )
+    .expect("state JSON");
+    assert_eq!(
+        state["definition"]["columns"][1]["column_type"],
+        "enum('Western','manGa','can''t')"
+    );
+    assert_eq!(
+        state["definition"]["columns"][1]["character_set"],
+        "utf8mb4"
+    );
+    assert_eq!(
+        state["definition"]["columns"][1]["collation"],
+        "utf8mb4_unicode_ci"
+    );
+}
+
+#[test]
+fn create_timestamp_on_update_does_not_require_generated_default() {
+    let ast = create_enum_timestamp_ast();
+    let defaults = crate::inventory::SchemaDefaults {
+        character_set: "utf8mb4".into(),
+        collation: "utf8mb4_unicode_ci".into(),
+    };
+    let state: serde_json::Value = serde_json::from_str(
+        &super::canonical::expected_create_table_post_state(&ast, &defaults)
+            .expect("expected state"),
+    )
+    .expect("state JSON");
+    let columns = &state["definition"]["columns"];
+    assert_eq!(columns[0]["extra"], "auto_increment");
+    assert_eq!(columns[2]["extra"], "on update CURRENT_TIMESTAMP");
+    assert_eq!(columns[2]["default_value"], serde_json::Value::Null);
+    assert_eq!(columns[2]["is_nullable"], true);
+    assert_eq!(columns[3]["extra"], "DEFAULT_GENERATED");
+    assert_eq!(columns[3]["default_value"], "CURRENT_TIMESTAMP");
+}
+
 #[test]
 fn fixture_create_table_expected_post_state_matches_observed_inventory_exactly() {
     let source_sql = "CREATE TABLE accounts (\
