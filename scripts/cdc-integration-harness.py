@@ -84,6 +84,7 @@ SCENARIOS = (
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("add-char-column-pending-replay", True),
+    ScenarioSpec("add-signed-tinyint-pending-replay", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
@@ -1773,23 +1774,14 @@ DELIMITER ;
             raise HarnessError(f"unexpected unresolved DDL journal debt after strict replay: {pending}")
         print(f"strict_secondary_btree_ok coordinate={stop.file}:{stop.position} journal_rows={len(rows)}")
 
-    def run_add_char_column_pending_replay(self) -> None:
+    def prepare_pending_add_column(
+        self, schema: str, ddl: str
+    ) -> tuple[Coordinate, dict[str, str]]:
         assert self.source and self.target
-        schema = (
-            "CREATE TABLE release_states (id INT NOT NULL PRIMARY KEY, "
-            "facet_vocab_version VARCHAR(96) DEFAULT NULL, payload VARCHAR(64)) "
-            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci; "
-            "INSERT INTO release_states VALUES (7, 'v1', 'before');"
-        )
         for endpoint in (self.source, self.target):
             self.admin_sql(endpoint, schema)
         start = self.coordinate()
         self.write_checkpoint(start)
-        ddl = (
-            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ "
-            "ALTER TABLE release_states ADD COLUMN `prompt_sha256` CHAR(64) "
-            "DEFAULT NULL AFTER `facet_vocab_version`"
-        )
         run(
             [
                 "mariadb",
@@ -1817,7 +1809,7 @@ DELIMITER ;
             if "\tQuery\t" in line and "ADD COLUMN" in line
         ]
         if len(queries) != 1:
-            raise HarnessError(f"expected one CHAR ADD event, got {events!r}")
+            raise HarnessError(f"expected one ADD COLUMN event, got {events!r}")
         file, position, _, server_id, end_position, info = queries[0]
         if info != f"use `{APP_SCHEMA}`; {ddl}":
             raise HarnessError(f"source failed to preserve ordinary comment: {info!r}")
@@ -1839,11 +1831,11 @@ DELIMITER ;
             or pending["generated_sql"] != "NULL"
         ):
             raise HarnessError(f"pending fixture not persisted: {pending!r}")
-        self.admin_sql(
-            self.source,
-            "UPDATE release_states SET prompt_sha256=REPEAT('a',64),payload='after' WHERE id=7; "
-            "INSERT INTO release_states (id,facet_vocab_version,payload) VALUES (8,'v2','nullable');",
-        )
+        return start, pending
+
+    def replay_pending_add_column(
+        self, start: Coordinate, pending: dict[str, str]
+    ) -> Coordinate:
         stop = self.coordinate()
         process, log = self.start_stream(start, stop)
         try:
@@ -1851,7 +1843,9 @@ DELIMITER ;
             while process.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.1)
             if process.poll() != 0:
-                raise HarnessError(f"CHAR ADD pending replay failed: {log.read_text()}")
+                raise HarnessError(
+                    f"ADD COLUMN pending replay failed: {log.read_text()}"
+                )
         finally:
             self.stop_sync_process(process)
         promoted = self.journal_full_row()
@@ -1874,34 +1868,121 @@ DELIMITER ;
             raise HarnessError(
                 f"pending row was not promoted with evidence: {promoted!r}"
             )
-        metadata = self.admin_query(
-            self.target,
-            "SELECT column_name,column_type,is_nullable,column_default,ordinal_position,"
-            "character_set_name,collation_name FROM information_schema.columns "
-            "WHERE table_schema='globalcomix' AND table_name='release_states' "
-            "AND column_name='prompt_sha256';",
-        ).strip()
-        expected = "prompt_sha256\tchar(64)\tYES\tNULL\t3\tutf8mb4\tutf8mb4_unicode_ci"
-        if metadata != expected:
-            raise HarnessError(f"CHAR metadata/order/default mismatch: {metadata!r}")
-        expected_rows = f"7\tv1\t{'a' * 64}\tafter\n8\tv2\tNULL\tnullable"
-        for endpoint in (self.source, self.target):
-            rows = self.admin_query(
-                endpoint, "SELECT * FROM release_states ORDER BY id;"
-            ).strip()
-            if rows != expected_rows:
-                raise HarnessError(
-                    f"post-DDL rows differ at {endpoint.container}: {rows!r}"
-                )
         checkpoint = self.checkpoint()
         if (
             checkpoint["source_file"] != stop.file
             or checkpoint["source_position"] != stop.position
         ):
             raise HarnessError(f"post-DDL checkpoint did not advance: {checkpoint!r}")
+        return stop
+
+    def assert_added_column_metadata(
+        self, table: str, column: str, expected: str
+    ) -> None:
+        assert self.target
+        metadata = self.admin_query(
+            self.target,
+            "SELECT column_name,column_type,is_nullable,column_default,ordinal_position,"
+            "character_set_name,collation_name FROM information_schema.columns "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name={sql_literal(table)} "
+            f"AND column_name={sql_literal(column)};",
+        ).strip()
+        if metadata != expected:
+            raise HarnessError(
+                f"{table}.{column} metadata/order/default mismatch: {metadata!r}"
+            )
+
+    def assert_post_ddl_rows(self, table: str, expected: str) -> None:
+        assert self.source and self.target
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(
+                endpoint, f"SELECT * FROM `{table}` ORDER BY id;"
+            ).strip()
+            if rows != expected:
+                raise HarnessError(
+                    f"post-DDL rows differ at {endpoint.container}: {rows!r}"
+                )
+
+    def run_add_char_column_pending_replay(self) -> None:
+        assert self.source
+        schema = (
+            "CREATE TABLE release_states (id INT NOT NULL PRIMARY KEY, "
+            "facet_vocab_version VARCHAR(96) DEFAULT NULL, payload VARCHAR(64)) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci; "
+            "INSERT INTO release_states VALUES (7, 'v1', 'before');"
+        )
+        ddl = (
+            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ "
+            "ALTER TABLE release_states ADD COLUMN `prompt_sha256` CHAR(64) "
+            "DEFAULT NULL AFTER `facet_vocab_version`"
+        )
+        start, pending = self.prepare_pending_add_column(schema, ddl)
+        self.admin_sql(
+            self.source,
+            "UPDATE release_states SET prompt_sha256=REPEAT('a',64),payload='after' WHERE id=7; "
+            "INSERT INTO release_states (id,facet_vocab_version,payload) VALUES (8,'v2','nullable');",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_added_column_metadata(
+            "release_states",
+            "prompt_sha256",
+            "prompt_sha256\tchar(64)\tYES\tNULL\t3\tutf8mb4\tutf8mb4_unicode_ci",
+        )
+        self.assert_post_ddl_rows(
+            "release_states", f"7\tv1\t{'a' * 64}\tafter\n8\tv2\tNULL\tnullable"
+        )
         print(
             "add_char_column_pending_replay_ok pending_promoted=true immutable_identity=true "
             f"metadata=true post_ddl_rows=true coordinate={stop.file}:{stop.position}"
+        )
+
+    def run_add_signed_tinyint_pending_replay(self) -> None:
+        assert self.source and self.target
+        schema = (
+            "CREATE TABLE queue_items (id INT NOT NULL PRIMARY KEY, "
+            "end_time DATETIME DEFAULT NULL, payload VARCHAR(64)) ENGINE=InnoDB; "
+            "INSERT INTO queue_items VALUES (7, NULL, 'before');"
+        )
+        ddl = (
+            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ "
+            "ALTER TABLE `queue_items` ADD COLUMN `is_admin_only` TINYINT(1) "
+            "NOT NULL DEFAULT 0 AFTER `end_time`"
+        )
+        start, pending = self.prepare_pending_add_column(schema, ddl)
+        self.admin_sql(
+            self.source,
+            "UPDATE queue_items SET is_admin_only=-128,payload='minimum' WHERE id=7; "
+            "INSERT INTO queue_items (id,is_admin_only,payload) VALUES "
+            "(8,127,'maximum'),(10,-1,'negative'),(11,1,'positive'); "
+            "INSERT INTO queue_items (id,payload) VALUES (9,'default');",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_added_column_metadata(
+            "queue_items",
+            "is_admin_only",
+            "is_admin_only\ttinyint\tNO\t0\t3\tNULL\tNULL",
+        )
+        for endpoint in (self.source, self.target):
+            for value, error in [
+                (128, "Out of range value"),
+                (-129, "Out of range value"),
+                ("NULL", "cannot be null"),
+            ]:
+                self.assert_admin_sql_rejected(
+                    endpoint,
+                    "SET SESSION sql_mode='STRICT_ALL_TABLES'; "
+                    f"INSERT INTO queue_items (id,is_admin_only) VALUES (99,{value});",
+                    error,
+                )
+        self.assert_post_ddl_rows(
+            "queue_items",
+            "7\tNULL\t-128\tminimum\n8\tNULL\t127\tmaximum\n9\tNULL\t0\tdefault\n"
+            "10\tNULL\t-1\tnegative\n11\tNULL\t1\tpositive",
+        )
+        print(
+            "add_signed_tinyint_pending_replay_ok pending_promoted=true immutable_identity=true "
+            "signed_range=true nullability=true default=true order=true post_ddl_rows=true "
+            f"coordinate={stop.file}:{stop.position}"
         )
 
     def run_production_alter_table(self) -> None:
@@ -6200,6 +6281,8 @@ DELIMITER ;
             self.run_production_alter_table()
         elif scenario == "add-char-column-pending-replay":
             self.run_add_char_column_pending_replay()
+        elif scenario == "add-signed-tinyint-pending-replay":
+            self.run_add_signed_tinyint_pending_replay()
         elif scenario == "create-facets-historical-crash-restart":
             self.run_create_facets_historical_crash_restart()
         elif scenario == "create-table-crash-restart":
