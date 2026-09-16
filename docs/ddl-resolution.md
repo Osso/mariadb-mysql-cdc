@@ -7,16 +7,17 @@ Automatic admission currently covers strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
 metadata and no FK dependency; the production-observed unqualified multi-clause
 `ALTER TABLE` form with general `ADD COLUMN` under the exact unquoted type grammar
-`VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or
-`FLOAT UNSIGNED`; plus the exact `content_sections_events_raw` two-column
-`ADD COLUMN IF NOT EXISTS ... TIMESTAMP NULL DEFAULT NULL COMMENT ...,
-ALGORITHM=INSTANT` recovery shape. Quoted type keywords, quoted `VARCHAR` lengths,
-and quoted `UNSIGNED` forms are rejected, as are `DATETIME` precision, `SMALLINT`
-display width, `FLOAT` parameters, and every other guarded `TIMESTAMP` or algorithm
-variant. The observed `NULL` or `NOT NULL`, `DEFAULT NULL`
-or `DEFAULT 0`, `COMMENT`, and `AFTER` options, named composite `ADD KEY`,
-MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
-clauses. Multiple admitted clauses render in source order as deterministic MySQL
+`CHAR(canonical decimal length 1..255)`, `VARCHAR(positive canonical decimal length)`,
+`DATETIME`, `SMALLINT UNSIGNED`, or `FLOAT UNSIGNED`; plus the exact
+`content_sections_events_raw` two-column `ADD COLUMN IF NOT EXISTS ... TIMESTAMP
+NULL DEFAULT NULL COMMENT ..., ALGORITHM=INSTANT` recovery shape. Quoted type
+keywords, quoted character-type lengths, quoted `UNSIGNED` forms, `DATETIME`
+precision, `SMALLINT` display width, `FLOAT` parameters, and every other guarded
+`TIMESTAMP` or algorithm variant are rejected. Modeled ADD COLUMN clauses admit
+ordinary block and inline line comments; executable/version comments and optimizer
+hints remain rejected. The observed `NULL` or `NOT NULL`, `DEFAULT NULL` or
+`DEFAULT 0`, `COMMENT`, and `AFTER` options, named composite `ADD KEY`,
+MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY` clauses. Multiple admitted clauses render in source order as deterministic MySQL
 8 SQL; source `ADD INDEX` emits as target `ADD KEY`. The slice also admits
 `DROP COLUMN IF EXISTS`
 with ASCII-case-insensitive target matching, one emitted drop per matched target spelling, and absent or repeated case-variant no-ops; the source-only
