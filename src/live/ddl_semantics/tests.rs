@@ -2248,6 +2248,55 @@ fn production_tinyint_unsigned_add_column_normalizes_display_width() {
 }
 
 #[test]
+fn signed_tinyint_add_column_replay_metadata() {
+    let sql = "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ ALTER TABLE accounts ADD COLUMN is_admin_only TINYINT(1) NOT NULL DEFAULT 0 AFTER id";
+    assert_eq!(
+        transform_production_alter_table(sql)
+            .expect("signed TINYINT ADD")
+            .target_sql
+            .as_deref(),
+        Some(
+            "ALTER TABLE `accounts` ADD COLUMN `is_admin_only` TINYINT NOT NULL DEFAULT 0 AFTER `id`"
+        )
+    );
+    let target = semantic_snapshot(7, Some(8));
+    let operation = parse_ddl_operation(sql).expect("signed TINYINT operation");
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("signed evidence");
+    let mut expected = target.clone();
+    expected.inventory.tables[0].columns[1].ordinal_position = 3;
+    expected.inventory.tables[0].columns.insert(
+        1,
+        ColumnInventory {
+            name: "is_admin_only".into(),
+            ordinal_position: 2,
+            column_type: "tinyint".into(),
+            data_type: "tinyint".into(),
+            is_nullable: false,
+            character_set: None,
+            collation: None,
+            default_value: Some("0".into()),
+            extra: String::new(),
+            comment: String::new(),
+            generated: None,
+        },
+    );
+    assert_eq!(
+        evidence.expected_post_state,
+        super::canonical::observe_operation_state(&expected, &operation)
+            .expect("signed post-state")
+    );
+    for rejected in [
+        sql.replace("TINYINT(1)", "TINYINT(2)"),
+        sql.replace("TINYINT(1)", "TINYINT(01)"),
+        sql.replace("TINYINT(1)", "TINYINT(`1`)"),
+        sql.replace("TINYINT(1)", "`TINYINT`(1)"),
+        sql.replace("DEFAULT 0", "DEFAULT 0 UNSIGNED"),
+    ] {
+        assert!(!supports_production_alter_table(&rejected), "{rejected}");
+    }
+}
+
+#[test]
 fn already_present_tinyint_add_column_has_equal_pre_and_post_state() {
     let target = artists_settings_with_disable_sam("0");
     let operation = parse_ddl_operation(DISABLE_SAM_DDL).expect("production ALTER");

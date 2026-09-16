@@ -2067,8 +2067,7 @@ fn parse_observed_column_type(
             data_type.clone()
         }
         "tinyint" => {
-            let (column_type, next_index) =
-                parse_tinyint_unsigned_type(tokens, quoted_flags, index)?;
+            let (column_type, next_index) = parse_tinyint_type(tokens, quoted_flags, index)?;
             index = next_index;
             column_type
         }
@@ -2101,7 +2100,7 @@ fn parse_observed_column_type(
     Ok((column_type, data_type, index))
 }
 
-fn parse_tinyint_unsigned_type(
+fn parse_tinyint_type(
     tokens: &[String],
     quoted_flags: &[bool],
     mut index: usize,
@@ -2115,9 +2114,14 @@ fn parse_tinyint_unsigned_type(
         require_keyword(tokens, index + 2, ")")?;
         index += 3;
     }
-    require_unquoted_token(quoted_flags, index, "TINYINT UNSIGNED keyword")?;
-    require_keyword(tokens, index, "UNSIGNED")?;
-    Ok(("tinyint unsigned".to_string(), index + 1))
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("UNSIGNED"))
+    {
+        require_unquoted_token(quoted_flags, index, "TINYINT UNSIGNED keyword")?;
+        return Ok(("tinyint unsigned".to_string(), index + 1));
+    }
+    Ok(("tinyint".to_string(), index))
 }
 
 fn require_unquoted_token(
