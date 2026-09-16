@@ -1702,6 +1702,10 @@ fn create_enum_labels_retain_case_in_expected_inventory() {
         "enum('Western','manGa','can''t')"
     );
     assert_eq!(
+        state["definition"]["columns"][1]["default_value"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
         state["definition"]["columns"][1]["character_set"],
         "utf8mb4"
     );
