@@ -756,6 +756,56 @@ fn add_varchar_column_expected_state_uses_table_default_encoding() {
 }
 
 #[test]
+fn add_char_column_with_ordinary_comment() {
+    let sql = "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ ALTER TABLE accounts ADD COLUMN `prompt_sha256` CHAR(64) DEFAULT NULL AFTER `handle`";
+    assert_eq!(
+        super::transform::transform_production_alter_table(sql)
+            .expect("commented CHAR ADD")
+            .target_sql
+            .as_deref(),
+        Some(
+            "ALTER TABLE `accounts` ADD COLUMN `prompt_sha256` CHAR(64) NULL DEFAULT NULL AFTER `handle`"
+        )
+    );
+    let target = semantic_snapshot(7, Some(8));
+    let operation = parse_ddl_operation(sql).expect("CHAR operation");
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("CHAR evidence");
+    let mut expected = target.clone();
+    expected.inventory.tables[0].columns.push(ColumnInventory {
+        name: "prompt_sha256".into(),
+        ordinal_position: 3,
+        column_type: "char(64)".into(),
+        data_type: "char".into(),
+        is_nullable: true,
+        character_set: Some("utf8mb4".into()),
+        collation: Some("utf8mb4_unicode_ci".into()),
+        default_value: None,
+        extra: String::new(),
+        comment: String::new(),
+        generated: None,
+    });
+    assert_eq!(
+        evidence.expected_post_state,
+        super::canonical::observe_operation_state(&expected, &operation).expect("CHAR post-state")
+    );
+    for rejected in [
+        sql.replace("CHAR(64)", "CHAR(256)"),
+        sql.replace("CHAR(64)", "CHAR(064)"),
+        sql.replace("CHAR(64)", "CHAR(`64`)"),
+        sql.replace("CHAR(64)", "CHAR(64) UNSIGNED"),
+        sql.replace(
+            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */",
+            "/*!50000 SET sql_mode='' */",
+        ),
+    ] {
+        assert!(
+            !super::transform::supports_production_alter_table(&rejected),
+            "{rejected}"
+        );
+    }
+}
+
+#[test]
 fn modify_varchar_not_null_grammar() {
     let sql = "ALTER TABLE kg_comic_facets MODIFY COLUMN facet_vocab_version VARCHAR(128) NOT NULL";
     let ast = parse_production_alter_table_ast(sql).expect("observed MODIFY");
@@ -808,7 +858,6 @@ fn modify_varchar_ordinary_comments() {
         ));
     }
     for input in [
-        "/* ordinary */ ALTER TABLE t ADD COLUMN c VARCHAR(128) DEFAULT NULL",
         "/* ordinary */ ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NOT NULL, ADD KEY idx(c)",
         "/* ordinary */ ALTER TABLE t MODIFY COLUMN c VARCHAR(128) /*! NOT NULL */",
     ] {

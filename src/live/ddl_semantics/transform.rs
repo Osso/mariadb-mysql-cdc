@@ -1744,9 +1744,9 @@ fn rename_columns_if_exists_sql(source_sql: &str) -> Result<(Option<&str>, &str)
 
 pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterTableAst, String> {
     let (_, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
-    let modify_comments = ddl_contains_comments(statement_sql);
+    let ordinary_comments = ddl_contains_comments(statement_sql);
     let stripped;
-    let source_sql = if modify_comments {
+    let source_sql = if ordinary_comments {
         stripped = observed_create::remove_ordinary_comments(source_sql)?;
         stripped.as_str()
     } else {
@@ -1759,14 +1759,19 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
     let literals = extract_single_quoted_literals(source_sql)?;
     let (clauses, algorithm, lock) =
         parse_production_alter_body(&tokens, &quoted_flags, &table, literals)?;
-    if modify_comments
+    if ordinary_comments
         && (algorithm.is_some()
             || lock.is_some()
-            || !clauses
-                .iter()
-                .all(|clause| matches!(clause, ParsedAlterClause::ModifyVarchar { .. })))
+            || !clauses.iter().all(|clause| {
+                matches!(
+                    clause,
+                    ParsedAlterClause::ModifyVarchar { .. } | ParsedAlterClause::AddColumn(_)
+                )
+            }))
     {
-        return Err("ordinary ALTER comments require only modeled MODIFY clauses".to_string());
+        return Err(
+            "ordinary ALTER comments require only modeled ADD COLUMN or MODIFY clauses".to_string(),
+        );
     }
     Ok(ParsedAlterTableAst {
         table,
@@ -2018,7 +2023,7 @@ fn parse_observed_column_type(
     let data_type = require_identifier(tokens, index, "added column type")?.to_ascii_lowercase();
     if !matches!(
         data_type.as_str(),
-        "varchar" | "datetime" | "timestamp" | "tinyint" | "smallint" | "float"
+        "char" | "varchar" | "datetime" | "timestamp" | "tinyint" | "smallint" | "float"
     ) {
         return Err(format!(
             "unsupported production ADD COLUMN type {data_type}"
@@ -2026,10 +2031,14 @@ fn parse_observed_column_type(
     }
     index += 1;
     let column_type = match data_type.as_str() {
-        "varchar" => {
-            require_unquoted_token(quoted_flags, index, "VARCHAR opening parenthesis")?;
-            require_unquoted_token(quoted_flags, index + 1, "VARCHAR length")?;
-            require_unquoted_token(quoted_flags, index + 2, "VARCHAR closing parenthesis")?;
+        "char" | "varchar" => {
+            require_unquoted_token(quoted_flags, index, "character type opening parenthesis")?;
+            require_unquoted_token(quoted_flags, index + 1, "character type length")?;
+            require_unquoted_token(
+                quoted_flags,
+                index + 2,
+                "character type closing parenthesis",
+            )?;
             require_keyword(tokens, index, "(")?;
             let length = tokens
                 .get(index + 1)
@@ -2041,9 +2050,12 @@ fn parse_observed_column_type(
             if parsed_length == 0 || parsed_length.to_string() != length {
                 return Err(format!("noncanonical column type length {length}"));
             }
+            if data_type == "char" && parsed_length > 255 {
+                return Err(format!("CHAR length exceeds 255: {parsed_length}"));
+            }
             require_keyword(tokens, index + 2, ")")?;
             index += 3;
-            format!("varchar({parsed_length})")
+            format!("{data_type}({parsed_length})")
         }
         "datetime" | "timestamp" => {
             if tokens.get(index).map(String::as_str) == Some("(") {
