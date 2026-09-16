@@ -118,6 +118,7 @@ broader DDL coverage and operational proof gaps listed below.
       a composite primary key; named composite ordinary keys; `ENGINE=InnoDB`;
       and `DEFAULT CHARSET=utf8mb4`. It preserves the event definition, including
       historical `VARCHAR(80)`, rather than reading a later source definition.
+- [x] The observed storefront CREATE additionally models `INT UNSIGNED` with non-null `AUTO_INCREMENT`, signed `TINYINT(1)`, `ENUM` members containing only ASCII letters/digits/underscores, nullable columns, explicit `DEFAULT NULL`, integer `DEFAULT 0`, signed-tinyint `DEFAULT 1`, optional timestamp default/on-update clauses, and named composite `UNIQUE KEY`. Enum value spelling is retained; strings with backslash escapes and unmodeled defaults/options remain blocked. Historical charset evidence and target-absent preconditions are unchanged. The concrete parser fixture is `fixtures/ddl/create-storefront-chips.sql`; integration/deployment proof is recorded separately.
 - [x] For a charset-only CREATE, runtime decodes MariaDB QueryEvent status
       variables `Q_CHARACTER_SET_COLLATIONS` and resolves the historical
       `utf8mb4` collation through the source collation-ID catalog. The canonical
