@@ -128,6 +128,67 @@ fn metadata_table_map_supplies_set_member_names() {
 }
 
 #[test]
+fn string_encoded_enum_metadata_maps_labels_and_row_values() {
+    let labels = vec!["western".to_string(), "Manga".to_string()];
+    let table_map = MysqlCdcTableMapEvent {
+        table_id: 80,
+        database_name: "app".to_string(),
+        table_name: "chips".to_string(),
+        column_types: vec![3, 254],
+        column_metadata: vec![0, (u16::from(MYSQL_COLUMN_TYPE_ENUM) << 8) | 1],
+        null_bitmap: vec![false, false],
+        table_metadata: Some(TableMetadata {
+            signedness: None,
+            default_charset: None,
+            column_charsets: None,
+            column_names: Some(vec!["id".to_string(), "tab".to_string()]),
+            set_string_values: None,
+            enum_string_values: Some(vec![labels.clone()]),
+            geometry_types: None,
+            simple_primary_keys: Some(vec![0]),
+            primary_keys_with_prefix: None,
+            enum_and_set_default_charset: None,
+            enum_and_set_column_charsets: None,
+            column_visibility: None,
+        }),
+    };
+    let mapped = map_table_map_event(&stream_coordinate(100), &table_map, &EmptySchemaResolver)
+        .expect("map STRING-encoded ENUM metadata")
+        .expect("mapped table");
+    assert_eq!(mapped.table.enum_columns.get("tab"), Some(&labels));
+
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let mut state = StructuredEventState::new(Some("app".to_string()));
+    let write = MysqlCdcWriteRowsEvent {
+        table_id: 80,
+        flags: 0,
+        columns_number: 2,
+        columns_present: vec![true, true],
+        rows: vec![RowData::new(vec![
+            Some(MySqlValue::Int(7)),
+            Some(MySqlValue::Enum(2)),
+        ])],
+    };
+    for event in [
+        BinlogEvent::TableMapEvent(table_map),
+        BinlogEvent::WriteRowsEvent(write),
+    ] {
+        handle_structured_event(
+            &mut applier,
+            &EmptySchemaResolver,
+            &mut state,
+            "mysql-bin.000002",
+            &event_header(99, 120),
+            &event,
+        )
+        .expect("apply STRING-encoded ENUM row");
+    }
+    let statements = applier.executor().statements.borrow();
+    assert_eq!(statements.len(), 1);
+    assert_eq!(statements[0].params, vec![Value::UInt(7), bytes("Manga")]);
+}
+
+#[test]
 fn parses_enum_values_from_inventory_column_type() {
     assert_eq!(
         parse_enum_column_type("enum('1','2','14')"),
