@@ -46,11 +46,14 @@ target SQL is accepted as a resolution path.
 
 The bounded observed `CREATE TABLE IF NOT EXISTS` grammar admits ordinary leading
 block comments and inline `--` comments; unsigned `MEDIUMINT`, `SMALLINT`, and
-`TINYINT`; canonical `VARCHAR(n)`; `DECIMAL(4,3)`; the observed `TIMESTAMP`
-default/on-update form; composite primary and ordinary keys; InnoDB; and
-`DEFAULT CHARSET=utf8mb4`. It uses the event AST, so a historical
-`VARCHAR(80)` remains `VARCHAR(80)` even if the current source table is later
-`VARCHAR(128)`.
+`INT`, signed `TINYINT(1)`, canonical `VARCHAR(n)`, and restricted `ENUM`
+members; explicit `NULL`/`NOT NULL`, observed `DEFAULT NULL`, integer defaults,
+non-null `INT UNSIGNED AUTO_INCREMENT`, and nullable timestamp `ON UPDATE`
+forms. It admits primary, ordinary, and unique keys, InnoDB, and `DEFAULT
+CHARSET=utf8mb4`. Enum member spelling is preserved. Backslash-escaped enum
+strings and unmodeled defaults or options remain unsupported. It uses the event
+AST, so a historical `VARCHAR(80)` remains `VARCHAR(80)` even if the current
+source table is later `VARCHAR(128)`.
 
 When such a CREATE omits `COLLATE`, runtime decodes MariaDB QueryEvent
 `Q_CHARACTER_SET_COLLATIONS` and resolves the historical utf8mb4 collation via
@@ -60,9 +63,10 @@ unsupported context fails closed; current source defaults and a source-coordinat
 fence cannot reconstruct it. The target table must be absent. An existing target
 `CREATE TABLE IF NOT EXISTS` is not a converged no-op in this slice.
 
-As of September 10, 2026, the recorded `kg_comic_facets` CREATE at
-`mysqld-bin.002994:1005806835-1005808327` remains `translation_pending` pending
-final integration proof and deployment. The journal row, coordinate, and
+Parser and semantic rendering tests cover the storefront CREATE additions, but
+real-database replay and deployment proof remain separate gates. The historical
+context requirement and target-absent gate apply unchanged. Unsupported CREATE
+statements remain `translation_pending`; their journal row, coordinate, and
 checkpoint must not be edited manually.
 
 ### Exact production ALTER recovery target
