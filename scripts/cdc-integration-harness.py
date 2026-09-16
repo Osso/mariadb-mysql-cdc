@@ -87,6 +87,7 @@ SCENARIOS = (
     ScenarioSpec("add-signed-tinyint-pending-replay", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
+    ScenarioSpec("storefront-create-pending-replay", True),
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("insert-duplicate-idempotent", True),
     ScenarioSpec("users-update-snapshot-ahead", True),
@@ -1775,11 +1776,12 @@ DELIMITER ;
         print(f"strict_secondary_btree_ok coordinate={stop.file}:{stop.position} journal_rows={len(rows)}")
 
     def prepare_pending_add_column(
-        self, schema: str, ddl: str
+        self, schema: str, ddl: str, marker: str = "ADD COLUMN"
     ) -> tuple[Coordinate, dict[str, str]]:
         assert self.source and self.target
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, schema)
+        if schema:
+            for endpoint in (self.source, self.target):
+                self.admin_sql(endpoint, schema)
         start = self.coordinate()
         self.write_checkpoint(start)
         run(
@@ -1803,14 +1805,23 @@ DELIMITER ;
             self.source,
             f"SHOW BINLOG EVENTS IN {sql_literal(start.file)} FROM {start.position};",
         )
+        event_header = r"^[^\t\n]+\t[0-9]+\t\w+\t[0-9]+\t[0-9]+\t"
         queries = [
-            line.split("\t", 5)
-            for line in events.splitlines()
-            if "\tQuery\t" in line and "ADD COLUMN" in line
+            match.groups()
+            for match in re.finditer(
+                r"^([^\t\n]+)\t([0-9]+)\tQuery\t([0-9]+)\t([0-9]+)\t"
+                + r"(.*?)(?="
+                + event_header
+                + r"|\Z)",
+                events,
+                re.MULTILINE | re.DOTALL,
+            )
+            if marker in match.group(5)
         ]
         if len(queries) != 1:
-            raise HarnessError(f"expected one ADD COLUMN event, got {events!r}")
-        file, position, _, server_id, end_position, info = queries[0]
+            raise HarnessError(f"expected one {marker} event, got {events!r}")
+        file, position, server_id, end_position, info = queries[0]
+        info = info.rstrip("\n")
         if info != f"use `{APP_SCHEMA}`; {ddl}":
             raise HarnessError(f"source failed to preserve ordinary comment: {info!r}")
         identity = f"{SOURCE_IDENTITY}#server-id={server_id}"
@@ -1843,9 +1854,7 @@ DELIMITER ;
             while process.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.1)
             if process.poll() != 0:
-                raise HarnessError(
-                    f"ADD COLUMN pending replay failed: {log.read_text()}"
-                )
+                raise HarnessError(f"DDL pending replay failed: {log.read_text()}")
         finally:
             self.stop_sync_process(process)
         promoted = self.journal_full_row()
@@ -1984,6 +1993,123 @@ DELIMITER ;
             "signed_range=true nullability=true default=true order=true post_ddl_rows=true "
             f"coordinate={stop.file}:{stop.position}"
         )
+
+    def run_storefront_create_pending_replay(self) -> None:
+        assert self.source and self.target
+        self.admin_sql(
+            self.source,
+            "SET GLOBAL character_set_collations='utf8mb4=utf8mb4_unicode_ci';",
+        )
+        self.admin_sql(
+            self.target,
+            f"ALTER DATABASE {APP_SCHEMA} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+        )
+        ddl = (
+            (self.repo / "fixtures/ddl/create-storefront-chips.sql").read_text().strip()
+        )
+        start, pending = self.prepare_pending_add_column("", ddl, "CREATE TABLE")
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='storefront_chips';",
+        ).strip()
+        if absent != "0":
+            raise HarnessError("pending CREATE fixture requires absent target table")
+        self.admin_sql(
+            self.source,
+            "SET GLOBAL character_set_collations='utf8mb4=utf8mb4_general_ci'; "
+            "INSERT INTO storefront_chips(tab,chip_key,display_name) VALUES "
+            "('western','horror','Horror'),('manga','horror','Manga horror'); "
+            "INSERT INTO storefront_chips(chip_key,display_name) VALUES ('implicit','Implicit'); "
+            "UPDATE storefront_chips SET display_name='Updated horror',is_active=-1 WHERE id=1;",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_storefront_create_metadata()
+        expected = "1\twestern\thorror\tUpdated horror\t0\t-1\t1\n2\tmanga\thorror\tManga horror\t0\t1\t0\n3\twestern\timplicit\tImplicit\t0\t1\t0"
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(
+                endpoint,
+                "SELECT id,tab,chip_key,display_name,display_order,is_active,"
+                "update_time IS NOT NULL FROM storefront_chips ORDER BY id;",
+            ).strip()
+            if rows != expected:
+                raise HarnessError(
+                    f"storefront downstream rows/defaults differ: {rows!r}"
+                )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "INSERT INTO storefront_chips(tab,chip_key,display_name) VALUES('western','horror','duplicate');",
+                "Duplicate entry",
+            )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO storefront_chips(chip_key,display_name) VALUES('target-implicit','Target implicit');",
+        )
+        implicit = self.admin_query(
+            self.target,
+            "SELECT tab,display_order,is_active,update_time IS NULL,create_time IS NOT NULL "
+            "FROM storefront_chips WHERE chip_key='target-implicit';",
+        ).strip()
+        if implicit != "western\t0\t1\t1\t1":
+            raise HarnessError(f"target implicit defaults differ: {implicit!r}")
+        print(
+            "storefront_create_pending_replay_ok pending_promoted=true historical_collation=true "
+            "enum_metadata=true implicit_enum_default=true unique_key=true auto_increment=true "
+            f"timestamp_on_update=true post_ddl_rows=true coordinate={stop.file}:{stop.position}"
+        )
+
+    def assert_storefront_create_metadata(self) -> None:
+        assert self.target
+        columns = self.admin_query(
+            self.target,
+            "SELECT column_name,column_type,is_nullable,column_default,ordinal_position,extra "
+            "FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='storefront_chips' "
+            "ORDER BY ordinal_position;",
+        ).strip()
+        expected = "\n".join(
+            [
+                "id\tint unsigned\tNO\tNULL\t1\tauto_increment",
+                "tab\tenum('western','manga','webtoon')\tNO\tNULL\t2\t",
+                "chip_key\tvarchar(64)\tNO\tNULL\t3\t",
+                "display_name\tvarchar(128)\tNO\tNULL\t4\t",
+                "display_order\tsmallint unsigned\tNO\t0\t5\t",
+                "is_active\ttinyint\tNO\t1\t6\t",
+                "updater_id\tint unsigned\tYES\tNULL\t7\t",
+                "update_time\ttimestamp\tYES\tNULL\t8\ton update CURRENT_TIMESTAMP",
+                "creator_id\tint unsigned\tYES\tNULL\t9\t",
+                "create_time\ttimestamp\tNO\tCURRENT_TIMESTAMP\t10\tDEFAULT_GENERATED",
+            ]
+        )
+        if columns != expected:
+            raise HarnessError(f"storefront CREATE metadata mismatch: {columns!r}")
+        collation = self.admin_query(
+            self.target,
+            "SELECT table_collation FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='storefront_chips';",
+        ).strip()
+        if collation != "utf8mb4_unicode_ci":
+            raise HarnessError(
+                f"CREATE used current rather than historical collation: {collation!r}"
+            )
+        keys = self.admin_query(
+            self.target,
+            "SELECT index_name,non_unique,seq_in_index,column_name FROM information_schema.STATISTICS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='storefront_chips' "
+            "ORDER BY index_name,seq_in_index;",
+        ).strip()
+        expected_keys = "\n".join(
+            [
+                "idx_chip_tab_order\t1\t1\ttab",
+                "idx_chip_tab_order\t1\t2\tis_active",
+                "idx_chip_tab_order\t1\t3\tdisplay_order",
+                "PRIMARY\t0\t1\tid",
+                "uq_chip_tab_key\t0\t1\ttab",
+                "uq_chip_tab_key\t0\t2\tchip_key",
+            ]
+        )
+        if keys != expected_keys:
+            raise HarnessError(f"storefront key metadata mismatch: {keys!r}")
 
     def run_production_alter_table(self) -> None:
         assert self.source and self.target
@@ -2743,38 +2869,24 @@ DELIMITER ;
         assert self.target
         output = self.query(
             self.target,
-            "SELECT source_identity,source_server_id,binlog_file,event_start_position,"
-            "event_end_position,schema_name,raw_sql,transformation_version,generated_sql,canonical_ast,"
-            "pre_state,expected_post_state,status,created_at,updated_at "
+            "SELECT JSON_OBJECT('source_identity',source_identity,'source_server_id',source_server_id,"
+            "'binlog_file',binlog_file,'event_start_position',event_start_position,"
+            "'event_end_position',event_end_position,'schema_name',schema_name,'raw_sql',raw_sql,"
+            "'transformation_version',transformation_version,'generated_sql',generated_sql,"
+            "'canonical_ast',canonical_ast,'pre_state',pre_state,'expected_post_state',expected_post_state,"
+            "'status',status,'created_at',CAST(created_at AS CHAR),'updated_at',CAST(updated_at AS CHAR)) "
             "FROM cdc.ddl_replay_journal "
             "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
             "ORDER BY event_start_position;",
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         )
-        rows = [line.split("\t") for line in output.splitlines() if line.strip()]
-        if len(rows) != 1:
-            raise HarnessError(f"expected exactly one immutable journal row, got {output}")
-        if len(rows[0]) != 15:
-            raise HarnessError(f"immutable journal row column mismatch count={len(rows[0])} output={output!r}")
-        names = [
-            "source_identity",
-            "source_server_id",
-            "binlog_file",
-            "event_start_position",
-            "event_end_position",
-            "schema_name",
-            "raw_sql",
-            "transformation_version",
-            "generated_sql",
-            "canonical_ast",
-            "pre_state",
-            "expected_post_state",
-            "status",
-            "created_at",
-            "updated_at",
-        ]
-        return dict(zip(names, rows[0], strict=True))
+        rows = [json.loads(line) for line in output.splitlines() if line.strip()]
+        if len(rows) != 1 or len(rows[0]) != 15:
+            raise HarnessError(
+                f"expected exactly one complete immutable journal row, got {output}"
+            )
+        return {key: "NULL" if value is None else str(value) for key, value in rows[0].items()}
 
     def replace_journal_row(self, row: dict[str, str]) -> None:
         assert self.target
@@ -6285,6 +6397,8 @@ DELIMITER ;
             self.run_add_signed_tinyint_pending_replay()
         elif scenario == "create-facets-historical-crash-restart":
             self.run_create_facets_historical_crash_restart()
+        elif scenario == "storefront-create-pending-replay":
+            self.run_storefront_create_pending_replay()
         elif scenario == "create-table-crash-restart":
             self.run_create_table_crash_restart()
         elif scenario == "bootstrap-contract":
