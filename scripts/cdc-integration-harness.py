@@ -83,6 +83,7 @@ SCENARIOS = (
     ScenarioSpec("sync-progress-least-privilege", True),
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("production-alter-table", True),
+    ScenarioSpec("add-char-column-pending-replay", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("bootstrap-contract", True),
@@ -1771,6 +1772,137 @@ DELIMITER ;
         if pending != "0":
             raise HarnessError(f"unexpected unresolved DDL journal debt after strict replay: {pending}")
         print(f"strict_secondary_btree_ok coordinate={stop.file}:{stop.position} journal_rows={len(rows)}")
+
+    def run_add_char_column_pending_replay(self) -> None:
+        assert self.source and self.target
+        schema = (
+            "CREATE TABLE release_states (id INT NOT NULL PRIMARY KEY, "
+            "facet_vocab_version VARCHAR(96) DEFAULT NULL, payload VARCHAR(64)) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci; "
+            "INSERT INTO release_states VALUES (7, 'v1', 'before');"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema)
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        ddl = (
+            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ "
+            "ALTER TABLE release_states ADD COLUMN `prompt_sha256` CHAR(64) "
+            "DEFAULT NULL AFTER `facet_vocab_version`"
+        )
+        run(
+            [
+                "mariadb",
+                "--protocol=tcp",
+                "--ssl",
+                f"--ssl-ca={self.ca_file}",
+                "--ssl-verify-server-cert",
+                "--host=127.0.0.1",
+                f"--port={self.source.port}",
+                "--user=root",
+                f"--password={ADMIN_PASSWORD}",
+                f"--database={APP_SCHEMA}",
+                "--comments",
+                "--batch",
+            ],
+            input_text=ddl + ";",
+        )
+        events = self.admin_query(
+            self.source,
+            f"SHOW BINLOG EVENTS IN {sql_literal(start.file)} FROM {start.position};",
+        )
+        queries = [
+            line.split("\t", 5)
+            for line in events.splitlines()
+            if "\tQuery\t" in line and "ADD COLUMN" in line
+        ]
+        if len(queries) != 1:
+            raise HarnessError(f"expected one CHAR ADD event, got {events!r}")
+        file, position, _, server_id, end_position, info = queries[0]
+        if info != f"use `{APP_SCHEMA}`; {ddl}":
+            raise HarnessError(f"source failed to preserve ordinary comment: {info!r}")
+        identity = f"{SOURCE_IDENTITY}#server-id={server_id}"
+        # Reproduce the durable translator-unavailable state left by the old binary.
+        self.admin_sql(
+            self.target,
+            "INSERT INTO cdc.ddl_replay_journal "
+            "(source_identity,source_server_id,binlog_file,event_start_position,"
+            "event_end_position,schema_name,raw_sql,transformation_version,generated_sql,"
+            "canonical_ast,pre_state,expected_post_state,status) VALUES ("
+            f"{sql_literal(identity)},{int(server_id)},{sql_literal(file)},"
+            f"{int(position)},{int(end_position)},{sql_literal(APP_SCHEMA)},"
+            f"{sql_literal(ddl)},'translator-unavailable',NULL,'','','','translation_pending');",
+        )
+        pending = self.journal_full_row()
+        if (
+            pending["status"] != "translation_pending"
+            or pending["generated_sql"] != "NULL"
+        ):
+            raise HarnessError(f"pending fixture not persisted: {pending!r}")
+        self.admin_sql(
+            self.source,
+            "UPDATE release_states SET prompt_sha256=REPEAT('a',64),payload='after' WHERE id=7; "
+            "INSERT INTO release_states (id,facet_vocab_version,payload) VALUES (8,'v2','nullable');",
+        )
+        stop = self.coordinate()
+        process, log = self.start_stream(start, stop)
+        try:
+            deadline = time.monotonic() + 30
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if process.poll() != 0:
+                raise HarnessError(f"CHAR ADD pending replay failed: {log.read_text()}")
+        finally:
+            self.stop_sync_process(process)
+        promoted = self.journal_full_row()
+        for field in (
+            "source_identity",
+            "source_server_id",
+            "binlog_file",
+            "event_start_position",
+            "event_end_position",
+            "schema_name",
+            "raw_sql",
+            "created_at",
+        ):
+            if promoted[field] != pending[field]:
+                raise HarnessError(f"promotion changed immutable {field}: {promoted!r}")
+        if promoted["status"] != "checkpointed" or not all(
+            promoted[field]
+            for field in ("canonical_ast", "pre_state", "expected_post_state")
+        ):
+            raise HarnessError(
+                f"pending row was not promoted with evidence: {promoted!r}"
+            )
+        metadata = self.admin_query(
+            self.target,
+            "SELECT column_name,column_type,is_nullable,column_default,ordinal_position,"
+            "character_set_name,collation_name FROM information_schema.columns "
+            "WHERE table_schema='globalcomix' AND table_name='release_states' "
+            "AND column_name='prompt_sha256';",
+        ).strip()
+        expected = "prompt_sha256\tchar(64)\tYES\tNULL\t3\tutf8mb4\tutf8mb4_unicode_ci"
+        if metadata != expected:
+            raise HarnessError(f"CHAR metadata/order/default mismatch: {metadata!r}")
+        expected_rows = f"7\tv1\t{'a' * 64}\tafter\n8\tv2\tNULL\tnullable"
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(
+                endpoint, "SELECT * FROM release_states ORDER BY id;"
+            ).strip()
+            if rows != expected_rows:
+                raise HarnessError(
+                    f"post-DDL rows differ at {endpoint.container}: {rows!r}"
+                )
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint["source_file"] != stop.file
+            or checkpoint["source_position"] != stop.position
+        ):
+            raise HarnessError(f"post-DDL checkpoint did not advance: {checkpoint!r}")
+        print(
+            "add_char_column_pending_replay_ok pending_promoted=true immutable_identity=true "
+            f"metadata=true post_ddl_rows=true coordinate={stop.file}:{stop.position}"
+        )
 
     def run_production_alter_table(self) -> None:
         assert self.source and self.target
@@ -6066,6 +6198,8 @@ DELIMITER ;
             self.run_writable_column_generated_metadata()
         elif scenario == "production-alter-table":
             self.run_production_alter_table()
+        elif scenario == "add-char-column-pending-replay":
+            self.run_add_char_column_pending_replay()
         elif scenario == "create-facets-historical-crash-restart":
             self.run_create_facets_historical_crash_restart()
         elif scenario == "create-table-crash-restart":
