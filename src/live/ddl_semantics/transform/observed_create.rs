@@ -1,5 +1,8 @@
-// Typed grammar for observed facet and storefront CREATE statements.
+// Typed grammar for observed facet, storefront, and reader-memory CREATE statements.
+use super::super::model::{ParsedCheckConstraintAst, ParsedCreateColumnAst, ParsedIndexAst};
 use super::*;
+
+const TABLE_DEFINITION_KEYWORDS: [&str; 4] = ["PRIMARY", "UNIQUE", "KEY", "CONSTRAINT"];
 
 pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
     let sql = remove_ordinary_comments(sql)?;
@@ -10,75 +13,73 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
         literals: extract_single_quoted_literals(&sql)?.into_iter(),
         position: 0,
     };
-    parser.keyword("CREATE")?;
-    parser.keyword("TABLE")?;
-    parser.keyword("IF")?;
-    parser.keyword("NOT")?;
-    parser.keyword("EXISTS")?;
+    for keyword in ["CREATE", "TABLE", "IF", "NOT", "EXISTS"] {
+        parser.keyword(keyword)?;
+    }
     let name = parser.identifier()?;
     parser.keyword("(")?;
     let mut columns = Vec::new();
-    while !parser.at("PRIMARY") {
-        columns.push(parser.column()?);
+    let mut primary_key = Vec::new();
+    while !parser.at_any(&TABLE_DEFINITION_KEYWORDS) {
+        let (column, inline_primary) = parser.column()?;
+        if inline_primary {
+            if !primary_key.is_empty() {
+                return Err("CREATE has more than one PRIMARY KEY".into());
+            }
+            primary_key = vec![column.name.clone()];
+        }
+        columns.push(column);
+        if parser.at(")") {
+            break;
+        }
         parser.keyword(",")?;
     }
-    parser.keyword("PRIMARY")?;
-    parser.keyword("KEY")?;
-    let primary_key = parser.key_columns()?;
     let mut indexes = Vec::new();
-    while parser.at(",") {
-        parser.keyword(",")?;
-        let unique = parser.at("UNIQUE");
-        if unique {
-            parser.keyword("UNIQUE")?;
+    let mut check_constraints = Vec::new();
+    while !parser.at(")") {
+        if parser.at("PRIMARY") {
+            parser.keyword("PRIMARY")?;
+            parser.keyword("KEY")?;
+            if !primary_key.is_empty() {
+                return Err("CREATE has more than one PRIMARY KEY".into());
+            }
+            primary_key = parser.key_columns()?;
+        } else if parser.at("CONSTRAINT") {
+            let (constraint, next) = check_constraint::parse_named_check(
+                &parser.tokens,
+                &parser.quoted,
+                parser.position,
+                &mut parser.literals,
+            )?;
+            parser.position = next;
+            check_constraints.push(constraint);
+        } else {
+            indexes.push(parser.index(&name)?);
         }
-        parser.keyword("KEY")?;
-        let index_name = parser.identifier()?;
-        let key_parts = parser
-            .key_columns()?
-            .into_iter()
-            .map(|column| ParsedIndexKeyPart {
-                column,
-                prefix_length: None,
-                order: "ASC".into(),
-                collation: Some("A".into()),
-            })
-            .collect();
-        indexes.push(ParsedIndexAst {
-            create: true,
-            name: index_name,
-            table: name.clone(),
-            unique,
-            index_type: "BTREE".into(),
-            visible: true,
-            comment: None,
-            key_parts,
-        });
+        if parser.at(")") {
+            break;
+        }
+        parser.keyword(",")?;
     }
     parser.keyword(")")?;
-    parser.keyword("ENGINE")?;
-    parser.keyword("=")?;
-    parser.keyword("InnoDB")?;
-    parser.keyword("DEFAULT")?;
-    parser.keyword("CHARSET")?;
-    parser.keyword("=")?;
-    parser.keyword("utf8mb4")?;
+    let collation = parser.table_options()?;
     if parser.at(";") {
         parser.keyword(";")?;
     }
     if parser.position != parser.tokens.len() {
         return Err("unmodeled CREATE tail".into());
     }
-    validate_definitions(&columns, &primary_key, &indexes)?;
+    validate_definitions(&columns, &primary_key, &indexes, &check_constraints)?;
     Ok(ParsedCreateTableAst {
         name,
         if_not_exists: true,
         columns,
         primary_key,
         indexes,
+        check_constraints,
         engine: "InnoDB".into(),
         character_set: Some("utf8mb4".into()),
-        collation: None,
+        collation,
     })
 }
 
@@ -86,6 +87,7 @@ fn validate_definitions(
     columns: &[ParsedCreateColumnAst],
     primary: &[String],
     indexes: &[ParsedIndexAst],
+    check_constraints: &[ParsedCheckConstraintAst],
 ) -> Result<(), String> {
     let names = columns
         .iter()
@@ -95,14 +97,20 @@ fn validate_definitions(
         .iter()
         .map(|index| index.name.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
+    let check_names = check_constraints
+        .iter()
+        .map(|constraint| constraint.name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
     if columns.is_empty()
+        || primary.is_empty()
         || names.len() != columns.len()
         || index_names.len() != indexes.len()
+        || check_names.len() != check_constraints.len()
         || indexes
             .iter()
             .any(|index| index.name.eq_ignore_ascii_case("PRIMARY"))
     {
-        return Err("empty or duplicate CREATE definition".into());
+        return Err("empty, missing, or duplicate CREATE definition".into());
     }
     let keys = std::iter::once(primary.to_vec()).chain(indexes.iter().map(|index| {
         index
@@ -118,6 +126,16 @@ fn validate_definitions(
             .collect::<BTreeSet<_>>();
         if unique.len() != key.len() || !unique.is_subset(&names) {
             return Err("duplicate or unknown CREATE key column".into());
+        }
+    }
+    for constraint in check_constraints {
+        for column in check_constraint::referenced_columns(constraint) {
+            if !names.contains(&column.to_ascii_lowercase()) {
+                return Err(format!(
+                    "CHECK constraint {} references unknown column {column}",
+                    constraint.name
+                ));
+            }
         }
     }
     Ok(())
@@ -136,6 +154,10 @@ impl Parser {
             .get(self.position)
             .is_some_and(|token| token.eq_ignore_ascii_case(keyword))
             && !self.quoted[self.position]
+    }
+
+    fn at_any(&self, keywords: &[&str]) -> bool {
+        keywords.iter().any(|keyword| self.at(keyword))
     }
 
     fn keyword(&mut self, keyword: &str) -> Result<(), String> {
@@ -163,21 +185,108 @@ impl Parser {
         Ok(columns)
     }
 
-    fn column(&mut self) -> Result<ParsedCreateColumnAst, String> {
+    fn index(&mut self, table: &str) -> Result<ParsedIndexAst, String> {
+        let unique = self.at("UNIQUE");
+        if unique {
+            self.keyword("UNIQUE")?;
+        }
+        self.keyword("KEY")?;
+        let index_name = self.identifier()?;
+        let key_parts = self
+            .key_columns()?
+            .into_iter()
+            .map(|column| ParsedIndexKeyPart {
+                column,
+                prefix_length: None,
+                order: "ASC".into(),
+                collation: Some("A".into()),
+            })
+            .collect();
+        Ok(ParsedIndexAst {
+            create: true,
+            name: index_name,
+            table: table.to_string(),
+            unique,
+            index_type: "BTREE".into(),
+            visible: true,
+            comment: None,
+            key_parts,
+        })
+    }
+
+    fn table_options(&mut self) -> Result<Option<String>, String> {
+        for keyword in [
+            "ENGINE", "=", "InnoDB", "DEFAULT", "CHARSET", "=", "utf8mb4",
+        ] {
+            self.keyword(keyword)?;
+        }
+        if !self.at("COLLATE") {
+            return Ok(None);
+        }
+        self.keyword("COLLATE")?;
+        self.keyword("=")?;
+        let collation = self.identifier()?;
+        if !collation.starts_with("utf8mb4_") {
+            return Err(format!(
+                "CREATE collation {collation} is not a utf8mb4 collation"
+            ));
+        }
+        Ok(Some(collation))
+    }
+
+    /// Parses one column definition; the flag reports an inline `PRIMARY KEY`.
+    fn column(&mut self) -> Result<(ParsedCreateColumnAst, bool), String> {
         let name = self.identifier()?;
         let column_type = self.column_type()?;
+        let (character_set, collation) = self.column_encoding(&column_type)?;
         let nullable = self.nullability()?;
         let default_sql = self.column_default(&column_type, nullable)?;
         let auto_increment = self.auto_increment(&column_type, nullable)?;
         let on_update_current_timestamp = self.on_update(&column_type)?;
-        Ok(ParsedCreateColumnAst {
-            name,
-            column_type,
-            nullable,
-            default_sql,
-            auto_increment,
-            on_update_current_timestamp,
-        })
+        let inline_primary = self.at("PRIMARY");
+        if inline_primary {
+            if nullable {
+                return Err("inline PRIMARY KEY requires NOT NULL".into());
+            }
+            self.keyword("PRIMARY")?;
+            self.keyword("KEY")?;
+        }
+        Ok((
+            ParsedCreateColumnAst {
+                name,
+                column_type,
+                nullable,
+                default_sql,
+                auto_increment,
+                on_update_current_timestamp,
+                character_set,
+                collation,
+            },
+            inline_primary,
+        ))
+    }
+
+    fn column_encoding(
+        &mut self,
+        column_type: &str,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        if !self.at("CHARACTER") {
+            return Ok((None, None));
+        }
+        if !is_character_type(column_type) {
+            return Err("CHARACTER SET requires a character column type".into());
+        }
+        self.keyword("CHARACTER")?;
+        self.keyword("SET")?;
+        let character_set = self.identifier()?;
+        self.keyword("COLLATE")?;
+        let collation = self.identifier()?;
+        if !collation.starts_with(&format!("{character_set}_")) {
+            return Err(format!(
+                "column collation {collation} does not belong to {character_set}"
+            ));
+        }
+        Ok((Some(character_set), Some(collation)))
     }
 
     fn nullability(&mut self) -> Result<bool, String> {
@@ -201,23 +310,54 @@ impl Parser {
             return Ok(None);
         }
         self.keyword("DEFAULT")?;
-        let integer = column_type
-            .split(' ')
-            .next()
-            .is_some_and(|kind| matches!(kind, "int" | "mediumint" | "smallint" | "tinyint"));
-        let allowed = if self.at("NULL") && nullable {
-            "NULL"
-        } else if self.at("CURRENT_TIMESTAMP") && column_type == "timestamp" {
-            "CURRENT_TIMESTAMP"
-        } else if self.at("0") && integer {
-            "0"
-        } else if self.at("1") && column_type == "tinyint" {
-            "1"
-        } else {
-            return Err("unmodeled observed CREATE default".into());
-        };
-        self.keyword(allowed)?;
-        Ok(Some(allowed.into()))
+        let kind = column_type.split(['(', ' ']).next().unwrap_or_default();
+        let integer = matches!(
+            kind,
+            "int" | "mediumint" | "smallint" | "tinyint" | "bigint"
+        );
+        if self.at("NULL") && nullable {
+            self.keyword("NULL")?;
+            return Ok(Some("NULL".into()));
+        }
+        if self.at("CURRENT_TIMESTAMP") && matches!(kind, "timestamp" | "datetime") {
+            return self.current_timestamp(column_type).map(Some);
+        }
+        if (self.at("0") || self.at("1")) && integer {
+            let value = self.tokens[self.position].clone();
+            self.position += 1;
+            return Ok(Some(value));
+        }
+        if self.at("<string>") && is_character_type(column_type) {
+            self.keyword("<string>")?;
+            let value = self.literals.next().ok_or("missing DEFAULT literal")?;
+            if value.is_empty()
+                || !value
+                    .chars()
+                    .all(|character| character.is_ascii_graphic() && character != '\'')
+            {
+                return Err("unmodeled observed CREATE string default".into());
+            }
+            return Ok(Some(if is_text_type(kind) {
+                text_expression_default(&value)
+            } else {
+                quote_string_literal(&value)
+            }));
+        }
+        Err("unmodeled observed CREATE default".into())
+    }
+
+    /// Consumes `CURRENT_TIMESTAMP` or `CURRENT_TIMESTAMP(6)` matching the column precision.
+    fn current_timestamp(&mut self, column_type: &str) -> Result<String, String> {
+        self.keyword("CURRENT_TIMESTAMP")?;
+        let expected = current_timestamp_for(column_type);
+        if expected.ends_with("(6)") {
+            for token in ["(", "6", ")"] {
+                self.keyword(token)?;
+            }
+        } else if self.at("(") {
+            return Err("CURRENT_TIMESTAMP precision does not match the column".into());
+        }
+        Ok(expected)
     }
 
     fn auto_increment(&mut self, column_type: &str, nullable: bool) -> Result<bool, String> {
@@ -235,12 +375,12 @@ impl Parser {
         if !self.at("ON") {
             return Ok(false);
         }
-        if column_type != "timestamp" {
-            return Err("ON UPDATE requires TIMESTAMP".into());
+        if !matches!(column_type, "timestamp" | "datetime" | "datetime(6)") {
+            return Err("ON UPDATE requires TIMESTAMP or DATETIME".into());
         }
         self.keyword("ON")?;
         self.keyword("UPDATE")?;
-        self.keyword("CURRENT_TIMESTAMP")?;
+        self.current_timestamp(column_type)?;
         Ok(true)
     }
 
@@ -278,7 +418,7 @@ impl Parser {
             self.position = next;
             return Ok(column_type);
         }
-        for kind in ["INT", "MEDIUMINT", "SMALLINT"] {
+        for kind in ["INT", "MEDIUMINT", "SMALLINT", "BIGINT"] {
             if self.at(kind) {
                 self.keyword(kind)?;
                 self.keyword("UNSIGNED")?;
@@ -289,28 +429,69 @@ impl Parser {
             self.keyword("TIMESTAMP")?;
             return Ok("timestamp".into());
         }
+        if self.at("DATETIME") {
+            self.keyword("DATETIME")?;
+            if !self.at("(") {
+                return Ok("datetime".into());
+            }
+            for token in ["(", "6", ")"] {
+                self.keyword(token)?;
+            }
+            return Ok("datetime(6)".into());
+        }
+        for kind in ["TEXT", "MEDIUMTEXT"] {
+            if self.at(kind) {
+                self.keyword(kind)?;
+                return Ok(kind.to_ascii_lowercase());
+            }
+        }
         if self.at("DECIMAL") {
             for token in ["DECIMAL", "(", "4", ",", "3", ")"] {
                 self.keyword(token)?;
             }
             return Ok("decimal(4,3)".into());
         }
-        self.keyword("VARCHAR")?;
+        let kind = if self.at("CHAR") { "CHAR" } else { "VARCHAR" };
+        self.keyword(kind)?;
         self.keyword("(")?;
         let length = self
             .tokens
             .get(self.position)
             .cloned()
-            .ok_or("missing VARCHAR length")?;
+            .ok_or("missing character type length")?;
         let value = length
             .parse::<u32>()
-            .map_err(|_| "invalid VARCHAR length")?;
-        if value == 0 || value.to_string() != length {
-            return Err("noncanonical VARCHAR length".into());
+            .map_err(|_| "invalid character type length")?;
+        if value == 0 || value.to_string() != length || (kind == "CHAR" && value > 255) {
+            return Err("noncanonical character type length".into());
         }
         self.keyword(&length)?;
         self.keyword(")")?;
-        Ok(format!("varchar({value})"))
+        Ok(format!("{}({value})", kind.to_ascii_lowercase()))
+    }
+}
+
+pub(crate) fn is_character_type(column_type: &str) -> bool {
+    let kind = column_type.split('(').next().unwrap_or_default();
+    matches!(kind, "char" | "varchar") || is_text_type(kind)
+}
+
+pub(crate) fn is_text_type(data_type: &str) -> bool {
+    matches!(data_type, "tinytext" | "text" | "mediumtext" | "longtext")
+}
+
+/// MySQL 8 rejects literal TEXT defaults; the expression default with an explicit
+/// introducer yields the same stored value on every connection character set.
+pub(crate) fn text_expression_default(value: &str) -> String {
+    format!("(_utf8mb4{})", quote_string_literal(value))
+}
+
+/// The `CURRENT_TIMESTAMP` spelling whose precision matches the column type.
+pub(crate) fn current_timestamp_for(column_type: &str) -> String {
+    if column_type.ends_with("(6)") {
+        "CURRENT_TIMESTAMP(6)".to_string()
+    } else {
+        "CURRENT_TIMESTAMP".to_string()
     }
 }
 
@@ -368,6 +549,7 @@ pub(super) fn remove_ordinary_comments(sql: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::model::CheckPredicate;
     use super::*;
 
     const SQL: &str = "/* ordinary */ CREATE TABLE IF NOT EXISTS `facets` (\n`comic_id` MEDIUMINT UNSIGNED NOT NULL, -- identity\n`facet_id` SMALLINT UNSIGNED NOT NULL, `kind` TINYINT UNSIGNED NOT NULL, `label` VARCHAR(80) NOT NULL, `score` DECIMAL(4,3) NOT NULL, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (`comic_id`, `facet_id`), KEY `by_kind` (`kind`, `comic_id`), KEY `by_facet` (`facet_id`, `kind`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
@@ -421,6 +603,178 @@ mod tests {
         assert!(sql.contains("`label` VARCHAR(80) NOT NULL"));
         assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"));
         assert!(sql.ends_with("DEFAULT CHARACTER SET=utf8mb4"));
+    }
+
+    const PROFILES: &str =
+        include_str!("../../../../fixtures/ddl/create-reader-memory-profiles.sql");
+    const ITEMS: &str = include_str!("../../../../fixtures/ddl/create-reader-memory-items.sql");
+    const OPERATIONS: &str =
+        include_str!("../../../../fixtures/ddl/create-reader-memory-operations.sql");
+
+    #[test]
+    fn reader_memory_profiles_create_parses_inline_primary_key_defaults_and_checks() {
+        let ast = parse(PROFILES).expect("profiles CREATE");
+        assert_eq!(ast.name, "reader_memory_profiles");
+        assert_eq!(ast.primary_key, ["user_id"]);
+        assert_eq!(ast.collation.as_deref(), Some("utf8mb4_unicode_ci"));
+        let columns = &ast.columns;
+        assert_eq!(columns.len(), 10);
+        assert_eq!(columns[0].column_type, "int unsigned");
+        assert!(!columns[0].nullable);
+        assert_eq!(columns[1].column_type, "smallint unsigned");
+        assert_eq!(columns[1].default_sql.as_deref(), Some("1"));
+        assert_eq!(columns[2].column_type, "tinyint");
+        assert_eq!(columns[2].default_sql.as_deref(), Some("0"));
+        assert_eq!(columns[4].column_type, "bigint unsigned");
+        assert_eq!(columns[4].default_sql.as_deref(), Some("0"));
+        assert_eq!(columns[6].column_type, "datetime(6)");
+        assert!(columns[6].nullable);
+        assert_eq!(columns[6].default_sql, None);
+        assert_eq!(columns[8].column_type, "mediumtext");
+        assert!(!columns[8].nullable);
+        assert_eq!(columns[8].default_sql.as_deref(), Some("(_utf8mb4'{}')"));
+        assert_eq!(columns[8].character_set, None);
+        assert_eq!(columns[9].column_type, "datetime(6)");
+        assert_eq!(
+            columns[9].default_sql.as_deref(),
+            Some("CURRENT_TIMESTAMP(6)")
+        );
+        assert!(columns[9].on_update_current_timestamp);
+        assert!(ast.indexes.is_empty());
+        assert_eq!(
+            ast.check_constraints,
+            vec![
+                ParsedCheckConstraintAst {
+                    name: "reader_memory_profile_json".into(),
+                    disjuncts: vec![CheckPredicate::JsonValid {
+                        column: "prepared_json".into(),
+                    }],
+                },
+                ParsedCheckConstraintAst {
+                    name: "reader_memory_profile_size".into(),
+                    disjuncts: vec![CheckPredicate::OctetLengthAtMost {
+                        column: "prepared_json".into(),
+                        limit: 32768,
+                    }],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reader_memory_items_create_parses_ascii_char_text_and_disjunctive_checks() {
+        let ast = parse(ITEMS).expect("items CREATE");
+        assert_eq!(ast.primary_key, ["uuid"]);
+        let uuid = &ast.columns[0];
+        assert_eq!(uuid.column_type, "char(36)");
+        assert_eq!(uuid.character_set.as_deref(), Some("ascii"));
+        assert_eq!(uuid.collation.as_deref(), Some("ascii_bin"));
+        assert!(!uuid.nullable);
+        let payload = &ast.columns[5];
+        assert_eq!(payload.name, "payload_json");
+        assert_eq!(payload.column_type, "text");
+        assert!(payload.nullable);
+        assert_eq!(payload.default_sql, None);
+        assert_eq!(ast.columns[8].column_type, "datetime(6)");
+        assert!(!ast.columns[8].nullable);
+        assert_eq!(ast.indexes.len(), 2);
+        assert!(ast.indexes[0].unique);
+        assert_eq!(ast.indexes[0].name, "reader_memory_semantic");
+        assert_eq!(ast.indexes[0].key_parts.len(), 2);
+        assert!(!ast.indexes[1].unique);
+        assert_eq!(
+            ast.check_constraints,
+            vec![
+                ParsedCheckConstraintAst {
+                    name: "reader_memory_item_json".into(),
+                    disjuncts: vec![
+                        CheckPredicate::IsNull {
+                            column: "payload_json".into(),
+                        },
+                        CheckPredicate::JsonValid {
+                            column: "payload_json".into(),
+                        },
+                    ],
+                },
+                ParsedCheckConstraintAst {
+                    name: "reader_memory_item_size".into(),
+                    disjuncts: vec![
+                        CheckPredicate::IsNull {
+                            column: "payload_json".into(),
+                        },
+                        CheckPredicate::OctetLengthAtMost {
+                            column: "payload_json".into(),
+                            limit: 8192,
+                        },
+                    ],
+                },
+                ParsedCheckConstraintAst {
+                    name: "reader_memory_item_state".into(),
+                    disjuncts: vec![CheckPredicate::InStrings {
+                        column: "status".into(),
+                        values: vec!["active".into(), "disabled".into(), "forgotten".into()],
+                    }],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reader_memory_operations_create_parses_varchar_default_and_datetime_default() {
+        let ast = parse(OPERATIONS).expect("operations CREATE");
+        assert_eq!(ast.columns[3].column_type, "varchar(24)");
+        assert_eq!(ast.columns[3].default_sql.as_deref(), Some("'pending'"));
+        assert_eq!(ast.columns[3].character_set, None);
+        assert_eq!(ast.columns[5].name, "lease_token");
+        assert_eq!(ast.columns[5].character_set.as_deref(), Some("ascii"));
+        assert!(ast.columns[5].nullable);
+        let created = &ast.columns[12];
+        assert_eq!(created.name, "created_at");
+        assert_eq!(created.default_sql.as_deref(), Some("CURRENT_TIMESTAMP(6)"));
+        assert!(!created.on_update_current_timestamp);
+        assert!(ast.columns[13].on_update_current_timestamp);
+        assert_eq!(ast.indexes.len(), 4);
+        assert!(ast.indexes[0].unique);
+        assert_eq!(ast.indexes[1].key_parts.len(), 3);
+        assert!(ast.check_constraints.is_empty());
+    }
+
+    #[test]
+    fn reader_memory_create_rejects_unmodeled_semantics() {
+        for rejected in [
+            PROFILES.replace("DATETIME(6)", "DATETIME(3)"),
+            PROFILES.replace("CURRENT_TIMESTAMP(6) ON", "CURRENT_TIMESTAMP ON"),
+            PROFILES.replace("JSON_VALID(prepared_json)", "CHAR_LENGTH(prepared_json)"),
+            PROFILES.replace(
+                "OCTET_LENGTH(prepared_json) <=",
+                "OCTET_LENGTH(prepared_json) <",
+            ),
+            PROFILES.replace(
+                "CHECK (JSON_VALID(prepared_json))",
+                "CHECK (JSON_VALID(missing))",
+            ),
+            PROFILES.replace("DEFAULT '{}'", "DEFAULT '{\\\\}'"),
+            PROFILES.replace("reader_memory_profile_size", "reader_memory_profile_json"),
+            PROFILES.replace(
+                "DEFAULT 0,\n deletion_epoch",
+                "DEFAULT 'x',\n deletion_epoch",
+            ),
+            PROFILES.replace(
+                "CONSTRAINT reader_memory_profile_json",
+                "PRIMARY KEY (user_id),\n CONSTRAINT reader_memory_profile_json",
+            ),
+            ITEMS.replace("'active','disabled'", "'act-ive','disabled'"),
+            ITEMS.replace(
+                "COLLATE ascii_bin NOT NULL PRIMARY KEY",
+                "COLLATE utf8mb4_bin NOT NULL PRIMARY KEY",
+            ),
+            ITEMS.replace(
+                "CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY",
+                "CHARACTER SET ascii NOT NULL PRIMARY KEY",
+            ),
+        ] {
+            assert!(parse(&rejected).is_err(), "accepted {rejected}");
+        }
     }
 
     #[test]

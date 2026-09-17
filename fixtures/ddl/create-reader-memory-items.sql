@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS reader_memory_items (
+ uuid CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+ user_id INT UNSIGNED NOT NULL,
+ semantic_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ memory_group VARCHAR(32) NOT NULL,
+ predicate VARCHAR(64) NOT NULL,
+ payload_json TEXT NULL,
+ status VARCHAR(16) NOT NULL,
+ source_message_id BIGINT UNSIGNED NOT NULL,
+ evidence_at DATETIME(6) NOT NULL,
+ barrier_at DATETIME(6) NULL,
+ expires_at DATETIME(6) NULL,
+ revision BIGINT UNSIGNED NOT NULL,
+ updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+ UNIQUE KEY reader_memory_semantic (user_id,semantic_key),
+ KEY reader_memory_owner (user_id,status),
+ CONSTRAINT reader_memory_item_json CHECK (payload_json IS NULL OR JSON_VALID(payload_json)),
+ CONSTRAINT reader_memory_item_size CHECK (payload_json IS NULL OR OCTET_LENGTH(payload_json) <= 8192),
+ CONSTRAINT reader_memory_item_state CHECK (status IN ('active','disabled','forgotten'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci

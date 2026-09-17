@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS reader_memory_operations (
+ uuid CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
+ user_id INT UNSIGNED NOT NULL,
+ source_message_id BIGINT UNSIGNED NOT NULL,
+ status VARCHAR(24) NOT NULL DEFAULT 'pending',
+ attempts SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+ lease_token CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+ lease_until DATETIME(6) NULL,
+ dispatch_after DATETIME(6) NULL,
+ started_at DATETIME(6) NULL,
+ expected_revision BIGINT UNSIGNED NULL,
+ expected_epoch BIGINT UNSIGNED NULL,
+ error_code VARCHAR(48) NULL,
+ created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+ updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+ UNIQUE KEY reader_memory_source (user_id,source_message_id),
+ KEY reader_memory_dispatch (status,lease_until,created_at),
+ KEY reader_memory_started (started_at),
+ KEY reader_memory_operations_owner (user_id,status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci

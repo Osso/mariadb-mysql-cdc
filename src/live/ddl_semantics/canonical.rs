@@ -337,11 +337,18 @@ pub(crate) fn expected_create_table_post_state(
                     .next()
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                let (character_set, collation) = column_default_encoding(
-                    &data_type,
-                    &defaults.character_set,
-                    &defaults.collation,
-                );
+                let (character_set, collation) = match (&column.character_set, &column.collation) {
+                    (Some(character_set), Some(collation)) => {
+                        (Some(character_set.clone()), Some(collation.clone()))
+                    }
+                    _ => column_default_encoding(
+                        &data_type,
+                        &defaults.character_set,
+                        &defaults.collation,
+                    ),
+                };
+                let (default_value, generated_default) =
+                    expected_create_column_default(column.default_sql.as_deref());
                 crate::inventory::ColumnInventory {
                     name: column.name.clone(),
                     ordinal_position: (index + 1) as u32,
@@ -354,12 +361,8 @@ pub(crate) fn expected_create_table_post_state(
                     is_nullable: column.nullable,
                     character_set,
                     collation,
-                    default_value: column
-                        .default_sql
-                        .as_ref()
-                        .filter(|value| !value.eq_ignore_ascii_case("NULL"))
-                        .cloned(),
-                    extra: expected_create_column_extra(column),
+                    default_value,
+                    extra: expected_create_column_extra(column, generated_default),
                     comment: String::new(),
                     generated: None,
                 }
@@ -403,40 +406,101 @@ pub(crate) fn expected_create_table_post_state(
     .map_err(|error| format!("failed to encode expected CREATE TABLE state: {error}"))
 }
 
-fn expected_create_column_extra(column: &super::model::ParsedCreateColumnAst) -> String {
+/// The `COLUMN_DEFAULT` MySQL 8 reports for a rendered CREATE default, and whether MySQL marks
+/// it `DEFAULT_GENERATED`: `CURRENT_TIMESTAMP[(6)]` and the TEXT expression default
+/// `(_utf8mb4'...')` are generated; quoted literals are reported bare.
+fn expected_create_column_default(default_sql: Option<&str>) -> (Option<String>, bool) {
+    let Some(default_sql) = default_sql else {
+        return (None, false);
+    };
+    if default_sql.eq_ignore_ascii_case("NULL") {
+        return (None, false);
+    }
+    if default_sql
+        .get(..17)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CURRENT_TIMESTAMP"))
+    {
+        return (Some(default_sql.to_string()), true);
+    }
+    if let Some(literal) = default_sql
+        .strip_prefix("(_utf8mb4'")
+        .and_then(|rest| rest.strip_suffix("')"))
+    {
+        return (Some(format!("_utf8mb4\\'{literal}\\'")), true);
+    }
+    if let Some(literal) = default_sql
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        return (Some(literal.replace("''", "'")), false);
+    }
+    (Some(default_sql.to_string()), false)
+}
+
+fn expected_create_column_extra(
+    column: &super::model::ParsedCreateColumnAst,
+    generated_default: bool,
+) -> String {
     if column.auto_increment {
         return "auto_increment".to_string();
     }
-    let generated_default = column
-        .default_sql
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("CURRENT_TIMESTAMP"));
+    let on_update = super::transform::current_timestamp_for(&column.column_type);
     match (generated_default, column.on_update_current_timestamp) {
-        (true, true) => "DEFAULT_GENERATED on update CURRENT_TIMESTAMP".to_string(),
+        (true, true) => format!("DEFAULT_GENERATED on update {on_update}"),
         (true, false) => "DEFAULT_GENERATED".to_string(),
-        (false, true) => "on update CURRENT_TIMESTAMP".to_string(),
+        (false, true) => format!("on update {on_update}"),
         (false, false) => String::new(),
     }
 }
 
+/// The `COLUMN_DEFAULT`/`DEFAULT_GENERATED` pair MySQL 8 reports for a translated ADD COLUMN.
+fn expected_added_column_default(
+    data_type: &str,
+    default_value: Option<&str>,
+) -> (Option<String>, String) {
+    match default_value {
+        Some(value) if super::transform::is_text_type(data_type) => (
+            Some(format!("_utf8mb4\\'{value}\\'")),
+            "DEFAULT_GENERATED".to_string(),
+        ),
+        other => (other.map(str::to_string), String::new()),
+    }
+}
+
 fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::Value {
-    json!({
+    let mut value = json!({
         "name": ast.name,
         "if_not_exists": ast.if_not_exists,
-        "columns": ast.columns.iter().map(|column| json!({
-            "name": column.name,
-            "column_type": column.column_type,
-            "nullable": column.nullable,
-            "default_sql": column.default_sql,
-            "auto_increment": column.auto_increment,
-            "on_update_current_timestamp": column.on_update_current_timestamp,
-        })).collect::<Vec<_>>(),
+        "columns": ast.columns.iter().map(|column| {
+            let mut value = json!({
+                "name": column.name,
+                "column_type": column.column_type,
+                "nullable": column.nullable,
+                "default_sql": column.default_sql,
+                "auto_increment": column.auto_increment,
+                "on_update_current_timestamp": column.on_update_current_timestamp,
+            });
+            if let (Some(character_set), Some(collation)) = (&column.character_set, &column.collation) {
+                value["character_set"] = json!(character_set);
+                value["collation"] = json!(collation);
+            }
+            value
+        }).collect::<Vec<_>>(),
         "primary_key": ast.primary_key,
         "indexes": ast.indexes.iter().map(canonical_index_ast_value).collect::<Vec<_>>(),
         "engine": ast.engine,
         "character_set": ast.character_set,
         "collation": ast.collation,
-    })
+    });
+    if !ast.check_constraints.is_empty() {
+        value["check_constraints"] = json!(
+            ast.check_constraints
+                .iter()
+                .map(super::transform::canonical_check_constraint_value)
+                .collect::<Vec<_>>()
+        );
+    }
+    value
 }
 
 fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Value {
@@ -452,6 +516,10 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
             ParsedAlterClause::AddKey(index) => json!({
                 "kind": "add_key",
                 "index": canonical_index_ast_value(index),
+            }),
+            ParsedAlterClause::AddCheck(constraint) => json!({
+                "kind": "add_check",
+                "constraint": super::transform::canonical_check_constraint_value(constraint),
             }),
             ParsedAlterClause::DropColumn(column) => json!({
                 "kind": "drop_column",
@@ -490,6 +558,10 @@ fn canonical_add_column_ast_value(column: &ParsedAddColumnAst) -> serde_json::Va
     });
     if column.if_not_exists {
         value["if_not_exists"] = json!(true);
+    }
+    if let (Some(character_set), Some(collation)) = (&column.character_set, &column.collation) {
+        value["character_set"] = json!(character_set);
+        value["collation"] = json!(collation);
     }
     value
 }
@@ -551,9 +623,36 @@ fn apply_alter_clause(
             apply_modify_varchar(expected, &ast.table, name, column_type)
         }
         ParsedAlterClause::AddKey(index) => apply_add_key(expected, index),
+        ParsedAlterClause::AddCheck(constraint) => {
+            validate_add_check(expected, &ast.table, constraint)
+        }
         ParsedAlterClause::DropColumn(column) => apply_drop_column(expected, &ast.table, column),
         ParsedAlterClause::DropIndex(index) => apply_drop_index(expected, &ast.table, index),
     }
+}
+
+/// CHECK constraints are outside the inventory the post-state compares, so the expected state
+/// only proves every referenced column exists once preceding clauses have applied.
+fn validate_add_check(
+    expected: &SemanticSchemaSnapshot,
+    table_name: &str,
+    constraint: &super::model::ParsedCheckConstraintAst,
+) -> Result<(), String> {
+    let table = find_table(expected, table_name)
+        .ok_or_else(|| format!("ADD CONSTRAINT target `{table_name}` is missing"))?;
+    for column in super::transform::referenced_columns(constraint) {
+        if !table
+            .columns
+            .iter()
+            .any(|item| item.name.eq_ignore_ascii_case(column))
+        {
+            return Err(format!(
+                "CHECK constraint `{}` references missing column `{table_name}`.`{column}`",
+                constraint.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn apply_modify_varchar(
@@ -658,8 +757,14 @@ fn expected_added_column(
         .as_deref()
         .ok_or_else(|| format!("ALTER TABLE target `{table_name}` has no default collation"))?;
     let table_character_set = table_collation.split('_').next().unwrap_or(table_collation);
-    let (character_set, collation) =
-        column_default_encoding(&column.data_type, table_character_set, table_collation);
+    let (character_set, collation) = match (&column.character_set, &column.collation) {
+        (Some(character_set), Some(collation)) => {
+            (Some(character_set.clone()), Some(collation.clone()))
+        }
+        _ => column_default_encoding(&column.data_type, table_character_set, table_collation),
+    };
+    let (default_value, extra) =
+        expected_added_column_default(&column.data_type, column.default_value.as_deref());
     Ok(crate::inventory::ColumnInventory {
         name: column.name.clone(),
         ordinal_position: (insertion + 1) as u32,
@@ -668,8 +773,8 @@ fn expected_added_column(
         is_nullable: column.nullable,
         character_set,
         collation,
-        default_value: column.default_value.clone(),
-        extra: String::new(),
+        default_value,
+        extra,
         comment: column.comment.clone(),
         generated: None,
     })

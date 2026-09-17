@@ -1,0 +1,14 @@
+CREATE TABLE IF NOT EXISTS reader_memory_profiles (
+ user_id INT UNSIGNED NOT NULL PRIMARY KEY,
+ schema_version SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+ enabled TINYINT(1) NOT NULL DEFAULT 0,
+ capture_enabled TINYINT(1) NOT NULL DEFAULT 0,
+ revision BIGINT UNSIGNED NOT NULL DEFAULT 0,
+ deletion_epoch BIGINT UNSIGNED NOT NULL DEFAULT 0,
+ capture_after DATETIME(6) NULL,
+ evidence_floor DATETIME(6) NULL,
+ prepared_json MEDIUMTEXT NOT NULL DEFAULT '{}',
+ updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+ CONSTRAINT reader_memory_profile_json CHECK (JSON_VALID(prepared_json)),
+ CONSTRAINT reader_memory_profile_size CHECK (OCTET_LENGTH(prepared_json) <= 32768)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci

@@ -10,7 +10,11 @@ use super::tokenizer::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+mod check_constraint;
 mod observed_create;
+
+pub(crate) use check_constraint::{canonical_check_constraint_value, referenced_columns};
+pub(crate) use observed_create::{current_timestamp_for, is_text_type, text_expression_default};
 
 pub const DDL_TRANSFORMATION_VERSION: &str = "mariadb-mysql8-v1";
 
@@ -51,7 +55,9 @@ fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
             ParsedAlterClause::AddColumn(column) => {
                 !column.if_not_exists && column.data_type != "timestamp"
             }
-            ParsedAlterClause::AddKey(_) | ParsedAlterClause::ModifyVarchar { .. } => true,
+            ParsedAlterClause::AddKey(_)
+            | ParsedAlterClause::AddCheck(_)
+            | ParsedAlterClause::ModifyVarchar { .. } => true,
             ParsedAlterClause::DropColumn(_) | ParsedAlterClause::DropIndex(_) => false,
         })
 }
@@ -138,6 +144,8 @@ fn is_exact_seen_column(column: &ParsedAddColumnAst, name: &str, comment: &str) 
             default_value: None,
             comment: comment.to_string(),
             after: None,
+            character_set: None,
+            collation: None,
         }
 }
 
@@ -189,6 +197,12 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
             column_type.to_ascii_uppercase()
         ),
         ParsedAlterClause::AddKey(index) => render_add_key(index),
+        ParsedAlterClause::AddCheck(constraint) => {
+            format!(
+                "ADD {}",
+                check_constraint::render_check_constraint(constraint)
+            )
+        }
         ParsedAlterClause::DropColumn(column) => {
             format!("DROP COLUMN {}", quote_identifier(&column.name))
         }
@@ -200,11 +214,16 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
 
 fn render_add_column(column: &ParsedAddColumnAst) -> String {
     let nullability = if column.nullable { "NULL" } else { "NOT NULL" };
-    let default_value = column.default_value.as_deref().unwrap_or("NULL");
+    let default_value = match column.default_value.as_deref() {
+        None => "NULL".to_string(),
+        Some(value) if is_text_type(&column.data_type) => text_expression_default(value),
+        Some(value) => value.to_string(),
+    };
     let mut sql = format!(
-        "ADD COLUMN {} {} {nullability} DEFAULT {default_value}",
+        "ADD COLUMN {} {}{} {nullability} DEFAULT {default_value}",
         quote_identifier(&column.name),
-        column.column_type.to_ascii_uppercase()
+        column.column_type.to_ascii_uppercase(),
+        render_column_encoding(column.character_set.as_deref(), column.collation.as_deref()),
     );
     if !column.comment.is_empty() {
         sql.push_str(&format!(
@@ -241,6 +260,15 @@ fn render_add_key(index: &ParsedIndexAst) -> String {
 
 fn quote_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+fn render_column_encoding(character_set: Option<&str>, collation: Option<&str>) -> String {
+    match (character_set, collation) {
+        (Some(character_set), Some(collation)) => {
+            format!(" CHARACTER SET {character_set} COLLATE {collation}")
+        }
+        _ => String::new(),
+    }
 }
 
 pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableAst, String> {
@@ -324,6 +352,7 @@ pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableA
         columns,
         primary_key,
         indexes,
+        check_constraints: Vec::new(),
         engine: "InnoDB".to_string(),
         character_set: None,
         collation: None,
@@ -351,6 +380,7 @@ fn parse_home_feed_artist_blacklist_create(
         columns: home_feed_artist_blacklist_columns(),
         primary_key: vec!["id".to_string()],
         indexes: vec![home_feed_artist_blacklist_index()],
+        check_constraints: Vec::new(),
         engine: "InnoDB".to_string(),
         character_set: Some("utf8mb4".to_string()),
         collation: Some("utf8mb4_unicode_ci".to_string()),
@@ -411,6 +441,8 @@ fn create_column(
         default_sql: default_sql.map(str::to_string),
         auto_increment,
         on_update_current_timestamp: false,
+        character_set: None,
+        collation: None,
     }
 }
 
@@ -457,6 +489,8 @@ fn parse_fixture_table_column(
             default_sql: None,
             auto_increment: false,
             on_update_current_timestamp: false,
+            character_set: None,
+            collation: None,
         },
         primary,
         next_index,
@@ -1388,6 +1422,11 @@ fn transform_fixture_create_table_ast(
             .join(", ")
     ));
     definitions.extend(ast.indexes.iter().map(render_create_index));
+    definitions.extend(
+        ast.check_constraints
+            .iter()
+            .map(check_constraint::render_check_constraint),
+    );
     let schema_defaults = render_create_schema_defaults(ast, defaults);
     Ok(DdlTransformation {
         version: DDL_TRANSFORMATION_VERSION,
@@ -1413,16 +1452,18 @@ fn render_create_column(column: &ParsedCreateColumnAst) -> String {
         ""
     };
     let on_update = if column.on_update_current_timestamp {
-        " ON UPDATE CURRENT_TIMESTAMP"
+        format!(" ON UPDATE {}", current_timestamp_for(&column.column_type))
     } else {
-        ""
+        String::new()
     };
     let column_type = match column.column_type.strip_prefix("enum(") {
         Some(labels) => format!("ENUM({labels}"),
         None => column.column_type.to_ascii_uppercase(),
     };
+    let encoding =
+        render_column_encoding(column.character_set.as_deref(), column.collation.as_deref());
     format!(
-        "{} {column_type} {nullability}{default}{on_update}{auto_increment}",
+        "{} {column_type}{encoding} {nullability}{default}{on_update}{auto_increment}",
         quote_identifier(&column.name),
     )
 }
@@ -1918,6 +1959,11 @@ fn parse_production_add_clause(
             require_keyword(tokens, index + 2, "KEY")?;
             parse_add_key_clause(tokens, index + 2, table, true)
         }
+        Some(kind) if kind == "CONSTRAINT" => {
+            let (constraint, next_index) =
+                check_constraint::parse_named_check(tokens, quoted_flags, index + 1, literals)?;
+            Ok((ParsedAlterClause::AddCheck(constraint), next_index))
+        }
         actual => Err(format!(
             "unsupported production ALTER TABLE clause {actual:?}"
         )),
@@ -1948,8 +1994,10 @@ fn parse_add_column_clause(
         name_index += 3;
     }
     let name = require_identifier(tokens, name_index, "added column")?;
-    let (column_type, data_type, options_start) =
+    let (column_type, data_type, encoding_start) =
         parse_observed_column_type(tokens, quoted_flags, name_index + 1)?;
+    let (character_set, collation, options_start) =
+        parse_column_encoding(tokens, quoted_flags, encoding_start, &data_type)?;
     let options = parse_observed_column_options(tokens, options_start, literals, &data_type)?;
     Ok((
         ParsedAlterClause::AddColumn(ParsedAddColumnAst {
@@ -1961,9 +2009,38 @@ fn parse_add_column_clause(
             default_value: options.default_value,
             comment: options.comment,
             after: options.after,
+            character_set,
+            collation,
         }),
         options.next_index,
     ))
+}
+
+/// Parses an optional `CHARACTER SET <charset> COLLATE <collation>` pair after a character type.
+fn parse_column_encoding(
+    tokens: &[String],
+    quoted_flags: &[bool],
+    index: usize,
+    data_type: &str,
+) -> Result<(Option<String>, Option<String>, usize), String> {
+    if !tokens_match(tokens, index, "CHARACTER") {
+        return Ok((None, None, index));
+    }
+    if !matches!(data_type, "char" | "varchar") && !is_text_type(data_type) {
+        return Err(format!("CHARACTER SET is unsupported for {data_type}"));
+    }
+    for (offset, keyword) in [(0, "CHARACTER"), (1, "SET"), (3, "COLLATE")] {
+        require_unquoted_token(quoted_flags, index + offset, keyword)?;
+        require_keyword(tokens, index + offset, keyword)?;
+    }
+    let character_set = require_identifier(tokens, index + 2, "column character set")?;
+    let collation = require_identifier(tokens, index + 4, "column collation")?;
+    if !collation.starts_with(&format!("{character_set}_")) {
+        return Err(format!(
+            "column collation {collation} does not belong to {character_set}"
+        ));
+    }
+    Ok((Some(character_set), Some(collation), index + 5))
 }
 
 fn parse_add_key_clause(
@@ -2027,7 +2104,15 @@ fn parse_observed_column_type(
     let data_type = require_identifier(tokens, index, "added column type")?.to_ascii_lowercase();
     if !matches!(
         data_type.as_str(),
-        "char" | "varchar" | "datetime" | "timestamp" | "tinyint" | "smallint" | "float"
+        "char"
+            | "varchar"
+            | "text"
+            | "mediumtext"
+            | "datetime"
+            | "timestamp"
+            | "tinyint"
+            | "smallint"
+            | "float"
     ) {
         return Err(format!(
             "unsupported production ADD COLUMN type {data_type}"
@@ -2035,6 +2120,12 @@ fn parse_observed_column_type(
     }
     index += 1;
     let column_type = match data_type.as_str() {
+        "text" | "mediumtext" => {
+            if tokens.get(index).map(String::as_str) == Some("(") {
+                return Err(format!("{data_type} length is unsupported"));
+            }
+            data_type.clone()
+        }
         "char" | "varchar" => {
             require_unquoted_token(quoted_flags, index, "character type opening parenthesis")?;
             require_unquoted_token(quoted_flags, index + 1, "character type length")?;
@@ -2150,12 +2241,13 @@ fn parse_observed_column_options(
     let mut comment = String::new();
     let mut after = None;
     let supports_required_zero = matches!(data_type, "float" | "tinyint");
+    let text = is_text_type(data_type);
     while index < tokens.len() && tokens[index] != "," {
         if tokens[index].eq_ignore_ascii_case("NULL") {
             nullable = true;
             index += 1;
         } else if tokens[index].eq_ignore_ascii_case("NOT") {
-            if !supports_required_zero {
+            if !supports_required_zero && !text {
                 return Err(format!(
                     "unsupported production ADD COLUMN option {:?}",
                     tokens.get(index)
@@ -2172,6 +2264,8 @@ fn parse_observed_column_options(
                 default_value = None;
             } else if supports_required_zero && value == "0" {
                 default_value = Some("0".to_string());
+            } else if text && value == "<string>" {
+                default_value = Some(parse_text_default_literal(literals)?);
             } else {
                 return Err(format!("unsupported production ADD COLUMN default {value}"));
             }
@@ -2192,6 +2286,9 @@ fn parse_observed_column_options(
             ));
         }
     }
+    if text && !nullable && default_value.is_none() {
+        return Err("required TEXT ADD COLUMN needs a modeled string default".to_string());
+    }
     Ok(ParsedColumnOptions {
         nullable,
         default_value,
@@ -2199,6 +2296,23 @@ fn parse_observed_column_options(
         after,
         next_index: index,
     })
+}
+
+/// The literal a TEXT `DEFAULT '...'` carries; MySQL 8 receives it as an expression default.
+fn parse_text_default_literal(
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<String, String> {
+    let value = literals
+        .next()
+        .ok_or_else(|| "TEXT DEFAULT literal is missing".to_string())?;
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_graphic() && !matches!(character, '\'' | '\\'))
+    {
+        return Err(format!("unmodeled TEXT default literal {value:?}"));
+    }
+    Ok(value)
 }
 
 fn extract_single_quoted_literals(source_sql: &str) -> Result<Vec<String>, String> {

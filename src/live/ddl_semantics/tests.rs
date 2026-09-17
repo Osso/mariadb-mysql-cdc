@@ -1,3 +1,4 @@
+use super::model::ParsedAlterClause;
 use super::transform::{
     DDL_TRANSFORMATION_VERSION, parse_fixture_create_table, parse_production_alter_table_ast,
     supports_drop_procedure, supports_source_only_release_move_procedure_create,
@@ -1669,6 +1670,8 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 default_sql: None,
                 auto_increment: true,
                 on_update_current_timestamp: false,
+                character_set: None,
+                collation: None,
             },
             ParsedCreateColumnAst {
                 name: "kind".into(),
@@ -1677,6 +1680,8 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 default_sql: None,
                 auto_increment: false,
                 on_update_current_timestamp: false,
+                character_set: None,
+                collation: None,
             },
             ParsedCreateColumnAst {
                 name: "updated_at".into(),
@@ -1685,6 +1690,8 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 default_sql: None,
                 auto_increment: false,
                 on_update_current_timestamp: true,
+                character_set: None,
+                collation: None,
             },
             ParsedCreateColumnAst {
                 name: "created_at".into(),
@@ -1693,10 +1700,13 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 default_sql: Some("CURRENT_TIMESTAMP".into()),
                 auto_increment: false,
                 on_update_current_timestamp: false,
+                character_set: None,
+                collation: None,
             },
         ],
         primary_key: vec!["id".into()],
         indexes: Vec::new(),
+        check_constraints: Vec::new(),
         engine: "InnoDB".into(),
         character_set: Some("utf8mb4".into()),
         collation: Some("utf8mb4_unicode_ci".into()),
@@ -2756,5 +2766,447 @@ fn enum_columns_translate_and_set_columns_are_rejected() {
             super::translate_modeled_ddl(sql, &[]).is_err(),
             "unsupported enumerated column passed through: {sql}"
         );
+    }
+}
+
+const READER_MEMORY_PROFILES_CREATE: &str =
+    include_str!("../../../fixtures/ddl/create-reader-memory-profiles.sql");
+const READER_MEMORY_ITEMS_CREATE: &str =
+    include_str!("../../../fixtures/ddl/create-reader-memory-items.sql");
+const READER_MEMORY_OPERATIONS_CREATE: &str =
+    include_str!("../../../fixtures/ddl/create-reader-memory-operations.sql");
+const READER_MEMORY_PROFILES_ALTER: &str =
+    include_str!("../../../fixtures/ddl/alter-reader-memory-profiles-checkpoints.sql");
+const READER_MEMORY_OPERATIONS_ALTER: &str =
+    include_str!("../../../fixtures/ddl/alter-reader-memory-operations-batch.sql");
+
+fn globalcomix_inventory() -> LiveDdlSemanticInventory {
+    LiveDdlSemanticInventory::new(
+        InventoryConfig::default(),
+        InventoryConfig::default(),
+        "globalcomix".to_string(),
+        "globalcomix".to_string(),
+    )
+}
+
+fn absent_target() -> SemanticSchemaSnapshot {
+    SemanticSchemaSnapshot {
+        inventory: SchemaInventory {
+            schema: "globalcomix".to_string(),
+            tables: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            views: Vec::new(),
+            triggers: Vec::new(),
+            routines: Vec::new(),
+            events: Vec::new(),
+        },
+        table_runtime: Default::default(),
+    }
+}
+
+fn reader_memory_create_post_state(source_sql: &str) -> serde_json::Value {
+    let operation = parse_ddl_operation(source_sql).expect("reader memory CREATE operation");
+    assert!(
+        operation.create_table_ast.is_some(),
+        "CREATE must be modeled"
+    );
+    let coordinate = crate::inventory::SourceMasterCoordinate {
+        file: "mysqld-bin.003058".to_string(),
+        position: 1,
+    };
+    let evidence = build_fenced_create_table_evidence(
+        &operation,
+        &absent_target(),
+        &crate::inventory::SchemaDefaults {
+            character_set: "utf8mb4".to_string(),
+            collation: "utf8mb4_uca1400_ai_ci".to_string(),
+        },
+        "mysqld-bin.003058",
+        312415666,
+        &coordinate,
+        &coordinate,
+    )
+    .expect("explicit-collation CREATE evidence needs no source fence");
+    serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON")
+}
+
+fn column<'a>(state: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    state["definition"]["columns"]
+        .as_array()
+        .expect("columns")
+        .iter()
+        .find(|column| column["name"] == name)
+        .unwrap_or_else(|| panic!("column {name} missing from {state}"))
+}
+
+#[test]
+fn reader_memory_profiles_create_transforms_to_mysql8_sql() {
+    let transformation = globalcomix_inventory()
+        .transform_sql(READER_MEMORY_PROFILES_CREATE)
+        .expect("reader_memory_profiles CREATE must be translatable");
+    assert_eq!(transformation.version, DDL_TRANSFORMATION_VERSION);
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "CREATE TABLE `reader_memory_profiles` (\
+`user_id` INT UNSIGNED NOT NULL, \
+`schema_version` SMALLINT UNSIGNED NOT NULL DEFAULT 1, \
+`enabled` TINYINT NOT NULL DEFAULT 0, \
+`capture_enabled` TINYINT NOT NULL DEFAULT 0, \
+`revision` BIGINT UNSIGNED NOT NULL DEFAULT 0, \
+`deletion_epoch` BIGINT UNSIGNED NOT NULL DEFAULT 0, \
+`capture_after` DATETIME(6) NULL, \
+`evidence_floor` DATETIME(6) NULL, \
+`prepared_json` MEDIUMTEXT NOT NULL DEFAULT (_utf8mb4'{}'), \
+`updated_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), \
+PRIMARY KEY (`user_id`), \
+CONSTRAINT `reader_memory_profile_json` CHECK (JSON_VALID(`prepared_json`)), \
+CONSTRAINT `reader_memory_profile_size` CHECK (OCTET_LENGTH(`prepared_json`) <= 32768)\
+) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        )
+    );
+}
+
+#[test]
+fn reader_memory_items_and_operations_create_transform_to_mysql8_sql() {
+    let inventory = globalcomix_inventory();
+    let items = inventory
+        .transform_sql(READER_MEMORY_ITEMS_CREATE)
+        .expect("reader_memory_items CREATE must be translatable");
+    assert_eq!(
+        items.target_sql.as_deref(),
+        Some(
+            "CREATE TABLE `reader_memory_items` (\
+`uuid` CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, \
+`user_id` INT UNSIGNED NOT NULL, \
+`semantic_key` CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, \
+`memory_group` VARCHAR(32) NOT NULL, \
+`predicate` VARCHAR(64) NOT NULL, \
+`payload_json` TEXT NULL, \
+`status` VARCHAR(16) NOT NULL, \
+`source_message_id` BIGINT UNSIGNED NOT NULL, \
+`evidence_at` DATETIME(6) NOT NULL, \
+`barrier_at` DATETIME(6) NULL, \
+`expires_at` DATETIME(6) NULL, \
+`revision` BIGINT UNSIGNED NOT NULL, \
+`updated_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), \
+PRIMARY KEY (`uuid`), \
+UNIQUE KEY `reader_memory_semantic` (`user_id`, `semantic_key`), \
+KEY `reader_memory_owner` (`user_id`, `status`), \
+CONSTRAINT `reader_memory_item_json` CHECK (`payload_json` IS NULL OR JSON_VALID(`payload_json`)), \
+CONSTRAINT `reader_memory_item_size` CHECK (`payload_json` IS NULL OR OCTET_LENGTH(`payload_json`) <= 8192), \
+CONSTRAINT `reader_memory_item_state` CHECK (`status` IN ('active','disabled','forgotten'))\
+) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        )
+    );
+    let operations = inventory
+        .transform_sql(READER_MEMORY_OPERATIONS_CREATE)
+        .expect("reader_memory_operations CREATE must be translatable");
+    let sql = operations.target_sql.expect("operations SQL");
+    assert!(sql.starts_with("CREATE TABLE `reader_memory_operations` (`uuid` CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, "), "{sql}");
+    assert!(
+        sql.contains("`status` VARCHAR(24) NOT NULL DEFAULT 'pending', "),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("`lease_token` CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL, "),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("`created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), "),
+        "{sql}"
+    );
+    assert!(sql.ends_with("PRIMARY KEY (`uuid`), UNIQUE KEY `reader_memory_source` (`user_id`, `source_message_id`), KEY `reader_memory_dispatch` (`status`, `lease_until`, `created_at`), KEY `reader_memory_started` (`started_at`), KEY `reader_memory_operations_owner` (`user_id`, `status`)) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_unicode_ci"), "{sql}");
+}
+
+#[test]
+fn reader_memory_create_expected_post_state_matches_mysql8_inventory() {
+    let profiles = reader_memory_create_post_state(READER_MEMORY_PROFILES_CREATE);
+    assert_eq!(profiles["definition"]["collation"], "utf8mb4_unicode_ci");
+    assert_eq!(
+        profiles["definition"]["primary_key"],
+        serde_json::json!(["user_id"])
+    );
+    let schema_version = column(&profiles, "schema_version");
+    assert_eq!(schema_version["column_type"], "smallint unsigned");
+    assert_eq!(schema_version["default_value"], "1");
+    assert_eq!(schema_version["extra"], "");
+    let capture_after = column(&profiles, "capture_after");
+    assert_eq!(capture_after["column_type"], "datetime(6)");
+    assert_eq!(capture_after["data_type"], "datetime");
+    assert_eq!(capture_after["is_nullable"], true);
+    assert_eq!(capture_after["default_value"], serde_json::Value::Null);
+    let prepared = column(&profiles, "prepared_json");
+    assert_eq!(prepared["column_type"], "mediumtext");
+    assert_eq!(prepared["data_type"], "mediumtext");
+    assert_eq!(prepared["character_set"], "utf8mb4");
+    assert_eq!(prepared["collation"], "utf8mb4_unicode_ci");
+    assert_eq!(prepared["default_value"], "_utf8mb4\\'{}\\'");
+    assert_eq!(prepared["extra"], "DEFAULT_GENERATED");
+    let updated = column(&profiles, "updated_at");
+    assert_eq!(updated["default_value"], "CURRENT_TIMESTAMP(6)");
+    assert_eq!(
+        updated["extra"],
+        "DEFAULT_GENERATED on update CURRENT_TIMESTAMP(6)"
+    );
+    assert_eq!(profiles["indexes"], serde_json::json!([]));
+
+    let items = reader_memory_create_post_state(READER_MEMORY_ITEMS_CREATE);
+    let uuid = column(&items, "uuid");
+    assert_eq!(uuid["column_type"], "char(36)");
+    assert_eq!(uuid["character_set"], "ascii");
+    assert_eq!(uuid["collation"], "ascii_bin");
+    let payload = column(&items, "payload_json");
+    assert_eq!(payload["data_type"], "text");
+    assert_eq!(payload["character_set"], "utf8mb4");
+    assert_eq!(payload["default_value"], serde_json::Value::Null);
+    assert_eq!(payload["extra"], "");
+    let indexes = items["indexes"].as_array().expect("indexes");
+    assert_eq!(indexes.len(), 2);
+    assert_eq!(indexes[0]["name"], "reader_memory_owner");
+    assert_eq!(indexes[1]["name"], "reader_memory_semantic");
+    assert_eq!(indexes[1]["unique"], true);
+
+    let operations = reader_memory_create_post_state(READER_MEMORY_OPERATIONS_CREATE);
+    let status = column(&operations, "status");
+    assert_eq!(status["default_value"], "pending");
+    assert_eq!(status["extra"], "");
+    let created = column(&operations, "created_at");
+    assert_eq!(created["default_value"], "CURRENT_TIMESTAMP(6)");
+    assert_eq!(created["extra"], "DEFAULT_GENERATED");
+}
+
+#[test]
+fn reader_memory_create_canonical_ast_records_checks_and_column_encoding() {
+    let operation = parse_ddl_operation(READER_MEMORY_ITEMS_CREATE).expect("items operation");
+    let evidence = build_semantic_evidence(&operation, &absent_target(), &absent_target())
+        .expect("canonical AST");
+    let ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast).expect("AST JSON");
+    let create = &ast["parsed_create_table"];
+    assert_eq!(create["columns"][0]["character_set"], "ascii");
+    assert_eq!(create["columns"][0]["collation"], "ascii_bin");
+    assert!(create["columns"][1].get("character_set").is_none());
+    assert_eq!(
+        create["check_constraints"][0]["name"],
+        "reader_memory_item_json"
+    );
+    assert_eq!(
+        create["check_constraints"][0]["disjuncts"][0]["kind"],
+        "is_null"
+    );
+    assert_eq!(
+        create["check_constraints"][0]["disjuncts"][1]["kind"],
+        "json_valid"
+    );
+    assert_eq!(
+        create["check_constraints"][1]["disjuncts"][1]["limit"],
+        8192
+    );
+    assert_eq!(
+        create["check_constraints"][2]["disjuncts"][0]["values"],
+        serde_json::json!(["active", "disabled", "forgotten"])
+    );
+    let storefront = parse_ddl_operation(include_str!(
+        "../../../fixtures/ddl/create-storefront-chips.sql"
+    ))
+    .expect("storefront operation");
+    let storefront_ast: serde_json::Value = serde_json::from_str(
+        &build_semantic_evidence(&storefront, &absent_target(), &absent_target())
+            .expect("storefront AST")
+            .canonical_ast,
+    )
+    .expect("storefront JSON");
+    assert!(
+        storefront_ast["parsed_create_table"]
+            .get("check_constraints")
+            .is_none()
+    );
+    assert!(
+        storefront_ast["parsed_create_table"]["columns"][0]
+            .get("character_set")
+            .is_none()
+    );
+}
+
+fn reader_memory_profiles_target() -> SemanticSchemaSnapshot {
+    let mut target = absent_target();
+    target.inventory.tables.push(TableInventory {
+        name: "reader_memory_profiles".to_string(),
+        table_type: "BASE TABLE".to_string(),
+        engine: Some("InnoDB".to_string()),
+        collation: Some("utf8mb4_unicode_ci".to_string()),
+        primary_key: vec!["user_id".to_string()],
+        columns: vec![
+            ColumnInventory {
+                name: "user_id".to_string(),
+                ordinal_position: 1,
+                column_type: "int unsigned".to_string(),
+                data_type: "int".to_string(),
+                is_nullable: false,
+                character_set: None,
+                collation: None,
+                default_value: None,
+                extra: String::new(),
+                comment: String::new(),
+                generated: None,
+            },
+            ColumnInventory {
+                name: "prepared_json".to_string(),
+                ordinal_position: 2,
+                column_type: "mediumtext".to_string(),
+                data_type: "mediumtext".to_string(),
+                is_nullable: false,
+                character_set: Some("utf8mb4".to_string()),
+                collation: Some("utf8mb4_unicode_ci".to_string()),
+                default_value: Some("_utf8mb4\\'{}\\'".to_string()),
+                extra: "DEFAULT_GENERATED".to_string(),
+                comment: String::new(),
+                generated: None,
+            },
+        ],
+    });
+    target
+}
+
+#[test]
+fn reader_memory_profiles_alter_adds_text_expression_default_and_checks() {
+    let transformation = globalcomix_inventory()
+        .transform_sql(READER_MEMORY_PROFILES_ALTER)
+        .expect("reader_memory_profiles ALTER must be translatable");
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `reader_memory_profiles` \
+ADD COLUMN `checkpoints_json` TEXT NOT NULL DEFAULT (_utf8mb4'{}'), \
+ADD CONSTRAINT `reader_memory_checkpoints_json` CHECK (JSON_VALID(`checkpoints_json`)), \
+ADD CONSTRAINT `reader_memory_checkpoints_size` CHECK (OCTET_LENGTH(`checkpoints_json`) <= 16384)"
+        )
+    );
+    let operation = parse_ddl_operation(READER_MEMORY_PROFILES_ALTER).expect("ALTER operation");
+    assert!(operation.alter_table_ast.is_some());
+    let target = reader_memory_profiles_target();
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("ALTER evidence");
+    let post: serde_json::Value =
+        serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
+    let added = column(&post, "checkpoints_json");
+    assert_eq!(added["ordinal_position"], 3);
+    assert_eq!(added["column_type"], "text");
+    assert_eq!(added["data_type"], "text");
+    assert_eq!(added["is_nullable"], false);
+    assert_eq!(added["character_set"], "utf8mb4");
+    assert_eq!(added["collation"], "utf8mb4_unicode_ci");
+    assert_eq!(added["default_value"], "_utf8mb4\\'{}\\'");
+    assert_eq!(added["extra"], "DEFAULT_GENERATED");
+    let ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast).expect("AST JSON");
+    let clauses = &ast["parsed_alter_table"]["clauses"];
+    assert_eq!(clauses[0]["kind"], "add_column");
+    assert_eq!(clauses[0]["default_value"], "{}");
+    assert!(clauses[0].get("character_set").is_none());
+    assert_eq!(clauses[1]["kind"], "add_check");
+    assert_eq!(
+        clauses[1]["constraint"]["name"],
+        "reader_memory_checkpoints_json"
+    );
+    assert_eq!(clauses[2]["constraint"]["disjuncts"][0]["limit"], 16384);
+
+    let missing_column = READER_MEMORY_PROFILES_ALTER.replace(
+        "CHECK (JSON_VALID(checkpoints_json))",
+        "CHECK (JSON_VALID(absent_json))",
+    );
+    let operation = parse_ddl_operation(&missing_column).expect("ALTER with unknown check column");
+    assert!(build_semantic_evidence(&operation, &target, &target).is_err());
+}
+
+#[test]
+fn reader_memory_operations_alter_adds_ascii_char_column_and_key() {
+    let transformation = globalcomix_inventory()
+        .transform_sql(READER_MEMORY_OPERATIONS_ALTER)
+        .expect("reader_memory_operations ALTER must be translatable");
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `reader_memory_operations` \
+ADD COLUMN `batch_uuid` CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL DEFAULT NULL, \
+ADD KEY `reader_memory_batch` (`batch_uuid`, `status`)"
+        )
+    );
+    let ast = parse_production_alter_table_ast(READER_MEMORY_OPERATIONS_ALTER).expect("ALTER AST");
+    let ParsedAlterClause::AddColumn(added) = &ast.clauses[0] else {
+        panic!("first clause must add a column: {ast:?}");
+    };
+    assert_eq!(added.character_set.as_deref(), Some("ascii"));
+    assert_eq!(added.collation.as_deref(), Some("ascii_bin"));
+    assert_eq!(added.default_value, None);
+    let mut target = absent_target();
+    target.inventory.tables.push(TableInventory {
+        name: "reader_memory_operations".to_string(),
+        table_type: "BASE TABLE".to_string(),
+        engine: Some("InnoDB".to_string()),
+        collation: Some("utf8mb4_unicode_ci".to_string()),
+        primary_key: vec!["uuid".to_string()],
+        columns: vec![
+            ColumnInventory {
+                name: "uuid".to_string(),
+                ordinal_position: 1,
+                column_type: "char(36)".to_string(),
+                data_type: "char".to_string(),
+                is_nullable: false,
+                character_set: Some("ascii".to_string()),
+                collation: Some("ascii_bin".to_string()),
+                default_value: None,
+                extra: String::new(),
+                comment: String::new(),
+                generated: None,
+            },
+            ColumnInventory {
+                name: "status".to_string(),
+                ordinal_position: 2,
+                column_type: "varchar(24)".to_string(),
+                data_type: "varchar".to_string(),
+                is_nullable: false,
+                character_set: Some("utf8mb4".to_string()),
+                collation: Some("utf8mb4_unicode_ci".to_string()),
+                default_value: Some("pending".to_string()),
+                extra: String::new(),
+                comment: String::new(),
+                generated: None,
+            },
+        ],
+    });
+    let operation = parse_ddl_operation(READER_MEMORY_OPERATIONS_ALTER).expect("ALTER operation");
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("ALTER evidence");
+    let post: serde_json::Value =
+        serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
+    let batch = column(&post, "batch_uuid");
+    assert_eq!(batch["character_set"], "ascii");
+    assert_eq!(batch["collation"], "ascii_bin");
+    assert_eq!(batch["is_nullable"], true);
+    assert_eq!(post["indexes"][0]["name"], "reader_memory_batch");
+    assert_eq!(post["indexes"][0]["columns"][1]["name"], "status");
+    let ast_json: serde_json::Value = serde_json::from_str(&evidence.canonical_ast).expect("AST");
+    assert_eq!(
+        ast_json["parsed_alter_table"]["clauses"][0]["character_set"],
+        "ascii"
+    );
+}
+
+#[test]
+fn reader_memory_alter_rejects_unmodeled_text_defaults_and_checks() {
+    for sql in [
+        READER_MEMORY_PROFILES_ALTER.replace(
+            "TEXT NOT NULL DEFAULT '{}'",
+            "TEXT NOT NULL DEFAULT '{\\\\}'",
+        ),
+        READER_MEMORY_PROFILES_ALTER.replace("TEXT NOT NULL DEFAULT '{}'", "TEXT NOT NULL"),
+        READER_MEMORY_PROFILES_ALTER.replace(
+            "JSON_VALID(checkpoints_json)",
+            "JSON_VALID(checkpoints_json) AND 1",
+        ),
+        READER_MEMORY_PROFILES_ALTER.replace("<=16384", ">=16384"),
+        READER_MEMORY_OPERATIONS_ALTER.replace("COLLATE ascii_bin", "COLLATE latin1_bin"),
+        "ALTER TABLE t ADD COLUMN c VARCHAR(8) NOT NULL DEFAULT 'x'".to_string(),
+    ] {
+        assert!(!supports_production_alter_table(&sql), "accepted {sql}");
     }
 }

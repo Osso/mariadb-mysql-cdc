@@ -52,9 +52,28 @@ pub struct ParsedCreateColumnAst {
     pub name: String,
     pub column_type: String,
     pub nullable: bool,
+    /// MySQL-rendered default: `NULL`, an integer, a quoted string, `CURRENT_TIMESTAMP[(6)]`,
+    /// or the expression default `(_utf8mb4'...')` MySQL requires for TEXT columns.
     pub default_sql: Option<String>,
     pub auto_increment: bool,
     pub on_update_current_timestamp: bool,
+    pub character_set: Option<String>,
+    pub collation: Option<String>,
+}
+
+/// One predicate of a bounded CHECK constraint; predicates are joined with `OR`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckPredicate {
+    IsNull { column: String },
+    JsonValid { column: String },
+    OctetLengthAtMost { column: String, limit: u64 },
+    InStrings { column: String, values: Vec<String> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedCheckConstraintAst {
+    pub name: String,
+    pub disjuncts: Vec<CheckPredicate>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +83,7 @@ pub struct ParsedCreateTableAst {
     pub columns: Vec<ParsedCreateColumnAst>,
     pub primary_key: Vec<String>,
     pub indexes: Vec<ParsedIndexAst>,
+    pub check_constraints: Vec<ParsedCheckConstraintAst>,
     pub engine: String,
     pub character_set: Option<String>,
     pub collation: Option<String>,
@@ -76,9 +96,12 @@ pub struct ParsedAddColumnAst {
     pub column_type: String,
     pub data_type: String,
     pub nullable: bool,
+    /// Source literal default as MariaDB reports it (`0`, `{}`), or `None` for `NULL`.
     pub default_value: Option<String>,
     pub comment: String,
     pub after: Option<String>,
+    pub character_set: Option<String>,
+    pub collation: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +148,7 @@ pub enum ParsedAlterClause {
     AddColumn(ParsedAddColumnAst),
     ModifyVarchar { name: String, column_type: String },
     AddKey(ParsedIndexAst),
+    AddCheck(ParsedCheckConstraintAst),
     DropColumn(ParsedDropColumnAst),
     DropIndex(ParsedDropIndexAst),
 }
