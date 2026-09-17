@@ -88,6 +88,8 @@ SCENARIOS = (
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
+    ScenarioSpec("commented-drop-column-present-pending-replay", True),
+    ScenarioSpec("commented-drop-column-absent-pending-replay", True),
     ScenarioSpec("bootstrap-contract", True),
     ScenarioSpec("insert-duplicate-idempotent", True),
     ScenarioSpec("users-update-snapshot-ahead", True),
@@ -211,8 +213,7 @@ class Harness:
         csr = self.tempdir / "server.csr"
         extfile = self.tempdir / "server-ext.cnf"
         extfile.write_text(
-            "subjectAltName=IP:127.0.0.1,DNS:localhost\n"
-            "extendedKeyUsage=serverAuth\n"
+            "subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\n"
         )
         run(
             [
@@ -435,11 +436,15 @@ class Harness:
             assert_exact_grants(normalize_grants(grants), expected, user)
 
     def refresh_endpoint(self, endpoint: Endpoint) -> Endpoint:
-        port_text = run(["docker", "port", endpoint.container, "3306/tcp"]).stdout.strip()
+        port_text = run(
+            ["docker", "port", endpoint.container, "3306/tcp"]
+        ).stdout.strip()
         try:
             return Endpoint(endpoint.container, int(port_text.rsplit(":", 1)[1]))
         except (IndexError, ValueError) as error:
-            raise HarnessError(f"could not refresh Docker port for {endpoint.container}: {port_text!r}") from error
+            raise HarnessError(
+                f"could not refresh Docker port for {endpoint.container}: {port_text!r}"
+            ) from error
 
     def admin_sql_file(self, endpoint: Endpoint, path: Path) -> str:
         if not path.is_file():
@@ -452,7 +457,9 @@ class Harness:
     def admin_query(self, endpoint: Endpoint, sql: str) -> str:
         return self.admin_sql(endpoint, sql)
 
-    def assert_admin_sql_rejected(self, endpoint: Endpoint, sql: str, expected_error: str) -> None:
+    def assert_admin_sql_rejected(
+        self, endpoint: Endpoint, sql: str, expected_error: str
+    ) -> None:
         try:
             self.admin_sql(endpoint, sql)
         except HarnessError as error:
@@ -461,7 +468,9 @@ class Harness:
                     f"SQL failed for the wrong reason endpoint={endpoint.container}: {error}"
                 ) from error
             return
-        raise HarnessError(f"SQL unexpectedly succeeded endpoint={endpoint.container}: {sql}")
+        raise HarnessError(
+            f"SQL unexpectedly succeeded endpoint={endpoint.container}: {sql}"
+        )
 
     def query(self, endpoint: Endpoint, sql: str, *, user: str, password: str) -> str:
         return self._mysql(endpoint, sql, user, password)
@@ -495,8 +504,12 @@ class Harness:
             if evidence:
                 fields = evidence.split("\t")
                 if len(fields) != 4 or "INSERT INTO" not in fields[0]:
-                    raise HarnessError(f"unexpected INSERT lock-wait evidence: {evidence!r}")
-                print(f"failed_run_claim_second_connection_blocked evidence={evidence!r}")
+                    raise HarnessError(
+                        f"unexpected INSERT lock-wait evidence: {evidence!r}"
+                    )
+                print(
+                    f"failed_run_claim_second_connection_blocked evidence={evidence!r}"
+                )
                 return evidence
             if time.monotonic() >= deadline:
                 raise HarnessError(
@@ -568,7 +581,16 @@ class Harness:
 
     def coordinate(self) -> Coordinate:
         assert self.source
-        row = self.query(self.source, "SHOW MASTER STATUS;", user=SOURCE_USER, password=SOURCE_PASSWORD).splitlines()[0].split("\t")
+        row = (
+            self.query(
+                self.source,
+                "SHOW MASTER STATUS;",
+                user=SOURCE_USER,
+                password=SOURCE_PASSWORD,
+            )
+            .splitlines()[0]
+            .split("\t")
+        )
         return Coordinate(row[0], int(row[1]))
 
     def write_checkpoint(self, coordinate: Coordinate) -> None:
@@ -578,7 +600,10 @@ class Harness:
             "source_position": coordinate.position,
             "gtid": None,
             "event_timestamp": 0,
-            "last_event": {"event_type": "bootstrap", "description": "harness bootstrap"},
+            "last_event": {
+                "event_type": "bootstrap",
+                "description": "harness bootstrap",
+            },
         }
         name = f"stream-binlog:{SOURCE_IDENTITY}"
         sql = (
@@ -869,9 +894,13 @@ class Harness:
             if ready.is_file():
                 return
             if process.poll() is not None:
-                raise HarnessError(f"stream exited before barrier {boundary}: {self.process_output(process)}")
+                raise HarnessError(
+                    f"stream exited before barrier {boundary}: {self.process_output(process)}"
+                )
             time.sleep(0.1)
-        raise HarnessError(f"stream did not reach barrier {boundary}: {self.process_output(process)}")
+        raise HarnessError(
+            f"stream did not reach barrier {boundary}: {self.process_output(process)}"
+        )
 
     def release_barrier(self, barrier_dir: Path, boundary: str) -> None:
         (barrier_dir / f"{boundary}.release").write_text("release")
@@ -908,7 +937,9 @@ class Harness:
 
     def _assert_sync_target_unchanged(self) -> None:
         assert self.target
-        row_count = self.admin_query(self.target, "SELECT COUNT(*) FROM accounts;").strip()
+        row_count = self.admin_query(
+            self.target, "SELECT COUNT(*) FROM accounts;"
+        ).strip()
         progress_count = self.admin_query(
             self.target,
             "SELECT COUNT(*) FROM cdc.sync_runs;",
@@ -1026,8 +1057,7 @@ class Harness:
         require_success(replay, "completed unified sync rerun")
         if mutation_attempts != "0":
             raise HarnessError(
-                "completed sync rerun attempted account mutations: "
-                f"{mutation_attempts}"
+                f"completed sync rerun attempted account mutations: {mutation_attempts}"
             )
         print(
             "sync_tls_converged rows=4 target_ca=true wrong_target_ca_rejected=true "
@@ -1068,9 +1098,10 @@ class Harness:
                 f"serial duplicate INSERT changed target authority or skipped later row: {rows!r}"
             )
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(
-            checkpoint.get("source_position", 0)
-        ) != stop.position:
+        if (
+            checkpoint.get("source_file") != stop.file
+            or int(checkpoint.get("source_position", 0)) != stop.position
+        ):
             raise HarnessError(
                 f"serial duplicate INSERT checkpoint did not reach exact stop: {checkpoint}"
             )
@@ -1408,13 +1439,18 @@ DELIMITER ;
             password=TARGET_PASSWORD,
         ).strip()
         if parent != "41\t0123456789abcdef0123456789abcdef\tsource-parent":
-            raise HarnessError(f"missing FK parent was not copied from source: {parent!r}")
+            raise HarnessError(
+                f"missing FK parent was not copied from source: {parent!r}"
+            )
         if child != "7001\t41\t0123456789abcdef0123456789abcdef\tchild":
-            raise HarnessError(f"child row was not retried after parent copy: {child!r}")
+            raise HarnessError(
+                f"child row was not retried after parent copy: {child!r}"
+            )
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(
-            checkpoint.get("source_position", 0)
-        ) != stop.position:
+        if (
+            checkpoint.get("source_file") != stop.file
+            or int(checkpoint.get("source_position", 0)) != stop.position
+        ):
             raise HarnessError(
                 f"missing FK repair checkpoint did not reach exact stop: {checkpoint}"
             )
@@ -1479,9 +1515,10 @@ DELIMITER ;
                 f"serial superseded source INSERT did not converge: {child!r}"
             )
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(
-            checkpoint.get("source_position", 0)
-        ) != stop.position:
+        if (
+            checkpoint.get("source_file") != stop.file
+            or int(checkpoint.get("source_position", 0)) != stop.position
+        ):
             raise HarnessError(
                 f"serial superseded INSERT checkpoint did not reach exact stop: {checkpoint}"
             )
@@ -1595,9 +1632,10 @@ DELIMITER ;
         if releases != "391409\t49125\n391410\t49126":
             raise HarnessError(f"{mode} comic children were not retried: {releases!r}")
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(
-            checkpoint.get("source_position", 0)
-        ) != stop.position:
+        if (
+            checkpoint.get("source_file") != stop.file
+            or int(checkpoint.get("source_position", 0)) != stop.position
+        ):
             raise HarnessError(
                 f"{mode} duplicate-parent checkpoint did not reach exact stop: {checkpoint}"
             )
@@ -1691,9 +1729,10 @@ DELIMITER ;
                 f"serial target did not retry child after nested parent repair: {child!r}"
             )
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(
-            checkpoint.get("source_position", 0)
-        ) != stop.position:
+        if (
+            checkpoint.get("source_file") != stop.file
+            or int(checkpoint.get("source_position", 0)) != stop.position
+        ):
             raise HarnessError(
                 f"serial nested missing-FK checkpoint did not reach exact stop: {checkpoint}"
             )
@@ -1725,7 +1764,9 @@ DELIMITER ;
             password=TARGET_PASSWORD,
         )
         if created.strip() != "idx_accounts_email\t1\t1\temail\tA\tBTREE":
-            raise HarnessError(f"target missing complete replayed BTREE index metadata:\n{created}")
+            raise HarnessError(
+                f"target missing complete replayed BTREE index metadata:\n{created}"
+            )
 
         self.admin_sql(
             self.source,
@@ -1749,10 +1790,17 @@ DELIMITER ;
             password=TARGET_PASSWORD,
         ).strip()
         if count != "1":
-            raise HarnessError(f"target row count mismatch after DDL/DML replay: {count!r}")
+            raise HarnessError(
+                f"target row count mismatch after DDL/DML replay: {count!r}"
+            )
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
-            raise HarnessError(f"checkpoint did not reach exact source end coordinate {stop}: {checkpoint}")
+        if (
+            checkpoint.get("source_file") != stop.file
+            or int(checkpoint.get("source_position", 0)) != stop.position
+        ):
+            raise HarnessError(
+                f"checkpoint did not reach exact source end coordinate {stop}: {checkpoint}"
+            )
         journal = self.query(
             self.target,
             "SELECT source_identity,status,binlog_file,event_start_position,event_end_position "
@@ -1764,7 +1812,9 @@ DELIMITER ;
         )
         rows = [line.split("\t") for line in journal.splitlines() if line.strip()]
         if len(rows) != 2 or any(row[1] != "checkpointed" for row in rows):
-            raise HarnessError(f"DDL journal did not contain two checkpointed rows:\n{journal}")
+            raise HarnessError(
+                f"DDL journal did not contain two checkpointed rows:\n{journal}"
+            )
         pending = self.query(
             self.target,
             "SELECT COUNT(*) FROM cdc.ddl_replay_journal WHERE status IN ('translation_pending','blocked');",
@@ -1772,8 +1822,12 @@ DELIMITER ;
             password=TARGET_PASSWORD,
         ).strip()
         if pending != "0":
-            raise HarnessError(f"unexpected unresolved DDL journal debt after strict replay: {pending}")
-        print(f"strict_secondary_btree_ok coordinate={stop.file}:{stop.position} journal_rows={len(rows)}")
+            raise HarnessError(
+                f"unexpected unresolved DDL journal debt after strict replay: {pending}"
+            )
+        print(
+            f"strict_secondary_btree_ok coordinate={stop.file}:{stop.position} journal_rows={len(rows)}"
+        )
 
     def prepare_pending_add_column(
         self, schema: str, ddl: str, marker: str = "ADD COLUMN"
@@ -1994,6 +2048,122 @@ DELIMITER ;
             f"coordinate={stop.file}:{stop.position}"
         )
 
+    def run_commented_drop_column_pending_replay(self, present: bool) -> None:
+        assert self.source and self.target
+        role_column = "role ENUM('anchor','collect') NOT NULL, " if present else ""
+        schema = (
+            "CREATE TABLE kg_storefront_chip_terms ("
+            "id INT UNSIGNED NOT NULL AUTO_INCREMENT, chip_id INT UNSIGNED NOT NULL, "
+            "facet_type VARCHAR(32) NOT NULL, value VARCHAR(128) NOT NULL, "
+            f"{role_column}create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "PRIMARY KEY(id), UNIQUE KEY uq_chip_term(chip_id,facet_type,value), "
+            "KEY idx_chip_term_facet(facet_type,value)) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci; "
+            "INSERT INTO kg_storefront_chip_terms(id,chip_id,facet_type,value,create_time) "
+            "VALUES(7,21,'genre','before','2026-01-02 03:04:05');"
+        )
+        ddl = (
+            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ "
+            "ALTER TABLE kg_storefront_chip_terms DROP COLUMN IF EXISTS `role`"
+        )
+        start, pending = self.prepare_pending_add_column(
+            schema, ddl, marker="DROP COLUMN"
+        )
+        self.admin_sql(
+            self.source,
+            "UPDATE kg_storefront_chip_terms SET value='after' WHERE id=7; "
+            "INSERT INTO kg_storefront_chip_terms(chip_id,facet_type,value) "
+            "VALUES(22,'theme','inserted');",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        promoted = self.journal_full_row()
+        expected_sql = (
+            "ALTER TABLE `kg_storefront_chip_terms` DROP COLUMN `role`"
+            if present
+            else "NULL"
+        )
+        if promoted["generated_sql"] != expected_sql:
+            raise HarnessError(
+                f"conditional DROP execution/no-op differs: {promoted!r}"
+            )
+        self.assert_chip_terms_drop_metadata()
+        source_rows = self.admin_query(
+            self.source, "SELECT * FROM kg_storefront_chip_terms ORDER BY id;"
+        ).strip()
+        self.assert_post_ddl_rows("kg_storefront_chip_terms", source_rows)
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(
+                endpoint,
+                "SELECT id,chip_id,facet_type,value,create_time IS NOT NULL "
+                "FROM kg_storefront_chip_terms ORDER BY id;",
+            ).strip()
+            if rows != "7\t21\tgenre\tafter\t1\n8\t22\ttheme\tinserted\t1":
+                raise HarnessError(
+                    f"conditional DROP downstream rows/defaults differ: {rows!r}"
+                )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "INSERT INTO kg_storefront_chip_terms(chip_id,facet_type,value) "
+                "VALUES(22,'theme','inserted');",
+                "Duplicate entry",
+            )
+        print(
+            f"commented_drop_column_pending_replay_ok present={present} "
+            "pending_promoted=true immutable_identity=true metadata=true "
+            "conditional_execution=true post_ddl_rows=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def assert_chip_terms_drop_metadata(self) -> None:
+        assert self.target
+        columns = self.admin_query(
+            self.target,
+            "SELECT column_name,column_type,is_nullable,column_default,ordinal_position,extra "
+            "FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='kg_storefront_chip_terms' "
+            "ORDER BY ordinal_position;",
+        ).strip()
+        expected = "\n".join(
+            [
+                "id\tint unsigned\tNO\tNULL\t1\tauto_increment",
+                "chip_id\tint unsigned\tNO\tNULL\t2\t",
+                "facet_type\tvarchar(32)\tNO\tNULL\t3\t",
+                "value\tvarchar(128)\tNO\tNULL\t4\t",
+                "create_time\ttimestamp\tNO\tCURRENT_TIMESTAMP\t5\tDEFAULT_GENERATED",
+            ]
+        )
+        if columns != expected:
+            raise HarnessError(f"conditional DROP column metadata differs: {columns!r}")
+        collations = self.admin_query(
+            self.target,
+            "SELECT column_name,collation_name FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='kg_storefront_chip_terms' "
+            "AND character_set_name IS NOT NULL ORDER BY ordinal_position;",
+        ).strip()
+        if collations != "facet_type\tutf8mb4_unicode_ci\nvalue\tutf8mb4_unicode_ci":
+            raise HarnessError(
+                f"conditional DROP historical collation differs: {collations!r}"
+            )
+        keys = self.admin_query(
+            self.target,
+            "SELECT index_name,non_unique,seq_in_index,column_name,sub_part,index_type "
+            "FROM information_schema.STATISTICS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='kg_storefront_chip_terms' "
+            "ORDER BY index_name,seq_in_index;",
+        ).strip()
+        expected_keys = "\n".join(
+            [
+                "idx_chip_term_facet\t1\t1\tfacet_type\tNULL\tBTREE",
+                "idx_chip_term_facet\t1\t2\tvalue\tNULL\tBTREE",
+                "PRIMARY\t0\t1\tid\tNULL\tBTREE",
+                "uq_chip_term\t0\t1\tchip_id\tNULL\tBTREE",
+                "uq_chip_term\t0\t2\tfacet_type\tNULL\tBTREE",
+                "uq_chip_term\t0\t3\tvalue\tNULL\tBTREE",
+            ]
+        )
+        if keys != expected_keys:
+            raise HarnessError(f"conditional DROP key metadata differs: {keys!r}")
+
     def run_storefront_create_pending_replay(self) -> None:
         assert self.source and self.target
         self.admin_sql(
@@ -2167,7 +2337,9 @@ DELIMITER ;
             "home_feed_panel_candidates\tfiltered_time\tdatetime\tYES\tNULL\tsanitized description",
         ]
         if columns != expected_columns:
-            raise HarnessError(f"production ALTER TABLE column parity failed: {columns}")
+            raise HarnessError(
+                f"production ALTER TABLE column parity failed: {columns}"
+            )
         index_rows = self.query(
             self.target,
             "SELECT index_name,non_unique,seq_in_index,column_name,index_type "
@@ -2182,7 +2354,9 @@ DELIMITER ;
             "idx_hfb_variant_status_published\t1\t2\tstatus\tBTREE",
             "idx_hfb_variant_status_published\t1\t3\tpublished_time\tBTREE",
         ]:
-            raise HarnessError(f"production ALTER TABLE index parity failed: {index_rows}")
+            raise HarnessError(
+                f"production ALTER TABLE index parity failed: {index_rows}"
+            )
         unique_metadata = []
         for endpoint in (self.source, self.target):
             unique_metadata.append(
@@ -2196,11 +2370,17 @@ DELIMITER ;
             )
         expected_unique_metadata = "uq_accounts_email\t0\t1\temail\tNULL\tBTREE"
         if unique_metadata != [expected_unique_metadata, expected_unique_metadata]:
-            raise HarnessError(f"production ADD UNIQUE KEY metadata parity failed: {unique_metadata}")
-        duplicate_sql = "INSERT INTO accounts (id,email) VALUES (2, 'existing@example.test');"
+            raise HarnessError(
+                f"production ADD UNIQUE KEY metadata parity failed: {unique_metadata}"
+            )
+        duplicate_sql = (
+            "INSERT INTO accounts (id,email) VALUES (2, 'existing@example.test');"
+        )
         for endpoint in (self.source, self.target):
             self.assert_admin_sql_rejected(endpoint, duplicate_sql, "Duplicate entry")
-            rows = self.admin_query(endpoint, "SELECT id,email FROM accounts ORDER BY id;").strip()
+            rows = self.admin_query(
+                endpoint, "SELECT id,email FROM accounts ORDER BY id;"
+            ).strip()
             if rows != "1\texisting@example.test":
                 raise HarnessError(
                     f"production ADD UNIQUE KEY duplicate rejection mutated rows "
@@ -2227,9 +2407,15 @@ DELIMITER ;
         ).strip()
         unique_evidence_fields = unique_evidence_row.split("\t", 5)
         if len(unique_evidence_fields) != 6:
-            raise HarnessError(f"production ADD UNIQUE KEY evidence shape mismatch: {unique_evidence_row!r}")
-        status, version, generated_sql, ast_json, pre_state_json, post_state_json = unique_evidence_fields
-        expected_generated_sql = "ALTER TABLE `accounts` ADD UNIQUE KEY `uq_accounts_email` (`email`)"
+            raise HarnessError(
+                f"production ADD UNIQUE KEY evidence shape mismatch: {unique_evidence_row!r}"
+            )
+        status, version, generated_sql, ast_json, pre_state_json, post_state_json = (
+            unique_evidence_fields
+        )
+        expected_generated_sql = (
+            "ALTER TABLE `accounts` ADD UNIQUE KEY `uq_accounts_email` (`email`)"
+        )
         if (status, version, generated_sql) != (
             "checkpointed",
             "mariadb-mysql8-v1",
@@ -2270,15 +2456,23 @@ DELIMITER ;
         }
         canonical_ast = json.loads(ast_json)
         if canonical_ast != expected_ast:
-            raise HarnessError(f"production ADD UNIQUE KEY canonical AST mismatch: {canonical_ast!r}")
+            raise HarnessError(
+                f"production ADD UNIQUE KEY canonical AST mismatch: {canonical_ast!r}"
+            )
         pre_state = json.loads(pre_state_json)
         post_state = json.loads(post_state_json)
         expected_state_keys = {"kind", "name", "definition", "indexes", "foreign_keys"}
-        if set(pre_state) != expected_state_keys or set(post_state) != expected_state_keys:
+        if (
+            set(pre_state) != expected_state_keys
+            or set(post_state) != expected_state_keys
+        ):
             raise HarnessError(
                 f"production ADD UNIQUE KEY state shape mismatch: pre={pre_state!r} post={post_state!r}"
             )
-        if pre_state["definition"] != post_state["definition"] or pre_state["foreign_keys"] != post_state["foreign_keys"]:
+        if (
+            pre_state["definition"] != post_state["definition"]
+            or pre_state["foreign_keys"] != post_state["foreign_keys"]
+        ):
             raise HarnessError(
                 f"production ADD UNIQUE KEY changed unrelated state: pre={pre_state!r} post={post_state!r}"
             )
@@ -2299,7 +2493,9 @@ DELIMITER ;
                 }
             ],
         }
-        if pre_state["indexes"] != [] or post_state["indexes"] != [expected_index_state]:
+        if pre_state["indexes"] != [] or post_state["indexes"] != [
+            expected_index_state
+        ]:
             raise HarnessError(
                 f"production ADD UNIQUE KEY post-state mismatch: pre={pre_state!r} post={post_state!r}"
             )
@@ -2314,7 +2510,9 @@ DELIMITER ;
                 ).strip()
             )
         if dropped_columns != ["0", "0"]:
-            raise HarnessError(f"DROP COLUMN IF EXISTS parity failed: {dropped_columns}")
+            raise HarnessError(
+                f"DROP COLUMN IF EXISTS parity failed: {dropped_columns}"
+            )
         drop_evidence = self.query(
             self.target,
             "SELECT status,transformation_version,generated_sql "
@@ -2326,10 +2524,17 @@ DELIMITER ;
             "checkpointed\tmariadb-mysql8-v1\t"
             "ALTER TABLE `accounts` DROP COLUMN `handle`"
         ):
-            raise HarnessError(f"DROP COLUMN IF EXISTS evidence mismatch: {drop_evidence!r}")
+            raise HarnessError(
+                f"DROP COLUMN IF EXISTS evidence mismatch: {drop_evidence!r}"
+            )
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != stop.file or int(checkpoint.get("source_position", 0)) != stop.position:
-            raise HarnessError(f"production ALTER TABLE checkpoint mismatch: {checkpoint}")
+        if (
+            checkpoint.get("source_file") != stop.file
+            or int(checkpoint.get("source_position", 0)) != stop.position
+        ):
+            raise HarnessError(
+                f"production ALTER TABLE checkpoint mismatch: {checkpoint}"
+            )
         supported_checkpoint = checkpoint
 
         releases_schema = """
@@ -2381,7 +2586,9 @@ DELIMITER ;
             """,
         )
         releases_stop = self.coordinate()
-        releases_process, releases_log = self.start_stream(releases_start, releases_stop)
+        releases_process, releases_log = self.start_stream(
+            releases_start, releases_stop
+        )
         deadline = time.monotonic() + 30
         while releases_process.poll() is None and time.monotonic() < deadline:
             pending = self.query(
@@ -2421,7 +2628,9 @@ DELIMITER ;
             "3\t1\t0\t0\t0\t2\t2026-08-28 14:00:00\t12\tthird",
         ]
         if releases_rows != expected_releases_rows:
-            raise HarnessError(f"production releases index rebuild changed rows: {releases_rows!r}")
+            raise HarnessError(
+                f"production releases index rebuild changed rows: {releases_rows!r}"
+            )
         releases_index = self.query(
             self.target,
             "SELECT seq_in_index,column_name,collation FROM information_schema.statistics "
@@ -2457,14 +2666,18 @@ DELIMITER ;
                 f"production releases index rebuild journal mismatch: {releases_journal!r}"
             )
         releases_checkpoint = self.checkpoint()
-        if releases_checkpoint.get("source_file") != releases_stop.file or int(
-            releases_checkpoint.get("source_position", 0)
-        ) != releases_stop.position:
+        if (
+            releases_checkpoint.get("source_file") != releases_stop.file
+            or int(releases_checkpoint.get("source_position", 0))
+            != releases_stop.position
+        ):
             raise HarnessError(
                 f"production releases index rebuild checkpoint mismatch: {releases_checkpoint}"
             )
 
-        self.admin_sql(self.source, "ALTER TABLE accounts DROP COLUMN IF EXISTS handle;")
+        self.admin_sql(
+            self.source, "ALTER TABLE accounts DROP COLUMN IF EXISTS handle;"
+        )
         no_op_stop = self.coordinate()
         no_op_result = self.run_stream(stop, no_op_stop)
         require_success(no_op_result, "DROP COLUMN IF EXISTS proven no-op replay")
@@ -2477,12 +2690,17 @@ DELIMITER ;
             password=TARGET_PASSWORD,
         ).strip()
         if no_op_evidence != "checkpointed\tmariadb-mysql8-v1\tNULL":
-            raise HarnessError(f"DROP COLUMN IF EXISTS no-op evidence mismatch: {no_op_evidence!r}")
+            raise HarnessError(
+                f"DROP COLUMN IF EXISTS no-op evidence mismatch: {no_op_evidence!r}"
+            )
         no_op_checkpoint = self.checkpoint()
-        if no_op_checkpoint.get("source_file") != no_op_stop.file or int(
-            no_op_checkpoint.get("source_position", 0)
-        ) != no_op_stop.position:
-            raise HarnessError(f"DROP COLUMN IF EXISTS no-op checkpoint mismatch: {no_op_checkpoint}")
+        if (
+            no_op_checkpoint.get("source_file") != no_op_stop.file
+            or int(no_op_checkpoint.get("source_position", 0)) != no_op_stop.position
+        ):
+            raise HarnessError(
+                f"DROP COLUMN IF EXISTS no-op checkpoint mismatch: {no_op_checkpoint}"
+            )
         supported_checkpoint = no_op_checkpoint
 
         self.admin_sql(
@@ -2497,7 +2715,9 @@ DELIMITER ;
         pending_stop = self.coordinate()
         pending_process, pending_log = self.start_stream(no_op_stop, pending_stop)
         try:
-            self.wait_for_pending_ddl(pending_process, pending_log, "uq_accounts_email_prefix")
+            self.wait_for_pending_ddl(
+                pending_process, pending_log, "uq_accounts_email_prefix"
+            )
         finally:
             self.stop_sync_process(pending_process)
         pending_index = self.admin_query(
@@ -2528,7 +2748,9 @@ DELIMITER ;
             password=TARGET_PASSWORD,
         ).splitlines()
         if pending_rows != ["translation_pending\ttranslator-unavailable\tNULL\t\t\t"]:
-            raise HarnessError(f"unsupported unique-key journal evidence mismatch: {pending_rows}")
+            raise HarnessError(
+                f"unsupported unique-key journal evidence mismatch: {pending_rows}"
+            )
         pending_checkpoint = self.checkpoint()
         if pending_checkpoint != supported_checkpoint:
             raise HarnessError(
@@ -2701,12 +2923,17 @@ DELIMITER ;
             self.target,
             f"SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME={sql_literal(APP_SCHEMA)};",
         ).strip()
-        if source_default != "latin1_swedish_ci" or target_default != "utf8mb4_0900_ai_ci":
+        if (
+            source_default != "latin1_swedish_ci"
+            or target_default != "utf8mb4_0900_ai_ci"
+        ):
             raise HarnessError(
                 f"CREATE TABLE defaults were not intentionally different source={source_default!r} target={target_default!r}"
             )
 
-        self.admin_sql(self.target, "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;")
+        self.admin_sql(
+            self.target, "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;"
+        )
         start = self.coordinate()
         self.write_checkpoint(start)
         self.admin_sql(
@@ -2743,7 +2970,9 @@ DELIMITER ;
             f"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='accounts';",
         ).strip()
         if table_count != "1":
-            raise HarnessError(f"CREATE TABLE crash produced target table count={table_count}")
+            raise HarnessError(
+                f"CREATE TABLE crash produced target table count={table_count}"
+            )
         target_collation = self.admin_query(
             self.target,
             f"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='accounts';",
@@ -2759,17 +2988,37 @@ DELIMITER ;
             "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
             "ORDER BY event_start_position;",
         )
-        evidence_rows = [line.split("\t") for line in evidence.splitlines() if line.strip()]
+        evidence_rows = [
+            line.split("\t") for line in evidence.splitlines() if line.strip()
+        ]
         if len(evidence_rows) != 1 or len(evidence_rows[0]) != 5:
-            raise HarnessError(f"CREATE TABLE durable evidence row mismatch: {evidence!r}")
-        status, generated_sql, canonical_ast, pre_state, expected_post_state = evidence_rows[0]
+            raise HarnessError(
+                f"CREATE TABLE durable evidence row mismatch: {evidence!r}"
+            )
+        status, generated_sql, canonical_ast, pre_state, expected_post_state = (
+            evidence_rows[0]
+        )
         if status != "prepared":
             raise HarnessError(f"CREATE TABLE crash journal status={status!r}")
-        if "DEFAULT CHARACTER SET latin1 COLLATE latin1_swedish_ci" not in generated_sql:
-            raise HarnessError(f"CREATE TABLE generated SQL omitted source defaults: {generated_sql}")
-        if '"character_set":"latin1"' not in canonical_ast or '"collation":"latin1_swedish_ci"' not in canonical_ast:
-            raise HarnessError(f"CREATE TABLE canonical evidence omitted source defaults: {canonical_ast}")
-        if not pre_state or not expected_post_state or '"collation":"latin1_swedish_ci"' not in expected_post_state:
+        if (
+            "DEFAULT CHARACTER SET latin1 COLLATE latin1_swedish_ci"
+            not in generated_sql
+        ):
+            raise HarnessError(
+                f"CREATE TABLE generated SQL omitted source defaults: {generated_sql}"
+            )
+        if (
+            '"character_set":"latin1"' not in canonical_ast
+            or '"collation":"latin1_swedish_ci"' not in canonical_ast
+        ):
+            raise HarnessError(
+                f"CREATE TABLE canonical evidence omitted source defaults: {canonical_ast}"
+            )
+        if (
+            not pre_state
+            or not expected_post_state
+            or '"collation":"latin1_swedish_ci"' not in expected_post_state
+        ):
             raise HarnessError("CREATE TABLE durable pre/post evidence is incomplete")
 
         def target_create_count() -> str:
@@ -2781,7 +3030,9 @@ DELIMITER ;
             ).strip()
 
         if target_create_count() != "1":
-            raise HarnessError("CREATE TABLE target execution count was not exactly one after crash")
+            raise HarnessError(
+                "CREATE TABLE target execution count was not exactly one after crash"
+            )
 
         restarted = self.run_stream(start, final_stop)
         require_success(restarted, "CREATE TABLE prepared-state restart")
@@ -2790,7 +3041,8 @@ DELIMITER ;
         checkpoint_after_restart = self.checkpoint()
         if (
             checkpoint_after_restart.get("source_file") != final_stop.file
-            or int(checkpoint_after_restart.get("source_position", 0)) != final_stop.position
+            or int(checkpoint_after_restart.get("source_position", 0))
+            != final_stop.position
         ):
             raise HarnessError(
                 f"CREATE TABLE restart did not advance checkpoint exactly to event end: {checkpoint_after_restart}"
@@ -2800,9 +3052,13 @@ DELIMITER ;
         replayed = self.run_stream(start, final_stop)
         require_success(replayed, "CREATE TABLE idempotent replay")
         if self.checkpoint() != checkpoint_after_restart:
-            raise HarnessError("CREATE TABLE idempotent replay changed checkpoint state")
+            raise HarnessError(
+                "CREATE TABLE idempotent replay changed checkpoint state"
+            )
         if target_create_count() != "1":
-            raise HarnessError("CREATE TABLE idempotent replay executed target DDL again")
+            raise HarnessError(
+                "CREATE TABLE idempotent replay executed target DDL again"
+            )
         final_status = self.admin_query(
             self.target,
             "SELECT status FROM cdc.ddl_replay_journal "
@@ -2852,7 +3108,9 @@ DELIMITER ;
         )
         has_index = "idx_accounts_email" in indexes
         if has_index != expected_index:
-            raise HarnessError(f"target schema state mismatch expected_index={expected_index}: {indexes}")
+            raise HarnessError(
+                f"target schema state mismatch expected_index={expected_index}: {indexes}"
+            )
         count = self.query(
             self.target,
             "SELECT COUNT(*) FROM accounts;",
@@ -2860,10 +3118,17 @@ DELIMITER ;
             password=TARGET_PASSWORD,
         ).strip()
         if count != expected_rows:
-            raise HarnessError(f"later DML overtook DDL boundary: expected rows={expected_rows}, got {count}")
+            raise HarnessError(
+                f"later DML overtook DDL boundary: expected rows={expected_rows}, got {count}"
+            )
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != coordinate.file or int(checkpoint.get("source_position", 0)) != coordinate.position:
-            raise HarnessError(f"checkpoint mismatch expected {coordinate.file}:{coordinate.position}: {checkpoint}")
+        if (
+            checkpoint.get("source_file") != coordinate.file
+            or int(checkpoint.get("source_position", 0)) != coordinate.position
+        ):
+            raise HarnessError(
+                f"checkpoint mismatch expected {coordinate.file}:{coordinate.position}: {checkpoint}"
+            )
 
     def journal_full_row(self) -> dict[str, str]:
         assert self.target
@@ -2886,7 +3151,10 @@ DELIMITER ;
             raise HarnessError(
                 f"expected exactly one complete immutable journal row, got {output}"
             )
-        return {key: "NULL" if value is None else str(value) for key, value in rows[0].items()}
+        return {
+            key: "NULL" if value is None else str(value)
+            for key, value in rows[0].items()
+        }
 
     def replace_journal_row(self, row: dict[str, str]) -> None:
         assert self.target
@@ -2916,8 +3184,12 @@ DELIMITER ;
         self.setup_accounts_table()
         start = self.coordinate()
         self.write_checkpoint(start)
-        self.admin_sql(self.source, "CREATE INDEX idx_accounts_email ON accounts (email);")
-        self.admin_sql(self.source, "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');")
+        self.admin_sql(
+            self.source, "CREATE INDEX idx_accounts_email ON accounts (email);"
+        )
+        self.admin_sql(
+            self.source, "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');"
+        )
         final_stop = self.coordinate()
         result = self.run_stream(start, final_stop)
         require_success(result, "journal mismatch baseline DDL")
@@ -2937,7 +3209,10 @@ DELIMITER ;
     ) -> None:
         assert self.target
         baseline_indexes = self.query(
-            self.target, "SHOW INDEX FROM accounts;", user=TARGET_USER, password=TARGET_PASSWORD
+            self.target,
+            "SHOW INDEX FROM accounts;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
         )
         baseline_rows = self.query(
             self.target,
@@ -2970,7 +3245,11 @@ DELIMITER ;
         ).strip()
         self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
         output = f"{result.stdout}\\n{result.stderr}".lower()
-        if result.returncode == 0 or "identity mismatch" not in output or field not in output:
+        if (
+            result.returncode == 0
+            or "identity mismatch" not in output
+            or field not in output
+        ):
             raise HarnessError(
                 f"{scenario} did not reject immutable-field reuse field={field}: "
                 f"exit={result.returncode} output={result.stdout} {result.stderr}"
@@ -2979,19 +3258,46 @@ DELIMITER ;
             raise HarnessError(
                 f"{scenario} attempted target mutation before identity rejection: attempts={mutation_attempts}"
             )
-        if self.query(self.target, "SHOW INDEX FROM accounts;", user=TARGET_USER, password=TARGET_PASSWORD) != baseline_indexes:
-            raise HarnessError(f"{scenario} mutated target schema before identity rejection")
-        if self.query(self.target, "SELECT COUNT(*) FROM accounts;", user=TARGET_USER, password=TARGET_PASSWORD).strip() != baseline_rows:
-            raise HarnessError(f"{scenario} mutated target rows before identity rejection")
+        if (
+            self.query(
+                self.target,
+                "SHOW INDEX FROM accounts;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            )
+            != baseline_indexes
+        ):
+            raise HarnessError(
+                f"{scenario} mutated target schema before identity rejection"
+            )
+        if (
+            self.query(
+                self.target,
+                "SELECT COUNT(*) FROM accounts;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).strip()
+            != baseline_rows
+        ):
+            raise HarnessError(
+                f"{scenario} mutated target rows before identity rejection"
+            )
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
-            raise HarnessError(f"{scenario} advanced checkpoint after identity rejection: {checkpoint}")
+        if (
+            checkpoint.get("source_file") != start.file
+            or int(checkpoint.get("source_position", 0)) != start.position
+        ):
+            raise HarnessError(
+                f"{scenario} advanced checkpoint after identity rejection: {checkpoint}"
+            )
         retained = self.journal_full_row()
         if retained != inserted_row:
             raise HarnessError(
                 f"{scenario} changed inserted journal row: expected={inserted_row} retained={retained}"
             )
-        print(f"{scenario}_blocked identity_mismatch={field} no_overtake=true evidence_retained=true")
+        print(
+            f"{scenario}_blocked identity_mismatch={field} no_overtake=true evidence_retained=true"
+        )
 
     def run_journal_mismatch_scenario(self, scenario: str) -> None:
         assert self.source and self.target
@@ -2999,38 +3305,94 @@ DELIMITER ;
             self.setup_accounts_table()
             start = self.coordinate()
             self.write_checkpoint(start)
-            self.admin_sql(self.source, "CREATE INDEX idx_accounts_email ON accounts (email);")
-            self.admin_sql(self.source, "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');")
+            self.admin_sql(
+                self.source, "CREATE INDEX idx_accounts_email ON accounts (email);"
+            )
+            self.admin_sql(
+                self.source,
+                "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');",
+            )
             final_stop = self.coordinate()
-            prepared = self.run_stream(start, final_stop, integration_failpoint="prepare-failure")
-            if prepared.returncode == 0 or "cdc_integration_failpoint" not in f"{prepared.stdout}\\n{prepared.stderr}":
-                raise HarnessError(f"pre-state-drift did not retain prepared journal evidence: {prepared}")
-            self.assert_recovery_state(start, expected_status="prepared", expected_index=False, expected_rows="0")
-            self.admin_sql(self.target, "CREATE INDEX idx_accounts_external ON accounts (email);")
+            prepared = self.run_stream(
+                start, final_stop, integration_failpoint="prepare-failure"
+            )
+            if (
+                prepared.returncode == 0
+                or "cdc_integration_failpoint"
+                not in f"{prepared.stdout}\\n{prepared.stderr}"
+            ):
+                raise HarnessError(
+                    f"pre-state-drift did not retain prepared journal evidence: {prepared}"
+                )
+            self.assert_recovery_state(
+                start,
+                expected_status="prepared",
+                expected_index=False,
+                expected_rows="0",
+            )
+            self.admin_sql(
+                self.target, "CREATE INDEX idx_accounts_external ON accounts (email);"
+            )
             blocked = self.run_stream(start, final_stop)
             output = f"{blocked.stdout}\\n{blocked.stderr}".lower()
             if blocked.returncode == 0 or "pre-state mismatch" not in output:
-                raise HarnessError(f"pre-state-drift did not reject external inventory drift: {blocked}")
+                raise HarnessError(
+                    f"pre-state-drift did not reject external inventory drift: {blocked}"
+                )
             rows = self.ddl_journal_rows()
-            if len(rows) != 1 or rows[0][0] != "blocked" or any(int(value) <= 0 for value in rows[0][1:4]):
+            if (
+                len(rows) != 1
+                or rows[0][0] != "blocked"
+                or any(int(value) <= 0 for value in rows[0][1:4])
+            ):
                 raise HarnessError(f"pre-state-drift lost immutable evidence: {rows}")
-            indexes = self.query(self.target, "SHOW INDEX FROM accounts;", user=TARGET_USER, password=TARGET_PASSWORD)
-            if "idx_accounts_external" not in indexes or "idx_accounts_email" in indexes:
-                raise HarnessError(f"pre-state-drift target state crossed DDL boundary: {indexes}")
-            if self.query(self.target, "SELECT COUNT(*) FROM accounts;", user=TARGET_USER, password=TARGET_PASSWORD).strip() != "0":
-                raise HarnessError("pre-state-drift applied later DML after blocked reconciliation")
+            indexes = self.query(
+                self.target,
+                "SHOW INDEX FROM accounts;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            )
+            if (
+                "idx_accounts_external" not in indexes
+                or "idx_accounts_email" in indexes
+            ):
+                raise HarnessError(
+                    f"pre-state-drift target state crossed DDL boundary: {indexes}"
+                )
+            if (
+                self.query(
+                    self.target,
+                    "SELECT COUNT(*) FROM accounts;",
+                    user=TARGET_USER,
+                    password=TARGET_PASSWORD,
+                ).strip()
+                != "0"
+            ):
+                raise HarnessError(
+                    "pre-state-drift applied later DML after blocked reconciliation"
+                )
             checkpoint = self.checkpoint()
-            if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
+            if (
+                checkpoint.get("source_file") != start.file
+                or int(checkpoint.get("source_position", 0)) != start.position
+            ):
                 raise HarnessError(f"pre-state-drift advanced checkpoint: {checkpoint}")
-            print("pre-state-drift_blocked pre-state_mismatch=true evidence_retained=true no_overtake=true")
+            print(
+                "pre-state-drift_blocked pre-state_mismatch=true evidence_retained=true no_overtake=true"
+            )
             return
 
         if scenario == "checkpoint-mismatch":
             self.setup_accounts_table()
             start = self.coordinate()
             self.write_checkpoint(start)
-            self.admin_sql(self.source, "CREATE INDEX idx_accounts_email ON accounts (email);")
-            self.admin_sql(self.source, "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');")
+            self.admin_sql(
+                self.source, "CREATE INDEX idx_accounts_email ON accounts (email);"
+            )
+            self.admin_sql(
+                self.source,
+                "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');",
+            )
             final_stop = self.coordinate()
             barrier_dir = self.tempdir / "checkpoint-mismatch-barrier"
             process, _log = self.start_stream(
@@ -3040,43 +3402,94 @@ DELIMITER ;
                 barrier_dir=barrier_dir,
                 label="checkpoint-mismatch",
             )
-            self.wait_for_barrier(process, barrier_dir, "after-target-operation-before-journal-applied")
-            self.assert_recovery_state(start, expected_status="prepared", expected_index=True, expected_rows="0")
+            self.wait_for_barrier(
+                process, barrier_dir, "after-target-operation-before-journal-applied"
+            )
+            self.assert_recovery_state(
+                start,
+                expected_status="prepared",
+                expected_index=True,
+                expected_rows="0",
+            )
             journal_row = self.journal_full_row()
             wrong = Coordinate(
                 journal_row["binlog_file"],
                 int(journal_row["event_start_position"]) + 1,
             )
             self.write_checkpoint(wrong)
-            self.release_barrier(barrier_dir, "after-target-operation-before-journal-applied")
+            self.release_barrier(
+                barrier_dir, "after-target-operation-before-journal-applied"
+            )
             blocked = self.finish_stream(process)
             blocked_output = f"{blocked.stdout}\\n{blocked.stderr}".lower()
-            if blocked.returncode == 0 or "checkpoint predecessor mismatch" not in blocked_output:
-                raise HarnessError(f"checkpoint-mismatch did not block predecessor disagreement: {blocked}")
+            if (
+                blocked.returncode == 0
+                or "checkpoint predecessor mismatch" not in blocked_output
+            ):
+                raise HarnessError(
+                    f"checkpoint-mismatch did not block predecessor disagreement: {blocked}"
+                )
             rows = self.ddl_journal_rows()
-            if len(rows) != 1 or rows[0][0] != "applied" or any(int(value) <= 0 for value in rows[0][1:4]):
-                raise HarnessError(f"checkpoint-mismatch changed journal evidence: {rows}")
-            if self.query(self.target, "SHOW INDEX FROM accounts;", user=TARGET_USER, password=TARGET_PASSWORD).count("idx_accounts_email") != 1:
-                raise HarnessError("checkpoint-mismatch unexpectedly changed target DDL state")
-            if self.query(self.target, "SELECT COUNT(*) FROM accounts;", user=TARGET_USER, password=TARGET_PASSWORD).strip() != "0":
-                raise HarnessError("checkpoint-mismatch applied later DML after predecessor rejection")
+            if (
+                len(rows) != 1
+                or rows[0][0] != "applied"
+                or any(int(value) <= 0 for value in rows[0][1:4])
+            ):
+                raise HarnessError(
+                    f"checkpoint-mismatch changed journal evidence: {rows}"
+                )
+            if (
+                self.query(
+                    self.target,
+                    "SHOW INDEX FROM accounts;",
+                    user=TARGET_USER,
+                    password=TARGET_PASSWORD,
+                ).count("idx_accounts_email")
+                != 1
+            ):
+                raise HarnessError(
+                    "checkpoint-mismatch unexpectedly changed target DDL state"
+                )
+            if (
+                self.query(
+                    self.target,
+                    "SELECT COUNT(*) FROM accounts;",
+                    user=TARGET_USER,
+                    password=TARGET_PASSWORD,
+                ).strip()
+                != "0"
+            ):
+                raise HarnessError(
+                    "checkpoint-mismatch applied later DML after predecessor rejection"
+                )
             checkpoint = self.checkpoint()
-            if checkpoint.get("source_file") != wrong.file or int(checkpoint.get("source_position", 0)) != wrong.position:
-                raise HarnessError(f"checkpoint-mismatch advanced checkpoint: {checkpoint}")
-            print("checkpoint-mismatch_blocked checkpoint_predecessor_mismatch=true evidence_retained=true no_overtake=true")
+            if (
+                checkpoint.get("source_file") != wrong.file
+                or int(checkpoint.get("source_position", 0)) != wrong.position
+            ):
+                raise HarnessError(
+                    f"checkpoint-mismatch advanced checkpoint: {checkpoint}"
+                )
+            print(
+                "checkpoint-mismatch_blocked checkpoint_predecessor_mismatch=true evidence_retained=true no_overtake=true"
+            )
             return
 
         start, final_stop, row = self.prepare_checkpointed_ddl()
         row["status"] = "prepared"
         if scenario == "coordinate-reuse":
             row["source_server_id"] = str(int(row["source_server_id"]) + 1)
-            self.assert_reuse_rejected(scenario, start, final_stop, row, "source_server_id")
+            self.assert_reuse_rejected(
+                scenario, start, final_stop, row, "source_server_id"
+            )
         elif scenario == "raw-sql-reuse":
             row["raw_sql"] = row["raw_sql"] + " /* reused coordinate */"
             self.assert_reuse_rejected(scenario, start, final_stop, row, "raw_sql")
         elif scenario == "end-position-reuse":
             row["event_end_position"] = str(int(row["event_end_position"]) + 1)
-            self.assert_reuse_rejected(scenario, start, final_stop, row, "event_end_position")
+            self.assert_reuse_rejected(
+                scenario, start, final_stop, row, "event_end_position"
+            )
         else:
             raise HarnessError(f"unknown journal mismatch scenario: {scenario}")
 
@@ -3085,16 +3498,26 @@ DELIMITER ;
         self.setup_accounts_table()
         start = self.coordinate()
         self.write_checkpoint(start)
-        self.admin_sql(self.source, "CREATE INDEX idx_accounts_email ON accounts (email);")
-        self.admin_sql(self.source, "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');")
+        self.admin_sql(
+            self.source, "CREATE INDEX idx_accounts_email ON accounts (email);"
+        )
+        self.admin_sql(
+            self.source, "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');"
+        )
         final_stop = self.coordinate()
 
         crashed = self.run_stream(start, final_stop, integration_failpoint=scenario)
         output = f"{crashed.stdout}\\n{crashed.stderr}"
         if crashed.returncode == 0 or "cdc_integration_failpoint" not in output:
-            raise HarnessError(f"{scenario} did not terminate at its deterministic failpoint: {output}")
+            raise HarnessError(
+                f"{scenario} did not terminate at its deterministic failpoint: {output}"
+            )
 
-        crash_status = "prepared" if scenario in {"prepare-failure", "post-ddl-pre-applied"} else "applied"
+        crash_status = (
+            "prepared"
+            if scenario in {"prepare-failure", "post-ddl-pre-applied"}
+            else "applied"
+        )
         crash_index = scenario != "prepare-failure"
         self.assert_recovery_state(
             start,
@@ -3105,22 +3528,40 @@ DELIMITER ;
 
         restarted = self.run_stream(start, final_stop)
         if scenario == "prepare-failure":
-            if restarted.returncode == 0 or "semantic reconciliation blocked" not in f"{restarted.stdout}\n{restarted.stderr}".lower():
-                raise HarnessError(f"{scenario} restart did not stop at the blocking boundary: {restarted}")
+            if (
+                restarted.returncode == 0
+                or "semantic reconciliation blocked"
+                not in f"{restarted.stdout}\n{restarted.stderr}".lower()
+            ):
+                raise HarnessError(
+                    f"{scenario} restart did not stop at the blocking boundary: {restarted}"
+                )
             self.assert_recovery_state(
                 start,
                 expected_status="blocked",
                 expected_index=False,
                 expected_rows="0",
             )
-            print(f"{scenario}_blocked blocking=manual-resolution no_overtake coordinate={start.file}:{start.position}")
+            print(
+                f"{scenario}_blocked blocking=manual-resolution no_overtake coordinate={start.file}:{start.position}"
+            )
             return
 
         require_success(restarted, f"{scenario} restart")
-        if scenario == "post-ddl-pre-applied" and "cdc_ddl_reconcile_prepared" not in restarted.stdout:
-            raise HarnessError(f"{scenario} restart did not report prepared-state reconciliation")
-        if scenario in {"applied-pre-checkpoint", "checkpoint-transaction"} and "cdc_ddl_checkpoint_only" not in restarted.stdout:
-            raise HarnessError(f"{scenario} restart did not use checkpoint-only recovery")
+        if (
+            scenario == "post-ddl-pre-applied"
+            and "cdc_ddl_reconcile_prepared" not in restarted.stdout
+        ):
+            raise HarnessError(
+                f"{scenario} restart did not report prepared-state reconciliation"
+            )
+        if (
+            scenario in {"applied-pre-checkpoint", "checkpoint-transaction"}
+            and "cdc_ddl_checkpoint_only" not in restarted.stdout
+        ):
+            raise HarnessError(
+                f"{scenario} restart did not use checkpoint-only recovery"
+            )
         self.assert_recovery_state(
             final_stop,
             expected_status="checkpointed",
@@ -3134,8 +3575,12 @@ DELIMITER ;
             password=TARGET_PASSWORD,
         ).strip()
         if pending != "0":
-            raise HarnessError(f"{scenario} left unresolved DDL journal debt: {pending}")
-        print(f"{scenario}_converged convergence=complete coordinate={final_stop.file}:{final_stop.position}")
+            raise HarnessError(
+                f"{scenario} left unresolved DDL journal debt: {pending}"
+            )
+        print(
+            f"{scenario}_converged convergence=complete coordinate={final_stop.file}:{final_stop.position}"
+        )
 
     def wait_for_target_count(self, expected: str, timeout: float = 60.0) -> None:
         assert self.target
@@ -3157,7 +3602,9 @@ DELIMITER ;
             time.sleep(0.25)
         raise HarnessError(f"target row count did not converge to {expected}: {last}")
 
-    def wait_for_checkpoint(self, coordinate: Coordinate, timeout: float = 60.0) -> None:
+    def wait_for_checkpoint(
+        self, coordinate: Coordinate, timeout: float = 60.0
+    ) -> None:
         deadline = time.monotonic() + timeout
         last = None
         while time.monotonic() < deadline:
@@ -3166,10 +3613,15 @@ DELIMITER ;
             except HarnessError:
                 time.sleep(0.25)
                 continue
-            if last.get("source_file") == coordinate.file and int(last.get("source_position", 0)) >= coordinate.position:
+            if (
+                last.get("source_file") == coordinate.file
+                and int(last.get("source_position", 0)) >= coordinate.position
+            ):
                 return
             time.sleep(0.25)
-        raise HarnessError(f"checkpoint did not reach {coordinate.file}:{coordinate.position}: {last}")
+        raise HarnessError(
+            f"checkpoint did not reach {coordinate.file}:{coordinate.position}: {last}"
+        )
 
     def run_connection_loss_scenario(self, scenario: str) -> None:
         assert self.source and self.target
@@ -3179,7 +3631,10 @@ DELIMITER ;
         barrier_dir = self.tempdir / f"{scenario}-barrier"
 
         if scenario == "source-connection-loss":
-            self.admin_sql(self.source, "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');")
+            self.admin_sql(
+                self.source,
+                "INSERT INTO accounts VALUES (1, 'one@example.test', 'one');",
+            )
             first_stop = self.coordinate()
             process, _log = self.start_stream(
                 start,
@@ -3199,11 +3654,18 @@ DELIMITER ;
                 if "cdc_stream_reconnect_start" in self.process_output(process):
                     break
                 if process.poll() is not None:
-                    raise HarnessError(f"source loss stream exited before reconnect: {self.process_output(process)}")
+                    raise HarnessError(
+                        f"source loss stream exited before reconnect: {self.process_output(process)}"
+                    )
                 time.sleep(0.1)
             else:
-                raise HarnessError(f"source loss did not enter reconnect loop: {self.process_output(process)}")
-            self.admin_sql(self.source, "INSERT INTO accounts VALUES (2, 'two@example.test', 'two');")
+                raise HarnessError(
+                    f"source loss did not enter reconnect loop: {self.process_output(process)}"
+                )
+            self.admin_sql(
+                self.source,
+                "INSERT INTO accounts VALUES (2, 'two@example.test', 'two');",
+            )
             second_stop = self.coordinate()
             self.wait_for_target_count("2")
             self.wait_for_checkpoint(second_stop)
@@ -3213,10 +3675,17 @@ DELIMITER ;
             if "cdc_stream_reconnect_start" not in output:
                 raise HarnessError(f"source reconnect evidence missing: {output}")
             checkpoint = self.checkpoint()
-            if checkpoint.get("source_file") != second_stop.file or int(checkpoint.get("source_position", 0)) < second_stop.position:
-                raise HarnessError(f"source reconnect checkpoint did not advance after recovery: {checkpoint}")
+            if (
+                checkpoint.get("source_file") != second_stop.file
+                or int(checkpoint.get("source_position", 0)) < second_stop.position
+            ):
+                raise HarnessError(
+                    f"source reconnect checkpoint did not advance after recovery: {checkpoint}"
+                )
             if not coordinate_is_after(second_stop, first_stop):
-                raise HarnessError(f"source event boundary did not advance: {first_stop} -> {second_stop}")
+                raise HarnessError(
+                    f"source event boundary did not advance: {first_stop} -> {second_stop}"
+                )
             journal_count = self.query(
                 self.target,
                 "SELECT COUNT(*) FROM cdc.ddl_replay_journal;",
@@ -3224,14 +3693,20 @@ DELIMITER ;
                 password=TARGET_PASSWORD,
             ).strip()
             if journal_count != "0":
-                raise HarnessError(f"source loss unexpectedly created journal rows: {journal_count}")
-            print(f"{scenario}_converged reconnect=observed target_rows=2 checkpoint={second_stop.file}:{second_stop.position}")
+                raise HarnessError(
+                    f"source loss unexpectedly created journal rows: {journal_count}"
+                )
+            print(
+                f"{scenario}_converged reconnect=observed target_rows=2 checkpoint={second_stop.file}:{second_stop.position}"
+            )
             return
 
         if scenario != "target-connection-loss":
             raise HarnessError(f"unknown connection-loss scenario: {scenario}")
 
-        self.admin_sql(self.source, "CREATE INDEX idx_accounts_email ON accounts (email);")
+        self.admin_sql(
+            self.source, "CREATE INDEX idx_accounts_email ON accounts (email);"
+        )
         final_stop = self.coordinate()
         process, _log = self.start_stream(
             start,
@@ -3240,28 +3715,54 @@ DELIMITER ;
             barrier_dir=barrier_dir,
             label=scenario,
         )
-        self.wait_for_barrier(process, barrier_dir, "after-target-operation-before-journal-applied")
+        self.wait_for_barrier(
+            process, barrier_dir, "after-target-operation-before-journal-applied"
+        )
         journal = self.ddl_journal_rows()
         if len(journal) != 1 or journal[0][0] != "prepared":
-            raise HarnessError(f"target loss journal was not prepared before interruption: {journal}")
-        indexes = self.query(self.target, "SHOW INDEX FROM accounts;", user=TARGET_USER, password=TARGET_PASSWORD)
+            raise HarnessError(
+                f"target loss journal was not prepared before interruption: {journal}"
+            )
+        indexes = self.query(
+            self.target,
+            "SHOW INDEX FROM accounts;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        )
         if "idx_accounts_email" not in indexes:
-            raise HarnessError(f"target loss barrier did not follow target DDL mutation: {indexes}")
-        self.assert_recovery_state(start, expected_status="prepared", expected_index=True, expected_rows="0")
+            raise HarnessError(
+                f"target loss barrier did not follow target DDL mutation: {indexes}"
+            )
+        self.assert_recovery_state(
+            start, expected_status="prepared", expected_index=True, expected_rows="0"
+        )
         pre_restart_checkpoint = self.checkpoint()
         run(["docker", "restart", self.target.container])
         self.target = self.refresh_endpoint(self.target)
-        self.release_barrier(barrier_dir, "after-target-operation-before-journal-applied")
+        self.release_barrier(
+            barrier_dir, "after-target-operation-before-journal-applied"
+        )
         crashed = self.finish_stream(process)
         if crashed.returncode == 0:
-            raise HarnessError("target loss stream reported success after target connection loss")
+            raise HarnessError(
+                "target loss stream reported success after target connection loss"
+            )
         wait_for_sql(self.target, self.ca_file)
         if self.checkpoint() != pre_restart_checkpoint:
-            raise HarnessError("target loss advanced or regressed checkpoint before restart")
+            raise HarnessError(
+                "target loss advanced or regressed checkpoint before restart"
+            )
         restarted = self.run_stream(start, final_stop)
         require_success(restarted, "target-connection-loss restart")
-        self.assert_recovery_state(final_stop, expected_status="checkpointed", expected_index=True, expected_rows="0")
-        print(f"{scenario}_converged journal=checkpointed checkpoint={final_stop.file}:{final_stop.position}")
+        self.assert_recovery_state(
+            final_stop,
+            expected_status="checkpointed",
+            expected_index=True,
+            expected_rows="0",
+        )
+        print(
+            f"{scenario}_converged journal=checkpointed checkpoint={final_stop.file}:{final_stop.position}"
+        )
 
     def run_row_conflict_source_row_migration(self) -> None:
         assert self.target
@@ -3307,7 +3808,9 @@ DELIMITER ;
             "AND index_name='row_conflicts_source_row_status' ORDER BY seq_in_index;",
         ).strip()
         if index_columns != "source_row_identity\nstatus":
-            raise HarnessError(f"source-row migration index mismatch: {index_columns!r}")
+            raise HarnessError(
+                f"source-row migration index mismatch: {index_columns!r}"
+            )
         self.assert_admin_sql_rejected(
             self.target,
             "UPDATE cdc.row_conflicts SET source_identity='mutated' "
@@ -3324,7 +3827,9 @@ DELIMITER ;
         for endpoint, label in ((self.source, "source"), (self.target, "target")):
             checks = self.admin_query(endpoint, "SELECT @@FOREIGN_KEY_CHECKS;").strip()
             if checks != "1":
-                raise HarnessError(f"{label} foreign-key checks were not enabled: {checks}")
+                raise HarnessError(
+                    f"{label} foreign-key checks were not enabled: {checks}"
+                )
 
     def setup_sync_accounts(self, table: str = "sync_accounts") -> None:
         assert self.source and self.target
@@ -3358,7 +3863,10 @@ DELIMITER ;
         if any(
             grant.startswith("GRANT ")
             and " ON CDC.* " in grant
-            and any(privilege in grant.split(" ON ", 1)[0] for privilege in ("ALTER", "DROP", "DELETE"))
+            and any(
+                privilege in grant.split(" ON ", 1)[0]
+                for privilege in ("ALTER", "DROP", "DELETE")
+            )
             for grant in upper_grants
         ):
             raise HarnessError(f"sync identity has excessive CDC grants: {grants!r}")
@@ -3990,9 +4498,15 @@ DELIMITER ;
             self.assert_admin_sql_rejected(self.target, sql, "1452")
         print(f"{run_id}_ok exact_rows=true fk_enforced=true alter_privilege=false")
 
-    def run_sync_fk_parent_convergence(self, update_existing_child: bool = False) -> None:
+    def run_sync_fk_parent_convergence(
+        self, update_existing_child: bool = False
+    ) -> None:
         assert self.source and self.target
-        run_id = "sync-fk-parent-update" if update_existing_child else "sync-fk-parent-insert"
+        run_id = (
+            "sync-fk-parent-update"
+            if update_existing_child
+            else "sync-fk-parent-insert"
+        )
         for endpoint in (self.source, self.target):
             self.admin_sql(
                 endpoint,
@@ -4052,7 +4566,9 @@ DELIMITER ;
         if progress != 'complete	["87308589"]':
             raise HarnessError(f"FK sync progress mismatch: {progress!r}")
         operation = "update" if update_existing_child else "insert"
-        print(f"sync_fk_parent_converged operation={operation} constraints_restored=true")
+        print(
+            f"sync_fk_parent_converged operation={operation} constraints_restored=true"
+        )
 
     def run_sync_fk_parent_stale_unique_owner(self) -> None:
         assert self.source and self.target
@@ -4112,7 +4628,9 @@ DELIMITER ;
         if parents != expected_parents:
             raise HarnessError(f"stale unique owner did not converge: {parents!r}")
         if child != "10	2	LiveUser":
-            raise HarnessError(f"child did not converge after parent displacement: {child!r}")
+            raise HarnessError(
+                f"child did not converge after parent displacement: {child!r}"
+            )
         print("sync_fk_parent_stale_unique_owner_ok constraints_restored=true")
 
     def run_sync_fk_source_absent_unique_owner(self) -> None:
@@ -4467,7 +4985,9 @@ DELIMITER ;
             outcome,
         ]
         transactions = self.sync_unique_owner_transaction_sequences(table)
-        matches = [transaction for transaction in transactions if transaction == expected]
+        matches = [
+            transaction for transaction in transactions if transaction == expected
+        ]
         if len(matches) != 1:
             raise HarnessError(
                 "unique-owner transaction ordering mismatch: "
@@ -4548,7 +5068,10 @@ DELIMITER ;
         )
         self.admin_sql(self.target, "SET GLOBAL general_log=OFF;")
         failed_output = "\n".join((failed.stdout, failed.stderr))
-        if failed.returncode == 0 or "injected unique-owner retry failure" not in failed_output:
+        if (
+            failed.returncode == 0
+            or "injected unique-owner retry failure" not in failed_output
+        ):
             raise HarnessError(
                 "unique-owner retry failure was not observed: "
                 f"exit={failed.returncode} output={failed_output!r}"
@@ -4558,7 +5081,9 @@ DELIMITER ;
             f"SELECT id,token,page,payload FROM {table} ORDER BY id;",
         ).strip()
         if retained != "200\ttoken-129\tpage-129\tmisfiled-owner":
-            raise HarnessError(f"failed sync did not roll back target rows: {retained!r}")
+            raise HarnessError(
+                f"failed sync did not roll back target rows: {retained!r}"
+            )
         failed_progress = self.admin_query(
             self.target,
             "SELECT status,IF(last_primary_key_json IS NULL,'<NULL>',last_primary_key_json),"
@@ -4617,7 +5142,10 @@ DELIMITER ;
             self.target,
             f"SELECT id,token,page,payload FROM {table} ORDER BY id;",
         ).strip()
-        if target_snapshot != source_snapshot or len(target_snapshot.splitlines()) != 131:
+        if (
+            target_snapshot != source_snapshot
+            or len(target_snapshot.splitlines()) != 131
+        ):
             raise HarnessError(
                 "resumed sync did not converge all 131 source rows: "
                 f"source={source_snapshot!r} target={target_snapshot!r}"
@@ -4630,7 +5158,9 @@ DELIMITER ;
             "129\ttoken-129\tpage-129\tpayload-129",
             "200\ttoken-200\tpage-200\tpayload-200",
         ]:
-            raise HarnessError(f"critical unique-owner rows are wrong: {critical_rows!r}")
+            raise HarnessError(
+                f"critical unique-owner rows are wrong: {critical_rows!r}"
+            )
         progress = self.admin_query(
             self.target,
             "SELECT status,last_primary_key_json,chunks,rows_scanned,inserts_applied,"
@@ -4645,7 +5175,9 @@ DELIMITER ;
             )
         audits = self.sync_unique_owner_audits(resumed)
         if len(audits) != 1:
-            raise HarnessError(f"expected one committed reconciliation audit: {audits!r}")
+            raise HarnessError(
+                f"expected one committed reconciliation audit: {audits!r}"
+            )
         expected_audit = {
             "event": "sync_unique_owner_reconciliation",
             "table": table,
@@ -4657,9 +5189,17 @@ DELIMITER ;
         if audits[0] != expected_audit:
             raise HarnessError(f"unexpected reconciliation audit: {audits[0]!r}")
         encoded_audit = json.dumps(audits[0], sort_keys=True)
-        for secret in ["token-129", "page-129", "payload-129", "misfiled-owner", "token-200"]:
+        for secret in [
+            "token-129",
+            "page-129",
+            "payload-129",
+            "misfiled-owner",
+            "token-200",
+        ]:
             if secret in encoded_audit:
-                raise HarnessError(f"reconciliation audit leaked {secret!r}: {encoded_audit}")
+                raise HarnessError(
+                    f"reconciliation audit leaked {secret!r}: {encoded_audit}"
+                )
         print(
             "sync_unique_owner_rollback_resume_ok rows=131 chunks=9 inserts=130 "
             "failed_sequence=first,second,second resumed_sequence=first,second,second "
@@ -4877,7 +5417,9 @@ DELIMITER ;
         )
         fields = output.split("\t")
         if len(fields) != len(columns):
-            raise HarnessError(f"unexpected sync row progress evidence for {table}: {output!r}")
+            raise HarnessError(
+                f"unexpected sync row progress evidence for {table}: {output!r}"
+            )
         return dict(zip(columns, fields, strict=True))
 
     def sync_table_state(self, endpoint: Endpoint, table: str) -> tuple[int, int, int]:
@@ -5932,8 +6474,12 @@ DELIMITER ;
             f"({index}, 'running-{index}', 'source-{index}')"
             for index in range(1, 4001)
         )
-        self.admin_sql(self.source, f"INSERT INTO {complete_table} VALUES {complete_values};")
-        self.admin_sql(self.source, f"INSERT INTO {running_table} VALUES {running_values};")
+        self.admin_sql(
+            self.source, f"INSERT INTO {complete_table} VALUES {complete_values};"
+        )
+        self.admin_sql(
+            self.source, f"INSERT INTO {running_table} VALUES {running_values};"
+        )
 
         process, log_path = self.start_sync(
             tables=tables,
@@ -5994,16 +6540,25 @@ DELIMITER ;
 
         complete_before = self.sync_row_progress_evidence(run_id, complete_table)
         running_before = self.sync_row_progress_evidence(run_id, running_table)
-        if complete_before["status"] != "complete" or running_before["status"] != "running":
+        if (
+            complete_before["status"] != "complete"
+            or running_before["status"] != "running"
+        ):
             raise HarnessError(
                 "interrupted sync did not retain exact complete/running boundary: "
                 f"complete={complete_before!r} running={running_before!r}"
             )
         if int(running_before["chunks"]) < 150:
-            raise HarnessError(f"running progress regressed before resume: {running_before!r}")
+            raise HarnessError(
+                f"running progress regressed before resume: {running_before!r}"
+            )
 
-        source_before = {table: self.sync_table_state(self.source, table) for table in tables}
-        target_before = {table: self.sync_table_state(self.target, table) for table in tables}
+        source_before = {
+            table: self.sync_table_state(self.source, table) for table in tables
+        }
+        target_before = {
+            table: self.sync_table_state(self.target, table) for table in tables
+        }
         if source_before[complete_table] != target_before[complete_table]:
             raise HarnessError(
                 "completed table was not converged before resume: "
@@ -6017,12 +6572,16 @@ DELIMITER ;
                 f"source={source_before[running_table]} target={target_before[running_table]}"
             )
         if running_target_count != running_target_distinct:
-            raise HarnessError(f"running table had duplicate target PKs: {target_before[running_table]}")
+            raise HarnessError(
+                f"running table had duplicate target PKs: {target_before[running_table]}"
+            )
         legacy_before = {
             table: self.sync_legacy_run_spec(run_id, table) for table in tables
         }
         if legacy_before != legacy_specs:
-            raise HarnessError(f"legacy run specifications were not installed: {legacy_before!r}")
+            raise HarnessError(
+                f"legacy run specifications were not installed: {legacy_before!r}"
+            )
 
         resumed = self.run_sync(
             tables=tables,
@@ -6078,7 +6637,9 @@ DELIMITER ;
                 f"before={before_primary_key} after={after_primary_key}"
             )
         if running_after["created_at"] != running_before["created_at"]:
-            raise HarnessError("running table progress was recreated instead of resumed")
+            raise HarnessError(
+                "running table progress was recreated instead of resumed"
+            )
 
         legacy_after = {
             table: self.sync_legacy_run_spec(run_id, table) for table in tables
@@ -6102,7 +6663,9 @@ DELIMITER ;
                     f"source={source_state} target={target_state}"
                 )
             if source_state[0] != source_state[1]:
-                raise HarnessError(f"same-run resume left duplicate PKs in `{table}`: {source_state}")
+                raise HarnessError(
+                    f"same-run resume left duplicate PKs in `{table}`: {source_state}"
+                )
 
         run_identity = self.admin_query(
             self.target,
@@ -6110,7 +6673,9 @@ DELIMITER ;
             "FROM cdc.sync_runs WHERE run_id LIKE 'sync-resume%';",
         ).strip()
         if run_identity != "1\tsync-resume\tsync-resume\t6":
-            raise HarnessError(f"sync resume created unexpected run identity: {run_identity!r}")
+            raise HarnessError(
+                f"sync resume created unexpected run identity: {run_identity!r}"
+            )
         stages = self.admin_query(
             self.target,
             "SELECT stage,status,COUNT(*) FROM cdc.sync_runs "
@@ -6130,7 +6695,9 @@ DELIMITER ;
             f"WHERE run_id={sql_literal(run_id)} AND status IN ('running','error');",
         ).strip()
         if nonterminal != "0":
-            raise HarnessError(f"sync resume retained nonterminal progress rows: {nonterminal}")
+            raise HarnessError(
+                f"sync resume retained nonterminal progress rows: {nonterminal}"
+            )
 
         print(
             "sync_resume_ok same_run_id=true target_address_changed=true parallelism=16 "
@@ -6258,25 +6825,40 @@ DELIMITER ;
             self.admin_sql(self.target, "DELETE FROM cdc.stream_checkpoint;")
             expected = "checkpoint"
         elif scenario == "missing-trigger":
-            self.admin_sql(self.target, "DROP TRIGGER cdc.ddl_replay_journal_update_guard;")
+            self.admin_sql(
+                self.target, "DROP TRIGGER cdc.ddl_replay_journal_update_guard;"
+            )
             expected = "trigger"
         elif scenario == "missing-grant":
-            self.admin_sql(self.target, "REVOKE UPDATE ON cdc.ddl_replay_journal FROM 'cdc_stream'@'%';")
+            self.admin_sql(
+                self.target,
+                "REVOKE UPDATE ON cdc.ddl_replay_journal FROM 'cdc_stream'@'%';",
+            )
             expected = "grant"
         elif scenario == "journal-outage":
-            self.admin_sql(self.target, "RENAME TABLE cdc.ddl_replay_journal TO cdc.ddl_replay_journal_outage;")
+            self.admin_sql(
+                self.target,
+                "RENAME TABLE cdc.ddl_replay_journal TO cdc.ddl_replay_journal_outage;",
+            )
             expected = "journal"
         else:
             raise HarnessError(f"unknown startup rejection scenario: {scenario}")
         result = self.run_stream(start)
-        if result.returncode == 0 or expected not in (result.stderr + result.stdout).lower():
+        if (
+            result.returncode == 0
+            or expected not in (result.stderr + result.stdout).lower()
+        ):
             raise HarnessError(
                 f"{scenario} did not fail at the expected startup boundary:\n"
                 f"stdout={result.stdout}\nstderr={result.stderr}"
             )
-        rows = self.admin_query(self.target, "SELECT COUNT(*) FROM globalcomix.accounts;").strip()
+        rows = self.admin_query(
+            self.target, "SELECT COUNT(*) FROM globalcomix.accounts;"
+        ).strip()
         if rows != "0":
-            raise HarnessError(f"{scenario} mutated target before startup rejection: {rows}")
+            raise HarnessError(
+                f"{scenario} mutated target before startup rejection: {rows}"
+            )
         print(f"{scenario}_rejected boundary={expected}")
 
     def run_translation_pending_barrier(self) -> None:
@@ -6312,11 +6894,20 @@ DELIMITER ;
             password=TARGET_PASSWORD,
         ).splitlines()
         if rows != ["translation_pending\ttranslator-unavailable\tNULL\t\t\t"]:
-            raise HarnessError(f"unexpected translation-pending journal evidence: {rows}")
+            raise HarnessError(
+                f"unexpected translation-pending journal evidence: {rows}"
+            )
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != start.file or int(checkpoint.get("source_position", 0)) != start.position:
-            raise HarnessError(f"translation-pending DDL advanced checkpoint: {checkpoint}")
-        print(f"translation_pending_barrier_ok coordinate={start.file}:{start.position} rows=1")
+        if (
+            checkpoint.get("source_file") != start.file
+            or int(checkpoint.get("source_position", 0)) != start.position
+        ):
+            raise HarnessError(
+                f"translation-pending DDL advanced checkpoint: {checkpoint}"
+            )
+        print(
+            f"translation_pending_barrier_ok coordinate={start.file}:{start.position} rows=1"
+        )
 
     def run_scenario(self, scenario: str) -> None:
         spec = SCENARIO_BY_NAME[scenario]
@@ -6399,6 +6990,10 @@ DELIMITER ;
             self.run_create_facets_historical_crash_restart()
         elif scenario == "storefront-create-pending-replay":
             self.run_storefront_create_pending_replay()
+        elif scenario == "commented-drop-column-present-pending-replay":
+            self.run_commented_drop_column_pending_replay(present=True)
+        elif scenario == "commented-drop-column-absent-pending-replay":
+            self.run_commented_drop_column_pending_replay(present=False)
         elif scenario == "create-table-crash-restart":
             self.run_create_table_crash_restart()
         elif scenario == "bootstrap-contract":
@@ -6457,7 +7052,9 @@ def make_tls_material_container_readable(tempdir: Path, files: Iterable[Path]) -
 
 def container_logs(container: str) -> str:
     result = run(["docker", "logs", container], check=False)
-    output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+    output = "\n".join(
+        part for part in (result.stdout.strip(), result.stderr.strip()) if part
+    )
     return output or "<no container logs>"
 
 
@@ -6526,7 +7123,11 @@ def assert_exact_grants(
 ) -> None:
     actual: set[tuple[frozenset[str], str]] = set()
     for grant in grants:
-        if "WITH GRANT OPTION" in grant.upper() or " PROXY " in grant.upper() or "GRANT ROLE" in grant.upper():
+        if (
+            "WITH GRANT OPTION" in grant.upper()
+            or " PROXY " in grant.upper()
+            or "GRANT ROLE" in grant.upper()
+        ):
             raise HarnessError(f"unsafe effective grant for {user}: {grant}")
         match = re.match(r"GRANT (.+?) ON (.+?) TO ", grant, flags=re.IGNORECASE)
         if not match:
@@ -6537,9 +7138,13 @@ def assert_exact_grants(
         scope = match.group(2).strip().lower()
         actual.add((privileges, scope))
     normalized_expected = {
-        (canonicalize_privileges(privileges), scope.lower()) for privileges, scope in expected
+        (canonicalize_privileges(privileges), scope.lower())
+        for privileges, scope in expected
     }
-    if any(privileges != frozenset({"USAGE"}) for privileges, _scope in actual | normalized_expected):
+    if any(
+        privileges != frozenset({"USAGE"})
+        for privileges, _scope in actual | normalized_expected
+    ):
         actual = discard_implicit_usage(actual)
         normalized_expected = discard_implicit_usage(normalized_expected)
     if actual != normalized_expected:
@@ -6553,7 +7158,9 @@ def sql_literal(value: str) -> str:
 
 
 def coordinate_is_after(left: Coordinate, right: Coordinate) -> bool:
-    return left.file > right.file or (left.file == right.file and left.position > right.position)
+    return left.file > right.file or (
+        left.file == right.file and left.position > right.position
+    )
 
 
 def require_success(result: CommandResult, operation: str) -> None:
@@ -6567,7 +7174,9 @@ def require_success(result: CommandResult, operation: str) -> None:
 def require_translation_pending_termination(result: CommandResult) -> None:
     output = f"{result.stdout}\n{result.stderr}".lower()
     if result.returncode == 0:
-        raise HarnessError("bounded stream returned success without translation-pending block")
+        raise HarnessError(
+            "bounded stream returned success without translation-pending block"
+        )
     if "translator unavailable" not in output:
         raise HarnessError(
             "unsupported DDL did not terminate at the translation-pending boundary:\n"
@@ -6603,7 +7212,9 @@ def run(
         )
     except subprocess.TimeoutExpired as error:
         raise HarnessError(f"command timed out: {' '.join(argv)}") from error
-    result = CommandResult(argv, completed.returncode, completed.stdout, completed.stderr)
+    result = CommandResult(
+        argv, completed.returncode, completed.stdout, completed.stderr
+    )
     if check and result.returncode:
         raise HarnessError(
             f"command failed ({result.returncode}): {' '.join(argv)}\n"
@@ -6614,10 +7225,25 @@ def run(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--list", action="store_true", help="list scenarios with executable/prerequisite status")
-    parser.add_argument("--scenario", action="append", choices=tuple(SCENARIO_BY_NAME), help="run one scenario")
-    parser.add_argument("--binary", type=Path, help="path to the built mariadb-mysql-cdc binary")
-    parser.add_argument("--keep", action="store_true", help="keep temporary containers/files for diagnosis")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="list scenarios with executable/prerequisite status",
+    )
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        choices=tuple(SCENARIO_BY_NAME),
+        help="run one scenario",
+    )
+    parser.add_argument(
+        "--binary", type=Path, help="path to the built mariadb-mysql-cdc binary"
+    )
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="keep temporary containers/files for diagnosis",
+    )
     return parser.parse_args()
 
 
