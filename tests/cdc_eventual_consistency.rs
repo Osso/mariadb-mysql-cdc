@@ -150,6 +150,12 @@ fn real_create_table_crash_restart_harness_smoke() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_reader_memory_create_pending_replay_promotes_and_replays_following_ddl() {
+    run_harness_scenario("reader-memory-create-pending-replay");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_production_alter_table_harness_smoke() {
     let output = Command::new("python3")
         .arg(harness_script())

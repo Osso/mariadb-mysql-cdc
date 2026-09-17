@@ -88,6 +88,7 @@ SCENARIOS = (
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
+    ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("commented-drop-column-present-pending-replay", True),
     ScenarioSpec("commented-drop-column-absent-pending-replay", True),
     ScenarioSpec("bootstrap-contract", True),
@@ -2228,6 +2229,277 @@ DELIMITER ;
         )
         if keys != expected_keys:
             raise HarnessError(f"storefront key metadata mismatch: {keys!r}")
+
+    READER_MEMORY_DDL_FIXTURES = (
+        "create-reader-memory-items.sql",
+        "create-reader-memory-operations.sql",
+        "alter-reader-memory-profiles-checkpoints.sql",
+        "alter-reader-memory-operations-batch.sql",
+    )
+
+    def run_reader_memory_create_pending_replay(self) -> None:
+        """The mysqld-bin.003058 barrier: a pending reader_memory_profiles CREATE followed by
+        two more CREATEs, two ALTERs (TEXT expression default, CHECKs, ascii CHAR, KEY), and
+        DML exercising DATETIME(6), JSON text defaults, and CHECK enforcement on both ends."""
+        assert self.source and self.target
+        fixtures = self.repo / "fixtures/ddl"
+        profiles_ddl = (fixtures / "create-reader-memory-profiles.sql").read_text().strip()
+        start, pending = self.prepare_pending_add_column("", profiles_ddl, "CREATE TABLE")
+        for name in self.READER_MEMORY_DDL_FIXTURES:
+            self.admin_sql(self.source, (fixtures / name).read_text().strip() + ";")
+        self.admin_sql(
+            self.source,
+            "INSERT INTO reader_memory_profiles (user_id) VALUES (7); "
+            "INSERT INTO reader_memory_profiles (user_id,enabled,prepared_json,capture_after) "
+            "VALUES (8,1,'{\"tone\":\"warm\"}','2026-09-17 12:34:56.654321'); "
+            "INSERT INTO reader_memory_items (uuid,user_id,semantic_key,memory_group,predicate,"
+            "payload_json,status,source_message_id,evidence_at,revision) VALUES "
+            "('a0000000-0000-4000-8000-000000000001',8,REPEAT('k',64),'prefs','likes',"
+            "'{\"genre\":\"horror\"}','active',11,'2026-09-17 12:34:56.000001',1),"
+            "('a0000000-0000-4000-8000-000000000002',8,REPEAT('m',64),'prefs','dislikes',"
+            "NULL,'disabled',12,'2026-09-17 12:34:57',1); "
+            "INSERT INTO reader_memory_operations (uuid,user_id,source_message_id,expected_revision,"
+            "batch_uuid) VALUES ('b0000000-0000-4000-8000-000000000001',8,11,1,"
+            "'c0000000-0000-4000-8000-000000000001'); "
+            "UPDATE reader_memory_profiles SET checkpoints_json='{\"last\":1}',revision=2 WHERE user_id=8; "
+            "UPDATE reader_memory_items SET status='forgotten' WHERE source_message_id=12;",
+        )
+        stop = self.replay_pending_reader_memory(start, pending)
+        self.assert_reader_memory_metadata()
+        for table, order in [
+            ("reader_memory_profiles", "user_id"),
+            ("reader_memory_items", "uuid"),
+            ("reader_memory_operations", "uuid"),
+        ]:
+            rows = {
+                endpoint.container: self.admin_query(
+                    endpoint, f"SELECT * FROM `{table}` ORDER BY `{order}`;"
+                ).strip()
+                for endpoint in (self.source, self.target)
+            }
+            source_rows, target_rows = rows.values()
+            if source_rows != target_rows or not source_rows:
+                raise HarnessError(
+                    f"{table} rows differ after replay:\nsource={source_rows!r}\ntarget={target_rows!r}"
+                )
+        profile_rows = self.admin_query(
+            self.target,
+            "SELECT user_id,schema_version,enabled,revision,capture_after,prepared_json,"
+            "checkpoints_json FROM reader_memory_profiles ORDER BY user_id;",
+        ).strip()
+        expected_profiles = (
+            "7\t1\t0\t0\tNULL\t{}\t{}\n"
+            '8\t1\t1\t2\t2026-09-17 12:34:56.654321\t{"tone":"warm"}\t{"last":1}'
+        )
+        if profile_rows != expected_profiles:
+            raise HarnessError(f"reader_memory_profiles values differ: {profile_rows!r}")
+        item_rows = self.admin_query(
+            self.target,
+            "SELECT uuid,payload_json,status,evidence_at FROM reader_memory_items ORDER BY uuid;",
+        ).strip()
+        expected_items = (
+            'a0000000-0000-4000-8000-000000000001\t{"genre":"horror"}\tactive\t2026-09-17 12:34:56.000001\n'
+            "a0000000-0000-4000-8000-000000000002\tNULL\tforgotten\t2026-09-17 12:34:57.000000"
+        )
+        if item_rows != expected_items:
+            raise HarnessError(f"reader_memory_items values differ: {item_rows!r}")
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "INSERT INTO reader_memory_profiles (user_id,prepared_json) VALUES (99,'not json');",
+                "reader_memory_profile_json",
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "INSERT INTO reader_memory_items (uuid,user_id,semantic_key,memory_group,predicate,"
+                "status,source_message_id,evidence_at,revision) VALUES "
+                "('a0000000-0000-4000-8000-0000000000ff',9,'k','g','p','weird',1,NOW(6),1);",
+                "reader_memory_item_state",
+            )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO reader_memory_profiles (user_id) VALUES (100); "
+            "INSERT INTO reader_memory_operations (uuid,user_id,source_message_id) "
+            "VALUES ('b0000000-0000-4000-8000-0000000000aa',100,5);",
+        )
+        implicit = self.admin_query(
+            self.target,
+            "SELECT p.schema_version,p.enabled,p.prepared_json,p.checkpoints_json,"
+            "p.updated_at IS NOT NULL,o.status,o.attempts,o.created_at IS NOT NULL,o.batch_uuid "
+            "FROM reader_memory_profiles p JOIN reader_memory_operations o ON o.user_id=p.user_id "
+            "WHERE p.user_id=100;",
+        ).strip()
+        if implicit != "1\t0\t{}\t{}\t1\tpending\t0\t1\tNULL":
+            raise HarnessError(f"target implicit reader_memory defaults differ: {implicit!r}")
+        print(
+            "reader_memory_create_pending_replay_ok pending_promoted=true following_ddl=4 "
+            "check_constraints=true text_expression_default=true datetime6_micros=true "
+            f"ascii_char=true post_ddl_rows=true coordinate={stop.file}:{stop.position}"
+        )
+
+    def replay_pending_reader_memory(
+        self, start: Coordinate, pending: dict[str, str]
+    ) -> Coordinate:
+        stop = self.coordinate()
+        process, log = self.start_stream(start, stop)
+        try:
+            deadline = time.monotonic() + 60
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if process.poll() != 0:
+                raise HarnessError(f"reader memory pending replay failed: {log.read_text()}")
+        finally:
+            self.stop_sync_process(process)
+        rows = [
+            line.split("\t")
+            for line in self.query(
+                self.target,
+                "SELECT event_start_position,status,transformation_version,"
+                "generated_sql IS NOT NULL,canonical_ast<>'',pre_state<>'',expected_post_state<>'',"
+                "CAST(created_at AS CHAR) FROM cdc.ddl_replay_journal "
+                "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
+                "ORDER BY event_start_position;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).splitlines()
+            if line.strip()
+        ]
+        if len(rows) != 5:
+            raise HarnessError(f"expected five journaled reader memory DDL events: {rows!r}")
+        promoted = rows[0]
+        if promoted[0] != pending["event_start_position"] or promoted[7] != pending["created_at"]:
+            raise HarnessError(f"promotion changed the pending row identity: {promoted!r}")
+        for row in rows:
+            if row[1:7] != ["checkpointed", "mariadb-mysql8-v1", "1", "1", "1", "1"]:
+                raise HarnessError(
+                    f"reader memory DDL event was not checkpointed with evidence: {row!r}"
+                )
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint["source_file"] != stop.file
+            or checkpoint["source_position"] != stop.position
+        ):
+            raise HarnessError(f"post-DDL checkpoint did not advance: {checkpoint!r}")
+        return stop
+
+    def assert_reader_memory_metadata(self) -> None:
+        assert self.target
+        columns = self.admin_query(
+            self.target,
+            "SELECT table_name,column_name,column_type,is_nullable,column_default,extra,"
+            "IFNULL(character_set_name,''),IFNULL(collation_name,'') FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME LIKE 'reader_memory%' "
+            "ORDER BY table_name,ordinal_position;",
+        ).strip()
+        text_default = "_utf8mb4\\'{}\\'"
+        on_update = "DEFAULT_GENERATED on update CURRENT_TIMESTAMP(6)"
+        expected = "\n".join(
+            [
+                "reader_memory_items\tuuid\tchar(36)\tNO\tNULL\t\tascii\tascii_bin",
+                "reader_memory_items\tuser_id\tint unsigned\tNO\tNULL\t\t\t",
+                "reader_memory_items\tsemantic_key\tchar(64)\tNO\tNULL\t\tascii\tascii_bin",
+                "reader_memory_items\tmemory_group\tvarchar(32)\tNO\tNULL\t\tutf8mb4\tutf8mb4_unicode_ci",
+                "reader_memory_items\tpredicate\tvarchar(64)\tNO\tNULL\t\tutf8mb4\tutf8mb4_unicode_ci",
+                "reader_memory_items\tpayload_json\ttext\tYES\tNULL\t\tutf8mb4\tutf8mb4_unicode_ci",
+                "reader_memory_items\tstatus\tvarchar(16)\tNO\tNULL\t\tutf8mb4\tutf8mb4_unicode_ci",
+                "reader_memory_items\tsource_message_id\tbigint unsigned\tNO\tNULL\t\t\t",
+                "reader_memory_items\tevidence_at\tdatetime(6)\tNO\tNULL\t\t\t",
+                "reader_memory_items\tbarrier_at\tdatetime(6)\tYES\tNULL\t\t\t",
+                "reader_memory_items\texpires_at\tdatetime(6)\tYES\tNULL\t\t\t",
+                "reader_memory_items\trevision\tbigint unsigned\tNO\tNULL\t\t\t",
+                f"reader_memory_items\tupdated_at\tdatetime(6)\tNO\tCURRENT_TIMESTAMP(6)\t{on_update}\t\t",
+                "reader_memory_operations\tuuid\tchar(36)\tNO\tNULL\t\tascii\tascii_bin",
+                "reader_memory_operations\tuser_id\tint unsigned\tNO\tNULL\t\t\t",
+                "reader_memory_operations\tsource_message_id\tbigint unsigned\tNO\tNULL\t\t\t",
+                "reader_memory_operations\tstatus\tvarchar(24)\tNO\tpending\t\tutf8mb4\tutf8mb4_unicode_ci",
+                "reader_memory_operations\tattempts\tsmallint unsigned\tNO\t0\t\t\t",
+                "reader_memory_operations\tlease_token\tchar(36)\tYES\tNULL\t\tascii\tascii_bin",
+                "reader_memory_operations\tlease_until\tdatetime(6)\tYES\tNULL\t\t\t",
+                "reader_memory_operations\tdispatch_after\tdatetime(6)\tYES\tNULL\t\t\t",
+                "reader_memory_operations\tstarted_at\tdatetime(6)\tYES\tNULL\t\t\t",
+                "reader_memory_operations\texpected_revision\tbigint unsigned\tYES\tNULL\t\t\t",
+                "reader_memory_operations\texpected_epoch\tbigint unsigned\tYES\tNULL\t\t\t",
+                "reader_memory_operations\terror_code\tvarchar(48)\tYES\tNULL\t\tutf8mb4\tutf8mb4_unicode_ci",
+                "reader_memory_operations\tcreated_at\tdatetime(6)\tNO\tCURRENT_TIMESTAMP(6)\tDEFAULT_GENERATED\t\t",
+                f"reader_memory_operations\tupdated_at\tdatetime(6)\tNO\tCURRENT_TIMESTAMP(6)\t{on_update}\t\t",
+                "reader_memory_operations\tbatch_uuid\tchar(36)\tYES\tNULL\t\tascii\tascii_bin",
+                "reader_memory_profiles\tuser_id\tint unsigned\tNO\tNULL\t\t\t",
+                "reader_memory_profiles\tschema_version\tsmallint unsigned\tNO\t1\t\t\t",
+                "reader_memory_profiles\tenabled\ttinyint\tNO\t0\t\t\t",
+                "reader_memory_profiles\tcapture_enabled\ttinyint\tNO\t0\t\t\t",
+                "reader_memory_profiles\trevision\tbigint unsigned\tNO\t0\t\t\t",
+                "reader_memory_profiles\tdeletion_epoch\tbigint unsigned\tNO\t0\t\t\t",
+                "reader_memory_profiles\tcapture_after\tdatetime(6)\tYES\tNULL\t\t\t",
+                "reader_memory_profiles\tevidence_floor\tdatetime(6)\tYES\tNULL\t\t\t",
+                f"reader_memory_profiles\tprepared_json\tmediumtext\tNO\t{text_default}\tDEFAULT_GENERATED\tutf8mb4\tutf8mb4_unicode_ci",
+                f"reader_memory_profiles\tupdated_at\tdatetime(6)\tNO\tCURRENT_TIMESTAMP(6)\t{on_update}\t\t",
+                f"reader_memory_profiles\tcheckpoints_json\ttext\tNO\t{text_default}\tDEFAULT_GENERATED\tutf8mb4\tutf8mb4_unicode_ci",
+            ]
+        )
+        if columns != expected:
+            raise HarnessError(f"reader memory column metadata mismatch:\n{columns}")
+        checks = self.admin_query(
+            self.target,
+            "SELECT tc.TABLE_NAME,cc.CONSTRAINT_NAME,cc.CHECK_CLAUSE "
+            "FROM information_schema.TABLE_CONSTRAINTS tc "
+            "JOIN information_schema.CHECK_CONSTRAINTS cc "
+            "ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME "
+            f"WHERE tc.CONSTRAINT_SCHEMA={sql_literal(APP_SCHEMA)} AND tc.CONSTRAINT_TYPE='CHECK' "
+            "AND tc.TABLE_NAME LIKE 'reader_memory%' ORDER BY tc.TABLE_NAME,cc.CONSTRAINT_NAME;",
+        ).strip()
+        expected_checks = "\n".join(
+            [
+                "reader_memory_items\treader_memory_item_json\t((`payload_json` is null) or json_valid(`payload_json`))",
+                "reader_memory_items\treader_memory_item_size\t((`payload_json` is null) or (length(`payload_json`) <= 8192))",
+                "reader_memory_items\treader_memory_item_state\t(`status` in (_utf8mb4\\'active\\',_utf8mb4\\'disabled\\',_utf8mb4\\'forgotten\\'))",
+                "reader_memory_profiles\treader_memory_checkpoints_json\tjson_valid(`checkpoints_json`)",
+                "reader_memory_profiles\treader_memory_checkpoints_size\t(length(`checkpoints_json`) <= 16384)",
+                "reader_memory_profiles\treader_memory_profile_json\tjson_valid(`prepared_json`)",
+                "reader_memory_profiles\treader_memory_profile_size\t(length(`prepared_json`) <= 32768)",
+            ]
+        )
+        if checks != expected_checks:
+            raise HarnessError(f"reader memory CHECK constraints mismatch:\n{checks}")
+        keys = self.admin_query(
+            self.target,
+            "SELECT table_name,index_name,non_unique,seq_in_index,column_name FROM information_schema.STATISTICS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME LIKE 'reader_memory%' "
+            "ORDER BY table_name,index_name,seq_in_index;",
+        ).strip()
+        expected_keys = "\n".join(
+            [
+                "reader_memory_items\tPRIMARY\t0\t1\tuuid",
+                "reader_memory_items\treader_memory_owner\t1\t1\tuser_id",
+                "reader_memory_items\treader_memory_owner\t1\t2\tstatus",
+                "reader_memory_items\treader_memory_semantic\t0\t1\tuser_id",
+                "reader_memory_items\treader_memory_semantic\t0\t2\tsemantic_key",
+                "reader_memory_operations\tPRIMARY\t0\t1\tuuid",
+                "reader_memory_operations\treader_memory_batch\t1\t1\tbatch_uuid",
+                "reader_memory_operations\treader_memory_batch\t1\t2\tstatus",
+                "reader_memory_operations\treader_memory_dispatch\t1\t1\tstatus",
+                "reader_memory_operations\treader_memory_dispatch\t1\t2\tlease_until",
+                "reader_memory_operations\treader_memory_dispatch\t1\t3\tcreated_at",
+                "reader_memory_operations\treader_memory_operations_owner\t1\t1\tuser_id",
+                "reader_memory_operations\treader_memory_operations_owner\t1\t2\tstatus",
+                "reader_memory_operations\treader_memory_source\t0\t1\tuser_id",
+                "reader_memory_operations\treader_memory_source\t0\t2\tsource_message_id",
+                "reader_memory_operations\treader_memory_started\t1\t1\tstarted_at",
+                "reader_memory_profiles\tPRIMARY\t0\t1\tuser_id",
+            ]
+        )
+        if keys != expected_keys:
+            raise HarnessError(f"reader memory key metadata mismatch:\n{keys}")
+        collations = self.admin_query(
+            self.target,
+            "SELECT table_name,table_collation FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME LIKE 'reader_memory%' ORDER BY table_name;",
+        ).strip()
+        if collations != "\n".join(
+            f"{table}\tutf8mb4_unicode_ci"
+            for table in ("reader_memory_items", "reader_memory_operations", "reader_memory_profiles")
+        ):
+            raise HarnessError(f"reader memory table collation mismatch: {collations!r}")
+
 
     def run_production_alter_table(self) -> None:
         assert self.source and self.target
@@ -6517,6 +6789,8 @@ DELIMITER ;
             self.run_create_facets_historical_crash_restart()
         elif scenario == "storefront-create-pending-replay":
             self.run_storefront_create_pending_replay()
+        elif scenario == "reader-memory-create-pending-replay":
+            self.run_reader_memory_create_pending_replay()
         elif scenario == "commented-drop-column-present-pending-replay":
             self.run_commented_drop_column_pending_replay(present=True)
         elif scenario == "commented-drop-column-absent-pending-replay":
