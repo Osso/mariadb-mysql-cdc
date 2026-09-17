@@ -1748,6 +1748,8 @@ fn rename_columns_if_exists_sql(source_sql: &str) -> Result<(Option<&str>, &str)
 pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterTableAst, String> {
     let (_, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
     let ordinary_comments = ddl_contains_comments(statement_sql);
+    let leading_comments_only =
+        !ddl_contains_comments(strip_leading_ordinary_ddl_comments(statement_sql)?);
     let stripped;
     let source_sql = if ordinary_comments {
         stripped = observed_create::remove_ordinary_comments(source_sql)?;
@@ -1765,15 +1767,14 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
     if ordinary_comments
         && (algorithm.is_some()
             || lock.is_some()
-            || !clauses.iter().all(|clause| {
-                matches!(
-                    clause,
-                    ParsedAlterClause::ModifyVarchar { .. } | ParsedAlterClause::AddColumn(_)
-                )
+            || !clauses.iter().all(|clause| match clause {
+                ParsedAlterClause::ModifyVarchar { .. } | ParsedAlterClause::AddColumn(_) => true,
+                ParsedAlterClause::DropColumn(_) => leading_comments_only,
+                _ => false,
             }))
     {
         return Err(
-            "ordinary ALTER comments require only modeled ADD COLUMN or MODIFY clauses".to_string(),
+            "ordinary ALTER comments require modeled ADD COLUMN or MODIFY clauses, or leading-only comments for DROP COLUMN IF EXISTS".to_string(),
         );
     }
     Ok(ParsedAlterTableAst {

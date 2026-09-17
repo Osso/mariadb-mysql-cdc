@@ -1342,6 +1342,41 @@ fn transforms_mariadb_drop_column_if_exists_for_mysql8() {
 }
 
 #[test]
+fn drop_column_if_exists_accepts_leading_client_comment() {
+    let sql = "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ ALTER TABLE kg_storefront_chip_terms DROP COLUMN IF EXISTS `role`";
+    let columns = ["id".to_string(), "role".to_string()].into_iter().collect();
+    let transformation = transform_drop_columns_if_exists(sql, &columns)
+        .expect("leading ordinary client comment does not change conditional drop");
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some("ALTER TABLE `kg_storefront_chip_terms` DROP COLUMN `role`")
+    );
+    let absent = ["id".to_string()].into_iter().collect();
+    assert_eq!(
+        transform_drop_columns_if_exists(sql, &absent)
+            .expect("absent column remains a proven no-op")
+            .target_sql,
+        None
+    );
+}
+
+#[test]
+fn drop_column_if_exists_rejects_active_and_embedded_comments() {
+    let columns = ["id".to_string(), "role".to_string()].into_iter().collect();
+    for sql in [
+        "/*! ALTER TABLE kg_storefront_chip_terms DROP COLUMN IF EXISTS role */",
+        "/*+ hint */ ALTER TABLE kg_storefront_chip_terms DROP COLUMN IF EXISTS role",
+        "/*M! ALTER TABLE kg_storefront_chip_terms DROP COLUMN IF EXISTS role */",
+        "ALTER TABLE kg_storefront_chip_terms /* embedded */ DROP COLUMN IF EXISTS role",
+    ] {
+        assert!(
+            transform_drop_columns_if_exists(sql, &columns).is_err(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn drop_column_if_exists_matches_target_column_case_insensitively() {
     let columns = ["id".to_string(), "handle".to_string()]
         .into_iter()
