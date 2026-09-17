@@ -739,7 +739,7 @@ fn account_row(id: u32, name: &str) -> RowData {
             hour: 12,
             minute: 3,
             second: 4,
-            millis: 0,
+            micros: 0,
         })),
     ])
 }

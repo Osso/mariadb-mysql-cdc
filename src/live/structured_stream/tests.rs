@@ -52,7 +52,7 @@ fn write_rows_event(table_id: u64, id: u32, name: &str) -> BinlogEvent {
                 hour: 12,
                 minute: 3,
                 second: 4,
-                millis: 0,
+                micros: 0,
             })),
         ])],
     })

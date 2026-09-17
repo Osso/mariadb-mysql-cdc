@@ -117,7 +117,7 @@ fn maps_constructed_write_update_and_delete_rows_to_recording_executor() {
                 hour: 12,
                 minute: 3,
                 second: 4,
-                millis: 0,
+                micros: 0,
             })),
         ])],
     });
@@ -140,7 +140,7 @@ fn maps_constructed_write_update_and_delete_rows_to_recording_executor() {
                     hour: 12,
                     minute: 3,
                     second: 4,
-                    millis: 0,
+                    micros: 0,
                 })),
             ]),
             RowData::new(vec![
@@ -155,7 +155,7 @@ fn maps_constructed_write_update_and_delete_rows_to_recording_executor() {
                     hour: 12,
                     minute: 3,
                     second: 5,
-                    millis: 0,
+                    micros: 0,
                 })),
             ]),
         )],

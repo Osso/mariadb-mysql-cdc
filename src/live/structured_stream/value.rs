@@ -125,7 +125,7 @@ pub(super) fn format_date(value: &Date) -> String {
 
 pub(super) fn format_time(value: &Time) -> String {
     let base = format!("{:02}:{:02}:{:02}", value.hour, value.minute, value.second);
-    append_millis(base, value.millis)
+    append_micros(base, value.micros)
 }
 
 pub(super) fn format_datetime(value: &DateTime) -> String {
@@ -133,23 +133,26 @@ pub(super) fn format_datetime(value: &DateTime) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         value.year, value.month, value.day, value.hour, value.minute, value.second
     );
-    append_millis(base, value.millis)
+    append_micros(base, value.micros)
 }
 
-pub(super) fn format_timestamp(millis: u64) -> String {
-    let seconds = (millis / MILLIS_PER_SECOND) as i64;
+pub(super) fn format_timestamp(micros: u64) -> String {
+    let seconds = (micros / MICROS_PER_SECOND) as i64;
     let (date, time) = split_unix_seconds(seconds);
-    format!(
+    let base = format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         date.year, date.month, date.day, time.hour, time.minute, time.second
-    )
+    );
+    append_micros(base, (micros % MICROS_PER_SECOND) as u32)
 }
 
-pub(super) fn append_millis(base: String, millis: u32) -> String {
-    if millis == 0 {
+/// MySQL accepts a six-digit fraction for any `fsp`; an absent fraction stays bare so
+/// whole-second values keep their historical text form.
+pub(super) fn append_micros(base: String, micros: u32) -> String {
+    if micros == 0 {
         base
     } else {
-        format!("{base}.{millis:03}")
+        format!("{base}.{micros:06}")
     }
 }
 

@@ -85,13 +85,13 @@ pub fn parse_time(cursor: &mut Cursor<&[u8]>, _metadata: u16) -> Result<Time, Er
         hour: hour as i16,
         minute: minute as u8,
         second: second as u8,
-        millis: 0,
+        micros: 0,
     })
 }
 
 pub fn parse_time2(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<Time, Error> {
     let value = cursor.read_u24::<BigEndian>()?;
-    let millis = parse_fractional_part(cursor, metadata)? / 1000;
+    let micros = parse_fractional_part(cursor, metadata)?;
 
     let negative = ((value >> 23) & 1) == 0;
     if negative {
@@ -113,7 +113,7 @@ pub fn parse_time2(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<Time, Er
         hour: hour as i16,
         minute: minute as u8,
         second: second as u8,
-        millis: millis as u32,
+        micros: micros as u32,
     })
 }
 
@@ -138,13 +138,13 @@ pub fn parse_date_time(cursor: &mut Cursor<&[u8]>, _metadata: u16) -> Result<Dat
         hour: hour as u8,
         minute: minute as u8,
         second: second as u8,
-        millis: 0,
+        micros: 0,
     })
 }
 
 pub fn parse_date_time2(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<DateTime, Error> {
     let value = cursor.read_uint::<BigEndian>(5)?;
-    let millis = parse_fractional_part(cursor, metadata)? / 1000;
+    let micros = parse_fractional_part(cursor, metadata)?;
 
     // 1 bit sign(always true). 17 bits year*13+month. 5 bits day. 5 bits hour. 6 bits minute. 6 bits second.
     let year_month = (value >> 22) % (1 << 17);
@@ -162,22 +162,25 @@ pub fn parse_date_time2(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<Dat
         hour: hour as u8,
         minute: minute as u8,
         second: second as u8,
-        millis: millis as u32,
+        micros: micros as u32,
     })
 }
 
 pub fn parse_timestamp(cursor: &mut Cursor<&[u8]>, _metadata: u16) -> Result<u64, Error> {
     let seconds = cursor.read_u32::<LittleEndian>()? as u64;
-    Ok(seconds * 1000)
+    Ok(seconds * MICROS_PER_SECOND)
 }
 
 pub fn parse_timestamp2(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<u64, Error> {
     let seconds = cursor.read_u32::<BigEndian>()? as u64;
-    let millisecond = parse_fractional_part(cursor, metadata)? / 1000;
-    let timestamp = seconds * 1000 + millisecond;
-    Ok(timestamp)
+    let micros = parse_fractional_part(cursor, metadata)?;
+    Ok(seconds * MICROS_PER_SECOND + micros)
 }
 
+const MICROS_PER_SECOND: u64 = 1_000_000;
+
+/// The fractional second of a `*2` temporal value in microseconds, as MySQL stores it:
+/// `fsp` digits packed big-endian into `(fsp + 1) / 2` bytes.
 fn parse_fractional_part(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<u64, Error> {
     let length = (metadata + 1) / 2;
     if length == 0 {
@@ -186,4 +189,37 @@ fn parse_fractional_part(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<u6
 
     let fraction = cursor.read_uint::<BigEndian>(length as usize)?;
     Ok(fraction * u64::pow(100, 3 - length as u32))
+}
+
+#[cfg(test)]
+mod fractional_tests {
+    use super::*;
+
+    #[test]
+    fn datetime2_and_timestamp2_keep_microseconds() {
+        let mut cursor = Cursor::new(&[153, 186, 226, 200, 184, 9, 251, 241][..]);
+        let value = parse_date_time2(&mut cursor, 6).expect("DATETIME(6)");
+        assert_eq!(
+            (
+                value.year,
+                value.month,
+                value.day,
+                value.hour,
+                value.minute,
+                value.second
+            ),
+            (2026, 9, 17, 12, 34, 56)
+        );
+        assert_eq!(value.micros, 654_321);
+
+        let mut cursor = Cursor::new(&[106, 161, 249, 64, 9, 251, 241][..]);
+        assert_eq!(
+            parse_timestamp2(&mut cursor, 6).expect("TIMESTAMP(6)"),
+            1_789_000_000_654_321
+        );
+
+        let mut cursor = Cursor::new(&[153, 186, 226, 200, 184, 25, 143][..]);
+        let value = parse_date_time2(&mut cursor, 3).expect("DATETIME(3)");
+        assert_eq!(value.micros, 654_300);
+    }
 }

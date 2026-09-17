@@ -10,7 +10,8 @@ pub struct Time {
     pub hour: i16, // Signed value from -838 to 838
     pub minute: u8,
     pub second: u8,
-    pub millis: u32,
+    /// Fractional seconds in microseconds (`TIME(fsp)` keeps up to six digits).
+    pub micros: u32,
 }
 
 #[derive(Debug)]
@@ -21,7 +22,8 @@ pub struct DateTime {
     pub hour: u8,
     pub minute: u8,
     pub second: u8,
-    pub millis: u32,
+    /// Fractional seconds in microseconds (`DATETIME(fsp)` keeps up to six digits).
+    pub micros: u32,
 }
 
 #[derive(Debug)]
@@ -43,5 +45,5 @@ pub enum MySqlValue {
     Date(Date),
     Time(Time),
     DateTime(DateTime),
-    Timestamp(u64), // millis from unix time
+    Timestamp(u64), // microseconds from unix time
 }

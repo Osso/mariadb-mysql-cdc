@@ -277,7 +277,7 @@ fn non_source_schema_table_maps_and_rows_are_ignored_without_target_apply() {
                 hour: 12,
                 minute: 3,
                 second: 4,
-                millis: 0,
+                micros: 0,
             })),
         ])],
     };
@@ -329,7 +329,7 @@ fn structured_rows_preserve_null_and_blob_values_as_mysql_params() {
                 hour: 12,
                 minute: 3,
                 second: 4,
-                millis: 0,
+                micros: 0,
             })),
             Some(MySqlValue::String("active".to_string())),
         ])],

@@ -4,7 +4,14 @@ const SMALL_INT_BIT_PATTERN: u16 = 64_872;
 
 #[test]
 fn formats_mysql_cdc_values_like_snapshot_text_rows() {
-    assert_eq!(format_timestamp(1_782_075_535_000), "2026-06-21 20:58:55");
+    assert_eq!(
+        format_timestamp(1_782_075_535_000_000),
+        "2026-06-21 20:58:55"
+    );
+    assert_eq!(
+        format_timestamp(1_782_075_535_000_001),
+        "2026-06-21 20:58:55.000001"
+    );
     assert_eq!(
         convert_mysql_value(&Some(MySqlValue::Blob(b"hello".to_vec())), false),
         Value::Bytes(b"hello".to_vec())
@@ -28,7 +35,7 @@ fn formats_mysql_cdc_values_like_snapshot_text_rows() {
                 hour: 26,
                 minute: 3,
                 second: 4,
-                millis: 0,
+                micros: 0,
             })),
             false,
         ),
@@ -125,10 +132,10 @@ fn converts_every_mysql_value_variant_without_enum_metadata() {
                 hour: 3,
                 minute: 4,
                 second: 5,
-                millis: 600,
+                micros: 600_000,
             })),
             false,
-            Value::Bytes(b"03:04:05.600".to_vec()),
+            Value::Bytes(b"03:04:05.600000".to_vec()),
         ),
         (
             Some(MySqlValue::DateTime(DateTime {
@@ -138,15 +145,20 @@ fn converts_every_mysql_value_variant_without_enum_metadata() {
                 hour: 3,
                 minute: 4,
                 second: 5,
-                millis: 600,
+                micros: 654_321,
             })),
             false,
-            Value::Bytes(b"2026-07-16 03:04:05.600".to_vec()),
+            Value::Bytes(b"2026-07-16 03:04:05.654321".to_vec()),
         ),
         (
-            Some(MySqlValue::Timestamp(1_782_075_535_000)),
+            Some(MySqlValue::Timestamp(1_782_075_535_000_000)),
             false,
             Value::Bytes(b"2026-06-21 20:58:55".to_vec()),
+        ),
+        (
+            Some(MySqlValue::Timestamp(1_782_075_535_123_456)),
+            false,
+            Value::Bytes(b"2026-06-21 20:58:55.123456".to_vec()),
         ),
     ];
 
