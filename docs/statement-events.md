@@ -23,12 +23,16 @@ Automatic DDL admission currently has these narrow slices:
 - the production-observed unqualified multi-clause `ALTER TABLE` form with
   `ADD COLUMN` under the exact unquoted type grammar
   `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`,
-  or `FLOAT UNSIGNED`; quoted type keywords, quoted `VARCHAR` lengths, and quoted
-  `UNSIGNED` forms are rejected, as are `DATETIME` precision, `SMALLINT` display
-  width, and `FLOAT` parameters. The observed `NULL` or `NOT NULL`, `DEFAULT NULL`
-  or `DEFAULT 0`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY`,
-  MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
-  clauses. Multiple admitted clauses are rendered in source order
+  `FLOAT UNSIGNED`, or `TEXT`/`MEDIUMTEXT`; quoted type keywords, quoted `VARCHAR`
+  lengths, and quoted `UNSIGNED` forms are rejected, as are `DATETIME` precision,
+  `SMALLINT` display width, and `FLOAT` parameters. The observed `NULL` or `NOT
+  NULL`, `DEFAULT NULL` or `DEFAULT 0`, `COMMENT`, and `AFTER` options; a TEXT
+  `NOT NULL DEFAULT '<literal>'` rendered as the MySQL 8 expression default
+  `(_utf8mb4'<literal>')`; `CHAR(n) CHARACTER SET <charset> COLLATE <collation>`;
+  named composite `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same
+  AST, or `ADD UNIQUE KEY` clauses; and `ADD CONSTRAINT <name> CHECK (...)` under
+  the bounded CHECK grammar in
+  [the DDL transformation spec](specs/ddl-transformation.md). Multiple admitted clauses are rendered in source order
   as deterministic MySQL 8 SQL; source `ADD INDEX` is emitted as target `ADD
   KEY`. One exact `releases` index-rebuild form also admits `DROP INDEX
   idx_downloads_sort`, the observed eight-part replacement with `published_time

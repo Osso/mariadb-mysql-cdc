@@ -41,10 +41,11 @@ allowlist.
 - [x] Transform the general observed `ADD COLUMN` forms only under the exact unquoted type grammar `CHAR(canonical decimal length 1..255)`, `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or `FLOAT UNSIGNED`. The first four retain the observed `DEFAULT NULL`, explicit `NULL`, `COMMENT`, and `AFTER` options; `FLOAT UNSIGNED` additionally admits the observed `NOT NULL DEFAULT 0` form. Expected post-state for added character columns records the table-inherited character set and collation so live inventory comparison matches MySQL metadata. Type keywords, `CHAR`/`VARCHAR` parentheses and length, and `UNSIGNED` must be unquoted; `DATETIME` precision, `SMALLINT` display width, `FLOAT` parameters, and other numeric defaults remain unsupported.
 - [x] Admit only the exact production `content_sections_events_raw` shape with two ordered `ADD COLUMN IF NOT EXISTS` clauses for nullable `TIMESTAMP DEFAULT NULL` columns `direct_seen_at` and `sync_seen_at`, their exact comments, and a final `ALGORITHM=INSTANT`. Model both source existence guards in the AST, but emit valid MySQL 8 SQL as one atomic two-column ALTER without `IF NOT EXISTS` after proving both columns are absent. When both exact columns are already present, suppress target SQL as a proven no-op. Partial presence or any divergent definition fails closed before target execution. `ALGORITHM=INPLACE` and every other table, column, comment, type, clause count/order, or algorithm variant remain `translation_pending` with no target execution or checkpoint advance.
 - [x] Admit the production-observed signed `TINYINT(1) NOT NULL DEFAULT 0` and unsigned `TINYINT(1) UNSIGNED NOT NULL DEFAULT 0` `ADD COLUMN` forms. Emit deterministic MySQL 8 `TINYINT` or `TINYINT UNSIGNED`, respectively, preserving signed range, nullability, default, and requested column position. When the target already contains the exact column definition at the requested position, promote the same `translation_pending` journal row as a proven no-op with `generated_sql = NULL`; any definition or position mismatch remains blocked.
+- [x] Admit the production-observed `reader_memory` ALTER forms: `ADD COLUMN <name> TEXT|MEDIUMTEXT NOT NULL DEFAULT '<literal>'` whose literal is non-empty printable ASCII without quotes or backslashes, rendered as the MySQL 8 expression default `(_utf8mb4'<literal>')` because MySQL rejects literal TEXT defaults; the expected post-state records `COLUMN_DEFAULT` as `_utf8mb4\'<literal>\'` with `DEFAULT_GENERATED`. A required TEXT column without a modeled default remains blocked. `ADD COLUMN CHAR(n) CHARACTER SET <charset> COLLATE <charset>_<suffix>` records the explicit column encoding in the AST and expected post-state. `ADD CONSTRAINT <name> CHECK (...)` admits only the bounded CHECK grammar: predicates `<column> IS NULL`, `JSON_VALID(<column>)`, `OCTET_LENGTH(<column>) <= <positive integer>`, and `<column> IN ('<[A-Za-z0-9_]+>', ...)`, joined only by `OR`. CHECK constraints are outside the compared schema inventory; the expected post-state proves each referenced column exists after preceding clauses apply, and the real-database harness proves MySQL's stored `CHECK_CLAUSE` text and enforcement.
 - [x] Reject quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms as unsupported syntax. These variants remain `translation_pending` with no target DDL or checkpoint advance.
 - [x] Transform named composite `ADD KEY`, MariaDB-syntax `ADD INDEX`, and `ADD UNIQUE KEY` clauses over ordinary columns as BTREE indexes; multiple admitted clauses remain ordered, source `ADD INDEX` emits as target `ADD KEY`, and broader index and clause options remain outside this slice.
 - [x] Admit only the observed `releases` `DROP INDEX idx_downloads_sort`, replacement eight-part `ADD INDEX idx_downloads_sort` with `published_time DESC`, final `ALGORITHM=INPLACE, LOCK=NONE` shape. Preserve typed drop/add index clauses, algorithm, lock, key-part direction, and fenced target pre/post-state; every table, index, key list/order, algorithm, lock, or clause-order variation remains `translation_pending`.
-- [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position and records `if_not_exists` only for the admitted guarded form; `add_key` records the typed index AST and ordered key parts; the exact instant ALTER records `algorithm=instant`.
+- [x] Encode a canonical typed clause AST: `add_column` records name/type/nullability/default/comment/position, records `if_not_exists` only for the admitted guarded form, and records `character_set`/`collation` only when the source names them; `add_key` records the typed index AST and ordered key parts; `add_check` records the constraint name and ordered typed predicates; the exact instant ALTER records `algorithm=instant`. Statements without these optional parts keep their previous canonical encoding byte for byte.
 - [x] Record expected target object state for crash/replay verification without treating that evidence as source/target reconciliation.
 - [x] Fail closed as `translation_pending` before target execution when syntax, context, dependencies, or semantics fall outside that explicit slice; the stream checkpoint and later-event barrier must remain unchanged, and the durable DDL block retries in-process without skipping or executing raw source SQL.
 - [x] Carry `TIMESTAMP` column types across unchanged. The former unconditional `TIMESTAMP` to `DATETIME` rewrite is removed: MySQL rejects values past 2038-01-19 that MariaDB 11 accepts, but no source column holds one, so the rewrite bought nothing and would have required rebuilding 384 tables and about 864 GB with `ALGORITHM=COPY`.
@@ -132,6 +133,7 @@ broader DDL coverage and operational proof gaps listed below.
       historical `VARCHAR(80)` crash/restart/row-replay harness passed. Production
       deployment remains pending; its target pre-state must be absent. Existing-target
       `CREATE TABLE IF NOT EXISTS` is not admitted as a no-op.
+- [x] The observed `reader_memory` CREATEs at `mysqld-bin.003058:312414813-312418004` extend the generic `CREATE TABLE IF NOT EXISTS` family with: an inline `NOT NULL PRIMARY KEY` column (exactly one primary key definition, inline or table-level); `BIGINT UNSIGNED`; `DATETIME` and `DATETIME(6)` with `DEFAULT CURRENT_TIMESTAMP(6)` and `ON UPDATE CURRENT_TIMESTAMP(6)` whose precision must match the column; `TEXT` and `MEDIUMTEXT`, whose literal default renders as the MySQL 8 expression default `(_utf8mb4'<literal>')` and whose expected post-state records `_utf8mb4\'<literal>\'` with `DEFAULT_GENERATED`; `CHAR(1..255)`; quoted string defaults for `CHAR`/`VARCHAR`; integer defaults `0`/`1` for every unsigned integer kind and `TINYINT(1)`; per-column `CHARACTER SET <charset> COLLATE <charset>_<suffix>` on character types; table-level `CONSTRAINT <name> CHECK (...)` under the bounded CHECK grammar with distinct names and known columns; and an explicit `COLLATE=utf8mb4_<suffix>` table option, which makes the charset/collation evidence explicit so no source fence or QueryEvent charset context is required. Table definitions after the columns may appear in any order. The concrete fixtures are `fixtures/ddl/create-reader-memory-{profiles,items,operations}.sql`.
 - [ ] The bounded `MODIFY COLUMN <name> VARCHAR(positive canonical n) NOT NULL`
       renderer preserves target column order and existing indexes/FKs without drops.
       Unit/renderer proof exists, but the historical CREATE harness's later widening
@@ -150,7 +152,10 @@ are not resolution paths.
 
 No other `CREATE TABLE` syntax is admitted. Executable/version comments,
 optimizer hints, embedded block comments, unmodeled types/defaults/index forms,
-and an existing target table remain durable barriers.
+CHECK predicates outside the bounded grammar (other functions, operators,
+`AND`, non-alphanumeric `IN` literals), other `DATETIME` precisions, string
+defaults with quotes or backslashes, and an existing target table remain durable
+barriers.
 
 ### Execution and recovery
 
@@ -259,6 +264,26 @@ The current slice is covered by:
       final supported-event checkpoint; an unsupported
       unique-prefix option remains `translation_pending` with zero target
       execution and unchanged checkpoint.
+- [x] `src/live/ddl_semantics/transform/observed_create.rs` tests and the
+      `reader_memory_*` tests in `src/live/ddl_semantics/tests.rs` — typed AST for
+      the three `reader_memory` CREATE fixtures (inline primary key, `BIGINT
+      UNSIGNED`, `DATETIME(6)` defaults/on-update, TEXT expression defaults,
+      ascii `CHAR`, quoted string defaults, bounded CHECK predicates, explicit
+      collation), exact MySQL 8 SQL for all five fixtures, expected post-state
+      matching MySQL's `COLUMN_DEFAULT`/`EXTRA`/encoding metadata, canonical AST
+      encoding of checks and column encoding without changing older statements,
+      ALTER post-state for the TEXT expression default and ascii column,
+      rejection of unknown CHECK columns, and rejection of unmodeled precisions,
+      functions, operators, literals, encodings, and duplicate definitions.
+- [x] `scripts/cdc-integration-harness.py --scenario reader-memory-create-pending-replay`
+      (`real_reader_memory_create_pending_replay_promotes_and_replays_following_ddl`) —
+      real MariaDB 11.4/MySQL 8 replay of the durable `translation_pending`
+      `reader_memory_profiles` CREATE followed by two CREATEs, two ALTERs, and
+      DML: pending-row promotion with immutable identity, five checkpointed
+      journal rows with evidence, exact column/key/CHECK/collation metadata,
+      identical source and target rows including `DATETIME(6)` microseconds,
+      CHECK enforcement on both endpoints, target implicit defaults, and exact
+      final checkpoint.
 - [x] `src/live/ddl_semantics/tests.rs` and
       `src/live/structured_stream/tests/ddl_replay.rs` — exact `releases`
       `idx_downloads_sort` DROP/ADD directional-index AST, deterministic target

@@ -21,6 +21,11 @@ The applier translates full row images into target DML:
   not change, only changed writable columns need assignment.
 - `DeleteRowsEvent` uses every before-image primary-key column for `DELETE`.
 
+Fractional-second temporal values keep microsecond precision: `DATETIME2`,
+`TIME2`, and `TIMESTAMP2` fractions decode to microseconds and render as a
+six-digit fraction whenever the fraction is non-zero, so `DATETIME(6)` columns
+replicate exactly.
+
 Each row statement runs inside the target transaction. A native ROW `INSERT` that
 returns MySQL `1062` is treated as idempotent success. The stream does not read,
 compare, replace, or repair the target row and does not write conflict-ledger

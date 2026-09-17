@@ -36,10 +36,13 @@ statement, absent or mismatched target, or moving source fence remains a
 barrier without checkpoint advance; and the production-observed unqualified
 multi-clause `ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type
 grammar `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT
-UNSIGNED`, or `FLOAT UNSIGNED`, the observed `NULL` or `NOT NULL`, `DEFAULT NULL`
-or `DEFAULT 0`, `COMMENT`, and `AFTER` options, and named composite `ADD KEY`,
-MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE KEY`
-clauses. Multiple admitted clauses render in source
+UNSIGNED`, `FLOAT UNSIGNED`, or `TEXT`/`MEDIUMTEXT`, the observed `NULL` or `NOT
+NULL`, `DEFAULT NULL` or `DEFAULT 0`, a TEXT `NOT NULL DEFAULT '<literal>'`
+rendered as the MySQL 8 expression default `(_utf8mb4'<literal>')`, `CHAR(n)
+CHARACTER SET ... COLLATE ...`, `COMMENT`, and `AFTER` options, named composite
+`ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, or `ADD UNIQUE
+KEY` clauses, and `ADD CONSTRAINT ... CHECK (...)` under the bounded CHECK
+grammar of the DDL transformation spec. Multiple admitted clauses render in source
 order as deterministic MySQL 8 SQL; source `ADD INDEX` emits as target `ADD KEY`.
 The slice also admits `DROP COLUMN IF EXISTS` with ASCII-case-insensitive target
 matching, one emitted drop per matched target spelling, and absent or repeated
