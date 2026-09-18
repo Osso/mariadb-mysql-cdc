@@ -110,11 +110,11 @@ tokens. The target routine must be absent before and after evidence capture, no
 target SQL runs, and later ROW/FULL events carry data effects in source order;
 the
 production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN` under the exact unquoted type grammar
-`VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or `TEXT`/`MEDIUMTEXT`;
+`VARCHAR(positive canonical decimal length)`, `DATETIME`, `DATETIME(6)`, `SMALLINT UNSIGNED`, or `TEXT`/`MEDIUMTEXT`;
 quoted type keywords, quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are
-rejected, as are `DATETIME` precision and `SMALLINT` display width. The observed
-`DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options; a TEXT `NOT NULL DEFAULT '<literal>'` rendered as the MySQL 8 expression default `(_utf8mb4'<literal>')`; `CHAR(n) CHARACTER SET ... COLLATE ...`; named composite `ADD KEY` or `ADD UNIQUE KEY` clauses over
-ordinary columns; `ADD CONSTRAINT ... CHECK (...)` under the bounded CHECK grammar in `docs/specs/ddl-transformation.md`; and `DROP COLUMN IF EXISTS`, which matches target column identifiers ASCII-case-insensitively, emits each matched target spelling once, and treats absent or repeated case-variant clauses as proven no-ops. Two routine-drop forms are admitted: the generic exact unqualified, unquoted
+rejected, as are other `DATETIME` precisions and `SMALLINT` display width. The observed
+`DEFAULT NULL`, `NULL`, `COMMENT`, and `AFTER` options; `CHAR`/`VARCHAR` `NOT NULL DEFAULT '<literal>'`; a TEXT `NOT NULL DEFAULT '<literal>'` rendered as the MySQL 8 expression default `(_utf8mb4'<literal>')`; `CHAR(n) CHARACTER SET ... COLLATE ...`; named composite `ADD KEY` or `ADD UNIQUE KEY` clauses over
+ordinary columns; `ADD COLUMN IF NOT EXISTS` and `ADD INDEX IF NOT EXISTS` guards, executed unguarded when every guarded object is absent and proven no-ops when every one already exists exactly; `ADD CONSTRAINT ... CHECK (...)` under the bounded CHECK grammar in `docs/specs/ddl-transformation.md`; and `DROP COLUMN IF EXISTS`, which matches target column identifiers ASCII-case-insensitively, emits each matched target spelling once, and treats absent or repeated case-variant clauses as proven no-ops. Two routine-drop forms are admitted: the generic exact unqualified, unquoted
 `DROP PROCEDURE IF EXISTS <identifier>` form, and the exact unqualified,
 unquoted plain `DROP PROCEDURE apply_release_move_purchase_repair` form.
 Target-local routine inventory determines the result: an existing routine emits

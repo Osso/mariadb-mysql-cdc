@@ -58,10 +58,14 @@ MySQL `-- ` line comment. Embedded comments, executable/version comments,
 optimizer hints, and all other leading comment forms remain rejected. For the
 ALTER `ADD COLUMN` slice, the exact unquoted type grammar is
 `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`, or
-`FLOAT UNSIGNED`; quoted type keywords, quoted `VARCHAR` lengths, and quoted
-`UNSIGNED` forms are rejected, as are `DATETIME` precision, `SMALLINT` display
-width, and `FLOAT` parameters. Unsupported defaults, options, comments, and
-clauses remain `translation_pending` with no target DDL or checkpoint advance. For
+`FLOAT UNSIGNED`, plus `DATETIME(6)`, `TEXT`/`MEDIUMTEXT`, and string defaults for
+character columns; quoted type keywords, quoted `VARCHAR` lengths, and quoted
+`UNSIGNED` forms are rejected, as are other `DATETIME` precisions, `SMALLINT`
+display width, and `FLOAT` parameters. `ADD COLUMN IF NOT EXISTS` and `ADD INDEX
+IF NOT EXISTS` guards execute unguarded only when every guarded object is absent
+and are proven no-ops when every one already exists exactly. Unsupported
+defaults, options, comments, and clauses remain `translation_pending` with no
+target DDL or checkpoint advance. For
 admitted CREATE TABLE, source charset/collation are read between exact
 event-coordinate fences, persisted in evidence, rendered explicitly, and checked
 against target absence before and after capture plus the exact observed post-state;
