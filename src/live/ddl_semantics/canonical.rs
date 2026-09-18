@@ -513,10 +513,19 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                 "kind": "modify_column", "name": name, "column_type": column_type,
                 "data_type": "varchar", "nullable": false,
             }),
-            ParsedAlterClause::AddKey(index) => json!({
-                "kind": "add_key",
-                "index": canonical_index_ast_value(index),
-            }),
+            ParsedAlterClause::AddKey {
+                index,
+                if_not_exists,
+            } => {
+                let mut value = json!({
+                    "kind": "add_key",
+                    "index": canonical_index_ast_value(index),
+                });
+                if *if_not_exists {
+                    value["if_not_exists"] = json!(true);
+                }
+                value
+            }
             ParsedAlterClause::AddCheck(constraint) => json!({
                 "kind": "add_check",
                 "constraint": super::transform::canonical_check_constraint_value(constraint),
@@ -574,7 +583,7 @@ fn translated_alter_table_post_state(
         .alter_table_ast
         .as_ref()
         .ok_or_else(|| "ALTER TABLE DDL lacks parsed AST".to_string())?;
-    validate_guarded_add_column_pre_state(target, ast)?;
+    validate_guarded_clause_pre_state(target, ast)?;
     let mut expected = target.clone();
     for clause in &ast.clauses {
         apply_alter_clause(&mut expected, ast, clause)?;
@@ -582,32 +591,45 @@ fn translated_alter_table_post_state(
     canonical_table_structure_state(&expected, &ast.table)
 }
 
-fn validate_guarded_add_column_pre_state(
+/// MySQL 8 has no `IF NOT EXISTS` for ADD COLUMN/INDEX, so guarded clauses execute unguarded
+/// only when every guarded object is absent, or prove a no-op when every one already exists
+/// with its exact definition. Partial presence fails closed.
+fn validate_guarded_clause_pre_state(
     target: &SemanticSchemaSnapshot,
     ast: &ParsedAlterTableAst,
 ) -> Result<(), String> {
-    let guarded_columns = ast
-        .clauses
-        .iter()
-        .filter_map(|clause| match clause {
-            ParsedAlterClause::AddColumn(column) if column.if_not_exists => Some(column),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if guarded_columns.is_empty() {
-        return Ok(());
+    let mut guarded = 0;
+    let mut present = 0;
+    for clause in &ast.clauses {
+        match clause {
+            ParsedAlterClause::AddColumn(column) if column.if_not_exists => {
+                guarded += 1;
+                let table = find_table(target, &ast.table)
+                    .ok_or_else(|| format!("ALTER TABLE target `{}` is missing", ast.table))?;
+                if table.columns.iter().any(|item| item.name == column.name) {
+                    present += 1;
+                }
+            }
+            ParsedAlterClause::AddKey {
+                index,
+                if_not_exists: true,
+            } => {
+                guarded += 1;
+                if table_indexes(target, &ast.table)
+                    .iter()
+                    .any(|item| item.name == index.name)
+                {
+                    present += 1;
+                }
+            }
+            _ => {}
+        }
     }
-    let table = find_table(target, &ast.table)
-        .ok_or_else(|| format!("ALTER TABLE target `{}` is missing", ast.table))?;
-    let present_count = guarded_columns
-        .iter()
-        .filter(|column| table.columns.iter().any(|item| item.name == column.name))
-        .count();
-    if present_count == 0 || present_count == guarded_columns.len() {
+    if present == 0 || present == guarded {
         return Ok(());
     }
     Err(format!(
-        "guarded ADD COLUMN target `{}` has partial pre-state",
+        "guarded ALTER TABLE target `{}` has partial pre-state",
         ast.table
     ))
 }
@@ -622,7 +644,10 @@ fn apply_alter_clause(
         ParsedAlterClause::ModifyVarchar { name, column_type } => {
             apply_modify_varchar(expected, &ast.table, name, column_type)
         }
-        ParsedAlterClause::AddKey(index) => apply_add_key(expected, index),
+        ParsedAlterClause::AddKey {
+            index,
+            if_not_exists,
+        } => apply_add_key(expected, index, *if_not_exists),
         ParsedAlterClause::AddCheck(constraint) => {
             validate_add_check(expected, &ast.table, constraint)
         }
@@ -882,8 +907,18 @@ fn apply_drop_index(
 fn apply_add_key(
     expected: &mut SemanticSchemaSnapshot,
     ast: &ParsedIndexAst,
+    if_not_exists: bool,
 ) -> Result<(), String> {
     let (table, indexes) = validate_index_table(expected, ast)?;
+    if if_not_exists && let Some(existing) = indexes.iter().find(|index| index.name == ast.name) {
+        if **existing == index_inventory_from_ast(ast) {
+            return Ok(());
+        }
+        return Err(format!(
+            "guarded ADD INDEX target `{}`.`{}` already exists with a divergent definition",
+            ast.table, ast.name
+        ));
+    }
     validate_create_index(ast, table, &indexes, &expected.inventory.foreign_keys, true)?;
     expected
         .inventory

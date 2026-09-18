@@ -52,10 +52,8 @@ fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
     ast.algorithm.is_none()
         && ast.lock.is_none()
         && ast.clauses.iter().all(|clause| match clause {
-            ParsedAlterClause::AddColumn(column) => {
-                !column.if_not_exists && column.data_type != "timestamp"
-            }
-            ParsedAlterClause::AddKey(_)
+            ParsedAlterClause::AddColumn(column) => column.data_type != "timestamp",
+            ParsedAlterClause::AddKey { .. }
             | ParsedAlterClause::AddCheck(_)
             | ParsedAlterClause::ModifyVarchar { .. } => true,
             ParsedAlterClause::DropColumn(_) | ParsedAlterClause::DropIndex(_) => false,
@@ -90,7 +88,10 @@ fn supports_content_sections_seen_columns_instant(ast: &ParsedAlterTableAst) -> 
 fn supports_releases_downloads_sort_rebuild(ast: &ParsedAlterTableAst) -> bool {
     let [
         ParsedAlterClause::DropIndex(dropped),
-        ParsedAlterClause::AddKey(added),
+        ParsedAlterClause::AddKey {
+            index: added,
+            if_not_exists: false,
+        },
     ] = ast.clauses.as_slice()
     else {
         return false;
@@ -196,7 +197,7 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
             quote_identifier(name),
             column_type.to_ascii_uppercase()
         ),
-        ParsedAlterClause::AddKey(index) => render_add_key(index),
+        ParsedAlterClause::AddKey { index, .. } => render_add_key(index),
         ParsedAlterClause::AddCheck(constraint) => {
             format!(
                 "ADD {}",
@@ -217,6 +218,9 @@ fn render_add_column(column: &ParsedAddColumnAst) -> String {
     let default_value = match column.default_value.as_deref() {
         None => "NULL".to_string(),
         Some(value) if is_text_type(&column.data_type) => text_expression_default(value),
+        Some(value) if matches!(column.data_type.as_str(), "char" | "varchar") => {
+            quote_string_literal(value)
+        }
         Some(value) => value.to_string(),
     };
     let mut sql = format!(
@@ -2049,10 +2053,17 @@ fn parse_add_key_clause(
     table: &str,
     unique: bool,
 ) -> Result<(ParsedAlterClause, usize), String> {
-    let name = require_identifier(tokens, key_index + 1, "added key name")?;
-    require_keyword(tokens, key_index + 2, "(")?;
+    let mut name_index = key_index + 1;
+    let if_not_exists = !unique && tokens_match(tokens, name_index, "IF");
+    if if_not_exists {
+        require_keyword(tokens, name_index + 1, "NOT")?;
+        require_keyword(tokens, name_index + 2, "EXISTS")?;
+        name_index += 3;
+    }
+    let name = require_identifier(tokens, name_index, "added key name")?;
+    require_keyword(tokens, name_index + 1, "(")?;
     let mut key_parts = Vec::new();
-    let mut column_index = key_index + 3;
+    let mut column_index = name_index + 2;
     loop {
         let column = require_identifier(tokens, column_index, "added key column")?;
         let (order, next_index) = parse_key_part_order(tokens, column_index + 1);
@@ -2076,7 +2087,13 @@ fn parse_add_key_clause(
                     comment: None,
                     key_parts,
                 };
-                return Ok((ParsedAlterClause::AddKey(ast), column_index + 1));
+                return Ok((
+                    ParsedAlterClause::AddKey {
+                        index: ast,
+                        if_not_exists,
+                    },
+                    column_index + 1,
+                ));
             }
             actual => {
                 return Err(format!(
@@ -2151,6 +2168,14 @@ fn parse_observed_column_type(
             require_keyword(tokens, index + 2, ")")?;
             index += 3;
             format!("{data_type}({parsed_length})")
+        }
+        "datetime" if tokens.get(index).map(String::as_str) == Some("(") => {
+            for (offset, token) in [(0, "("), (1, "6"), (2, ")")] {
+                require_unquoted_token(quoted_flags, index + offset, "DATETIME precision")?;
+                require_keyword(tokens, index + offset, token)?;
+            }
+            index += 3;
+            "datetime(6)".to_string()
         }
         "datetime" | "timestamp" => {
             if tokens.get(index).map(String::as_str) == Some("(") {
@@ -2241,13 +2266,13 @@ fn parse_observed_column_options(
     let mut comment = String::new();
     let mut after = None;
     let supports_required_zero = matches!(data_type, "float" | "tinyint");
-    let text = is_text_type(data_type);
+    let string_default = is_text_type(data_type) || matches!(data_type, "char" | "varchar");
     while index < tokens.len() && tokens[index] != "," {
         if tokens[index].eq_ignore_ascii_case("NULL") {
             nullable = true;
             index += 1;
         } else if tokens[index].eq_ignore_ascii_case("NOT") {
-            if !supports_required_zero && !text {
+            if !supports_required_zero && !string_default {
                 return Err(format!(
                     "unsupported production ADD COLUMN option {:?}",
                     tokens.get(index)
@@ -2264,8 +2289,8 @@ fn parse_observed_column_options(
                 default_value = None;
             } else if supports_required_zero && value == "0" {
                 default_value = Some("0".to_string());
-            } else if text && value == "<string>" {
-                default_value = Some(parse_text_default_literal(literals)?);
+            } else if string_default && value == "<string>" {
+                default_value = Some(parse_string_default_literal(literals)?);
             } else {
                 return Err(format!("unsupported production ADD COLUMN default {value}"));
             }
@@ -2286,8 +2311,8 @@ fn parse_observed_column_options(
             ));
         }
     }
-    if text && !nullable && default_value.is_none() {
-        return Err("required TEXT ADD COLUMN needs a modeled string default".to_string());
+    if string_default && !nullable && default_value.is_none() {
+        return Err("required string ADD COLUMN needs a modeled string default".to_string());
     }
     Ok(ParsedColumnOptions {
         nullable,
@@ -2298,19 +2323,20 @@ fn parse_observed_column_options(
     })
 }
 
-/// The literal a TEXT `DEFAULT '...'` carries; MySQL 8 receives it as an expression default.
-fn parse_text_default_literal(
+/// The literal a string `DEFAULT '...'` carries; TEXT columns receive it as a MySQL 8
+/// expression default, CHAR/VARCHAR columns as a quoted literal.
+fn parse_string_default_literal(
     literals: &mut impl Iterator<Item = String>,
 ) -> Result<String, String> {
     let value = literals
         .next()
-        .ok_or_else(|| "TEXT DEFAULT literal is missing".to_string())?;
+        .ok_or_else(|| "string DEFAULT literal is missing".to_string())?;
     if value.is_empty()
         || !value
             .chars()
             .all(|character| character.is_ascii_graphic() && !matches!(character, '\'' | '\\'))
     {
-        return Err(format!("unmodeled TEXT default literal {value:?}"));
+        return Err(format!("unmodeled string default literal {value:?}"));
     }
     Ok(value)
 }

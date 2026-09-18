@@ -2560,10 +2560,17 @@ fn production_alter_rejects_noncanonical_type_lengths() {
 }
 
 #[test]
-fn production_alter_rejects_datetime_precision() {
-    assert!(!supports_production_alter_table(
+fn production_alter_admits_only_microsecond_datetime_precision() {
+    assert!(supports_production_alter_table(
         "ALTER TABLE accounts ADD COLUMN c DATETIME(6)"
     ));
+    for sql in [
+        "ALTER TABLE accounts ADD COLUMN c DATETIME(3)",
+        "ALTER TABLE accounts ADD COLUMN c DATETIME(`6`)",
+        "ALTER TABLE accounts ADD COLUMN c TIMESTAMP(6)",
+    ] {
+        assert!(!supports_production_alter_table(sql), "accepted {sql}");
+    }
 }
 
 #[test]
@@ -3205,7 +3212,191 @@ fn reader_memory_alter_rejects_unmodeled_text_defaults_and_checks() {
         ),
         READER_MEMORY_PROFILES_ALTER.replace("<=16384", ">=16384"),
         READER_MEMORY_OPERATIONS_ALTER.replace("COLLATE ascii_bin", "COLLATE latin1_bin"),
-        "ALTER TABLE t ADD COLUMN c VARCHAR(8) NOT NULL DEFAULT 'x'".to_string(),
+        "ALTER TABLE t ADD COLUMN c VARCHAR(8) NOT NULL".to_string(),
+        "ALTER TABLE t ADD COLUMN c VARCHAR(8) NOT NULL DEFAULT 'x\\\\y'".to_string(),
+    ] {
+        assert!(!supports_production_alter_table(&sql), "accepted {sql}");
+    }
+}
+
+const READER_MEMORY_PROFILES_GUARDED_ALTER: &str =
+    include_str!("../../../fixtures/ddl/alter-reader-memory-profiles-suggestions.sql");
+
+fn reader_memory_profiles_with_suggestions_target() -> SemanticSchemaSnapshot {
+    let mut target = reader_memory_profiles_target();
+    let table = &mut target.inventory.tables[0];
+    for (name, column_type, data_type, nullable, default_value, encoding) in [
+        (
+            "suggestions_status",
+            "varchar(16)",
+            "varchar",
+            false,
+            Some("idle"),
+            true,
+        ),
+        (
+            "suggestions_dispatch_after",
+            "datetime(6)",
+            "datetime",
+            true,
+            None,
+            false,
+        ),
+        (
+            "suggestions_started_at",
+            "datetime(6)",
+            "datetime",
+            true,
+            None,
+            false,
+        ),
+    ] {
+        table.columns.push(ColumnInventory {
+            name: name.to_string(),
+            ordinal_position: table.columns.len() as u32 + 1,
+            column_type: column_type.to_string(),
+            data_type: data_type.to_string(),
+            is_nullable: nullable,
+            character_set: encoding.then(|| "utf8mb4".to_string()),
+            collation: encoding.then(|| "utf8mb4_unicode_ci".to_string()),
+            default_value: default_value.map(str::to_string),
+            extra: String::new(),
+            comment: String::new(),
+            generated: None,
+        });
+    }
+    for (name, columns) in [
+        (
+            "reader_memory_suggestion_dispatch",
+            vec!["suggestions_status", "suggestions_dispatch_after"],
+        ),
+        (
+            "reader_memory_suggestion_started",
+            vec!["suggestions_started_at"],
+        ),
+    ] {
+        target.inventory.indexes.push(IndexInventory {
+            table: "reader_memory_profiles".to_string(),
+            name: name.to_string(),
+            unique: false,
+            index_type: "BTREE".to_string(),
+            visible: true,
+            comment: None,
+            columns: columns
+                .into_iter()
+                .enumerate()
+                .map(|(sequence, column)| IndexColumnInventory {
+                    name: column.to_string(),
+                    sequence: sequence as u32 + 1,
+                    prefix_length: None,
+                    collation: Some("A".to_string()),
+                    order: "ASC".to_string(),
+                })
+                .collect(),
+        });
+    }
+    target
+}
+
+#[test]
+fn reader_memory_guarded_alter_transforms_to_unguarded_mysql8_sql() {
+    let transformation = globalcomix_inventory()
+        .transform_sql(READER_MEMORY_PROFILES_GUARDED_ALTER)
+        .expect("guarded reader_memory_profiles ALTER must be translatable");
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `reader_memory_profiles` \
+ADD COLUMN `suggestions_status` VARCHAR(16) NOT NULL DEFAULT 'idle', \
+ADD COLUMN `suggestions_dispatch_after` DATETIME(6) NULL DEFAULT NULL, \
+ADD COLUMN `suggestions_started_at` DATETIME(6) NULL DEFAULT NULL, \
+ADD KEY `reader_memory_suggestion_dispatch` (`suggestions_status`, `suggestions_dispatch_after`), \
+ADD KEY `reader_memory_suggestion_started` (`suggestions_started_at`)"
+        )
+    );
+}
+
+#[test]
+fn reader_memory_guarded_alter_adds_absent_columns_and_keys() {
+    let operation =
+        parse_ddl_operation(READER_MEMORY_PROFILES_GUARDED_ALTER).expect("guarded ALTER operation");
+    let target = reader_memory_profiles_target();
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("ALTER evidence");
+    assert_ne!(evidence.pre_state, evidence.expected_post_state);
+    let post: serde_json::Value =
+        serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
+    let status = column(&post, "suggestions_status");
+    assert_eq!(status["ordinal_position"], 3);
+    assert_eq!(status["column_type"], "varchar(16)");
+    assert_eq!(status["is_nullable"], false);
+    assert_eq!(status["default_value"], "idle");
+    assert_eq!(status["extra"], "");
+    assert_eq!(status["character_set"], "utf8mb4");
+    assert_eq!(status["collation"], "utf8mb4_unicode_ci");
+    let dispatch_after = column(&post, "suggestions_dispatch_after");
+    assert_eq!(dispatch_after["column_type"], "datetime(6)");
+    assert_eq!(dispatch_after["data_type"], "datetime");
+    assert_eq!(dispatch_after["is_nullable"], true);
+    assert_eq!(dispatch_after["default_value"], serde_json::Value::Null);
+    assert_eq!(
+        column(&post, "suggestions_started_at")["ordinal_position"],
+        5
+    );
+    let indexes = post["indexes"].as_array().expect("indexes");
+    assert_eq!(indexes.len(), 2);
+    assert_eq!(indexes[0]["name"], "reader_memory_suggestion_dispatch");
+    assert_eq!(
+        indexes[0]["columns"][1]["name"],
+        "suggestions_dispatch_after"
+    );
+    assert_eq!(indexes[1]["name"], "reader_memory_suggestion_started");
+    let ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast).expect("AST JSON");
+    let clauses = &ast["parsed_alter_table"]["clauses"];
+    assert_eq!(clauses[0]["if_not_exists"], true);
+    assert_eq!(clauses[0]["default_value"], "idle");
+    assert_eq!(clauses[3]["kind"], "add_key");
+    assert_eq!(clauses[3]["if_not_exists"], true);
+    let plain = parse_ddl_operation(READER_MEMORY_OPERATIONS_ALTER).expect("plain ALTER");
+    let plain_ast: serde_json::Value = serde_json::from_str(
+        &build_semantic_evidence(&plain, &absent_target(), &absent_target())
+            .expect_err("plain ALTER needs its table")
+            .to_string(),
+    )
+    .unwrap_or(serde_json::Value::Null);
+    assert!(plain_ast.is_null());
+}
+
+#[test]
+fn reader_memory_guarded_alter_is_a_proven_noop_when_everything_exists() {
+    let operation =
+        parse_ddl_operation(READER_MEMORY_PROFILES_GUARDED_ALTER).expect("guarded ALTER operation");
+    let target = reader_memory_profiles_with_suggestions_target();
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("no-op evidence");
+    assert_eq!(evidence.pre_state, evidence.expected_post_state);
+
+    let mut partial = reader_memory_profiles_with_suggestions_target();
+    partial.inventory.indexes.clear();
+    assert!(build_semantic_evidence(&operation, &partial, &partial).is_err());
+
+    let mut divergent = reader_memory_profiles_with_suggestions_target();
+    divergent.inventory.indexes[0].unique = true;
+    assert!(build_semantic_evidence(&operation, &divergent, &divergent).is_err());
+}
+
+#[test]
+fn reader_memory_guarded_alter_rejects_unmodeled_variants() {
+    for sql in [
+        READER_MEMORY_PROFILES_GUARDED_ALTER.replace("DATETIME(6) NULL,", "DATETIME(3) NULL,"),
+        READER_MEMORY_PROFILES_GUARDED_ALTER.replace("NOT NULL DEFAULT 'idle'", "NOT NULL"),
+        READER_MEMORY_PROFILES_GUARDED_ALTER.replace("DEFAULT 'idle'", "DEFAULT 'id''le'"),
+        READER_MEMORY_PROFILES_GUARDED_ALTER.replace(
+            "ADD INDEX IF NOT EXISTS reader_memory_suggestion_started (suggestions_started_at)",
+            "ADD UNIQUE INDEX IF NOT EXISTS reader_memory_suggestion_started (suggestions_started_at)",
+        ),
+        READER_MEMORY_PROFILES_GUARDED_ALTER.replace(
+            "(suggestions_started_at)",
+            "(suggestions_started_at) USING HASH",
+        ),
     ] {
         assert!(!supports_production_alter_table(&sql), "accepted {sql}");
     }
