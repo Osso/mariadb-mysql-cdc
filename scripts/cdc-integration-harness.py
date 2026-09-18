@@ -89,6 +89,7 @@ SCENARIOS = (
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
+    ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("commented-drop-column-present-pending-replay", True),
     ScenarioSpec("commented-drop-column-absent-pending-replay", True),
     ScenarioSpec("bootstrap-contract", True),
@@ -2499,6 +2500,118 @@ DELIMITER ;
             for table in ("reader_memory_items", "reader_memory_operations", "reader_memory_profiles")
         ):
             raise HarnessError(f"reader memory table collation mismatch: {collations!r}")
+
+
+    def run_reader_memory_guarded_alter_pending_replay(self) -> None:
+        """The mysqld-bin.003062 barrier: a pending guarded ALTER (ADD COLUMN/INDEX IF NOT
+        EXISTS, VARCHAR string default, DATETIME(6)) replays unguarded on MySQL 8, then the
+        same statement re-run on the source is proven a no-op without target DDL."""
+        assert self.source and self.target
+        schema = (
+            "CREATE TABLE reader_memory_profiles (user_id INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "revision BIGINT UNSIGNED NOT NULL DEFAULT 0) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci; "
+            "INSERT INTO reader_memory_profiles VALUES (7,1);"
+        )
+        ddl = (
+            (self.repo / "fixtures/ddl/alter-reader-memory-profiles-suggestions.sql")
+            .read_text()
+            .strip()
+        )
+        start, pending = self.prepare_pending_add_column(schema, ddl, "ALTER TABLE")
+        self.admin_sql(
+            self.source,
+            "INSERT INTO reader_memory_profiles (user_id,revision,suggestions_status,"
+            "suggestions_dispatch_after) VALUES (8,2,'queued','2026-09-18 08:12:21.123456'); "
+            "UPDATE reader_memory_profiles SET suggestions_started_at='2026-09-18 08:13:00.000001' "
+            "WHERE user_id=7;",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_reader_memory_guarded_metadata()
+        expected_rows = (
+            "7\t1\tidle\tNULL\t2026-09-18 08:13:00.000001\n"
+            "8\t2\tqueued\t2026-09-18 08:12:21.123456\tNULL"
+        )
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(
+                endpoint, "SELECT * FROM reader_memory_profiles ORDER BY user_id;"
+            ).strip()
+            if rows != expected_rows:
+                raise HarnessError(
+                    f"guarded ALTER rows differ at {endpoint.container}: {rows!r}"
+                )
+        # Re-running the guarded statement is a MariaDB no-op; the target must prove it.
+        self.admin_sql(self.source, ddl + ";")
+        second_stop = self.coordinate()
+        if second_stop == stop:
+            raise HarnessError("MariaDB did not binlog the repeated guarded ALTER")
+        process, log = self.start_stream(stop, second_stop)
+        try:
+            deadline = time.monotonic() + 60
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if process.poll() != 0:
+                raise HarnessError(f"guarded no-op replay failed: {log.read_text()}")
+        finally:
+            self.stop_sync_process(process)
+        journal = self.query(
+            self.target,
+            "SELECT status,transformation_version,generated_sql IS NULL FROM cdc.ddl_replay_journal "
+            "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' ORDER BY event_start_position;",
+            user=TARGET_USER,
+            password=TARGET_PASSWORD,
+        ).splitlines()
+        if journal != [
+            "checkpointed\tmariadb-mysql8-v1\t0",
+            "checkpointed\tmariadb-mysql8-v1\t1",
+        ]:
+            raise HarnessError(f"guarded no-op journal evidence differs: {journal!r}")
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint["source_file"] != second_stop.file
+            or checkpoint["source_position"] != second_stop.position
+        ):
+            raise HarnessError(f"no-op checkpoint did not advance: {checkpoint!r}")
+        self.assert_reader_memory_guarded_metadata()
+        print(
+            "reader_memory_guarded_alter_pending_replay_ok pending_promoted=true unguarded_sql=true "
+            "varchar_default=true datetime6=true guarded_noop=true post_ddl_rows=true "
+            f"coordinate={second_stop.file}:{second_stop.position}"
+        )
+
+    def assert_reader_memory_guarded_metadata(self) -> None:
+        for column, expected in [
+            (
+                "suggestions_status",
+                "suggestions_status\tvarchar(16)\tNO\tidle\t3\tutf8mb4\tutf8mb4_unicode_ci",
+            ),
+            (
+                "suggestions_dispatch_after",
+                "suggestions_dispatch_after\tdatetime(6)\tYES\tNULL\t4\tNULL\tNULL",
+            ),
+            (
+                "suggestions_started_at",
+                "suggestions_started_at\tdatetime(6)\tYES\tNULL\t5\tNULL\tNULL",
+            ),
+        ]:
+            self.assert_added_column_metadata("reader_memory_profiles", column, expected)
+        assert self.target
+        keys = self.admin_query(
+            self.target,
+            "SELECT index_name,non_unique,seq_in_index,column_name FROM information_schema.STATISTICS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='reader_memory_profiles' "
+            "ORDER BY index_name,seq_in_index;",
+        ).strip()
+        expected_keys = "\n".join(
+            [
+                "PRIMARY\t0\t1\tuser_id",
+                "reader_memory_suggestion_dispatch\t1\t1\tsuggestions_status",
+                "reader_memory_suggestion_dispatch\t1\t2\tsuggestions_dispatch_after",
+                "reader_memory_suggestion_started\t1\t1\tsuggestions_started_at",
+            ]
+        )
+        if keys != expected_keys:
+            raise HarnessError(f"guarded ALTER key metadata mismatch:\n{keys}")
 
 
     def run_production_alter_table(self) -> None:
@@ -6791,6 +6904,8 @@ DELIMITER ;
             self.run_storefront_create_pending_replay()
         elif scenario == "reader-memory-create-pending-replay":
             self.run_reader_memory_create_pending_replay()
+        elif scenario == "reader-memory-guarded-alter-pending-replay":
+            self.run_reader_memory_guarded_alter_pending_replay()
         elif scenario == "commented-drop-column-present-pending-replay":
             self.run_commented_drop_column_pending_replay(present=True)
         elif scenario == "commented-drop-column-absent-pending-replay":

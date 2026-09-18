@@ -156,6 +156,12 @@ fn real_reader_memory_create_pending_replay_promotes_and_replays_following_ddl()
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_reader_memory_guarded_alter_replays_then_proves_noop() {
+    run_harness_scenario("reader-memory-guarded-alter-pending-replay");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_production_alter_table_harness_smoke() {
     let output = Command::new("python3")
         .arg(harness_script())
