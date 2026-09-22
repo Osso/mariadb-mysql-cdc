@@ -7471,7 +7471,10 @@ def run(
             cwd=cwd,
         )
     except subprocess.TimeoutExpired as error:
-        raise HarnessError(f"command timed out: {' '.join(argv)}") from error
+        raise HarnessError(
+            f"command timed out: {' '.join(argv)}\n"
+            f"stdout={error.stdout!r}\nstderr={error.stderr!r}"
+        ) from error
     result = CommandResult(argv, completed.returncode, completed.stdout, completed.stderr)
     if check and result.returncode:
         raise HarnessError(
