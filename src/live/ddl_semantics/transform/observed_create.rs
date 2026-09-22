@@ -364,8 +364,10 @@ impl Parser {
         if !self.at("AUTO_INCREMENT") {
             return Ok(false);
         }
-        if column_type != "int unsigned" || nullable {
-            return Err("AUTO_INCREMENT requires observed non-null INT UNSIGNED".into());
+        if !matches!(column_type, "int unsigned" | "bigint unsigned") || nullable {
+            return Err(
+                "AUTO_INCREMENT requires observed non-null INT UNSIGNED or BIGINT UNSIGNED".into(),
+            );
         }
         self.keyword("AUTO_INCREMENT")?;
         Ok(true)
