@@ -2214,7 +2214,10 @@ DELIMITER ;
         query = (
             "SELECT COLUMN_NAME,DATA_TYPE,IS_NULLABLE,"
             "COALESCE(CHARACTER_MAXIMUM_LENGTH,0),COALESCE(COLLATION_NAME,''),"
-            "COLUMN_TYPE LIKE '%unsigned%',ORDINAL_POSITION FROM information_schema.COLUMNS "
+            "COLUMN_TYPE LIKE '%unsigned%',ORDINAL_POSITION,"
+            "COALESCE(NULLIF(REPLACE(LOWER(COLUMN_DEFAULT),'()',''),'null'),'<null>'),"
+            "TRIM(REPLACE(REPLACE(LOWER(EXTRA),'default_generated',''),'()','')) "
+            "FROM information_schema.COLUMNS "
             f"WHERE {where} ORDER BY ORDINAL_POSITION;"
         )
         source = self.admin_query(self.source, query).strip()
