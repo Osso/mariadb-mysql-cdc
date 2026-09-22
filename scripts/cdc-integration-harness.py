@@ -88,6 +88,7 @@ SCENARIOS = (
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
+    ScenarioSpec("spotlight-create-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("commented-drop-column-present-pending-replay", True),
@@ -2113,6 +2114,134 @@ DELIMITER ;
         )
         if keys != expected_keys:
             raise HarnessError(f"conditional DROP key metadata differs: {keys!r}")
+
+    SPOTLIGHT_JSON_COLUMNS = (
+        "sale_release_ids_json",
+        "assistant_prompts",
+        "start_here_json",
+        "best_run_comic_ids_json",
+        "hub_snapshot_json",
+    )
+
+    def run_spotlight_create_pending_replay(self) -> None:
+        assert self.source and self.target
+        table = "home_feed_mantle_spotlights"
+        ddl = (
+            (self.repo / "fixtures/ddl/create-home-feed-mantle-spotlights.sql")
+            .read_text()
+            .strip()
+        )
+        self.admin_sql(
+            self.target,
+            f"ALTER DATABASE {APP_SCHEMA} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+        )
+        start, pending = self.prepare_pending_add_column("", ddl, "CREATE TABLE")
+        required = "mantle_id,mantle_key,artist_id,start_time,end_time,cta_url,name"
+        values = "4294967301,'frozen',16777215,'2026-09-01','2026-10-01','/spotlight','Original'"
+        payload = '{ "duplicate": 1, "duplicate": 2, "nested": [ 3, 4 ] }'
+        json_columns = ",".join(self.SPOTLIGHT_JSON_COLUMNS)
+        json_values = ",".join(
+            sql_literal(payload) for _ in self.SPOTLIGHT_JSON_COLUMNS
+        )
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table}(id,{required},{json_columns},update_time) "
+            f"VALUES(4294967297,{values},{json_values},'2026-01-01'); "
+            f"INSERT INTO {table}({required}) VALUES({values}); "
+            f"UPDATE {table} SET name='Updated',display_order=65535 WHERE id=4294967297;",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_spotlight_metadata()
+        source_rows = self.admin_query(
+            self.source, f"SELECT * FROM {table} ORDER BY id;"
+        )
+        target_rows = self.admin_query(
+            self.target, f"SELECT * FROM {table} ORDER BY id;"
+        )
+        if source_rows != target_rows:
+            raise HarnessError(
+                f"spotlight replay rows differ: {source_rows!r} != {target_rows!r}"
+            )
+        ids = self.admin_query(
+            self.target, f"SELECT id FROM {table} ORDER BY id;"
+        ).strip()
+        if ids != "4294967297\n4294967298":
+            raise HarnessError(
+                f"spotlight unsigned BIGINT auto increment differs: {ids!r}"
+            )
+        for column in self.SPOTLIGHT_JSON_COLUMNS:
+            stored = self.admin_query(
+                self.target, f"SELECT HEX({column}) FROM {table} WHERE id=4294967297;"
+            ).strip()
+            if stored != payload.encode().hex().upper():
+                raise HarnessError(f"JSON text changed for {column}: {stored!r}")
+            self.assert_admin_sql_rejected(
+                self.target,
+                f"UPDATE {table} SET {column}='invalid json' WHERE id=4294967297;",
+                "Check constraint",
+            )
+        nulls = " AND ".join(
+            f"{column} IS NULL" for column in self.SPOTLIGHT_JSON_COLUMNS
+        )
+        defaults = self.admin_query(
+            self.target,
+            f"SELECT {nulls},is_admin_only,display_order,start_here_show_description,"
+            f"create_time IS NOT NULL,update_time IS NOT NULL FROM {table} WHERE id=4294967298;",
+        ).strip()
+        if defaults != "1\t0\t0\t1\t1\t1":
+            raise HarnessError(f"spotlight defaults differ: {defaults!r}")
+        self.admin_sql(
+            self.target,
+            f"INSERT INTO {table}({required},update_time) VALUES({values},'2026-01-01'); "
+            f"UPDATE {table} SET name='Target update' WHERE id=4294967299;",
+        )
+        updated = self.admin_query(
+            self.target,
+            f"SELECT id,update_time>'2026-01-01' FROM {table} WHERE id=4294967299;",
+        ).strip()
+        if updated != "4294967299\t1":
+            raise HarnessError(f"target auto increment/on-update differs: {updated!r}")
+        print(
+            "spotlight_create_pending_replay_ok all_columns=true indexes=true unicode_ci=true "
+            "bigint_auto_increment=true json_text_preserved=true json_validation=true "
+            "null_defaults=true timestamp_on_update=true post_ddl_rows=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def assert_spotlight_metadata(self) -> None:
+        assert self.source and self.target
+        where = f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='home_feed_mantle_spotlights'"
+        query = (
+            "SELECT COLUMN_NAME,DATA_TYPE,IS_NULLABLE,"
+            "COALESCE(CHARACTER_MAXIMUM_LENGTH,0),COALESCE(COLLATION_NAME,''),"
+            "COLUMN_TYPE LIKE '%unsigned%',ORDINAL_POSITION FROM information_schema.COLUMNS "
+            f"WHERE {where} ORDER BY ORDINAL_POSITION;"
+        )
+        source = self.admin_query(self.source, query).strip()
+        target = self.admin_query(self.target, query).strip()
+        if source != target or len(target.splitlines()) != 39:
+            raise HarnessError(
+                f"spotlight column metadata differs: {source!r} != {target!r}"
+            )
+        for column in self.SPOTLIGHT_JSON_COLUMNS:
+            if f"{column}\tlongtext\tYES\t4294967295\tutf8mb4_bin\t0\t" not in target:
+                raise HarnessError(
+                    f"JSON alias metadata differs for {column}: {target!r}"
+                )
+        keys = self.admin_query(
+            self.target,
+            "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME "
+            f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;",
+        ).strip()
+        expected = "idx_hfms_mantle\t1\t1\tmantle_id\nidx_hfms_window\t1\t1\tstart_time\nidx_hfms_window\t1\t2\tend_time\nPRIMARY\t0\t1\tid"
+        if keys != expected:
+            raise HarnessError(f"spotlight index metadata differs: {keys!r}")
+        collation = self.admin_query(
+            self.target,
+            f"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE {where};",
+        ).strip()
+        if collation != "utf8mb4_unicode_ci":
+            raise HarnessError(f"spotlight table collation differs: {collation!r}")
 
     def run_storefront_create_pending_replay(self) -> None:
         assert self.source and self.target
@@ -6900,6 +7029,8 @@ DELIMITER ;
             self.run_add_signed_tinyint_pending_replay()
         elif scenario == "create-facets-historical-crash-restart":
             self.run_create_facets_historical_crash_restart()
+        elif scenario == "spotlight-create-pending-replay":
+            self.run_spotlight_create_pending_replay()
         elif scenario == "storefront-create-pending-replay":
             self.run_storefront_create_pending_replay()
         elif scenario == "reader-memory-create-pending-replay":
