@@ -57,8 +57,9 @@ Automatic DDL admission currently has these narrow slices:
   hints, and all other leading comment forms remain rejected; and
 - the bounded observed `CREATE TABLE IF NOT EXISTS` grammar with ordinary
   leading block comments and inline `--` comments; `MEDIUMINT`, `SMALLINT`, and
-  `TINYINT UNSIGNED`; canonical `VARCHAR(n)`; exactly `DECIMAL(4,3)`;
-  `TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`;
+  `TINYINT UNSIGNED`; canonical `VARCHAR(n)`; exactly `DECIMAL(4,3)` with
+  exact-scale `NOT NULL DEFAULT <digits>.<three digits>` values; `TIMESTAMP NOT
+  NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`;
   a composite primary key; named composite ordinary keys; `ENGINE=InnoDB`; and
   `DEFAULT CHARSET=utf8mb4`. The event definition is authoritative: historical
   `VARCHAR(80)` is not widened from later source metadata. A charset-only CREATE
