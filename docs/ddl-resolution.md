@@ -69,6 +69,17 @@ context requirement and target-absent gate apply unchanged. Unsupported CREATE
 statements remain `translation_pending`; their journal row, coordinate, and
 checkpoint must not be edited manually.
 
+### Curated-strip persisted-pending replay harnesses
+
+`curated-strip-create-pending-replay` and
+`curated-strip-slides-create-pending-replay` each require an explicit
+`--old-binary` that predates the admitted translation; neither runs by default.
+They prove a real `translation_pending` row is promoted without identity change.
+The first covers `DECIMAL(4,3) DEFAULT 0.650`, omitted-default inserts, and
+later decimal DML. The second covers the bounded named single-column same-schema
+foreign key, its explicit supporting index, `ON DELETE CASCADE`, implicit update
+`RESTRICT`, later child DML, orphan rejection, and cascade behavior.
+
 ### Exact production ALTER recovery target
 
 The active recovery target is the exact source event at
