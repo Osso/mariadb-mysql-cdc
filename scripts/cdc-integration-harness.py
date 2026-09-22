@@ -1929,7 +1929,7 @@ DELIMITER ;
                 raise HarnessError(f"DDL pending replay failed: {log.read_text()}")
         finally:
             self.stop_sync_process(process)
-        promoted = self.journal_full_row()
+        promoted = self.journal_full_row(int(pending["event_start_position"]))
         for field in (
             "source_identity",
             "source_server_id",
@@ -2384,9 +2384,12 @@ DELIMITER ;
             "ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci; "
             "INSERT INTO releases_pages VALUES (1,10,100,7),(2,10,101,9);"
         )
+        schema += schema.replace("releases_pages", "releases_pages_history")
         start, pending = self.prepare_pending_add_column(
             schema, ddl, prepared=True, old_binary=self.old_binary
         )
+        history_ddl = ddl.replace("`releases_pages`", "`releases_pages_history`")
+        self.admin_sql(self.source, history_ddl + ";")
         absent = self.admin_query(
             self.target,
             "SELECT COUNT(*) FROM information_schema.COLUMNS "
@@ -2405,6 +2408,7 @@ DELIMITER ;
         )
         stop = self.replay_pending_add_column(start, pending)
         self.assert_source_layout_json_schema()
+        self.assert_source_layout_json_schema("releases_pages_history")
         initial = "1\t10\t100\tNULL\t7\n2\t10\t101\tNULL\t9"
         for endpoint in (self.source, self.target):
             rows = self.admin_query(
@@ -2451,7 +2455,7 @@ DELIMITER ;
             "SELECT status,generated_sql IS NULL FROM cdc.ddl_replay_journal "
             "ORDER BY event_start_position;",
         ).strip()
-        if journal != "checkpointed\t0\ncheckpointed\t1":
+        if journal != "checkpointed\t0\ncheckpointed\t0\ncheckpointed\t1":
             raise HarnessError(
                 f"guarded JSON ADD was not a checkpointed no-op: {journal!r}"
             )
@@ -2462,7 +2466,7 @@ DELIMITER ;
         print(
             "source_layout_json_pending_replay_ok old_binary_pending=true immutable_identity=true "
             "existing_nulls=true json_text_preserved=true sql_json_null_distinct=true "
-            "invalid_json_rejected=true guarded_noop=true post_ddl_rows=true "
+            "invalid_json_rejected=true guarded_noop=true both_migration_tables=true post_ddl_rows=true "
             f"coordinate={second_stop.file}:{second_stop.position}"
         )
 
@@ -2480,11 +2484,9 @@ DELIMITER ;
                     f"JSON text/null values differ at {endpoint.container}: {rows!r}"
                 )
 
-    def assert_source_layout_json_schema(self) -> None:
+    def assert_source_layout_json_schema(self, table: str = "releases_pages") -> None:
         assert self.source and self.target
-        where = (
-            f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='releases_pages'"
-        )
+        where = f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)}"
         query = (
             "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,ORDINAL_POSITION,"
             "CHARACTER_SET_NAME,COLLATION_NAME FROM information_schema.COLUMNS "
@@ -2520,13 +2522,19 @@ DELIMITER ;
             ).strip()
             if indexes != "PRIMARY\t0\t1\tid":
                 raise HarnessError(f"JSON ADD changed table indexes: {indexes!r}")
+            # MariaDB permits identical CHECK names on different tables.
+            table_filter = (
+                f"AND cc.TABLE_NAME={sql_literal(table)} "
+                if endpoint == self.source
+                else ""
+            )
             checks = self.admin_query(
                 endpoint,
                 "SELECT cc.CHECK_CLAUSE FROM information_schema.TABLE_CONSTRAINTS tc "
                 "JOIN information_schema.CHECK_CONSTRAINTS cc "
                 "ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME "
-                f"WHERE tc.TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND tc.TABLE_NAME='releases_pages' "
-                "AND tc.CONSTRAINT_TYPE='CHECK';",
+                f"WHERE tc.TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND tc.TABLE_NAME={sql_literal(table)} "
+                f"{table_filter}AND tc.CONSTRAINT_TYPE='CHECK';",
             ).strip()
             normalized = re.sub(r"[\s`()]+", "", checks).lower()
             if normalized != "json_validsource_layout":
@@ -4016,11 +4024,23 @@ DELIMITER ;
         if count != expected_rows:
             raise HarnessError(f"later DML overtook DDL boundary: expected rows={expected_rows}, got {count}")
         checkpoint = self.checkpoint()
-        if checkpoint.get("source_file") != coordinate.file or int(checkpoint.get("source_position", 0)) != coordinate.position:
-            raise HarnessError(f"checkpoint mismatch expected {coordinate.file}:{coordinate.position}: {checkpoint}")
+        if (
+            checkpoint.get("source_file") != coordinate.file
+            or int(checkpoint.get("source_position", 0)) != coordinate.position
+        ):
+            raise HarnessError(
+                f"checkpoint mismatch expected {coordinate.file}:{coordinate.position}: {checkpoint}"
+            )
 
-    def journal_full_row(self) -> dict[str, str]:
+    def journal_full_row(
+        self, event_start_position: int | None = None
+    ) -> dict[str, str]:
         assert self.target
+        event_filter = (
+            f"AND event_start_position={int(event_start_position)} "
+            if event_start_position is not None
+            else ""
+        )
         output = self.query(
             self.target,
             "SELECT JSON_OBJECT('source_identity',source_identity,'source_server_id',source_server_id,"
@@ -4031,7 +4051,7 @@ DELIMITER ;
             "'status',status,'created_at',CAST(created_at AS CHAR),'updated_at',CAST(updated_at AS CHAR)) "
             "FROM cdc.ddl_replay_journal "
             "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
-            "ORDER BY event_start_position;",
+            f"{event_filter}ORDER BY event_start_position;",
             user=TARGET_USER,
             password=TARGET_PASSWORD,
         )
