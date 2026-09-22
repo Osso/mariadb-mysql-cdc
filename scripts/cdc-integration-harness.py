@@ -2380,7 +2380,7 @@ DELIMITER ;
         schema = (
             "CREATE TABLE releases_pages (id INT UNSIGNED NOT NULL PRIMARY KEY, "
             "release_id INT UNSIGNED NOT NULL, comic_asset_id INT UNSIGNED NOT NULL, "
-            "trailing INT UNSIGNED NOT NULL DEFAULT 7) "
+            "trailing_value INT UNSIGNED NOT NULL DEFAULT 7) "
             "ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci; "
             "INSERT INTO releases_pages VALUES (1,10,100,7),(2,10,101,9);"
         )
@@ -2496,7 +2496,7 @@ DELIMITER ;
                 "release_id\tint unsigned\tNO\tNULL\t2\tNULL\tNULL",
                 "comic_asset_id\tint unsigned\tNO\tNULL\t3\tNULL\tNULL",
                 "source_layout\tlongtext\tYES\tNULL\t4\tutf8mb4\tutf8mb4_bin",
-                "trailing\tint unsigned\tNO\t7\t5\tNULL\tNULL",
+                "trailing_value\tint unsigned\tNO\t7\t5\tNULL\tNULL",
             ]
         )
         for endpoint in (self.source, self.target):
