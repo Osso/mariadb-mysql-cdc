@@ -1,7 +1,7 @@
 mod bigint_auto_increment;
 
-mod json_create;
 mod json_add;
+mod json_create;
 mod nullable_modify;
 
 use super::model::ParsedAlterClause;
