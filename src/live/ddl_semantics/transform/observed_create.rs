@@ -338,6 +338,9 @@ impl Parser {
             self.position += 1;
             return Ok(Some(value));
         }
+        if column_type == "decimal(4,3)" {
+            return self.decimal_default().map(Some);
+        }
         if self.at("<string>") && is_character_type(column_type) {
             self.keyword("<string>")?;
             let value = self.literals.next().ok_or("missing DEFAULT literal")?;
@@ -355,6 +358,28 @@ impl Parser {
             }));
         }
         Err("unmodeled observed CREATE default".into())
+    }
+
+    fn decimal_default(&mut self) -> Result<String, String> {
+        let start = self.position;
+        let parts = self
+            .tokens
+            .get(start..start + 3)
+            .ok_or("incomplete DECIMAL(4,3) default")?;
+        let unquoted = !self.quoted[start..start + 3].contains(&true);
+        let integer = &parts[0];
+        let fraction = &parts[2];
+        let exact_scale = integer.len() == 1 && fraction.len() == 3;
+        let digits = integer
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|byte| byte.is_ascii_digit());
+        if !unquoted || !exact_scale || !digits || parts[1] != "." {
+            return Err("unmodeled DECIMAL(4,3) default".into());
+        }
+        let value = format!("{integer}.{fraction}");
+        self.position += 3;
+        Ok(value)
     }
 
     /// Consumes `CURRENT_TIMESTAMP` or `CURRENT_TIMESTAMP(6)` matching the column precision.
@@ -616,6 +641,43 @@ mod tests {
         assert!(sql.contains("`label` VARCHAR(80) NOT NULL"));
         assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"));
         assert!(sql.ends_with("DEFAULT CHARACTER SET=utf8mb4"));
+    }
+
+    const CURATED_STRIPS: &str =
+        include_str!("../../../../fixtures/ddl/create-home-feed-curated-strips.sql");
+
+    #[test]
+    fn curated_strips_create_preserves_decimal_default() {
+        let ast = parse(CURATED_STRIPS).expect("curated strips CREATE");
+        let aspect = &ast.columns[5];
+        assert_eq!(aspect.name, "aspect_ratio");
+        assert_eq!(aspect.column_type, "decimal(4,3)");
+        assert_eq!(aspect.default_sql.as_deref(), Some("0.650"));
+        assert!(!aspect.nullable);
+        assert_eq!(ast.primary_key, ["id"]);
+        assert_eq!(ast.columns.len(), 13);
+    }
+
+    #[test]
+    fn curated_strips_decimal_defaults_preserve_exact_scale() {
+        for value in ["0.000", "1.000", "9.999"] {
+            let sql = CURATED_STRIPS.replace("DEFAULT 0.650", &format!("DEFAULT {value}"));
+            let ast = parse(&sql).expect(value);
+            assert_eq!(ast.columns[5].default_sql.as_deref(), Some(value));
+        }
+        for value in [
+            "10.000",
+            "0.6500",
+            "0.65",
+            "00.650",
+            "0.65e0",
+            "'0.650'",
+            "(0.650)",
+            "`0`.`650`",
+        ] {
+            let sql = CURATED_STRIPS.replace("DEFAULT 0.650", &format!("DEFAULT {value}"));
+            assert!(parse(&sql).is_err(), "{value}");
+        }
     }
 
     const PROFILES: &str =

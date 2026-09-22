@@ -116,6 +116,8 @@ broader DDL coverage and operational proof gaps listed below.
 - [x] The observed generic `CREATE TABLE IF NOT EXISTS` family accepts ordinary
       leading block comments and inline `--` comments; `MEDIUMINT`, `SMALLINT`,
       and `TINYINT UNSIGNED`; canonical `VARCHAR(n)`; exactly `DECIMAL(4,3)`;
+      unquoted nonnegative `DECIMAL(4,3)` defaults with one integer digit and
+      exactly three fractional digits, preserved without floating-point conversion;
       `TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`;
       a composite primary key; named composite ordinary keys; `ENGINE=InnoDB`;
       and `DEFAULT CHARSET=utf8mb4`. It preserves the event definition, including
