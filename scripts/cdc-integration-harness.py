@@ -91,6 +91,7 @@ SCENARIOS = (
     ScenarioSpec("spotlight-create-pending-replay", True),
     ScenarioSpec("curated-strip-create-pending-replay", True),
     ScenarioSpec("curated-strip-slides-create-pending-replay", True),
+    ScenarioSpec("source-layout-json-pending-replay", True),
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
@@ -169,6 +170,7 @@ def default_scenarios() -> list[str]:
         not in {
             "curated-strip-create-pending-replay",
             "curated-strip-slides-create-pending-replay",
+            "source-layout-json-pending-replay",
         }
     ]
 
@@ -2363,6 +2365,172 @@ DELIMITER ;
             "post_ddl_rows=true schema=true "
             f"coordinate={stop.file}:{stop.position}"
         )
+
+    def run_source_layout_json_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError(
+                "source-layout replay requires --old-binary predating JSON ADD"
+            )
+        ddl = (
+            (self.repo / "fixtures/ddl/alter-releases-pages-source-layout.sql")
+            .read_text()
+            .strip()
+        )
+        schema = (
+            "CREATE TABLE releases_pages (id INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "release_id INT UNSIGNED NOT NULL, comic_asset_id INT UNSIGNED NOT NULL, "
+            "trailing INT UNSIGNED NOT NULL DEFAULT 7) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci; "
+            "INSERT INTO releases_pages VALUES (1,10,100,7),(2,10,101,9);"
+        )
+        start, pending = self.prepare_pending_add_column(
+            schema, ddl, prepared=True, old_binary=self.old_binary
+        )
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='releases_pages' "
+            "AND COLUMN_NAME='source_layout';",
+        ).strip()
+        if absent != "0":
+            raise HarnessError("old binary added source_layout before translation")
+        text = '{ "panel": 1, "panel": 2, "label": "雪 😀", "items": [ 1, 2 ] }'
+        value = f"CONVERT(0x{text.encode('utf-8').hex()} USING utf8mb4)"
+        self.admin_sql(
+            self.source,
+            "INSERT INTO releases_pages(id,release_id,comic_asset_id,source_layout) VALUES "
+            f"(3,11,102,{value}),(4,11,103,'null'); "
+            "INSERT INTO releases_pages(id,release_id,comic_asset_id) VALUES(5,11,104);",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_source_layout_json_schema()
+        initial = "1\t10\t100\tNULL\t7\n2\t10\t101\tNULL\t9"
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(
+                endpoint, "SELECT * FROM releases_pages WHERE id IN (1,2) ORDER BY id;"
+            ).strip()
+            if rows != initial:
+                raise HarnessError(f"existing rows changed after JSON ADD: {rows!r}")
+        self.assert_source_layout_json_rows(
+            {1: None, 2: None, 3: text, 4: "null", 5: None}
+        )
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "INSERT INTO releases_pages(id,release_id,comic_asset_id,source_layout) "
+                "VALUES(99,99,99,'{invalid');",
+                "CONSTRAINT" if endpoint == self.source else "Check constraint",
+            )
+            if (
+                self.admin_query(
+                    endpoint, "SELECT COUNT(*) FROM releases_pages WHERE id=99;"
+                ).strip()
+                != "0"
+            ):
+                raise HarnessError("invalid JSON insert persisted a row")
+        self.admin_sql(self.source, ddl + ";")
+        self.admin_sql(
+            self.source,
+            f"UPDATE releases_pages SET source_layout={value} WHERE id=2; "
+            "UPDATE releases_pages SET source_layout=NULL WHERE id=3;",
+        )
+        second_stop = self.coordinate()
+        require_success(
+            self.run_stream(stop, second_stop),
+            "guarded JSON no-op and downstream updates",
+        )
+        checkpoint = self.checkpoint()
+        if (checkpoint["source_file"], checkpoint["source_position"]) != (
+            second_stop.file,
+            second_stop.position,
+        ):
+            raise HarnessError(f"guarded JSON no-op checkpoint differs: {checkpoint!r}")
+        journal = self.admin_query(
+            self.target,
+            "SELECT status,generated_sql IS NULL FROM cdc.ddl_replay_journal "
+            "ORDER BY event_start_position;",
+        ).strip()
+        if journal != "checkpointed\t0\ncheckpointed\t1":
+            raise HarnessError(
+                f"guarded JSON ADD was not a checkpointed no-op: {journal!r}"
+            )
+        self.assert_source_layout_json_schema()
+        self.assert_source_layout_json_rows(
+            {1: None, 2: text, 3: None, 4: "null", 5: None}
+        )
+        print(
+            "source_layout_json_pending_replay_ok old_binary_pending=true immutable_identity=true "
+            "existing_nulls=true json_text_preserved=true sql_json_null_distinct=true "
+            "invalid_json_rejected=true guarded_noop=true post_ddl_rows=true "
+            f"coordinate={second_stop.file}:{second_stop.position}"
+        )
+
+    def assert_source_layout_json_rows(self, values: dict[int, str | None]) -> None:
+        assert self.source and self.target
+        expected = "\n".join(
+            f"{key}\t{1 if value is None else 0}\t{value.encode('utf-8').hex().upper() if value is not None else 'NULL'}"
+            for key, value in values.items()
+        )
+        query = "SELECT id,source_layout IS NULL,HEX(source_layout) FROM releases_pages ORDER BY id;"
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(endpoint, query).strip()
+            if rows != expected:
+                raise HarnessError(
+                    f"JSON text/null values differ at {endpoint.container}: {rows!r}"
+                )
+
+    def assert_source_layout_json_schema(self) -> None:
+        assert self.source and self.target
+        where = (
+            f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='releases_pages'"
+        )
+        query = (
+            "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,ORDINAL_POSITION,"
+            "CHARACTER_SET_NAME,COLLATION_NAME FROM information_schema.COLUMNS "
+            f"WHERE {where} ORDER BY ORDINAL_POSITION;"
+        )
+        expected = "\n".join(
+            [
+                "id\tint unsigned\tNO\tNULL\t1\tNULL\tNULL",
+                "release_id\tint unsigned\tNO\tNULL\t2\tNULL\tNULL",
+                "comic_asset_id\tint unsigned\tNO\tNULL\t3\tNULL\tNULL",
+                "source_layout\tlongtext\tYES\tNULL\t4\tutf8mb4\tutf8mb4_bin",
+                "trailing\tint unsigned\tNO\t7\t5\tNULL\tNULL",
+            ]
+        )
+        for endpoint in (self.source, self.target):
+            metadata = re.sub(
+                r"int\([0-9]+\)", "int", self.admin_query(endpoint, query).strip()
+            )
+            if metadata != expected:
+                raise HarnessError(
+                    f"JSON ADD metadata differs at {endpoint.container}: {metadata!r}"
+                )
+            collation = self.admin_query(
+                endpoint,
+                f"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE {where};",
+            ).strip()
+            if collation != "utf8mb3_general_ci":
+                raise HarnessError(f"JSON ADD changed table collation: {collation!r}")
+            indexes = self.admin_query(
+                endpoint,
+                "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME "
+                f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;",
+            ).strip()
+            if indexes != "PRIMARY\t0\t1\tid":
+                raise HarnessError(f"JSON ADD changed table indexes: {indexes!r}")
+            checks = self.admin_query(
+                endpoint,
+                "SELECT cc.CHECK_CLAUSE FROM information_schema.TABLE_CONSTRAINTS tc "
+                "JOIN information_schema.CHECK_CONSTRAINTS cc "
+                "ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME "
+                f"WHERE tc.TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND tc.TABLE_NAME='releases_pages' "
+                "AND tc.CONSTRAINT_TYPE='CHECK';",
+            ).strip()
+            normalized = re.sub(r"[\s`()]+", "", checks).lower()
+            if normalized != "json_validsource_layout":
+                raise HarnessError(f"JSON validity CHECK differs: {checks!r}")
 
     def run_curated_strip_slides_create_pending_replay(self) -> None:
         assert self.source and self.target
@@ -7387,6 +7555,8 @@ DELIMITER ;
             self.run_curated_strip_create_pending_replay()
         elif scenario == "curated-strip-slides-create-pending-replay":
             self.run_curated_strip_slides_create_pending_replay()
+        elif scenario == "source-layout-json-pending-replay":
+            self.run_source_layout_json_pending_replay()
         elif scenario == "spotlight-create-pending-replay":
             self.run_spotlight_create_pending_replay()
         elif scenario == "spotlight-nullable-varchar-pending-replay":
