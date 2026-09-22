@@ -2400,39 +2400,42 @@ DELIMITER ;
             raise HarnessError("old binary added source_layout before translation")
         text = '{ "panel": 1, "panel": 2, "label": "雪 😀", "items": [ 1, 2 ] }'
         value = f"CONVERT(0x{text.encode('utf-8').hex()} USING utf8mb4)"
-        self.admin_sql(
-            self.source,
-            "INSERT INTO releases_pages(id,release_id,comic_asset_id,source_layout) VALUES "
-            f"(3,11,102,{value}),(4,11,103,'null'); "
-            "INSERT INTO releases_pages(id,release_id,comic_asset_id) VALUES(5,11,104);",
-        )
+        for table in ("releases_pages", "releases_pages_history"):
+            self.admin_sql(
+                self.source,
+                f"INSERT INTO {table}(id,release_id,comic_asset_id,source_layout) VALUES "
+                f"(3,11,102,{value}),(4,11,103,'null'); "
+                f"INSERT INTO {table}(id,release_id,comic_asset_id) VALUES(5,11,104);",
+            )
         stop = self.replay_pending_add_column(start, pending)
         self.assert_source_layout_json_schema()
         self.assert_source_layout_json_schema("releases_pages_history")
         initial = "1\t10\t100\tNULL\t7\n2\t10\t101\tNULL\t9"
-        for endpoint in (self.source, self.target):
-            rows = self.admin_query(
-                endpoint, "SELECT * FROM releases_pages WHERE id IN (1,2) ORDER BY id;"
-            ).strip()
-            if rows != initial:
-                raise HarnessError(f"existing rows changed after JSON ADD: {rows!r}")
-        self.assert_source_layout_json_rows(
-            {1: None, 2: None, 3: text, 4: "null", 5: None}
-        )
-        for endpoint in (self.source, self.target):
-            self.assert_admin_sql_rejected(
-                endpoint,
-                "INSERT INTO releases_pages(id,release_id,comic_asset_id,source_layout) "
-                "VALUES(99,99,99,'{invalid');",
-                "CONSTRAINT" if endpoint == self.source else "Check constraint",
-            )
-            if (
-                self.admin_query(
-                    endpoint, "SELECT COUNT(*) FROM releases_pages WHERE id=99;"
+        for table in ("releases_pages", "releases_pages_history"):
+            for endpoint in (self.source, self.target):
+                rows = self.admin_query(
+                    endpoint, f"SELECT * FROM {table} WHERE id IN (1,2) ORDER BY id;"
                 ).strip()
-                != "0"
-            ):
-                raise HarnessError("invalid JSON insert persisted a row")
+                if rows != initial:
+                    raise HarnessError(
+                        f"existing {table} rows changed after JSON ADD: {rows!r}"
+                    )
+                self.assert_admin_sql_rejected(
+                    endpoint,
+                    f"INSERT INTO {table}(id,release_id,comic_asset_id,source_layout) "
+                    "VALUES(99,99,99,'{invalid');",
+                    "CONSTRAINT" if endpoint == self.source else "Check constraint",
+                )
+                if (
+                    self.admin_query(
+                        endpoint, f"SELECT COUNT(*) FROM {table} WHERE id=99;"
+                    ).strip()
+                    != "0"
+                ):
+                    raise HarnessError(f"invalid JSON insert persisted in {table}")
+            self.assert_source_layout_json_rows(
+                {1: None, 2: None, 3: text, 4: "null", 5: None}, table
+            )
         self.admin_sql(self.source, ddl + ";")
         self.admin_sql(
             self.source,
@@ -2470,13 +2473,15 @@ DELIMITER ;
             f"coordinate={second_stop.file}:{second_stop.position}"
         )
 
-    def assert_source_layout_json_rows(self, values: dict[int, str | None]) -> None:
+    def assert_source_layout_json_rows(
+        self, values: dict[int, str | None], table: str = "releases_pages"
+    ) -> None:
         assert self.source and self.target
         expected = "\n".join(
             f"{key}\t{1 if value is None else 0}\t{value.encode('utf-8').hex().upper() if value is not None else 'NULL'}"
             for key, value in values.items()
         )
-        query = "SELECT id,source_layout IS NULL,HEX(source_layout) FROM releases_pages ORDER BY id;"
+        query = f"SELECT id,source_layout IS NULL,HEX(source_layout) FROM {table} ORDER BY id;"
         for endpoint in (self.source, self.target):
             rows = self.admin_query(endpoint, query).strip()
             if rows != expected:
