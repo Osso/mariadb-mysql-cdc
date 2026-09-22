@@ -2718,9 +2718,10 @@ DELIMITER ;
                 if endpoint == self.source
                 else ""
             )
+            enforced = "'YES'" if endpoint == self.source else "tc.ENFORCED"
             checks = self.admin_query(
                 endpoint,
-                "SELECT tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE,tc.ENFORCED FROM information_schema.TABLE_CONSTRAINTS tc "
+                f"SELECT tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE,{enforced} FROM information_schema.TABLE_CONSTRAINTS tc "
                 "JOIN information_schema.CHECK_CONSTRAINTS cc "
                 "ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME "
                 f"WHERE tc.TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND tc.TABLE_NAME={sql_literal(table)} "
