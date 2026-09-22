@@ -509,9 +509,13 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
         .iter()
         .map(|clause| match clause {
             ParsedAlterClause::AddColumn(column) => canonical_add_column_ast_value(column),
-            ParsedAlterClause::ModifyVarchar { name, column_type } => json!({
+            ParsedAlterClause::ModifyVarchar {
+                name,
+                column_type,
+                nullable,
+            } => json!({
                 "kind": "modify_column", "name": name, "column_type": column_type,
-                "data_type": "varchar", "nullable": false,
+                "data_type": "varchar", "nullable": nullable,
             }),
             ParsedAlterClause::AddKey {
                 index,
@@ -641,9 +645,11 @@ fn apply_alter_clause(
 ) -> Result<(), String> {
     match clause {
         ParsedAlterClause::AddColumn(column) => apply_add_column(expected, &ast.table, column),
-        ParsedAlterClause::ModifyVarchar { name, column_type } => {
-            apply_modify_varchar(expected, &ast.table, name, column_type)
-        }
+        ParsedAlterClause::ModifyVarchar {
+            name,
+            column_type,
+            nullable,
+        } => apply_modify_varchar(expected, &ast.table, name, column_type, *nullable),
         ParsedAlterClause::AddKey {
             index,
             if_not_exists,
@@ -685,6 +691,7 @@ fn apply_modify_varchar(
     table_name: &str,
     name: &str,
     column_type: &str,
+    nullable: bool,
 ) -> Result<(), String> {
     let table = expected
         .inventory
@@ -701,7 +708,7 @@ fn apply_modify_varchar(
         return Err("MODIFY requires an ordinary existing VARCHAR column".into());
     }
     column.column_type = column_type.to_string();
-    column.is_nullable = false;
+    column.is_nullable = nullable;
     column.default_value = None;
     column.comment.clear();
     let collation = table

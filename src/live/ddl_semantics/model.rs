@@ -149,6 +149,7 @@ pub enum ParsedAlterClause {
     ModifyVarchar {
         name: String,
         column_type: String,
+        nullable: bool,
     },
     AddKey {
         index: ParsedIndexAst,

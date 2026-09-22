@@ -192,11 +192,22 @@ fn render_production_alter_table(ast: &ParsedAlterTableAst) -> String {
 fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
     match clause {
         ParsedAlterClause::AddColumn(column) => render_add_column(column),
-        ParsedAlterClause::ModifyVarchar { name, column_type } => format!(
-            "MODIFY COLUMN {} {} NOT NULL",
-            quote_identifier(name),
-            column_type.to_ascii_uppercase()
-        ),
+        ParsedAlterClause::ModifyVarchar {
+            name,
+            column_type,
+            nullable,
+        } => {
+            let attributes = if *nullable {
+                "NULL DEFAULT NULL"
+            } else {
+                "NOT NULL"
+            };
+            format!(
+                "MODIFY COLUMN {} {} {attributes}",
+                quote_identifier(name),
+                column_type.to_ascii_uppercase()
+            )
+        }
         ParsedAlterClause::AddKey { index, .. } => render_add_key(index),
         ParsedAlterClause::AddCheck(constraint) => {
             format!(
@@ -1928,16 +1939,24 @@ fn parse_modify_varchar_clause(
     let (column_type, data_type, next) =
         parse_observed_column_type(tokens, quoted_flags, index + 3)?;
     if data_type != "varchar" {
-        return Err("MODIFY supports only VARCHAR(n) NOT NULL".into());
+        return Err("MODIFY supports only VARCHAR(n) NOT NULL or DEFAULT NULL".into());
     }
-    for (offset, keyword) in [(0, "NOT"), (1, "NULL")] {
+    let nullable = tokens
+        .get(next)
+        .is_some_and(|token| token.eq_ignore_ascii_case("DEFAULT"));
+    let first_keyword = if nullable { "DEFAULT" } else { "NOT" };
+    for (offset, keyword) in [(0, first_keyword), (1, "NULL")] {
         require_keyword(tokens, next + offset, keyword)?;
         if quoted_flags.get(next + offset) == Some(&true) {
             return Err("quoted MODIFY nullability is unsupported".into());
         }
     }
     Ok((
-        ParsedAlterClause::ModifyVarchar { name, column_type },
+        ParsedAlterClause::ModifyVarchar {
+            name,
+            column_type,
+            nullable,
+        },
         next + 2,
     ))
 }
