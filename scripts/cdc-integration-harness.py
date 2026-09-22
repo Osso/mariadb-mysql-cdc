@@ -2454,6 +2454,44 @@ DELIMITER ;
             )
         return restart, blocked
 
+    def assert_source_layout_divergent_prestate_rejected(
+        self, restart: Coordinate, blocked: dict[str, str]
+    ) -> None:
+        assert self.target
+        self.admin_sql(
+            self.target,
+            "ALTER TABLE releases_pages_history "
+            "ALTER COLUMN trailing_value SET DEFAULT 8;",
+        )
+        drifted = self.run_stream(restart, self.coordinate())
+        after = self.journal_full_row(int(blocked["event_start_position"]))
+        checkpoint = self.checkpoint()
+        column_state = self.admin_query(
+            self.target,
+            "SELECT COLUMN_DEFAULT FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA='globalcomix' "
+            "AND TABLE_NAME='releases_pages_history' "
+            "AND COLUMN_NAME='trailing_value';",
+        ).strip()
+        if (
+            drifted.returncode == 0
+            or after != blocked
+            or (checkpoint["source_file"], checkpoint["source_position"])
+            != (restart.file, restart.position)
+            or column_state != "8"
+        ):
+            raise HarnessError(
+                "divergent target state was not preserved behind blocked JSON ALTER: "
+                f"returncode={drifted.returncode} journal={after!r} "
+                f"checkpoint={checkpoint!r} default={column_state!r} "
+                f"stream={drifted.stdout}{drifted.stderr}"
+            )
+        self.admin_sql(
+            self.target,
+            "ALTER TABLE releases_pages_history "
+            "ALTER COLUMN trailing_value SET DEFAULT 7;",
+        )
+
     def run_source_layout_json_pending_replay(self) -> None:
         assert self.source and self.target
         if self.old_binary is None or not self.old_binary.is_file():
@@ -2505,6 +2543,7 @@ DELIMITER ;
             restart, blocked = self.assert_failed_source_layout_history_replay(
                 start, pending, history_ddl
             )
+            self.assert_source_layout_divergent_prestate_rejected(restart, blocked)
             stop = self.replay_pending_add_column(restart, blocked)
             first = self.journal_full_row(int(pending["event_start_position"]))
             if first["status"] != "checkpointed":
@@ -2574,6 +2613,7 @@ DELIMITER ;
             "existing_nulls=true json_text_preserved=true sql_json_null_distinct=true "
             "invalid_json_rejected=true guarded_noop=true both_migration_tables=true post_ddl_rows=true "
             f"failed_binary_restart={self.failed_binary is not None} "
+            f"divergent_prestate_rejected={self.failed_binary is not None} "
             f"coordinate={second_stop.file}:{second_stop.position}"
         )
 
