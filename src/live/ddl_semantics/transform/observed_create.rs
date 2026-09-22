@@ -737,6 +737,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn curated_slides_rejects_observed_foreign_key_action_drift() {
+        let ast = parse(CURATED_SLIDES).unwrap();
+        let key = crate::canonical_foreign_key::CanonicalForeignKey {
+            constraint_schema: "test".into(),
+            constraint_name: "fk_hfcss_strip".into(),
+            child_schema: "test".into(),
+            child_table: "home_feed_curated_strip_slides".into(),
+            child_columns: vec!["curated_strip_id".into()],
+            parent_schema: "test".into(),
+            parent_table: "home_feed_curated_strips".into(),
+            parent_columns: vec!["id".into()],
+            update_rule: "RESTRICT".into(),
+            delete_rule: "CASCADE".into(),
+            match_option: "NONE".into(),
+            enforced: true,
+        };
+        let validate = |keys: &[crate::canonical_foreign_key::CanonicalForeignKey]| {
+            crate::live::ddl_semantics::canonical::validate_create_foreign_keys(&ast, "test", keys)
+        };
+        assert!(validate(std::slice::from_ref(&key)).is_ok());
+        assert!(validate(&[]).is_err());
+        let mut changed = key.clone();
+        changed.delete_rule = "RESTRICT".into();
+        assert!(validate(&[changed]).is_err());
+        let mut changed = key.clone();
+        changed.update_rule = "CASCADE".into();
+        assert!(validate(&[changed]).is_err());
+        let mut changed = key;
+        changed.parent_columns = vec!["other_id".into()];
+        assert!(validate(&[changed]).is_err());
+    }
+
     const CURATED_STRIPS: &str =
         include_str!("../../../../fixtures/ddl/create-home-feed-curated-strips.sql");
 
