@@ -958,65 +958,6 @@ fn check_has_outer_parentheses(tokens: &[String], quoted: &[bool]) -> bool {
     false
 }
 
-#[cfg(test)]
-mod json_alias_check_tests {
-    use super::*;
-
-    #[test]
-    fn json_alias_check_requires_exact_column_and_enforcement() {
-        for clause in [
-            "json_valid(`source_layout`)",
-            "((JSON_VALID((`source_layout`))))",
-        ] {
-            assert!(json_valid_check_matches(clause, "source_layout"));
-        }
-        for clause in [
-            "JSON_VALID(other)",
-            "JSON_VALID(source_layout) OR 1",
-            "JSON_VALID('source_layout')",
-            "`JSON_VALID`(source_layout)",
-            "(JSON_VALID(source_layout)) OR (1)",
-        ] {
-            assert!(!json_valid_check_matches(clause, "source_layout"));
-        }
-        let column = ParsedAddColumnAst {
-            name: "source_layout".into(),
-            if_not_exists: true,
-            column_type: "json".into(),
-            data_type: "json".into(),
-            nullable: true,
-            default_value: None,
-            comment: String::new(),
-            after: None,
-            character_set: Some("utf8mb4".into()),
-            collation: Some("utf8mb4_bin".into()),
-        };
-        assert!(validate_json_alias_checks(&[&column], &[]).is_err());
-        assert!(
-            validate_json_alias_checks(
-                &[&column],
-                &[(
-                    "source_layout".into(),
-                    "JSON_VALID(source_layout)".into(),
-                    false
-                )]
-            )
-            .is_err()
-        );
-        assert!(
-            validate_json_alias_checks(
-                &[&column],
-                &[(
-                    "source_layout".into(),
-                    "JSON_VALID(source_layout)".into(),
-                    true
-                )]
-            )
-            .is_ok()
-        );
-    }
-}
-
 fn column_default_encoding(
     data_type: &str,
     character_set: &str,
@@ -1527,3 +1468,63 @@ pub fn supports_automatic_semantic_recovery(operation: &DdlOperation) -> bool {
         && operation.index_ast.is_some())
         || (operation.family == DdlFamily::Table && operation.create_table_ast.is_some())
 }
+
+#[cfg(test)]
+mod json_alias_check_tests {
+    use super::*;
+
+    #[test]
+    fn json_alias_check_requires_exact_column_and_enforcement() {
+        for clause in [
+            "json_valid(`source_layout`)",
+            "((JSON_VALID((`source_layout`))))",
+        ] {
+            assert!(json_valid_check_matches(clause, "source_layout"));
+        }
+        for clause in [
+            "JSON_VALID(other)",
+            "JSON_VALID(source_layout) OR 1",
+            "JSON_VALID('source_layout')",
+            "`JSON_VALID`(source_layout)",
+            "(JSON_VALID(source_layout)) OR (1)",
+        ] {
+            assert!(!json_valid_check_matches(clause, "source_layout"));
+        }
+        let column = ParsedAddColumnAst {
+            name: "source_layout".into(),
+            if_not_exists: true,
+            column_type: "json".into(),
+            data_type: "json".into(),
+            nullable: true,
+            default_value: None,
+            comment: String::new(),
+            after: None,
+            character_set: Some("utf8mb4".into()),
+            collation: Some("utf8mb4_bin".into()),
+        };
+        assert!(validate_json_alias_checks(&[&column], &[]).is_err());
+        assert!(
+            validate_json_alias_checks(
+                &[&column],
+                &[(
+                    "source_layout".into(),
+                    "JSON_VALID(source_layout)".into(),
+                    false
+                )]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_json_alias_checks(
+                &[&column],
+                &[(
+                    "source_layout".into(),
+                    "JSON_VALID(source_layout)".into(),
+                    true
+                )]
+            )
+            .is_ok()
+        );
+    }
+}
+
