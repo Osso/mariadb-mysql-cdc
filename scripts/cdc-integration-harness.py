@@ -90,6 +90,7 @@ SCENARIOS = (
     ScenarioSpec("storefront-create-pending-replay", True),
     ScenarioSpec("spotlight-create-pending-replay", True),
     ScenarioSpec("curated-strip-create-pending-replay", True),
+    ScenarioSpec("curated-strip-slides-create-pending-replay", True),
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
@@ -164,7 +165,11 @@ def default_scenarios() -> list[str]:
         scenario.name
         for scenario in SCENARIOS
         if scenario.executable
-        and scenario.name != "curated-strip-create-pending-replay"
+        and scenario.name
+        not in {
+            "curated-strip-create-pending-replay",
+            "curated-strip-slides-create-pending-replay",
+        }
     ]
 
 
@@ -2358,6 +2363,116 @@ DELIMITER ;
             "post_ddl_rows=true schema=true "
             f"coordinate={stop.file}:{stop.position}"
         )
+
+    def run_curated_strip_slides_create_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError(
+                "curated slides replay requires --old-binary predating CREATE foreign keys"
+            )
+        parent = "home_feed_curated_strips"
+        table = "home_feed_curated_strip_slides"
+        parent_ddl = (
+            (self.repo / "fixtures/ddl/create-home-feed-curated-strips.sql")
+            .read_text()
+            .strip()
+        )
+        ddl = (
+            (self.repo / "fixtures/ddl/create-home-feed-curated-strip-slides.sql")
+            .read_text()
+            .strip()
+        )
+        self.admin_sql(
+            self.target, f"ALTER DATABASE {APP_SCHEMA} COLLATE utf8mb4_0900_ai_ci;"
+        )
+        seed = (
+            f"INSERT INTO {parent}(id,name,title,start_time,end_time,create_time,update_time) VALUES "
+            "(4294967297,'first','First','2026-09-01','2026-10-01','2026-09-01','2026-09-01'),"
+            "(4294967298,'second','Second','2026-09-01','2026-10-01','2026-09-01','2026-09-01');"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, parent_ddl + ";" + seed)
+        parent_query = f"SELECT * FROM {parent} ORDER BY id;"
+        if self.admin_query(self.source, parent_query) != self.admin_query(
+            self.target, parent_query
+        ):
+            raise HarnessError("curated parent fixtures differ before child CREATE")
+        start, pending = self.prepare_pending_add_column(
+            "", ddl, "CREATE TABLE", prepared=True, old_binary=self.old_binary
+        )
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='{table}';",
+        ).strip()
+        if absent != "0":
+            raise HarnessError("old binary created slides table before translation")
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table}(id,curated_strip_id,image_url) VALUES "
+            "(1,4294967297,'https://example.test/first.png'),"
+            "(2,4294967298,'https://example.test/second.png'); "
+            f"UPDATE {table} SET cta_url='https://example.test/read',display_order=7 WHERE id=1;",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        query = f"SELECT * FROM {table} ORDER BY id;"
+        source_rows = self.admin_query(self.source, query)
+        target_rows = self.admin_query(self.target, query)
+        if not source_rows.strip() or source_rows != target_rows:
+            raise HarnessError(
+                f"curated slide rows differ: {source_rows!r} != {target_rows!r}"
+            )
+        self.assert_curated_slides_foreign_key(table, parent)
+        self.assert_admin_sql_rejected(
+            self.target,
+            f"INSERT INTO {table}(id,curated_strip_id,image_url) VALUES(3,9999999999,'missing.png');",
+            "Cannot add or update a child row",
+        )
+        rejected = self.admin_query(
+            self.target, f"SELECT COUNT(*) FROM {table} WHERE id=3;"
+        ).strip()
+        if rejected != "0":
+            raise HarnessError("rejected orphan insert persisted a row")
+        self.admin_sql(self.target, f"DELETE FROM {parent} WHERE id=4294967298;")
+        surviving = self.admin_query(
+            self.target,
+            f"SELECT id,curated_strip_id,display_order FROM {table} ORDER BY id;",
+        ).strip()
+        if surviving != "1\t4294967297\t7":
+            raise HarnessError(f"cascade removed wrong child rows: {surviving!r}")
+        remaining_parents = self.admin_query(
+            self.target, f"SELECT id FROM {parent} ORDER BY id;"
+        ).strip()
+        if remaining_parents != "4294967297":
+            raise HarnessError(f"cascade parent delete differs: {remaining_parents!r}")
+        print(
+            "curated_strip_slides_create_pending_replay_ok old_binary_pending=true "
+            "immutable_identity=true post_ddl_rows=true foreign_key_metadata=true "
+            "orphan_rejected=true delete_cascade=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def assert_curated_slides_foreign_key(self, table: str, parent: str) -> None:
+        assert self.source and self.target
+        query = (
+            "SELECT k.CONSTRAINT_NAME,k.COLUMN_NAME,k.ORDINAL_POSITION,"
+            "k.REFERENCED_TABLE_SCHEMA,k.REFERENCED_TABLE_NAME,k.REFERENCED_COLUMN_NAME,"
+            "CASE WHEN r.UPDATE_RULE IN ('NO ACTION','RESTRICT') THEN 'RESTRICT' "
+            "ELSE r.UPDATE_RULE END,r.DELETE_RULE "
+            "FROM information_schema.KEY_COLUMN_USAGE k "
+            "JOIN information_schema.REFERENTIAL_CONSTRAINTS r "
+            "ON r.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND r.TABLE_NAME=k.TABLE_NAME "
+            "AND r.CONSTRAINT_NAME=k.CONSTRAINT_NAME "
+            f"WHERE k.TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND k.TABLE_NAME={sql_literal(table)} "
+            "ORDER BY k.CONSTRAINT_NAME,k.ORDINAL_POSITION;"
+        )
+        expected = f"fk_hfcss_strip\tcurated_strip_id\t1\t{APP_SCHEMA}\t{parent}\tid\tRESTRICT\tCASCADE"
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, query).strip()
+            if actual != expected:
+                raise HarnessError(
+                    f"curated slides FK metadata differs: {actual!r} != {expected!r}"
+                )
 
     def run_spotlight_create_pending_replay(self) -> None:
         assert self.source and self.target
@@ -7270,6 +7385,8 @@ DELIMITER ;
             self.run_create_facets_historical_crash_restart()
         elif scenario == "curated-strip-create-pending-replay":
             self.run_curated_strip_create_pending_replay()
+        elif scenario == "curated-strip-slides-create-pending-replay":
+            self.run_curated_strip_slides_create_pending_replay()
         elif scenario == "spotlight-create-pending-replay":
             self.run_spotlight_create_pending_replay()
         elif scenario == "spotlight-nullable-varchar-pending-replay":
