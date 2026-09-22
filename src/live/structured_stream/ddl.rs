@@ -138,26 +138,50 @@ where
         .map_err(ApplyBinlogError::Statement)?;
     let outcome = match status {
         Some(DdlReplayStatus::Prepared) => {
-            reconcile_prepared_automatic_ddl(
+            if recover_legacy_json_alias(
                 applier.executor(),
                 journal,
                 semantic_inventory,
                 context,
                 event,
                 &ddl_event,
-            )?;
-            resolved_ddl_outcome(ddl_event)
+                DdlReplayStatus::Prepared,
+            )? {
+                resolved_ddl_outcome(ddl_event.clone())
+            } else {
+                reconcile_prepared_automatic_ddl(
+                    applier.executor(),
+                    journal,
+                    semantic_inventory,
+                    context,
+                    event,
+                    &ddl_event,
+                )?;
+                resolved_ddl_outcome(ddl_event)
+            }
         }
         Some(DdlReplayStatus::Blocked) => {
-            recover_blocked_automatic_ddl(
+            if recover_legacy_json_alias(
                 applier.executor(),
                 journal,
                 semantic_inventory,
                 context,
                 event,
                 &ddl_event,
-            )?;
-            resolved_ddl_outcome(ddl_event)
+                DdlReplayStatus::Blocked,
+            )? {
+                resolved_ddl_outcome(ddl_event.clone())
+            } else {
+                recover_blocked_automatic_ddl(
+                    applier.executor(),
+                    journal,
+                    semantic_inventory,
+                    context,
+                    event,
+                    &ddl_event,
+                )?;
+                resolved_ddl_outcome(ddl_event)
+            }
         }
         _ => match replay_action(&ddl_event, status).map_err(ApplyBinlogError::Statement)? {
             DdlReplayAction::PrepareAndExecute => prepare_and_execute_automatic_ddl(
@@ -399,6 +423,138 @@ where
         .recover_blocked(ddl_event, &evidence)
         .map_err(ApplyBinlogError::Statement)?;
     finalize_automatic_ddl_checkpoint(executor, journal, context, event, ddl_event)
+}
+
+fn is_source_layout_json_event(sql: &str) -> bool {
+    let original =
+        include_str!("../../../fixtures/ddl/alter-releases-pages-source-layout.sql").trim();
+    let history = original.replace("`releases_pages`", "`releases_pages_history`");
+    sql.trim() == original || sql.trim() == history
+}
+
+fn corrected_json_alias_sql(
+    raw_sql: &str,
+    recorded: &DdlSemanticEvidence,
+    fresh: &DdlSemanticEvidence,
+    replacement: &DdlTransformation,
+) -> Result<String, String> {
+    if !is_source_layout_json_event(raw_sql)
+        || recorded.transformation_version != replacement.version
+        || recorded.pre_state == recorded.expected_post_state
+        || recorded.pre_state != fresh.pre_state
+        || recorded.expected_post_state != fresh.expected_post_state
+        || recorded.canonical_ast != fresh.canonical_ast
+    {
+        return Err(
+            "JSON alias recovery requires exact event and unchanged semantic evidence".into(),
+        );
+    }
+    let corrected = replacement
+        .target_sql
+        .as_ref()
+        .ok_or("JSON alias recovery lacks corrected SQL")?;
+    let old = corrected.replace(
+        ", ADD CHECK (JSON_VALID(`source_layout`))",
+        ", ADD CONSTRAINT `source_layout` CHECK (JSON_VALID(`source_layout`))",
+    );
+    if old == *corrected || recorded.generated_sql.as_deref() != Some(old.as_str()) {
+        return Err("JSON alias recovery requires exact legacy named CHECK collision".into());
+    }
+    Ok(corrected.clone())
+}
+
+fn recover_legacy_json_alias<E, R, C, J, S>(
+    executor: &E,
+    journal: &J,
+    semantic_inventory: &S,
+    context: &mut StreamEventContext<'_, R, C>,
+    event: &BinlogEvent,
+    ddl_event: &DdlEvent,
+    status: DdlReplayStatus,
+) -> Result<bool, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    C: StreamCheckpointStore,
+    J: DdlReplayJournal,
+    S: DdlSemanticInventory,
+{
+    if !is_source_layout_json_event(&ddl_event.raw_sql) {
+        return Ok(false);
+    }
+    let recorded = read_blocked_evidence(journal, ddl_event)?;
+    let replacement = semantic_inventory
+        .transform_sql(&ddl_event.raw_sql)
+        .map_err(ApplyBinlogError::Statement)?;
+    let observed = semantic_inventory
+        .observe_target_state(&ddl_event.raw_sql)
+        .map_err(ApplyBinlogError::Statement)?;
+    if observed == recorded.expected_post_state {
+        let _ = corrected_json_alias_sql(&ddl_event.raw_sql, &recorded, &recorded, &replacement)
+            .map_err(ApplyBinlogError::Statement)?;
+        if status == DdlReplayStatus::Prepared {
+            return Ok(false);
+        }
+        journal
+            .recover_blocked(ddl_event, &recorded)
+            .map_err(ApplyBinlogError::Statement)?;
+        finalize_automatic_ddl_checkpoint(executor, journal, context, event, ddl_event)?;
+        return Ok(true);
+    }
+    if observed != recorded.pre_state {
+        return Err(ApplyBinlogError::DdlBlocked(format!(
+            "legacy JSON alias replay target diverged at {}:{}",
+            ddl_event.binlog_file, ddl_event.event_start_position
+        )));
+    }
+    let fresh = semantic_inventory
+        .capture_evidence(
+            &ddl_event.raw_sql,
+            &ddl_event.binlog_file,
+            ddl_event.event_end_position,
+        )
+        .map_err(ApplyBinlogError::Statement)?;
+    let corrected = corrected_json_alias_sql(&ddl_event.raw_sql, &recorded, &fresh, &replacement)
+        .map_err(ApplyBinlogError::Statement)?;
+    if status == DdlReplayStatus::Prepared {
+        journal
+            .mark_blocked(ddl_event)
+            .map_err(ApplyBinlogError::Statement)?;
+    }
+    executor
+        .execute(&SqlStatement {
+            sql: corrected.clone(),
+            params: Vec::new(),
+        })
+        .map_err(|error| {
+            ApplyBinlogError::Statement(format!(
+                "corrected JSON alias DDL failed at {}:{} target_sql={corrected}: {error}",
+                ddl_event.binlog_file, ddl_event.event_start_position
+            ))
+        })?;
+    #[cfg(feature = "integration-failpoints")]
+    trigger_integration_failpoint(
+        super::super::IntegrationFailpoint::PostDdlPreApplied,
+        "after-ddl-before-journal-applied",
+    );
+    let post = semantic_inventory
+        .observe_target_state(&ddl_event.raw_sql)
+        .map_err(ApplyBinlogError::Statement)?;
+    if post != recorded.expected_post_state {
+        return Err(ApplyBinlogError::DdlBlocked(format!(
+            "corrected JSON alias postcondition differs at {}:{}",
+            ddl_event.binlog_file, ddl_event.event_start_position
+        )));
+    }
+    let updated = DdlSemanticEvidence {
+        transformation_version: replacement.version.into(),
+        generated_sql: Some(corrected),
+        ..recorded
+    };
+    journal
+        .recover_blocked(ddl_event, &updated)
+        .map_err(ApplyBinlogError::Statement)?;
+    finalize_automatic_ddl_checkpoint(executor, journal, context, event, ddl_event)?;
+    Ok(true)
 }
 
 fn verified_blocked_recovery_evidence<J, S>(
@@ -772,4 +928,58 @@ pub(super) fn lock_validate_and_save_checkpoint(
     executor
         .save_transaction_checkpoint(table, checkpoint_name, checkpoint)
         .map_err(|error| ApplyBinlogError::Target(error.to_string()))
+}
+
+#[cfg(test)]
+mod json_alias_retry_tests {
+    use super::*;
+
+    fn recorded() -> DdlSemanticEvidence {
+        DdlSemanticEvidence {
+            transformation_version: DDL_TRANSFORMATION_VERSION.into(),
+            generated_sql: Some("ALTER TABLE `releases_pages_history` ADD COLUMN `source_layout` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL DEFAULT NULL AFTER `comic_asset_id`, ADD CONSTRAINT `source_layout` CHECK (JSON_VALID(`source_layout`))".into()),
+            canonical_ast: "typed-json-add".into(),
+            pre_state: "before".into(),
+            expected_post_state: "after".into(),
+        }
+    }
+
+    #[test]
+    fn json_alias_retry_requires_exact_legacy_sql_and_immutable_semantics() {
+        let raw = include_str!("../../../fixtures/ddl/alter-releases-pages-source-layout.sql")
+            .replace("`releases_pages`", "`releases_pages_history`");
+        let old = recorded();
+        let fresh = old.clone();
+        let replacement = DdlTransformation {
+            version: DDL_TRANSFORMATION_VERSION,
+            target_sql: Some(
+                old.generated_sql
+                    .as_ref()
+                    .unwrap()
+                    .replace(", ADD CONSTRAINT `source_layout` CHECK", ", ADD CHECK"),
+            ),
+        };
+        assert!(corrected_json_alias_sql(&raw, &old, &fresh, &replacement).is_ok());
+        let mut drift = fresh.clone();
+        drift.expected_post_state = "other".into();
+        assert!(corrected_json_alias_sql(&raw, &old, &drift, &replacement).is_err());
+        drift = fresh.clone();
+        drift.pre_state = "other".into();
+        assert!(corrected_json_alias_sql(&raw, &old, &drift, &replacement).is_err());
+        drift = fresh.clone();
+        drift.canonical_ast = "other".into();
+        assert!(corrected_json_alias_sql(&raw, &old, &drift, &replacement).is_err());
+        let mut unrelated = old.clone();
+        unrelated.generated_sql = Some("ALTER TABLE x ADD COLUMN y INT".into());
+        assert!(corrected_json_alias_sql(&raw, &unrelated, &fresh, &replacement).is_err());
+        assert!(
+            corrected_json_alias_sql(
+                &raw.replace("releases_pages_history", "other"),
+                &old,
+                &fresh,
+                &replacement
+            )
+            .is_err()
+        );
+    }
 }
