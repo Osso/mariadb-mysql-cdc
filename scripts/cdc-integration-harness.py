@@ -2463,7 +2463,19 @@ DELIMITER ;
             "ALTER TABLE releases_pages_history "
             "ALTER COLUMN trailing_value SET DEFAULT 8;",
         )
-        drifted = self.run_stream(restart, self.coordinate())
+        process, log = self.start_stream(
+            restart, self.coordinate(), label="divergent-json"
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while "legacy_JSON_alias_replay_target_diverged" not in log.read_text():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise HarnessError(
+                        f"divergent stream did not reject pre-state: {log.read_text()}"
+                    )
+                time.sleep(0.1)
+        finally:
+            self.stop_sync_process(process)
         after = self.journal_full_row(int(blocked["event_start_position"]))
         checkpoint = self.checkpoint()
         column_state = self.admin_query(
@@ -2474,17 +2486,15 @@ DELIMITER ;
             "AND COLUMN_NAME='trailing_value';",
         ).strip()
         if (
-            drifted.returncode == 0
-            or after != blocked
+            after != blocked
             or (checkpoint["source_file"], checkpoint["source_position"])
             != (restart.file, restart.position)
             or column_state != "8"
         ):
             raise HarnessError(
                 "divergent target state was not preserved behind blocked JSON ALTER: "
-                f"returncode={drifted.returncode} journal={after!r} "
-                f"checkpoint={checkpoint!r} default={column_state!r} "
-                f"stream={drifted.stdout}{drifted.stderr}"
+                f"journal={after!r} checkpoint={checkpoint!r} default={column_state!r} "
+                f"stream={log.read_text()}"
             )
         self.admin_sql(
             self.target,
