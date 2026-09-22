@@ -508,6 +508,23 @@ fn plan_legacy_json_alias_recovery<S: DdlSemanticInventory>(
     Ok((updated, true))
 }
 
+fn verify_corrected_json_alias_postcondition<S: DdlSemanticInventory>(
+    semantic_inventory: &S,
+    ddl_event: &DdlEvent,
+    evidence: &DdlSemanticEvidence,
+) -> Result<(), ApplyBinlogError> {
+    let post = semantic_inventory
+        .observe_target_state(&ddl_event.raw_sql)
+        .map_err(ApplyBinlogError::Statement)?;
+    if post != evidence.expected_post_state {
+        return Err(ApplyBinlogError::DdlBlocked(format!(
+            "corrected JSON alias postcondition differs at {}:{}",
+            ddl_event.binlog_file, ddl_event.event_start_position
+        )));
+    }
+    Ok(())
+}
+
 fn execute_corrected_json_alias<E: TransactionalTargetExecutor, S: DdlSemanticInventory>(
     executor: &E,
     semantic_inventory: &S,
@@ -533,16 +550,28 @@ fn execute_corrected_json_alias<E: TransactionalTargetExecutor, S: DdlSemanticIn
         super::super::IntegrationFailpoint::PostDdlPreApplied,
         "after-ddl-before-journal-applied",
     );
-    let post = semantic_inventory
+    verify_corrected_json_alias_postcondition(semantic_inventory, ddl_event, evidence)
+}
+
+fn load_legacy_json_alias_recovery_plan<J: DdlReplayJournal, S: DdlSemanticInventory>(
+    journal: &J,
+    semantic_inventory: &S,
+    ddl_event: &DdlEvent,
+) -> Result<(DdlSemanticEvidence, bool), ApplyBinlogError> {
+    let recorded = read_blocked_evidence(journal, ddl_event)?;
+    let replacement = semantic_inventory
+        .transform_sql(&ddl_event.raw_sql)
+        .map_err(ApplyBinlogError::Statement)?;
+    let observed = semantic_inventory
         .observe_target_state(&ddl_event.raw_sql)
         .map_err(ApplyBinlogError::Statement)?;
-    if post != evidence.expected_post_state {
-        return Err(ApplyBinlogError::DdlBlocked(format!(
-            "corrected JSON alias postcondition differs at {}:{}",
-            ddl_event.binlog_file, ddl_event.event_start_position
-        )));
-    }
-    Ok(())
+    plan_legacy_json_alias_recovery(
+        semantic_inventory,
+        ddl_event,
+        &recorded,
+        &replacement,
+        &observed,
+    )
 }
 
 fn recover_legacy_json_alias<E, R, C, J, S>(
@@ -563,20 +592,8 @@ where
     if !is_failed_source_layout_history_event(&ddl_event.raw_sql) {
         return Ok(false);
     }
-    let recorded = read_blocked_evidence(journal, ddl_event)?;
-    let replacement = semantic_inventory
-        .transform_sql(&ddl_event.raw_sql)
-        .map_err(ApplyBinlogError::Statement)?;
-    let observed = semantic_inventory
-        .observe_target_state(&ddl_event.raw_sql)
-        .map_err(ApplyBinlogError::Statement)?;
-    let (updated, execute) = plan_legacy_json_alias_recovery(
-        semantic_inventory,
-        ddl_event,
-        &recorded,
-        &replacement,
-        &observed,
-    )?;
+    let (updated, execute) =
+        load_legacy_json_alias_recovery_plan(journal, semantic_inventory, ddl_event)?;
     if !execute && status == DdlReplayStatus::Prepared {
         return Ok(false);
     }
