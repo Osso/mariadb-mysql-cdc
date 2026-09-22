@@ -234,10 +234,15 @@ fn render_add_column(column: &ParsedAddColumnAst) -> String {
         }
         Some(value) => value.to_string(),
     };
+    let column_type = if column.data_type == "json" {
+        "longtext"
+    } else {
+        &column.column_type
+    };
     let mut sql = format!(
         "ADD COLUMN {} {}{} {nullability} DEFAULT {default_value}",
         quote_identifier(&column.name),
-        column.column_type.to_ascii_uppercase(),
+        column_type.to_ascii_uppercase(),
         render_column_encoding(column.character_set.as_deref(), column.collation.as_deref()),
     );
     if !column.comment.is_empty() {
@@ -248,6 +253,12 @@ fn render_add_column(column: &ParsedAddColumnAst) -> String {
     }
     if let Some(after) = &column.after {
         sql.push_str(&format!(" AFTER {}", quote_identifier(after)));
+    }
+    if column.data_type == "json" {
+        let name = quote_identifier(&column.name);
+        sql.push_str(&format!(
+            ", ADD CONSTRAINT {name} CHECK (JSON_VALID({name}))"
+        ));
     }
     sql
 }
@@ -2045,6 +2056,11 @@ fn parse_add_column_clause(
     let (character_set, collation, options_start) =
         parse_column_encoding(tokens, quoted_flags, encoding_start, &data_type)?;
     let options = parse_observed_column_options(tokens, options_start, literals, &data_type)?;
+    let (character_set, collation) = if data_type == "json" {
+        (Some("utf8mb4".into()), Some("utf8mb4_bin".into()))
+    } else {
+        (character_set, collation)
+    };
     Ok((
         ParsedAlterClause::AddColumn(ParsedAddColumnAst {
             name,
@@ -2167,6 +2183,7 @@ fn parse_observed_column_type(
             | "varchar"
             | "text"
             | "mediumtext"
+            | "json"
             | "datetime"
             | "timestamp"
             | "tinyint"
@@ -2179,7 +2196,7 @@ fn parse_observed_column_type(
     }
     index += 1;
     let column_type = match data_type.as_str() {
-        "text" | "mediumtext" => {
+        "text" | "mediumtext" | "json" => {
             if tokens.get(index).map(String::as_str) == Some("(") {
                 return Err(format!("{data_type} length is unsupported"));
             }
