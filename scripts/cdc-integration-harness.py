@@ -89,6 +89,7 @@ SCENARIOS = (
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
     ScenarioSpec("spotlight-create-pending-replay", True),
+    ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("commented-drop-column-present-pending-replay", True),
@@ -2122,6 +2123,98 @@ DELIMITER ;
         "best_run_comic_ids_json",
         "hub_snapshot_json",
     )
+
+    def run_spotlight_nullable_varchar_pending_replay(self) -> None:
+        assert self.source and self.target
+        table = "home_feed_mantle_spotlights"
+        schema = f"""
+            CREATE TABLE {table} (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                cta_url VARCHAR(1024) NOT NULL,
+                name VARCHAR(255) NOT NULL DEFAULT 'Untitled',
+                payload LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
+                CONSTRAINT spotlight_payload CHECK (JSON_VALID(payload)),
+                KEY spotlight_name (name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            INSERT INTO {table} VALUES
+                (1,'/update','First','{{"keep": 1}}'),
+                (2,'/original','Original','{{"keep": 2}}');
+        """
+        ddl = (
+            "-- Mantle Spotlight: cta_url is no longer required. A curated spotlight may have nowhere to send\n"
+            "-- the tap; the admin curation surface stopped requiring it, so the column must allow that.\n"
+            "ALTER TABLE `home_feed_mantle_spotlights`\n"
+            "    MODIFY COLUMN `cta_url` VARCHAR(1024) DEFAULT NULL"
+        )
+        start, pending = self.prepare_pending_add_column(schema, ddl, "MODIFY COLUMN")
+        metadata = (
+            "SELECT column_name,column_type,is_nullable,column_default,extra,collation_name "
+            "FROM information_schema.COLUMNS "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name='{table}' "
+            "AND column_name<>'cta_url' ORDER BY ordinal_position;"
+        )
+        indexes = (
+            "SELECT index_name,non_unique,seq_in_index,column_name,sub_part,index_type "
+            "FROM information_schema.STATISTICS "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name='{table}' "
+            "ORDER BY index_name,seq_in_index;"
+        )
+        before = [self.admin_query(self.target, query) for query in (metadata, indexes)]
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET cta_url=NULL WHERE id=1; "
+            f"INSERT INTO {table}(id,cta_url) VALUES(3,NULL),(5,'/new'); "
+            f"INSERT INTO {table}(id) VALUES(4);",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        after = [self.admin_query(self.target, query) for query in (metadata, indexes)]
+        if before != after:
+            raise HarnessError(
+                f"nullable MODIFY changed unrelated metadata: {before!r} != {after!r}"
+            )
+        self.assert_added_column_metadata(
+            table,
+            "cta_url",
+            "cta_url\tvarchar(1024)\tYES\tNULL\t2\tutf8mb4\tutf8mb4_unicode_ci",
+        )
+        query = (
+            f"SELECT id,COALESCE(cta_url,'<null>'),name,payload FROM {table} ORDER BY id;"
+        )
+        source_rows = self.admin_query(self.source, query).strip()
+        target_rows = self.admin_query(self.target, query).strip()
+        expected = "\n".join(
+            [
+                '1\t<null>\tFirst\t{"keep": 1}',
+                '2\t/original\tOriginal\t{"keep": 2}',
+                "3\t<null>\tUntitled\tNULL",
+                "4\t<null>\tUntitled\tNULL",
+                "5\t/new\tUntitled\tNULL",
+            ]
+        )
+        if source_rows != expected or target_rows != expected:
+            raise HarnessError(
+                f"nullable MODIFY row preservation failed: {source_rows!r} / {target_rows!r}"
+            )
+        self.admin_sql(
+            self.target,
+            f"INSERT INTO {table}(id,cta_url) VALUES(6,NULL); INSERT INTO {table}(id) VALUES(7);",
+        )
+        allowed = self.admin_query(
+            self.target,
+            f"SELECT COUNT(*) FROM {table} WHERE id IN (6,7) AND cta_url IS NULL;",
+        ).strip()
+        if allowed != "2":
+            raise HarnessError(f"target nullable/omitted insert failed: {allowed!r}")
+        self.assert_admin_sql_rejected(
+            self.target,
+            f"UPDATE {table} SET payload='invalid json' WHERE id=2;",
+            "Check constraint",
+        )
+        print(
+            "spotlight_nullable_varchar_pending_replay_ok nullable=true historical_collation=true "
+            "unaffected_metadata=true json_check=true existing_values=true post_ddl_rows=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
 
     def run_spotlight_create_pending_replay(self) -> None:
         assert self.source and self.target
@@ -7034,6 +7127,8 @@ DELIMITER ;
             self.run_create_facets_historical_crash_restart()
         elif scenario == "spotlight-create-pending-replay":
             self.run_spotlight_create_pending_replay()
+        elif scenario == "spotlight-nullable-varchar-pending-replay":
+            self.run_spotlight_nullable_varchar_pending_replay()
         elif scenario == "storefront-create-pending-replay":
             self.run_storefront_create_pending_replay()
         elif scenario == "reader-memory-create-pending-replay":
