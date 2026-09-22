@@ -1,5 +1,7 @@
 mod bigint_auto_increment;
 
+mod json_create;
+
 use super::model::ParsedAlterClause;
 use super::transform::{
     DDL_TRANSFORMATION_VERSION, parse_fixture_create_table, parse_production_alter_table_ast,

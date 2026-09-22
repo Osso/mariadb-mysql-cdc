@@ -20,8 +20,20 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
     parser.keyword("(")?;
     let mut columns = Vec::new();
     let mut primary_key = Vec::new();
+    let mut check_constraints = Vec::new();
     while !parser.at_any(&TABLE_DEFINITION_KEYWORDS) {
-        let (column, inline_primary) = parser.column()?;
+        let (mut column, inline_primary) = parser.column()?;
+        if column.column_type == "json" {
+            column.column_type = "longtext".into();
+            column.character_set = Some("utf8mb4".into());
+            column.collation = Some("utf8mb4_bin".into());
+            check_constraints.push(ParsedCheckConstraintAst {
+                name: column.name.clone(),
+                disjuncts: vec![super::super::model::CheckPredicate::JsonValid {
+                    column: column.name.clone(),
+                }],
+            });
+        }
         if inline_primary {
             if !primary_key.is_empty() {
                 return Err("CREATE has more than one PRIMARY KEY".into());
@@ -35,7 +47,6 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
         parser.keyword(",")?;
     }
     let mut indexes = Vec::new();
-    let mut check_constraints = Vec::new();
     while !parser.at(")") {
         if parser.at("PRIMARY") {
             parser.keyword("PRIMARY")?;
@@ -441,7 +452,7 @@ impl Parser {
             }
             return Ok("datetime(6)".into());
         }
-        for kind in ["TEXT", "MEDIUMTEXT"] {
+        for kind in ["TEXT", "MEDIUMTEXT", "JSON"] {
             if self.at(kind) {
                 self.keyword(kind)?;
                 return Ok(kind.to_ascii_lowercase());
