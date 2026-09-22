@@ -83,11 +83,16 @@ foreign key, its explicit supporting index, `ON DELETE CASCADE`, implicit update
 ### Source-layout JSON persisted-pending replay harness
 
 `source-layout-json-pending-replay` requires an explicit `--old-binary` before
-nullable JSON ADD support and is excluded from default scenarios. It replays the
-exact guarded `source_layout` ALTER, promoting an authentic pending row without
-identity change. It proves MariaDB's `LONGTEXT utf8mb4_bin` plus enforced
-`JSON_VALID` alias, column order, SQL NULL distinct from JSON `null`, exact JSON
-text bytes, later DML, invalid-JSON rejection, and a guarded converged no-op.
+nullable JSON ADD support and is excluded from default scenarios. Its optional
+`--failed-binary` exercises the September 22, 2026 legacy generated-SQL failure:
+MariaDB allows the same CHECK name on separate tables, while MySQL requires
+schema-wide uniqueness. The corrected renderer emits an anonymous enforced
+`JSON_VALID` CHECK, whose table-specific name is deliberately not part of the
+semantic contract. The scenario covers pending → prepared → blocked recovery,
+divergent-prestate rejection, post-DDL crash/restart, journal identity, both
+migration tables, alias metadata, SQL NULL distinct from JSON `null`, exact JSON
+bytes, later DML, invalid-JSON rejection, and guarded converged no-ops. This
+document does not claim a completed run or live recovery proof.
 
 ### Exact production ALTER recovery target
 

@@ -31,8 +31,10 @@ Automatic DDL admission currently has these narrow slices:
   `AFTER` options; `CHAR`/`VARCHAR` `NOT NULL DEFAULT '<literal>'`; a TEXT `NOT
   NULL DEFAULT '<literal>'` rendered as the MySQL 8 expression default
   `(_utf8mb4'<literal>')`; nullable JSON is rendered as MariaDB's validated
-  `LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` alias with a named,
-  enforced `JSON_VALID` CHECK rather than native MySQL JSON; `CHAR(n) CHARACTER
+  `LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` alias with an enforced
+  `JSON_VALID` CHECK rather than native MySQL JSON. The CHECK is anonymous in
+  generated MySQL so MySQL assigns a table-specific name; semantic validation
+  matches its exact expression and enforcement, not its generated name. `CHAR(n) CHARACTER
   SET <charset> COLLATE <collation>`;
   named composite `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same
   AST, or `ADD UNIQUE KEY` clauses; `ADD COLUMN IF NOT EXISTS` and `ADD INDEX IF
