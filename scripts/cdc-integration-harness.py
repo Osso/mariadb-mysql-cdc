@@ -89,6 +89,7 @@ SCENARIOS = (
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
     ScenarioSpec("spotlight-create-pending-replay", True),
+    ScenarioSpec("curated-strip-create-pending-replay", True),
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
@@ -162,9 +163,16 @@ def default_scenarios() -> list[str]:
 
 
 class Harness:
-    def __init__(self, repo: Path, binary: Path | None, keep: bool = False):
+    def __init__(
+        self,
+        repo: Path,
+        binary: Path | None,
+        keep: bool = False,
+        old_binary: Path | None = None,
+    ):
         self.repo = repo
         self.binary = binary
+        self.old_binary = old_binary
         self.keep = keep
         self.tempdir = Path(tempfile.mkdtemp(prefix="mariadb-mysql-cdc-harness-"))
         self.containers: list[str] = []
@@ -1782,7 +1790,13 @@ DELIMITER ;
         print(f"strict_secondary_btree_ok coordinate={stop.file}:{stop.position} journal_rows={len(rows)}")
 
     def prepare_pending_add_column(
-        self, schema: str, ddl: str, marker: str = "ADD COLUMN", *, prepared: bool = False
+        self,
+        schema: str,
+        ddl: str,
+        marker: str = "ADD COLUMN",
+        *,
+        prepared: bool = False,
+        old_binary: Path | None = None,
     ) -> tuple[Coordinate, dict[str, str]]:
         assert self.source and self.target
         if schema:
@@ -1836,6 +1850,30 @@ DELIMITER ;
         if info != f"use `{APP_SCHEMA}`; {ddl}":
             raise HarnessError(f"source failed to preserve ordinary comment: {info!r}")
         identity = f"{SOURCE_IDENTITY}#server-id={server_id}"
+        if old_binary is not None:
+            result = run(
+                self._stream_args(old_binary, start, self.coordinate(), None, 0),
+                env={
+                    **os.environ,
+                    "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
+                    "CDC_TARGET_PASSWORD": LIVE_TARGET_PASSWORD,
+                },
+                timeout=90,
+                check=False,
+            )
+            require_translation_pending_termination(result)
+            pending = self.journal_full_row()
+            checkpoint = self.checkpoint()
+            if (
+                pending["status"] != "translation_pending"
+                or pending["raw_sql"] != ddl
+                or checkpoint["source_file"] != start.file
+                or checkpoint["source_position"] != start.position
+            ):
+                raise HarnessError(
+                    f"old binary did not preserve pending barrier: {pending!r} {checkpoint!r}"
+                )
+            return start, pending
         # Reproduce the durable translator-unavailable state left by the old binary.
         self.admin_sql(
             self.target,
@@ -2220,6 +2258,88 @@ DELIMITER ;
         print(
             "spotlight_nullable_varchar_pending_replay_ok nullable=true historical_collation=true "
             "unaffected_metadata=true json_check=true existing_values=true post_ddl_rows=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def run_curated_strip_create_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError(
+                "curated-strip replay requires --old-binary predating decimal defaults"
+            )
+        table = "home_feed_curated_strips"
+        ddl = (
+            (self.repo / "fixtures/ddl/create-home-feed-curated-strips.sql")
+            .read_text()
+            .strip()
+        )
+        self.admin_sql(
+            self.target, f"ALTER DATABASE {APP_SCHEMA} COLLATE utf8mb4_0900_ai_ci;"
+        )
+        start, pending = self.prepare_pending_add_column(
+            "", ddl, "CREATE TABLE", prepared=True, old_binary=self.old_binary
+        )
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='{table}';",
+        ).strip()
+        if absent != "0":
+            raise HarnessError("old binary created target table before translation")
+        required = "name,title,start_time,end_time"
+        values = "'curated','Daily strip','2026-09-01','2026-10-01'"
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table}(id,{required}) VALUES(4294967297,{values}); "
+            f"INSERT INTO {table}({required},aspect_ratio) VALUES({values},1.250); "
+            f"UPDATE {table} SET aspect_ratio=0.875,title='Updated' WHERE id=4294967298;",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        query = f"SELECT * FROM {table} ORDER BY id;"
+        source_rows = self.admin_query(self.source, query)
+        target_rows = self.admin_query(self.target, query)
+        if source_rows != target_rows:
+            raise HarnessError(
+                f"curated rows differ: {source_rows!r} != {target_rows!r}"
+            )
+        ratios = self.admin_query(
+            self.target, f"SELECT id,aspect_ratio FROM {table} ORDER BY id;"
+        ).strip()
+        if ratios != "4294967297\t0.650\n4294967298\t0.875":
+            raise HarnessError(f"curated decimal values differ: {ratios!r}")
+        where = f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='{table}'"
+        metadata = self.admin_query(
+            self.target,
+            "SELECT COLUMN_TYPE,NUMERIC_PRECISION,NUMERIC_SCALE,IS_NULLABLE,COLUMN_DEFAULT "
+            f"FROM information_schema.COLUMNS WHERE {where} AND COLUMN_NAME='aspect_ratio';",
+        ).strip()
+        if metadata != "decimal(4,3)\t4\t3\tNO\t0.650":
+            raise HarnessError(f"curated decimal metadata differs: {metadata!r}")
+        for query in [
+            "SELECT COLUMN_NAME,DATA_TYPE,IS_NULLABLE,ORDINAL_POSITION "
+            f"FROM information_schema.COLUMNS WHERE {where} ORDER BY ORDINAL_POSITION;",
+            "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME "
+            f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;",
+            f"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE {where};",
+        ]:
+            if self.admin_query(self.source, query) != self.admin_query(
+                self.target, query
+            ):
+                raise HarnessError(f"curated schema differs for query: {query}")
+        self.admin_sql(
+            self.target, f"INSERT INTO {table}({required}) VALUES({values});"
+        )
+        target_default = self.admin_query(
+            self.target, f"SELECT aspect_ratio FROM {table} WHERE id=4294967299;"
+        ).strip()
+        if target_default != "0.650":
+            raise HarnessError(
+                f"target omitted decimal default differs: {target_default!r}"
+            )
+        print(
+            "curated_strip_create_pending_replay_ok old_binary_pending=true "
+            "immutable_identity=true decimal_default=true target_default_insert=true "
+            "post_ddl_rows=true schema=true "
             f"coordinate={stop.file}:{stop.position}"
         )
 
@@ -7132,6 +7252,8 @@ DELIMITER ;
             self.run_add_signed_tinyint_pending_replay()
         elif scenario == "create-facets-historical-crash-restart":
             self.run_create_facets_historical_crash_restart()
+        elif scenario == "curated-strip-create-pending-replay":
+            self.run_curated_strip_create_pending_replay()
         elif scenario == "spotlight-create-pending-replay":
             self.run_spotlight_create_pending_replay()
         elif scenario == "spotlight-nullable-varchar-pending-replay":
@@ -7364,6 +7486,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list", action="store_true", help="list scenarios with executable/prerequisite status")
     parser.add_argument("--scenario", action="append", choices=tuple(SCENARIO_BY_NAME), help="run one scenario")
     parser.add_argument("--binary", type=Path, help="path to the built mariadb-mysql-cdc binary")
+    parser.add_argument(
+        "--old-binary",
+        type=Path,
+        help="previous CDC binary for authentic pending-barrier replay",
+    )
     parser.add_argument("--keep", action="store_true", help="keep temporary containers/files for diagnosis")
     return parser.parse_args()
 
@@ -7382,7 +7509,7 @@ def main() -> int:
     try:
         for scenario in scenarios:
             print(f"scenario_start name={scenario}")
-            with Harness(repo, args.binary, args.keep) as harness:
+            with Harness(repo, args.binary, args.keep, args.old_binary) as harness:
                 harness.run_scenario(scenario)
             print(f"scenario_pass name={scenario}")
     except HarnessSkip as skip:
