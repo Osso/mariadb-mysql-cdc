@@ -1782,7 +1782,7 @@ DELIMITER ;
         print(f"strict_secondary_btree_ok coordinate={stop.file}:{stop.position} journal_rows={len(rows)}")
 
     def prepare_pending_add_column(
-        self, schema: str, ddl: str, marker: str = "ADD COLUMN"
+        self, schema: str, ddl: str, marker: str = "ADD COLUMN", *, prepared: bool = False
     ) -> tuple[Coordinate, dict[str, str]]:
         assert self.source and self.target
         if schema:
@@ -1805,7 +1805,12 @@ DELIMITER ;
                 "--comments",
                 "--batch",
             ],
-            input_text=ddl + ";",
+            input_text=(
+                f"PREPARE harness_ddl FROM {sql_literal(ddl)}; "
+                "EXECUTE harness_ddl; DEALLOCATE PREPARE harness_ddl;"
+                if prepared
+                else ddl + ";"
+            ),
         )
         events = self.admin_query(
             self.source,
@@ -2146,7 +2151,9 @@ DELIMITER ;
             "ALTER TABLE `home_feed_mantle_spotlights`\n"
             "    MODIFY COLUMN `cta_url` VARCHAR(1024) DEFAULT NULL"
         )
-        start, pending = self.prepare_pending_add_column(schema, ddl, "MODIFY COLUMN")
+        start, pending = self.prepare_pending_add_column(
+            schema, ddl, "MODIFY COLUMN", prepared=True
+        )
         metadata = (
             "SELECT column_name,column_type,is_nullable,column_default,extra,collation_name "
             "FROM information_schema.COLUMNS "
