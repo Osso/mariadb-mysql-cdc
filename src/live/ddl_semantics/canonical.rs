@@ -63,8 +63,51 @@ pub(crate) fn build_resolved_create_table_evidence(
         generated_sql: transformation.target_sql,
         canonical_ast,
         pre_state,
-        expected_post_state: expected_create_table_post_state(ast, defaults)?,
+        expected_post_state: expected_create_table_post_state(
+            ast,
+            defaults,
+            &target.inventory.schema,
+        )?,
     })
+}
+
+pub(crate) fn validate_create_foreign_keys(
+    ast: &ParsedCreateTableAst,
+    target_schema: &str,
+    observed: &[crate::canonical_foreign_key::CanonicalForeignKey],
+) -> Result<(), String> {
+    let mut expected = ast
+        .foreign_keys
+        .iter()
+        .map(|key| crate::canonical_foreign_key::CanonicalForeignKey {
+            constraint_schema: target_schema.into(),
+            constraint_name: key.name.clone(),
+            child_schema: target_schema.into(),
+            child_table: ast.name.clone(),
+            child_columns: key.columns.clone(),
+            parent_schema: target_schema.into(),
+            parent_table: key.referenced_table.clone(),
+            parent_columns: key.referenced_columns.clone(),
+            update_rule: "RESTRICT".into(),
+            delete_rule: "CASCADE".into(),
+            match_option: "NONE".into(),
+            enforced: true,
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    let mut actual = observed
+        .iter()
+        .filter(|key| key.child_table == ast.name)
+        .cloned()
+        .collect::<Vec<_>>();
+    actual.sort();
+    if actual != expected {
+        return Err(format!(
+            "CREATE foreign-key definitions or actions differ for `{}`",
+            ast.name
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn explicit_create_table_defaults(
@@ -319,6 +362,7 @@ fn canonical_index_state(
 pub(crate) fn expected_create_table_post_state(
     ast: &ParsedCreateTableAst,
     defaults: &crate::inventory::SchemaDefaults,
+    target_schema: &str,
 ) -> Result<String, String> {
     let table = crate::inventory::TableInventory {
         name: ast.name.clone(),
@@ -396,12 +440,25 @@ pub(crate) fn expected_create_table_post_state(
         })
         .collect::<Vec<_>>();
     indexes.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut foreign_keys = ast
+        .foreign_keys
+        .iter()
+        .map(|key| crate::inventory::ForeignKeyInventory {
+            table: ast.name.clone(),
+            name: key.name.clone(),
+            columns: key.columns.clone(),
+            referenced_schema: target_schema.to_string(),
+            referenced_table: key.referenced_table.clone(),
+            referenced_columns: key.referenced_columns.clone(),
+        })
+        .collect::<Vec<_>>();
+    foreign_keys.sort_by(|left, right| left.name.cmp(&right.name));
     serde_json::to_string(&json!({
         "kind": "table",
         "name": ast.name,
         "definition": table,
         "indexes": indexes,
-        "foreign_keys": [],
+        "foreign_keys": foreign_keys,
     }))
     .map_err(|error| format!("failed to encode expected CREATE TABLE state: {error}"))
 }
@@ -492,6 +549,21 @@ fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::V
         "character_set": ast.character_set,
         "collation": ast.collation,
     });
+    if !ast.foreign_keys.is_empty() {
+        value["foreign_keys"] = json!(
+            ast.foreign_keys
+                .iter()
+                .map(|key| json!({
+                    "name": key.name,
+                    "columns": key.columns,
+                    "referenced_table": key.referenced_table,
+                    "referenced_columns": key.referenced_columns,
+                    "delete_rule": "CASCADE",
+                    "update_rule": "RESTRICT",
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
     if !ast.check_constraints.is_empty() {
         value["check_constraints"] = json!(
             ast.check_constraints

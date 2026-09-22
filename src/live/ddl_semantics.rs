@@ -442,6 +442,9 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         let before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
         let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
         validate_target_snapshot_consistency(&before, &after)?;
+        if let Some(ast) = operation.create_table_ast.as_ref() {
+            self.validate_observed_create_foreign_keys(ast, &before)?;
+        }
         observe_operation_state(&before, &operation)
     }
 
@@ -454,7 +457,30 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         let defaults = canonical::explicit_create_table_defaults(ast).ok_or_else(|| {
             "blocked recovery requires explicit CREATE TABLE defaults".to_string()
         })?;
-        canonical::expected_create_table_post_state(ast, &defaults)
+        canonical::expected_create_table_post_state(ast, &defaults, &self.target_schema)
+    }
+}
+
+impl LiveDdlSemanticInventory {
+    fn validate_observed_create_foreign_keys(
+        &self,
+        ast: &model::ParsedCreateTableAst,
+        snapshot: &SemanticSchemaSnapshot,
+    ) -> Result<(), String> {
+        let exists = snapshot
+            .inventory
+            .tables
+            .iter()
+            .any(|table| table.name == ast.name);
+        if ast.foreign_keys.is_empty() || !exists {
+            return Ok(());
+        }
+        let keys = crate::inventory::build_canonical_foreign_key_inventory(
+            &self.target_schema,
+            &self.target,
+        )
+        .map_err(|error| format!("failed to read CREATE foreign-key actions: {error}"))?;
+        canonical::validate_create_foreign_keys(ast, &self.target_schema, &keys)
     }
 }
 
