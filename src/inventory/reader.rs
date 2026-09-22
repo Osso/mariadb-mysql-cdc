@@ -110,6 +110,7 @@ pub(crate) enum InventoryQueryStage {
     Indexes,
     ForeignKeys,
     CanonicalForeignKeys,
+    CheckConstraints,
     Views,
     Triggers,
     Routines,
@@ -129,6 +130,7 @@ impl InventoryQueryStage {
             Self::Indexes => "indexes",
             Self::ForeignKeys => "foreign_keys",
             Self::CanonicalForeignKeys => "canonical_foreign_keys",
+            Self::CheckConstraints => "check_constraints",
             Self::Views => "views",
             Self::Triggers => "triggers",
             Self::Routines => "routines",
@@ -361,6 +363,33 @@ impl MariaDbInventoryReader {
         if expired {
             self.conn.replace(None);
         }
+    }
+
+    pub(crate) fn read_table_check_constraints(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<(String, String, bool)>, InventoryError> {
+        let rows = self.query_rows(
+            InventoryQueryStage::CheckConstraints,
+            schema,
+            &format!(
+                "SELECT tc.CONSTRAINT_NAME, cc.CHECK_CLAUSE, tc.ENFORCED FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA={} AND tc.TABLE_NAME={} AND tc.CONSTRAINT_TYPE='CHECK' ORDER BY tc.CONSTRAINT_NAME",
+                crate::mysql_support::quote_sql_literal(schema),
+                crate::mysql_support::quote_sql_literal(table),
+            ),
+        )?;
+        rows.into_iter()
+            .map(|row| {
+                let [name, clause, enforced] = row.as_slice() else {
+                    return Err(InventoryError::new("malformed table CHECK metadata"));
+                };
+                match enforced.as_str() {
+                    "YES" | "NO" => Ok((name.clone(), clause.clone(), enforced == "YES")),
+                    _ => Err(InventoryError::new("unknown table CHECK enforcement value")),
+                }
+            })
+            .collect()
     }
 
     pub fn read_schema_defaults(&self, schema: &str) -> Result<SchemaDefaults, InventoryError> {

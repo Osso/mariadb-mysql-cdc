@@ -445,6 +445,9 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         if let Some(ast) = operation.create_table_ast.as_ref() {
             self.validate_observed_create_foreign_keys(ast, &before)?;
         }
+        if let Some(ast) = operation.alter_table_ast.as_ref() {
+            self.validate_observed_json_alias_checks(ast, &before)?;
+        }
         observe_operation_state(&before, &operation)
     }
 
@@ -462,6 +465,52 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
 }
 
 impl LiveDdlSemanticInventory {
+    fn validate_observed_json_alias_checks(
+        &self,
+        ast: &model::ParsedAlterTableAst,
+        snapshot: &SemanticSchemaSnapshot,
+    ) -> Result<(), String> {
+        let Some(table) = snapshot
+            .inventory
+            .tables
+            .iter()
+            .find(|table| table.name == ast.table)
+        else {
+            return Ok(());
+        };
+        let columns = ast
+            .clauses
+            .iter()
+            .filter_map(|clause| match clause {
+                model::ParsedAlterClause::AddColumn(column)
+                    if column.data_type == "json"
+                        && table
+                            .columns
+                            .iter()
+                            .any(|existing| existing.name == column.name) =>
+                {
+                    Some(column)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let before = self
+            .target
+            .read_table_check_constraints(&self.target_schema, &ast.table)
+            .map_err(|error| format!("failed to read JSON alias CHECK constraints: {error}"))?;
+        let after = self
+            .target
+            .read_table_check_constraints(&self.target_schema, &ast.table)
+            .map_err(|error| format!("failed to reread JSON alias CHECK constraints: {error}"))?;
+        if before != after {
+            return Err("JSON alias CHECK constraints changed during observation".into());
+        }
+        canonical::validate_json_alias_checks(&columns, &before)
+    }
+
     fn validate_observed_create_foreign_keys(
         &self,
         ast: &model::ParsedCreateTableAst,

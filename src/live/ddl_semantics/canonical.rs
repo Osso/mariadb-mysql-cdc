@@ -869,11 +869,16 @@ fn expected_added_column(
     };
     let (default_value, extra) =
         expected_added_column_default(&column.data_type, column.default_value.as_deref());
+    let (column_type, data_type) = if column.data_type == "json" {
+        ("longtext".to_string(), "longtext".to_string())
+    } else {
+        (column.column_type.clone(), column.data_type.clone())
+    };
     Ok(crate::inventory::ColumnInventory {
         name: column.name.clone(),
         ordinal_position: (insertion + 1) as u32,
-        column_type: column.column_type.clone(),
-        data_type: column.data_type.clone(),
+        column_type,
+        data_type,
         is_nullable: column.nullable,
         character_set,
         collation,
@@ -882,6 +887,134 @@ fn expected_added_column(
         comment: column.comment.clone(),
         generated: None,
     })
+}
+
+pub(crate) fn validate_json_alias_checks(
+    columns: &[&ParsedAddColumnAst],
+    checks: &[(String, String, bool)],
+) -> Result<(), String> {
+    for column in columns {
+        let valid = checks.iter().any(|(name, clause, enforced)| {
+            name == &column.name && *enforced && json_valid_check_matches(clause, &column.name)
+        });
+        if !valid {
+            return Err(format!(
+                "JSON alias `{}` lacks its enforced JSON_VALID CHECK",
+                column.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn json_valid_check_matches(clause: &str, column: &str) -> bool {
+    let Ok((tokens, quoted)) = super::tokenizer::tokenize_ddl_with_quoted_flags(clause) else {
+        return false;
+    };
+    let (tokens, quoted) = strip_check_parentheses(&tokens, &quoted);
+    if tokens.len() < 4 || quoted[0] || !tokens[0].eq_ignore_ascii_case("JSON_VALID") {
+        return false;
+    }
+    if tokens[1] != "("
+        || quoted[1]
+        || tokens.last().map(String::as_str) != Some(")")
+        || quoted[tokens.len() - 1]
+    {
+        return false;
+    }
+    let (argument, _) =
+        strip_check_parentheses(&tokens[2..tokens.len() - 1], &quoted[2..quoted.len() - 1]);
+    argument.len() == 1 && argument[0].eq_ignore_ascii_case(column)
+}
+
+fn strip_check_parentheses<'a>(
+    mut tokens: &'a [String],
+    mut quoted: &'a [bool],
+) -> (&'a [String], &'a [bool]) {
+    while check_has_outer_parentheses(tokens, quoted) {
+        tokens = &tokens[1..tokens.len() - 1];
+        quoted = &quoted[1..quoted.len() - 1];
+    }
+    (tokens, quoted)
+}
+
+fn check_has_outer_parentheses(tokens: &[String], quoted: &[bool]) -> bool {
+    if tokens.len() < 2 || tokens[0] != "(" || quoted[0] {
+        return false;
+    }
+    let mut depth = 0_i32;
+    for (index, (token, quoted)) in tokens.iter().zip(quoted).enumerate() {
+        if !quoted {
+            match token.as_str() {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth <= 0 {
+            return depth == 0 && index == tokens.len() - 1;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod json_alias_check_tests {
+    use super::*;
+
+    #[test]
+    fn json_alias_check_requires_exact_column_and_enforcement() {
+        for clause in [
+            "json_valid(`source_layout`)",
+            "((JSON_VALID((`source_layout`))))",
+        ] {
+            assert!(json_valid_check_matches(clause, "source_layout"));
+        }
+        for clause in [
+            "JSON_VALID(other)",
+            "JSON_VALID(source_layout) OR 1",
+            "JSON_VALID('source_layout')",
+            "`JSON_VALID`(source_layout)",
+            "(JSON_VALID(source_layout)) OR (1)",
+        ] {
+            assert!(!json_valid_check_matches(clause, "source_layout"));
+        }
+        let column = ParsedAddColumnAst {
+            name: "source_layout".into(),
+            if_not_exists: true,
+            column_type: "json".into(),
+            data_type: "json".into(),
+            nullable: true,
+            default_value: None,
+            comment: String::new(),
+            after: None,
+            character_set: Some("utf8mb4".into()),
+            collation: Some("utf8mb4_bin".into()),
+        };
+        assert!(validate_json_alias_checks(&[&column], &[]).is_err());
+        assert!(
+            validate_json_alias_checks(
+                &[&column],
+                &[(
+                    "source_layout".into(),
+                    "JSON_VALID(source_layout)".into(),
+                    false
+                )]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_json_alias_checks(
+                &[&column],
+                &[(
+                    "source_layout".into(),
+                    "JSON_VALID(source_layout)".into(),
+                    true
+                )]
+            )
+            .is_ok()
+        );
+    }
 }
 
 fn column_default_encoding(
