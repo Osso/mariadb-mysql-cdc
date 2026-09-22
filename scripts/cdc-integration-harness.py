@@ -182,10 +182,12 @@ class Harness:
         binary: Path | None,
         keep: bool = False,
         old_binary: Path | None = None,
+        failed_binary: Path | None = None,
     ):
         self.repo = repo
         self.binary = binary
         self.old_binary = old_binary
+        self.failed_binary = failed_binary
         self.keep = keep
         self.tempdir = Path(tempfile.mkdtemp(prefix="mariadb-mysql-cdc-harness-"))
         self.containers: list[str] = []
@@ -699,8 +701,9 @@ class Harness:
         integration_failpoint: str | None = None,
         max_reconnects: int = 0,
         barrier_dir: Path | None = None,
+        binary: Path | None = None,
     ) -> CommandResult:
-        binary = self._stream_binary(integration_failpoint)
+        binary = binary or self._stream_binary(integration_failpoint)
         env = {
             **os.environ,
             "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
@@ -2366,11 +2369,100 @@ DELIMITER ;
             f"coordinate={stop.file}:{stop.position}"
         )
 
+    def assert_failed_source_layout_history_replay(
+        self, start: Coordinate, pending: dict[str, str], history_ddl: str
+    ) -> tuple[Coordinate, dict[str, str]]:
+        assert self.target and self.failed_binary
+        stop = self.coordinate()
+        failed = self.run_stream(start, stop, binary=self.failed_binary)
+        output = f"{failed.stdout}\n{failed.stderr}"
+        if (
+            failed.returncode == 0
+            or "ERROR 3822" not in output
+            or "Duplicate check constraint name" not in output
+        ):
+            raise HarnessError(
+                f"old JSON translator did not hit second-table CHECK collision: {output}"
+            )
+        first = self.journal_full_row(int(pending["event_start_position"]))
+        for field in (
+            "source_identity",
+            "source_server_id",
+            "binlog_file",
+            "event_start_position",
+            "event_end_position",
+            "schema_name",
+            "raw_sql",
+            "created_at",
+        ):
+            if first[field] != pending[field]:
+                raise HarnessError(
+                    f"failed translator changed first journal identity {field}: {first!r}"
+                )
+        if first["status"] != "checkpointed":
+            raise HarnessError(f"first JSON ALTER did not checkpoint: {first!r}")
+        second_position = self.admin_query(
+            self.target,
+            "SELECT event_start_position FROM cdc.ddl_replay_journal "
+            f"WHERE raw_sql={sql_literal(history_ddl)};",
+        ).strip()
+        if not second_position.isdigit():
+            raise HarnessError(
+                f"second JSON ALTER journal missing: {second_position!r}"
+            )
+        second = self.journal_full_row(int(second_position))
+        if second["status"] != "prepared" or second["raw_sql"] != history_ddl:
+            raise HarnessError(
+                f"failed translator did not preserve second prepared row: {second!r}"
+            )
+        checkpoint = self.checkpoint()
+        if (checkpoint["source_file"], checkpoint["source_position"]) != (
+            first["binlog_file"],
+            int(first["event_end_position"]),
+        ):
+            raise HarnessError(
+                f"second ALTER failure advanced checkpoint: {checkpoint!r}"
+            )
+        restart = Coordinate(checkpoint["source_file"], checkpoint["source_position"])
+        failed_restart = self.run_stream(restart, stop, binary=self.failed_binary)
+        restart_output = f"{failed_restart.stdout}\n{failed_restart.stderr}"
+        if (
+            failed_restart.returncode == 0
+            or "blocked recovery requires modeled CREATE TABLE" not in restart_output
+        ):
+            raise HarnessError(
+                f"old translator restart did not fail closed at prepared ALTER: {restart_output}"
+            )
+        blocked = self.journal_full_row(int(second_position))
+        for field in (
+            "source_identity",
+            "source_server_id",
+            "binlog_file",
+            "event_start_position",
+            "event_end_position",
+            "schema_name",
+            "raw_sql",
+            "created_at",
+        ):
+            if blocked[field] != second[field]:
+                raise HarnessError(
+                    f"old restart changed second journal identity {field}: {blocked!r}"
+                )
+        if blocked["status"] != "blocked" or self.checkpoint() != checkpoint:
+            raise HarnessError(
+                f"old restart did not leave blocked journal and checkpoint: {blocked!r}"
+            )
+        return restart, blocked
+
     def run_source_layout_json_pending_replay(self) -> None:
         assert self.source and self.target
         if self.old_binary is None or not self.old_binary.is_file():
             raise HarnessError(
                 "source-layout replay requires --old-binary predating JSON ADD"
+            )
+        if self.failed_binary is not None and not self.failed_binary.is_file():
+            raise HarnessError(
+                "--failed-binary must be an existing JSON translator executable"
             )
         ddl = (
             (self.repo / "fixtures/ddl/alter-releases-pages-source-layout.sql")
@@ -2407,7 +2499,18 @@ DELIMITER ;
                 f"(3,11,102,{value}),(4,11,103,'null'); "
                 f"INSERT INTO {table}(id,release_id,comic_asset_id) VALUES(5,11,104);",
             )
-        stop = self.replay_pending_add_column(start, pending)
+        if self.failed_binary is None:
+            stop = self.replay_pending_add_column(start, pending)
+        else:
+            restart, blocked = self.assert_failed_source_layout_history_replay(
+                start, pending, history_ddl
+            )
+            stop = self.replay_pending_add_column(restart, blocked)
+            first = self.journal_full_row(int(pending["event_start_position"]))
+            if first["status"] != "checkpointed":
+                raise HarnessError(
+                    f"fixed translator changed first checkpointed event: {first!r}"
+                )
         self.assert_source_layout_json_schema()
         self.assert_source_layout_json_schema("releases_pages_history")
         initial = "1\t10\t100\tNULL\t7\n2\t10\t101\tNULL\t9"
@@ -2470,6 +2573,7 @@ DELIMITER ;
             "source_layout_json_pending_replay_ok old_binary_pending=true immutable_identity=true "
             "existing_nulls=true json_text_preserved=true sql_json_null_distinct=true "
             "invalid_json_rejected=true guarded_noop=true both_migration_tables=true post_ddl_rows=true "
+            f"failed_binary_restart={self.failed_binary is not None} "
             f"coordinate={second_stop.file}:{second_stop.position}"
         )
 
@@ -2535,15 +2639,19 @@ DELIMITER ;
             )
             checks = self.admin_query(
                 endpoint,
-                "SELECT cc.CHECK_CLAUSE FROM information_schema.TABLE_CONSTRAINTS tc "
+                "SELECT tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE,tc.ENFORCED FROM information_schema.TABLE_CONSTRAINTS tc "
                 "JOIN information_schema.CHECK_CONSTRAINTS cc "
                 "ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME "
                 f"WHERE tc.TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND tc.TABLE_NAME={sql_literal(table)} "
                 f"{table_filter}AND tc.CONSTRAINT_TYPE='CHECK';",
             ).strip()
-            normalized = re.sub(r"[\s`()]+", "", checks).lower()
-            if normalized != "json_validsource_layout":
-                raise HarnessError(f"JSON validity CHECK differs: {checks!r}")
+            rows = [line.split("\t") for line in checks.splitlines() if line.strip()]
+            if len(rows) != 1 or len(rows[0]) != 3:
+                raise HarnessError(f"expected one JSON validity CHECK: {checks!r}")
+            name, clause, enforced = rows[0]
+            normalized = re.sub(r"[\s`()]+", "", clause).lower()
+            if not name or normalized != "json_validsource_layout" or enforced != "YES":
+                raise HarnessError(f"JSON validity CHECK differs or is unenforced: {checks!r}")
 
     def run_curated_strip_slides_create_pending_replay(self) -> None:
         assert self.source and self.target
@@ -7764,7 +7872,9 @@ def require_success(result: CommandResult, operation: str) -> None:
 def require_translation_pending_termination(result: CommandResult) -> None:
     output = f"{result.stdout}\n{result.stderr}".lower()
     if result.returncode == 0:
-        raise HarnessError("bounded stream returned success without translation-pending block")
+        raise HarnessError(
+            "bounded stream returned success without translation-pending block"
+        )
     if "translator unavailable" not in output:
         raise HarnessError(
             "unsupported DDL did not terminate at the translation-pending boundary:\n"
@@ -7803,7 +7913,9 @@ def run(
             f"command timed out: {' '.join(argv)}\n"
             f"stdout={error.stdout!r}\nstderr={error.stderr!r}"
         ) from error
-    result = CommandResult(argv, completed.returncode, completed.stdout, completed.stderr)
+    result = CommandResult(
+        argv, completed.returncode, completed.stdout, completed.stderr
+    )
     if check and result.returncode:
         raise HarnessError(
             f"command failed ({result.returncode}): {' '.join(argv)}\n"
@@ -7821,6 +7933,10 @@ def parse_args() -> argparse.Namespace:
         "--old-binary",
         type=Path,
         help="previous CDC binary for authentic pending-barrier replay",
+    )
+    parser.add_argument(
+        "--failed-binary", type=Path,
+        help="intermediate JSON translator that persisted a failed second-table ALTER",
     )
     parser.add_argument("--keep", action="store_true", help="keep temporary containers/files for diagnosis")
     return parser.parse_args()
@@ -7840,7 +7956,7 @@ def main() -> int:
     try:
         for scenario in scenarios:
             print(f"scenario_start name={scenario}")
-            with Harness(repo, args.binary, args.keep, args.old_binary) as harness:
+            with Harness(repo, args.binary, args.keep, args.old_binary, args.failed_binary) as harness:
                 harness.run_scenario(scenario)
             print(f"scenario_pass name={scenario}")
     except HarnessSkip as skip:
