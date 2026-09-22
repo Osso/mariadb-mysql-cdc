@@ -2713,12 +2713,11 @@ DELIMITER ;
             if indexes != "PRIMARY\t0\t1\tid":
                 raise HarnessError(f"JSON ADD changed table indexes: {indexes!r}")
             # MariaDB permits identical CHECK names on different tables.
+            source_endpoint = endpoint.port == self.source.port
             table_filter = (
-                f"AND cc.TABLE_NAME={sql_literal(table)} "
-                if endpoint == self.source
-                else ""
+                f"AND cc.TABLE_NAME={sql_literal(table)} " if source_endpoint else ""
             )
-            enforced = "'YES'" if endpoint == self.source else "tc.ENFORCED"
+            enforced = "'YES'" if source_endpoint else "tc.ENFORCED"
             checks = self.admin_query(
                 endpoint,
                 f"SELECT tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE,{enforced} FROM information_schema.TABLE_CONSTRAINTS tc "
