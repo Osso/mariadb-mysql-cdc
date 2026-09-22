@@ -1712,6 +1712,7 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
         primary_key: vec!["id".into()],
         indexes: Vec::new(),
         check_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
         engine: "InnoDB".into(),
         character_set: Some("utf8mb4".into()),
         collation: Some("utf8mb4_unicode_ci".into()),
@@ -1743,7 +1744,7 @@ fn create_enum_labels_retain_case_in_expected_inventory() {
         collation: "utf8mb4_unicode_ci".into(),
     };
     let state: serde_json::Value = serde_json::from_str(
-        &super::canonical::expected_create_table_post_state(&ast, &defaults)
+        &super::canonical::expected_create_table_post_state(&ast, &defaults, "globalcomix")
             .expect("expected state"),
     )
     .expect("state JSON");
@@ -1773,7 +1774,7 @@ fn create_timestamp_on_update_does_not_require_generated_default() {
         collation: "utf8mb4_unicode_ci".into(),
     };
     let state: serde_json::Value = serde_json::from_str(
-        &super::canonical::expected_create_table_post_state(&ast, &defaults)
+        &super::canonical::expected_create_table_post_state(&ast, &defaults, "globalcomix")
             .expect("expected state"),
     )
     .expect("state JSON");

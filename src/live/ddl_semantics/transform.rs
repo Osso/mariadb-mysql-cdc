@@ -368,6 +368,7 @@ pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableA
         primary_key,
         indexes,
         check_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
         engine: "InnoDB".to_string(),
         character_set: None,
         collation: None,
@@ -396,6 +397,7 @@ fn parse_home_feed_artist_blacklist_create(
         primary_key: vec!["id".to_string()],
         indexes: vec![home_feed_artist_blacklist_index()],
         check_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
         engine: "InnoDB".to_string(),
         character_set: Some("utf8mb4".to_string()),
         collation: Some("utf8mb4_unicode_ci".to_string()),
@@ -1442,6 +1444,7 @@ fn transform_fixture_create_table_ast(
             .iter()
             .map(check_constraint::render_check_constraint),
     );
+    definitions.extend(ast.foreign_keys.iter().map(render_create_foreign_key));
     let schema_defaults = render_create_schema_defaults(ast, defaults);
     Ok(DdlTransformation {
         version: DDL_TRANSFORMATION_VERSION,
@@ -1480,6 +1483,26 @@ fn render_create_column(column: &ParsedCreateColumnAst) -> String {
     format!(
         "{} {column_type}{encoding} {nullability}{default}{on_update}{auto_increment}",
         quote_identifier(&column.name),
+    )
+}
+
+fn render_create_foreign_key(key: &super::model::ParsedCreateForeignKeyAst) -> String {
+    let columns = key
+        .columns
+        .iter()
+        .map(|name| quote_identifier(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let referenced = key
+        .referenced_columns
+        .iter()
+        .map(|name| quote_identifier(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {} ({referenced}) ON DELETE CASCADE",
+        quote_identifier(&key.name),
+        quote_identifier(&key.referenced_table)
     )
 }
 

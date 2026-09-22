@@ -118,6 +118,9 @@ broader DDL coverage and operational proof gaps listed below.
       and `TINYINT UNSIGNED`; canonical `VARCHAR(n)`; exactly `DECIMAL(4,3)`;
       unquoted nonnegative `DECIMAL(4,3)` defaults with one integer digit and
       exactly three fractional digits, preserved without floating-point conversion;
+      named single-column same-schema foreign keys with `ON DELETE CASCADE`
+      and implicit update restriction, requiring an explicit supporting index;
+      observed foreign-key identity and referential actions must match before checkpointing;
       `TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`;
       a composite primary key; named composite ordinary keys; `ENGINE=InnoDB`;
       and `DEFAULT CHARSET=utf8mb4`. It preserves the event definition, including

@@ -1,5 +1,7 @@
 // Typed grammar for observed facet, storefront, and reader-memory CREATE statements.
-use super::super::model::{ParsedCheckConstraintAst, ParsedCreateColumnAst, ParsedIndexAst};
+use super::super::model::{
+    ParsedCheckConstraintAst, ParsedCreateColumnAst, ParsedCreateForeignKeyAst, ParsedIndexAst,
+};
 use super::*;
 
 const TABLE_DEFINITION_KEYWORDS: [&str; 4] = ["PRIMARY", "UNIQUE", "KEY", "CONSTRAINT"];
@@ -47,6 +49,7 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
         parser.keyword(",")?;
     }
     let mut indexes = Vec::new();
+    let mut foreign_keys = Vec::new();
     while !parser.at(")") {
         if parser.at("PRIMARY") {
             parser.keyword("PRIMARY")?;
@@ -55,6 +58,13 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
                 return Err("CREATE has more than one PRIMARY KEY".into());
             }
             primary_key = parser.key_columns()?;
+        } else if parser.at("CONSTRAINT")
+            && parser
+                .tokens
+                .get(parser.position + 2)
+                .is_some_and(|token| token.eq_ignore_ascii_case("FOREIGN"))
+        {
+            foreign_keys.push(parser.foreign_key()?);
         } else if parser.at("CONSTRAINT") {
             let (constraint, next) = check_constraint::parse_named_check(
                 &parser.tokens,
@@ -81,6 +91,7 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
         return Err("unmodeled CREATE tail".into());
     }
     validate_definitions(&columns, &primary_key, &indexes, &check_constraints)?;
+    validate_foreign_keys(&foreign_keys, &columns, &primary_key, &indexes)?;
     Ok(ParsedCreateTableAst {
         name,
         if_not_exists: true,
@@ -88,6 +99,7 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
         primary_key,
         indexes,
         check_constraints,
+        foreign_keys,
         engine: "InnoDB".into(),
         character_set: Some("utf8mb4".into()),
         collation,
@@ -152,6 +164,35 @@ fn validate_definitions(
     Ok(())
 }
 
+fn validate_foreign_keys(
+    foreign_keys: &[ParsedCreateForeignKeyAst],
+    columns: &[ParsedCreateColumnAst],
+    primary: &[String],
+    indexes: &[ParsedIndexAst],
+) -> Result<(), String> {
+    let mut names = BTreeSet::new();
+    for key in foreign_keys {
+        let known_columns = key.columns.iter().all(|name| {
+            columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(name))
+        });
+        let supporting_index = primary.starts_with(&key.columns)
+            || indexes.iter().any(|index| {
+                let parts = index
+                    .key_parts
+                    .iter()
+                    .map(|part| &part.column)
+                    .collect::<Vec<_>>();
+                parts.starts_with(&key.columns.iter().collect::<Vec<_>>())
+            });
+        if !names.insert(key.name.to_ascii_lowercase()) || !known_columns || !supporting_index {
+            return Err("CREATE foreign key requires unique name, known columns and explicit supporting index".into());
+        }
+    }
+    Ok(())
+}
+
 struct Parser {
     tokens: Vec<String>,
     quoted: Vec<bool>,
@@ -160,6 +201,29 @@ struct Parser {
 }
 
 impl Parser {
+    fn foreign_key(&mut self) -> Result<ParsedCreateForeignKeyAst, String> {
+        self.keyword("CONSTRAINT")?;
+        let name = self.identifier()?;
+        self.keyword("FOREIGN")?;
+        self.keyword("KEY")?;
+        let columns = self.key_columns()?;
+        self.keyword("REFERENCES")?;
+        let referenced_table = self.identifier()?;
+        let referenced_columns = self.key_columns()?;
+        for keyword in ["ON", "DELETE", "CASCADE"] {
+            self.keyword(keyword)?;
+        }
+        if columns.len() != 1 || referenced_columns.len() != 1 {
+            return Err("observed CREATE foreign key requires one column".into());
+        }
+        Ok(ParsedCreateForeignKeyAst {
+            name,
+            columns,
+            referenced_table,
+            referenced_columns,
+        })
+    }
+
     fn at(&self, keyword: &str) -> bool {
         self.tokens
             .get(self.position)
@@ -641,6 +705,36 @@ mod tests {
         assert!(sql.contains("`label` VARCHAR(80) NOT NULL"));
         assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"));
         assert!(sql.ends_with("DEFAULT CHARACTER SET=utf8mb4"));
+    }
+
+    const CURATED_SLIDES: &str =
+        include_str!("../../../../fixtures/ddl/create-home-feed-curated-strip-slides.sql");
+
+    #[test]
+    fn curated_slides_create_preserves_cascading_foreign_key() {
+        let result = transform_fixture_create_table(CURATED_SLIDES)
+            .expect("curated slides CREATE")
+            .target_sql
+            .unwrap();
+        assert!(result.contains("CONSTRAINT `fk_hfcss_strip` FOREIGN KEY (`curated_strip_id`) REFERENCES `home_feed_curated_strips` (`id`) ON DELETE CASCADE"));
+        for rejected in [
+            CURATED_SLIDES.replace("ON DELETE CASCADE", "ON DELETE SET NULL"),
+            CURATED_SLIDES.replace("ON DELETE CASCADE", "ON DELETE CASCADE ON UPDATE CASCADE"),
+            CURATED_SLIDES.replace(
+                "FOREIGN KEY (`curated_strip_id`)",
+                "FOREIGN KEY (`missing`)",
+            ),
+            CURATED_SLIDES.replace(
+                "REFERENCES `home_feed_curated_strips`",
+                "REFERENCES other.`home_feed_curated_strips`",
+            ),
+            CURATED_SLIDES.replace(
+                "KEY `idx_hfcss_strip` (`curated_strip_id`, `display_order`)",
+                "KEY `idx_hfcss_strip` (`display_order`)",
+            ),
+        ] {
+            assert!(parse(&rejected).is_err(), "{rejected}");
+        }
     }
 
     const CURATED_STRIPS: &str =

@@ -76,6 +76,15 @@ pub struct ParsedCheckConstraintAst {
     pub disjuncts: Vec<CheckPredicate>,
 }
 
+/// A same-schema CREATE foreign key with ON DELETE CASCADE and implicit RESTRICT on update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedCreateForeignKeyAst {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedCreateTableAst {
     pub name: String,
@@ -84,6 +93,7 @@ pub struct ParsedCreateTableAst {
     pub primary_key: Vec<String>,
     pub indexes: Vec<ParsedIndexAst>,
     pub check_constraints: Vec<ParsedCheckConstraintAst>,
+    pub foreign_keys: Vec<ParsedCreateForeignKeyAst>,
     pub engine: String,
     pub character_set: Option<String>,
     pub collation: Option<String>,
