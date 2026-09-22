@@ -894,8 +894,8 @@ pub(crate) fn validate_json_alias_checks(
     checks: &[(String, String, bool)],
 ) -> Result<(), String> {
     for column in columns {
-        let valid = checks.iter().any(|(name, clause, enforced)| {
-            name == &column.name && *enforced && json_valid_check_matches(clause, &column.name)
+        let valid = checks.iter().any(|(_, clause, enforced)| {
+            *enforced && json_valid_check_matches(clause, &column.name)
         });
         if !valid {
             return Err(format!(
@@ -1518,7 +1518,7 @@ mod json_alias_check_tests {
             validate_json_alias_checks(
                 &[&column],
                 &[(
-                    "source_layout".into(),
+                    "releases_pages_chk_1".into(),
                     "JSON_VALID(source_layout)".into(),
                     true
                 )]
@@ -1527,4 +1527,3 @@ mod json_alias_check_tests {
         );
     }
 }
-

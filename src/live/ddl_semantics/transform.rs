@@ -256,9 +256,7 @@ fn render_add_column(column: &ParsedAddColumnAst) -> String {
     }
     if column.data_type == "json" {
         let name = quote_identifier(&column.name);
-        sql.push_str(&format!(
-            ", ADD CONSTRAINT {name} CHECK (JSON_VALID({name}))"
-        ));
+        sql.push_str(&format!(", ADD CHECK (JSON_VALID({name}))"));
     }
     sql
 }

@@ -10,7 +10,7 @@ fn json_add_preserves_alias_validation_and_position() {
     assert_eq!(
         result.target_sql.as_deref(),
         Some(
-            "ALTER TABLE `releases_pages` ADD COLUMN `source_layout` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL DEFAULT NULL AFTER `comic_asset_id`, ADD CONSTRAINT `source_layout` CHECK (JSON_VALID(`source_layout`))"
+            "ALTER TABLE `releases_pages` ADD COLUMN `source_layout` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL DEFAULT NULL AFTER `comic_asset_id`, ADD CHECK (JSON_VALID(`source_layout`))"
         )
     );
     let history = JSON_ADD.replace("`releases_pages`", "`releases_pages_history`");
