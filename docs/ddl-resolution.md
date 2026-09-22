@@ -80,6 +80,15 @@ later decimal DML. The second covers the bounded named single-column same-schema
 foreign key, its explicit supporting index, `ON DELETE CASCADE`, implicit update
 `RESTRICT`, later child DML, orphan rejection, and cascade behavior.
 
+### Source-layout JSON persisted-pending replay harness
+
+`source-layout-json-pending-replay` requires an explicit `--old-binary` before
+nullable JSON ADD support and is excluded from default scenarios. It replays the
+exact guarded `source_layout` ALTER, promoting an authentic pending row without
+identity change. It proves MariaDB's `LONGTEXT utf8mb4_bin` plus enforced
+`JSON_VALID` alias, column order, SQL NULL distinct from JSON `null`, exact JSON
+text bytes, later DML, invalid-JSON rejection, and a guarded converged no-op.
+
 ### Exact production ALTER recovery target
 
 The active recovery target is the exact source event at

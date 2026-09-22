@@ -23,13 +23,17 @@ Automatic DDL admission currently has these narrow slices:
 - the production-observed unqualified multi-clause `ALTER TABLE` form with
   `ADD COLUMN` under the exact unquoted type grammar
   `VARCHAR(positive canonical decimal length)`, `DATETIME`, `SMALLINT UNSIGNED`,
-  `FLOAT UNSIGNED`, `DATETIME(6)`, or `TEXT`/`MEDIUMTEXT`; quoted type keywords,
+  `FLOAT UNSIGNED`, `DATETIME(6)`, `TEXT`/`MEDIUMTEXT`, or nullable `JSON
+  DEFAULT NULL`; quoted type keywords,
   quoted `VARCHAR` lengths, and quoted `UNSIGNED` forms are rejected, as are other
   `DATETIME` precisions, `SMALLINT` display width, and `FLOAT` parameters. The
   observed `NULL` or `NOT NULL`, `DEFAULT NULL` or `DEFAULT 0`, `COMMENT`, and
   `AFTER` options; `CHAR`/`VARCHAR` `NOT NULL DEFAULT '<literal>'`; a TEXT `NOT
   NULL DEFAULT '<literal>'` rendered as the MySQL 8 expression default
-  `(_utf8mb4'<literal>')`; `CHAR(n) CHARACTER SET <charset> COLLATE <collation>`;
+  `(_utf8mb4'<literal>')`; nullable JSON is rendered as MariaDB's validated
+  `LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` alias with a named,
+  enforced `JSON_VALID` CHECK rather than native MySQL JSON; `CHAR(n) CHARACTER
+  SET <charset> COLLATE <collation>`;
   named composite `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same
   AST, or `ADD UNIQUE KEY` clauses; `ADD COLUMN IF NOT EXISTS` and `ADD INDEX IF
   NOT EXISTS` guards, executed unguarded when every guarded object is absent and
