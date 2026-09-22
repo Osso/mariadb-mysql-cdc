@@ -159,7 +159,13 @@ class CommandResult:
 
 
 def default_scenarios() -> list[str]:
-    return [scenario.name for scenario in SCENARIOS if scenario.executable]
+    # Upgrade regressions require a caller-supplied historical binary.
+    return [
+        scenario.name
+        for scenario in SCENARIOS
+        if scenario.executable
+        and scenario.name != "curated-strip-create-pending-replay"
+    ]
 
 
 class Harness:
@@ -842,8 +848,9 @@ class Harness:
         max_reconnects: int = 0,
         barrier_dir: Path | None = None,
         label: str = "stream",
+        binary: Path | None = None,
     ) -> tuple[subprocess.Popen[str], Path]:
-        binary = self._stream_binary(integration_failpoint)
+        binary = binary or self._stream_binary(integration_failpoint)
         env = {
             **os.environ,
             "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
@@ -1851,17 +1858,26 @@ DELIMITER ;
             raise HarnessError(f"source failed to preserve ordinary comment: {info!r}")
         identity = f"{SOURCE_IDENTITY}#server-id={server_id}"
         if old_binary is not None:
-            result = run(
-                self._stream_args(old_binary, start, self.coordinate(), None, 0),
-                env={
-                    **os.environ,
-                    "CDC_SOURCE_PASSWORD": SOURCE_PASSWORD,
-                    "CDC_TARGET_PASSWORD": LIVE_TARGET_PASSWORD,
-                },
-                timeout=90,
-                check=False,
+            process, log = self.start_stream(
+                start, self.coordinate(), label="old-stream", binary=old_binary
             )
-            require_translation_pending_termination(result)
+            try:
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    status = self.admin_query(
+                        self.target, "SELECT status FROM cdc.ddl_replay_journal;"
+                    ).strip()
+                    if status == "translation_pending":
+                        break
+                    if process.poll() is not None:
+                        raise HarnessError(f"old stream exited: {log.read_text()}")
+                    time.sleep(0.1)
+                else:
+                    raise HarnessError(
+                        f"old stream did not persist barrier: {log.read_text()}"
+                    )
+            finally:
+                self.stop_sync_process(process)
             pending = self.journal_full_row()
             checkpoint = self.checkpoint()
             if (
