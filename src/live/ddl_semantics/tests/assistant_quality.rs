@@ -244,6 +244,14 @@ fn conversation_fk_on_accounts() -> String {
         .replace("(`conversation_id`)", "(`handle`)")
 }
 
+/// The `accounts` fixture with `idx_handle` as a full (unprefixed) index, which MySQL can use
+/// to support a foreign key on `handle`.
+fn accounts_with_full_handle_index() -> SemanticSchemaSnapshot {
+    let mut target = semantic_snapshot(0, Some(1));
+    target.inventory.indexes[0].columns[0].prefix_length = None;
+    target
+}
+
 #[test]
 fn conversation_fk_alter_renders_named_cascading_foreign_key() {
     let result = translate_ddl(CONVERSATION_FK, &[]).expect("ADD FOREIGN KEY must translate");
@@ -257,7 +265,7 @@ fn conversation_fk_alter_renders_named_cascading_foreign_key() {
 
 #[test]
 fn conversation_fk_alter_expects_foreign_key_and_keeps_indexes() {
-    let target = semantic_snapshot(0, Some(1));
+    let target = accounts_with_full_handle_index();
     let operation = parse_ddl_operation(&conversation_fk_on_accounts()).expect("operation");
     let evidence = build_semantic_evidence(&operation, &target, &target).expect("evidence");
     let pre: serde_json::Value = serde_json::from_str(&evidence.pre_state).unwrap();
@@ -295,9 +303,12 @@ fn conversation_fk_alter_rejects_unmodeled_forms() {
             "accepted {sql}"
         );
     }
-    let target = semantic_snapshot(0, Some(1));
+    let target = accounts_with_full_handle_index();
     let mut unindexed = target.clone();
     unindexed.inventory.indexes.clear();
+    // MySQL cannot use a prefix index for a foreign key and silently creates its own.
+    let mut prefix_indexed = target.clone();
+    prefix_indexed.inventory.indexes[0].columns[0].prefix_length = Some(4);
     let mut existing = target.clone();
     existing
         .inventory
@@ -316,6 +327,7 @@ fn conversation_fk_alter_rejects_unmodeled_forms() {
             &target,
         ),
         (conversation_fk_on_accounts(), &unindexed),
+        (conversation_fk_on_accounts(), &prefix_indexed),
         (conversation_fk_on_accounts(), &existing),
     ] {
         let operation = parse_ddl_operation(&sql).expect("operation");

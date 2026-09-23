@@ -813,7 +813,7 @@ fn validate_add_check(
 }
 
 /// MySQL silently creates an index for an unsupported foreign key, which the expected state
-/// cannot model, so the child column must already lead an index or the primary key.
+/// cannot model, so the child column must already lead the primary key or an unprefixed index.
 fn apply_add_foreign_key(
     expected: &mut SemanticSchemaSnapshot,
     table_name: &str,
@@ -836,7 +836,7 @@ fn apply_add_foreign_key(
             index
                 .columns
                 .first()
-                .is_some_and(|part| part.name == key.columns[0])
+                .is_some_and(|part| part.name == key.columns[0] && part.prefix_length.is_none())
         });
     if !supported {
         return Err(format!(
