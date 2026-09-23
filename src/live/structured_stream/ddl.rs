@@ -425,11 +425,38 @@ where
     finalize_automatic_ddl_checkpoint(executor, journal, context, event, ddl_event)
 }
 
-fn is_failed_source_layout_history_event(sql: &str) -> bool {
+/// Exact events whose recorded translation named a JSON alias CHECK and hit MySQL's
+/// schema-wide CHECK name uniqueness (error 3822).
+fn is_legacy_json_check_collision_event(sql: &str) -> bool {
     let original =
         include_str!("../../../fixtures/ddl/alter-releases-pages-source-layout.sql").trim();
     let history = original.replace("`releases_pages`", "`releases_pages_history`");
-    sql.trim() == history
+    let contributor_cards =
+        include_str!("../../../fixtures/ddl/create-home-feed-contributor-cards.sql").trim();
+    sql.trim() == history || sql.trim() == contributor_cards
+}
+
+/// The legacy rendering of `sql`: every anonymous JSON alias CHECK named after its column.
+fn name_json_alias_checks(sql: &str) -> String {
+    const MARKER: &str = "CHECK (JSON_VALID(`";
+    let mut named = String::new();
+    let mut rest = sql;
+    while let Some(start) = rest.find(MARKER) {
+        let (head, tail) = rest.split_at(start);
+        let Some(end) = tail[MARKER.len()..].find("`))") else {
+            break;
+        };
+        let column = &tail[MARKER.len()..MARKER.len() + end];
+        named.push_str(head);
+        if head.ends_with(", ") || head.ends_with(", ADD ") {
+            named.push_str(&format!("CONSTRAINT `{column}` "));
+        }
+        let clause_end = MARKER.len() + end + "`))".len();
+        named.push_str(&tail[..clause_end]);
+        rest = &tail[clause_end..];
+    }
+    named.push_str(rest);
+    named
 }
 
 fn corrected_json_alias_sql(
@@ -438,7 +465,7 @@ fn corrected_json_alias_sql(
     fresh: &DdlSemanticEvidence,
     replacement: &DdlTransformation,
 ) -> Result<String, String> {
-    if !is_failed_source_layout_history_event(raw_sql)
+    if !is_legacy_json_check_collision_event(raw_sql)
         || recorded.transformation_version != replacement.version
         || recorded.pre_state == recorded.expected_post_state
         || recorded.pre_state != fresh.pre_state
@@ -453,10 +480,7 @@ fn corrected_json_alias_sql(
         .target_sql
         .as_ref()
         .ok_or("JSON alias recovery lacks corrected SQL")?;
-    let old = corrected.replace(
-        ", ADD CHECK (JSON_VALID(`source_layout`))",
-        ", ADD CONSTRAINT `source_layout` CHECK (JSON_VALID(`source_layout`))",
-    );
+    let old = name_json_alias_checks(corrected);
     if old == *corrected || recorded.generated_sql.as_deref() != Some(old.as_str()) {
         return Err("JSON alias recovery requires exact legacy named CHECK collision".into());
     }
@@ -589,7 +613,7 @@ where
     J: DdlReplayJournal,
     S: DdlSemanticInventory,
 {
-    if !is_failed_source_layout_history_event(&ddl_event.raw_sql) {
+    if !is_legacy_json_check_collision_event(&ddl_event.raw_sql) {
         return Ok(false);
     }
     let (updated, execute) =
@@ -1047,6 +1071,38 @@ mod json_alias_retry_tests {
                 &raw.replace("releases_pages_history", "other"),
                 &old,
                 &fresh,
+                &replacement
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn contributor_cards_retry_replaces_recorded_named_json_checks() {
+        let raw = include_str!("../../../fixtures/ddl/create-home-feed-contributor-cards.sql");
+        let legacy = include_str!(
+            "../../../fixtures/ddl/create-home-feed-contributor-cards.legacy-generated.sql"
+        );
+        let old = DdlSemanticEvidence {
+            generated_sql: Some(legacy.into()),
+            ..recorded()
+        };
+        let replacement = crate::live::ddl_semantics::translate_ddl(raw, &[])
+            .expect("contributor cards CREATE translates");
+        let corrected = replacement.target_sql.clone().unwrap();
+        assert!(corrected.contains(", CHECK (JSON_VALID(`assistant_prompts`))"));
+        assert!(!corrected.contains("CONSTRAINT `assistant_prompts`"));
+        let recovered = corrected_json_alias_evidence(raw, &old, &old, &replacement)
+            .expect("corrected contributor cards evidence");
+        assert_eq!(recovered.generated_sql.as_deref(), Some(corrected.as_str()));
+        let mut unrelated = old.clone();
+        unrelated.generated_sql = Some(legacy.replace("VARCHAR(255)", "VARCHAR(254)"));
+        assert!(corrected_json_alias_sql(raw, &unrelated, &old, &replacement).is_err());
+        assert!(
+            corrected_json_alias_sql(
+                &raw.replace("VARCHAR(80)", "VARCHAR(81)"),
+                &old,
+                &old,
                 &replacement
             )
             .is_err()

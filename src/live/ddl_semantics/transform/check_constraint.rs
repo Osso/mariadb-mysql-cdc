@@ -152,6 +152,17 @@ pub(super) fn render_check_constraint(constraint: &ParsedCheckConstraintAst) -> 
     )
 }
 
+/// MySQL CHECK names are schema-wide, so a JSON alias CHECK (MariaDB names it after its
+/// column) renders anonymously and MySQL assigns a table-specific name.
+pub(super) fn render_create_check_constraint(constraint: &ParsedCheckConstraintAst) -> String {
+    match constraint.disjuncts.as_slice() {
+        [CheckPredicate::JsonValid { column }] if *column == constraint.name => {
+            format!("CHECK (JSON_VALID({}))", quote_identifier(column))
+        }
+        _ => render_check_constraint(constraint),
+    }
+}
+
 fn render_predicate(predicate: &CheckPredicate) -> String {
     match predicate {
         CheckPredicate::IsNull { column } => format!("{} IS NULL", quote_identifier(column)),

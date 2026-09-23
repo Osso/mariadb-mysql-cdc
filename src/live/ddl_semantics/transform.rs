@@ -1471,7 +1471,7 @@ fn transform_fixture_create_table_ast(
     definitions.extend(
         ast.check_constraints
             .iter()
-            .map(check_constraint::render_check_constraint),
+            .map(check_constraint::render_create_check_constraint),
     );
     definitions.extend(ast.foreign_keys.iter().map(render_create_foreign_key));
     let schema_defaults = render_create_schema_defaults(ast, defaults);

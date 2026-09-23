@@ -20,7 +20,7 @@ fn json_create_preserves_mariadb_text_storage_and_validation() {
     assert_eq!(
         transformed.target_sql.as_deref(),
         Some(
-            "CREATE TABLE `spotlight` (`id` INT UNSIGNED NOT NULL AUTO_INCREMENT, `payload` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL DEFAULT NULL, PRIMARY KEY (`id`), CONSTRAINT `payload` CHECK (JSON_VALID(`payload`))) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+            "CREATE TABLE `spotlight` (`id` INT UNSIGNED NOT NULL AUTO_INCREMENT, `payload` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL DEFAULT NULL, PRIMARY KEY (`id`), CHECK (JSON_VALID(`payload`))) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
         )
     );
 }

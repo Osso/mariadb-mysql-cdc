@@ -96,6 +96,7 @@ SCENARIOS = (
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("assistant-quality-pending-replay", True),
+    ScenarioSpec("contributor-cards-check-collision-recovery", True),
     ScenarioSpec("commented-drop-column-present-pending-replay", True),
     ScenarioSpec("commented-drop-column-absent-pending-replay", True),
     ScenarioSpec("bootstrap-contract", True),
@@ -172,6 +173,7 @@ def default_scenarios() -> list[str]:
             "curated-strip-create-pending-replay",
             "curated-strip-slides-create-pending-replay",
             "source-layout-json-pending-replay",
+            "contributor-cards-check-collision-recovery",
         }
     ]
 
@@ -3283,6 +3285,166 @@ DELIMITER ;
             raise HarnessError(
                 f"assistant_quality indexes differ:\nsource={source_indexes}\ntarget={target_indexes}"
             )
+
+    def run_contributor_cards_check_collision_recovery(self) -> None:
+        """The mysqld-bin.003091 barrier: a CREATE whose JSON alias CHECK was named after its
+        column collided with an existing schema-wide CHECK name (MySQL error 3822). The failed
+        binary leaves the journal row blocked at the untouched pre-state; the fixed binary
+        replays corrected anonymous CHECKs and checkpoints the same row."""
+        assert self.source and self.target
+        if self.failed_binary is None or not self.failed_binary.is_file():
+            raise HarnessError("contributor cards recovery requires --failed-binary")
+        mantles = (
+            "CREATE TABLE kg_mantles (id INT UNSIGNED NOT NULL PRIMARY KEY, "
+            "assistant_prompts {type} DEFAULT NULL{check}) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
+        )
+        self.admin_sql(self.source, mantles.format(type="JSON", check=""))
+        self.admin_sql(
+            self.target,
+            mantles.format(
+                type="LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+                check=", CONSTRAINT assistant_prompts CHECK (JSON_VALID(assistant_prompts))",
+            ),
+        )
+        table = "home_feed_contributor_cards"
+        ddl = (
+            (self.repo / "fixtures/ddl/create-home-feed-contributor-cards.sql")
+            .read_text()
+            .strip()
+        )
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.source_sql_with_comments(ddl + ";")
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table} (name,contributor_name,display_name,assistant_prompts,"
+            "comic_ids_json,start_time,end_time) VALUES "
+            "('card','o''neil, dennis','Dennis O''Neil','[\"Who is he?\"]','[1,2]',"
+            "'2026-09-23 00:00:00','2026-10-01 00:00:00');",
+        )
+        stop = self.coordinate()
+        blocked = self.drive_failed_binary_to_blocked(start, stop)
+        if "CONSTRAINT `assistant_prompts` CHECK" not in blocked["generated_sql"]:
+            raise HarnessError(f"failed binary did not record named CHECKs: {blocked!r}")
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='{table}';",
+        ).strip()
+        if absent != "0":
+            raise HarnessError("failed binary created the contributor cards table")
+        process, log = self.start_stream(start, stop)
+        try:
+            deadline = time.monotonic() + 60
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if process.poll() != 0:
+                raise HarnessError(f"collision recovery replay failed: {log.read_text()}")
+        finally:
+            self.stop_sync_process(process)
+        recovered = self.journal_full_row(int(blocked["event_start_position"]))
+        for field in ("event_start_position", "raw_sql", "created_at", "pre_state", "expected_post_state"):
+            if recovered[field] != blocked[field]:
+                raise HarnessError(f"recovery changed immutable {field}: {recovered!r}")
+        if recovered["status"] != "checkpointed" or "CONSTRAINT `" in recovered["generated_sql"]:
+            raise HarnessError(f"recovery did not record anonymous CHECK SQL: {recovered!r}")
+        checkpoint = self.checkpoint()
+        if (checkpoint["source_file"], checkpoint["source_position"]) != (stop.file, stop.position):
+            raise HarnessError(f"collision recovery checkpoint differs: {checkpoint!r}")
+        query = f"SELECT * FROM {table} ORDER BY id;"
+        source_rows = self.admin_query(self.source, query).strip()
+        target_rows = self.admin_query(self.target, query).strip()
+        if not source_rows or source_rows != target_rows:
+            raise HarnessError(
+                f"contributor cards rows differ:\nsource={source_rows!r}\ntarget={target_rows!r}"
+            )
+        checks = self.admin_query(
+            self.target,
+            "SELECT tc.TABLE_NAME,cc.CHECK_CLAUSE,tc.ENFORCED FROM information_schema.TABLE_CONSTRAINTS tc "
+            "JOIN information_schema.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA "
+            "AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME "
+            f"WHERE tc.CONSTRAINT_SCHEMA={sql_literal(APP_SCHEMA)} AND tc.CONSTRAINT_TYPE='CHECK' "
+            "ORDER BY tc.TABLE_NAME,cc.CHECK_CLAUSE;",
+        ).strip()
+        expected = "\n".join(
+            f"{name}\tjson_valid(`{column}`)\tYES"
+            for name, column in [
+                (table, "assistant_prompts"),
+                (table, "comic_ids_json"),
+                (table, "release_ids_json"),
+                ("kg_mantles", "assistant_prompts"),
+            ]
+        )
+        if checks != expected:
+            raise HarnessError(f"target CHECK constraints differ:\n{checks}")
+        self.assert_admin_sql_rejected(
+            self.target,
+            f"INSERT INTO {table} (name,contributor_name,display_name,release_ids_json,"
+            "start_time,end_time) VALUES ('bad','x','x','{nope','2026-09-23','2026-09-24');",
+            "Check constraint",
+        )
+        print(
+            "contributor_cards_check_collision_recovery_ok failed_binary_blocked=true "
+            "same_journal_row=true anonymous_checks=true checks_enforced=true post_ddl_rows=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def drive_failed_binary_to_blocked(
+        self, start: Coordinate, stop: Coordinate
+    ) -> dict[str, str]:
+        """Runs the failed binary, restarting it after its failed execution, until the
+        journal row is blocked, mirroring the production pod restart."""
+        assert self.failed_binary
+        deadline = time.monotonic() + 90
+        saw_collision = False
+        while time.monotonic() < deadline:
+            process, log = self.start_stream(
+                start, stop, label="failed-stream", binary=self.failed_binary
+            )
+            try:
+                while process.poll() is None and time.monotonic() < deadline:
+                    status = self.admin_query(
+                        self.target, "SELECT status FROM cdc.ddl_replay_journal;"
+                    ).strip()
+                    if status == "blocked":
+                        break
+                    time.sleep(0.2)
+            finally:
+                self.stop_sync_process(process)
+            saw_collision = saw_collision or "Duplicate check constraint name" in log.read_text()
+            row = self.journal_full_row()
+            if row.get("status") == "blocked":
+                if not saw_collision:
+                    raise HarnessError("failed binary blocked without the CHECK name collision")
+                checkpoint = self.checkpoint()
+                if (checkpoint["source_file"], checkpoint["source_position"]) != (
+                    start.file,
+                    start.position,
+                ):
+                    raise HarnessError(f"failed binary advanced checkpoint: {checkpoint!r}")
+                return row
+        raise HarnessError("failed binary did not leave a blocked journal row")
+
+    def source_sql_with_comments(self, sql: str) -> None:
+        assert self.source
+        run(
+            [
+                "mariadb",
+                "--protocol=tcp",
+                "--ssl",
+                f"--ssl-ca={self.ca_file}",
+                "--ssl-verify-server-cert",
+                "--host=127.0.0.1",
+                f"--port={self.source.port}",
+                "--user=root",
+                f"--password={ADMIN_PASSWORD}",
+                f"--database={APP_SCHEMA}",
+                "--comments",
+                "--batch",
+            ],
+            input_text=sql,
+        )
 
     def run_reader_memory_create_pending_replay(self) -> None:
         """The mysqld-bin.003058 barrier: a pending reader_memory_profiles CREATE followed by
@@ -7986,6 +8148,8 @@ DELIMITER ;
             self.run_reader_memory_guarded_alter_pending_replay()
         elif scenario == "assistant-quality-pending-replay":
             self.run_assistant_quality_pending_replay()
+        elif scenario == "contributor-cards-check-collision-recovery":
+            self.run_contributor_cards_check_collision_recovery()
         elif scenario == "commented-drop-column-present-pending-replay":
             self.run_commented_drop_column_pending_replay(present=True)
         elif scenario == "commented-drop-column-absent-pending-replay":
