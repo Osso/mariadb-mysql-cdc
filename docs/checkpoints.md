@@ -9,6 +9,13 @@ must change when the source incarnation changes. Runtime validates the
 pre-created table and source-scoped row; it does not create or repair the
 control plane.
 
+With target transaction grouping, the stream writes this row once per target
+commit: the latest source coordinate reached in the open target transaction is
+locked, validated against regression, and saved immediately before `COMMIT`.
+Rows and checkpoint commit atomically, and a rollback discards both. At the
+source head a group usually holds one source transaction, so the saving applies
+to catch-up backlogs.
+
 Unified synchronization stores aggregate stage/table progress in the selected
 progress table, `cdc.sync_runs` by default, keyed by `(run_id, stage, table_name)`.
 For incomplete row work it also requires the additive `<progress-table>_phases`
