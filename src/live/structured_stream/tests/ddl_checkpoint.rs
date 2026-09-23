@@ -46,11 +46,16 @@ fn grouped_dml_checkpoint_rejects_a_concurrently_advanced_checkpoint() {
         }),
     };
 
-    let error = save_outcome_checkpoint(&executor, &mut context, &event, &outcome)
+    save_outcome_checkpoint(&mut context, &event, &outcome).expect("defer group checkpoint");
+    let error = commit_target_group(&executor, &mut context)
         .expect_err("concurrent checkpoint advance must block DML regression");
 
     assert!(error.to_string().contains("refusing checkpoint regression"));
     assert_eq!(executor.operations(), vec!["BEGIN", "LOCK_CHECKPOINT"]);
+    assert!(
+        context.target_transaction.is_open(),
+        "no commit after refused checkpoint"
+    );
 }
 
 #[test]

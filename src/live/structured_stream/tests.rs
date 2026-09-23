@@ -507,6 +507,7 @@ struct TransactionRecordingExecutor {
     fail_execute: bool,
     fail_update_with_duplicate: bool,
     locked_checkpoint: Option<crate::checkpoint::Checkpoint>,
+    saved_positions: std::cell::RefCell<Vec<u64>>,
 }
 
 impl Default for TransactionRecordingExecutor {
@@ -516,6 +517,7 @@ impl Default for TransactionRecordingExecutor {
             fail_execute: false,
             fail_update_with_duplicate: false,
             locked_checkpoint: Some(test_checkpoint("mysqld-bin.000000", 4)),
+            saved_positions: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -628,9 +630,12 @@ impl crate::target::TransactionalTargetExecutor for TransactionRecordingExecutor
         &self,
         _checkpoint_table: &str,
         _checkpoint_name: &str,
-        _checkpoint: &crate::checkpoint::Checkpoint,
+        checkpoint: &crate::checkpoint::Checkpoint,
     ) -> Result<(), crate::target::TargetExecuteError> {
         self.operations.borrow_mut().push("CHECKPOINT");
+        self.saved_positions
+            .borrow_mut()
+            .push(checkpoint.source_position);
         Ok(())
     }
 

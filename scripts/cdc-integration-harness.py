@@ -122,6 +122,7 @@ SCENARIOS = (
     ScenarioSpec("post-ddl-pre-applied", True),
     ScenarioSpec("applied-pre-checkpoint", True),
     ScenarioSpec("checkpoint-transaction", True),
+    ScenarioSpec("grouped-checkpoint-crash-resume", True),
     ScenarioSpec("source-connection-loss", True),
     ScenarioSpec("target-connection-loss", True),
     ScenarioSpec("row-conflict-source-row-migration", True),
@@ -194,6 +195,7 @@ class Harness:
         self.keep = keep
         self.tempdir = Path(tempfile.mkdtemp(prefix="mariadb-mysql-cdc-harness-"))
         self.containers: list[str] = []
+        self.stream_extra_args: list[str] = []
         self.source: Endpoint | None = None
         self.target: Endpoint | None = None
         self.ca_file = self.tempdir / "ca.pem"
@@ -695,6 +697,7 @@ class Harness:
             args.extend(["--stop-position", str(stop.position)])
         if integration_failpoint is not None:
             args.extend(["--integration-failpoint", integration_failpoint])
+        args.extend(self.stream_extra_args)
         return args
 
     def run_stream(
@@ -3444,6 +3447,120 @@ DELIMITER ;
                 "--batch",
             ],
             input_text=sql,
+        )
+
+    PRODUCTION_GROUPING = [
+        "--target-transaction-group-size",
+        "100",
+        "--target-transaction-group-timeout-ms",
+        "200",
+    ]
+
+    def insert_account_transactions(self, first_id: int, count: int) -> None:
+        """Writes one autocommitted single-row source transaction per id."""
+        assert self.source
+        for chunk_start in range(first_id, first_id + count, 2000):
+            chunk_end = min(chunk_start + 2000, first_id + count)
+            self.admin_sql(
+                self.source,
+                "".join(
+                    f"INSERT INTO accounts VALUES ({row_id},'a{row_id}@example.test','p');"
+                    for row_id in range(chunk_start, chunk_end)
+                ),
+            )
+
+    def target_checkpoint_statements(self) -> int:
+        assert self.target
+        value = self.admin_query(
+            self.target,
+            "SELECT COALESCE(SUM(COUNT_STAR),0) FROM performance_schema.events_statements_summary_by_digest "
+            "WHERE DIGEST_TEXT LIKE '%stream_checkpoint%';",
+        ).strip()
+        return int(value)
+
+    def source_transaction_ends(self, start: Coordinate) -> list[int]:
+        events = self.admin_query(
+            self.source,
+            f"SHOW BINLOG EVENTS IN {sql_literal(start.file)} FROM {start.position};",
+        )
+        return [
+            int(fields[4])
+            for fields in (line.split("\t") for line in events.splitlines())
+            if len(fields) > 4 and fields[2] == "Xid"
+        ]
+
+    def run_grouped_checkpoint_crash_resume(self) -> None:
+        """Production grouping (100 transactions / 200 ms): the checkpoint is written once per
+        target commit, a SIGKILL mid-catch-up leaves exactly the rows of the transactions up to
+        the committed checkpoint, and a restart converges to the source."""
+        assert self.source and self.target
+        self.stream_extra_args = list(self.PRODUCTION_GROUPING)
+        self.setup_accounts_table()
+        grouped = 2000
+        start = self.coordinate()
+        self.write_checkpoint(start)
+        self.insert_account_transactions(1, grouped)
+        stop = self.coordinate()
+        self.admin_sql(
+            self.target, "TRUNCATE TABLE performance_schema.events_statements_summary_by_digest;"
+        )
+        require_success(self.run_stream(start, stop), "grouped catch-up")
+        checkpoint_statements = self.target_checkpoint_statements()
+        if checkpoint_statements > grouped // 10:
+            raise HarnessError(
+                f"{checkpoint_statements} checkpoint statements for {grouped} grouped transactions"
+            )
+        count = self.admin_query(self.target, "SELECT COUNT(*) FROM accounts;").strip()
+        if count != str(grouped) or self.checkpoint()["source_position"] != stop.position:
+            raise HarnessError(f"grouped catch-up incomplete: rows={count} {self.checkpoint()!r}")
+
+        crash_start = stop
+        crashed = 12000
+        self.insert_account_transactions(grouped + 1, crashed)
+        crash_stop = self.coordinate()
+        process, log = self.start_stream(crash_start, crash_stop, label="grouped-crash")
+        try:
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                applied = int(
+                    self.admin_query(
+                        self.target, f"SELECT COUNT(*) FROM accounts WHERE id > {grouped};"
+                    ).strip()
+                )
+                if applied >= crashed // 4 or process.poll() is not None:
+                    break
+                time.sleep(0.02)
+        finally:
+            self.stop_sync_process(process)
+        position = self.checkpoint()["source_position"]
+        committed = sum(1 for end in self.source_transaction_ends(crash_start) if end <= position)
+        if not 0 < committed < crashed:
+            raise HarnessError(
+                f"SIGKILL did not land mid-catch-up: committed={committed} log={log.read_text()[-500:]}"
+            )
+        rows = self.admin_query(
+            self.target,
+            f"SELECT COUNT(*),COALESCE(MIN(id),0),COALESCE(MAX(id),0) FROM accounts WHERE id > {grouped};",
+        ).strip()
+        expected = f"{committed}\t{grouped + 1}\t{grouped + committed}"
+        if rows != expected:
+            raise HarnessError(
+                f"rows and checkpoint diverged after SIGKILL: rows={rows!r} expected={expected!r}"
+            )
+        require_success(self.run_stream(crash_start, crash_stop), "resume after SIGKILL")
+        query = "SELECT COUNT(*),SUM(id),SUM(CRC32(email)) FROM accounts;"
+        source_rows = self.admin_query(self.source, query).strip()
+        target_rows = self.admin_query(self.target, query).strip()
+        checkpoint = self.checkpoint()
+        if source_rows != target_rows or checkpoint["source_position"] != crash_stop.position:
+            raise HarnessError(
+                f"resume diverged: source={source_rows!r} target={target_rows!r} {checkpoint!r}"
+            )
+        print(
+            "grouped_checkpoint_crash_resume_ok "
+            f"grouped_transactions={grouped} checkpoint_statements={checkpoint_statements} "
+            f"killed_after_committed={committed} rows_match_checkpoint=true "
+            f"resumed_rows={source_rows.split(chr(9))[0]}"
         )
 
     def run_reader_memory_create_pending_replay(self) -> None:
@@ -8190,6 +8307,8 @@ DELIMITER ;
             self.run_recovery_scenario(scenario)
         elif scenario in {"source-connection-loss", "target-connection-loss"}:
             self.run_connection_loss_scenario(scenario)
+        elif scenario == "grouped-checkpoint-crash-resume":
+            self.run_grouped_checkpoint_crash_resume()
         elif scenario == "row-conflict-source-row-migration":
             self.run_row_conflict_source_row_migration()
         elif scenario in {

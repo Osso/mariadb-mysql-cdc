@@ -323,8 +323,7 @@ fn direct_checkpoint_saves_without_parallel_flush() {
         }),
     };
 
-    save_outcome_checkpoint(&executor, &mut context, &event, &outcome)
-        .expect("save direct checkpoint");
+    save_outcome_checkpoint(&mut context, &event, &outcome).expect("save direct checkpoint");
 
     assert_eq!(executor.operations(), ["CHECKPOINT"]);
 }
@@ -376,19 +375,19 @@ fn groups_multiple_xids_in_one_mysql_target_transaction() {
     )
     .expect("second XID");
 
+    // One checkpoint write per target commit, carrying the last grouped XID's coordinate.
     assert_eq!(
         applier.executor().operations().as_slice(),
         [
             "BEGIN",
             "EXEC",
-            "LOCK_CHECKPOINT",
-            "CHECKPOINT",
             "EXEC",
             "LOCK_CHECKPOINT",
             "CHECKPOINT",
             "COMMIT",
         ]
     );
+    assert_eq!(*applier.executor().saved_positions.borrow(), [320]);
 }
 
 #[test]
@@ -441,15 +440,9 @@ fn grouped_update_duplicate_rolls_back_complete_target_transaction() {
     assert!(error.to_string().contains("1062"));
     assert_eq!(
         applier.executor().operations().as_slice(),
-        [
-            "BEGIN",
-            "EXEC",
-            "LOCK_CHECKPOINT",
-            "CHECKPOINT",
-            "EXEC",
-            "ROLLBACK",
-        ]
+        ["BEGIN", "EXEC", "EXEC", "ROLLBACK"]
     );
+    assert!(applier.executor().saved_positions.borrow().is_empty());
     assert!(!applier.executor().operations().contains(&"COMMIT"));
     assert!(!transaction.is_open());
 }
@@ -512,6 +505,7 @@ fn group_timeout_flushes_before_next_target_write() {
             "EXEC",
         ]
     );
+    assert_eq!(*applier.executor().saved_positions.borrow(), [260]);
     assert!(transaction.is_open());
 }
 

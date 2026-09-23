@@ -30,6 +30,9 @@ pub(super) struct TargetTransaction {
     source_transactions: usize,
     opened_at: Option<Instant>,
     pending_file_checkpoint: Option<crate::checkpoint::Checkpoint>,
+    /// Latest source coordinate reached inside the open target transaction; written once,
+    /// in the same transaction, just before it commits.
+    pending_transaction_checkpoint: Option<crate::checkpoint::Checkpoint>,
 }
 
 impl TargetTransaction {
@@ -89,6 +92,10 @@ impl TargetTransaction {
         self.pending_file_checkpoint.take()
     }
 
+    fn remember_transaction_checkpoint(&mut self, checkpoint: crate::checkpoint::Checkpoint) {
+        self.pending_transaction_checkpoint = Some(checkpoint);
+    }
+
     pub(super) fn should_flush(&self, config: TargetTransactionGroupConfig, force: bool) -> bool {
         self.has_completed_source_transactions()
             && (force
@@ -113,6 +120,7 @@ impl TargetTransaction {
         self.source_transactions = 0;
         self.opened_at = None;
         self.pending_file_checkpoint = None;
+        self.pending_transaction_checkpoint = None;
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -168,7 +176,7 @@ where
         return Ok(outcome);
     }
 
-    save_outcome_checkpoint(applier.executor(), context, event, &outcome)?;
+    save_outcome_checkpoint(context, event, &outcome)?;
     Ok(outcome)
 }
 
@@ -186,12 +194,12 @@ where
     context.target_transaction.record_source_transaction();
 
     if context.transaction_checkpoint_table.is_some() {
-        save_outcome_checkpoint(executor, context, event, outcome)?;
+        save_outcome_checkpoint(context, event, outcome)?;
         if context
             .target_transaction
             .should_flush(context.group_config, force_flush)
         {
-            context.target_transaction.commit_if_open(executor)?;
+            commit_target_group(executor, context)?;
         }
         return Ok(());
     }
@@ -221,7 +229,7 @@ where
         return Ok(());
     }
     let checkpoint = context.target_transaction.take_file_checkpoint();
-    if let Err(error) = context.target_transaction.commit_if_open(executor) {
+    if let Err(error) = commit_target_group(executor, context) {
         if let Some(checkpoint) = checkpoint {
             context
                 .target_transaction
@@ -235,6 +243,34 @@ where
         store.save_checkpoint(&checkpoint)?;
     }
     Ok(())
+}
+
+/// Commits the open target transaction after writing its pending transactional checkpoint,
+/// so the rows and the checkpoint of every grouped source transaction commit atomically.
+pub(super) fn commit_target_group<E, R, C>(
+    executor: &E,
+    context: &mut StreamEventContext<'_, R, C>,
+) -> Result<(), ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+{
+    let pending = context
+        .target_transaction
+        .pending_transaction_checkpoint
+        .take();
+    if let (Some(checkpoint), Some(checkpoint_table), Some(checkpoint_name)) = (
+        pending,
+        context.transaction_checkpoint_table,
+        context.transaction_checkpoint_name,
+    ) && let Err(error) =
+        lock_validate_and_save_checkpoint(executor, checkpoint_table, checkpoint_name, &checkpoint)
+    {
+        context
+            .target_transaction
+            .remember_transaction_checkpoint(checkpoint);
+        return Err(error);
+    }
+    context.target_transaction.commit_if_open(executor)
 }
 
 pub(super) fn remember_file_checkpoint<R, C>(
@@ -265,14 +301,12 @@ pub(super) fn event_can_write_target(event: &BinlogEvent, state: &StructuredEven
     }
 }
 
-pub(super) fn save_outcome_checkpoint<E, R, C>(
-    executor: &E,
+pub(super) fn save_outcome_checkpoint<R, C>(
     context: &mut StreamEventContext<'_, R, C>,
     event: &BinlogEvent,
     outcome: &StructuredEventOutcome,
 ) -> Result<(), ApplyBinlogError>
 where
-    E: TransactionalTargetExecutor,
     C: StreamCheckpointStore,
 {
     let Some(coordinate) = &outcome.resume_coordinate else {
@@ -280,19 +314,14 @@ where
     };
 
     if context.target_transaction.is_open()
-        && let (Some(checkpoint_table), Some(checkpoint_name)) = (
-            context.transaction_checkpoint_table,
-            context.transaction_checkpoint_name,
-        )
+        && context.transaction_checkpoint_table.is_some()
+        && context.transaction_checkpoint_name.is_some()
     {
         let checkpoint =
             crate::live::reconnect::coordinate_checkpoint(coordinate, event_name(event));
-        lock_validate_and_save_checkpoint(
-            executor,
-            checkpoint_table,
-            checkpoint_name,
-            &checkpoint,
-        )?;
+        context
+            .target_transaction
+            .remember_transaction_checkpoint(checkpoint);
         *context.current_file = coordinate.file.clone();
         return Ok(());
     }
