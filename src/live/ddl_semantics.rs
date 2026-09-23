@@ -447,6 +447,7 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         }
         if let Some(ast) = operation.alter_table_ast.as_ref() {
             self.validate_observed_json_alias_checks(ast, &before)?;
+            self.validate_observed_alter_foreign_keys(ast)?;
         }
         observe_operation_state(&before, &operation)
     }
@@ -509,6 +510,25 @@ impl LiveDdlSemanticInventory {
             return Err("JSON alias CHECK constraints changed during observation".into());
         }
         canonical::validate_json_alias_checks(&columns, &before)
+    }
+
+    fn validate_observed_alter_foreign_keys(
+        &self,
+        ast: &model::ParsedAlterTableAst,
+    ) -> Result<(), String> {
+        let adds_foreign_key = ast
+            .clauses
+            .iter()
+            .any(|clause| matches!(clause, model::ParsedAlterClause::AddForeignKey(_)));
+        if !adds_foreign_key {
+            return Ok(());
+        }
+        let keys = crate::inventory::build_canonical_foreign_key_inventory(
+            &self.target_schema,
+            &self.target,
+        )
+        .map_err(|error| format!("failed to read ALTER foreign-key actions: {error}"))?;
+        canonical::validate_alter_foreign_keys(ast, &self.target_schema, &keys)
     }
 
     fn validate_observed_create_foreign_keys(

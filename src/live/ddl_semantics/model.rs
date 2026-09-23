@@ -185,6 +185,7 @@ pub enum ParsedAlterClause {
         if_not_exists: bool,
     },
     AddCheck(ParsedCheckConstraintAst),
+    AddForeignKey(ParsedCreateForeignKeyAst),
     DropColumn(ParsedDropColumnAst),
     DropIndex(ParsedDropIndexAst),
 }

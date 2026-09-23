@@ -59,6 +59,7 @@ fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
             ParsedAlterClause::AddColumn(column) => column.data_type != "timestamp",
             ParsedAlterClause::AddKey { .. }
             | ParsedAlterClause::AddCheck(_)
+            | ParsedAlterClause::AddForeignKey(_)
             | ParsedAlterClause::ModifyVarchar { .. } => true,
             ParsedAlterClause::DropColumn(_) | ParsedAlterClause::DropIndex(_) => false,
         })
@@ -220,6 +221,7 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
                 check_constraint::render_check_constraint(constraint)
             )
         }
+        ParsedAlterClause::AddForeignKey(key) => format!("ADD {}", render_create_foreign_key(key)),
         ParsedAlterClause::DropColumn(column) => {
             format!("DROP COLUMN {}", quote_identifier(&column.name))
         }
@@ -2034,6 +2036,9 @@ fn parse_production_add_clause(
             require_keyword(tokens, index + 2, "KEY")?;
             parse_add_key_clause(tokens, index + 2, table, true)
         }
+        Some(kind) if kind == "CONSTRAINT" && tokens_match(tokens, index + 3, "FOREIGN") => {
+            parse_add_foreign_key_clause(tokens, quoted_flags, index)
+        }
         Some(kind) if kind == "CONSTRAINT" => {
             let (constraint, next_index) =
                 check_constraint::parse_named_check(tokens, quoted_flags, index + 1, literals)?;
@@ -2043,6 +2048,50 @@ fn parse_production_add_clause(
             "unsupported production ALTER TABLE clause {actual:?}"
         )),
     }
+}
+
+/// Parses `ADD CONSTRAINT <name> FOREIGN KEY (<column>) REFERENCES <table> (<column>)
+/// ON DELETE CASCADE|RESTRICT`; update stays the implicit RESTRICT.
+fn parse_add_foreign_key_clause(
+    tokens: &[String],
+    quoted_flags: &[bool],
+    index: usize,
+) -> Result<(ParsedAlterClause, usize), String> {
+    let name = require_identifier(tokens, index + 2, "foreign key name")?;
+    let child = require_identifier(tokens, index + 6, "foreign key column")?;
+    let parent_table = require_identifier(tokens, index + 9, "referenced table")?;
+    let parent = require_identifier(tokens, index + 11, "referenced column")?;
+    let keywords = [
+        (1, "CONSTRAINT"),
+        (3, "FOREIGN"),
+        (4, "KEY"),
+        (5, "("),
+        (7, ")"),
+        (8, "REFERENCES"),
+        (10, "("),
+        (12, ")"),
+        (13, "ON"),
+        (14, "DELETE"),
+    ];
+    for (offset, keyword) in keywords {
+        require_unquoted_token(quoted_flags, index + offset, keyword)?;
+        require_keyword(tokens, index + offset, keyword)?;
+    }
+    let delete_rule = ["CASCADE", "RESTRICT"]
+        .into_iter()
+        .find(|rule| tokens_match(tokens, index + 15, rule))
+        .ok_or_else(|| "ADD FOREIGN KEY requires ON DELETE CASCADE or RESTRICT".to_string())?;
+    require_unquoted_token(quoted_flags, index + 15, "ON DELETE action")?;
+    Ok((
+        ParsedAlterClause::AddForeignKey(super::model::ParsedCreateForeignKeyAst {
+            name,
+            columns: vec![child],
+            referenced_table: parent_table,
+            referenced_columns: vec![parent],
+            delete_rule: delete_rule.to_string(),
+        }),
+        index + 16,
+    ))
 }
 
 struct ParsedColumnOptions {

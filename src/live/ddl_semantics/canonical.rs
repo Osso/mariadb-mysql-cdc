@@ -71,6 +71,54 @@ pub(crate) fn build_resolved_create_table_evidence(
     })
 }
 
+/// Verifies the action and identity of each foreign key an ALTER adds once the target
+/// reports it; an absent key is ordinary pre-state.
+pub(crate) fn validate_alter_foreign_keys(
+    ast: &ParsedAlterTableAst,
+    target_schema: &str,
+    observed: &[crate::canonical_foreign_key::CanonicalForeignKey],
+) -> Result<(), String> {
+    for clause in &ast.clauses {
+        let ParsedAlterClause::AddForeignKey(key) = clause else {
+            continue;
+        };
+        let Some(actual) = observed
+            .iter()
+            .find(|item| item.constraint_name.eq_ignore_ascii_case(&key.name))
+        else {
+            continue;
+        };
+        if *actual != expected_canonical_foreign_key(key, &ast.table, target_schema) {
+            return Err(format!(
+                "ADD FOREIGN KEY `{}` definition or actions differ",
+                key.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expected_canonical_foreign_key(
+    key: &super::model::ParsedCreateForeignKeyAst,
+    child_table: &str,
+    target_schema: &str,
+) -> crate::canonical_foreign_key::CanonicalForeignKey {
+    crate::canonical_foreign_key::CanonicalForeignKey {
+        constraint_schema: target_schema.into(),
+        constraint_name: key.name.clone(),
+        child_schema: target_schema.into(),
+        child_table: child_table.into(),
+        child_columns: key.columns.clone(),
+        parent_schema: target_schema.into(),
+        parent_table: key.referenced_table.clone(),
+        parent_columns: key.referenced_columns.clone(),
+        update_rule: "RESTRICT".into(),
+        delete_rule: key.delete_rule.clone(),
+        match_option: "NONE".into(),
+        enforced: true,
+    }
+}
+
 pub(crate) fn validate_create_foreign_keys(
     ast: &ParsedCreateTableAst,
     target_schema: &str,
@@ -79,20 +127,7 @@ pub(crate) fn validate_create_foreign_keys(
     let mut expected = ast
         .foreign_keys
         .iter()
-        .map(|key| crate::canonical_foreign_key::CanonicalForeignKey {
-            constraint_schema: target_schema.into(),
-            constraint_name: key.name.clone(),
-            child_schema: target_schema.into(),
-            child_table: ast.name.clone(),
-            child_columns: key.columns.clone(),
-            parent_schema: target_schema.into(),
-            parent_table: key.referenced_table.clone(),
-            parent_columns: key.referenced_columns.clone(),
-            update_rule: "RESTRICT".into(),
-            delete_rule: key.delete_rule.clone(),
-            match_option: "NONE".into(),
-            enforced: true,
-        })
+        .map(|key| expected_canonical_foreign_key(key, &ast.name, target_schema))
         .collect::<Vec<_>>();
     expected.sort();
     let mut actual = observed
@@ -609,6 +644,15 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                 "kind": "add_check",
                 "constraint": super::transform::canonical_check_constraint_value(constraint),
             }),
+            ParsedAlterClause::AddForeignKey(key) => json!({
+                "kind": "add_foreign_key",
+                "name": key.name,
+                "columns": key.columns,
+                "referenced_table": key.referenced_table,
+                "referenced_columns": key.referenced_columns,
+                "delete_rule": key.delete_rule,
+                "update_rule": "RESTRICT",
+            }),
             ParsedAlterClause::DropColumn(column) => json!({
                 "kind": "drop_column",
                 "name": column.name,
@@ -738,6 +782,7 @@ fn apply_alter_clause(
         ParsedAlterClause::AddCheck(constraint) => {
             validate_add_check(expected, &ast.table, constraint)
         }
+        ParsedAlterClause::AddForeignKey(key) => apply_add_foreign_key(expected, &ast.table, key),
         ParsedAlterClause::DropColumn(column) => apply_drop_column(expected, &ast.table, column),
         ParsedAlterClause::DropIndex(index) => apply_drop_index(expected, &ast.table, index),
     }
@@ -764,6 +809,61 @@ fn validate_add_check(
             ));
         }
     }
+    Ok(())
+}
+
+/// MySQL silently creates an index for an unsupported foreign key, which the expected state
+/// cannot model, so the child column must already lead an index or the primary key.
+fn apply_add_foreign_key(
+    expected: &mut SemanticSchemaSnapshot,
+    table_name: &str,
+    key: &super::model::ParsedCreateForeignKeyAst,
+) -> Result<(), String> {
+    let table = find_table(expected, table_name)
+        .ok_or_else(|| format!("ADD FOREIGN KEY target `{table_name}` is missing"))?;
+    if !table
+        .columns
+        .iter()
+        .any(|column| column.name == key.columns[0])
+    {
+        return Err(format!(
+            "ADD FOREIGN KEY column `{table_name}`.`{}` is missing",
+            key.columns[0]
+        ));
+    }
+    let supported = table.primary_key.starts_with(&key.columns)
+        || table_indexes(expected, table_name).iter().any(|index| {
+            index
+                .columns
+                .first()
+                .is_some_and(|part| part.name == key.columns[0])
+        });
+    if !supported {
+        return Err(format!(
+            "ADD FOREIGN KEY `{}` lacks an explicit supporting index",
+            key.name
+        ));
+    }
+    if expected
+        .inventory
+        .foreign_keys
+        .iter()
+        .any(|existing| existing.name.eq_ignore_ascii_case(&key.name))
+    {
+        return Err(format!("foreign key `{}` already exists", key.name));
+    }
+    let referenced_schema = expected.inventory.schema.clone();
+    expected
+        .inventory
+        .foreign_keys
+        .push(crate::inventory::ForeignKeyInventory {
+            table: table_name.to_string(),
+            name: key.name.clone(),
+            columns: key.columns.clone(),
+            referenced_schema,
+            referenced_table: key.referenced_table.clone(),
+            referenced_columns: key.referenced_columns.clone(),
+        });
     Ok(())
 }
 

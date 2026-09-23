@@ -3,6 +3,8 @@ use super::*;
 const RUNS: &str = include_str!("../../../../fixtures/ddl/create-assistant-quality-runs.sql");
 const VERDICTS: &str =
     include_str!("../../../../fixtures/ddl/create-assistant-quality-verdicts.sql");
+const CONVERSATION_FK: &str =
+    include_str!("../../../../fixtures/ddl/alter-assistant-quality-verdicts-conversation-fk.sql");
 const IN_FLIGHT: &str =
     include_str!("../../../../fixtures/ddl/alter-assistant-quality-runs-in-flight-lock.sql");
 
@@ -232,4 +234,124 @@ fn in_flight_alter_rejects_unmodeled_generation_forms() {
             "accepted {sql}"
         );
     }
+}
+
+/// The observed conversation FK ALTER against the `accounts` fixture, whose `idx_handle`
+/// supports the child column.
+fn conversation_fk_on_accounts() -> String {
+    CONVERSATION_FK
+        .replace("`assistant_quality_verdicts`", "`accounts`")
+        .replace("(`conversation_id`)", "(`handle`)")
+}
+
+#[test]
+fn conversation_fk_alter_renders_named_cascading_foreign_key() {
+    let result = translate_ddl(CONVERSATION_FK, &[]).expect("ADD FOREIGN KEY must translate");
+    assert_eq!(
+        result.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `assistant_quality_verdicts` ADD CONSTRAINT `fk_aqv_conversation` FOREIGN KEY (`conversation_id`) REFERENCES `llm_conversations` (`id`) ON DELETE CASCADE"
+        )
+    );
+}
+
+#[test]
+fn conversation_fk_alter_expects_foreign_key_and_keeps_indexes() {
+    let target = semantic_snapshot(0, Some(1));
+    let operation = parse_ddl_operation(&conversation_fk_on_accounts()).expect("operation");
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("evidence");
+    let pre: serde_json::Value = serde_json::from_str(&evidence.pre_state).unwrap();
+    let post: serde_json::Value = serde_json::from_str(&evidence.expected_post_state).unwrap();
+    assert_eq!(post["indexes"], pre["indexes"]);
+    assert_eq!(pre["foreign_keys"], serde_json::json!([]));
+    assert_eq!(
+        post["foreign_keys"],
+        serde_json::json!([{
+            "table": "accounts",
+            "name": "fk_aqv_conversation",
+            "columns": ["handle"],
+            "referenced_schema": "fixture_cdc",
+            "referenced_table": "llm_conversations",
+            "referenced_columns": ["id"],
+        }])
+    );
+}
+
+#[test]
+fn conversation_fk_alter_rejects_unmodeled_forms() {
+    for (from, to) in [
+        ("ON DELETE CASCADE", "ON DELETE SET NULL"),
+        ("ON DELETE CASCADE", "ON DELETE CASCADE ON UPDATE CASCADE"),
+        ("ON DELETE CASCADE", ""),
+        ("(`conversation_id`)", "(`conversation_id`, `run_id`)"),
+        (
+            "REFERENCES `llm_conversations`",
+            "REFERENCES other.`llm_conversations`",
+        ),
+    ] {
+        let sql = CONVERSATION_FK.replacen(from, to, 1);
+        assert!(
+            parse_production_alter_table_ast(&sql).is_err(),
+            "accepted {sql}"
+        );
+    }
+    let target = semantic_snapshot(0, Some(1));
+    let mut unindexed = target.clone();
+    unindexed.inventory.indexes.clear();
+    let mut existing = target.clone();
+    existing
+        .inventory
+        .foreign_keys
+        .push(crate::inventory::ForeignKeyInventory {
+            table: "accounts".into(),
+            name: "fk_aqv_conversation".into(),
+            columns: vec!["handle".into()],
+            referenced_schema: "fixture_cdc".into(),
+            referenced_table: "llm_conversations".into(),
+            referenced_columns: vec!["id".into()],
+        });
+    for (sql, snapshot) in [
+        (
+            CONVERSATION_FK.replace("`assistant_quality_verdicts`", "`accounts`"),
+            &target,
+        ),
+        (conversation_fk_on_accounts(), &unindexed),
+        (conversation_fk_on_accounts(), &existing),
+    ] {
+        let operation = parse_ddl_operation(&sql).expect("operation");
+        assert!(
+            build_semantic_evidence(&operation, snapshot, snapshot).is_err(),
+            "accepted {sql}"
+        );
+    }
+}
+
+#[test]
+fn conversation_fk_alter_verifies_observed_delete_rule() {
+    let ast = parse_production_alter_table_ast(&conversation_fk_on_accounts()).unwrap();
+    let key = crate::canonical_foreign_key::CanonicalForeignKey {
+        constraint_schema: "test".into(),
+        constraint_name: "fk_aqv_conversation".into(),
+        child_schema: "test".into(),
+        child_table: "accounts".into(),
+        child_columns: vec!["handle".into()],
+        parent_schema: "test".into(),
+        parent_table: "llm_conversations".into(),
+        parent_columns: vec!["id".into()],
+        update_rule: "RESTRICT".into(),
+        delete_rule: "CASCADE".into(),
+        match_option: "NONE".into(),
+        enforced: true,
+    };
+    let validate = |keys: &[crate::canonical_foreign_key::CanonicalForeignKey]| {
+        canonical::validate_alter_foreign_keys(&ast, "test", keys)
+    };
+    assert!(validate(&[]).is_ok(), "absent pre-state key is not drift");
+    assert!(validate(std::slice::from_ref(&key)).is_ok());
+    let mut restricted = key.clone();
+    restricted.delete_rule = "RESTRICT".into();
+    assert!(validate(&[restricted]).is_err());
+    let mut other_parent = key;
+    other_parent.parent_table = "users".into();
+    assert!(validate(&[other_parent]).is_err());
 }
