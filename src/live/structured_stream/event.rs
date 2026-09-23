@@ -234,11 +234,19 @@ pub(super) fn is_transaction_control_query(sql: &str) -> bool {
     )
 }
 
+/// MariaDB omits generated columns from FULL row images; the target computes those, so only
+/// target generated columns may be absent.
 pub(super) fn require_full_row_image(
     columns_present: &[bool],
+    table: &RowTableMap,
     operation: &str,
 ) -> Result<(), ApplyBinlogError> {
-    if columns_present.iter().all(|present| *present) {
+    let complete = columns_present.len() == table.columns.len()
+        && columns_present
+            .iter()
+            .zip(&table.columns)
+            .all(|(present, column)| *present || table.generated_columns.contains(column));
+    if complete {
         return Ok(());
     }
 

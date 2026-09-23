@@ -311,6 +311,10 @@ fn render_column_encoding(character_set: Option<&str>, collation: Option<&str>) 
 
 pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableAst, String> {
     if let Ok(ast) = observed_create::parse(source_sql) {
+        // Only the exact recorded event hash admits this table's CREATE.
+        if ast.name.eq_ignore_ascii_case("assistant_reply_reports") {
+            return Err("assistant_reply_reports CREATE is admitted only by exact hash".into());
+        }
         return Ok(ast);
     }
     let source_sql = strip_leading_ordinary_ddl_comments(source_sql)?;

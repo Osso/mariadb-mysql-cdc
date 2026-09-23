@@ -198,3 +198,18 @@ fn maps_constructed_write_update_and_delete_rows_to_recording_executor() {
         ]
     );
 }
+
+#[test]
+fn row_images_may_omit_only_target_generated_columns() {
+    // MariaDB omits generated columns from FULL row images; the target computes them.
+    let mut table = accounts_row_table_map().table;
+    table.generated_columns = vec!["note".to_string()];
+    let omits_generated = [true, true, true, false, true];
+    assert!(require_full_row_image(&omits_generated, &table, "update after").is_ok());
+    let omits_ordinary = [true, false, true, true, true];
+    assert!(require_full_row_image(&omits_ordinary, &table, "update after").is_err());
+    assert!(require_full_row_image(&[true; 4], &table, "write").is_err());
+    table.generated_columns.clear();
+    assert!(require_full_row_image(&omits_generated, &table, "write").is_err());
+    assert!(require_full_row_image(&[true; 5], &table, "write").is_ok());
+}

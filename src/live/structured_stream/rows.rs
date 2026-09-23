@@ -40,8 +40,8 @@ where
     if state.is_ignored_table_id(rows.table_id) {
         return Ok(EventPolicy::Ignore);
     }
-    require_full_row_image(&rows.columns_present, "write")?;
     let table = row_event_table_map(applier, rows.table_id, coordinate)?;
+    require_full_row_image(&rows.columns_present, &table, "write")?;
     let event = crate::row::WriteRowsEvent {
         coordinate: coordinate.clone(),
         table_id: rows.table_id,
@@ -65,9 +65,9 @@ where
     if state.is_ignored_table_id(rows.table_id) {
         return Ok(EventPolicy::Ignore);
     }
-    require_full_row_image(&rows.columns_before_update, "update before")?;
-    require_full_row_image(&rows.columns_after_update, "update after")?;
     let table = row_event_table_map(applier, rows.table_id, coordinate)?;
+    require_full_row_image(&rows.columns_before_update, &table, "update before")?;
+    require_full_row_image(&rows.columns_after_update, &table, "update after")?;
     let event = crate::row::UpdateRowsEvent {
         coordinate: coordinate.clone(),
         table_id: rows.table_id,
@@ -95,8 +95,8 @@ where
     if state.is_ignored_table_id(rows.table_id) {
         return Ok(EventPolicy::Ignore);
     }
-    require_full_row_image(&rows.columns_present, "delete")?;
     let table = row_event_table_map(applier, rows.table_id, coordinate)?;
+    require_full_row_image(&rows.columns_present, &table, "delete")?;
     let event = DeleteRowsEvent {
         coordinate: coordinate.clone(),
         table_id: rows.table_id,
