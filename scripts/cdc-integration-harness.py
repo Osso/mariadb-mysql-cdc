@@ -7850,13 +7850,23 @@ DELIMITER ;
             "CREATE UNIQUE INDEX idx_accounts_email_unique ON accounts (email);",
         )
         stop = self.coordinate()
-        result = self.run_stream(start, stop)
-        combined = (result.stdout + result.stderr).lower()
-        if result.returncode == 0 or "translator unavailable" not in combined:
-            raise HarnessError(
-                "unsupported DDL did not stop at the translation barrier:\n"
-                f"stdout={result.stdout}\nstderr={result.stderr}"
-            )
+        # A durable DDL block keeps the stream process alive, retrying from the unchanged
+        # checkpoint instead of exiting.
+        process, log = self.start_stream(start, stop)
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise HarnessError(f"stream exited at the DDL barrier: {log.read_text()}")
+                if log.read_text().count("DDL_blocked") >= 2:
+                    break
+                time.sleep(0.1)
+            else:
+                raise HarnessError(f"stream did not retry the DDL barrier: {log.read_text()}")
+        finally:
+            self.stop_sync_process(process)
+        if "translator_unavailable" not in log.read_text().lower():
+            raise HarnessError(f"DDL barrier reason differs: {log.read_text()}")
         target_indexes = self.query(
             self.target,
             "SHOW INDEX FROM accounts;",
