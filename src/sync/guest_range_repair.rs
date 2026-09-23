@@ -75,9 +75,9 @@ fn parse_options<'a>(
     target: &mut TargetMySqlConfig,
 ) -> Result<std::collections::BTreeMap<&'a str, u64>, String> {
     let mut options = std::collections::BTreeMap::new();
-    let mut pairs = args.chunks_exact(2);
-    for pair in &mut pairs {
-        let (flag, value) = (pair[0].as_str(), pair[1].as_str());
+    let (pairs, remainder) = args.as_chunks::<2>();
+    for [flag, value] in pairs {
+        let (flag, value) = (flag.as_str(), value.as_str());
         if crate::sync_cli::apply_source_option(source, flag, value)?
             || crate::sync_cli::apply_target_option(target, flag, value)?
         {
@@ -88,7 +88,7 @@ fn parse_options<'a>(
             return Err(format!("{flag} may be specified only once"));
         }
     }
-    if let Some(flag) = pairs.remainder().first() {
+    if let Some(flag) = remainder.first() {
         return Err(format!("{flag} needs a value"));
     }
     Ok(options)

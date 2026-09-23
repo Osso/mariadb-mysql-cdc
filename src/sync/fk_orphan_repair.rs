@@ -397,11 +397,11 @@ pub(crate) fn parse_fk_orphan_repair_config(
     args: Vec<String>,
 ) -> Result<FkOrphanRepairConfig, String> {
     let mut builder = FkOrphanRepairConfigBuilder::default();
-    let mut pairs = args.chunks_exact(2);
-    for pair in &mut pairs {
-        builder.apply(&pair[0], &pair[1])?;
+    let (pairs, remainder) = args.as_chunks::<2>();
+    for [flag, value] in pairs {
+        builder.apply(flag, value)?;
     }
-    if let Some(flag) = pairs.remainder().first() {
+    if let Some(flag) = remainder.first() {
         return Err(format!("{flag} needs a value"));
     }
     builder.finish()

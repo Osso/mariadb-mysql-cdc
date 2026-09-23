@@ -551,7 +551,9 @@ fn hex_bytes_parameter_value(
     }
     let bytes = value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(decode_hex_byte)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|()| {
@@ -563,9 +565,9 @@ fn hex_bytes_parameter_value(
     Ok(Value::Bytes(bytes))
 }
 
-fn decode_hex_byte(pair: &[u8]) -> Result<u8, ()> {
-    let high = decode_hex_digit(pair[0])?;
-    let low = decode_hex_digit(pair[1])?;
+fn decode_hex_byte([high, low]: &[u8; 2]) -> Result<u8, ()> {
+    let high = decode_hex_digit(*high)?;
+    let low = decode_hex_digit(*low)?;
     Ok(high << 4 | low)
 }
 
