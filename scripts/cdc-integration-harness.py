@@ -180,6 +180,9 @@ def default_scenarios() -> list[str]:
 
 
 class Harness:
+    # Extra stream-binlog flags a scenario opts into, e.g. production transaction grouping.
+    stream_extra_args: tuple[str, ...] = ()
+
     def __init__(
         self,
         repo: Path,
@@ -195,7 +198,6 @@ class Harness:
         self.keep = keep
         self.tempdir = Path(tempfile.mkdtemp(prefix="mariadb-mysql-cdc-harness-"))
         self.containers: list[str] = []
-        self.stream_extra_args: list[str] = []
         self.source: Endpoint | None = None
         self.target: Endpoint | None = None
         self.ca_file = self.tempdir / "ca.pem"
@@ -3494,7 +3496,7 @@ DELIMITER ;
         target commit, a SIGKILL mid-catch-up leaves exactly the rows of the transactions up to
         the committed checkpoint, and a restart converges to the source."""
         assert self.source and self.target
-        self.stream_extra_args = list(self.PRODUCTION_GROUPING)
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
         self.setup_accounts_table()
         grouped = 2000
         start = self.coordinate()
