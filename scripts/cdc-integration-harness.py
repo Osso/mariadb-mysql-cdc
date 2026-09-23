@@ -37,7 +37,7 @@ SYNC_TARGET_PASSWORD = "cdc-sync-password"
 TARGET_USER = LIVE_TARGET_USER
 TARGET_PASSWORD = LIVE_TARGET_PASSWORD
 SOURCE_IMAGE = "mariadb:11.4"
-TARGET_IMAGE = "mysql:8.0"
+TARGET_IMAGE = os.environ.get("CDC_HARNESS_TARGET_IMAGE", "mysql:8.0")
 SOURCE_IDENTITY = "cdc-harness-source"
 
 
@@ -95,6 +95,7 @@ SCENARIOS = (
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
+    ScenarioSpec("assistant-quality-pending-replay", True),
     ScenarioSpec("commented-drop-column-present-pending-replay", True),
     ScenarioSpec("commented-drop-column-absent-pending-replay", True),
     ScenarioSpec("bootstrap-contract", True),
@@ -3090,6 +3091,198 @@ DELIMITER ;
         "alter-reader-memory-profiles-checkpoints.sql",
         "alter-reader-memory-operations-batch.sql",
     )
+
+    ASSISTANT_QUALITY_FOLLOWING_DDL = (
+        "create-assistant-quality-verdicts.sql",
+        "alter-assistant-quality-runs-in-flight-lock.sql",
+        "alter-assistant-quality-verdicts-conversation-key.sql",
+        "alter-assistant-quality-verdicts-conversation-fk.sql",
+    )
+
+    def run_assistant_quality_pending_replay(self) -> None:
+        """The mysqld-bin.003089 barrier: a pending assistant_quality_runs CREATE (integer
+        display widths, column comments, JSON) followed by the verdicts CREATE with a RESTRICT
+        foreign key, a stored generated column with a unique key, an ADD KEY, and an ALTER
+        foreign key, with DML before and after the generated column exists."""
+        assert self.source and self.target
+        fixtures = self.repo / "fixtures/ddl"
+        conversations = (
+            "CREATE TABLE llm_conversations (id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+            "uuid CHAR(36) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci; "
+            "INSERT INTO llm_conversations VALUES (11,'c-11'),(12,'c-12');"
+        )
+        runs_ddl = (fixtures / "create-assistant-quality-runs.sql").read_text().strip()
+        start, pending = self.prepare_pending_add_column(
+            conversations, runs_ddl, "CREATE TABLE", old_binary=self.old_binary
+        )
+        verdicts_ddl, *alters = [
+            (fixtures / name).read_text().strip() + ";"
+            for name in self.ASSISTANT_QUALITY_FOLLOWING_DDL
+        ]
+        self.admin_sql(self.source, verdicts_ddl)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO assistant_quality_runs (uuid,status,model,window_days,sample_size,create_time) "
+            "VALUES ('r-1','running','judge/m',7,50,'2026-09-23 08:00:00'),"
+            "('r-2','done','judge/m',7,50,'2026-09-23 08:01:00'),"
+            "('r-3','running','judge/m',7,50,'2026-09-23 08:02:00'); "
+            "UPDATE assistant_quality_runs SET is_active=0 WHERE uuid='r-3'; "
+            "INSERT INTO assistant_quality_verdicts (run_id,conversation_id,conversation_uuid,stratum,"
+            "turns,verdict,dimensions,tags,evidence,create_time) VALUES "
+            "(1,11,'c-11','1_turn',1,'satisfying','{\"a\": 1}','[\"x\"]',NULL,'2026-09-23 08:03:00'),"
+            "(2,12,'c-12','2_turns',2,'partial',NULL,'[]','{\"tag\": \"quote\"}','2026-09-23 08:04:00');",
+        )
+        for alter in alters:
+            self.admin_sql(self.source, alter)
+        self.admin_sql(
+            self.source,
+            "UPDATE assistant_quality_runs SET status='done',finish_time='2026-09-23 08:10:00' "
+            "WHERE uuid='r-1'; "
+            "INSERT INTO assistant_quality_runs (uuid,status,model,window_days,sample_size,create_time,"
+            "summary) VALUES ('r-4','running','judge/m',14,25,'2026-09-23 08:11:00','{\"headline\": \"ok\"}'); "
+            "INSERT INTO assistant_quality_verdicts (run_id,conversation_id,conversation_uuid,stratum,"
+            "create_time) VALUES (4,11,'c-11','9+_turns','2026-09-23 08:12:00'); "
+            "DELETE FROM assistant_quality_verdicts WHERE id=2;",
+        )
+        stop = self.replay_pending_ddl_sequence(start, pending, 5)
+        for table in ("assistant_quality_runs", "assistant_quality_verdicts"):
+            query = f"SELECT * FROM `{table}` ORDER BY id;"
+            source_rows = self.admin_query(self.source, query).strip()
+            target_rows = self.admin_query(self.target, query).strip()
+            if not source_rows or source_rows != target_rows:
+                raise HarnessError(
+                    f"{table} rows differ after replay:\nsource={source_rows!r}\ntarget={target_rows!r}"
+                )
+        locks = self.admin_query(
+            self.target, "SELECT uuid,in_flight_lock FROM assistant_quality_runs ORDER BY id;"
+        ).strip()
+        if locks != "r-1\tNULL\nr-2\tNULL\nr-3\tNULL\nr-4\t1":
+            raise HarnessError(f"target in_flight_lock values differ: {locks!r}")
+        self.assert_assistant_quality_metadata()
+        self.assert_admin_sql_rejected(
+            self.target,
+            "INSERT INTO assistant_quality_runs (uuid,status,model,window_days,sample_size) "
+            "VALUES ('r-5','running','judge/m',1,1);",
+            "uk_single_in_flight",
+        )
+        self.assert_admin_sql_rejected(
+            self.target,
+            "DELETE FROM assistant_quality_runs WHERE uuid='r-4';",
+            "fk_aqv_run",
+        )
+        self.admin_sql(self.target, "DELETE FROM llm_conversations WHERE id=11;")
+        remaining = self.admin_query(
+            self.target, "SELECT COUNT(*) FROM assistant_quality_verdicts;"
+        ).strip()
+        if remaining != "0":
+            raise HarnessError(f"conversation delete did not cascade verdicts: {remaining!r}")
+        print(
+            "assistant_quality_pending_replay_ok pending_promoted=true following_ddl=4 "
+            "display_widths=true column_comments=true stored_generated=true "
+            "generated_unique=true restrict_fk=true alter_fk_cascade=true post_ddl_rows=true "
+            f"old_binary_pending={self.old_binary is not None} coordinate={stop.file}:{stop.position}"
+        )
+
+    def replay_pending_ddl_sequence(
+        self, start: Coordinate, pending: dict[str, str], expected_events: int
+    ) -> Coordinate:
+        stop = self.coordinate()
+        process, log = self.start_stream(start, stop)
+        try:
+            deadline = time.monotonic() + 60
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if process.poll() != 0:
+                raise HarnessError(f"pending DDL sequence replay failed: {log.read_text()}")
+        finally:
+            self.stop_sync_process(process)
+        rows = [
+            line.split("\t")
+            for line in self.query(
+                self.target,
+                "SELECT event_start_position,status,transformation_version,"
+                "generated_sql IS NOT NULL,canonical_ast<>'',pre_state<>'',expected_post_state<>'',"
+                "CAST(created_at AS CHAR) FROM cdc.ddl_replay_journal "
+                "WHERE source_identity LIKE 'cdc-harness-source#server-id=%' "
+                "ORDER BY event_start_position;",
+                user=TARGET_USER,
+                password=TARGET_PASSWORD,
+            ).splitlines()
+            if line.strip()
+        ]
+        if len(rows) != expected_events:
+            raise HarnessError(f"expected {expected_events} journaled DDL events: {rows!r}")
+        promoted = rows[0]
+        if promoted[0] != pending["event_start_position"] or promoted[7] != pending["created_at"]:
+            raise HarnessError(f"promotion changed the pending row identity: {promoted!r}")
+        for row in rows:
+            if row[1:7] != ["checkpointed", "mariadb-mysql8-v1", "1", "1", "1", "1"]:
+                raise HarnessError(f"DDL event was not checkpointed with evidence: {row!r}")
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint["source_file"] != stop.file
+            or checkpoint["source_position"] != stop.position
+        ):
+            raise HarnessError(f"post-DDL checkpoint did not advance: {checkpoint!r}")
+        return stop
+
+    def assert_assistant_quality_metadata(self) -> None:
+        assert self.source and self.target
+        columns = self.admin_query(
+            self.target,
+            "SELECT column_name,column_type,is_nullable,IFNULL(column_default,'NULL'),extra,"
+            "column_comment,generation_expression FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='assistant_quality_runs' "
+            "AND column_name IN ('id','status','window_days','summary','is_active','creator_id',"
+            "'create_time','in_flight_lock') ORDER BY ordinal_position;",
+        ).strip()
+        expected = "\n".join(
+            [
+                "id\tint unsigned\tNO\tNULL\tauto_increment\t\t",
+                "status\tvarchar(16)\tNO\trunning\t\trunning|done|error\t",
+                "window_days\tsmallint unsigned\tNO\tNULL\t\t\t",
+                "summary\tlongtext\tYES\tNULL\t\taggregates: headline, strata, dims, tags, fbt\t",
+                "is_active\ttinyint unsigned\tNO\t1\t\t\t",
+                "creator_id\tint unsigned\tYES\tNULL\t\tadmin who pressed Run now; NULL for cron\t",
+                "create_time\ttimestamp\tNO\tCURRENT_TIMESTAMP\tDEFAULT_GENERATED\t\t",
+                "in_flight_lock\ttinyint unsigned\tYES\tNULL\tSTORED GENERATED\t"
+                "single-flight slot: 1 while active+running, NULL otherwise\t"
+                "if(((`status` = _utf8mb4\\'running\\') and (`is_active` = 1)),1,NULL)",
+            ]
+        )
+        if columns != expected:
+            raise HarnessError(f"assistant_quality_runs metadata differs:\n{columns}")
+        foreign_keys = (
+            "SELECT k.CONSTRAINT_NAME,k.COLUMN_NAME,k.REFERENCED_TABLE_NAME,k.REFERENCED_COLUMN_NAME,"
+            "CASE WHEN r.UPDATE_RULE IN ('NO ACTION','RESTRICT') THEN 'RESTRICT' "
+            "ELSE r.UPDATE_RULE END,r.DELETE_RULE "
+            "FROM information_schema.KEY_COLUMN_USAGE k "
+            "JOIN information_schema.REFERENTIAL_CONSTRAINTS r "
+            "ON r.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND r.TABLE_NAME=k.TABLE_NAME "
+            "AND r.CONSTRAINT_NAME=k.CONSTRAINT_NAME "
+            f"WHERE k.TABLE_SCHEMA={sql_literal(APP_SCHEMA)} "
+            "AND k.TABLE_NAME='assistant_quality_verdicts' ORDER BY k.CONSTRAINT_NAME;"
+        )
+        expected_keys = (
+            "fk_aqv_conversation\tconversation_id\tllm_conversations\tid\tRESTRICT\tCASCADE\n"
+            "fk_aqv_run\trun_id\tassistant_quality_runs\tid\tRESTRICT\tRESTRICT"
+        )
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, foreign_keys).strip()
+            if actual != expected_keys:
+                raise HarnessError(f"assistant_quality FK metadata differs: {actual!r}")
+        indexes = (
+            "SELECT TABLE_NAME,INDEX_NAME,NON_UNIQUE,GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) "
+            "FROM information_schema.STATISTICS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME LIKE 'assistant_quality_%' "
+            "GROUP BY TABLE_NAME,INDEX_NAME,NON_UNIQUE ORDER BY TABLE_NAME,INDEX_NAME;"
+        )
+        source_indexes = self.admin_query(self.source, indexes).strip()
+        target_indexes = self.admin_query(self.target, indexes).strip()
+        if not source_indexes or source_indexes != target_indexes:
+            raise HarnessError(
+                f"assistant_quality indexes differ:\nsource={source_indexes}\ntarget={target_indexes}"
+            )
 
     def run_reader_memory_create_pending_replay(self) -> None:
         """The mysqld-bin.003058 barrier: a pending reader_memory_profiles CREATE followed by
@@ -7781,6 +7974,8 @@ DELIMITER ;
             self.run_reader_memory_create_pending_replay()
         elif scenario == "reader-memory-guarded-alter-pending-replay":
             self.run_reader_memory_guarded_alter_pending_replay()
+        elif scenario == "assistant-quality-pending-replay":
+            self.run_assistant_quality_pending_replay()
         elif scenario == "commented-drop-column-present-pending-replay":
             self.run_commented_drop_column_pending_replay(present=True)
         elif scenario == "commented-drop-column-absent-pending-replay":
