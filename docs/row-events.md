@@ -21,6 +21,10 @@ The applier translates full row images into target DML:
   not change, only changed writable columns need assignment.
 - `DeleteRowsEvent` uses every before-image primary-key column for `DELETE`.
 
+MariaDB leaves generated columns out of FULL row images. A row image may omit a
+column only when the target reports it generated; the target computes it. Any
+other missing column stops the stream as a non-FULL image.
+
 Fractional-second temporal values keep microsecond precision: `DATETIME2`,
 `TIME2`, and `TIMESTAMP2` fractions decode to microseconds and render as a
 six-digit fraction whenever the fraction is non-zero, so `DATETIME(6)` columns
