@@ -1,0 +1,23 @@
+CREATE TABLE IF NOT EXISTS `assistant_quality_runs` (
+    `id`                      int(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `uuid`                    char(36) NOT NULL,
+    `status`                  varchar(16) NOT NULL DEFAULT 'running' COMMENT 'running|done|error',
+    `trigger_source`          varchar(16) NOT NULL DEFAULT 'cron' COMMENT 'cron|manual',
+    `model`                   varchar(128) NOT NULL COMMENT 'OpenRouter model id used by the judge',
+    `judge_prompt_version_id` int(11) UNSIGNED DEFAULT NULL COMMENT 'llm_prompts.id of the rubric used',
+    `window_days`             smallint(5) UNSIGNED NOT NULL,
+    `sample_size`             smallint(5) UNSIGNED NOT NULL COMMENT 'requested size',
+    `sampled_count`           smallint(5) UNSIGNED NOT NULL DEFAULT 0 COMMENT 'actually drawn',
+    `judged_count`            smallint(5) UNSIGNED NOT NULL DEFAULT 0,
+    `failed_count`            smallint(5) UNSIGNED NOT NULL DEFAULT 0,
+    `prompt_tokens`           int(11) UNSIGNED NOT NULL DEFAULT 0,
+    `completion_tokens`       int(11) UNSIGNED NOT NULL DEFAULT 0,
+    `summary`                 json DEFAULT NULL COMMENT 'aggregates: headline, strata, dims, tags, fbt',
+    `error`                   varchar(255) DEFAULT NULL,
+    `is_active`               tinyint(1) UNSIGNED NOT NULL DEFAULT 1,
+    `creator_id`              int(12) UNSIGNED DEFAULT NULL COMMENT 'admin who pressed Run now; NULL for cron',
+    `create_time`             timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `finish_time`             timestamp NULL DEFAULT NULL,
+    UNIQUE KEY `uk_uuid` (`uuid`),
+    KEY `idx_status_time` (`status`, `create_time`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci

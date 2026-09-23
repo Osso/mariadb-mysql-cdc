@@ -1,3 +1,4 @@
+mod assistant_quality;
 mod bigint_auto_increment;
 
 mod json_add;
@@ -1678,6 +1679,7 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 on_update_current_timestamp: false,
                 character_set: None,
                 collation: None,
+                comment: String::new(),
             },
             ParsedCreateColumnAst {
                 name: "kind".into(),
@@ -1688,6 +1690,7 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 on_update_current_timestamp: false,
                 character_set: None,
                 collation: None,
+                comment: String::new(),
             },
             ParsedCreateColumnAst {
                 name: "updated_at".into(),
@@ -1698,6 +1701,7 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 on_update_current_timestamp: true,
                 character_set: None,
                 collation: None,
+                comment: String::new(),
             },
             ParsedCreateColumnAst {
                 name: "created_at".into(),
@@ -1708,6 +1712,7 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 on_update_current_timestamp: false,
                 character_set: None,
                 collation: None,
+                comment: String::new(),
             },
         ],
         primary_key: vec!["id".into()],

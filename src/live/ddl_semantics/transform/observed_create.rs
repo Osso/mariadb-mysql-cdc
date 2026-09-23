@@ -1,4 +1,5 @@
-// Typed grammar for observed facet, storefront, and reader-memory CREATE statements.
+// Typed grammar for observed facet, storefront, reader-memory, and assistant-quality CREATE
+// statements.
 use super::super::model::{
     ParsedCheckConstraintAst, ParsedCreateColumnAst, ParsedCreateForeignKeyAst, ParsedIndexAst,
 };
@@ -210,9 +211,14 @@ impl Parser {
         self.keyword("REFERENCES")?;
         let referenced_table = self.identifier()?;
         let referenced_columns = self.key_columns()?;
-        for keyword in ["ON", "DELETE", "CASCADE"] {
-            self.keyword(keyword)?;
-        }
+        self.keyword("ON")?;
+        self.keyword("DELETE")?;
+        let delete_rule = if self.at("RESTRICT") {
+            "RESTRICT"
+        } else {
+            "CASCADE"
+        };
+        self.keyword(delete_rule)?;
         if columns.len() != 1 || referenced_columns.len() != 1 {
             return Err("observed CREATE foreign key requires one column".into());
         }
@@ -221,6 +227,7 @@ impl Parser {
             columns,
             referenced_table,
             referenced_columns,
+            delete_rule: delete_rule.into(),
         })
     }
 
@@ -326,6 +333,7 @@ impl Parser {
             self.keyword("PRIMARY")?;
             self.keyword("KEY")?;
         }
+        let comment = self.column_comment()?;
         Ok((
             ParsedCreateColumnAst {
                 name,
@@ -336,9 +344,27 @@ impl Parser {
                 on_update_current_timestamp,
                 character_set,
                 collation,
+                comment,
             },
             inline_primary,
         ))
+    }
+
+    /// Consumes an optional trailing `COMMENT '<literal>'` of printable ASCII without quotes.
+    fn column_comment(&mut self) -> Result<String, String> {
+        if !self.at("COMMENT") {
+            return Ok(String::new());
+        }
+        self.keyword("COMMENT")?;
+        self.keyword("<string>")?;
+        let value = self.literals.next().ok_or("missing COMMENT literal")?;
+        let printable = value
+            .chars()
+            .all(|character| (' '..='~').contains(&character) && character != '\'');
+        if value.is_empty() || value.len() > 1024 || !printable {
+            return Err("unmodeled observed CREATE column comment".into());
+        }
+        Ok(value)
     }
 
     fn column_encoding(
@@ -510,6 +536,28 @@ impl Parser {
         Ok(format!("enum({})", members.join(",")))
     }
 
+    /// Consumes an optional MariaDB integer display width; MySQL 8 has no display width for
+    /// these types, so the width carries no target semantics.
+    fn integer_display_width(&mut self) -> Result<(), String> {
+        if !self.at("(") {
+            return Ok(());
+        }
+        self.keyword("(")?;
+        let width = self
+            .tokens
+            .get(self.position)
+            .cloned()
+            .ok_or("missing integer display width")?;
+        let value = width
+            .parse::<u8>()
+            .map_err(|_| "invalid integer display width")?;
+        if value == 0 || value.to_string() != width {
+            return Err("noncanonical integer display width".into());
+        }
+        self.keyword(&width)?;
+        self.keyword(")")
+    }
+
     fn column_type(&mut self) -> Result<String, String> {
         if self.at("ENUM") {
             return self.enum_type();
@@ -523,6 +571,7 @@ impl Parser {
         for kind in ["INT", "MEDIUMINT", "SMALLINT", "BIGINT"] {
             if self.at(kind) {
                 self.keyword(kind)?;
+                self.integer_display_width()?;
                 self.keyword("UNSIGNED")?;
                 return Ok(format!("{} unsigned", kind.to_ascii_lowercase()));
             }

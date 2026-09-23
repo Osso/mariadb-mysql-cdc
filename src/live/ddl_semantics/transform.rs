@@ -469,6 +469,7 @@ fn create_column(
         on_update_current_timestamp: false,
         character_set: None,
         collation: None,
+        comment: String::new(),
     }
 }
 
@@ -517,6 +518,7 @@ fn parse_fixture_table_column(
             on_update_current_timestamp: false,
             character_set: None,
             collation: None,
+            comment: String::new(),
         },
         primary,
         next_index,
@@ -1489,8 +1491,13 @@ fn render_create_column(column: &ParsedCreateColumnAst) -> String {
     };
     let encoding =
         render_column_encoding(column.character_set.as_deref(), column.collation.as_deref());
+    let comment = if column.comment.is_empty() {
+        String::new()
+    } else {
+        format!(" COMMENT {}", quote_string_literal(&column.comment))
+    };
     format!(
-        "{} {column_type}{encoding} {nullability}{default}{on_update}{auto_increment}",
+        "{} {column_type}{encoding} {nullability}{default}{on_update}{auto_increment}{comment}",
         quote_identifier(&column.name),
     )
 }
@@ -1509,9 +1516,10 @@ fn render_create_foreign_key(key: &super::model::ParsedCreateForeignKeyAst) -> S
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {} ({referenced}) ON DELETE CASCADE",
+        "CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {} ({referenced}) ON DELETE {}",
         quote_identifier(&key.name),
-        quote_identifier(&key.referenced_table)
+        quote_identifier(&key.referenced_table),
+        key.delete_rule,
     )
 }
 

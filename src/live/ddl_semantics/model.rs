@@ -59,6 +59,8 @@ pub struct ParsedCreateColumnAst {
     pub on_update_current_timestamp: bool,
     pub character_set: Option<String>,
     pub collation: Option<String>,
+    /// Column `COMMENT` literal; empty when the source declares none.
+    pub comment: String,
 }
 
 /// One predicate of a bounded CHECK constraint; predicates are joined with `OR`.
@@ -76,13 +78,15 @@ pub struct ParsedCheckConstraintAst {
     pub disjuncts: Vec<CheckPredicate>,
 }
 
-/// A same-schema CREATE foreign key with ON DELETE CASCADE and implicit RESTRICT on update.
+/// A same-schema CREATE foreign key with ON DELETE CASCADE or RESTRICT and implicit RESTRICT
+/// on update.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedCreateForeignKeyAst {
     pub name: String,
     pub columns: Vec<String>,
     pub referenced_table: String,
     pub referenced_columns: Vec<String>,
+    pub delete_rule: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

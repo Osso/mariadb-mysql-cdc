@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS `assistant_quality_verdicts` (
+    `id`                  bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `run_id`              int(11) UNSIGNED NOT NULL,
+    `conversation_id`     int(11) UNSIGNED NOT NULL,
+    `conversation_uuid`   char(36) NOT NULL,
+    `stratum`             varchar(16) NOT NULL COMMENT '1_turn|2_turns|3-4_turns|5-8_turns|9+_turns',
+    `surface`             varchar(16) DEFAULT NULL COMMENT 'first user turn context',
+    `turns`               smallint(5) UNSIGNED NOT NULL DEFAULT 0,
+    `verdict`             varchar(16) DEFAULT NULL COMMENT 'satisfying|partial|unsatisfying|errored',
+    `dimensions`          json DEFAULT NULL,
+    `tags`                json DEFAULT NULL,
+    `evidence`            json DEFAULT NULL COMMENT 'tag => verbatim quote',
+    `first_bad_turn`      smallint(5) UNSIGNED DEFAULT NULL,
+    `user_frustration`    tinyint(1) UNSIGNED NOT NULL DEFAULT 0,
+    `note`                varchar(255) DEFAULT NULL,
+    `had_canned_fallback` tinyint(1) UNSIGNED NOT NULL DEFAULT 0 COMMENT 'joined metadata, not judged',
+    `judge_error`         varchar(255) DEFAULT NULL,
+    `create_time`         timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY `uk_run_conversation` (`run_id`, `conversation_id`),
+    KEY `idx_run_verdict` (`run_id`, `verdict`),
+    CONSTRAINT `fk_aqv_run` FOREIGN KEY (`run_id`) REFERENCES `assistant_quality_runs` (`id`) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci

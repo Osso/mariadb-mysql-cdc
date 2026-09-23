@@ -89,7 +89,7 @@ pub(crate) fn validate_create_foreign_keys(
             parent_table: key.referenced_table.clone(),
             parent_columns: key.referenced_columns.clone(),
             update_rule: "RESTRICT".into(),
-            delete_rule: "CASCADE".into(),
+            delete_rule: key.delete_rule.clone(),
             match_option: "NONE".into(),
             enforced: true,
         })
@@ -407,7 +407,7 @@ pub(crate) fn expected_create_table_post_state(
                     collation,
                     default_value,
                     extra: expected_create_column_extra(column, generated_default),
-                    comment: String::new(),
+                    comment: column.comment.clone(),
                     generated: None,
                 }
             })
@@ -541,6 +541,9 @@ fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::V
                 value["character_set"] = json!(character_set);
                 value["collation"] = json!(collation);
             }
+            if !column.comment.is_empty() {
+                value["comment"] = json!(column.comment);
+            }
             value
         }).collect::<Vec<_>>(),
         "primary_key": ast.primary_key,
@@ -558,7 +561,7 @@ fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::V
                     "columns": key.columns,
                     "referenced_table": key.referenced_table,
                     "referenced_columns": key.referenced_columns,
-                    "delete_rule": "CASCADE",
+                    "delete_rule": key.delete_rule,
                     "update_rule": "RESTRICT",
                 }))
                 .collect::<Vec<_>>()
