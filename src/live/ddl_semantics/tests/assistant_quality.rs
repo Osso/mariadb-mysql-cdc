@@ -3,6 +3,8 @@ use super::*;
 const RUNS: &str = include_str!("../../../../fixtures/ddl/create-assistant-quality-runs.sql");
 const VERDICTS: &str =
     include_str!("../../../../fixtures/ddl/create-assistant-quality-verdicts.sql");
+const IN_FLIGHT: &str =
+    include_str!("../../../../fixtures/ddl/alter-assistant-quality-runs-in-flight-lock.sql");
 
 fn post_state_column(post: &serde_json::Value, name: &str) -> serde_json::Value {
     post["definition"]["columns"]
@@ -41,10 +43,7 @@ fn quality_runs_create_drops_integer_display_widths_and_keeps_comments() {
     assert_eq!(column("window_days").comment, "");
     assert_eq!(column("summary").column_type, "longtext");
 
-    let sql = transform_fixture_create_table(RUNS)
-        .unwrap()
-        .target_sql
-        .unwrap();
+    let sql = translate_ddl(RUNS, &[]).unwrap().target_sql.unwrap();
     assert!(
         sql.contains(
             "`status` VARCHAR(16) NOT NULL DEFAULT 'running' COMMENT 'running|done|error'"
@@ -80,10 +79,7 @@ fn quality_verdicts_create_preserves_restrict_foreign_key() {
     assert_eq!(ast.check_constraints.len(), 3);
     assert_eq!(ast.foreign_keys.len(), 1);
     assert_eq!(ast.foreign_keys[0].delete_rule, "RESTRICT");
-    let sql = transform_fixture_create_table(VERDICTS)
-        .unwrap()
-        .target_sql
-        .unwrap();
+    let sql = translate_ddl(VERDICTS, &[]).unwrap().target_sql.unwrap();
     assert!(sql.contains(
         "CONSTRAINT `fk_aqv_run` FOREIGN KEY (`run_id`) REFERENCES `assistant_quality_runs` (`id`) ON DELETE RESTRICT"
     ));
@@ -135,6 +131,105 @@ fn quality_create_rejects_unmodeled_width_comment_and_action_forms() {
         assert!(
             parse_fixture_create_table(&rejected).is_err(),
             "accepted {rejected}"
+        );
+    }
+}
+
+/// The observed in-flight ALTER against the `accounts` fixture table, whose `handle` and
+/// `is_active` columns stand in for `status` and `is_active`.
+fn in_flight_on_accounts() -> String {
+    IN_FLIGHT
+        .replace("`assistant_quality_runs`", "`accounts`")
+        .replace("`status`", "`handle`")
+}
+
+fn accounts_with_is_active() -> SemanticSchemaSnapshot {
+    let mut target = semantic_snapshot(0, Some(1));
+    let table = &mut target.inventory.tables[0];
+    table.columns.push(ColumnInventory {
+        name: "is_active".into(),
+        ordinal_position: 3,
+        column_type: "tinyint unsigned".into(),
+        data_type: "tinyint".into(),
+        is_nullable: false,
+        character_set: None,
+        collation: None,
+        default_value: Some("1".into()),
+        extra: String::new(),
+        comment: String::new(),
+        generated: None,
+    });
+    target
+}
+
+#[test]
+fn in_flight_alter_renders_stored_generated_column_and_unique_key() {
+    let result = translate_ddl(IN_FLIGHT, &[]).expect("generated ALTER must translate");
+    assert_eq!(
+        result.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `assistant_quality_runs` ADD COLUMN `in_flight_lock` TINYINT UNSIGNED GENERATED ALWAYS AS (IF(`status` = _utf8mb4'running' AND `is_active` = 1, 1, NULL)) STORED COMMENT 'single-flight slot: 1 while active+running, NULL otherwise', ADD UNIQUE KEY `uk_single_in_flight` (`in_flight_lock`)"
+        )
+    );
+}
+
+#[test]
+fn in_flight_alter_expects_mysql_generation_metadata() {
+    let target = accounts_with_is_active();
+    let operation = parse_ddl_operation(&in_flight_on_accounts()).expect("operation");
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("evidence");
+    let post: serde_json::Value = serde_json::from_str(&evidence.expected_post_state).unwrap();
+    let column = post_state_column(&post, "in_flight_lock");
+    assert_eq!(column["column_type"], "tinyint unsigned");
+    assert_eq!(column["is_nullable"], true);
+    assert_eq!(column["default_value"], serde_json::Value::Null);
+    assert_eq!(column["extra"], "STORED GENERATED");
+    assert_eq!(column["ordinal_position"], 4);
+    assert_eq!(
+        column["generated"]["expression"],
+        "if(((`handle` = _utf8mb4\\'running\\') and (`is_active` = 1)),1,NULL)"
+    );
+    assert_eq!(column["generated"]["generation_kind"], "STORED");
+    let key = post["indexes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|index| index["name"] == "uk_single_in_flight")
+        .expect("unique key");
+    assert_eq!(key["unique"], true);
+}
+
+#[test]
+fn in_flight_alter_rejects_unmodeled_generation_forms() {
+    for (from, to) in [
+        ("PERSISTENT", "VIRTUAL"),
+        ("PERSISTENT", ""),
+        ("PERSISTENT", "PERSISTENT NOT NULL"),
+        ("PERSISTENT", "PERSISTENT DEFAULT NULL"),
+        ("`is_active` = 1", "`is_active` > 1"),
+        ("`is_active` = 1", "`is_active` = 01"),
+        ("AND", "OR"),
+        ("'running'", "'run ning'"),
+        (", 1, NULL", ", 1, 0"),
+        (", 1, NULL", ", 256, NULL"),
+        ("IF(", "COALESCE("),
+        ("tinyint(1) UNSIGNED", "varchar(8)"),
+    ] {
+        let sql = IN_FLIGHT.replacen(from, to, 1);
+        assert!(
+            parse_production_alter_table_ast(&sql).is_err(),
+            "accepted {sql}"
+        );
+    }
+    let target = accounts_with_is_active();
+    for sql in [
+        in_flight_on_accounts().replace("`handle`", "`missing`"),
+        in_flight_on_accounts().replace("`handle` = 'running'", "`id` = 1"),
+    ] {
+        let operation = parse_ddl_operation(&sql).expect("operation");
+        assert!(
+            build_semantic_evidence(&operation, &target, &target).is_err(),
+            "accepted {sql}"
         );
     }
 }

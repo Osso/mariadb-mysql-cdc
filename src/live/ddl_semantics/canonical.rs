@@ -651,6 +651,12 @@ fn canonical_add_column_ast_value(column: &ParsedAddColumnAst) -> serde_json::Va
         value["character_set"] = json!(character_set);
         value["collation"] = json!(collation);
     }
+    if let Some(expression) = &column.generated {
+        value["generated"] = json!({
+            "expression": super::transform::mysql_generation_expression(expression),
+            "generation_kind": "STORED",
+        });
+    }
     value
 }
 
@@ -810,6 +816,7 @@ fn apply_add_column(
         .columns
         .iter()
         .position(|item| item.name == column.name);
+    validate_generated_references(table, table_name, column)?;
     let insertion = add_column_insertion_index(table, table_name, column, existing_index)?;
     let expected_column = expected_added_column(table, table_name, column, insertion)?;
     if let Some(index) = existing_index {
@@ -870,8 +877,10 @@ fn expected_added_column(
         }
         _ => column_default_encoding(&column.data_type, table_character_set, table_collation),
     };
-    let (default_value, extra) =
-        expected_added_column_default(&column.data_type, column.default_value.as_deref());
+    let (default_value, extra) = match &column.generated {
+        Some(_) => (None, "STORED GENERATED".to_string()),
+        None => expected_added_column_default(&column.data_type, column.default_value.as_deref()),
+    };
     let (column_type, data_type) = if column.data_type == "json" {
         ("longtext".to_string(), "longtext".to_string())
     } else {
@@ -888,8 +897,38 @@ fn expected_added_column(
         default_value,
         extra,
         comment: column.comment.clone(),
-        generated: None,
+        generated: column
+            .generated
+            .as_ref()
+            .map(|expression| crate::inventory::GeneratedColumn {
+                expression: super::transform::mysql_generation_expression(expression),
+                generation_kind: "STORED".to_string(),
+            }),
     })
+}
+
+/// MySQL rejects generation expressions over AUTO_INCREMENT columns and this grammar admits
+/// only ordinary existing columns, so every reference must name one.
+fn validate_generated_references(
+    table: &crate::inventory::TableInventory,
+    table_name: &str,
+    column: &ParsedAddColumnAst,
+) -> Result<(), String> {
+    let Some(expression) = &column.generated else {
+        return Ok(());
+    };
+    for name in super::transform::generated_referenced_columns(expression) {
+        let ordinary = table.columns.iter().any(|item| {
+            item.name == name && item.generated.is_none() && !item.extra.contains("auto_increment")
+        });
+        if !ordinary {
+            return Err(format!(
+                "generated column `{table_name}`.`{}` references non-ordinary column `{name}`",
+                column.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_json_alias_checks(
@@ -1264,8 +1303,15 @@ fn validate_index_key_parts<'a>(
                     part.column
                 )
             })?;
-        if column.generated.is_some() {
-            return Err(format!("index column `{}` is generated", part.column));
+        if column
+            .generated
+            .as_ref()
+            .is_some_and(|generated| generated.generation_kind != "STORED")
+        {
+            return Err(format!(
+                "index column `{}` is virtual generated",
+                part.column
+            ));
         }
     }
     Ok(ast
@@ -1504,6 +1550,7 @@ mod json_alias_check_tests {
             after: None,
             character_set: Some("utf8mb4".into()),
             collation: Some("utf8mb4_bin".into()),
+            generated: None,
         };
         assert!(validate_json_alias_checks(&[&column], &[]).is_err());
         assert!(

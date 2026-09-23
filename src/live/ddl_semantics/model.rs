@@ -116,6 +116,21 @@ pub struct ParsedAddColumnAst {
     pub after: Option<String>,
     pub character_set: Option<String>,
     pub collation: Option<String>,
+    /// Stored generation expression; `None` for an ordinary column.
+    pub generated: Option<ParsedStoredIfExpression>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GeneratedOperand {
+    String(String),
+    Integer(u64),
+}
+
+/// `IF(<column> = <operand> [AND ...], <then_value>, NULL)` stored generation expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedStoredIfExpression {
+    pub equalities: Vec<(String, GeneratedOperand)>,
+    pub then_value: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

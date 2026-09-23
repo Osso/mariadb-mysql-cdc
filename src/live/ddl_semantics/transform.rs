@@ -1,7 +1,7 @@
 use super::model::{
     ParsedAddColumnAst, ParsedAlterAlgorithm, ParsedAlterClause, ParsedAlterLock,
     ParsedAlterTableAst, ParsedCreateColumnAst, ParsedCreateTableAst, ParsedDropColumnAst,
-    ParsedDropIndexAst, ParsedIndexAst, ParsedIndexKeyPart,
+    ParsedDropIndexAst, ParsedIndexAst, ParsedIndexKeyPart, ParsedStoredIfExpression,
 };
 use super::tokenizer::{
     ddl_contains_comments, split_one_leading_mysql_line_comment,
@@ -11,9 +11,13 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 mod check_constraint;
+mod generated_column;
 mod observed_create;
 
 pub(crate) use check_constraint::{canonical_check_constraint_value, referenced_columns};
+pub(crate) use generated_column::{
+    mysql_generation_expression, referenced_columns as generated_referenced_columns,
+};
 pub(crate) use observed_create::{current_timestamp_for, is_text_type, text_expression_default};
 
 pub const DDL_TRANSFORMATION_VERSION: &str = "mariadb-mysql8-v1";
@@ -147,6 +151,7 @@ fn is_exact_seen_column(column: &ParsedAddColumnAst, name: &str, comment: &str) 
             after: None,
             character_set: None,
             collation: None,
+            generated: None,
         }
 }
 
@@ -239,8 +244,15 @@ fn render_add_column(column: &ParsedAddColumnAst) -> String {
     } else {
         &column.column_type
     };
+    let attributes = match &column.generated {
+        Some(expression) => format!(
+            "GENERATED ALWAYS AS ({}) STORED",
+            generated_column::render_generation_sql(expression)
+        ),
+        None => format!("{nullability} DEFAULT {default_value}"),
+    };
     let mut sql = format!(
-        "ADD COLUMN {} {}{} {nullability} DEFAULT {default_value}",
+        "ADD COLUMN {} {}{} {attributes}",
         quote_identifier(&column.name),
         column_type.to_ascii_uppercase(),
         render_column_encoding(column.character_set.as_deref(), column.collation.as_deref()),
@@ -2059,9 +2071,27 @@ fn parse_add_column_clause(
     let name = require_identifier(tokens, name_index, "added column")?;
     let (column_type, data_type, encoding_start) =
         parse_observed_column_type(tokens, quoted_flags, name_index + 1)?;
-    let (character_set, collation, options_start) =
+    let (character_set, collation, generation_start) =
         parse_column_encoding(tokens, quoted_flags, encoding_start, &data_type)?;
+    let (generated, options_start) = parse_optional_stored_generation(
+        tokens,
+        quoted_flags,
+        generation_start,
+        literals,
+        &column_type,
+    )?;
     let options = parse_observed_column_options(tokens, options_start, literals, &data_type)?;
+    if generated.is_some()
+        && tokens[options_start..options.next_index]
+            .iter()
+            .any(|token| {
+                ["NOT", "NULL", "DEFAULT"]
+                    .iter()
+                    .any(|keyword| token.eq_ignore_ascii_case(keyword))
+            })
+    {
+        return Err("generated ADD COLUMN admits only COMMENT and AFTER options".into());
+    }
     let (character_set, collation) = if data_type == "json" {
         (Some("utf8mb4".into()), Some("utf8mb4_bin".into()))
     } else {
@@ -2079,9 +2109,30 @@ fn parse_add_column_clause(
             after: options.after,
             character_set,
             collation,
+            generated,
         }),
         options.next_index,
     ))
+}
+
+fn parse_optional_stored_generation(
+    tokens: &[String],
+    quoted_flags: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+    column_type: &str,
+) -> Result<(Option<ParsedStoredIfExpression>, usize), String> {
+    if !token_is_one_of(tokens, index, &["AS", "GENERATED"]) {
+        return Ok((None, index));
+    }
+    if column_type != "tinyint unsigned" {
+        return Err(format!(
+            "generated ADD COLUMN is unsupported for {column_type}"
+        ));
+    }
+    let (expression, next) =
+        generated_column::parse_stored_generation(tokens, quoted_flags, index, literals)?;
+    Ok((Some(expression), next))
 }
 
 /// Parses an optional `CHARACTER SET <charset> COLLATE <collation>` pair after a character type.
