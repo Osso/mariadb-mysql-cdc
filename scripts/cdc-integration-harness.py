@@ -2312,7 +2312,11 @@ DELIMITER ;
             .read_text()
             .strip()
         )
-        ddl = Path("/tmp/cdc-nullable-datetime.sql").read_text().strip()
+        ddl = (
+            (self.repo / "fixtures/ddl/modify-curated-strip-end-time.sql")
+            .read_text()
+            .strip()
+        )
         for endpoint in (self.source, self.target):
             self.admin_sql(endpoint, schema + ";")
             self.admin_sql(
