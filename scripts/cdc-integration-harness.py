@@ -91,6 +91,7 @@ SCENARIOS = (
     ScenarioSpec("spotlight-create-pending-replay", True),
     ScenarioSpec("curated-strip-create-pending-replay", True),
     ScenarioSpec("curated-strip-slides-create-pending-replay", True),
+    ScenarioSpec("sales-placements-create-pending-replay", True),
     ScenarioSpec("source-layout-json-pending-replay", True),
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
@@ -173,6 +174,7 @@ def default_scenarios() -> list[str]:
         not in {
             "curated-strip-create-pending-replay",
             "curated-strip-slides-create-pending-replay",
+            "sales-placements-create-pending-replay",
             "source-layout-json-pending-replay",
             "contributor-cards-check-collision-recovery",
         }
@@ -2829,6 +2831,146 @@ DELIMITER ;
             "orphan_rejected=true delete_cascade=true "
             f"coordinate={stop.file}:{stop.position}"
         )
+
+    def run_sales_placements_create_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError(
+                "sales placements replay requires --old-binary predating inline PRIMARY KEY"
+            )
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
+        table = "sales_placements"
+        ddl = (
+            (self.repo / "fixtures/ddl/create-sales-placements.sql").read_text().strip()
+        )
+        self.admin_sql(
+            self.target, f"ALTER DATABASE {APP_SCHEMA} COLLATE utf8mb4_0900_ai_ci;"
+        )
+        start, pending = self.prepare_pending_add_column(
+            "", ddl, "CREATE TABLE", prepared=True, old_binary=self.old_binary
+        )
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='{table}';",
+        ).strip()
+        if absent != "0":
+            raise HarnessError("old binary created sales placements before translation")
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table}(id,sale_id,target,placement_type,rule_json,create_time) VALUES "
+            "(101,42,'app_home_deals','card','{\"slot\":1}','2026-09-01 01:02:03'); "
+            f"INSERT INTO {table}(sale_id,target,placement_type,rule_json) VALUES "
+            "(43,'app_next_store','banner','{\"slot\":2}'); "
+            f"UPDATE {table} SET target_key_id=77,content_section_id=88,comic_id=99,"
+            "is_active=0,updater_id=12,update_time='2026-09-02 03:04:05' WHERE id=101; "
+            f"INSERT INTO {table}(id,sale_id,target,placement_type,rule_json) VALUES "
+            "(103,44,'landing','card','{\"slot\":3}'); "
+            f"DELETE FROM {table} WHERE id=103;",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_sales_placements_metadata()
+        query = (
+            f"SELECT id,sale_id,target,placement_type,target_key_id,content_section_id,"
+            "custom_card_id,comic_id,rule_json,is_active,creator_id,create_time IS NOT NULL,"
+            f"updater_id,update_time FROM {table} ORDER BY id;"
+        )
+        source_rows = self.admin_query(self.source, query).strip()
+        target_rows = self.admin_query(self.target, query).strip()
+        expected = (
+            '101\t42\tapp_home_deals\tcard\t77\t88\tNULL\t99\t{"slot":1}\t0\t0\t1\t12\t2026-09-02 03:04:05\n'
+            '102\t43\tapp_next_store\tbanner\tNULL\tNULL\tNULL\tNULL\t{"slot":2}\t1\t0\t1\tNULL\tNULL'
+        )
+        if source_rows != expected or target_rows != expected:
+            raise HarnessError(
+                f"sales placements replay rows differ: {source_rows!r} != {target_rows!r}"
+            )
+        self.admin_sql(
+            self.target,
+            f"INSERT INTO {table}(sale_id,target,placement_type,rule_json) "
+            "VALUES(45,'publisher:42','card','{}'); "
+            f"UPDATE {table} SET custom_card_id=22 WHERE sale_id=45; "
+            f"DELETE FROM {table} WHERE id=102;",
+        )
+        defaults = self.admin_query(
+            self.target,
+            f"SELECT id,custom_card_id,is_active,creator_id,create_time IS NOT NULL,"
+            f"updater_id,update_time FROM {table} WHERE sale_id=45;",
+        ).strip()
+        if defaults != "104\t22\t1\t0\t1\tNULL\tNULL":
+            raise HarnessError(
+                f"target sales placements defaults/DML differ: {defaults!r}"
+            )
+        remaining = self.admin_query(
+            self.target, f"SELECT id FROM {table} ORDER BY id;"
+        ).strip()
+        if remaining != "101\n104":
+            raise HarnessError(f"target sales placements delete differs: {remaining!r}")
+        print(
+            "sales_placements_create_pending_replay_ok old_binary_pending=true "
+            "immutable_identity=true schema=true insert_update_delete=true defaults=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def assert_sales_placements_metadata(self) -> None:
+        assert self.source and self.target
+        where = (
+            f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='sales_placements'"
+        )
+        query = (
+            "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,"
+            "COALESCE(LOWER(REPLACE(COLUMN_DEFAULT,'()','')),'<null>'),"
+            "EXTRA LIKE '%auto_increment%' FROM information_schema.COLUMNS "
+            f"WHERE {where} ORDER BY ORDINAL_POSITION;"
+        )
+        expected = "\n".join(
+            f"{name}\t{kind}\t{nullable}\t{default}\t{auto}"
+            for name, kind, nullable, default, auto in [
+                ("id", "int unsigned", "NO", "<null>", 1),
+                ("sale_id", "int unsigned", "NO", "<null>", 0),
+                ("target", "varchar(80)", "NO", "<null>", 0),
+                ("placement_type", "varchar(40)", "NO", "<null>", 0),
+                ("target_key_id", "int unsigned", "YES", "<null>", 0),
+                ("content_section_id", "int unsigned", "YES", "<null>", 0),
+                ("custom_card_id", "int unsigned", "YES", "<null>", 0),
+                ("comic_id", "int unsigned", "YES", "<null>", 0),
+                ("rule_json", "longtext", "NO", "<null>", 0),
+                ("is_active", "tinyint(1) unsigned", "NO", "1", 0),
+                ("creator_id", "int unsigned", "NO", "0", 0),
+                ("create_time", "timestamp", "NO", "current_timestamp", 0),
+                ("updater_id", "int unsigned", "YES", "<null>", 0),
+                ("update_time", "timestamp", "YES", "<null>", 0),
+            ]
+        )
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, query).strip()
+            if actual != expected:
+                raise HarnessError(
+                    f"sales placements column metadata differs at {endpoint.container}: {actual!r}"
+                )
+        indexes = self.admin_query(
+            self.target,
+            "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME "
+            f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;",
+        ).strip()
+        expected_indexes = (
+            "idx_sp_card\t1\t1\tcustom_card_id\n"
+            "idx_sp_sale\t1\t1\tsale_id\n"
+            "idx_sp_sale\t1\t2\tis_active\n"
+            "idx_sp_section\t1\t1\tcontent_section_id\n"
+            "PRIMARY\t0\t1\tid"
+        )
+        if indexes != expected_indexes:
+            raise HarnessError(f"sales placements indexes differ: {indexes!r}")
+        for endpoint in (self.source, self.target):
+            collation = self.admin_query(
+                endpoint,
+                f"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE {where};",
+            ).strip()
+            if collation != "utf8mb4_unicode_ci":
+                raise HarnessError(
+                    f"sales placements collation differs at {endpoint.container}: {collation!r}"
+                )
 
     def assert_curated_slides_foreign_key(self, table: str, parent: str) -> None:
         assert self.source and self.target
@@ -8253,6 +8395,8 @@ DELIMITER ;
             self.run_curated_strip_create_pending_replay()
         elif scenario == "curated-strip-slides-create-pending-replay":
             self.run_curated_strip_slides_create_pending_replay()
+        elif scenario == "sales-placements-create-pending-replay":
+            self.run_sales_placements_create_pending_replay()
         elif scenario == "source-layout-json-pending-replay":
             self.run_source_layout_json_pending_replay()
         elif scenario == "spotlight-create-pending-replay":
