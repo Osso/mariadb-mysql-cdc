@@ -89,6 +89,7 @@ fn nullable_datetime_modify_fails_closed_on_unmodeled_syntax_or_prestate() {
         "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME NOT NULL DEFAULT NULL",
         "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time `DATETIME` DEFAULT NULL",
         "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME DEFAULT `NULL`",
+        "/* ordinary */ ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME DEFAULT NULL",
     ] {
         assert!(parse_production_alter_table_ast(sql).is_err(), "{sql}");
     }

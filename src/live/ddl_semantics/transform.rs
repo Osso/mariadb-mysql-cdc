@@ -1887,9 +1887,7 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
         && (algorithm.is_some()
             || lock.is_some()
             || !clauses.iter().all(|clause| match clause {
-                ParsedAlterClause::ModifyVarchar { .. }
-                | ParsedAlterClause::ModifyNullableDatetime { .. }
-                | ParsedAlterClause::AddColumn(_) => true,
+                ParsedAlterClause::ModifyVarchar { .. } | ParsedAlterClause::AddColumn(_) => true,
                 ParsedAlterClause::DropColumn(_) => leading_comments_only,
                 _ => false,
             }))
