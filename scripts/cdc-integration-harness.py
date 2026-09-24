@@ -94,6 +94,7 @@ SCENARIOS = (
     ScenarioSpec("sales-placements-create-pending-replay", True),
     ScenarioSpec("source-layout-json-pending-replay", True),
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
+    ScenarioSpec("nullable-datetime-modify-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("assistant-quality-pending-replay", True),
@@ -175,6 +176,7 @@ def default_scenarios() -> list[str]:
             "curated-strip-create-pending-replay",
             "curated-strip-slides-create-pending-replay",
             "sales-placements-create-pending-replay",
+            "nullable-datetime-modify-pending-replay",
             "source-layout-json-pending-replay",
             "contributor-cards-check-collision-recovery",
         }
@@ -2295,6 +2297,138 @@ DELIMITER ;
             "spotlight_nullable_varchar_pending_replay_ok nullable=true historical_collation=true "
             "unaffected_metadata=true json_check=true existing_values=true post_ddl_rows=true "
             f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def run_nullable_datetime_modify_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError(
+                "nullable datetime replay requires --old-binary predating DATETIME MODIFY support"
+            )
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
+        table = "home_feed_curated_strips"
+        schema = (
+            (self.repo / "fixtures/ddl/create-home-feed-curated-strips.sql")
+            .read_text()
+            .strip()
+        )
+        ddl = Path("/tmp/cdc-nullable-datetime.sql").read_text().strip()
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema + ";")
+            self.admin_sql(
+                endpoint,
+                f"INSERT INTO {table}(id,name,title,start_time,end_time) VALUES "
+                "(1,'future','Future strip','2039-01-01 08:30:00','2040-12-31 23:59:59'),"
+                "(2,'current','Current strip','2026-09-01 00:00:00','2026-10-01 00:00:00');",
+            )
+
+        where = (
+            f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)}"
+        )
+        other_columns = (
+            "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,ORDINAL_POSITION,"
+            "EXTRA,CHARACTER_SET_NAME,COLLATION_NAME FROM information_schema.COLUMNS "
+            f"WHERE {where} AND COLUMN_NAME<>'end_time' ORDER BY ORDINAL_POSITION;"
+        )
+        indexes = (
+            "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME,SUB_PART,INDEX_TYPE "
+            f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;"
+        )
+        table_collation = (
+            f"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE {where};"
+        )
+        initial = [
+            self.admin_query(self.target, query)
+            for query in (other_columns, indexes, table_collation)
+        ]
+        for endpoint in (self.source, self.target):
+            metadata = self.admin_query(
+                endpoint,
+                "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,ORDINAL_POSITION "
+                f"FROM information_schema.COLUMNS WHERE {where} AND COLUMN_NAME='end_time';",
+            ).strip()
+            if metadata != "end_time\tdatetime\tNO\tNULL\t8":
+                raise HarnessError(
+                    f"initial DATETIME metadata differs at {endpoint.container}: {metadata!r}"
+                )
+        self.reset_target_general_log()
+        start, pending = self.prepare_pending_add_column(
+            "", ddl, "MODIFY COLUMN", prepared=True, old_binary=self.old_binary
+        )
+        if [
+            self.admin_query(self.target, query)
+            for query in (other_columns, indexes, table_collation)
+        ] != initial:
+            raise HarnessError("old binary changed target schema before pending replay")
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET end_time=NULL WHERE id=2; "
+            f"INSERT INTO {table}(id,name,title,start_time) VALUES "
+            "(3,'open','Open strip','2026-11-01 00:00:00');",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        if [
+            self.admin_query(self.target, query)
+            for query in (other_columns, indexes, table_collation)
+        ] != initial:
+            raise HarnessError("DATETIME MODIFY changed unrelated columns, indexes or collation")
+        expected_indexes = (
+            "idx_hfcs_window\t1\t1\tstart_time\tNULL\tBTREE\n"
+            "idx_hfcs_window\t1\t2\tend_time\tNULL\tBTREE\n"
+            "PRIMARY\t0\t1\tid\tNULL\tBTREE"
+        )
+        for endpoint in (self.source, self.target):
+            actual_indexes = self.admin_query(endpoint, indexes).strip()
+            if actual_indexes != expected_indexes:
+                raise HarnessError(f"window index differs at {endpoint.container}: {actual_indexes!r}")
+            metadata = self.admin_query(
+                endpoint,
+                "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,ORDINAL_POSITION "
+                f"FROM information_schema.COLUMNS WHERE {where} AND COLUMN_NAME='end_time';",
+            ).strip()
+            if metadata != "end_time\tdatetime\tYES\tNULL\t8":
+                raise HarnessError(
+                    f"nullable DATETIME metadata differs at {endpoint.container}: {metadata!r}"
+                )
+        rows = (
+            f"SELECT id,name,title,start_time,COALESCE(CAST(end_time AS CHAR),'<null>') "
+            f"FROM {table} ORDER BY id;"
+        )
+        expected_rows = (
+            "1\tfuture\tFuture strip\t2039-01-01 08:30:00\t2040-12-31 23:59:59\n"
+            "2\tcurrent\tCurrent strip\t2026-09-01 00:00:00\t<null>\n"
+            "3\topen\tOpen strip\t2026-11-01 00:00:00\t<null>"
+        )
+        for endpoint in (self.source, self.target):
+            actual_rows = self.admin_query(endpoint, rows).strip()
+            if actual_rows != expected_rows:
+                raise HarnessError(
+                    f"DATETIME replay rows differ at {endpoint.container}: {actual_rows!r}"
+                )
+        ddl_executions = (
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
+            "AND command_type IN ('Query','Execute') "
+            f"AND LOWER(argument) LIKE '%alter table%{table}%';"
+        )
+        execution_count = int(self.admin_query(self.target, ddl_executions).strip())
+        if execution_count == 0:
+            raise HarnessError("target did not execute DATETIME MODIFY")
+        checkpoint = self.checkpoint()
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        require_success(self.run_stream(start, stop), "nullable DATETIME restart")
+        if (
+            self.checkpoint() != checkpoint
+            or self.journal_full_row(int(pending["event_start_position"])) != journal
+            or int(self.admin_query(self.target, ddl_executions).strip()) != execution_count
+            or self.admin_query(self.target, rows).strip() != expected_rows
+        ):
+            raise HarnessError(
+                "nullable DATETIME restart reapplied DDL or changed checkpoint/data"
+            )
+        print(
+            "nullable_datetime_modify_pending_replay_ok old_binary_pending=true "
+            "metadata=true index=true existing_dates=true null_update=true omitted_insert=true "
+            f"restart=true coordinate={stop.file}:{stop.position}"
         )
 
     def run_curated_strip_create_pending_replay(self) -> None:
@@ -8405,6 +8539,8 @@ DELIMITER ;
             self.run_spotlight_create_pending_replay()
         elif scenario == "spotlight-nullable-varchar-pending-replay":
             self.run_spotlight_nullable_varchar_pending_replay()
+        elif scenario == "nullable-datetime-modify-pending-replay":
+            self.run_nullable_datetime_modify_pending_replay()
         elif scenario == "storefront-create-pending-replay":
             self.run_storefront_create_pending_replay()
         elif scenario == "reader-memory-create-pending-replay":
