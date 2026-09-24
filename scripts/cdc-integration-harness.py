@@ -2836,7 +2836,7 @@ DELIMITER ;
         assert self.source and self.target
         if self.old_binary is None or not self.old_binary.is_file():
             raise HarnessError(
-                "sales placements replay requires --old-binary predating inline PRIMARY KEY"
+                "sales placements replay requires --old-binary predating LONGTEXT support"
             )
         self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
         table = "sales_placements"
@@ -2918,8 +2918,10 @@ DELIMITER ;
             f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='sales_placements'"
         )
         query = (
-            "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,"
-            "COALESCE(LOWER(REPLACE(COLUMN_DEFAULT,'()','')),'<null>'),"
+            "SELECT COLUMN_NAME,CASE WHEN DATA_TYPE IN ('int','tinyint') "
+            "THEN CONCAT(DATA_TYPE,IF(COLUMN_TYPE LIKE '%unsigned%',' unsigned','')) "
+            "ELSE COLUMN_TYPE END,IS_NULLABLE,"
+            "COALESCE(NULLIF(LOWER(REPLACE(COLUMN_DEFAULT,'()','')),'null'),'<null>'),"
             "EXTRA LIKE '%auto_increment%' FROM information_schema.COLUMNS "
             f"WHERE {where} ORDER BY ORDINAL_POSITION;"
         )
@@ -2935,7 +2937,7 @@ DELIMITER ;
                 ("custom_card_id", "int unsigned", "YES", "<null>", 0),
                 ("comic_id", "int unsigned", "YES", "<null>", 0),
                 ("rule_json", "longtext", "NO", "<null>", 0),
-                ("is_active", "tinyint(1) unsigned", "NO", "1", 0),
+                ("is_active", "tinyint unsigned", "NO", "1", 0),
                 ("creator_id", "int unsigned", "NO", "0", 0),
                 ("create_time", "timestamp", "NO", "current_timestamp", 0),
                 ("updater_id", "int unsigned", "YES", "<null>", 0),
