@@ -60,7 +60,8 @@ fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
             ParsedAlterClause::AddKey { .. }
             | ParsedAlterClause::AddCheck(_)
             | ParsedAlterClause::AddForeignKey(_)
-            | ParsedAlterClause::ModifyVarchar { .. } => true,
+            | ParsedAlterClause::ModifyVarchar { .. }
+            | ParsedAlterClause::ModifyNullableDatetime { .. } => true,
             ParsedAlterClause::DropColumn(_) | ParsedAlterClause::DropIndex(_) => false,
         })
 }
@@ -198,6 +199,10 @@ fn render_production_alter_table(ast: &ParsedAlterTableAst) -> String {
 fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
     match clause {
         ParsedAlterClause::AddColumn(column) => render_add_column(column),
+        ParsedAlterClause::ModifyNullableDatetime { name } => format!(
+            "MODIFY COLUMN {} DATETIME NULL DEFAULT NULL",
+            quote_identifier(name)
+        ),
         ParsedAlterClause::ModifyVarchar {
             name,
             column_type,
@@ -1882,7 +1887,9 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
         && (algorithm.is_some()
             || lock.is_some()
             || !clauses.iter().all(|clause| match clause {
-                ParsedAlterClause::ModifyVarchar { .. } | ParsedAlterClause::AddColumn(_) => true,
+                ParsedAlterClause::ModifyVarchar { .. }
+                | ParsedAlterClause::ModifyNullableDatetime { .. }
+                | ParsedAlterClause::AddColumn(_) => true,
                 ParsedAlterClause::DropColumn(_) => leading_comments_only,
                 _ => false,
             }))
@@ -1996,6 +2003,15 @@ fn parse_modify_varchar_clause(
     let name = require_identifier(tokens, index + 2, "modified column")?;
     let (column_type, data_type, next) =
         parse_observed_column_type(tokens, quoted_flags, index + 3)?;
+    if column_type == "datetime" {
+        for (offset, keyword) in [(0, "DEFAULT"), (1, "NULL")] {
+            require_keyword(tokens, next + offset, keyword)?;
+            if quoted_flags.get(next + offset) == Some(&true) {
+                return Err("quoted MODIFY default is unsupported".into());
+            }
+        }
+        return Ok((ParsedAlterClause::ModifyNullableDatetime { name }, next + 2));
+    }
     if data_type != "varchar" {
         return Err("MODIFY supports only VARCHAR(n) NOT NULL or DEFAULT NULL".into());
     }

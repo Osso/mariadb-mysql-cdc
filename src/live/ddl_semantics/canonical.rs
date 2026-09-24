@@ -627,6 +627,10 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                 "kind": "modify_column", "name": name, "column_type": column_type,
                 "data_type": "varchar", "nullable": nullable,
             }),
+            ParsedAlterClause::ModifyNullableDatetime { name } => json!({
+                "kind": "modify_column", "name": name, "column_type": "datetime",
+                "data_type": "datetime", "nullable": true,
+            }),
             ParsedAlterClause::AddKey {
                 index,
                 if_not_exists,
@@ -775,6 +779,9 @@ fn apply_alter_clause(
             column_type,
             nullable,
         } => apply_modify_varchar(expected, &ast.table, name, column_type, *nullable),
+        ParsedAlterClause::ModifyNullableDatetime { name } => {
+            apply_modify_nullable_datetime(expected, &ast.table, name)
+        }
         ParsedAlterClause::AddKey {
             index,
             if_not_exists,
@@ -864,6 +871,35 @@ fn apply_add_foreign_key(
             referenced_table: key.referenced_table.clone(),
             referenced_columns: key.referenced_columns.clone(),
         });
+    Ok(())
+}
+
+fn apply_modify_nullable_datetime(
+    expected: &mut SemanticSchemaSnapshot,
+    table_name: &str,
+    name: &str,
+) -> Result<(), String> {
+    let table = expected
+        .inventory
+        .tables
+        .iter_mut()
+        .find(|table| table.name == table_name)
+        .ok_or_else(|| format!("MODIFY target table `{table_name}` is missing"))?;
+    let column = table
+        .columns
+        .iter_mut()
+        .find(|column| column.name == name)
+        .ok_or_else(|| format!("MODIFY target column `{table_name}`.`{name}` is missing"))?;
+    if column.data_type != "datetime"
+        || column.column_type != "datetime"
+        || column.generated.is_some()
+        || !column.extra.is_empty()
+    {
+        return Err("MODIFY requires an ordinary existing DATETIME column".into());
+    }
+    column.is_nullable = true;
+    column.default_value = None;
+    column.comment.clear();
     Ok(())
 }
 

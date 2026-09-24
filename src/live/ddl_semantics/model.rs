@@ -180,6 +180,9 @@ pub enum ParsedAlterClause {
         column_type: String,
         nullable: bool,
     },
+    ModifyNullableDatetime {
+        name: String,
+    },
     AddKey {
         index: ParsedIndexAst,
         if_not_exists: bool,
