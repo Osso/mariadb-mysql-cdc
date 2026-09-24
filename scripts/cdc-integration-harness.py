@@ -2412,11 +2412,17 @@ DELIMITER ;
         ddl_executions = (
             "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
             "AND command_type IN ('Query','Execute') "
-            f"AND LOWER(argument) LIKE '%alter table%{table}%';"
+            f"AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%alter table%{table}%';"
         )
         execution_count = int(self.admin_query(self.target, ddl_executions).strip())
         if execution_count == 0:
-            raise HarnessError("target did not execute DATETIME MODIFY")
+            observed = self.admin_query(
+                self.target,
+                "SELECT command_type,argument FROM mysql.general_log "
+                "WHERE user_host LIKE 'cdc_stream%' AND command_type IN ('Query','Execute') "
+                "ORDER BY event_time;",
+            )
+            raise HarnessError(f"target DATETIME MODIFY missing from execution log: {observed!r}")
         checkpoint = self.checkpoint()
         journal = self.journal_full_row(int(pending["event_start_position"]))
         require_success(self.run_stream(start, stop), "nullable DATETIME restart")
