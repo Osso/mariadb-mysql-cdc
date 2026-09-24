@@ -590,7 +590,7 @@ impl Parser {
             }
             return Ok("datetime(6)".into());
         }
-        for kind in ["TEXT", "MEDIUMTEXT", "JSON"] {
+        for kind in ["TEXT", "MEDIUMTEXT", "LONGTEXT", "JSON"] {
             if self.at(kind) {
                 self.keyword(kind)?;
                 return Ok(kind.to_ascii_lowercase());
@@ -704,6 +704,46 @@ mod tests {
     use super::*;
 
     const SQL: &str = "/* ordinary */ CREATE TABLE IF NOT EXISTS `facets` (\n`comic_id` MEDIUMINT UNSIGNED NOT NULL, -- identity\n`facet_id` SMALLINT UNSIGNED NOT NULL, `kind` TINYINT UNSIGNED NOT NULL, `label` VARCHAR(80) NOT NULL, `score` DECIMAL(4,3) NOT NULL, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (`comic_id`, `facet_id`), KEY `by_kind` (`kind`, `comic_id`), KEY `by_facet` (`facet_id`, `kind`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+
+    #[test]
+    fn sales_placements_create_preserves_columns_defaults_and_indexes() {
+        let source = include_str!("../../../../fixtures/ddl/create-sales-placements.sql");
+        let ast = parse(source).expect("sales placements observed CREATE AST");
+        assert_eq!(parse_fixture_create_table(source).unwrap(), ast);
+        assert_eq!(ast.name, "sales_placements");
+        assert_eq!(ast.columns.len(), 14);
+        assert_eq!(ast.primary_key, ["id"]);
+        assert_eq!(ast.columns[8].name, "rule_json");
+        assert_eq!(ast.columns[8].column_type, "longtext");
+        assert!(!ast.columns[8].nullable);
+        assert_eq!(ast.columns[9].column_type, "tinyint unsigned");
+        assert_eq!(ast.columns[9].default_sql.as_deref(), Some("1"));
+        assert_eq!(ast.columns[13].default_sql.as_deref(), Some("NULL"));
+        assert_eq!(ast.indexes.len(), 3);
+        assert_eq!(
+            ast.indexes[0]
+                .key_parts
+                .iter()
+                .map(|part| part.column.as_str())
+                .collect::<Vec<_>>(),
+            ["sale_id", "is_active"]
+        );
+        assert!(ast.indexes.iter().all(|index| !index.unique));
+
+        let result = transform_fixture_create_table(source).expect("sales placements translation");
+        assert_eq!(
+            result.target_sql.as_deref(),
+            Some(
+                "CREATE TABLE `sales_placements` (`id` INT UNSIGNED NOT NULL AUTO_INCREMENT, `sale_id` INT UNSIGNED NOT NULL, `target` VARCHAR(80) NOT NULL, `placement_type` VARCHAR(40) NOT NULL, `target_key_id` INT UNSIGNED NULL DEFAULT NULL, `content_section_id` INT UNSIGNED NULL DEFAULT NULL, `custom_card_id` INT UNSIGNED NULL DEFAULT NULL, `comic_id` INT UNSIGNED NULL DEFAULT NULL, `rule_json` LONGTEXT NOT NULL, `is_active` TINYINT UNSIGNED NOT NULL DEFAULT 1, `creator_id` INT UNSIGNED NOT NULL DEFAULT 0, `create_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updater_id` INT UNSIGNED NULL DEFAULT NULL, `update_time` TIMESTAMP NULL DEFAULT NULL, PRIMARY KEY (`id`), KEY `idx_sp_sale` (`sale_id`, `is_active`), KEY `idx_sp_section` (`content_section_id`), KEY `idx_sp_card` (`custom_card_id`)) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+            )
+        );
+        for unsupported in [
+            source.replace("LONGTEXT NOT NULL", "LONGTEXT NOT NULL DEFAULT 7"),
+            source.replace("LONGTEXT NOT NULL", "LONGTEXT BINARY NOT NULL"),
+        ] {
+            assert!(parse_fixture_create_table(&unsupported).is_err());
+        }
+    }
 
     #[test]
     fn storefront_create_parses_observed_columns_and_keys() {
