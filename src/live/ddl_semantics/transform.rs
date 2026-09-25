@@ -1,7 +1,8 @@
 use super::model::{
     ParsedAddColumnAst, ParsedAlterAlgorithm, ParsedAlterClause, ParsedAlterLock,
-    ParsedAlterTableAst, ParsedCreateColumnAst, ParsedCreateTableAst, ParsedDropColumnAst,
-    ParsedDropIndexAst, ParsedIndexAst, ParsedIndexKeyPart, ParsedStoredIfExpression,
+    ParsedAlterTableAst, ParsedColumnDefault, ParsedCreateColumnAst, ParsedCreateTableAst,
+    ParsedDropColumnAst, ParsedDropIndexAst, ParsedIndexAst, ParsedIndexKeyPart,
+    ParsedStoredIfExpression,
 };
 use super::tokenizer::{
     ddl_contains_comments, split_one_leading_mysql_line_comment,
@@ -62,6 +63,8 @@ fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
             | ParsedAlterClause::AddCheck(_)
             | ParsedAlterClause::AddForeignKey(_)
             | ParsedAlterClause::ModifyColumn(_)
+            | ParsedAlterClause::ChangeColumn { .. }
+            | ParsedAlterClause::AlterColumnDefault { .. }
             | ParsedAlterClause::RenameColumn { .. } => true,
             ParsedAlterClause::DropColumn(column) => !column.if_exists,
             ParsedAlterClause::DropIndex(_) => true,
@@ -153,6 +156,7 @@ fn is_exact_seen_column(column: &ParsedAddColumnAst, name: &str, comment: &str) 
             default_value: None,
             comment: comment.to_string(),
             after: None,
+            first: false,
             character_set: None,
             collation: None,
             generated: None,
@@ -204,6 +208,18 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
         ParsedAlterClause::ModifyColumn(column) => {
             render_add_column(column).replacen("ADD COLUMN", "MODIFY COLUMN", 1)
         }
+        ParsedAlterClause::ChangeColumn { old_name, column } => render_add_column(column).replacen(
+            "ADD COLUMN",
+            &format!("CHANGE COLUMN {}", quote_identifier(old_name)),
+            1,
+        ),
+        ParsedAlterClause::AlterColumnDefault { name, default } => {
+            let action = match default {
+                None => "DROP DEFAULT".to_string(),
+                Some(value) => format!("SET DEFAULT {}", render_alter_default(value)),
+            };
+            format!("ALTER COLUMN {} {action}", quote_identifier(name))
+        }
         ParsedAlterClause::RenameColumn { old_name, new_name } => format!(
             "RENAME COLUMN {} TO {}",
             quote_identifier(old_name),
@@ -223,6 +239,63 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
         ParsedAlterClause::DropIndex(index) => {
             format!("DROP INDEX {}", quote_identifier(&index.name))
         }
+    }
+}
+
+pub(crate) fn normalize_alter_column_default(
+    column_type: &str,
+    data_type: &str,
+    nullable: bool,
+    default: Option<&ParsedColumnDefault>,
+) -> Result<(Option<String>, bool), String> {
+    match default {
+        None => Ok((None, false)),
+        Some(ParsedColumnDefault::Null) if nullable => Ok((None, false)),
+        Some(ParsedColumnDefault::Null) => Err("NOT NULL column cannot have DEFAULT NULL".into()),
+        Some(ParsedColumnDefault::String(value)) if is_text_type(data_type) => {
+            Ok((Some(format!("_utf8mb4\\'{value}\\'")), true))
+        }
+        Some(ParsedColumnDefault::String(value))
+            if matches!(
+                data_type,
+                "char"
+                    | "varchar"
+                    | "binary"
+                    | "varbinary"
+                    | "date"
+                    | "datetime"
+                    | "time"
+                    | "timestamp"
+                    | "year"
+            ) =>
+        {
+            Ok((Some(value.clone()), false))
+        }
+        Some(ParsedColumnDefault::Number(value))
+            if matches!(
+                data_type,
+                "tinyint"
+                    | "smallint"
+                    | "mediumint"
+                    | "int"
+                    | "bigint"
+                    | "decimal"
+                    | "float"
+                    | "double"
+            ) =>
+        {
+            let normalized = basic_types::normalize_numeric_default(column_type, value)?;
+            Ok((Some(normalized), false))
+        }
+        Some(_) => Err(format!("unsupported literal default for {column_type}")),
+    }
+}
+
+fn render_alter_default(value: &ParsedColumnDefault) -> String {
+    match value {
+        ParsedColumnDefault::String(value) => quote_string_literal(value),
+        ParsedColumnDefault::Number(value) => value.clone(),
+        ParsedColumnDefault::Null => "NULL".into(),
     }
 }
 
@@ -261,7 +334,9 @@ fn render_add_column(column: &ParsedAddColumnAst) -> String {
             quote_string_literal(&column.comment)
         ));
     }
-    if let Some(after) = &column.after {
+    if column.first {
+        sql.push_str(" FIRST");
+    } else if let Some(after) = &column.after {
         sql.push_str(&format!(" AFTER {}", quote_identifier(after)));
     }
     if column.data_type == "json" {
@@ -1720,6 +1795,8 @@ fn parse_production_alter_clause(
         Some("ADD") => parse_production_add_clause(tokens, quoted_flags, index, table, literals),
         Some("DROP") => parse_drop_alter_clause(tokens, index),
         Some("MODIFY") => parse_modify_column_clause(tokens, quoted_flags, index, literals),
+        Some("CHANGE") => parse_change_column_clause(tokens, quoted_flags, index, literals),
+        Some("ALTER") => parse_alter_column_default_clause(tokens, quoted_flags, index, literals),
         Some("RENAME") => parse_rename_column_clause(tokens, quoted_flags, index),
         actual => Err(format!(
             "unsupported production ALTER TABLE clause {actual:?}"
@@ -1733,8 +1810,9 @@ fn parse_modify_column_clause(
     index: usize,
     literals: &mut impl Iterator<Item = String>,
 ) -> Result<(ParsedAlterClause, usize), String> {
-    require_keyword(tokens, index + 1, "COLUMN")?;
-    require_unquoted_token(quoted, index + 1, "MODIFY COLUMN")?;
+    if tokens_match(tokens, index + 1, "COLUMN") {
+        require_unquoted_token(quoted, index + 1, "MODIFY COLUMN")?;
+    }
     let (ParsedAlterClause::AddColumn(column), next) =
         parse_add_column_clause(tokens, quoted, index, literals)?
     else {
@@ -1744,6 +1822,83 @@ fn parse_modify_column_clause(
         return Err("MODIFY requires an ordinary unguarded non-JSON column".into());
     }
     Ok((ParsedAlterClause::ModifyColumn(column), next))
+}
+
+fn parse_change_column_clause(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(ParsedAlterClause, usize), String> {
+    let old_index = index + 1 + usize::from(tokens_match(tokens, index + 1, "COLUMN"));
+    if old_index == index + 2 {
+        require_unquoted_token(quoted, index + 1, "CHANGE COLUMN")?;
+    }
+    let old_name = require_identifier(tokens, old_index, "changed column")?;
+    let (ParsedAlterClause::AddColumn(column), next) =
+        parse_column_definition_clause(tokens, quoted, old_index + 1, literals)?
+    else {
+        unreachable!("column parser returns a column");
+    };
+    if column.if_not_exists || column.generated.is_some() || column.data_type == "json" {
+        return Err("CHANGE requires an ordinary unguarded non-JSON column".into());
+    }
+    Ok((ParsedAlterClause::ChangeColumn { old_name, column }, next))
+}
+
+fn parse_alter_column_default_clause(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(ParsedAlterClause, usize), String> {
+    require_keyword(tokens, index + 1, "COLUMN")?;
+    require_unquoted_token(quoted, index + 1, "ALTER COLUMN")?;
+    let name = require_identifier(tokens, index + 2, "altered column")?;
+    let action = index + 3;
+    if tokens_match(tokens, action, "DROP") {
+        require_unquoted_token(quoted, action, "DROP DEFAULT")?;
+        require_keyword(tokens, action + 1, "DEFAULT")?;
+        require_unquoted_token(quoted, action + 1, "DROP DEFAULT")?;
+        return Ok((
+            ParsedAlterClause::AlterColumnDefault {
+                name,
+                default: None,
+            },
+            action + 2,
+        ));
+    }
+    require_keyword(tokens, action, "SET")?;
+    require_unquoted_token(quoted, action, "SET DEFAULT")?;
+    require_keyword(tokens, action + 1, "DEFAULT")?;
+    require_unquoted_token(quoted, action + 1, "SET DEFAULT")?;
+    let value_index = action + 2;
+    require_unquoted_token(quoted, value_index, "DEFAULT literal")?;
+    let (default, next) = if tokens_match(tokens, value_index, "NULL") {
+        (ParsedColumnDefault::Null, value_index + 1)
+    } else if tokens_match(tokens, value_index, "<string>") {
+        (
+            ParsedColumnDefault::String(parse_string_default_literal(literals)?),
+            value_index + 1,
+        )
+    } else {
+        let (value, next) = numeric_default_literal(tokens, quoted, value_index)?;
+        if !value.chars().any(|digit| digit.is_ascii_digit())
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.'))
+        {
+            return Err("DEFAULT must be a numeric or string literal".into());
+        }
+        (ParsedColumnDefault::Number(value), next)
+    };
+    Ok((
+        ParsedAlterClause::AlterColumnDefault {
+            name,
+            default: Some(default),
+        },
+        next,
+    ))
 }
 
 fn parse_rename_column_clause(
@@ -1775,6 +1930,11 @@ fn parse_production_add_clause(
         .map(|token| token.to_ascii_uppercase())
     {
         Some(kind) if kind == "COLUMN" => {
+            parse_add_column_clause(tokens, quoted_flags, index, literals)
+        }
+        Some(kind)
+            if kind != "KEY" && kind != "INDEX" && kind != "UNIQUE" && kind != "CONSTRAINT" =>
+        {
             parse_add_column_clause(tokens, quoted_flags, index, literals)
         }
         Some(kind) if matches!(kind.as_str(), "KEY" | "INDEX") => {
@@ -1847,6 +2007,7 @@ struct ParsedColumnOptions {
     default_value: Option<String>,
     comment: String,
     after: Option<String>,
+    first: bool,
     next_index: usize,
 }
 
@@ -1856,7 +2017,20 @@ fn parse_add_column_clause(
     index: usize,
     literals: &mut impl Iterator<Item = String>,
 ) -> Result<(ParsedAlterClause, usize), String> {
-    let mut name_index = index + 2;
+    let name_index = index + 1 + usize::from(tokens_match(tokens, index + 1, "COLUMN"));
+    if name_index == index + 2 {
+        require_unquoted_token(quoted_flags, index + 1, "ADD COLUMN")?;
+    }
+    parse_column_definition_clause(tokens, quoted_flags, name_index, literals)
+}
+
+fn parse_column_definition_clause(
+    tokens: &[String],
+    quoted_flags: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(ParsedAlterClause, usize), String> {
+    let mut name_index = index;
     let if_not_exists = tokens
         .get(name_index)
         .is_some_and(|token| token.eq_ignore_ascii_case("IF"));
@@ -1905,6 +2079,7 @@ fn parse_add_column_clause(
             default_value: options.default_value,
             comment: options.comment,
             after: options.after,
+            first: options.first,
             character_set,
             collation,
             generated,
@@ -2057,6 +2232,7 @@ fn parse_observed_column_options(
         default_value: None,
         comment: String::new(),
         after: None,
+        first: false,
         next_index: index,
     };
     let mut seen = BTreeSet::new();
@@ -2125,8 +2301,18 @@ fn parse_observed_column_option(
             Ok(index + 2)
         }
         "AFTER" => {
+            if options.first {
+                return Err("FIRST and AFTER are mutually exclusive".into());
+            }
             options.after = Some(require_identifier(tokens, index + 1, "AFTER column")?);
             Ok(index + 2)
+        }
+        "FIRST" => {
+            if options.after.is_some() {
+                return Err("FIRST and AFTER are mutually exclusive".into());
+            }
+            options.first = true;
+            Ok(index + 1)
         }
         _ => Err(format!("unsupported column option {option}")),
     }

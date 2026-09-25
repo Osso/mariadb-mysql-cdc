@@ -114,6 +114,7 @@ pub struct ParsedAddColumnAst {
     pub default_value: Option<String>,
     pub comment: String,
     pub after: Option<String>,
+    pub first: bool,
     pub character_set: Option<String>,
     pub collation: Option<String>,
     /// Stored generation expression; `None` for an ordinary column.
@@ -173,9 +174,24 @@ impl ParsedAlterLock {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsedColumnDefault {
+    String(String),
+    Number(String),
+    Null,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsedAlterClause {
     AddColumn(ParsedAddColumnAst),
     ModifyColumn(ParsedAddColumnAst),
+    ChangeColumn {
+        old_name: String,
+        column: ParsedAddColumnAst,
+    },
+    AlterColumnDefault {
+        name: String,
+        default: Option<ParsedColumnDefault>,
+    },
     RenameColumn {
         old_name: String,
         new_name: String,

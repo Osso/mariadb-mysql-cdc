@@ -1,8 +1,8 @@
 use super::super::ddl_replay_journal::DdlFamily;
 use super::model::{
     DdlObjectKind, DdlOperation, DdlSemanticEvidence, ParsedAddColumnAst, ParsedAlterClause,
-    ParsedAlterTableAst, ParsedCreateTableAst, ParsedIndexAst, ParsedIndexKeyPart,
-    SemanticSchemaSnapshot,
+    ParsedAlterTableAst, ParsedColumnDefault, ParsedCreateTableAst, ParsedIndexAst,
+    ParsedIndexKeyPart, SemanticSchemaSnapshot,
 };
 use serde_json::json;
 
@@ -624,6 +624,20 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                 value["kind"] = json!("modify_column");
                 value
             }
+            ParsedAlterClause::ChangeColumn { old_name, column } => {
+                let mut value = canonical_add_column_ast_value(column);
+                value["kind"] = json!("change_column");
+                value["old_name"] = json!(old_name);
+                value
+            }
+            ParsedAlterClause::AlterColumnDefault { name, default } => json!({
+                "kind": "alter_column_default", "name": name,
+                "default": default.as_ref().map(|value| match value {
+                    ParsedColumnDefault::String(value) => json!({"string": value}),
+                    ParsedColumnDefault::Number(value) => json!({"number": value}),
+                    ParsedColumnDefault::Null => json!({"null": true}),
+                }),
+            }),
             ParsedAlterClause::RenameColumn { old_name, new_name } => json!({
                 "kind": "rename_column", "old_name": old_name, "new_name": new_name,
             }),
@@ -688,6 +702,9 @@ fn canonical_add_column_ast_value(column: &ParsedAddColumnAst) -> serde_json::Va
         "comment": column.comment,
         "after": column.after,
     });
+    if column.first {
+        value["first"] = json!(true);
+    }
     if column.if_not_exists {
         value["if_not_exists"] = json!(true);
     }
@@ -772,6 +789,12 @@ fn apply_alter_clause(
         ParsedAlterClause::AddColumn(column) => apply_add_column(expected, &ast.table, column),
         ParsedAlterClause::ModifyColumn(column) => {
             apply_modify_column(expected, &ast.table, column)
+        }
+        ParsedAlterClause::ChangeColumn { old_name, column } => {
+            apply_change_column(expected, &ast.table, old_name, column)
+        }
+        ParsedAlterClause::AlterColumnDefault { name, default } => {
+            apply_alter_column_default(expected, &ast.table, name, default.as_ref())
         }
         ParsedAlterClause::RenameColumn { old_name, new_name } => {
             apply_rename_column(expected, &ast.table, old_name, new_name)
@@ -885,15 +908,18 @@ fn apply_modify_column(
         .position(|item| item.name.eq_ignore_ascii_case(&column.name))
         .ok_or_else(|| format!("MODIFY column `{}` is missing", column.name))?;
     let original = &table.columns[previous];
-    if original.generated.is_some() || original.extra.contains("auto_increment") {
-        return Err("MODIFY of generated or AUTO_INCREMENT columns is not modeled".into());
+    if original.generated.is_some() || !original.extra.is_empty() {
+        return Err(
+            "MODIFY of generated, AUTO_INCREMENT, or extra-attribute columns is not modeled".into(),
+        );
     }
     let mut replacement = column.clone();
     replacement.name = original.name.clone();
     table.columns.remove(previous);
-    let insertion = match &column.after {
-        None => previous,
-        Some(_) => add_column_insertion_index(table, table_name, column, None)?,
+    let insertion = if column.first || column.after.is_some() {
+        add_column_insertion_index(table, table_name, column, None)?
+    } else {
+        previous
     };
     let replacement = expected_added_column(table, table_name, &replacement, insertion)?;
     table.columns.insert(insertion, replacement);
@@ -901,6 +927,76 @@ fn apply_modify_column(
         item.ordinal_position = (index + 1) as u32;
     }
     Ok(())
+}
+
+fn apply_change_column(
+    expected: &mut SemanticSchemaSnapshot,
+    table_name: &str,
+    old_name: &str,
+    column: &ParsedAddColumnAst,
+) -> Result<(), String> {
+    let refers_to_self = column
+        .after
+        .as_deref()
+        .is_some_and(|after| after.eq_ignore_ascii_case(old_name));
+    if refers_to_self {
+        return Err("CHANGE AFTER cannot reference the column being changed".into());
+    }
+    let mut original_name_column = column.clone();
+    original_name_column.name = old_name.to_string();
+    apply_modify_column(expected, table_name, &original_name_column)?;
+    if !old_name.eq_ignore_ascii_case(&column.name) {
+        apply_rename_column(expected, table_name, old_name, &column.name)?;
+    }
+    Ok(())
+}
+
+fn apply_alter_column_default(
+    expected: &mut SemanticSchemaSnapshot,
+    table_name: &str,
+    name: &str,
+    default: Option<&ParsedColumnDefault>,
+) -> Result<(), String> {
+    let table = expected
+        .inventory
+        .tables
+        .iter_mut()
+        .find(|table| table.name == table_name)
+        .ok_or_else(|| format!("ALTER table `{table_name}` is missing"))?;
+    let column = table
+        .columns
+        .iter_mut()
+        .find(|column| column.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("ALTER column `{name}` is missing"))?;
+    let unsupported = column.generated.is_some()
+        || column.extra.contains("auto_increment")
+        || column.data_type == "json";
+    if unsupported {
+        return Err(
+            "ALTER DEFAULT of generated, AUTO_INCREMENT, or JSON columns is not modeled".into(),
+        );
+    }
+    let (value, generated) = super::transform::normalize_alter_column_default(
+        &column.column_type,
+        &column.data_type,
+        column.is_nullable,
+        default,
+    )?;
+    column.default_value = value;
+    column.extra = replace_default_generated_extra(&column.extra, generated);
+    Ok(())
+}
+
+fn replace_default_generated_extra(extra: &str, generated: bool) -> String {
+    let remaining = extra
+        .strip_prefix("DEFAULT_GENERATED")
+        .unwrap_or(extra)
+        .trim_start();
+    match (generated, remaining.is_empty()) {
+        (true, true) => "DEFAULT_GENERATED".into(),
+        (true, false) => format!("DEFAULT_GENERATED {remaining}"),
+        (false, _) => remaining.into(),
+    }
 }
 
 fn apply_rename_column(
@@ -1036,6 +1132,9 @@ fn add_column_insertion_index(
         && let Some(index) = existing_index
     {
         return Ok(index);
+    }
+    if column.first {
+        return Ok(0);
     }
     match &column.after {
         Some(after) => table
@@ -1739,6 +1838,7 @@ mod json_alias_check_tests {
             default_value: None,
             comment: String::new(),
             after: None,
+            first: false,
             character_set: Some("utf8mb4".into()),
             collation: Some("utf8mb4_bin".into()),
             generated: None,
