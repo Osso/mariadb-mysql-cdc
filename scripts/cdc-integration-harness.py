@@ -2567,24 +2567,35 @@ DELIMITER ;
             "ALTER COLUMN new_default SET DEFAULT 'pending'"
         )
         start, pending = self.prepare_pending_add_column("", combined)
-        blocked = self.run_stream(start, self.coordinate(), binary=self.binary)
-        journal = self.journal_full_row(int(pending["event_start_position"]))
-        checkpoint = self.checkpoint()
-        absent = self.admin_query(
-            self.target,
-            "SELECT COUNT(*) FROM information_schema.columns WHERE TABLE_SCHEMA='globalcomix' AND TABLE_NAME='column_text_defaults' AND COLUMN_NAME='new_default';",
-        ).strip()
-        if (
-            blocked.returncode == 0
-            or "requires ordered DDL replay" not in blocked.stderr
-            or journal["status"] != "translation_pending"
-            or absent != "0"
-            or (checkpoint["source_file"], checkpoint["source_position"])
-            != (start.file, start.position)
-        ):
-            raise HarnessError(
-                f"combined default gap did not fail closed: {blocked!r} {journal!r} {checkpoint!r}"
-            )
+        process, log = self.start_stream(
+            start, self.coordinate(), binary=self.binary, label="combined-default-gap"
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while "requires_ordered_DDL_replay" not in log.read_text():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise HarnessError(
+                        f"combined default gap did not enter barrier: {log.read_text()}"
+                    )
+                time.sleep(0.1)
+            journal = self.journal_full_row(int(pending["event_start_position"]))
+            checkpoint = self.checkpoint()
+            absent = self.admin_query(
+                self.target,
+                "SELECT COUNT(*) FROM information_schema.columns WHERE TABLE_SCHEMA='globalcomix' AND TABLE_NAME='column_text_defaults' AND COLUMN_NAME='new_default';",
+            ).strip()
+            if (
+                process.poll() is not None
+                or journal["status"] != "translation_pending"
+                or absent != "0"
+                or (checkpoint["source_file"], checkpoint["source_position"])
+                != (start.file, start.position)
+            ):
+                raise HarnessError(
+                    f"combined default gap did not fail closed: {journal!r} {checkpoint!r}"
+                )
+        finally:
+            self.stop_sync_process(process)
 
     def run_table_lifecycle_pending_replay(self) -> None:
         assert self.source and self.target
