@@ -2797,9 +2797,26 @@ DELIMITER ;
             ):
                 self.assert_sql_mode_default_rows(table, "renamed", row_id, value)
                 self.assert_sql_mode_default_rows(table, "added", row_id, added_default)
+            if no_backslash_escapes:
+                self.assert_no_backslash_literal_boundaries(table, mode)
         print(
             "source_sql_mode_defaults_pending_replay_ok source_context=true exact_bytes=true crash_restart=true"
         )
+
+    def assert_no_backslash_literal_boundaries(self, table: str, mode: str) -> None:
+        assert self.source and self.target
+        for row_id, literal, expected in (
+            (7, r"'a\''other.table'", b"a\\'other.table"),
+            (8, r"'odd\'", b"odd\\"),
+        ):
+            ddl = f"/* client */ ALTER TABLE {table} ALTER COLUMN renamed SET DEFAULT {literal}"
+            start, pending = self.prepare_pending_add_column(
+                "", ddl, "ALTER COLUMN", source_sql_mode=mode
+            )
+            self.admin_sql(self.source, f"INSERT INTO {table}(id) VALUES({row_id});")
+            self.replay_pending_add_column(start, pending)
+            self.assert_source_sql_mode_evidence(pending, True)
+            self.assert_sql_mode_default_rows(table, "renamed", row_id, expected)
 
     def assert_source_sql_mode_evidence(
         self, pending: dict[str, str], no_backslash_escapes: bool
