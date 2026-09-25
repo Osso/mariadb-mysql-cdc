@@ -85,6 +85,8 @@ SCENARIOS = (
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("add-char-column-pending-replay", True),
     ScenarioSpec("add-signed-tinyint-pending-replay", True),
+    ScenarioSpec("curated-strip-sale-alter-pending-replay", True),
+    ScenarioSpec("basic-scalar-create-add-pending-replay", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
@@ -174,6 +176,8 @@ def default_scenarios() -> list[str]:
         and scenario.name
         not in {
             "curated-strip-create-pending-replay",
+            "curated-strip-sale-alter-pending-replay",
+            "basic-scalar-create-add-pending-replay",
             "curated-strip-slides-create-pending-replay",
             "sales-placements-create-pending-replay",
             "nullable-datetime-modify-pending-replay",
@@ -1900,7 +1904,7 @@ DELIMITER ;
                     )
             finally:
                 self.stop_sync_process(process)
-            pending = self.journal_full_row()
+            pending = self.journal_full_row(int(position))
             checkpoint = self.checkpoint()
             if (
                 pending["status"] != "translation_pending"
@@ -1923,7 +1927,7 @@ DELIMITER ;
             f"{int(position)},{int(end_position)},{sql_literal(APP_SCHEMA)},"
             f"{sql_literal(ddl)},'translator-unavailable',NULL,'','','','translation_pending');",
         )
-        pending = self.journal_full_row()
+        pending = self.journal_full_row(int(position))
         if (
             pending["status"] != "translation_pending"
             or pending["generated_sql"] != "NULL"
@@ -2080,6 +2084,290 @@ DELIMITER ;
             "signed_range=true nullability=true default=true order=true post_ddl_rows=true "
             f"coordinate={stop.file}:{stop.position}"
         )
+
+    def run_curated_strip_sale_alter_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError("curated sale ALTER requires --old-binary")
+        table = "home_feed_curated_strips"
+        schema = (
+            f"CREATE TABLE {table} (id INT UNSIGNED PRIMARY KEY, "
+            "display_order INT NOT NULL, trailing_note VARCHAR(32)) ENGINE=InnoDB "
+            "DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci; "
+            f"INSERT INTO {table} VALUES (1,10,'before');"
+        )
+        ddl = (
+            (self.repo / "fixtures/ddl/alter-home-feed-curated-strips-sale.sql")
+            .read_text()
+            .strip()
+        )
+        start, pending = self.prepare_pending_add_column(
+            schema, ddl, "ADD COLUMN", prepared=True, old_binary=self.old_binary
+        )
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='{table}' AND COLUMN_NAME='sale_id';",
+        ).strip()
+        if absent != "0":
+            raise HarnessError(f"old binary applied blocked ALTER: {absent}")
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET sale_id=4294967295,sale_title='Sale',"
+            "sale_subtitle='Now',sale_cta_url='https://example.invalid/sale',"
+            "sale_cover_comic_ids_json='[11,22]',trailing_note='updated' WHERE id=1; "
+            f"INSERT INTO {table}(id,display_order,trailing_note) VALUES (2,20,'omitted'); "
+            f"INSERT INTO {table}(id,display_order,sale_cover_comic_ids_json) "
+            "VALUES (3,30,'null');",
+        )
+        stop = self.coordinate()
+        crashed = self.run_stream(
+            start, stop, integration_failpoint="post-ddl-pre-applied"
+        )
+        if crashed.returncode == 0 or "cdc_integration_failpoint" not in (
+            crashed.stdout + crashed.stderr
+        ):
+            raise HarnessError(f"post-DDL crash did not fire: {crashed!r}")
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        if journal["status"] != "prepared" or (
+            checkpoint["source_file"],
+            checkpoint["source_position"],
+        ) != (start.file, start.position):
+            raise HarnessError(
+                f"crash lost pending identity/checkpoint: {journal!r} {checkpoint!r}"
+            )
+        stop = self.replay_pending_add_column(start, pending)
+        columns = self.admin_query(
+            self.target,
+            "SELECT COLUMN_NAME,DATA_TYPE,IS_NULLABLE,COLUMN_DEFAULT,ORDINAL_POSITION "
+            "FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='{table}' "
+            "ORDER BY ORDINAL_POSITION;",
+        ).strip()
+        expected = (
+            "id\tint\tNO\tNULL\t1\n"
+            "display_order\tint\tNO\tNULL\t2\n"
+            "sale_id\tint\tYES\tNULL\t3\n"
+            "sale_title\tvarchar\tYES\tNULL\t4\n"
+            "sale_subtitle\tvarchar\tYES\tNULL\t5\n"
+            "sale_cta_url\tvarchar\tYES\tNULL\t6\n"
+            "sale_cover_comic_ids_json\tlongtext\tYES\tNULL\t7\n"
+            "trailing_note\tvarchar\tYES\tNULL\t8"
+        )
+        if columns != expected:
+            raise HarnessError(
+                f"curated sale schema/default/order mismatch: {columns!r}"
+            )
+        for column, column_type in (
+            ("sale_id", "int unsigned"),
+            ("sale_title", "varchar(80)"),
+            ("sale_subtitle", "varchar(120)"),
+            ("sale_cta_url", "varchar(1024)"),
+        ):
+            actual = self.admin_query(
+                self.target,
+                "SELECT COLUMN_TYPE FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='{table}' "
+                f"AND COLUMN_NAME='{column}';",
+            ).strip()
+            if actual != column_type:
+                raise HarnessError(f"{column} type mismatch: {actual!r}")
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"INSERT INTO {table}(id,display_order,sale_cover_comic_ids_json) "
+                "VALUES(99,99,'{broken');",
+                "CONSTRAINT" if endpoint == self.source else "Check constraint",
+            )
+        self.assert_post_ddl_rows(
+            table,
+            "1\t10\t4294967295\tSale\tNow\thttps://example.invalid/sale\t[11,22]\tupdated\n"
+            "2\t20\tNULL\tNULL\tNULL\tNULL\tNULL\tomitted\n"
+            "3\t30\tNULL\tNULL\tNULL\tNULL\tnull\tNULL",
+        )
+        print(
+            "curated_strip_sale_alter_pending_replay_ok old_binary_pending=true "
+            "immutable_identity=true crash_restart=true schema_order_defaults=true "
+            "json_check=true following_dml=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def run_basic_scalar_create_add_pending_replay(self) -> None:
+        assert self.source and self.target
+        # The same independently checked family is used in both CREATE and ALTER.
+        columns = (
+            ("signed_tiny", "TINYINT NOT NULL DEFAULT -128", "tinyint"),
+            (
+                "unsigned_tiny",
+                "TINYINT UNSIGNED NOT NULL DEFAULT 255",
+                "tinyint unsigned",
+            ),
+            ("signed_small", "SMALLINT NOT NULL DEFAULT -32768", "smallint"),
+            (
+                "unsigned_small",
+                "SMALLINT UNSIGNED NOT NULL DEFAULT 65535",
+                "smallint unsigned",
+            ),
+            ("signed_medium", "MEDIUMINT NOT NULL DEFAULT -8388608", "mediumint"),
+            (
+                "unsigned_medium",
+                "MEDIUMINT UNSIGNED NOT NULL DEFAULT 16777215",
+                "mediumint unsigned",
+            ),
+            ("signed_int", "INT NOT NULL DEFAULT -2147483648", "int"),
+            (
+                "unsigned_int",
+                "INT UNSIGNED NOT NULL DEFAULT 4294967295",
+                "int unsigned",
+            ),
+            ("signed_big", "BIGINT NOT NULL DEFAULT -9223372036854775808", "bigint"),
+            (
+                "unsigned_big",
+                "BIGINT UNSIGNED NOT NULL DEFAULT 18446744073709551615",
+                "bigint unsigned",
+            ),
+            ("price", "DECIMAL(12,2) NOT NULL DEFAULT -12.30", "decimal(12,2)"),
+            ("float_value", "FLOAT DEFAULT NULL", "float"),
+            ("double_value", "DOUBLE DEFAULT NULL", "double"),
+            ("day_value", "DATE DEFAULT NULL", "date"),
+            ("time_zero", "TIME(0) DEFAULT NULL", "time"),
+            ("time_three", "TIME(3) DEFAULT NULL", "time(3)"),
+            ("time_six", "TIME(6) DEFAULT NULL", "time(6)"),
+            ("datetime_zero", "DATETIME(0) DEFAULT NULL", "datetime"),
+            ("datetime_three", "DATETIME(3) DEFAULT NULL", "datetime(3)"),
+            ("datetime_six", "DATETIME(6) DEFAULT NULL", "datetime(6)"),
+            ("flag", "BOOL NOT NULL DEFAULT 1", "tinyint"),
+            ("empty_label", "VARCHAR(32) NOT NULL DEFAULT ''", "varchar(32)"),
+            ("fixed_bytes", "BINARY(4) DEFAULT NULL", "binary(4)"),
+            ("variable_bytes", "VARBINARY(8) DEFAULT NULL", "varbinary(8)"),
+            ("short_text", "TINYTEXT", "tinytext"),
+            ("plain_text", "TEXT", "text"),
+            ("medium_text", "MEDIUMTEXT", "mediumtext"),
+            ("long_text", "LONGTEXT", "longtext"),
+            ("short_blob", "TINYBLOB", "tinyblob"),
+            ("plain_blob", "BLOB", "blob"),
+            ("medium_blob", "MEDIUMBLOB", "mediumblob"),
+            ("long_blob", "LONGBLOB", "longblob"),
+        )
+        table = "basic_scalar_matrix"
+        created = ", ".join(f"c_{name} {definition}" for name, definition, _ in columns)
+        ddl = f"CREATE TABLE {table} (id INT PRIMARY KEY, {created}) ENGINE=InnoDB"
+        start, pending = self.prepare_pending_add_column("", ddl, "CREATE TABLE")
+        self.admin_sql(self.source, f"INSERT INTO {table}(id) VALUES(1);")
+        self.replay_pending_add_column(start, pending)
+        self.assert_basic_scalar_metadata(table, columns, "c")
+        added = ", ".join(
+            f"ADD COLUMN a_{name} {definition}" for name, definition, _ in columns
+        )
+        alter = f"ALTER TABLE {table} {added}"
+        start, pending = self.prepare_pending_add_column("", alter)
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET a_float_value=1.5,a_double_value=-2.25,"
+            "a_day_value='2026-09-25',a_time_zero='12:34:56',"
+            "a_time_three='12:34:56.123',a_time_six='12:34:56.123456',"
+            "a_datetime_zero='2026-09-25 12:34:56',"
+            "a_datetime_three='2026-09-25 12:34:56.123',"
+            "a_datetime_six='2026-09-25 12:34:56.123456',"
+            "a_fixed_bytes=X'01020304',a_variable_bytes=X'000102',"
+            "a_short_text='tiny',a_plain_text='text',a_medium_text='medium',"
+            "a_long_text='long',a_short_blob=X'01',a_plain_blob=X'02',"
+            "a_medium_blob=X'03',a_long_blob=X'04' WHERE id=1; "
+            f"INSERT INTO {table}(id) VALUES(2);",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_basic_scalar_metadata(table, columns, "c")
+        self.assert_basic_scalar_metadata(table, columns, "a")
+        selected = ",".join(
+            ["id"]
+            + [f"c_{name}" for name, _, _ in columns[:11]]
+            + [f"a_{name}" for name, _, _ in columns[:11]]
+            + [
+                "a_float_value",
+                "a_double_value",
+                "a_day_value",
+                "a_time_zero",
+                "a_time_three",
+                "a_time_six",
+                "a_datetime_zero",
+                "a_datetime_three",
+                "a_datetime_six",
+                "a_flag",
+                "a_empty_label",
+            ]
+            + [
+                f"HEX(a_{name})"
+                for name in (
+                    "fixed_bytes",
+                    "variable_bytes",
+                    "short_blob",
+                    "plain_blob",
+                    "medium_blob",
+                    "long_blob",
+                )
+            ]
+            + [
+                f"a_{name}"
+                for name in ("short_text", "plain_text", "medium_text", "long_text")
+            ]
+        )
+        query = f"SELECT {selected} FROM {table} ORDER BY id;"
+        source_rows = self.admin_query(self.source, query).strip()
+        target_rows = self.admin_query(self.target, query).strip()
+        if source_rows != target_rows or len(source_rows.splitlines()) != 2:
+            raise HarnessError(
+                f"scalar CREATE/ADD DML differs: {source_rows!r} != {target_rows!r}"
+            )
+        for endpoint in (self.source, self.target):
+            default_row = self.admin_query(
+                endpoint,
+                f"SELECT a_signed_tiny,a_unsigned_tiny,a_signed_big,a_unsigned_big,"
+                f"a_price,a_flag,LENGTH(a_empty_label),a_time_six IS NULL,"
+                f"a_plain_blob IS NULL FROM {table} WHERE id=2;",
+            ).strip()
+            if (
+                default_row
+                != "-128\t255\t-9223372036854775808\t18446744073709551615\t-12.30\t1\t0\t1\t1"
+            ):
+                raise HarnessError(
+                    f"scalar default/null boundary differs: {default_row!r}"
+                )
+        print(
+            "basic_scalar_create_add_pending_replay_ok create_add=true "
+            "immutable_identity=true defaults=true widths=true fractional_time=true "
+            "nullable_binary_text_blob=true following_dml=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def assert_basic_scalar_metadata(
+        self, table: str, columns: tuple[tuple[str, str, str], ...], prefix: str
+    ) -> None:
+        assert self.source and self.target
+        for index, (name, _definition, column_type) in enumerate(columns, start=2):
+            expected_order = index if prefix == "c" else index + len(columns)
+            query = (
+                "SELECT COLUMN_TYPE,ORDINAL_POSITION FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='{table}' "
+                f"AND COLUMN_NAME='{prefix}_{name}';"
+            )
+            actual = self.admin_query(self.target, query).strip()
+            if actual != f"{column_type}\t{expected_order}":
+                raise HarnessError(f"{prefix}_{name} type/order differs: {actual!r}")
+        for name, expected in (
+            ("price", "-12.30"),
+            ("empty_label", ""),
+            ("signed_tiny", "-128"),
+            ("unsigned_big", "18446744073709551615"),
+        ):
+            default = self.admin_query(
+                self.target,
+                "SELECT COLUMN_DEFAULT FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='{table}' "
+                f"AND COLUMN_NAME='{prefix}_{name}';",
+            ).strip()
+            if default != expected:
+                raise HarnessError(f"{prefix}_{name} default differs: {default!r}")
 
     def run_commented_drop_column_pending_replay(self, present: bool) -> None:
         assert self.source and self.target
@@ -8535,6 +8823,10 @@ DELIMITER ;
             self.run_add_char_column_pending_replay()
         elif scenario == "add-signed-tinyint-pending-replay":
             self.run_add_signed_tinyint_pending_replay()
+        elif scenario == "curated-strip-sale-alter-pending-replay":
+            self.run_curated_strip_sale_alter_pending_replay()
+        elif scenario == "basic-scalar-create-add-pending-replay":
+            self.run_basic_scalar_create_add_pending_replay()
         elif scenario == "create-facets-historical-crash-restart":
             self.run_create_facets_historical_crash_restart()
         elif scenario == "curated-strip-create-pending-replay":
