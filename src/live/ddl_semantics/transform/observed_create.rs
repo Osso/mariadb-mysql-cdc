@@ -16,8 +16,13 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
         literals: extract_single_quoted_literals(&sql)?.into_iter(),
         position: 0,
     };
-    for keyword in ["CREATE", "TABLE", "IF", "NOT", "EXISTS"] {
-        parser.keyword(keyword)?;
+    parser.keyword("CREATE")?;
+    parser.keyword("TABLE")?;
+    let if_not_exists = parser.at("IF");
+    if if_not_exists {
+        for keyword in ["IF", "NOT", "EXISTS"] {
+            parser.keyword(keyword)?;
+        }
     }
     let name = parser.identifier()?;
     parser.keyword("(")?;
@@ -84,7 +89,7 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
         parser.keyword(",")?;
     }
     parser.keyword(")")?;
-    let collation = parser.table_options()?;
+    let (character_set, collation) = parser.table_options()?;
     if parser.at(";") {
         parser.keyword(";")?;
     }
@@ -93,16 +98,24 @@ pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
     }
     validate_definitions(&columns, &primary_key, &indexes, &check_constraints)?;
     validate_foreign_keys(&foreign_keys, &columns, &primary_key, &indexes)?;
+    for column in &mut columns {
+        if primary_key
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&column.name))
+        {
+            column.nullable = false;
+        }
+    }
     Ok(ParsedCreateTableAst {
         name,
-        if_not_exists: true,
+        if_not_exists,
         columns,
         primary_key,
         indexes,
         check_constraints,
         foreign_keys,
         engine: "InnoDB".into(),
-        character_set: Some("utf8mb4".into()),
+        character_set,
         collation,
     })
 }
@@ -296,24 +309,31 @@ impl Parser {
         })
     }
 
-    fn table_options(&mut self) -> Result<Option<String>, String> {
-        for keyword in [
-            "ENGINE", "=", "InnoDB", "DEFAULT", "CHARSET", "=", "utf8mb4",
-        ] {
+    fn table_options(&mut self) -> Result<(Option<String>, Option<String>), String> {
+        for keyword in ["ENGINE", "=", "InnoDB"] {
             self.keyword(keyword)?;
         }
+        let character_set = if self.at("DEFAULT") {
+            self.keyword("DEFAULT")?;
+            self.keyword("CHARSET")?;
+            self.keyword("=")?;
+            self.keyword("utf8mb4")?;
+            Some("utf8mb4".to_string())
+        } else {
+            None
+        };
         if !self.at("COLLATE") {
-            return Ok(None);
+            return Ok((character_set, None));
         }
         self.keyword("COLLATE")?;
         self.keyword("=")?;
         let collation = self.identifier()?;
         if !collation.starts_with("utf8mb4_") {
             return Err(format!(
-                "CREATE collation {collation} is not a utf8mb4 collation"
+                "CREATE collation {collation} requires utf8mb4 charset"
             ));
         }
-        Ok(Some(collation))
+        Ok((Some("utf8mb4".into()), Some(collation)))
     }
 
     /// Parses one column definition; the flag reports an inline `PRIMARY KEY`.
@@ -321,15 +341,21 @@ impl Parser {
         let name = self.identifier()?;
         let column_type = self.column_type()?;
         let (character_set, collation) = self.column_encoding(&column_type)?;
-        let nullable = self.nullability()?;
+        let explicit_null = self.at("NULL");
+        let mut nullable = self.nullability()?;
         let default_sql = self.column_default(&column_type, nullable)?;
-        let auto_increment = self.auto_increment(&column_type, nullable)?;
+        let incompatible_null = explicit_null || default_sql.as_deref() == Some("NULL");
+        let auto_increment = self.auto_increment(&column_type, incompatible_null)?;
+        if auto_increment {
+            nullable = false;
+        }
         let on_update_current_timestamp = self.on_update(&column_type)?;
         let inline_primary = self.at("PRIMARY");
         if inline_primary {
-            if nullable {
-                return Err("inline PRIMARY KEY requires NOT NULL".into());
+            if explicit_null || default_sql.as_deref() == Some("NULL") {
+                return Err("inline PRIMARY KEY cannot be NULL".into());
             }
+            nullable = false;
             self.keyword("PRIMARY")?;
             self.keyword("KEY")?;
         }
@@ -416,28 +442,25 @@ impl Parser {
             kind,
             "int" | "mediumint" | "smallint" | "tinyint" | "bigint"
         );
-        if self.at("NULL") && nullable {
+        if self.at("NULL") {
+            if !nullable {
+                return Err("NOT NULL column cannot DEFAULT NULL".into());
+            }
             self.keyword("NULL")?;
             return Ok(Some("NULL".into()));
         }
         if self.at("CURRENT_TIMESTAMP") && matches!(kind, "timestamp" | "datetime") {
             return self.current_timestamp(column_type).map(Some);
         }
-        if (self.at("0") || self.at("1")) && integer {
-            let value = self.tokens[self.position].clone();
-            self.position += 1;
-            return Ok(Some(value));
-        }
-        if column_type == "decimal(4,3)" {
-            return self.decimal_default().map(Some);
+        if integer || kind == "decimal" || matches!(kind, "float" | "double") {
+            return self.numeric_default(column_type).map(Some);
         }
         if self.at("<string>") && is_character_type(column_type) {
             self.keyword("<string>")?;
             let value = self.literals.next().ok_or("missing DEFAULT literal")?;
-            if value.is_empty()
-                || !value
-                    .chars()
-                    .all(|character| character.is_ascii_graphic() && character != '\'')
+            if !value
+                .chars()
+                .all(|character| (' '..='~').contains(&character) && character != '\'')
             {
                 return Err("unmodeled observed CREATE string default".into());
             }
@@ -450,50 +473,84 @@ impl Parser {
         Err("unmodeled observed CREATE default".into())
     }
 
-    fn decimal_default(&mut self) -> Result<String, String> {
+    fn numeric_default(&mut self, column_type: &str) -> Result<String, String> {
         let start = self.position;
-        let parts = self
-            .tokens
-            .get(start..start + 3)
-            .ok_or("incomplete DECIMAL(4,3) default")?;
-        let unquoted = !self.quoted[start..start + 3].contains(&true);
-        let integer = &parts[0];
-        let fraction = &parts[2];
-        let exact_scale = integer.len() == 1 && fraction.len() == 3;
-        let digits = integer
-            .bytes()
-            .chain(fraction.bytes())
-            .all(|byte| byte.is_ascii_digit());
-        if !unquoted || !exact_scale || !digits || parts[1] != "." {
-            return Err("unmodeled DECIMAL(4,3) default".into());
+        if self.at("+") || self.at("-") {
+            self.position += 1;
         }
-        let value = format!("{integer}.{fraction}");
-        self.position += 3;
-        Ok(value)
+        let digits = self
+            .tokens
+            .get(self.position)
+            .ok_or("missing numeric default")?;
+        if self.quoted[self.position]
+            || !digits.starts_with(|character: char| character.is_ascii_digit())
+        {
+            return Err("invalid numeric default".into());
+        }
+        self.position += 1;
+        if self.at(".") {
+            self.position += 1;
+            let fraction = self
+                .tokens
+                .get(self.position)
+                .ok_or("missing numeric fraction")?;
+            if self.quoted[self.position]
+                || !fraction.starts_with(|character: char| character.is_ascii_digit())
+            {
+                return Err("invalid numeric fraction".into());
+            }
+            self.position += 1;
+        }
+        if self.tokens[self.position - 1].ends_with(['e', 'E']) {
+            if self.at("+") || self.at("-") {
+                self.position += 1;
+            }
+            let exponent = self
+                .tokens
+                .get(self.position)
+                .ok_or("missing numeric exponent")?;
+            if self.quoted[self.position] || !exponent.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("invalid numeric exponent".into());
+            }
+            self.position += 1;
+        }
+        let literal = self.tokens[start..self.position].join("");
+        super::basic_types::normalize_numeric_default(column_type, &literal)
     }
 
     /// Consumes `CURRENT_TIMESTAMP` or `CURRENT_TIMESTAMP(6)` matching the column precision.
     fn current_timestamp(&mut self, column_type: &str) -> Result<String, String> {
         self.keyword("CURRENT_TIMESTAMP")?;
         let expected = current_timestamp_for(column_type);
-        if expected.ends_with("(6)") {
-            for token in ["(", "6", ")"] {
-                self.keyword(token)?;
-            }
+        if let Some(precision) = column_type
+            .strip_suffix(')')
+            .and_then(|kind| kind.rsplit_once('('))
+            .map(|(_, precision)| precision.to_string())
+        {
+            self.keyword("(")?;
+            self.keyword(&precision)?;
+            self.keyword(")")?;
         } else if self.at("(") {
             return Err("CURRENT_TIMESTAMP precision does not match the column".into());
         }
         Ok(expected)
     }
 
-    fn auto_increment(&mut self, column_type: &str, nullable: bool) -> Result<bool, String> {
+    fn auto_increment(
+        &mut self,
+        column_type: &str,
+        incompatible_null: bool,
+    ) -> Result<bool, String> {
         if !self.at("AUTO_INCREMENT") {
             return Ok(false);
         }
-        if !matches!(column_type, "int unsigned" | "bigint unsigned") || nullable {
-            return Err(
-                "AUTO_INCREMENT requires observed non-null INT UNSIGNED or BIGINT UNSIGNED".into(),
-            );
+        let kind = column_type.split(' ').next().unwrap_or_default();
+        let integer = matches!(
+            kind,
+            "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+        );
+        if !integer || incompatible_null {
+            return Err("AUTO_INCREMENT requires a non-null integer column".into());
         }
         self.keyword("AUTO_INCREMENT")?;
         Ok(true)
@@ -503,7 +560,7 @@ impl Parser {
         if !self.at("ON") {
             return Ok(false);
         }
-        if !matches!(column_type, "timestamp" | "datetime" | "datetime(6)") {
+        if !column_type.starts_with("timestamp") && !column_type.starts_with("datetime") {
             return Err("ON UPDATE requires TIMESTAMP or DATETIME".into());
         }
         self.keyword("ON")?;
@@ -536,89 +593,14 @@ impl Parser {
         Ok(format!("enum({})", members.join(",")))
     }
 
-    /// Consumes an optional MariaDB integer display width; MySQL 8 has no display width for
-    /// these types, so the width carries no target semantics.
-    fn integer_display_width(&mut self) -> Result<(), String> {
-        if !self.at("(") {
-            return Ok(());
-        }
-        self.keyword("(")?;
-        let width = self
-            .tokens
-            .get(self.position)
-            .cloned()
-            .ok_or("missing integer display width")?;
-        let value = width
-            .parse::<u8>()
-            .map_err(|_| "invalid integer display width")?;
-        if value == 0 || value.to_string() != width {
-            return Err("noncanonical integer display width".into());
-        }
-        self.keyword(&width)?;
-        self.keyword(")")
-    }
-
     fn column_type(&mut self) -> Result<String, String> {
         if self.at("ENUM") {
             return self.enum_type();
         }
-        if self.at("TINYINT") {
-            let (column_type, next) =
-                parse_tinyint_type(&self.tokens, &self.quoted, self.position + 1)?;
-            self.position = next;
-            return Ok(column_type);
-        }
-        for kind in ["INT", "MEDIUMINT", "SMALLINT", "BIGINT"] {
-            if self.at(kind) {
-                self.keyword(kind)?;
-                self.integer_display_width()?;
-                self.keyword("UNSIGNED")?;
-                return Ok(format!("{} unsigned", kind.to_ascii_lowercase()));
-            }
-        }
-        if self.at("TIMESTAMP") {
-            self.keyword("TIMESTAMP")?;
-            return Ok("timestamp".into());
-        }
-        if self.at("DATETIME") {
-            self.keyword("DATETIME")?;
-            if !self.at("(") {
-                return Ok("datetime".into());
-            }
-            for token in ["(", "6", ")"] {
-                self.keyword(token)?;
-            }
-            return Ok("datetime(6)".into());
-        }
-        for kind in ["TEXT", "MEDIUMTEXT", "LONGTEXT", "JSON"] {
-            if self.at(kind) {
-                self.keyword(kind)?;
-                return Ok(kind.to_ascii_lowercase());
-            }
-        }
-        if self.at("DECIMAL") {
-            for token in ["DECIMAL", "(", "4", ",", "3", ")"] {
-                self.keyword(token)?;
-            }
-            return Ok("decimal(4,3)".into());
-        }
-        let kind = if self.at("CHAR") { "CHAR" } else { "VARCHAR" };
-        self.keyword(kind)?;
-        self.keyword("(")?;
-        let length = self
-            .tokens
-            .get(self.position)
-            .cloned()
-            .ok_or("missing character type length")?;
-        let value = length
-            .parse::<u32>()
-            .map_err(|_| "invalid character type length")?;
-        if value == 0 || value.to_string() != length || (kind == "CHAR" && value > 255) {
-            return Err("noncanonical character type length".into());
-        }
-        self.keyword(&length)?;
-        self.keyword(")")?;
-        Ok(format!("{}({value})", kind.to_ascii_lowercase()))
+        let (column_type, _, next) =
+            super::basic_types::parse_column_type(&self.tokens, &self.quoted, self.position)?;
+        self.position = next;
+        Ok(column_type)
     }
 }
 
@@ -639,10 +621,12 @@ pub(crate) fn text_expression_default(value: &str) -> String {
 
 /// The `CURRENT_TIMESTAMP` spelling whose precision matches the column type.
 pub(crate) fn current_timestamp_for(column_type: &str) -> String {
-    if column_type.ends_with("(6)") {
-        "CURRENT_TIMESTAMP(6)".to_string()
-    } else {
-        "CURRENT_TIMESTAMP".to_string()
+    let precision = column_type
+        .strip_suffix(')')
+        .and_then(|kind| kind.rsplit_once('('));
+    match precision {
+        Some((_, precision)) => format!("CURRENT_TIMESTAMP({precision})"),
+        None => "CURRENT_TIMESTAMP".to_string(),
     }
 }
 
@@ -702,6 +686,91 @@ pub(super) fn remove_ordinary_comments(sql: &str) -> Result<String, String> {
 mod tests {
     use super::super::super::model::CheckPredicate;
     use super::*;
+
+    #[test]
+    fn ordinary_create_preserves_optional_clauses_and_nullable_defaults() {
+        let ast = parse("CREATE TABLE `ordinary` (`id` INTEGER PRIMARY KEY, `title` VARCHAR(30) DEFAULT '', `note` TEXT DEFAULT 'a b', `created` TIMESTAMP(3) NULL, `amount` DECIMAL(7,2) DEFAULT -12.50) ENGINE=InnoDB").unwrap();
+        assert!(!ast.if_not_exists);
+        assert_eq!(ast.character_set, None);
+        assert_eq!(ast.collation, None);
+        assert_eq!(ast.primary_key, ["id"]);
+        assert!(!ast.columns[0].nullable);
+        assert!(ast.columns[1..].iter().all(|column| column.nullable));
+        assert_eq!(ast.columns[1].default_sql.as_deref(), Some("''"));
+        assert_eq!(
+            ast.columns[2].default_sql.as_deref(),
+            Some("(_utf8mb4'a b')")
+        );
+        assert_eq!(ast.columns[3].column_type, "timestamp(3)");
+        assert_eq!(ast.columns[4].default_sql.as_deref(), Some("-12.50"));
+    }
+
+    #[test]
+    fn ordinary_create_accepts_basic_types_and_finite_numeric_defaults() {
+        let ast = parse("CREATE TABLE IF NOT EXISTS t (id BIGINT NOT NULL, count SMALLINT SIGNED DEFAULT -32768, ratio DOUBLE DEFAULT 1.25, occurred DATE NULL, elapsed TIME(6), bytes VARBINARY(16), payload BLOB, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci").unwrap();
+        assert!(ast.if_not_exists);
+        assert_eq!(ast.character_set.as_deref(), Some("utf8mb4"));
+        assert_eq!(ast.collation.as_deref(), Some("utf8mb4_unicode_ci"));
+        assert_eq!(ast.columns[1].default_sql.as_deref(), Some("-32768"));
+        assert_eq!(ast.columns[2].default_sql.as_deref(), Some("1.25"));
+        assert_eq!(ast.columns[4].column_type, "time(6)");
+        assert_eq!(ast.columns[5].column_type, "varbinary(16)");
+        assert_eq!(ast.columns[6].column_type, "blob");
+    }
+
+    #[test]
+    fn ordinary_create_accepts_finite_scientific_defaults_and_temporal_precision() {
+        let ast = parse("CREATE TABLE t (id INT PRIMARY KEY, rate FLOAT DEFAULT 1.5e2, changed DATETIME(2) NULL DEFAULT CURRENT_TIMESTAMP(2) ON UPDATE CURRENT_TIMESTAMP(2)) ENGINE=InnoDB").unwrap();
+        assert_eq!(ast.columns[1].default_sql.as_deref(), Some("150"));
+        assert_eq!(ast.columns[2].column_type, "datetime(2)");
+        assert_eq!(
+            ast.columns[2].default_sql.as_deref(),
+            Some("CURRENT_TIMESTAMP(2)")
+        );
+        assert!(ast.columns[2].on_update_current_timestamp);
+    }
+
+    #[test]
+    fn ordinary_create_table_primary_key_implies_not_null() {
+        let ast =
+            parse("CREATE TABLE t (id BIGINT, label VARCHAR(8), PRIMARY KEY (id)) ENGINE=InnoDB")
+                .unwrap();
+        assert!(!ast.columns[0].nullable);
+        assert!(ast.columns[1].nullable);
+    }
+
+    #[test]
+    fn ordinary_create_collation_implies_matching_charset() {
+        let ast =
+            parse("CREATE TABLE t (id INT PRIMARY KEY) ENGINE=InnoDB COLLATE=utf8mb4_unicode_ci")
+                .unwrap();
+        assert_eq!(ast.character_set.as_deref(), Some("utf8mb4"));
+        assert_eq!(ast.collation.as_deref(), Some("utf8mb4_unicode_ci"));
+    }
+
+    #[test]
+    fn ordinary_create_inline_primary_auto_increment_implies_not_null() {
+        let ast = parse(
+            "CREATE TABLE t (id INTEGER AUTO_INCREMENT PRIMARY KEY, name VARCHAR(8)) ENGINE=InnoDB",
+        )
+        .unwrap();
+        assert!(!ast.columns[0].nullable);
+        assert!(ast.columns[0].auto_increment);
+        assert!(ast.columns[1].nullable);
+    }
+
+    #[test]
+    fn ordinary_create_rejects_contradictory_and_unmodeled_options() {
+        for sql in [
+            "CREATE TABLE t (id INT NOT NULL DEFAULT NULL PRIMARY KEY) ENGINE=InnoDB",
+            "CREATE TABLE t (id INT PRIMARY KEY) ENGINE=InnoDB ROW_FORMAT=COMPRESSED",
+            "CREATE TABLE t (id INT PRIMARY KEY) ENGINE=MyISAM",
+            "CREATE TABLE t (id INT PRIMARY KEY, n INT DEFAULT 'abc') ENGINE=InnoDB",
+            "CREATE TABLE t (id INT PRIMARY KEY, n VARCHAR(5) DEFAULT 'a\\b') ENGINE=InnoDB",
+        ] {
+            assert!(parse(sql).is_err(), "{sql}");
+        }
+    }
 
     const SQL: &str = "/* ordinary */ CREATE TABLE IF NOT EXISTS `facets` (\n`comic_id` MEDIUMINT UNSIGNED NOT NULL, -- identity\n`facet_id` SMALLINT UNSIGNED NOT NULL, `kind` TINYINT UNSIGNED NOT NULL, `label` VARCHAR(80) NOT NULL, `score` DECIMAL(4,3) NOT NULL, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (`comic_id`, `facet_id`), KEY `by_kind` (`kind`, `comic_id`), KEY `by_facet` (`facet_id`, `kind`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
 
@@ -769,12 +838,10 @@ mod tests {
         assert!(ast.indexes[0].unique);
         assert!(!ast.indexes[1].unique);
         for rejected in [
-            sql.replace("TINYINT(1)", "TINYINT(2)"),
             sql.replace(
                 "ENUM('western','manga','webtoon')",
                 "ENUM('west\\\\nern','manga','webtoon')",
             ),
-            sql.replace("DEFAULT 1", "DEFAULT 2"),
             sql.replace("UNIQUE KEY", "UNIQUE HASH KEY"),
         ] {
             assert!(parse(&rejected).is_err(), "{rejected}");
@@ -881,16 +948,12 @@ mod tests {
             let ast = parse(&sql).expect(value);
             assert_eq!(ast.columns[5].default_sql.as_deref(), Some(value));
         }
-        for value in [
-            "10.000",
-            "0.6500",
-            "0.65",
-            "00.650",
-            "0.65e0",
-            "'0.650'",
-            "(0.650)",
-            "`0`.`650`",
-        ] {
+        for (value, normalized) in [("0.65", "0.650"), ("0.6500", "0.650"), ("00.650", "0.650")] {
+            let sql = CURATED_STRIPS.replace("DEFAULT 0.650", &format!("DEFAULT {value}"));
+            let ast = parse(&sql).expect(value);
+            assert_eq!(ast.columns[5].default_sql.as_deref(), Some(normalized));
+        }
+        for value in ["10.000", "0.65e0", "'0.650'", "(0.650)", "`0`.`650`"] {
             let sql = CURATED_STRIPS.replace("DEFAULT 0.650", &format!("DEFAULT {value}"));
             assert!(parse(&sql).is_err(), "{value}");
         }
@@ -1073,8 +1136,8 @@ mod tests {
         for sql in [
             SQL.replace("/* ordinary */", "/*!99999 invisible */"),
             SQL.replace("/* ordinary */", "/*+ hint */"),
-            SQL.replace("DECIMAL(4,3)", "DECIMAL(5,3)"),
-            SQL.replace("MEDIUMINT UNSIGNED", "MEDIUMINT"),
+            SQL.replace("DECIMAL(4,3)", "DECIMAL(0,3)"),
+            SQL.replace("MEDIUMINT UNSIGNED", "MEDIUMINT ZEROFILL"),
             SQL.replace("VARCHAR(80)", "VARCHAR(`80`)"),
             SQL.replace("TIMESTAMP NOT", "TIMESTAMP(6) NOT"),
             SQL.replace("KEY `by_kind`", "UNIQUE HASH KEY `by_kind`"),
