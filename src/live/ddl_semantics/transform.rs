@@ -1856,49 +1856,56 @@ fn parse_alter_column_default_clause(
     require_unquoted_token(quoted, index + 1, "ALTER COLUMN")?;
     let name = require_identifier(tokens, index + 2, "altered column")?;
     let action = index + 3;
+    let (default, next) = parse_alter_default_action(tokens, quoted, action, literals)?;
+    Ok((
+        ParsedAlterClause::AlterColumnDefault { name, default },
+        next,
+    ))
+}
+
+fn parse_alter_default_action(
+    tokens: &[String],
+    quoted: &[bool],
+    action: usize,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(Option<ParsedColumnDefault>, usize), String> {
     if tokens_match(tokens, action, "DROP") {
         require_unquoted_token(quoted, action, "DROP DEFAULT")?;
         require_keyword(tokens, action + 1, "DEFAULT")?;
         require_unquoted_token(quoted, action + 1, "DROP DEFAULT")?;
-        return Ok((
-            ParsedAlterClause::AlterColumnDefault {
-                name,
-                default: None,
-            },
-            action + 2,
-        ));
+        return Ok((None, action + 2));
     }
     require_keyword(tokens, action, "SET")?;
     require_unquoted_token(quoted, action, "SET DEFAULT")?;
     require_keyword(tokens, action + 1, "DEFAULT")?;
     require_unquoted_token(quoted, action + 1, "SET DEFAULT")?;
-    let value_index = action + 2;
-    require_unquoted_token(quoted, value_index, "DEFAULT literal")?;
-    let (default, next) = if tokens_match(tokens, value_index, "NULL") {
-        (ParsedColumnDefault::Null, value_index + 1)
-    } else if tokens_match(tokens, value_index, "<string>") {
-        (
-            ParsedColumnDefault::String(parse_string_default_literal(literals)?),
-            value_index + 1,
-        )
-    } else {
-        let (value, next) = numeric_default_literal(tokens, quoted, value_index)?;
-        if !value.chars().any(|digit| digit.is_ascii_digit())
-            || !value
-                .chars()
-                .all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.'))
-        {
-            return Err("DEFAULT must be a numeric or string literal".into());
-        }
-        (ParsedColumnDefault::Number(value), next)
-    };
-    Ok((
-        ParsedAlterClause::AlterColumnDefault {
-            name,
-            default: Some(default),
-        },
-        next,
-    ))
+    let (value, next) = parse_alter_default_literal(tokens, quoted, action + 2, literals)?;
+    Ok((Some(value), next))
+}
+
+fn parse_alter_default_literal(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(ParsedColumnDefault, usize), String> {
+    require_unquoted_token(quoted, index, "DEFAULT literal")?;
+    if tokens_match(tokens, index, "NULL") {
+        return Ok((ParsedColumnDefault::Null, index + 1));
+    }
+    if tokens_match(tokens, index, "<string>") {
+        let value = parse_string_default_literal(literals)?;
+        return Ok((ParsedColumnDefault::String(value), index + 1));
+    }
+    let (value, next) = numeric_default_literal(tokens, quoted, index)?;
+    let numeric = value.chars().any(|digit| digit.is_ascii_digit())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, '-' | '+' | '.'));
+    if !numeric {
+        return Err("DEFAULT must be a numeric or string literal".into());
+    }
+    Ok((ParsedColumnDefault::Number(value), next))
 }
 
 fn parse_rename_column_clause(
