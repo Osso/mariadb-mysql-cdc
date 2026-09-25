@@ -175,13 +175,10 @@ impl ParsedAlterLock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsedAlterClause {
     AddColumn(ParsedAddColumnAst),
-    ModifyVarchar {
-        name: String,
-        column_type: String,
-        nullable: bool,
-    },
-    ModifyNullableDatetime {
-        name: String,
+    ModifyColumn(ParsedAddColumnAst),
+    RenameColumn {
+        old_name: String,
+        new_name: String,
     },
     AddKey {
         index: ParsedIndexAst,

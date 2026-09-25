@@ -10,6 +10,7 @@ use super::tokenizer::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+mod basic_types;
 mod check_constraint;
 mod generated_column;
 mod observed_create;
@@ -56,13 +57,14 @@ fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
     ast.algorithm.is_none()
         && ast.lock.is_none()
         && ast.clauses.iter().all(|clause| match clause {
-            ParsedAlterClause::AddColumn(column) => column.data_type != "timestamp",
+            ParsedAlterClause::AddColumn(_) => true,
             ParsedAlterClause::AddKey { .. }
             | ParsedAlterClause::AddCheck(_)
             | ParsedAlterClause::AddForeignKey(_)
-            | ParsedAlterClause::ModifyVarchar { .. }
-            | ParsedAlterClause::ModifyNullableDatetime { .. } => true,
-            ParsedAlterClause::DropColumn(_) | ParsedAlterClause::DropIndex(_) => false,
+            | ParsedAlterClause::ModifyColumn(_)
+            | ParsedAlterClause::RenameColumn { .. } => true,
+            ParsedAlterClause::DropColumn(column) => !column.if_exists,
+            ParsedAlterClause::DropIndex(_) => true,
         })
 }
 
@@ -199,26 +201,14 @@ fn render_production_alter_table(ast: &ParsedAlterTableAst) -> String {
 fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
     match clause {
         ParsedAlterClause::AddColumn(column) => render_add_column(column),
-        ParsedAlterClause::ModifyNullableDatetime { name } => format!(
-            "MODIFY COLUMN {} DATETIME NULL DEFAULT NULL",
-            quote_identifier(name)
-        ),
-        ParsedAlterClause::ModifyVarchar {
-            name,
-            column_type,
-            nullable,
-        } => {
-            let attributes = if *nullable {
-                "NULL DEFAULT NULL"
-            } else {
-                "NOT NULL"
-            };
-            format!(
-                "MODIFY COLUMN {} {} {attributes}",
-                quote_identifier(name),
-                column_type.to_ascii_uppercase()
-            )
+        ParsedAlterClause::ModifyColumn(column) => {
+            render_add_column(column).replacen("ADD COLUMN", "MODIFY COLUMN", 1)
         }
+        ParsedAlterClause::RenameColumn { old_name, new_name } => format!(
+            "RENAME COLUMN {} TO {}",
+            quote_identifier(old_name),
+            quote_identifier(new_name)
+        ),
         ParsedAlterClause::AddKey { index, .. } => render_add_key(index),
         ParsedAlterClause::AddCheck(constraint) => {
             format!(
@@ -256,6 +246,7 @@ fn render_add_column(column: &ParsedAddColumnAst) -> String {
             "GENERATED ALWAYS AS ({}) STORED",
             generated_column::render_generation_sql(expression)
         ),
+        None if !column.nullable && column.default_value.is_none() => nullability.to_string(),
         None => format!("{nullability} DEFAULT {default_value}"),
     };
     let mut sql = format!(
@@ -1776,7 +1767,7 @@ pub fn supports_drop_columns_if_exists(source_sql: &str) -> bool {
             && ast
                 .clauses
                 .iter()
-                .all(|clause| matches!(clause, ParsedAlterClause::DropColumn(_)))
+                .all(|clause| matches!(clause, ParsedAlterClause::DropColumn(column) if column.if_exists))
     })
 }
 
@@ -1787,10 +1778,9 @@ pub fn transform_drop_columns_if_exists(
     let ast = parse_production_alter_table_ast(source_sql)?;
     if ast.algorithm.is_some()
         || ast.lock.is_some()
-        || !ast
-            .clauses
-            .iter()
-            .all(|clause| matches!(clause, ParsedAlterClause::DropColumn(_)))
+        || !ast.clauses.iter().all(
+            |clause| matches!(clause, ParsedAlterClause::DropColumn(column) if column.if_exists),
+        )
     {
         return Err("ALTER TABLE mixes DROP COLUMN IF EXISTS with unsupported clauses".to_string());
     }
@@ -1887,7 +1877,10 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
         && (algorithm.is_some()
             || lock.is_some()
             || !clauses.iter().all(|clause| match clause {
-                ParsedAlterClause::ModifyVarchar { .. } | ParsedAlterClause::AddColumn(_) => true,
+                ParsedAlterClause::ModifyColumn(_)
+                | ParsedAlterClause::AddColumn(_)
+                | ParsedAlterClause::RenameColumn { .. }
+                | ParsedAlterClause::DropIndex(_) => true,
                 ParsedAlterClause::DropColumn(_) => leading_comments_only,
                 _ => false,
             }))
@@ -1973,6 +1966,7 @@ fn parse_production_alter_clause(
     table: &str,
     literals: &mut impl Iterator<Item = String>,
 ) -> Result<(ParsedAlterClause, usize), String> {
+    require_unquoted_token(quoted_flags, index, "ALTER clause")?;
     match tokens
         .get(index)
         .map(|token| token.to_ascii_uppercase())
@@ -1980,56 +1974,47 @@ fn parse_production_alter_clause(
     {
         Some("ADD") => parse_production_add_clause(tokens, quoted_flags, index, table, literals),
         Some("DROP") => parse_drop_alter_clause(tokens, index),
-        Some("MODIFY") => parse_modify_varchar_clause(tokens, quoted_flags, index),
+        Some("MODIFY") => parse_modify_column_clause(tokens, quoted_flags, index, literals),
+        Some("RENAME") => parse_rename_column_clause(tokens, quoted_flags, index),
         actual => Err(format!(
             "unsupported production ALTER TABLE clause {actual:?}"
         )),
     }
 }
 
-fn parse_modify_varchar_clause(
+fn parse_modify_column_clause(
     tokens: &[String],
-    quoted_flags: &[bool],
+    quoted: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(ParsedAlterClause, usize), String> {
+    require_keyword(tokens, index + 1, "COLUMN")?;
+    require_unquoted_token(quoted, index + 1, "MODIFY COLUMN")?;
+    let (ParsedAlterClause::AddColumn(column), next) =
+        parse_add_column_clause(tokens, quoted, index, literals)?
+    else {
+        unreachable!("column parser returns a column");
+    };
+    if column.if_not_exists || column.generated.is_some() || column.data_type == "json" {
+        return Err("MODIFY requires an ordinary unguarded non-JSON column".into());
+    }
+    Ok((ParsedAlterClause::ModifyColumn(column), next))
+}
+
+fn parse_rename_column_clause(
+    tokens: &[String],
+    quoted: &[bool],
     index: usize,
 ) -> Result<(ParsedAlterClause, usize), String> {
-    for (offset, keyword) in [(0, "MODIFY"), (1, "COLUMN")] {
+    for (offset, keyword) in [(0, "RENAME"), (1, "COLUMN"), (3, "TO")] {
+        require_unquoted_token(quoted, index + offset, "RENAME COLUMN")?;
         require_keyword(tokens, index + offset, keyword)?;
-        if quoted_flags.get(index + offset) == Some(&true) {
-            return Err("quoted MODIFY keyword is unsupported".into());
-        }
     }
-    let name = require_identifier(tokens, index + 2, "modified column")?;
-    let (column_type, data_type, next) =
-        parse_observed_column_type(tokens, quoted_flags, index + 3)?;
-    if column_type == "datetime" {
-        for (offset, keyword) in [(0, "DEFAULT"), (1, "NULL")] {
-            require_keyword(tokens, next + offset, keyword)?;
-            if quoted_flags.get(next + offset) == Some(&true) {
-                return Err("quoted MODIFY default is unsupported".into());
-            }
-        }
-        return Ok((ParsedAlterClause::ModifyNullableDatetime { name }, next + 2));
-    }
-    if data_type != "varchar" {
-        return Err("MODIFY supports only VARCHAR(n) NOT NULL or DEFAULT NULL".into());
-    }
-    let nullable = tokens
-        .get(next)
-        .is_some_and(|token| token.eq_ignore_ascii_case("DEFAULT"));
-    let first_keyword = if nullable { "DEFAULT" } else { "NOT" };
-    for (offset, keyword) in [(0, first_keyword), (1, "NULL")] {
-        require_keyword(tokens, next + offset, keyword)?;
-        if quoted_flags.get(next + offset) == Some(&true) {
-            return Err("quoted MODIFY nullability is unsupported".into());
-        }
-    }
+    let old_name = require_identifier(tokens, index + 2, "renamed column")?;
+    let new_name = require_identifier(tokens, index + 4, "new column name")?;
     Ok((
-        ParsedAlterClause::ModifyVarchar {
-            name,
-            column_type,
-            nullable,
-        },
-        next + 2,
+        ParsedAlterClause::RenameColumn { old_name, new_name },
+        index + 5,
     ))
 }
 
@@ -2147,7 +2132,8 @@ fn parse_add_column_clause(
         literals,
         &column_type,
     )?;
-    let options = parse_observed_column_options(tokens, options_start, literals, &data_type)?;
+    let options =
+        parse_observed_column_options(tokens, quoted_flags, options_start, literals, &column_type)?;
     if generated.is_some()
         && tokens[options_start..options.next_index]
             .iter()
@@ -2297,134 +2283,9 @@ fn parse_key_part_order(tokens: &[String], index: usize) -> (&'static str, usize
 fn parse_observed_column_type(
     tokens: &[String],
     quoted_flags: &[bool],
-    mut index: usize,
+    index: usize,
 ) -> Result<(String, String, usize), String> {
-    require_unquoted_token(quoted_flags, index, "added column type")?;
-    let data_type = require_identifier(tokens, index, "added column type")?.to_ascii_lowercase();
-    if !matches!(
-        data_type.as_str(),
-        "char"
-            | "varchar"
-            | "text"
-            | "mediumtext"
-            | "json"
-            | "datetime"
-            | "timestamp"
-            | "tinyint"
-            | "smallint"
-            | "float"
-    ) {
-        return Err(format!(
-            "unsupported production ADD COLUMN type {data_type}"
-        ));
-    }
-    index += 1;
-    let column_type = match data_type.as_str() {
-        "text" | "mediumtext" | "json" => {
-            if tokens.get(index).map(String::as_str) == Some("(") {
-                return Err(format!("{data_type} length is unsupported"));
-            }
-            data_type.clone()
-        }
-        "char" | "varchar" => {
-            require_unquoted_token(quoted_flags, index, "character type opening parenthesis")?;
-            require_unquoted_token(quoted_flags, index + 1, "character type length")?;
-            require_unquoted_token(
-                quoted_flags,
-                index + 2,
-                "character type closing parenthesis",
-            )?;
-            require_keyword(tokens, index, "(")?;
-            let length = tokens
-                .get(index + 1)
-                .cloned()
-                .ok_or_else(|| "missing column type length".to_string())?;
-            let parsed_length = length
-                .parse::<u32>()
-                .map_err(|_| format!("invalid column type length {length}"))?;
-            if parsed_length == 0 || parsed_length.to_string() != length {
-                return Err(format!("noncanonical column type length {length}"));
-            }
-            if data_type == "char" && parsed_length > 255 {
-                return Err(format!("CHAR length exceeds 255: {parsed_length}"));
-            }
-            require_keyword(tokens, index + 2, ")")?;
-            index += 3;
-            format!("{data_type}({parsed_length})")
-        }
-        "datetime" if tokens.get(index).map(String::as_str) == Some("(") => {
-            for (offset, token) in [(0, "("), (1, "6"), (2, ")")] {
-                require_unquoted_token(quoted_flags, index + offset, "DATETIME precision")?;
-                require_keyword(tokens, index + offset, token)?;
-            }
-            index += 3;
-            "datetime(6)".to_string()
-        }
-        "datetime" | "timestamp" => {
-            if tokens.get(index).map(String::as_str) == Some("(") {
-                return Err(format!(
-                    "{} precision is unsupported",
-                    data_type.to_ascii_uppercase()
-                ));
-            }
-            data_type.clone()
-        }
-        "tinyint" => {
-            let (column_type, next_index) = parse_tinyint_type(tokens, quoted_flags, index)?;
-            index = next_index;
-            column_type
-        }
-        "smallint" => {
-            if tokens.get(index).map(String::as_str) == Some("(") {
-                return Err("SMALLINT display width is unsupported".to_string());
-            }
-            require_unquoted_token(quoted_flags, index, "SMALLINT UNSIGNED keyword")?;
-            require_keyword(tokens, index, "UNSIGNED")?;
-            index += 1;
-            "smallint unsigned".to_string()
-        }
-        "float" => {
-            if tokens.get(index).map(String::as_str) == Some("(") {
-                return Err("FLOAT parameters are unsupported".to_string());
-            }
-            require_unquoted_token(quoted_flags, index, "FLOAT UNSIGNED keyword")?;
-            require_keyword(tokens, index, "UNSIGNED")?;
-            index += 1;
-            "float unsigned".to_string()
-        }
-        _ => unreachable!("supported types were checked above"),
-    };
-    if tokens
-        .get(index)
-        .is_some_and(|token| token.eq_ignore_ascii_case("UNSIGNED"))
-    {
-        return Err(format!("UNSIGNED is unsupported for {data_type}"));
-    }
-    Ok((column_type, data_type, index))
-}
-
-fn parse_tinyint_type(
-    tokens: &[String],
-    quoted_flags: &[bool],
-    mut index: usize,
-) -> Result<(String, usize), String> {
-    if tokens.get(index).map(String::as_str) == Some("(") {
-        require_unquoted_token(quoted_flags, index, "TINYINT opening parenthesis")?;
-        require_unquoted_token(quoted_flags, index + 1, "TINYINT display width")?;
-        require_unquoted_token(quoted_flags, index + 2, "TINYINT closing parenthesis")?;
-        require_keyword(tokens, index, "(")?;
-        require_keyword(tokens, index + 1, "1")?;
-        require_keyword(tokens, index + 2, ")")?;
-        index += 3;
-    }
-    if tokens
-        .get(index)
-        .is_some_and(|token| token.eq_ignore_ascii_case("UNSIGNED"))
-    {
-        require_unquoted_token(quoted_flags, index, "TINYINT UNSIGNED keyword")?;
-        return Ok(("tinyint unsigned".to_string(), index + 1));
-    }
-    Ok(("tinyint".to_string(), index))
+    basic_types::parse_column_type(tokens, quoted_flags, index)
 }
 
 fn require_unquoted_token(
@@ -2440,70 +2301,125 @@ fn require_unquoted_token(
 
 fn parse_observed_column_options(
     tokens: &[String],
+    quoted: &[bool],
     mut index: usize,
     literals: &mut impl Iterator<Item = String>,
-    data_type: &str,
+    column_type: &str,
 ) -> Result<ParsedColumnOptions, String> {
-    let mut nullable = true;
-    let mut default_value = None;
-    let mut comment = String::new();
-    let mut after = None;
-    let supports_required_zero = matches!(data_type, "float" | "tinyint");
-    let string_default = is_text_type(data_type) || matches!(data_type, "char" | "varchar");
+    let data_type = column_type.split(['(', ' ']).next().unwrap_or(column_type);
+    let mut options = ParsedColumnOptions {
+        nullable: true,
+        default_value: None,
+        comment: String::new(),
+        after: None,
+        next_index: index,
+    };
+    let mut seen = BTreeSet::new();
+    let mut explicit_null_default = false;
     while index < tokens.len() && tokens[index] != "," {
-        if tokens[index].eq_ignore_ascii_case("NULL") {
-            nullable = true;
-            index += 1;
-        } else if tokens[index].eq_ignore_ascii_case("NOT") {
-            if !supports_required_zero && !string_default {
-                return Err(format!(
-                    "unsupported production ADD COLUMN option {:?}",
-                    tokens.get(index)
-                ));
+        require_unquoted_token(quoted, index, "column option")?;
+        let option = tokens[index].to_ascii_uppercase();
+        let key = if option == "NOT" { "NULL" } else { &option };
+        if !seen.insert(key.to_string()) {
+            return Err(format!("duplicate column option {key}"));
+        }
+        match option.as_str() {
+            "NULL" => {
+                options.nullable = true;
+                index += 1;
             }
-            require_keyword(tokens, index + 1, "NULL")?;
-            nullable = false;
-            index += 2;
-        } else if tokens[index].eq_ignore_ascii_case("DEFAULT") {
-            let value = tokens
-                .get(index + 1)
-                .ok_or_else(|| "DEFAULT value is missing".to_string())?;
-            if value.eq_ignore_ascii_case("NULL") {
-                default_value = None;
-            } else if supports_required_zero && value == "0" {
-                default_value = Some("0".to_string());
-            } else if string_default && value == "<string>" {
-                default_value = Some(parse_string_default_literal(literals)?);
-            } else {
-                return Err(format!("unsupported production ADD COLUMN default {value}"));
+            "NOT" => {
+                require_unquoted_token(quoted, index + 1, "NOT NULL")?;
+                require_keyword(tokens, index + 1, "NULL")?;
+                options.nullable = false;
+                index += 2;
             }
-            index += 2;
-        } else if tokens[index].eq_ignore_ascii_case("COMMENT") {
-            require_keyword(tokens, index + 1, "<string>")?;
-            comment = literals
-                .next()
-                .ok_or_else(|| "COMMENT literal is missing".to_string())?;
-            index += 2;
-        } else if tokens[index].eq_ignore_ascii_case("AFTER") {
-            after = Some(require_identifier(tokens, index + 1, "AFTER column")?);
-            index += 2;
-        } else {
-            return Err(format!(
-                "unsupported production ADD COLUMN option {:?}",
-                tokens.get(index)
-            ));
+            "DEFAULT" => {
+                require_unquoted_token(quoted, index + 1, "DEFAULT value")?;
+                explicit_null_default = tokens
+                    .get(index + 1)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("NULL"));
+                let (value, next) =
+                    parse_basic_default(tokens, quoted, index + 1, literals, column_type)?;
+                options.default_value = value;
+                index = next;
+            }
+            "COMMENT" => {
+                require_keyword(tokens, index + 1, "<string>")?;
+                options.comment = literals.next().ok_or("missing COMMENT literal")?;
+                index += 2;
+            }
+            "AFTER" => {
+                options.after = Some(require_identifier(tokens, index + 1, "AFTER column")?);
+                index += 2;
+            }
+            _ => return Err(format!("unsupported column option {option}")),
         }
     }
-    if string_default && !nullable && default_value.is_none() {
-        return Err("required string ADD COLUMN needs a modeled string default".to_string());
+    if !options.nullable && explicit_null_default {
+        return Err("NOT NULL column cannot have DEFAULT NULL".into());
     }
-    Ok(ParsedColumnOptions {
-        nullable,
-        default_value,
-        comment,
-        after,
-        next_index: index,
-    })
+    if data_type == "json" && options.default_value.is_some() {
+        return Err("JSON literal defaults are not modeled".into());
+    }
+    options.next_index = index;
+    Ok(options)
+}
+
+fn parse_basic_default(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+    column_type: &str,
+) -> Result<(Option<String>, usize), String> {
+    let value = tokens.get(index).ok_or("missing DEFAULT value")?;
+    if value.eq_ignore_ascii_case("NULL") {
+        return Ok((None, index + 1));
+    }
+    let kind = column_type.split(['(', ' ']).next().unwrap_or(column_type);
+    if is_text_type(kind) || matches!(kind, "char" | "varchar") {
+        require_keyword(tokens, index, "<string>")?;
+        return Ok((Some(parse_string_default_literal(literals)?), index + 1));
+    }
+    let (literal, next) = numeric_default_literal(tokens, quoted, index)?;
+    Ok((
+        Some(basic_types::normalize_numeric_default(
+            column_type,
+            &literal,
+        )?),
+        next,
+    ))
+}
+
+fn numeric_default_literal(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+) -> Result<(String, usize), String> {
+    require_unquoted_token(quoted, index, "numeric default")?;
+    let mut next = index;
+    let sign = match tokens.get(next).map(String::as_str) {
+        Some("-") => {
+            next += 1;
+            "-"
+        }
+        Some("+") => {
+            next += 1;
+            "+"
+        }
+        _ => "",
+    };
+    require_unquoted_token(quoted, next, "numeric digits")?;
+    let integer = tokens.get(next).ok_or("missing numeric default")?;
+    next += 1;
+    if tokens.get(next).map(String::as_str) != Some(".") {
+        return Ok((format!("{sign}{integer}"), next));
+    }
+    require_unquoted_token(quoted, next, "decimal point")?;
+    require_unquoted_token(quoted, next + 1, "decimal fraction")?;
+    let fraction = tokens.get(next + 1).ok_or("missing decimal fraction")?;
+    Ok((format!("{sign}{integer}.{fraction}"), next + 2))
 }
 
 /// The literal a string `DEFAULT '...'` carries; TEXT columns receive it as a MySQL 8
@@ -2514,10 +2430,9 @@ fn parse_string_default_literal(
     let value = literals
         .next()
         .ok_or_else(|| "string DEFAULT literal is missing".to_string())?;
-    if value.is_empty()
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_graphic() && !matches!(character, '\'' | '\\'))
+    if !value
+        .chars()
+        .all(|character| (' '..='~').contains(&character) && !matches!(character, '\'' | '\\'))
     {
         return Err(format!("unmodeled string default literal {value:?}"));
     }
@@ -2583,15 +2498,19 @@ fn parse_drop_column_clause(
     index: usize,
 ) -> Result<(ParsedAlterClause, usize), String> {
     require_keyword(tokens, index + 1, "COLUMN")?;
-    require_keyword(tokens, index + 2, "IF")?;
-    require_keyword(tokens, index + 3, "EXISTS")?;
-    let name = require_identifier(tokens, index + 4, "dropped column")?;
+    let if_exists = tokens
+        .get(index + 2)
+        .is_some_and(|token| token.eq_ignore_ascii_case("IF"));
+    let name_index = if if_exists {
+        require_keyword(tokens, index + 3, "EXISTS")?;
+        index + 4
+    } else {
+        index + 2
+    };
+    let name = require_identifier(tokens, name_index, "dropped column")?;
     Ok((
-        ParsedAlterClause::DropColumn(ParsedDropColumnAst {
-            name,
-            if_exists: true,
-        }),
-        index + 5,
+        ParsedAlterClause::DropColumn(ParsedDropColumnAst { name, if_exists }),
+        name_index + 1,
     ))
 }
 

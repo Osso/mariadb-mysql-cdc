@@ -619,17 +619,13 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
         .iter()
         .map(|clause| match clause {
             ParsedAlterClause::AddColumn(column) => canonical_add_column_ast_value(column),
-            ParsedAlterClause::ModifyVarchar {
-                name,
-                column_type,
-                nullable,
-            } => json!({
-                "kind": "modify_column", "name": name, "column_type": column_type,
-                "data_type": "varchar", "nullable": nullable,
-            }),
-            ParsedAlterClause::ModifyNullableDatetime { name } => json!({
-                "kind": "modify_column", "name": name, "column_type": "datetime",
-                "data_type": "datetime", "nullable": true,
+            ParsedAlterClause::ModifyColumn(column) => {
+                let mut value = canonical_add_column_ast_value(column);
+                value["kind"] = json!("modify_column");
+                value
+            }
+            ParsedAlterClause::RenameColumn { old_name, new_name } => json!({
+                "kind": "rename_column", "old_name": old_name, "new_name": new_name,
             }),
             ParsedAlterClause::AddKey {
                 index,
@@ -774,13 +770,11 @@ fn apply_alter_clause(
 ) -> Result<(), String> {
     match clause {
         ParsedAlterClause::AddColumn(column) => apply_add_column(expected, &ast.table, column),
-        ParsedAlterClause::ModifyVarchar {
-            name,
-            column_type,
-            nullable,
-        } => apply_modify_varchar(expected, &ast.table, name, column_type, *nullable),
-        ParsedAlterClause::ModifyNullableDatetime { name } => {
-            apply_modify_nullable_datetime(expected, &ast.table, name)
+        ParsedAlterClause::ModifyColumn(column) => {
+            apply_modify_column(expected, &ast.table, column)
+        }
+        ParsedAlterClause::RenameColumn { old_name, new_name } => {
+            apply_rename_column(expected, &ast.table, old_name, new_name)
         }
         ParsedAlterClause::AddKey {
             index,
@@ -874,67 +868,101 @@ fn apply_add_foreign_key(
     Ok(())
 }
 
-fn apply_modify_nullable_datetime(
+fn apply_modify_column(
     expected: &mut SemanticSchemaSnapshot,
     table_name: &str,
-    name: &str,
+    column: &ParsedAddColumnAst,
 ) -> Result<(), String> {
     let table = expected
         .inventory
         .tables
         .iter_mut()
         .find(|table| table.name == table_name)
-        .ok_or_else(|| format!("MODIFY target table `{table_name}` is missing"))?;
-    let column = table
+        .ok_or_else(|| format!("MODIFY table `{table_name}` is missing"))?;
+    let previous = table
         .columns
-        .iter_mut()
-        .find(|column| column.name == name)
-        .ok_or_else(|| format!("MODIFY target column `{table_name}`.`{name}` is missing"))?;
-    if column.data_type != "datetime"
-        || column.column_type != "datetime"
-        || column.generated.is_some()
-        || !column.extra.is_empty()
-    {
-        return Err("MODIFY requires an ordinary existing DATETIME column".into());
+        .iter()
+        .position(|item| item.name.eq_ignore_ascii_case(&column.name))
+        .ok_or_else(|| format!("MODIFY column `{}` is missing", column.name))?;
+    let original = &table.columns[previous];
+    if original.generated.is_some() || original.extra.contains("auto_increment") {
+        return Err("MODIFY of generated or AUTO_INCREMENT columns is not modeled".into());
     }
-    column.is_nullable = true;
-    column.default_value = None;
-    column.comment.clear();
+    let mut replacement = column.clone();
+    replacement.name = original.name.clone();
+    table.columns.remove(previous);
+    let insertion = match &column.after {
+        None => previous,
+        Some(_) => add_column_insertion_index(table, table_name, column, None)?,
+    };
+    let replacement = expected_added_column(table, table_name, &replacement, insertion)?;
+    table.columns.insert(insertion, replacement);
+    for (index, item) in table.columns.iter_mut().enumerate() {
+        item.ordinal_position = (index + 1) as u32;
+    }
     Ok(())
 }
 
-fn apply_modify_varchar(
+fn apply_rename_column(
     expected: &mut SemanticSchemaSnapshot,
     table_name: &str,
-    name: &str,
-    column_type: &str,
-    nullable: bool,
+    old_name: &str,
+    new_name: &str,
 ) -> Result<(), String> {
     let table = expected
         .inventory
         .tables
         .iter_mut()
         .find(|table| table.name == table_name)
-        .ok_or_else(|| format!("MODIFY target table `{table_name}` is missing"))?;
+        .ok_or_else(|| format!("RENAME table `{table_name}` is missing"))?;
+    if table
+        .columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case(new_name))
+    {
+        return Err(format!("RENAME destination `{new_name}` already exists"));
+    }
+    if table
+        .columns
+        .iter()
+        .any(|column| column.generated.is_some())
+    {
+        return Err("RENAME with generated-column dependencies is not modeled".into());
+    }
     let column = table
         .columns
         .iter_mut()
-        .find(|column| column.name == name)
-        .ok_or_else(|| format!("MODIFY target column `{table_name}`.`{name}` is missing"))?;
-    if column.data_type != "varchar" || column.generated.is_some() || !column.extra.is_empty() {
-        return Err("MODIFY requires an ordinary existing VARCHAR column".into());
+        .find(|column| column.name.eq_ignore_ascii_case(old_name))
+        .ok_or_else(|| format!("RENAME source `{old_name}` is missing"))?;
+    column.name = new_name.to_string();
+    rename_column_references(&mut table.primary_key, old_name, new_name);
+    for index in &mut expected.inventory.indexes {
+        if index.table == table_name {
+            for part in &mut index.columns {
+                if part.name.eq_ignore_ascii_case(old_name) {
+                    part.name = new_name.to_string();
+                }
+            }
+        }
     }
-    column.column_type = column_type.to_string();
-    column.is_nullable = nullable;
-    column.default_value = None;
-    column.comment.clear();
-    let collation = table
-        .collation
-        .as_deref()
-        .ok_or_else(|| "MODIFY target has no table collation".to_string())?;
-    column.character_set = Some(collation.split('_').next().unwrap_or(collation).to_string());
-    column.collation = Some(collation.to_string());
+    for key in &mut expected.inventory.foreign_keys {
+        if key.table == table_name {
+            rename_column_references(&mut key.columns, old_name, new_name);
+        }
+        if key.referenced_table == table_name && key.referenced_schema == expected.inventory.schema
+        {
+            rename_column_references(&mut key.referenced_columns, old_name, new_name);
+        }
+    }
     Ok(())
+}
+
+fn rename_column_references(names: &mut [String], old_name: &str, new_name: &str) {
+    for name in names {
+        if name.eq_ignore_ascii_case(old_name) {
+            *name = new_name.to_string();
+        }
+    }
 }
 
 fn apply_add_column(
