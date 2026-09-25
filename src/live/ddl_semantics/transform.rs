@@ -2703,7 +2703,7 @@ fn parse_string_default_literal(
 
 pub(crate) fn extract_single_quoted_literals_with_mode(
     source_sql: &str,
-    mode: crate::live::query_charset_context::SourceSqlMode,
+    mode: SourceSqlMode,
 ) -> Result<Vec<String>, String> {
     let characters = source_sql.chars().collect::<Vec<_>>();
     let mut literals = Vec::new();
@@ -2713,61 +2713,77 @@ pub(crate) fn extract_single_quoted_literals_with_mode(
             index += 1;
             continue;
         }
-        let mut literal = String::new();
-        let mut has_source_escape = false;
-        let mut has_non_ascii = false;
-        index += 1;
-        loop {
-            let character = *characters
-                .get(index)
-                .ok_or_else(|| "unterminated DDL string literal".to_string())?;
-            if character == '\'' {
-                if characters.get(index + 1) == Some(&'\'') {
-                    literal.push('\'');
-                    index += 2;
-                    continue;
-                }
-                index += 1;
-                break;
-            }
-            if character == '\\' {
-                has_source_escape = true;
-                let no_escapes = mode.no_backslash_escapes()?;
-                if no_escapes {
-                    literal.push('\\');
-                    index += 1;
-                    continue;
-                }
-                let escaped = *characters
-                    .get(index + 1)
-                    .ok_or_else(|| "unterminated DDL string escape".to_string())?;
-                match escaped {
-                    '0' => literal.push('\0'),
-                    'n' => literal.push('\n'),
-                    'r' => literal.push('\r'),
-                    't' => literal.push('\t'),
-                    'b' => literal.push('\u{0008}'),
-                    'Z' => literal.push('\u{001a}'),
-                    '\\' | '\'' | '"' => literal.push(escaped),
-                    '%' | '_' => {
-                        literal.push('\\');
-                        literal.push(escaped);
-                    }
-                    other => literal.push(other),
-                }
-                index += 2;
-                continue;
-            }
-            has_non_ascii |= !character.is_ascii();
-            literal.push(character);
-            index += 1;
-        }
-        if has_source_escape && has_non_ascii {
-            return Err("escaped non-ASCII source literal requires proven client charset".into());
-        }
+        let (literal, next) = decode_single_quoted_literal(&characters, index + 1, mode)?;
         literals.push(literal);
+        index = next;
     }
     Ok(literals)
+}
+
+fn decode_single_quoted_literal(
+    characters: &[char],
+    mut index: usize,
+    mode: SourceSqlMode,
+) -> Result<(String, usize), String> {
+    let mut literal = String::new();
+    let mut has_source_escape = false;
+    let mut has_non_ascii = false;
+    loop {
+        let character = *characters
+            .get(index)
+            .ok_or("unterminated DDL string literal")?;
+        if character == '\'' && characters.get(index + 1) != Some(&'\'') {
+            break;
+        }
+        match character {
+            '\'' => {
+                literal.push('\'');
+                index += 2;
+            }
+            '\\' => {
+                has_source_escape = true;
+                index = append_decoded_escape(characters, index, mode, &mut literal)?;
+            }
+            other => {
+                has_non_ascii |= !other.is_ascii();
+                literal.push(other);
+                index += 1;
+            }
+        }
+    }
+    if has_source_escape && has_non_ascii {
+        return Err("escaped non-ASCII source literal requires proven client charset".into());
+    }
+    Ok((literal, index + 1))
+}
+
+fn append_decoded_escape(
+    characters: &[char],
+    index: usize,
+    mode: SourceSqlMode,
+    literal: &mut String,
+) -> Result<usize, String> {
+    if mode.no_backslash_escapes()? {
+        literal.push('\\');
+        return Ok(index + 1);
+    }
+    let escaped = *characters
+        .get(index + 1)
+        .ok_or("unterminated DDL string escape")?;
+    match escaped {
+        '0' => literal.push('\0'),
+        'n' => literal.push('\n'),
+        'r' => literal.push('\r'),
+        't' => literal.push('\t'),
+        'b' => literal.push('\u{0008}'),
+        'Z' => literal.push('\u{001a}'),
+        '%' | '_' => {
+            literal.push('\\');
+            literal.push(escaped);
+        }
+        other => literal.push(other),
+    }
+    Ok(index + 2)
 }
 
 fn parse_drop_alter_clause(
