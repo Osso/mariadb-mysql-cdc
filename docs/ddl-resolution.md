@@ -3,7 +3,11 @@
 The event handler uses one durable DDL control plane:
 `cdc.ddl_replay_journal`. Unsupported DDL never routes through a manual ledger.
 
-Automatic admission currently covers strict named, unqualified, visible,
+Automatic admission includes the in-progress common basic DDL matrix in
+[DDL transformation](specs/ddl-transformation.md#basic-common-ddl-expansion--implementation-in-progress).
+It is bounded, has no deployment or live-recovery claim, and does not admit all
+DDL. The historical details below describe additional narrow slices, including
+strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
 metadata and no FK dependency; the production-observed unqualified multi-clause
 `ALTER TABLE` form with general `ADD COLUMN` under the exact unquoted type grammar
@@ -44,6 +48,11 @@ target SQL is accepted as a resolution path.
 
 ### Historical `CREATE TABLE` charset context
 
+The basic-matrix type/definition coverage is specified once in the
+[DDL transformation contract](specs/ddl-transformation.md#basic-common-ddl-expansion--implementation-in-progress).
+This section records historical charset evidence and observed extensions; its
+narrower type exclusions do not reduce the matrix.
+
 The bounded observed `CREATE TABLE IF NOT EXISTS` grammar admits ordinary leading
 block comments and inline `--` comments; unsigned `MEDIUMINT`, `SMALLINT`, and
 `INT`, signed `TINYINT(1)`, canonical `VARCHAR(n)`, and restricted `ENUM`
@@ -63,8 +72,9 @@ unsupported context fails closed; current source defaults and a source-coordinat
 fence cannot reconstruct it. The target table must be absent. An existing target
 `CREATE TABLE IF NOT EXISTS` is not a converged no-op in this slice.
 
-Parser and semantic rendering tests cover the storefront CREATE additions, but
-real-database replay and deployment proof remain separate gates. The historical
+Parser and semantic rendering tests cover earlier storefront CREATE additions.
+The common basic DDL matrix is still awaiting real-database replay and recovery
+proof; no deployment claim follows from its implementation. The historical
 context requirement and target-absent gate apply unchanged. Unsupported CREATE
 statements remain `translation_pending`; their journal row, coordinate, and
 checkpoint must not be edited manually.
@@ -295,9 +305,9 @@ advancement. Targeted unit and structured-stream tests also cover the exact
 `releases` `idx_downloads_sort` DROP/ADD rebuild with directional key parts and
 `ALGORITHM=INPLACE, LOCK=NONE`. Its disposable MariaDB/MySQL harness extension
 is blocked by a pre-existing `production-alter-table` scenario timeout. No
-integration, deployment, recovery, or live-stream success is claimed. This is
-implemented-slice proof only, not full ALTER TABLE coverage, a full
-compatibility matrix, or deployment proof.
+integration, deployment, recovery, or live-stream success is claimed. This is implemented-slice proof only. The basic common DDL matrix remains
+in integration proof; neither this scenario nor focused tests establish full
+`ALTER TABLE`, a complete compatibility matrix, deployment, or live recovery.
 
 ## Transformation/evidence failure
 

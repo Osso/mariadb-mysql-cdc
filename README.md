@@ -91,7 +91,13 @@ orphan limit. See [FK orphan repair](docs/specs/fk-orphan-repair.md).
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in
-the target. Automatic DDL admission currently covers these narrow slices: an explicitly named,
+the target. Basic common DDL expansion is implemented on this branch but remains
+in integration proof; it has no deployment or live-recovery claim. The accepted
+column types, statements, options, and explicit exclusions are the authoritative
+[basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion--implementation-in-progress).
+The historical details below record additional observed admissions; where they
+state narrower basic-column exclusions, the matrix supersedes them. Automatic
+DDL admission also covers an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
 when every key part/option is modeled and the operation is proven not to support
 or depend on a foreign key; a strict unqualified fixture `CREATE TABLE` grammar
@@ -137,8 +143,12 @@ idx_downloads_sort`, then the observed eight-part replacement `ADD INDEX` with
 direction, and options; every variation remains `translation_pending`. Targeted
 unit and structured-stream tests pass. Disposable MariaDB/MySQL replay is
 currently blocked by a pre-existing `production-alter-table` harness timeout;
-no deployment or recovery success is claimed. Broader types/options and full
-`ALTER TABLE` remain unsupported.
+no deployment or recovery success is claimed. The common basic column matrix is
+bounded: it does not claim full `ALTER TABLE`, all `CREATE TABLE` syntax, or
+unlisted DDL families. In particular, `FIRST`, `ALTER COLUMN SET/DROP DEFAULT`,
+`CHANGE COLUMN`, table rename/drop/truncate, new constraint grammars,
+mode-dependent `REAL`/`ZEROFILL`, arbitrary expressions, and unmodeled
+`ALGORITHM`/`LOCK` variants remain unsupported unless separately listed.
 
 For admitted `CREATE TABLE`, source schema charset/collation are read only between
 exact event-coordinate fences and persisted in immutable evidence; generated SQL

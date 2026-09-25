@@ -29,7 +29,22 @@ allowlist.
 
 ### Current implemented slice
 
-- [x] Admit `ALTER TABLE <table> MODIFY COLUMN <column> DATETIME DEFAULT NULL` only for an existing ordinary `DATETIME` column: render `DATETIME NULL DEFAULT NULL`, model nullable/SQL NULL default, clear omitted column comment, and retain column position, values and indexes. `DATETIME(6)`, comments, other defaults/nullability, other MODIFY types and generated/extra target columns remain blocked. Parse `ALTER TABLE <table> MODIFY COLUMN <column> VARCHAR(n)` with canonical positive length and unquoted keywords. Model `NOT NULL` and the observed `DEFAULT NULL` form; the latter renders `NULL DEFAULT NULL` and records nullable post-state with a SQL NULL default. Other defaults, other MODIFY types/options, and contradictory `NOT NULL DEFAULT NULL` remain blocked. Derive post-state from an existing ordinary VARCHAR column, retaining position, primary/secondary indexes and FKs; omitted defaults/comments are removed and charset/collation inherit table defaults. The production widening fixture additionally admits leading ordinary block and ordinary `--` comments using the CREATE comment scanner, only when all parsed clauses are modeled MODIFY or ADD COLUMN clauses without algorithm/lock options. Executable comments and hints remain rejected; other ALTER families retain their existing comment restrictions.
+#### Basic common DDL expansion — implementation in progress
+
+This branch replaces the former one-observed-shape-at-a-time direction for basic
+column DDL with the bounded common family below. It does **not** claim all DDL,
+real-database integration completion, deployment, or live recovery proof. The
+production-specific records below remain applicable where they add a narrower
+exception; their narrower type exclusions are superseded by this matrix.
+
+| Area | Accepted basic family | Safety boundary |
+|---|---|---|
+| Shared column types (`CREATE TABLE`, `ADD COLUMN`) | Signed/unsigned `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`/`INTEGER`, `BIGINT`; `BOOL`/`BOOLEAN` as `TINYINT`; `DECIMAL`/`NUMERIC`; `FLOAT`; `DOUBLE`/`DOUBLE PRECISION`; `CHAR`, `VARCHAR`, `BINARY`, `VARBINARY`; `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT`; `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB`; `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `YEAR`, and `JSON`. | Type keywords and numeric parameters are unquoted; lengths/precisions are canonical and bounded by the parser. `REAL`, `ZEROFILL`, and other mode-dependent qualifiers remain blocked. |
+| Definitions and defaults | `NULL`/`NOT NULL`; `DEFAULT NULL`; bounded, range-checked numeric literals for numeric types; printable unescaped string defaults for character/text types, including `VARCHAR DEFAULT ''`; `COMMENT` and `AFTER` for ALTER column clauses; existing modeled character-set/collation handling. | Contradictory `NOT NULL DEFAULT NULL`, out-of-range/non-finite defaults, arbitrary expressions, and JSON literal defaults remain blocked. Text literal defaults retain their MySQL expression rendering. |
+| `CREATE TABLE` | Ordinary unqualified `CREATE TABLE` and `CREATE TABLE IF NOT EXISTS` using the shared basic types, subject to existing modeled table options, primary/ordinary/unique index forms, charset/collation evidence, and target-absent proof. | Existing target is not a converged no-op. Unmodeled table, index, constraint, comment, qualification, or option grammar remains pending. |
+| `ALTER TABLE` columns | `ADD COLUMN` and ordinary unguarded `MODIFY COLUMN` share the definitions above. `MODIFY` applies only to an existing ordinary non-JSON, non-generated, non-`AUTO_INCREMENT` column and preserves its target position/index references while replacing modeled attributes. Ordinary `RENAME COLUMN old TO new`, `DROP COLUMN`, and their existing conditional forms are admitted from fenced target evidence. | `CHANGE COLUMN`, `ALTER COLUMN SET/DROP DEFAULT`, `FIRST`, generated/JSON/`AUTO_INCREMENT` MODIFY, and unmodeled clause combinations remain blocked. Rename and drop fail closed on ambiguous target state. |
+| Indexes | Existing admitted named ordinary/unique key additions and strict standalone `CREATE INDEX`/`DROP INDEX` rules remain available; ordinary `DROP INDEX` in ALTER is derived from target evidence. | New index/constraint grammar, FK-dependent index changes, and unmodeled key parts/options remain blocked. |
+
 
 - [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`, named `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, and named `ADD UNIQUE KEY` clauses; preserve clause order and render deterministic MySQL 8 SQL with source `ADD INDEX` emitted as target `ADD KEY`.
 - [x] Admit the exact production event at `mysqld-bin.002778:750897987-750898224` (150 raw bytes with CRLF line endings; SHA-256 `ea9f789b158dca0146715bafe9f2712b5945b9c6626411b382347e60e52eb85f`) when its otherwise-supported ALTER has exactly one leading ordinary MySQL `-- ` line comment. Strip that comment only for parsing, then preserve its exact source prefix, including the source line ending, in generated SQL. Modeled ADD COLUMN and MODIFY clauses also admit ordinary block and inline line comments; executable/version comments and optimizer hints remain rejected.
@@ -165,12 +180,11 @@ target, moving source fence, or schema mismatch remains `translation_pending`
 with no checkpoint advance; operator-authored SQL and manual journal mutation
 are not resolution paths.
 
-No other `CREATE TABLE` syntax is admitted. Executable/version comments,
-optimizer hints, embedded block comments, unmodeled types/defaults/index forms,
-CHECK predicates outside the bounded grammar (other functions, operators,
-`AND`, non-alphanumeric `IN` literals), other `DATETIME` precisions, string
-defaults with quotes or backslashes, and an existing target table remain durable
-barriers.
+Beyond the basic matrix and separately listed observed extensions, unsupported
+`CREATE TABLE` syntax remains a durable barrier. This includes executable/version
+comments, optimizer hints, unmodeled table/index/constraint grammar, CHECK
+predicates outside the bounded grammar, string defaults with quotes or
+backslashes, cross-schema forms, and an existing target table.
 
 ### Execution and recovery
 
@@ -318,21 +332,16 @@ The current slice is covered by:
       SQL/evidence, rejection of changed shape, and replay promotion from the
       durable pending row.
 
-These tests prove only the observed ALTER slice, the exact fixture CREATE TABLE
-admission, the identity-scoped source-only `CREATE PROCEDURE` form, the generic
-and exact `DROP PROCEDURE` admissions, the exact trigger-drop admission, the real
-differing-default crash/restart
-scenario, and existing narrow DDL paths. They do not prove full
-ALTER TABLE, generic CREATE TABLE, the broader
-transformation contract, a full MariaDB/MySQL matrix, or deployment safety.
+Existing proof covers the earlier observed ALTER/CREATE slices and narrow DDL
+paths. The basic common DDL matrix has implementation and focused parser/semantic
+coverage on this branch, but its real MariaDB/MySQL replay, recovery, deployment,
+and live-stream proof remain open. It does not prove full `ALTER TABLE`, all
+`CREATE TABLE` syntax, a complete compatibility matrix, or deployment safety.
 
 ## Known gaps (current cycle)
 
-- [ ] Extend the current translator beyond the production-observed
-      `ADD COLUMN`/`ADD KEY`/MariaDB `ADD INDEX`/`ADD UNIQUE KEY`/`DROP COLUMN IF EXISTS`, the
-      identity-scoped source-only `CREATE PROCEDURE` form, generic and exact
-      `DROP PROCEDURE`, and rename slices into the canonical MariaDB DDL parser
-      and MySQL 8 transformation pipeline.
+- [ ] Complete disposable MariaDB/MySQL replay and recovery proof for the basic
+      common DDL matrix before treating it as deployment-ready.
 - [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
       retired manual DDL ledger without restoring manual replay.
 - [ ] Restore the pre-existing `production-alter-table` harness path, then run
@@ -345,20 +354,21 @@ transformation contract, a full MariaDB/MySQL matrix, or deployment safety.
       fixture crash/restart scenario remains only a slice proof.
 - [ ] Define transformation-version compatibility after the first production
       deployment establishes a real schema upgrade boundary.
-- [ ] Extend the canonical AST and renderer one production-derived unsupported
-      ALTER shape at a time; each shape must first prove `translation_pending`,
-      no target execution, unchanged checkpoint, and no-overtake behavior.
+- [ ] Extend beyond the basic matrix only with a bounded grammar and proof that
+      unsupported variants remain `translation_pending`, execute no target SQL,
+      leave the checkpoint unchanged, and cannot be overtaken.
 
 ## Out of scope
 
 - Manual target-SQL authoring or operator resolution as a CDC fallback.
 - Index-only automatic replay as the target DDL architecture.
-- Full `ALTER TABLE` coverage beyond the observed `ADD COLUMN`, exact guarded
-  two-column `TIMESTAMP ... ALGORITHM=INSTANT`, `ADD KEY`/MariaDB `ADD INDEX`,
-  `ADD UNIQUE KEY`, `DROP COLUMN IF EXISTS`, and exact `releases`
-  directional-index rebuild forms.
-- Additional column types, defaults, clauses, algorithm options, index options,
-  and DDL families not listed in the implemented slice.
+- Full `ALTER TABLE` coverage beyond the basic matrix and separately listed
+  observed extensions.
+- `ALTER TABLE FIRST`, `ALTER COLUMN SET/DROP DEFAULT`, `CHANGE COLUMN`, table
+  rename/drop/truncate, and new constraint grammars unless separately listed in
+  the implemented slice.
+- Mode-dependent `REAL`/`ZEROFILL`, arbitrary expressions, and unmodeled
+  `ALGORITHM`/`LOCK` variants.
 - Silently dropping, weakening, or approximating parsed DDL clauses.
 - Cross-schema mutation outside the configured application schema.
 - Detecting or reconciling preexisting source/target schema differences,
