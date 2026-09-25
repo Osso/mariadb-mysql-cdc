@@ -38,9 +38,11 @@ exclusions are superseded by this matrix.
 
 The basic family is a required capability, not an exclusion. Native
 MariaDB/MySQL replay harnesses prove bounded slices below, including
-crash/restart reconciliation. Deployment is not claimed: production remains on
-`2b4238d`. This does not claim all types, all clause combinations, full `ALTER
-TABLE`, or all `CREATE TABLE` syntax.
+crash/restart reconciliation. Code `81fde02` is deployed after the runtime image
+gate (11 findings, zero HIGH/CRITICAL scan findings) and Flux rollout
+confirmation; the live sample passed with no pod restarts or quarantines.
+Independent verifier 53 is still running. This does not claim all types, all
+clause combinations, full `ALTER TABLE`, or all `CREATE TABLE` syntax.
 
 | Area | Required basic family implemented now | Runtime safety boundary | Proof level |
 |---|---|---|---|
@@ -57,10 +59,10 @@ The event's tag-1 source `SQL_MODE` is captured with the source SQL and decoded
 under standard escaping or `NO_BACKSLASH_ESCAPES`; the decoded value, raw SQL
 identity, and mode context are retained in immutable canonical evidence. Replay
 blocks before target SQL if required context is absent, malformed, unsupported,
-or mismatches the stored evidence. Rendering uses the known target mode. Native
-`/tmp/cdc-string-metadata-probe2.log`, quote-pattern probe, and
-`/tmp/cdc-context-mode-harness.log` prove canonical metadata and exact-byte
-standard-versus-`NO_BACKSLASH_ESCAPES` values through restart. This supports only
+or mismatches the stored evidence. Rendering uses the known target mode. Native `/tmp/cdc-context-mode-harness-final.log` proves canonical metadata,
+raw identity, and exact-byte standard-versus-`NO_BACKSLASH_ESCAPES` values
+through restart, including controls, odd trailing backslashes, dotted literals,
+and leading comments. This supports only
 currently modeled source SQL-mode literal features; it does not claim all SQL
 modes, Unicode/charset expansion, or additional identifier forms. No fallback
 path decodes missing context.
@@ -70,10 +72,9 @@ path decodes missing context.
 MariaDB resolves the final default before backfilling rows. Therefore an admitted
 `ADD COLUMN` plus `ALTER COLUMN ... SET/DROP DEFAULT` event folds into one atomic
 MySQL `ADD COLUMN` whose definition carries the final default; it is not split
-into ordered target DDL. Native `/tmp/cdc-dependent-default-probe.log` and
-`/tmp/cdc-context-fold-harness3.log` prove source/target old rows and future
-inserts for TEXT, integer, NOT NULL VARCHAR default removal, and nullable
-defaults, including restart. MySQL direct `DROP DEFAULT` cannot express nullable
+into ordered target DDL. Native `/tmp/cdc-context-fold-harness3.log` proves all four folds:
+TEXT, integer, NOT NULL VARCHAR default removal, and nullable TEXT default
+removal; it verifies source/target old rows, future inserts, and restart. MySQL direct `DROP DEFAULT` cannot express nullable
 default removal in this path, so ordinary scalar columns render `SET DEFAULT
 NULL`; MySQL error 1101 requires nullable TEXT removal to use the complete
 preserved-definition `MODIFY COLUMN` renderer. This is bounded to the admitted

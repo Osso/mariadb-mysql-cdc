@@ -6,9 +6,11 @@ The event handler uses one durable DDL control plane:
 Automatic admission, runtime barriers, and proof levels are maintained in the
 [DDL transformation matrix](specs/ddl-transformation.md#basic-common-ddl-expansion).
 Native MariaDB/MySQL replay harnesses prove bounded column and table-lifecycle
-slices, including crash/restart reconciliation. Deployment is not claimed:
-production remains on `2b4238d`. The matrix distinguishes that proof from
-unmodeled forms, which remain runtime barriers. Historical details
+slices, including crash/restart reconciliation. Code `81fde02` is deployed after
+the runtime image gate (11 findings, zero HIGH/CRITICAL scan findings) and Flux
+rollout confirmation; the live sample passed with no pod restarts or quarantines.
+Independent verifier 53 is still running. The matrix distinguishes that proof
+from unmodeled forms, which remain runtime barriers. Historical details
 below describe additional narrow slices, including
 strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
@@ -64,10 +66,9 @@ works with the required metadata preservation.
 An admitted `ALTER TABLE t ADD COLUMN c ..., ALTER COLUMN c SET/DROP DEFAULT
 ...` folds into one atomic target `ADD COLUMN` carrying MariaDB's final default;
 it is not split into ordered target DDL. MariaDB resolves that final default
-before backfilling rows. Native `/tmp/cdc-dependent-default-probe.log` and
-`/tmp/cdc-context-fold-harness3.log` prove source/target old rows and future
-inserts for TEXT, integer, NOT NULL VARCHAR default removal, and nullable
-defaults, including restart. For nullable default removal, ordinary scalar target
+before backfilling rows. Native `/tmp/cdc-context-fold-harness3.log` proves all four folds:
+TEXT, integer, NOT NULL VARCHAR default removal, and nullable TEXT default
+removal; it verifies source/target old rows, future inserts, and restart. For nullable default removal, ordinary scalar target
 SQL uses `SET DEFAULT NULL`; nullable TEXT uses the complete target-derived
 `MODIFY COLUMN` definition because direct omission is forbidden and `SET DEFAULT
 NULL` hits MySQL error 1101. Unmodeled combinations remain
@@ -77,9 +78,10 @@ Source DDL literal decoding captures tag-1 `SQL_MODE` as immutable context and
 decodes currently modeled strings under standard escaping or
 `NO_BACKSLASH_ESCAPES`. Missing, malformed, unsupported, or replay-mismatched
 required context blocks before target SQL; known target mode controls rendering.
-Native `/tmp/cdc-string-metadata-probe2.log`, quote-pattern probe, and
-`/tmp/cdc-context-mode-harness.log` prove canonical metadata, exact bytes, raw
-identity, mode evidence, and restart. This does not claim all source SQL modes,
+Native `/tmp/cdc-context-mode-harness-final.log` proves canonical metadata,
+exact bytes, raw identity, source-mode evidence, and restart, including standard
+and `NO_BACKSLASH_ESCAPES` controls, odd trailing backslashes, dotted literals,
+and leading comments. This does not claim all source SQL modes,
 Unicode/charset expansion, or identifier forms.
 
 For lifecycle DDL, ordinary leading or trailing comments are inert syntax; This

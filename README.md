@@ -94,8 +94,11 @@ The native stream applies row events and stores grouped row-event checkpoints in
 the target. DDL capability, runtime barriers, and proof levels are maintained in
 the authoritative [basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion).
 Native MariaDB/MySQL replay harnesses prove bounded column and table-lifecycle
-slices; deployment is not claimed, and production remains on `2b4238d`. The
-matrix records exact coverage, current required work, and runtime barriers.
+slices. Code `81fde02` is deployed after the runtime image gate (11 findings,
+zero HIGH/CRITICAL scan findings) and Flux rollout confirmation; the live sample
+passed with no pod restarts or quarantines. Independent verifier 53 is still
+running, so this is deployment evidence, not its final verdict. The matrix
+records exact coverage, current required work, and runtime barriers.
 Historical detail below never narrows that matrix. Automatic
 DDL admission also covers an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`

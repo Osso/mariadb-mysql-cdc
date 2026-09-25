@@ -21,8 +21,11 @@ including required `CHANGE [COLUMN]`, `FIRST`/`AFTER`, literal `ALTER COLUMN
 SET/DROP DEFAULT`, and strict single-table `DROP [IF EXISTS]`, one-pair `RENAME`,
 and `TRUNCATE [TABLE]` operations. Native MariaDB/MySQL replay harnesses prove
 bounded column and table-lifecycle slices, including crash/restart
-reconciliation; production deployment is not claimed and remains on `2b4238d`.
-Source literals use immutable tag-1 `SQL_MODE` context for standard and
+reconciliation. Code `81fde02` is deployed after the runtime image gate (11
+findings, zero HIGH/CRITICAL scan findings) and Flux rollout confirmation; the
+live sample passed with no pod restarts or quarantines. Independent verifier 53
+is still running. Source literals use immutable tag-1 `SQL_MODE` context for
+standard and
 `NO_BACKSLASH_ESCAPES` decoding; absent, malformed, unsupported, or
 replay-mismatched required context blocks. Admitted same-event `ADD COLUMN` plus
 `ALTER COLUMN SET/DROP DEFAULT` folds into one atomic target ADD with MariaDB's
