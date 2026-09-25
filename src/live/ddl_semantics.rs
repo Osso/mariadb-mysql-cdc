@@ -553,7 +553,7 @@ impl LiveDdlSemanticInventory {
             );
         };
         if ast.character_set.is_none() && ast.collation.is_none() {
-            return self.capture_database_default_create(&operation);
+            return self.capture_database_default_create(operation);
         }
         if ast.character_set.as_deref() != Some("utf8mb4") || ast.collation.is_some() {
             return self.capture_evidence_for_operation(
@@ -584,11 +584,11 @@ impl LiveDdlSemanticInventory {
         }
         let source_collation = defaults.collation.clone();
         defaults.collation = crate::sync_schema::canonical_collation(&defaults.collation);
-        let before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
-        let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+        let before = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        let after = Self::snapshot(&self.target, &self.target_schema, operation)?;
         validate_target_snapshot_consistency(&before, &after)?;
         let mut evidence =
-            canonical::build_resolved_create_table_evidence(&operation, &before, &defaults)?;
+            canonical::build_resolved_create_table_evidence(operation, &before, &defaults)?;
         record_query_charset_context(&mut evidence, overrides, collation_id, source_collation)?;
         Ok(evidence)
     }
@@ -724,38 +724,6 @@ impl LiveDdlSemanticInventory {
         )
         .map_err(|error| format!("failed to read CREATE foreign-key actions: {error}"))?;
         canonical::validate_create_foreign_keys(ast, &self.target_schema, &keys)
-    }
-}
-
-#[cfg(test)]
-mod source_mode_evidence_tests {
-    use super::*;
-
-    #[test]
-    fn evidence_keeps_immutable_mode_and_rejects_missing_or_malformed_mode() {
-        let mut evidence = DdlSemanticEvidence {
-            transformation_version: "v1".into(),
-            generated_sql: None,
-            canonical_ast: "{}".into(),
-            pre_state: "before".into(),
-            expected_post_state: "after".into(),
-        };
-        record_source_sql_mode(&mut evidence, SourceSqlMode(Some(1 << 20))).unwrap();
-        assert_eq!(
-            source_mode_from_evidence(&evidence).unwrap(),
-            SourceSqlMode(Some(1 << 20))
-        );
-        evidence.canonical_ast = "{}".into();
-        assert_eq!(
-            source_mode_from_evidence(&evidence).unwrap(),
-            SourceSqlMode(None)
-        );
-        evidence.canonical_ast = r#"{"source_sql_mode":"invalid"}"#.into();
-        assert!(source_mode_from_evidence(&evidence).is_err());
-        record_source_sql_mode(&mut evidence, SourceSqlMode(Some(0))).unwrap();
-        assert!(validate_replayed_source_mode(&evidence, &[1, 0, 0, 16, 0, 0, 0, 0, 0]).is_err());
-        assert!(validate_replayed_source_mode(&evidence, &[]).is_err());
-        assert!(validate_replayed_source_mode(&evidence, &[1, 0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
     }
 }
 
@@ -1064,4 +1032,36 @@ pub fn validate_source_snapshot_coordinate(
         "source semantic inventory is not event-position consistent: expected {}:{} before={}:{} after={}:{}",
         expected_file, expected_position, before.file, before.position, after.file, after.position,
     ))
+}
+
+#[cfg(test)]
+mod source_mode_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn evidence_keeps_immutable_mode_and_rejects_missing_or_malformed_mode() {
+        let mut evidence = DdlSemanticEvidence {
+            transformation_version: "v1".into(),
+            generated_sql: None,
+            canonical_ast: "{}".into(),
+            pre_state: "before".into(),
+            expected_post_state: "after".into(),
+        };
+        record_source_sql_mode(&mut evidence, SourceSqlMode(Some(1 << 20))).unwrap();
+        assert_eq!(
+            source_mode_from_evidence(&evidence).unwrap(),
+            SourceSqlMode(Some(1 << 20))
+        );
+        evidence.canonical_ast = "{}".into();
+        assert_eq!(
+            source_mode_from_evidence(&evidence).unwrap(),
+            SourceSqlMode(None)
+        );
+        evidence.canonical_ast = r#"{"source_sql_mode":"invalid"}"#.into();
+        assert!(source_mode_from_evidence(&evidence).is_err());
+        record_source_sql_mode(&mut evidence, SourceSqlMode(Some(0))).unwrap();
+        assert!(validate_replayed_source_mode(&evidence, &[1, 0, 0, 16, 0, 0, 0, 0, 0]).is_err());
+        assert!(validate_replayed_source_mode(&evidence, &[]).is_err());
+        assert!(validate_replayed_source_mode(&evidence, &[1, 0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
+    }
 }

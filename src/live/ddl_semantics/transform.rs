@@ -2701,161 +2701,6 @@ fn parse_string_default_literal(
     Ok(value)
 }
 
-#[cfg(test)]
-mod sql_mode_literal_tests {
-    use super::*;
-    use crate::live::query_charset_context::SourceSqlMode;
-
-    #[test]
-    fn unescaped_unicode_defaults_remain_unmodeled_but_unicode_comments_are_accepted() {
-        let mode = SourceSqlMode(Some(0));
-        let create =
-            "CREATE TABLE t (id INT PRIMARY KEY, label VARCHAR(40) DEFAULT 'é') ENGINE=InnoDB";
-        assert!(parse_fixture_create_table_with_mode(create, mode).is_err());
-        let alter = "ALTER TABLE t ADD COLUMN label VARCHAR(40) DEFAULT 'é'";
-        assert!(parse_production_alter_table_ast_with_mode(alter, mode).is_err());
-        let commented = "/* é */ ALTER TABLE t ADD COLUMN label VARCHAR(40) DEFAULT 'A'";
-        assert!(parse_production_alter_table_ast_with_mode(commented, mode).is_ok());
-    }
-
-    #[test]
-    fn rejects_mixed_non_ascii_and_escaped_source_literal_without_charset_proof() {
-        assert!(
-            extract_single_quoted_literals_with_mode(r"DEFAULT 'é\n'", SourceSqlMode(Some(0)))
-                .is_err()
-        );
-        assert!(
-            extract_single_quoted_literals_with_mode("DEFAULT 'é'", SourceSqlMode(Some(0))).is_ok()
-        );
-    }
-
-    #[test]
-    fn decodes_mysql_escapes_and_preserves_pattern_escapes() {
-        let sql =
-            r#"ALTER TABLE t ADD COLUMN c VARCHAR(80) DEFAULT 'a\0\n\r\t\b\Z\\\'\"\%\_\q''z'"#;
-        assert_eq!(
-            extract_single_quoted_literals_with_mode(sql, SourceSqlMode(Some(0))).unwrap(),
-            vec!["a\0\n\r\t\u{0008}\u{001a}\\'\"\\%\\_q'z"]
-        );
-    }
-
-    #[test]
-    fn create_ast_uses_source_mode_for_string_default() {
-        let sql =
-            r"CREATE TABLE t (id INT PRIMARY KEY, label VARCHAR(40) DEFAULT 'a\n\q') ENGINE=InnoDB";
-        let escaped = parse_fixture_create_table_with_mode(sql, SourceSqlMode(Some(0))).unwrap();
-        let unescaped =
-            parse_fixture_create_table_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
-        assert_eq!(escaped.columns[1].default_sql.as_deref(), Some("'a\\nq'"));
-        assert_eq!(
-            unescaped.columns[1].default_sql.as_deref(),
-            Some("'a\\\\n\\\\q'")
-        );
-        assert!(parse_fixture_create_table(sql).is_err());
-    }
-
-    #[test]
-    fn rendered_literal_survives_target_backslash_mode() {
-        assert_eq!(
-            quote_string_literal("\0\n\r\t\u{0008}\u{001a}\\'\""),
-            r#"'\0\n\r\t\b\Z\\''\"'"#
-        );
-    }
-
-    #[test]
-    fn no_backslash_mode_preserves_quoted_default_through_ordinary_comments() {
-        let sql = r"/* note */ ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''b'";
-        let ast =
-            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
-        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else {
-            panic!("expected ADD");
-        };
-        assert_eq!(column.default_value.as_deref(), Some("a\\'b"));
-    }
-
-    #[test]
-    fn no_backslash_mode_handles_slash_before_doubled_quote() {
-        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''b'";
-        let ast =
-            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
-        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else {
-            panic!("expected ADD");
-        };
-        assert_eq!(column.default_value.as_deref(), Some("a\\'b"));
-        let operation =
-            super::super::parser::parse_ddl_operation_with_mode(sql, SourceSqlMode(Some(1 << 20)))
-                .unwrap();
-        assert!(operation.alter_table_ast.is_some());
-    }
-
-    #[test]
-    fn no_backslash_comment_guard_rejects_active_comment_after_odd_slash() {
-        let mode = SourceSqlMode(Some(1 << 20));
-        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'trail\' /*! , ADD COLUMN hidden INT */";
-        assert!(parse_production_alter_table_ast_with_mode(sql, mode).is_err());
-    }
-
-    #[test]
-    fn no_backslash_comment_guard_preserves_literal_and_modeled_clauses() {
-        let mode = SourceSqlMode(Some(1 << 20));
-        for value in [r"'trail\'", r"'a\''other.table'"] {
-            let sql = format!("ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT {value}");
-            let ast = parse_production_alter_table_ast_with_mode(&sql, mode).unwrap();
-            let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else {
-                panic!("expected ADD COLUMN");
-            };
-            assert_eq!(ast.clauses.len(), 1);
-            let expected = value[1..value.len() - 1].replace("''", "'");
-            assert_eq!(column.default_value.as_deref(), Some(expected.as_str()));
-        }
-    }
-
-    #[test]
-    fn ordinary_leading_comments_admit_modeled_change_and_default() {
-        let mode = SourceSqlMode(Some(1 << 20));
-        for sql in [
-            "/* prose */ ALTER TABLE t CHANGE COLUMN old new INT",
-            "/* prose */ ALTER TABLE t ALTER COLUMN c SET DEFAULT 3",
-        ] {
-            let clean = sql.strip_prefix("/* prose */ ").unwrap();
-            assert_eq!(
-                parse_production_alter_table_ast_with_mode(sql, mode).unwrap(),
-                parse_production_alter_table_ast_with_mode(clean, mode).unwrap(),
-            );
-        }
-        for prefix in ["/*! SET @x=1 */", "/*+ BKA(t) */", "/*M! SET @x=1 */"] {
-            let sql = format!("{prefix} ALTER TABLE t ALTER COLUMN c SET DEFAULT 3");
-            assert!(parse_production_alter_table_ast_with_mode(&sql, mode).is_err());
-        }
-    }
-
-    #[test]
-    fn alter_ast_decodes_source_mode_before_normalizing_default() {
-        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n\q'";
-        let escaped =
-            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(0))).unwrap();
-        let unescaped =
-            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
-        let default = |ast: ParsedAlterTableAst| match ast.clauses.into_iter().next().unwrap() {
-            ParsedAlterClause::AddColumn(column) => column.default_value.unwrap(),
-            other => panic!("unexpected clause: {other:?}"),
-        };
-        assert_eq!(default(escaped), "a\nq");
-        assert_eq!(default(unescaped), r"a\n\q");
-        assert!(parse_production_alter_table_ast(sql).is_err());
-    }
-
-    #[test]
-    fn no_backslash_mode_preserves_slashes_and_doubled_quotes() {
-        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n\q b''c'";
-        assert_eq!(
-            extract_single_quoted_literals_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap(),
-            vec![r"a\n\q b'c"]
-        );
-        assert!(extract_single_quoted_literals_with_mode(sql, SourceSqlMode(None)).is_err());
-    }
-}
-
 pub(crate) fn extract_single_quoted_literals_with_mode(
     source_sql: &str,
     mode: crate::live::query_charset_context::SourceSqlMode,
@@ -3075,4 +2920,159 @@ fn require_identifier(tokens: &[String], index: usize, context: &str) -> Result<
 
 fn quote_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
+}
+
+#[cfg(test)]
+mod sql_mode_literal_tests {
+    use super::*;
+    use crate::live::query_charset_context::SourceSqlMode;
+
+    #[test]
+    fn unescaped_unicode_defaults_remain_unmodeled_but_unicode_comments_are_accepted() {
+        let mode = SourceSqlMode(Some(0));
+        let create =
+            "CREATE TABLE t (id INT PRIMARY KEY, label VARCHAR(40) DEFAULT 'é') ENGINE=InnoDB";
+        assert!(parse_fixture_create_table_with_mode(create, mode).is_err());
+        let alter = "ALTER TABLE t ADD COLUMN label VARCHAR(40) DEFAULT 'é'";
+        assert!(parse_production_alter_table_ast_with_mode(alter, mode).is_err());
+        let commented = "/* é */ ALTER TABLE t ADD COLUMN label VARCHAR(40) DEFAULT 'A'";
+        assert!(parse_production_alter_table_ast_with_mode(commented, mode).is_ok());
+    }
+
+    #[test]
+    fn rejects_mixed_non_ascii_and_escaped_source_literal_without_charset_proof() {
+        assert!(
+            extract_single_quoted_literals_with_mode(r"DEFAULT 'é\n'", SourceSqlMode(Some(0)))
+                .is_err()
+        );
+        assert!(
+            extract_single_quoted_literals_with_mode("DEFAULT 'é'", SourceSqlMode(Some(0))).is_ok()
+        );
+    }
+
+    #[test]
+    fn decodes_mysql_escapes_and_preserves_pattern_escapes() {
+        let sql =
+            r#"ALTER TABLE t ADD COLUMN c VARCHAR(80) DEFAULT 'a\0\n\r\t\b\Z\\\'\"\%\_\q''z'"#;
+        assert_eq!(
+            extract_single_quoted_literals_with_mode(sql, SourceSqlMode(Some(0))).unwrap(),
+            vec!["a\0\n\r\t\u{0008}\u{001a}\\'\"\\%\\_q'z"]
+        );
+    }
+
+    #[test]
+    fn create_ast_uses_source_mode_for_string_default() {
+        let sql =
+            r"CREATE TABLE t (id INT PRIMARY KEY, label VARCHAR(40) DEFAULT 'a\n\q') ENGINE=InnoDB";
+        let escaped = parse_fixture_create_table_with_mode(sql, SourceSqlMode(Some(0))).unwrap();
+        let unescaped =
+            parse_fixture_create_table_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        assert_eq!(escaped.columns[1].default_sql.as_deref(), Some("'a\\nq'"));
+        assert_eq!(
+            unescaped.columns[1].default_sql.as_deref(),
+            Some("'a\\\\n\\\\q'")
+        );
+        assert!(parse_fixture_create_table(sql).is_err());
+    }
+
+    #[test]
+    fn rendered_literal_survives_target_backslash_mode() {
+        assert_eq!(
+            quote_string_literal("\0\n\r\t\u{0008}\u{001a}\\'\""),
+            r#"'\0\n\r\t\b\Z\\''\"'"#
+        );
+    }
+
+    #[test]
+    fn no_backslash_mode_preserves_quoted_default_through_ordinary_comments() {
+        let sql = r"/* note */ ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''b'";
+        let ast =
+            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else {
+            panic!("expected ADD");
+        };
+        assert_eq!(column.default_value.as_deref(), Some("a\\'b"));
+    }
+
+    #[test]
+    fn no_backslash_mode_handles_slash_before_doubled_quote() {
+        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''b'";
+        let ast =
+            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else {
+            panic!("expected ADD");
+        };
+        assert_eq!(column.default_value.as_deref(), Some("a\\'b"));
+        let operation =
+            super::super::parser::parse_ddl_operation_with_mode(sql, SourceSqlMode(Some(1 << 20)))
+                .unwrap();
+        assert!(operation.alter_table_ast.is_some());
+    }
+
+    #[test]
+    fn no_backslash_comment_guard_rejects_active_comment_after_odd_slash() {
+        let mode = SourceSqlMode(Some(1 << 20));
+        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'trail\' /*! , ADD COLUMN hidden INT */";
+        assert!(parse_production_alter_table_ast_with_mode(sql, mode).is_err());
+    }
+
+    #[test]
+    fn no_backslash_comment_guard_preserves_literal_and_modeled_clauses() {
+        let mode = SourceSqlMode(Some(1 << 20));
+        for value in [r"'trail\'", r"'a\''other.table'"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT {value}");
+            let ast = parse_production_alter_table_ast_with_mode(&sql, mode).unwrap();
+            let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else {
+                panic!("expected ADD COLUMN");
+            };
+            assert_eq!(ast.clauses.len(), 1);
+            let expected = value[1..value.len() - 1].replace("''", "'");
+            assert_eq!(column.default_value.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn ordinary_leading_comments_admit_modeled_change_and_default() {
+        let mode = SourceSqlMode(Some(1 << 20));
+        for sql in [
+            "/* prose */ ALTER TABLE t CHANGE COLUMN old new INT",
+            "/* prose */ ALTER TABLE t ALTER COLUMN c SET DEFAULT 3",
+        ] {
+            let clean = sql.strip_prefix("/* prose */ ").unwrap();
+            assert_eq!(
+                parse_production_alter_table_ast_with_mode(sql, mode).unwrap(),
+                parse_production_alter_table_ast_with_mode(clean, mode).unwrap(),
+            );
+        }
+        for prefix in ["/*! SET @x=1 */", "/*+ BKA(t) */", "/*M! SET @x=1 */"] {
+            let sql = format!("{prefix} ALTER TABLE t ALTER COLUMN c SET DEFAULT 3");
+            assert!(parse_production_alter_table_ast_with_mode(&sql, mode).is_err());
+        }
+    }
+
+    #[test]
+    fn alter_ast_decodes_source_mode_before_normalizing_default() {
+        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n\q'";
+        let escaped =
+            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(0))).unwrap();
+        let unescaped =
+            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let default = |ast: ParsedAlterTableAst| match ast.clauses.into_iter().next().unwrap() {
+            ParsedAlterClause::AddColumn(column) => column.default_value.unwrap(),
+            other => panic!("unexpected clause: {other:?}"),
+        };
+        assert_eq!(default(escaped), "a\nq");
+        assert_eq!(default(unescaped), r"a\n\q");
+        assert!(parse_production_alter_table_ast(sql).is_err());
+    }
+
+    #[test]
+    fn no_backslash_mode_preserves_slashes_and_doubled_quotes() {
+        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n\q b''c'";
+        assert_eq!(
+            extract_single_quoted_literals_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap(),
+            vec![r"a\n\q b'c"]
+        );
+        assert!(extract_single_quoted_literals_with_mode(sql, SourceSqlMode(None)).is_err());
+    }
 }
