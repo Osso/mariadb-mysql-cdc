@@ -790,7 +790,7 @@ fn validate_guarded_clause_pre_state(
     ))
 }
 
-fn apply_alter_clause(
+pub(super) fn apply_alter_clause(
     expected: &mut SemanticSchemaSnapshot,
     ast: &ParsedAlterTableAst,
     clause: &ParsedAlterClause,

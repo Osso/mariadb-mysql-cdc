@@ -169,23 +169,110 @@ pub fn transform_production_alter_table(source_sql: &str) -> Result<DdlTransform
     if !supports_parsed_production_alter(&ast) {
         return Err("unsupported production ALTER TABLE shape".to_string());
     }
+    if ast
+        .clauses
+        .iter()
+        .any(|clause| matches!(clause, ParsedAlterClause::AlterColumnDefault { .. }))
+    {
+        return Err("ALTER COLUMN DEFAULT requires target column state".into());
+    }
     let rendered_sql = render_production_alter_table(&ast);
+    Ok(transformed_alter_sql(leading_comment, rendered_sql))
+}
+
+pub(crate) fn transform_production_alter_table_with_target(
+    source_sql: &str,
+    target: &super::model::SemanticSchemaSnapshot,
+) -> Result<DdlTransformation, String> {
+    let (leading_comment, _) = split_one_leading_mysql_line_comment(source_sql);
+    let ast = parse_production_alter_table_ast(source_sql)?;
+    if !supports_parsed_production_alter(&ast) {
+        return Err("unsupported production ALTER TABLE shape".to_string());
+    }
+    let rendered_sql = render_alter_table_with_target(&ast, target)?;
+    Ok(transformed_alter_sql(leading_comment, rendered_sql))
+}
+
+fn transformed_alter_sql(leading_comment: Option<&str>, rendered_sql: String) -> DdlTransformation {
     let target_sql = match leading_comment {
         Some(comment) => format!("{comment}{rendered_sql}"),
         None => rendered_sql,
     };
-    Ok(DdlTransformation {
+    DdlTransformation {
         version: DDL_TRANSFORMATION_VERSION,
         target_sql: Some(target_sql),
-    })
+    }
 }
 
 fn render_production_alter_table(ast: &ParsedAlterTableAst) -> String {
-    let mut clauses = ast
+    let clauses = ast
         .clauses
         .iter()
         .map(render_production_alter_clause)
-        .collect::<Vec<_>>();
+        .collect();
+    render_alter_table_clauses(ast, clauses)
+}
+
+fn render_alter_table_with_target(
+    ast: &ParsedAlterTableAst,
+    target: &super::model::SemanticSchemaSnapshot,
+) -> Result<String, String> {
+    let mut state = target.clone();
+    let mut clauses = Vec::with_capacity(ast.clauses.len());
+    for clause in &ast.clauses {
+        let rendered = match clause {
+            ParsedAlterClause::AlterColumnDefault { name, default } => {
+                render_target_column_default(&state, &ast.table, name, default.as_ref())?
+            }
+            other => render_production_alter_clause(other),
+        };
+        super::canonical::apply_alter_clause(&mut state, ast, clause)?;
+        clauses.push(rendered);
+    }
+    Ok(render_alter_table_clauses(ast, clauses))
+}
+
+fn render_target_column_default(
+    target: &super::model::SemanticSchemaSnapshot,
+    table: &str,
+    name: &str,
+    default: Option<&ParsedColumnDefault>,
+) -> Result<String, String> {
+    let column = target
+        .inventory
+        .tables
+        .iter()
+        .find(|candidate| candidate.name == table)
+        .and_then(|table| {
+            table
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(name))
+        })
+        .ok_or_else(|| format!("ALTER COLUMN target `{table}`.`{name}` is missing"))?;
+    let (normalized, _) = normalize_alter_column_default(
+        &column.column_type,
+        &column.data_type,
+        column.is_nullable,
+        default,
+    )?;
+    let action = match default {
+        None => "DROP DEFAULT".to_string(),
+        Some(ParsedColumnDefault::String(value)) if is_text_type(&column.data_type) => {
+            format!("SET DEFAULT {}", text_expression_default(value))
+        }
+        Some(ParsedColumnDefault::Number(_)) => {
+            format!(
+                "SET DEFAULT {}",
+                normalized.ok_or("numeric DEFAULT normalization is missing")?
+            )
+        }
+        Some(value) => format!("SET DEFAULT {}", render_alter_default(value)),
+    };
+    Ok(format!("ALTER COLUMN {} {action}", quote_identifier(name)))
+}
+
+fn render_alter_table_clauses(ast: &ParsedAlterTableAst, mut clauses: Vec<String>) -> String {
     if let Some(algorithm) = ast.algorithm {
         clauses.push(format!(
             "ALGORITHM={}",

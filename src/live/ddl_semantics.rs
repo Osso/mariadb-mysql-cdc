@@ -357,6 +357,19 @@ fn requires_translated_evidence(sql: &str, operation: &DdlOperation) -> bool {
 
 impl DdlSemanticInventory for LiveDdlSemanticInventory {
     fn transform_sql(&self, sql: &str) -> Result<DdlTransformation, String> {
+        if supports_production_alter_table(sql) {
+            let ast = transform::parse_production_alter_table_ast(sql)?;
+            let alters_default = ast.clauses.iter().any(|clause| {
+                matches!(clause, model::ParsedAlterClause::AlterColumnDefault { .. })
+            });
+            if alters_default {
+                let operation = parse_semantic_operation(sql)?;
+                let before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+                let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+                validate_target_snapshot_consistency(&before, &after)?;
+                return transform::transform_production_alter_table_with_target(sql, &before);
+            }
+        }
         let target_objects = if supports_drop_procedure(sql) {
             self.read_target_procedure_names()?
         } else if supports_drop_trigger_if_exists(sql) {

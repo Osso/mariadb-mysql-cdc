@@ -9,7 +9,7 @@ fn altered(
     (
         serde_json::from_str(&evidence.canonical_ast).expect("canonical AST"),
         serde_json::from_str(&evidence.expected_post_state).expect("post-state"),
-        super::super::transform::transform_production_alter_table(sql)
+        super::super::transform::transform_production_alter_table_with_target(sql, target)
             .expect("target SQL")
             .target_sql
             .expect("executable SQL"),
@@ -264,7 +264,7 @@ fn text_defaults_get_expression_metadata_and_drop_removes_only_default_marker() 
     );
     assert_eq!(
         rendered,
-        "ALTER TABLE `accounts` ALTER COLUMN `handle` SET DEFAULT '{}'"
+        "ALTER TABLE `accounts` ALTER COLUMN `handle` SET DEFAULT (_utf8mb4'{}')"
     );
     assert_eq!(
         post["definition"]["columns"][1]["default_value"],
@@ -285,6 +285,53 @@ fn text_defaults_get_expression_metadata_and_drop_removes_only_default_marker() 
         serde_json::Value::Null
     );
     assert_eq!(post["definition"]["columns"][1]["extra"], "");
+}
+
+#[test]
+fn text_default_uses_target_type_and_mysql_expression_sql() {
+    let mut target = semantic_snapshot(7, Some(8));
+    target.inventory.tables[0].columns[1].column_type = "text".into();
+    target.inventory.tables[0].columns[1].data_type = "text".into();
+    let sql = "ALTER TABLE accounts ALTER COLUMN handle SET DEFAULT '{}'";
+    let rendered =
+        super::super::transform::transform_production_alter_table_with_target(sql, &target)
+            .expect("type-aware transformation")
+            .target_sql
+            .unwrap();
+    assert_eq!(
+        rendered,
+        "ALTER TABLE `accounts` ALTER COLUMN `handle` SET DEFAULT (_utf8mb4'{}')"
+    );
+    let (_, post, _) = altered(sql, &target);
+    assert_eq!(
+        post["definition"]["columns"][1]["default_value"],
+        "_utf8mb4\\'{}\\'"
+    );
+}
+
+#[test]
+fn text_default_after_add_uses_same_statement_column_state() {
+    let target = semantic_snapshot(7, Some(8));
+    let sql = "ALTER TABLE accounts ADD COLUMN memo TEXT, ALTER COLUMN memo SET DEFAULT '{}'";
+    let rendered =
+        super::super::transform::transform_production_alter_table_with_target(sql, &target)
+            .expect("sequential transformation")
+            .target_sql
+            .unwrap();
+    assert_eq!(
+        rendered,
+        "ALTER TABLE `accounts` ADD COLUMN `memo` TEXT NULL DEFAULT NULL, ALTER COLUMN `memo` SET DEFAULT (_utf8mb4'{}')"
+    );
+    let (_, post, _) = altered(sql, &target);
+    assert_eq!(post["definition"]["columns"][2]["name"], "memo");
+    assert_eq!(
+        post["definition"]["columns"][2]["default_value"],
+        "_utf8mb4\\'{}\\'"
+    );
+    assert_eq!(
+        post["definition"]["columns"][2]["extra"],
+        "DEFAULT_GENERATED"
+    );
 }
 
 #[test]
