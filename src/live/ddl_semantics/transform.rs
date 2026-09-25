@@ -189,6 +189,7 @@ pub fn transform_production_alter_table_with_mode(
     Ok(transformed_alter_sql(leading_comment, rendered_sql))
 }
 
+#[cfg(test)]
 pub(crate) fn transform_production_alter_table_with_target(
     source_sql: &str,
     target: &super::model::SemanticSchemaSnapshot,
@@ -234,33 +235,108 @@ fn render_alter_table_with_target(
     ast: &ParsedAlterTableAst,
     target: &super::model::SemanticSchemaSnapshot,
 ) -> Result<String, String> {
+    let normalized = fold_new_column_defaults(ast, target)?;
     let mut state = target.clone();
-    let mut clauses = Vec::with_capacity(ast.clauses.len());
-    for clause in &ast.clauses {
+    let mut clauses = Vec::with_capacity(normalized.clauses.len());
+    for clause in &normalized.clauses {
         let rendered = match clause {
             ParsedAlterClause::AlterColumnDefault { name, default } => {
-                let existed = target
-                    .inventory
-                    .tables
-                    .iter()
-                    .find(|table| table.name == ast.table)
-                    .is_some_and(|table| {
-                        table
-                            .columns
-                            .iter()
-                            .any(|column| column.name.eq_ignore_ascii_case(name))
-                    });
-                if !existed {
-                    return Err("default change on a column introduced in the same ALTER requires ordered DDL replay".into());
-                }
                 render_target_column_default(&state, &ast.table, name, default.as_ref())?
             }
             other => render_production_alter_clause(other),
         };
-        super::canonical::apply_alter_clause(&mut state, ast, clause)?;
+        super::canonical::apply_alter_clause(&mut state, &normalized, clause)?;
         clauses.push(rendered);
     }
-    Ok(render_alter_table_clauses(ast, clauses))
+    Ok(render_alter_table_clauses(&normalized, clauses))
+}
+
+// MariaDB resolves these defaults before it backfills newly added columns. Keep
+// that atomic behavior instead of creating a column and then changing its default.
+fn fold_new_column_defaults(
+    ast: &ParsedAlterTableAst,
+    target: &super::model::SemanticSchemaSnapshot,
+) -> Result<ParsedAlterTableAst, String> {
+    let mut state = target.clone();
+    let mut normalized = ast.clone();
+    normalized.clauses.clear();
+    let mut added = std::collections::BTreeMap::new();
+    for clause in &ast.clauses {
+        let new_column = match clause {
+            ParsedAlterClause::AddColumn(column)
+                if !snapshot_has_column(&state, &ast.table, &column.name) =>
+            {
+                Some(column.name.to_ascii_lowercase())
+            }
+            _ => None,
+        };
+        super::canonical::apply_alter_clause(&mut state, ast, clause)?;
+        if let ParsedAlterClause::AlterColumnDefault { name, default } = clause
+            && let Some(index) = added.get(&name.to_ascii_lowercase())
+        {
+            fold_column_default(&mut normalized.clauses, *index, default.as_ref())?;
+            continue;
+        }
+        invalidate_changed_column_origin(&mut added, clause);
+        if let Some(name) = new_column {
+            added.insert(name, normalized.clauses.len());
+        }
+        normalized.clauses.push(clause.clone());
+    }
+    Ok(normalized)
+}
+
+fn snapshot_has_column(
+    snapshot: &super::model::SemanticSchemaSnapshot,
+    table: &str,
+    name: &str,
+) -> bool {
+    snapshot
+        .inventory
+        .tables
+        .iter()
+        .find(|item| item.name == table)
+        .is_some_and(|table| {
+            table
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(name))
+        })
+}
+
+fn fold_column_default(
+    clauses: &mut [ParsedAlterClause],
+    index: usize,
+    default: Option<&ParsedColumnDefault>,
+) -> Result<(), String> {
+    let Some(ParsedAlterClause::AddColumn(column)) = clauses.get_mut(index) else {
+        return Err("new-column default origin is not an ADD COLUMN".into());
+    };
+    column.default_value = match default {
+        None | Some(ParsedColumnDefault::Null) => None,
+        Some(ParsedColumnDefault::String(value)) => Some(value.clone()),
+        Some(ParsedColumnDefault::Number(value)) => Some(basic_types::normalize_numeric_default(
+            &column.column_type,
+            value,
+        )?),
+    };
+    Ok(())
+}
+
+fn invalidate_changed_column_origin(
+    added: &mut std::collections::BTreeMap<String, usize>,
+    clause: &ParsedAlterClause,
+) {
+    let name = match clause {
+        ParsedAlterClause::ModifyColumn(column) => Some(column.name.as_str()),
+        ParsedAlterClause::ChangeColumn { old_name, .. }
+        | ParsedAlterClause::RenameColumn { old_name, .. } => Some(old_name.as_str()),
+        ParsedAlterClause::DropColumn(column) => Some(column.name.as_str()),
+        _ => None,
+    };
+    if let Some(name) = name {
+        added.remove(&name.to_ascii_lowercase());
+    }
 }
 
 fn render_target_column_default(
@@ -449,10 +525,28 @@ fn render_alter_default(value: &ParsedColumnDefault) -> String {
 
 fn render_add_column(column: &ParsedAddColumnAst) -> String {
     let nullability = if column.nullable { "NULL" } else { "NOT NULL" };
+    let data_type = if column.data_type == "json" {
+        "longtext"
+    } else {
+        column.data_type.as_str()
+    };
     let default_value = match column.default_value.as_deref() {
         None => "NULL".to_string(),
-        Some(value) if is_text_type(&column.data_type) => text_expression_default(value),
-        Some(value) if matches!(column.data_type.as_str(), "char" | "varchar") => {
+        Some(value) if is_text_type(data_type) => text_expression_default(value),
+        Some(value)
+            if matches!(
+                data_type,
+                "char"
+                    | "varchar"
+                    | "binary"
+                    | "varbinary"
+                    | "date"
+                    | "datetime"
+                    | "time"
+                    | "timestamp"
+                    | "year"
+            ) =>
+        {
             quote_string_literal(value)
         }
         Some(value) => value.to_string(),
@@ -513,6 +607,23 @@ fn render_add_key(index: &ParsedIndexAst) -> String {
         "ADD {key_kind} {} ({columns})",
         quote_identifier(&index.name)
     )
+}
+
+pub(crate) fn mysql_text_default_metadata(value: &str) -> String {
+    let mut metadata = String::from("_utf8mb4\\'");
+    for character in value.chars() {
+        match character {
+            '\0' => metadata.push_str("\\\\0"),
+            '\n' => metadata.push_str("\\\\n"),
+            '\r' => metadata.push_str("\\\\r"),
+            '\u{001a}' => metadata.push_str("\\\\Z"),
+            '\\' => metadata.push_str("\\\\\\\\"),
+            '\'' => metadata.push_str("\\\\\\'"),
+            other => metadata.push(other),
+        }
+    }
+    metadata.push_str("\\'");
+    metadata
 }
 
 fn quote_string_literal(value: &str) -> String {
@@ -582,23 +693,6 @@ pub fn render_modeled_index_ddl(
         .key_parts
         .iter()
         .map(render_modeled_index_key_part)
-pub(crate) fn mysql_text_default_metadata(value: &str) -> String {
-    let mut metadata = String::from("_utf8mb4\\'");
-    for character in value.chars() {
-        match character {
-            '\0' => metadata.push_str("\\\\0"),
-            '\n' => metadata.push_str("\\\\n"),
-            '\r' => metadata.push_str("\\\\r"),
-            '\u{001a}' => metadata.push_str("\\\\Z"),
-            '\\' => metadata.push_str("\\\\\\\\"),
-            '\'' => metadata.push_str("\\\\\\'"),
-            other => metadata.push(other),
-        }
-    }
-    metadata.push_str("\\'");
-    metadata
-}
-
         .collect::<Vec<_>>()
         .join(",");
     let tokens = super::tokenizer::tokenize_ddl(source_sql)?;
@@ -1863,6 +1957,13 @@ fn rename_columns_if_exists_sql(source_sql: &str) -> Result<(Option<&str>, &str)
 }
 
 pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterTableAst, String> {
+    parse_production_alter_table_ast_with_mode(source_sql, SourceSqlMode(None))
+}
+
+pub fn parse_production_alter_table_ast_with_mode(
+    source_sql: &str,
+    mode: SourceSqlMode,
+) -> Result<ParsedAlterTableAst, String> {
     let (_, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
     let ordinary_comments = ddl_contains_comments(statement_sql);
     let leading_comments_only =
@@ -1908,13 +2009,6 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
 
 fn parse_production_alter_body(
     tokens: &[String],
-    parse_production_alter_table_ast_with_mode(source_sql, SourceSqlMode(None))
-}
-
-pub fn parse_production_alter_table_ast_with_mode(
-    source_sql: &str,
-    mode: SourceSqlMode,
-) -> Result<ParsedAlterTableAst, String> {
     quoted_flags: &[bool],
     table: &str,
     literals: Vec<String>,
@@ -2595,13 +2689,19 @@ mod sql_mode_literal_tests {
 
     #[test]
     fn rejects_mixed_non_ascii_and_escaped_source_literal_without_charset_proof() {
-        assert!(extract_single_quoted_literals_with_mode(r"DEFAULT 'é\n'", SourceSqlMode(Some(0))).is_err());
-        assert!(extract_single_quoted_literals_with_mode("DEFAULT 'é'", SourceSqlMode(Some(0))).is_ok());
+        assert!(
+            extract_single_quoted_literals_with_mode(r"DEFAULT 'é\n'", SourceSqlMode(Some(0)))
+                .is_err()
+        );
+        assert!(
+            extract_single_quoted_literals_with_mode("DEFAULT 'é'", SourceSqlMode(Some(0))).is_ok()
+        );
     }
 
     #[test]
     fn decodes_mysql_escapes_and_preserves_pattern_escapes() {
-        let sql = r#"ALTER TABLE t ADD COLUMN c VARCHAR(80) DEFAULT 'a\0\n\r\t\b\Z\\\'\"\%\_\q''z'"#;
+        let sql =
+            r#"ALTER TABLE t ADD COLUMN c VARCHAR(80) DEFAULT 'a\0\n\r\t\b\Z\\\'\"\%\_\q''z'"#;
         assert_eq!(
             extract_single_quoted_literals_with_mode(sql, SourceSqlMode(Some(0))).unwrap(),
             vec!["a\0\n\r\t\u{0008}\u{001a}\\'\"\\%\\_q'z"]
@@ -2610,11 +2710,16 @@ mod sql_mode_literal_tests {
 
     #[test]
     fn create_ast_uses_source_mode_for_string_default() {
-        let sql = r"CREATE TABLE t (id INT PRIMARY KEY, label VARCHAR(40) DEFAULT 'a\n\q') ENGINE=InnoDB";
+        let sql =
+            r"CREATE TABLE t (id INT PRIMARY KEY, label VARCHAR(40) DEFAULT 'a\n\q') ENGINE=InnoDB";
         let escaped = parse_fixture_create_table_with_mode(sql, SourceSqlMode(Some(0))).unwrap();
-        let unescaped = parse_fixture_create_table_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let unescaped =
+            parse_fixture_create_table_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
         assert_eq!(escaped.columns[1].default_sql.as_deref(), Some("'a\\nq'"));
-        assert_eq!(unescaped.columns[1].default_sql.as_deref(), Some("'a\\\\n\\\\q'"));
+        assert_eq!(
+            unescaped.columns[1].default_sql.as_deref(),
+            Some("'a\\\\n\\\\q'")
+        );
         assert!(parse_fixture_create_table(sql).is_err());
     }
 
@@ -2629,26 +2734,36 @@ mod sql_mode_literal_tests {
     #[test]
     fn no_backslash_mode_preserves_quoted_default_through_ordinary_comments() {
         let sql = r"/* note */ ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''b'";
-        let ast = parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
-        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else { panic!("expected ADD"); };
+        let ast =
+            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else {
+            panic!("expected ADD");
+        };
         assert_eq!(column.default_value.as_deref(), Some("a\\'b"));
     }
 
     #[test]
     fn no_backslash_mode_handles_slash_before_doubled_quote() {
         let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''b'";
-        let ast = parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
-        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else { panic!("expected ADD"); };
+        let ast =
+            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else {
+            panic!("expected ADD");
+        };
         assert_eq!(column.default_value.as_deref(), Some("a\\'b"));
-        let operation = super::super::parser::parse_ddl_operation_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let operation =
+            super::super::parser::parse_ddl_operation_with_mode(sql, SourceSqlMode(Some(1 << 20)))
+                .unwrap();
         assert!(operation.alter_table_ast.is_some());
     }
 
     #[test]
     fn alter_ast_decodes_source_mode_before_normalizing_default() {
         let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n\q'";
-        let escaped = parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(0))).unwrap();
-        let unescaped = parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let escaped =
+            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(0))).unwrap();
+        let unescaped =
+            parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
         let default = |ast: ParsedAlterTableAst| match ast.clauses.into_iter().next().unwrap() {
             ParsedAlterClause::AddColumn(column) => column.default_value.unwrap(),
             other => panic!("unexpected clause: {other:?}"),
@@ -2682,6 +2797,8 @@ pub(crate) fn extract_single_quoted_literals_with_mode(
             continue;
         }
         let mut literal = String::new();
+        let mut has_source_escape = false;
+        let mut has_non_ascii = false;
         index += 1;
         loop {
             let character = *characters
@@ -2724,8 +2841,12 @@ pub(crate) fn extract_single_quoted_literals_with_mode(
                 index += 2;
                 continue;
             }
+            has_non_ascii |= !character.is_ascii();
             literal.push(character);
             index += 1;
+        }
+        if has_source_escape && has_non_ascii {
+            return Err("escaped non-ASCII source literal requires proven client charset".into());
         }
         literals.push(literal);
     }
@@ -2751,8 +2872,6 @@ fn parse_drop_column_clause(
     index: usize,
 ) -> Result<(ParsedAlterClause, usize), String> {
     require_keyword(tokens, index + 1, "COLUMN")?;
-        let mut has_source_escape = false;
-        let mut has_non_ascii = false;
     let if_exists = tokens
         .get(index + 2)
         .is_some_and(|token| token.eq_ignore_ascii_case("IF"));
@@ -2770,13 +2889,9 @@ fn parse_drop_column_clause(
 }
 
 fn parse_drop_index_clause(
-            has_non_ascii |= !character.is_ascii();
     tokens: &[String],
     index: usize,
 ) -> Result<(ParsedAlterClause, usize), String> {
-        if has_source_escape && has_non_ascii {
-            return Err("escaped non-ASCII source literal requires proven client charset".into());
-        }
     require_keyword(tokens, index + 1, "INDEX")?;
     let name = require_identifier(tokens, index + 2, "dropped index")?;
     Ok((

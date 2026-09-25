@@ -310,12 +310,39 @@ fn text_default_uses_target_type_and_mysql_expression_sql() {
 }
 
 #[test]
-fn default_on_new_column_requires_ordered_replay_before_execution() {
+fn new_column_defaults_fold_into_one_atomic_add_definition() {
     let target = semantic_snapshot(7, Some(8));
-    let sql = "ALTER TABLE accounts ADD COLUMN memo TEXT, ALTER COLUMN memo SET DEFAULT '{}'";
-    let error = super::super::transform::transform_production_alter_table_with_target(sql, &target)
-        .expect_err("MySQL cannot apply a default change to a newly added column in one ALTER");
-    assert!(error.contains("requires ordered DDL replay"));
+    for (definition, action, expected) in [
+        (
+            "TEXT",
+            "SET DEFAULT '{}'",
+            "TEXT NULL DEFAULT (_utf8mb4'{}')",
+        ),
+        ("INT DEFAULT 7", "SET DEFAULT 9", "INT NULL DEFAULT 9"),
+        (
+            "VARCHAR(20) NOT NULL DEFAULT 'seed'",
+            "DROP DEFAULT",
+            "VARCHAR(20) NOT NULL",
+        ),
+        (
+            "TEXT DEFAULT 'seed'",
+            "SET DEFAULT NULL",
+            "TEXT NULL DEFAULT NULL",
+        ),
+    ] {
+        let sql = format!(
+            "ALTER TABLE accounts ADD COLUMN memo {definition}, ALTER COLUMN memo {action}"
+        );
+        let rendered =
+            super::super::transform::transform_production_alter_table_with_target(&sql, &target)
+                .expect("source combines the final default before backfilling the ADD")
+                .target_sql
+                .unwrap();
+        assert_eq!(
+            rendered,
+            format!("ALTER TABLE `accounts` ADD COLUMN `memo` {expected}")
+        );
+    }
 }
 
 #[test]
