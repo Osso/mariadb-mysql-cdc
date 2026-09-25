@@ -2554,12 +2554,7 @@ fn extract_single_quoted_literals(source_sql: &str) -> Result<Vec<String>, Strin
                 break;
             }
             if character == '\\' {
-                let escaped = *characters
-                    .get(index + 1)
-                    .ok_or_else(|| "unterminated DDL string escape".to_string())?;
-                literal.push(escaped);
-                index += 2;
-                continue;
+                return Err("backslash-escaped DDL strings require SQL-mode-aware decoding".into());
             }
             literal.push(character);
             index += 1;

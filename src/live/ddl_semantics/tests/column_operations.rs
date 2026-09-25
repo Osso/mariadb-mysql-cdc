@@ -319,6 +319,20 @@ fn default_on_new_column_requires_ordered_replay_before_execution() {
 }
 
 #[test]
+fn escaped_defaults_require_sql_mode_context_instead_of_changing_value() {
+    for sql in [
+        r"ALTER TABLE accounts ALTER COLUMN handle SET DEFAULT 'line\nbreak'",
+        r"ALTER TABLE accounts ALTER COLUMN handle SET DEFAULT 'tab\tvalue'",
+        r"ALTER TABLE accounts ALTER COLUMN handle SET DEFAULT 'zero\0byte'",
+        r"ALTER TABLE accounts ADD COLUMN note VARCHAR(30) DEFAULT 'line\nbreak'",
+        r"ALTER TABLE accounts MODIFY COLUMN handle VARCHAR(30) DEFAULT 'line\nbreak'",
+        r"ALTER TABLE accounts CHANGE COLUMN handle label VARCHAR(30) DEFAULT 'line\nbreak'",
+    ] {
+        assert!(parse_production_alter_table_ast(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
 fn default_null_is_rejected_on_not_null_but_drop_is_valid() {
     let mut target = semantic_snapshot(7, Some(8));
     target.inventory.tables[0].columns[1].is_nullable = false;
