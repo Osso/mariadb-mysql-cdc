@@ -89,6 +89,7 @@ SCENARIOS = (
     ScenarioSpec("basic-scalar-create-add-pending-replay", True),
     ScenarioSpec("basic-column-operations-pending-replay", True),
     ScenarioSpec("column-change-position-default-pending-replay", True),
+    ScenarioSpec("source-sql-mode-defaults-pending-replay", True),
     ScenarioSpec("table-lifecycle-pending-replay", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
@@ -183,6 +184,7 @@ def default_scenarios() -> list[str]:
             "basic-scalar-create-add-pending-replay",
             "basic-column-operations-pending-replay",
             "column-change-position-default-pending-replay",
+            "source-sql-mode-defaults-pending-replay",
             "table-lifecycle-pending-replay",
             "curated-strip-slides-create-pending-replay",
             "sales-placements-create-pending-replay",
@@ -1836,6 +1838,7 @@ DELIMITER ;
         *,
         prepared: bool = False,
         old_binary: Path | None = None,
+        source_sql_mode: str | None = None,
     ) -> tuple[Coordinate, dict[str, str]]:
         assert self.source and self.target
         if schema:
@@ -1859,10 +1862,17 @@ DELIMITER ;
                 "--batch",
             ],
             input_text=(
-                f"PREPARE harness_ddl FROM {sql_literal(ddl)}; "
-                "EXECUTE harness_ddl; DEALLOCATE PREPARE harness_ddl;"
-                if prepared
-                else ddl + ";"
+                (
+                    f"SET SESSION sql_mode={sql_literal(source_sql_mode)}; "
+                    if source_sql_mode is not None
+                    else ""
+                )
+                + (
+                    f"PREPARE harness_ddl FROM {sql_literal(ddl)}; "
+                    "EXECUTE harness_ddl; DEALLOCATE PREPARE harness_ddl;"
+                    if prepared
+                    else ddl + ";"
+                )
             ),
         )
         events = self.admin_query(
@@ -2562,40 +2572,262 @@ DELIMITER ;
             ).strip()
             if actual != "1\t1":
                 raise HarnessError(f"TEXT DROP DEFAULT mismatch: {actual!r}")
-        combined = (
+        self.replay_common_ddl(
             "ALTER TABLE column_text_defaults ADD COLUMN new_default TEXT, "
-            "ALTER COLUMN new_default SET DEFAULT 'pending'"
+            "ALTER COLUMN new_default SET DEFAULT 'pending'",
+            "ADD COLUMN",
+            following_sql="INSERT INTO column_text_defaults(id) VALUES(5);",
+            crash=True,
         )
-        start, pending = self.prepare_pending_add_column("", combined)
-        process, log = self.start_stream(
-            start, self.coordinate(), binary=self.binary, label="combined-default-gap"
-        )
-        try:
-            deadline = time.monotonic() + 15
-            while "requires_ordered_DDL_replay" not in log.read_text():
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    raise HarnessError(
-                        f"combined default gap did not enter barrier: {log.read_text()}"
-                    )
-                time.sleep(0.1)
-            journal = self.journal_full_row(int(pending["event_start_position"]))
-            checkpoint = self.checkpoint()
-            absent = self.admin_query(
-                self.target,
-                "SELECT COUNT(*) FROM information_schema.columns WHERE TABLE_SCHEMA='globalcomix' AND TABLE_NAME='column_text_defaults' AND COLUMN_NAME='new_default';",
+        expected = "\n".join(f"{row}\t70656E64696E67" for row in range(1, 6))
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(
+                endpoint,
+                "SELECT id,HEX(new_default) FROM column_text_defaults ORDER BY id;",
             ).strip()
-            if (
-                process.poll() is not None
-                or journal["status"] != "translation_pending"
-                or absent != "0"
-                or (checkpoint["source_file"], checkpoint["source_position"])
-                != (start.file, start.position)
+            if rows != expected:
+                raise HarnessError(
+                    f"combined TEXT default backfill/insert mismatch: {rows!r}"
+                )
+            self.admin_sql(endpoint, "INSERT INTO column_text_defaults(id) VALUES(6);")
+            inserted = self.admin_query(
+                endpoint,
+                "SELECT HEX(new_default) FROM column_text_defaults WHERE id=6;",
+            ).strip()
+            if inserted != "70656E64696E67":
+                raise HarnessError(
+                    f"combined TEXT default future insert mismatch: {inserted!r}"
+                )
+        self.assert_dependent_default_replay()
+
+    def assert_dependent_default_replay(self) -> None:
+        assert self.source and self.target
+        cases = (
+            (
+                "dependent_int_default",
+                "value INT NULL DEFAULT 7",
+                "ALTER COLUMN value SET DEFAULT 9",
+                "1\t39\n2\t39\n3\t39",
+                True,
+            ),
+            (
+                "dependent_required_drop",
+                "value VARCHAR(32) NOT NULL DEFAULT 'seed'",
+                "ALTER COLUMN value DROP DEFAULT",
+                "1\t\n2\t",
+                False,
+            ),
+            (
+                "dependent_text_null",
+                "value TEXT DEFAULT 'seed'",
+                "ALTER COLUMN value SET DEFAULT NULL",
+                "1\t<NULL>\n2\t<NULL>\n3\t<NULL>",
+                True,
+            ),
+        )
+        for table, definition, operation, expected, permits_omitted_insert in cases:
+            setup = (
+                f"CREATE TABLE {table} (id INT PRIMARY KEY) ENGINE=InnoDB; "
+                f"INSERT INTO {table}(id) VALUES (1),(2);"
+            )
+            for endpoint in (self.source, self.target):
+                self.admin_sql(endpoint, setup)
+            self.replay_common_ddl(
+                f"ALTER TABLE {table} ADD COLUMN {definition}, {operation}",
+                "ADD COLUMN",
+                following_sql=(
+                    f"INSERT INTO {table}(id) VALUES (3);"
+                    if permits_omitted_insert
+                    else ""
+                ),
+                crash=True,
+            )
+            query = (
+                "SELECT id,IF(value IS NULL,'<NULL>',HEX(CAST(value AS CHAR))) "
+                f"FROM {table} ORDER BY id;"
+            )
+            for endpoint in (self.source, self.target):
+                rows = self.admin_query(endpoint, query).rstrip("\n")
+                if rows != expected:
+                    raise HarnessError(
+                        f"{table} backfill/future insert mismatch at {endpoint.container}: {rows!r}"
+                    )
+                if permits_omitted_insert:
+                    self.admin_sql(endpoint, f"INSERT INTO {table}(id) VALUES (4);")
+                    future = self.admin_query(endpoint, query).rstrip("\n")
+                    if (
+                        future
+                        != expected + "\n4\t" + expected.split("\n")[-1].split("\t")[1]
+                    ):
+                        raise HarnessError(
+                            f"{table} independent omitted insert differs: {future!r}"
+                        )
+                else:
+                    self.assert_admin_sql_rejected(
+                        endpoint,
+                        f"INSERT INTO {table}(id) VALUES (4);",
+                        "default value",
+                    )
+
+    def run_source_sql_mode_defaults_pending_replay(self) -> None:
+        assert self.source and self.target
+        for suffix, mode, no_backslash_escapes in (
+            ("standard", "STRICT_ALL_TABLES", False),
+            ("no_backslash", "STRICT_ALL_TABLES,NO_BACKSLASH_ESCAPES", True),
+        ):
+            table = f"sql_mode_defaults_{suffix}"
+            create = (
+                f"CREATE TABLE {table} (id INT PRIMARY KEY, "
+                "value VARCHAR(100) DEFAULT 'born\\nline') ENGINE=InnoDB"
+            )
+            start, pending = self.prepare_pending_add_column(
+                "", create, "CREATE TABLE", source_sql_mode=mode
+            )
+            self.replay_pending_add_column(start, pending)
+            self.assert_source_sql_mode_evidence(pending, no_backslash_escapes)
+            for endpoint in (self.source, self.target):
+                self.admin_sql(endpoint, f"INSERT INTO {table}(id) VALUES (1);")
+            self.assert_sql_mode_default_rows(
+                table,
+                "value",
+                1,
+                rb"born\nline" if no_backslash_escapes else b"born\nline",
+            )
+
+            add = (
+                f"ALTER TABLE {table} ADD COLUMN added TEXT DEFAULT "
+                r"'NUL\0LF\nCR\rTAB\tZ\ZBS\\Q''end'"
+            )
+            start, pending = self.prepare_pending_add_column(
+                "", add, source_sql_mode=mode
+            )
+            self.admin_sql(self.source, f"INSERT INTO {table}(id) VALUES (2);")
+            self.replay_pending_add_column(start, pending)
+            self.assert_source_sql_mode_evidence(pending, no_backslash_escapes)
+            added_default = (
+                rb"NUL\0LF\nCR\rTAB\tZ\ZBS\\Q'end"
+                if no_backslash_escapes
+                else b"NUL\x00LF\nCR\rTAB\tZ\x1aBS\\Q'end"
+            )
+            for row_id in (1, 2):
+                self.assert_sql_mode_default_rows(table, "added", row_id, added_default)
+
+            modify = (
+                f"ALTER TABLE {table} MODIFY COLUMN value VARCHAR(100) "
+                r"DEFAULT 'edit\\end'"
+            )
+            start, pending = self.prepare_pending_add_column(
+                "", modify, "MODIFY COLUMN", source_sql_mode=mode
+            )
+            self.admin_sql(self.source, f"INSERT INTO {table}(id) VALUES (3);")
+            self.replay_pending_add_column(start, pending)
+            self.assert_source_sql_mode_evidence(pending, no_backslash_escapes)
+            self.assert_sql_mode_default_rows(
+                table,
+                "value",
+                3,
+                b"edit\\\\end" if no_backslash_escapes else b"edit\\end",
+            )
+
+            change = (
+                f"ALTER TABLE {table} CHANGE COLUMN value renamed VARCHAR(100) "
+                r"DEFAULT 'quote''and\tTAB'"
+            )
+            start, pending = self.prepare_pending_add_column(
+                "", change, "CHANGE COLUMN", source_sql_mode=mode
+            )
+            self.admin_sql(self.source, f"INSERT INTO {table}(id) VALUES (4);")
+            self.replay_pending_add_column(start, pending)
+            self.assert_source_sql_mode_evidence(pending, no_backslash_escapes)
+            self.assert_sql_mode_default_rows(
+                table,
+                "renamed",
+                4,
+                rb"quote'and\tTAB" if no_backslash_escapes else b"quote'and\tTAB",
+            )
+
+            set_default = (
+                f"ALTER TABLE {table} ALTER COLUMN renamed SET DEFAULT "
+                r"'trail\\'"
+            )
+            start, pending = self.prepare_pending_add_column(
+                "", set_default, "ALTER COLUMN", source_sql_mode=mode
+            )
+            self.admin_sql(self.source, f"INSERT INTO {table}(id) VALUES (5);")
+            stop = self.coordinate()
+            crashed = self.run_stream(
+                start,
+                stop,
+                integration_failpoint="post-ddl-pre-applied",
+                binary=self.binary,
+            )
+            if crashed.returncode != 70 or "cdc_integration_failpoint" not in (
+                crashed.stdout + crashed.stderr
             ):
                 raise HarnessError(
-                    f"combined default gap did not fail closed: {journal!r} {checkpoint!r}"
+                    f"SQL_MODE SET DEFAULT did not crash after DDL: {crashed!r}"
                 )
-        finally:
-            self.stop_sync_process(process)
+            journal = self.journal_full_row(int(pending["event_start_position"]))
+            checkpoint = self.checkpoint()
+            if journal["status"] != "prepared" or (
+                checkpoint["source_file"],
+                checkpoint["source_position"],
+            ) != (start.file, start.position):
+                raise HarnessError(
+                    f"SQL_MODE crash lost pending identity: {journal!r} {checkpoint!r}"
+                )
+            if journal["raw_sql"] != pending["raw_sql"]:
+                raise HarnessError(f"SQL_MODE crash changed raw SQL: {journal!r}")
+            self.replay_pending_add_column(start, pending)
+            self.assert_source_sql_mode_evidence(pending, no_backslash_escapes)
+            expected = b"trail\\\\" if no_backslash_escapes else b"trail\\"
+            self.assert_sql_mode_default_rows(table, "renamed", 5, expected)
+            for endpoint in (self.source, self.target):
+                self.admin_sql(endpoint, f"INSERT INTO {table}(id) VALUES (6);")
+            for row_id, value in enumerate(
+                (
+                    rb"born\nline" if no_backslash_escapes else b"born\nline",
+                    rb"born\nline" if no_backslash_escapes else b"born\nline",
+                    b"edit\\\\end" if no_backslash_escapes else b"edit\\end",
+                    rb"quote'and\tTAB" if no_backslash_escapes else b"quote'and\tTAB",
+                    expected,
+                    expected,
+                ),
+                start=1,
+            ):
+                self.assert_sql_mode_default_rows(table, "renamed", row_id, value)
+                self.assert_sql_mode_default_rows(table, "added", row_id, added_default)
+        print(
+            "source_sql_mode_defaults_pending_replay_ok source_context=true exact_bytes=true crash_restart=true"
+        )
+
+    def assert_source_sql_mode_evidence(
+        self, pending: dict[str, str], no_backslash_escapes: bool
+    ) -> None:
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        mode = json.loads(journal["canonical_ast"]).get("source_sql_mode")
+        if (
+            journal["raw_sql"] != pending["raw_sql"]
+            or journal["status"] != "checkpointed"
+            or not isinstance(mode, int)
+            or bool(mode & (1 << 20)) != no_backslash_escapes
+        ):
+            raise HarnessError(
+                f"SQL_MODE journal evidence/identity mismatch: {journal!r}"
+            )
+
+    def assert_sql_mode_default_rows(
+        self, table: str, column: str, row_id: int, expected: bytes
+    ) -> None:
+        assert self.source and self.target
+        query = f"SELECT HEX(`{column}`) FROM `{table}` WHERE id={row_id};"
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, query).strip()
+            if actual != expected.hex().upper():
+                raise HarnessError(
+                    f"{table}.{column} row {row_id} differs at {endpoint.container}: "
+                    f"expected={expected.hex().upper()} actual={actual!r}"
+                )
 
     def run_table_lifecycle_pending_replay(self) -> None:
         assert self.source and self.target
@@ -9365,6 +9597,8 @@ DELIMITER ;
             self.run_basic_column_operations_pending_replay()
         elif scenario == "column-change-position-default-pending-replay":
             self.run_column_change_position_default_pending_replay()
+        elif scenario == "source-sql-mode-defaults-pending-replay":
+            self.run_source_sql_mode_defaults_pending_replay()
         elif scenario == "table-lifecycle-pending-replay":
             self.run_table_lifecycle_pending_replay()
         elif scenario == "create-facets-historical-crash-restart":
