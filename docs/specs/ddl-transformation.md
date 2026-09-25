@@ -29,13 +29,25 @@ allowlist.
 
 ### Current implemented slice
 
-#### Basic common DDL expansion — implementation in progress
+#### Basic common DDL expansion
 
-This branch replaces the former one-observed-shape-at-a-time direction for basic
-column DDL with the bounded common family below. It does **not** claim all DDL,
-real-database integration completion, deployment, or live recovery proof. The
-production-specific records below remain applicable where they add a narrower
-exception; their narrower type exclusions are superseded by this matrix.
+The bounded common family below replaces the former one-observed-shape-at-a-time
+approach for basic column DDL. It does **not** claim all DDL. Historical records
+below remain applicable where they add a narrower exception; their narrower type
+exclusions are superseded by this matrix.
+
+Runtime revision `9dfb999` deployed September 25, 2026. Verification passed 866
+Rust tests (18 ignored), six Python tests, and Clippy. Real MariaDB 11.4/MySQL 8
+proof covers:
+
+| Behavior | Proof |
+|---|---|
+| Five-column integer/VARCHAR/JSON ALTER | Original pending event, unchanged journal identity, crash after target DDL, restart, JSON enforcement, column order/defaults and following DML. |
+| Basic scalar CREATE and ADD | 32 definitions in each path; signed/unsigned integer boundaries, decimal defaults, temporal precision, nullable binary/text/blob types and following DML. CREATE without charset uses stable target-database inheritance. |
+| MODIFY, indexed RENAME, DROP INDEX then DROP COLUMN | Persisted pending replay, crash/restart, row preservation, defaults/nullability, order/indexes and following DML. |
+
+Other accepted grammar has targeted parser/semantic tests; this matrix does not
+claim real-database proof of every possible combination.
 
 | Area | Accepted basic family | Safety boundary |
 |---|---|---|

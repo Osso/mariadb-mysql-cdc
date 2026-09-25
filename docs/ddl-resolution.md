@@ -3,10 +3,9 @@
 The event handler uses one durable DDL control plane:
 `cdc.ddl_replay_journal`. Unsupported DDL never routes through a manual ledger.
 
-Automatic admission includes the in-progress common basic DDL matrix in
-[DDL transformation](specs/ddl-transformation.md#basic-common-ddl-expansion--implementation-in-progress).
-It is bounded, has no deployment or live-recovery claim, and does not admit all
-DDL. The historical details below describe additional narrow slices, including
+Automatic admission includes the tested and deployed common basic DDL matrix in
+[DDL transformation](specs/ddl-transformation.md#basic-common-ddl-expansion).
+It remains bounded and does not admit all DDL. The historical details below describe additional narrow slices, including
 strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
 metadata and no FK dependency; the production-observed unqualified multi-clause
@@ -49,7 +48,7 @@ target SQL is accepted as a resolution path.
 ### Historical `CREATE TABLE` charset context
 
 The basic-matrix type/definition coverage is specified once in the
-[DDL transformation contract](specs/ddl-transformation.md#basic-common-ddl-expansion--implementation-in-progress).
+[DDL transformation contract](specs/ddl-transformation.md#basic-common-ddl-expansion).
 This section records historical charset evidence and observed extensions; its
 narrower type exclusions do not reduce the matrix.
 
@@ -75,8 +74,8 @@ not a converged no-op in this slice.
 
 The basic common DDL matrix has bounded real MariaDB 11.4/MySQL 8 replay and
 crash/restart proof for sale ALTER, 32 scalar CREATE/ADD definitions, and column
-operations. Deployment and final integration gates remain pending. Unsupported
-CREATE statements remain `translation_pending`; their journal row, coordinate,
+operations. Runtime revision `9dfb999` deployed September 25, 2026; its blocked
+sale ALTER replayed and the stream resumed. Unsupported CREATE statements remain `translation_pending`; their journal row, coordinate,
 and checkpoint must not be edited manually.
 
 ### Curated-strip persisted-pending replay harnesses

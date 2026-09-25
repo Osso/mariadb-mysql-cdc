@@ -91,17 +91,17 @@ orphan limit. See [FK orphan repair](docs/specs/fk-orphan-repair.md).
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in
-the target. Basic common DDL expansion is implemented on this branch but remains
-in integration proof; it has no deployment or live-recovery claim. The accepted
-column types, statements, options, and explicit exclusions are the authoritative
-[basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion--implementation-in-progress).
+the target. The basic common DDL family has real MariaDB/MySQL replay proof and
+was deployed September 25, 2026. Accepted column types, statements, options,
+explicit exclusions and proof levels are in the authoritative
+[basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion).
 The historical details below record additional observed admissions; where they
 state narrower basic-column exclusions, the matrix supersedes them. Automatic
 DDL admission also covers an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
 when every key part/option is modeled and the operation is proven not to support
 or depend on a foreign key; the shared observed `CREATE TABLE` grammar from the
-[basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion--implementation-in-progress),
+[basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion),
 which replaced the fixture/table-specific parser; production-observed source-only
 `CREATE PROCEDURE` form for the exact
 unqualified routine identity `apply_release_move_purchase_repair`, admitted only
