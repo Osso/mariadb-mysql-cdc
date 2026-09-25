@@ -88,6 +88,8 @@ SCENARIOS = (
     ScenarioSpec("curated-strip-sale-alter-pending-replay", True),
     ScenarioSpec("basic-scalar-create-add-pending-replay", True),
     ScenarioSpec("basic-column-operations-pending-replay", True),
+    ScenarioSpec("column-change-position-default-pending-replay", True),
+    ScenarioSpec("table-lifecycle-pending-replay", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
@@ -180,6 +182,8 @@ def default_scenarios() -> list[str]:
             "curated-strip-sale-alter-pending-replay",
             "basic-scalar-create-add-pending-replay",
             "basic-column-operations-pending-replay",
+            "column-change-position-default-pending-replay",
+            "table-lifecycle-pending-replay",
             "curated-strip-slides-create-pending-replay",
             "sales-placements-create-pending-replay",
             "nullable-datetime-modify-pending-replay",
@@ -2339,6 +2343,290 @@ DELIMITER ;
             "drop_index_column=true crash_restart=true persisted_journal=true "
             "rows_defaults_order_indexes_following_dml=true "
             f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def replay_common_ddl(
+        self, ddl: str, marker: str, *, following_sql: str = "", crash: bool = False
+    ) -> Coordinate:
+        assert self.source and self.target
+        start, pending = self.prepare_pending_add_column("", ddl, marker)
+        if following_sql:
+            self.admin_sql(self.source, following_sql)
+        if crash:
+            result = self.run_stream(
+                start,
+                self.coordinate(),
+                integration_failpoint="post-ddl-pre-applied",
+                binary=self.binary,
+            )
+            if result.returncode != 70 or "cdc_integration_failpoint" not in (
+                result.stdout + result.stderr
+            ):
+                raise HarnessError(
+                    f"DDL did not crash after application: {ddl}: {result!r}"
+                )
+            journal = self.journal_full_row(int(pending["event_start_position"]))
+            checkpoint = self.checkpoint()
+            if journal["status"] != "prepared" or (
+                checkpoint["source_file"],
+                checkpoint["source_position"],
+            ) != (start.file, start.position):
+                raise HarnessError(
+                    f"crash changed pending identity/checkpoint: {journal!r} {checkpoint!r}"
+                )
+        return self.replay_pending_add_column(start, pending)
+
+    def run_column_change_position_default_pending_replay(self) -> None:
+        assert self.source and self.target
+        table = "column_position_defaults"
+        setup = (
+            f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY, "
+            "label VARCHAR(32) NOT NULL DEFAULT 'seed', "
+            "amount INT NOT NULL DEFAULT 3, note VARCHAR(16) NULL, "
+            "KEY idx_label (label)) ENGINE=InnoDB; "
+            f"INSERT INTO {table}(id,label,amount,note) VALUES "
+            "(1,'kept',4,'one'),(2,'second',5,NULL);"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, setup)
+        self.replay_common_ddl(
+            f"ALTER TABLE {table} CHANGE COLUMN label title VARCHAR(32) "
+            "NOT NULL DEFAULT 'seed' FIRST",
+            "CHANGE COLUMN",
+            following_sql=f"UPDATE {table} SET title='changed' WHERE id=2;",
+        )
+        self.replay_common_ddl(
+            f"ALTER TABLE {table} ADD COLUMN priority INT NOT NULL DEFAULT 7 FIRST",
+            "ADD COLUMN",
+        )
+        self.replay_common_ddl(
+            f"ALTER TABLE {table} MODIFY COLUMN amount INT NOT NULL DEFAULT 3 FIRST",
+            "MODIFY COLUMN",
+        )
+        self.replay_common_ddl(
+            f"ALTER TABLE {table} ALTER COLUMN amount SET DEFAULT 9",
+            "ALTER COLUMN",
+        )
+        self.replay_common_ddl(
+            f"ALTER TABLE {table} ALTER COLUMN title SET DEFAULT 'ready'",
+            "ALTER COLUMN",
+        )
+        self.replay_common_ddl(
+            f"ALTER TABLE {table} ALTER COLUMN note SET DEFAULT NULL",
+            "ALTER COLUMN",
+            following_sql=f"INSERT INTO {table}(id) VALUES (3);",
+        )
+        active_defaults = (
+            "SELECT column_name,column_type,COALESCE(column_default,'<null>') "
+            "FROM information_schema.columns "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name={sql_literal(table)} "
+            "AND column_name IN ('amount','title','note') ORDER BY ordinal_position;"
+        )
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, active_defaults).strip()
+            expected = (
+                "amount\tint(11)\t9\ntitle\tvarchar(32)\t'ready'\n"
+                "note\tvarchar(16)\t<null>"
+                if endpoint is self.source
+                else "amount\tint\t9\ntitle\tvarchar(32)\tready\n"
+                "note\tvarchar(16)\t<null>"
+            )
+            if actual != expected:
+                raise HarnessError(
+                    f"active defaults mismatch at {endpoint.container}: {actual!r}"
+                )
+        self.replay_common_ddl(
+            f"ALTER TABLE {table} ALTER COLUMN title DROP DEFAULT",
+            "ALTER COLUMN",
+            crash=True,
+        )
+        self.replay_common_ddl(
+            f"ALTER TABLE {table} ALTER COLUMN amount DROP DEFAULT",
+            "ALTER COLUMN",
+        )
+        stop = self.replay_common_ddl(
+            f"ALTER TABLE {table} ALTER COLUMN note DROP DEFAULT",
+            "ALTER COLUMN",
+            following_sql=f"UPDATE {table} SET note='after' WHERE id=3;",
+        )
+        query = (
+            "SELECT column_name,column_type,is_nullable,COALESCE(column_default,'<null>'),"
+            "ordinal_position FROM information_schema.columns "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name={sql_literal(table)} "
+            "ORDER BY ordinal_position;"
+        )
+        expected_source = (
+            "amount\tint(11)\tNO\t<null>\t1\n"
+            "priority\tint(11)\tNO\t7\t2\n"
+            "title\tvarchar(32)\tNO\t<null>\t3\n"
+            "id\tint(11)\tNO\t<null>\t4\n"
+            "note\tvarchar(16)\tYES\t<null>\t5"
+        )
+        expected_target = expected_source.replace("int(11)", "int")
+        rows_query = f"SELECT amount,priority,title,id,COALESCE(note,'<null>') FROM {table} ORDER BY id;"
+        expected_rows = (
+            "4\t7\tkept\t1\tone\n5\t7\tchanged\t2\t<null>\n9\t7\tready\t3\tafter"
+        )
+        index_query = (
+            "SELECT index_name,column_name FROM information_schema.statistics "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name={sql_literal(table)} "
+            "ORDER BY index_name,seq_in_index;"
+        )
+        for endpoint in (self.source, self.target):
+            columns = self.admin_query(endpoint, query).strip()
+            rows = self.admin_query(endpoint, rows_query).strip()
+            indexes = self.admin_query(endpoint, index_query).strip()
+            if (columns, rows, indexes) != (
+                expected_source if endpoint is self.source else expected_target,
+                expected_rows,
+                "PRIMARY\tid\nidx_label\ttitle",
+            ):
+                raise HarnessError(
+                    f"column change/default mismatch at {endpoint.container}: "
+                    f"{columns!r} {rows!r} {indexes!r}"
+                )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"INSERT INTO {table}(id,amount) VALUES (90,10);",
+                "default value",
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"INSERT INTO {table}(id,title) VALUES (91,'missing');",
+                "default value",
+            )
+        print(
+            f"column_change_position_default_pending_replay_ok coordinate={stop.file}:{stop.position}"
+        )
+
+    def run_table_lifecycle_pending_replay(self) -> None:
+        assert self.source and self.target
+        setup = (
+            "CREATE TABLE lifecycle_lookup (id INT PRIMARY KEY) ENGINE=InnoDB; "
+            "INSERT INTO lifecycle_lookup VALUES (1); "
+            "CREATE TABLE lifecycle_parent ("
+            "id INT AUTO_INCREMENT PRIMARY KEY, lookup_id INT NOT NULL, "
+            "ancestor_id INT NULL, label VARCHAR(24) NOT NULL, KEY idx_label (label), "
+            "CONSTRAINT fk_lifecycle_lookup FOREIGN KEY (lookup_id) REFERENCES lifecycle_lookup(id), "
+            "CONSTRAINT fk_lifecycle_self FOREIGN KEY (ancestor_id) REFERENCES lifecycle_parent(id)"
+            ") ENGINE=InnoDB; "
+            "INSERT INTO lifecycle_parent(id,lookup_id,ancestor_id,label) VALUES "
+            "(1,1,NULL,'parent'),(2,1,1,'child'); "
+            "CREATE TABLE lifecycle_child (id INT AUTO_INCREMENT PRIMARY KEY, "
+            "parent_id INT NOT NULL, KEY idx_parent (parent_id), "
+            "CONSTRAINT fk_lifecycle_child FOREIGN KEY (parent_id) REFERENCES lifecycle_parent(id)"
+            ") ENGINE=InnoDB; "
+            "INSERT INTO lifecycle_child(parent_id) VALUES (1),(2); "
+            "CREATE TABLE lifecycle_audit (parent_id INT NOT NULL); "
+            "CREATE TRIGGER lifecycle_insert AFTER INSERT ON lifecycle_parent "
+            "FOR EACH ROW INSERT INTO lifecycle_audit(parent_id) VALUES (NEW.id);"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, setup)
+        self.replay_common_ddl(
+            "RENAME TABLE lifecycle_parent TO lifecycle_renamed",
+            "RENAME TABLE",
+            following_sql="UPDATE lifecycle_renamed SET label='renamed' WHERE id=2;",
+            crash=True,
+        )
+        self.replay_common_ddl(
+            "TRUNCATE TABLE lifecycle_child",
+            "TRUNCATE TABLE",
+            following_sql="INSERT INTO lifecycle_child(parent_id) VALUES (2);",
+            crash=True,
+        )
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(
+                endpoint, "SELECT id,parent_id FROM lifecycle_child;"
+            ).strip()
+            if rows != "1\t2":
+                raise HarnessError(
+                    f"TRUNCATE did not clear rows/reset AUTO_INCREMENT: {endpoint.container} {rows!r}"
+                )
+            self.admin_sql(
+                endpoint, "INSERT INTO lifecycle_child(parent_id) VALUES (1);"
+            )
+            new_id = self.admin_query(
+                endpoint, "SELECT MAX(id) FROM lifecycle_child;"
+            ).strip()
+            if new_id != "2":
+                raise HarnessError(
+                    f"post-TRUNCATE AUTO_INCREMENT differs: {endpoint.container} {new_id!r}"
+                )
+        self.replay_common_ddl(
+            "DROP TABLE lifecycle_child",
+            "DROP TABLE",
+            following_sql="UPDATE lifecycle_renamed SET label='following' WHERE id=1;",
+            crash=True,
+        )
+        stop = self.replay_common_ddl(
+            "DROP TABLE IF EXISTS lifecycle_child", "DROP TABLE"
+        )
+        for endpoint in (self.source, self.target):
+            tables = self.admin_query(
+                endpoint,
+                "SELECT table_name FROM information_schema.tables "
+                f"WHERE table_schema={sql_literal(APP_SCHEMA)} "
+                "AND table_name IN ('lifecycle_parent','lifecycle_child','lifecycle_renamed');",
+            ).strip()
+            rows = self.admin_query(
+                endpoint,
+                "SELECT id,lookup_id,COALESCE(ancestor_id,'<null>'),label "
+                "FROM lifecycle_renamed ORDER BY id;",
+            ).strip()
+            keys = self.admin_query(
+                endpoint,
+                "SELECT constraint_name,table_name,referenced_table_name "
+                "FROM information_schema.key_column_usage "
+                f"WHERE table_schema={sql_literal(APP_SCHEMA)} "
+                "AND referenced_table_name IS NOT NULL ORDER BY constraint_name;",
+            ).strip()
+            indexes = self.admin_query(
+                endpoint,
+                "SELECT index_name,column_name FROM information_schema.statistics "
+                f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name='lifecycle_renamed' "
+                "ORDER BY index_name,seq_in_index;",
+            ).strip()
+            trigger = self.admin_query(
+                endpoint,
+                "SELECT trigger_name,event_object_table FROM information_schema.triggers "
+                f"WHERE trigger_schema={sql_literal(APP_SCHEMA)} AND trigger_name='lifecycle_insert';",
+            ).strip()
+            if (
+                tables != "lifecycle_renamed"
+                or rows != "1\t1\t<null>\tfollowing\n2\t1\t1\trenamed"
+                or keys
+                != "fk_lifecycle_lookup\tlifecycle_renamed\tlifecycle_lookup\n"
+                "fk_lifecycle_self\tlifecycle_renamed\tlifecycle_renamed"
+                or indexes
+                != "PRIMARY\tid\nfk_lifecycle_lookup\tlookup_id\n"
+                "fk_lifecycle_self\tancestor_id\nidx_label\tlabel"
+                or trigger != "lifecycle_insert\tlifecycle_renamed"
+            ):
+                raise HarnessError(
+                    f"table lifecycle mismatch at {endpoint.container}: "
+                    f"{tables!r} {rows!r} {keys!r} {indexes!r} {trigger!r}"
+                )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "INSERT INTO lifecycle_renamed(lookup_id,ancestor_id,label) "
+                "VALUES (1,999,'invalid');",
+                "foreign key constraint fails",
+            )
+            self.admin_sql(
+                endpoint,
+                "INSERT INTO lifecycle_renamed(lookup_id,ancestor_id,label) "
+                "VALUES (1,1,'trigger-check');",
+            )
+            audit = self.admin_query(
+                endpoint, "SELECT parent_id FROM lifecycle_audit;"
+            ).strip()
+            if audit != "3":
+                raise HarnessError(
+                    f"renamed trigger did not fire: {endpoint.container} {audit!r}"
+                )
+        print(
+            f"table_lifecycle_pending_replay_ok coordinate={stop.file}:{stop.position}"
         )
 
     def run_basic_scalar_create_add_pending_replay(self) -> None:
@@ -8977,6 +9265,10 @@ DELIMITER ;
             self.run_basic_scalar_create_add_pending_replay()
         elif scenario == "basic-column-operations-pending-replay":
             self.run_basic_column_operations_pending_replay()
+        elif scenario == "column-change-position-default-pending-replay":
+            self.run_column_change_position_default_pending_replay()
+        elif scenario == "table-lifecycle-pending-replay":
+            self.run_table_lifecycle_pending_replay()
         elif scenario == "create-facets-historical-crash-restart":
             self.run_create_facets_historical_crash_restart()
         elif scenario == "curated-strip-create-pending-replay":
