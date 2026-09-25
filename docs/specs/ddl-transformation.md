@@ -39,9 +39,9 @@ exclusions are superseded by this matrix.
 The basic family is a required capability, not an exclusion. Native
 MariaDB/MySQL replay harnesses prove bounded slices below, including
 crash/restart reconciliation. Code `81fde02` is deployed after the runtime image
-gate (11 findings, zero HIGH/CRITICAL scan findings) and Flux rollout
+gate (11 checks, zero qualifying HIGH/CRITICAL scan findings) and Flux rollout
 confirmation; the live sample passed with no pod restarts or quarantines.
-Independent verifier 53 is still running. This does not claim all types, all
+This does not claim all types, all
 clause combinations, full `ALTER TABLE`, or all `CREATE TABLE` syntax.
 
 | Area | Required basic family implemented now | Runtime safety boundary | Proof level |

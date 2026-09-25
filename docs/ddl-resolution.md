@@ -7,9 +7,9 @@ Automatic admission, runtime barriers, and proof levels are maintained in the
 [DDL transformation matrix](specs/ddl-transformation.md#basic-common-ddl-expansion).
 Native MariaDB/MySQL replay harnesses prove bounded column and table-lifecycle
 slices, including crash/restart reconciliation. Code `81fde02` is deployed after
-the runtime image gate (11 findings, zero HIGH/CRITICAL scan findings) and Flux
+the runtime image gate (11 checks, zero qualifying HIGH/CRITICAL scan findings) and Flux
 rollout confirmation; the live sample passed with no pod restarts or quarantines.
-Independent verifier 53 is still running. The matrix distinguishes that proof
+The matrix distinguishes that proof
 from unmodeled forms, which remain runtime barriers. Historical details
 below describe additional narrow slices, including
 strict named, unqualified, visible,
