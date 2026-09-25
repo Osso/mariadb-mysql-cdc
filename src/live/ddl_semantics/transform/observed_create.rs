@@ -473,6 +473,9 @@ impl Parser {
     fn string_default(&mut self, kind: &str) -> Result<String, String> {
         self.keyword("<string>")?;
         let value = self.literals.next().ok_or("missing DEFAULT literal")?;
+        if !value.is_ascii() {
+            return Err("unmodeled observed CREATE string default".into());
+        }
         Ok(if is_text_type(kind) {
             text_expression_default(&value)
         } else {

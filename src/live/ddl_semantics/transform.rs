@@ -2679,6 +2679,9 @@ fn parse_string_default_literal(
     let value = literals
         .next()
         .ok_or_else(|| "string DEFAULT literal is missing".to_string())?;
+    if !value.is_ascii() {
+        return Err(format!("unmodeled string default literal {value:?}"));
+    }
     Ok(value)
 }
 
@@ -2686,6 +2689,18 @@ fn parse_string_default_literal(
 mod sql_mode_literal_tests {
     use super::*;
     use crate::live::query_charset_context::SourceSqlMode;
+
+    #[test]
+    fn unescaped_unicode_defaults_remain_unmodeled_but_unicode_comments_are_accepted() {
+        let mode = SourceSqlMode(Some(0));
+        let create =
+            "CREATE TABLE t (id INT PRIMARY KEY, label VARCHAR(40) DEFAULT 'é') ENGINE=InnoDB";
+        assert!(parse_fixture_create_table_with_mode(create, mode).is_err());
+        let alter = "ALTER TABLE t ADD COLUMN label VARCHAR(40) DEFAULT 'é'";
+        assert!(parse_production_alter_table_ast_with_mode(alter, mode).is_err());
+        let commented = "/* é */ ALTER TABLE t ADD COLUMN label VARCHAR(40) DEFAULT 'A'";
+        assert!(parse_production_alter_table_ast_with_mode(commented, mode).is_ok());
+    }
 
     #[test]
     fn rejects_mixed_non_ascii_and_escaped_source_literal_without_charset_proof() {
