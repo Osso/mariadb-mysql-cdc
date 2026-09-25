@@ -87,6 +87,7 @@ SCENARIOS = (
     ScenarioSpec("add-signed-tinyint-pending-replay", True),
     ScenarioSpec("curated-strip-sale-alter-pending-replay", True),
     ScenarioSpec("basic-scalar-create-add-pending-replay", True),
+    ScenarioSpec("basic-column-operations-pending-replay", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
@@ -178,6 +179,7 @@ def default_scenarios() -> list[str]:
             "curated-strip-create-pending-replay",
             "curated-strip-sale-alter-pending-replay",
             "basic-scalar-create-add-pending-replay",
+            "basic-column-operations-pending-replay",
             "curated-strip-slides-create-pending-replay",
             "sales-placements-create-pending-replay",
             "nullable-datetime-modify-pending-replay",
@@ -2190,6 +2192,143 @@ DELIMITER ;
             "curated_strip_sale_alter_pending_replay_ok old_binary_pending=true "
             "immutable_identity=true crash_restart=true schema_order_defaults=true "
             "json_check=true following_dml=true "
+            f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def run_basic_column_operations_pending_replay(self) -> None:
+        assert self.source and self.target
+        table = "basic_column_operations"
+        schema = (
+            f"CREATE TABLE {table} ("
+            "id INT NOT NULL PRIMARY KEY, "
+            "label VARCHAR(32) NOT NULL DEFAULT 'initial' COMMENT 'original', "
+            "quantity SMALLINT NOT NULL DEFAULT -2, "
+            "lookup_code VARCHAR(16) NOT NULL, "
+            "obsolete VARCHAR(16) DEFAULT NULL, "
+            "UNIQUE KEY uq_lookup (lookup_code), KEY idx_obsolete (obsolete)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; "
+            f"INSERT INTO {table}(id,label,quantity,lookup_code,obsolete) VALUES "
+            "(1,'kept',7,'alpha','remove-a'),"
+            "(2,'second',-2,'beta','remove-b');"
+        )
+        modify = (
+            f"ALTER TABLE {table} "
+            "MODIFY COLUMN label VARCHAR(80) NULL DEFAULT 'ready' COMMENT 'revised', "
+            "MODIFY COLUMN quantity INT NOT NULL DEFAULT -50000 AFTER id"
+        )
+        start, pending = self.prepare_pending_add_column(
+            schema, modify, "MODIFY COLUMN"
+        )
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET label=NULL,quantity=-50000 WHERE id=1; "
+            f"INSERT INTO {table}(id,lookup_code) VALUES (3,'gamma');",
+        )
+        stop = self.coordinate()
+        crashed = self.run_stream(
+            start, stop, integration_failpoint="post-ddl-pre-applied"
+        )
+        if crashed.returncode != 70 or "cdc_integration_failpoint" not in (
+            crashed.stdout + crashed.stderr
+        ):
+            raise HarnessError(
+                f"basic MODIFY did not crash after target DDL: {crashed!r}"
+            )
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        if journal["status"] != "prepared" or (
+            checkpoint["source_file"],
+            checkpoint["source_position"],
+        ) != (start.file, start.position):
+            raise HarnessError(
+                f"basic MODIFY crash lost pending identity/checkpoint: {journal!r} {checkpoint!r}"
+            )
+        self.replay_pending_add_column(start, pending)
+
+        rename = f"ALTER TABLE {table} RENAME COLUMN lookup_code TO reference_code"
+        start, pending = self.prepare_pending_add_column("", rename, "RENAME COLUMN")
+        self.admin_sql(
+            self.source, f"UPDATE {table} SET reference_code='gamma-new' WHERE id=3;"
+        )
+        self.replay_pending_add_column(start, pending)
+
+        drop = f"ALTER TABLE {table} DROP INDEX idx_obsolete, DROP COLUMN obsolete"
+        start, pending = self.prepare_pending_add_column("", drop, "DROP INDEX")
+        self.admin_sql(
+            self.source, f"INSERT INTO {table}(id,reference_code) VALUES(4,'delta');"
+        )
+        stop = self.replay_pending_add_column(start, pending)
+
+        columns_query = (
+            "SELECT column_name,column_type,is_nullable,"
+            "COALESCE(column_default,'<null>'),ordinal_position,column_comment "
+            "FROM information_schema.columns "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name={sql_literal(table)} "
+            "ORDER BY ordinal_position;"
+        )
+        expected_columns = (
+            "id\tint\tNO\t<null>\t1\t\n"
+            "quantity\tint\tNO\t-50000\t2\t\n"
+            "label\tvarchar(80)\tYES\tready\t3\trevised\n"
+            "reference_code\tvarchar(16)\tNO\t<null>\t4\t"
+        )
+        indexes_query = (
+            "SELECT index_name,non_unique,seq_in_index,column_name "
+            "FROM information_schema.statistics "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name={sql_literal(table)} "
+            "ORDER BY index_name,seq_in_index;"
+        )
+        expected_indexes = "PRIMARY\t0\t1\tid\nuq_lookup\t0\t1\treference_code"
+        rows_query = (
+            f"SELECT id,quantity,COALESCE(label,'<null>'),reference_code "
+            f"FROM {table} ORDER BY id;"
+        )
+        expected_rows = (
+            "1\t-50000\t<null>\talpha\n"
+            "2\t-2\tsecond\tbeta\n"
+            "3\t-50000\tready\tgamma-new\n"
+            "4\t-50000\tready\tdelta"
+        )
+        for endpoint in (self.source, self.target):
+            columns = self.admin_query(endpoint, columns_query).rstrip("\n")
+            indexes = self.admin_query(endpoint, indexes_query).strip()
+            rows = self.admin_query(endpoint, rows_query).strip()
+            if (
+                columns != expected_columns
+                or indexes != expected_indexes
+                or rows != expected_rows
+            ):
+                raise HarnessError(
+                    f"basic column operations differ at {endpoint.container}: "
+                    f"columns={columns!r} indexes={indexes!r} rows={rows!r}"
+                )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"INSERT INTO {table}(id,quantity,reference_code) "
+                "VALUES(90,NULL,'invalid-null');",
+                "cannot be null",
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"INSERT INTO {table}(id,reference_code) VALUES(91,'alpha');",
+                "Duplicate entry",
+            )
+        self.admin_sql(
+            self.target,
+            f"INSERT INTO {table}(id,label,reference_code) VALUES(5,NULL,'epsilon');",
+        )
+        inserted = self.admin_query(
+            self.target,
+            f"SELECT quantity,label IS NULL FROM {table} WHERE id=5;",
+        ).strip()
+        if inserted != "-50000\t1":
+            raise HarnessError(
+                f"post-replay target insert lost default/nullability: {inserted!r}"
+            )
+        print(
+            "basic_column_operations_pending_replay_ok modify=true rename=true "
+            "drop_index_column=true crash_restart=true persisted_journal=true "
+            "rows_defaults_order_indexes_following_dml=true "
             f"coordinate={stop.file}:{stop.position}"
         )
 
@@ -8827,6 +8966,8 @@ DELIMITER ;
             self.run_curated_strip_sale_alter_pending_replay()
         elif scenario == "basic-scalar-create-add-pending-replay":
             self.run_basic_scalar_create_add_pending_replay()
+        elif scenario == "basic-column-operations-pending-replay":
+            self.run_basic_column_operations_pending_replay()
         elif scenario == "create-facets-historical-crash-restart":
             self.run_create_facets_historical_crash_restart()
         elif scenario == "curated-strip-create-pending-replay":
