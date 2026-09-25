@@ -19,10 +19,16 @@ Automatic DDL admission has the bounded slices in the authoritative
 [DDL transformation matrix](specs/ddl-transformation.md#basic-common-ddl-expansion),
 including required `CHANGE [COLUMN]`, `FIRST`/`AFTER`, literal `ALTER COLUMN
 SET/DROP DEFAULT`, and strict single-table `DROP [IF EXISTS]`, one-pair `RENAME`,
-and `TRUNCATE [TABLE]` operations. The implementation was deployed on
-September 25, 2026. Real MariaDB/MySQL replay harnesses prove the bounded column
-and table-lifecycle slices, including crash/restart reconciliation; unsupported
-forms remain runtime barriers. Additional historical slices:
+and `TRUNCATE [TABLE]` operations. Native MariaDB/MySQL replay harnesses prove
+bounded column and table-lifecycle slices, including crash/restart
+reconciliation; production deployment is not claimed and remains on `2b4238d`.
+Source literals use immutable tag-1 `SQL_MODE` context for standard and
+`NO_BACKSLASH_ESCAPES` decoding; absent, malformed, unsupported, or
+replay-mismatched required context blocks. Admitted same-event `ADD COLUMN` plus
+`ALTER COLUMN SET/DROP DEFAULT` folds into one atomic target ADD with MariaDB's
+final default. These claims are limited to current source SQL-mode literal
+features and admitted AST forms; unsupported forms remain runtime barriers.
+Additional historical slices:
 
 - explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE
   INDEX` or `DROP INDEX` whose key parts and options are completely modeled and

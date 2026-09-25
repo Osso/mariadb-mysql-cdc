@@ -93,9 +93,9 @@ orphan limit. See [FK orphan repair](docs/specs/fk-orphan-repair.md).
 The native stream applies row events and stores grouped row-event checkpoints in
 the target. DDL capability, runtime barriers, and proof levels are maintained in
 the authoritative [basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion).
-The common-operation implementation was deployed on September 25, 2026.
-Real MariaDB/MySQL replay harnesses prove its bounded column and table-lifecycle
-slices; the matrix records their exact coverage and remaining required gaps.
+Native MariaDB/MySQL replay harnesses prove bounded column and table-lifecycle
+slices; deployment is not claimed, and production remains on `2b4238d`. The
+matrix records exact coverage, current required work, and runtime barriers.
 Historical detail below never narrows that matrix. Automatic
 DDL admission also covers an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
@@ -144,7 +144,15 @@ matrix is bounded: it does not claim full `ALTER TABLE`, all
 `CREATE TABLE` syntax, or unlisted DDL families. `FIRST`, literal `ALTER COLUMN
 SET/DROP DEFAULT`, `CHANGE [COLUMN]`, and strict single-table rename/drop/truncate
 are required implemented operations; unmodeled variants remain runtime barriers.
-New constraint grammars, mode-dependent `REAL`/`ZEROFILL`, arbitrary expressions,
+For currently modeled literal/default forms, tag-1 source `SQL_MODE` is retained
+as immutable context and decodes standard or `NO_BACKSLASH_ESCAPES` escaping;
+missing, malformed, unsupported, or replay-mismatched required context blocks.
+Admitted same-event `ADD COLUMN` plus `ALTER COLUMN SET/DROP DEFAULT` folds into
+one atomic target ADD with MariaDB's final default. Native source-mode and
+combined-default harnesses prove exact bytes, raw identity, canonical metadata,
+old rows, future inserts, and restart. This does not claim all SQL modes,
+Unicode/charset expansion, identifier forms, or default combinations. New
+constraint grammars, mode-dependent `REAL`/`ZEROFILL`, arbitrary expressions,
 and unmodeled `ALGORITHM`/`LOCK` variants remain unimplemented.
 
 For admitted `CREATE TABLE`, an explicit `DEFAULT CHARSET=utf8mb4` without

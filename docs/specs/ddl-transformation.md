@@ -36,43 +36,48 @@ approach for basic column DDL. It does **not** claim all DDL. Historical records
 below remain applicable where they add a narrower exception; their narrower type
 exclusions are superseded by this matrix.
 
-The basic family is a required capability, not an exclusion. It was deployed
-on September 25, 2026. Real MariaDB/MySQL replay harnesses prove the bounded
-column and table-lifecycle slices below, including crash/restart reconciliation.
-This does not claim all types, all clause combinations, full `ALTER TABLE`, or
-all `CREATE TABLE` syntax.
+The basic family is a required capability, not an exclusion. Native
+MariaDB/MySQL replay harnesses prove bounded slices below, including
+crash/restart reconciliation. Deployment is not claimed: production remains on
+`2b4238d`. This does not claim all types, all clause combinations, full `ALTER
+TABLE`, or all `CREATE TABLE` syntax.
 
 | Area | Required basic family implemented now | Runtime safety boundary | Proof level |
 |---|---|---|---|
 | Shared column types (`CREATE TABLE`, `ADD COLUMN`) | Signed/unsigned `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`/`INTEGER`, `BIGINT`; `BOOL`/`BOOLEAN` as `TINYINT`; `DECIMAL`/`NUMERIC`; `FLOAT`; `DOUBLE`/`DOUBLE PRECISION`; `CHAR`, `VARCHAR`, `BINARY`, `VARBINARY`; text/blob families; `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `YEAR`, and `JSON`. | Parsed type parameters must be canonical and bounded. `REAL`, `ZEROFILL`, and other mode-dependent qualifiers remain runtime barriers until modeled. | Existing bounded coverage; not requalified here. |
-| Definitions and defaults | `NULL`/`NOT NULL`, modeled literal defaults, comments, character-set/collation handling; `ALTER COLUMN SET DEFAULT <literal>` and `DROP DEFAULT` derive compatibility from the existing target column. For `TEXT`/`MEDIUMTEXT` string defaults, source `ALTER TABLE t ALTER COLUMN body SET DEFAULT '{}'` emits a complete target-derived `MODIFY COLUMN` definition with MySQL expression default `(_utf8mb4'{}')`, rather than `ALTER COLUMN ... SET DEFAULT`. | The `MODIFY COLUMN` workaround requires an ordinary existing target column and preserves its type, nullability, character set, collation, comment, and position. Generated or otherwise unmodeled column attributes, expressions, type-mismatched/out-of-range literals, and `NOT NULL SET DEFAULT NULL` block before target SQL. | Real replay covers literal `SET/DROP DEFAULT`, including the TEXT workaround, values and metadata, and crash/restart. |
-| `ALTER TABLE` columns | `ADD`, `MODIFY`, `CHANGE [COLUMN] old new definition`, `RENAME COLUMN`, `DROP COLUMN`; `FIRST` or `AFTER` positioning where modeled. `CHANGE` updates affected primary-key, index, and FK references in derived post-state. | Existing ordinary column and unambiguous fenced target state required; generated/JSON/`AUTO_INCREMENT` modification and unmodeled clause combinations remain runtime barriers. A same-statement `ADD COLUMN c ... , ALTER COLUMN c SET DEFAULT ...` fails closed: MySQL cannot apply the dependent default change atomically. | Real replay covers `CHANGE`, `FIRST`, values/metadata, and crash/restart. The dependent same-statement negative remains stable `translation_pending` with no target DDL. |
+| Definitions and defaults | `NULL`/`NOT NULL`, modeled literal defaults, comments, character-set/collation handling; source literal decoding uses captured standard or `NO_BACKSLASH_ESCAPES` SQL mode. `ALTER COLUMN SET DEFAULT <literal>` and `DROP DEFAULT` derive compatibility from the existing target column. For `TEXT`/`MEDIUMTEXT` string defaults, source `ALTER TABLE t ALTER COLUMN body SET DEFAULT '{}'` emits a complete target-derived `MODIFY COLUMN` definition with MySQL expression default `(_utf8mb4'{}')`, rather than `ALTER COLUMN ... SET DEFAULT`. Nullable ordinary-scalar default removal renders `SET DEFAULT NULL`; nullable TEXT removal renders a full target-derived `MODIFY COLUMN` definition with `DEFAULT NULL`. | Captured source SQL mode is immutable; absent, malformed, unsupported, or replay-mismatched required context blocks before target SQL. The `MODIFY COLUMN` renderer requires an ordinary existing target column and preserves its type, nullability, character set, collation, comment, and position. Generated or otherwise unmodeled column attributes, expressions, type-mismatched/out-of-range literals, and `NOT NULL SET DEFAULT NULL` block before target SQL. | Native source-mode harness proves exact bytes, raw identity, mode evidence, and restart; native default harness proves values/metadata, `SET/DROP DEFAULT`, and restart. |
+| `ALTER TABLE` columns | `ADD`, `MODIFY`, `CHANGE [COLUMN] old new definition`, `RENAME COLUMN`, `DROP COLUMN`; `FIRST` or `AFTER` positioning where modeled. Same-event `ADD COLUMN` plus `ALTER COLUMN SET/DROP DEFAULT` folds the final default into one atomic target `ADD`. `CHANGE` updates affected primary-key, index, and FK references in derived post-state. | Existing ordinary column and unambiguous fenced target state required; generated/JSON/`AUTO_INCREMENT` modification and unmodeled clause combinations remain runtime barriers. | Native default harness proves MariaDB final-default-before-backfill behavior, old rows and future inserts for TEXT, integer, NOT NULL VARCHAR default removal, and nullable defaults, plus restart. |
 | Table lifecycle | Strict unqualified single-table `DROP TABLE [IF EXISTS]`, one-pair `RENAME TABLE old TO new`, and `TRUNCATE [TABLE] name`. Ordinary leading or trailing comments, including MariaDB's server-rewritten trailing `DROP TABLE \`name\` /* generated by server */` form, are inert syntax; target SQL uses the parsed identifier. Evidence includes affected table definitions, row count, auto-increment, indexes, FKs, and triggers; truncate derives row count zero and auto-increment reset when present. Target inventory disables `information_schema` statistics caching so post-`TRUNCATE`/restart `AUTO_INCREMENT` evidence is fresh. | InnoDB base table and complete runtime metadata required. Rename requires an unoccupied destination and preserves incoming/outgoing FK bindings. DROP/TRUNCATE require no references from other tables in the configured schema. Semantically active executable/version comments, optimizer hints, multi-table, qualified, temporary, cascade, or extra-token forms block. | Real replay covers rename with generated/named and inbound/self FKs, indexes, and triggers; truncate row clearing/auto-increment reset and restart; drop and restart; and absent `IF EXISTS` no-op followed by DML. |
 | Indexes | Existing admitted named ordinary/unique key additions and strict standalone `CREATE INDEX`/`DROP INDEX` rules; ordinary `DROP INDEX` in ALTER is target-derived. | New index/constraint grammar, FK-dependent index changes, and unmodeled key parts/options remain runtime barriers. | Existing bounded coverage; not requalified here. |
 
 
-#### Known required gap: SQL-mode-dependent string decoding
+#### Source SQL-mode-aware literals
 
-Backslash escapes depend on the source event's SQL mode. Until that context is
-modeled, raw backslash-escaped DDL strings are rejected rather than silently
-rewritten. Regression tests cover ADD/MODIFY/CHANGE and SET DEFAULT literals,
-and prove an escaped default stays pending without target SQL or checkpoint
-advancement. This is an outstanding decoding requirement, not a product exclusion.
+The event's tag-1 source `SQL_MODE` is captured with the source SQL and decoded
+under standard escaping or `NO_BACKSLASH_ESCAPES`; the decoded value, raw SQL
+identity, and mode context are retained in immutable canonical evidence. Replay
+blocks before target SQL if required context is absent, malformed, unsupported,
+or mismatches the stored evidence. Rendering uses the known target mode. Native
+`/tmp/cdc-string-metadata-probe2.log`, quote-pattern probe, and
+`/tmp/cdc-context-mode-harness.log` prove canonical metadata and exact-byte
+standard-versus-`NO_BACKSLASH_ESCAPES` values through restart. This supports only
+currently modeled source SQL-mode literal features; it does not claim all SQL
+modes, Unicode/charset expansion, or additional identifier forms. No fallback
+path decodes missing context.
 
-#### Known required gap: dependent default in one `ALTER TABLE`
+#### Same-event dependent defaults
 
-`ALTER TABLE t ADD COLUMN c TEXT, ALTER COLUMN c SET DEFAULT 'value'` is a
-known **required** gap, not a product exclusion. MySQL 8 rejects the dependent
-operation atomically with error 1054, including when the default is rendered as
-a `CONCAT` expression. The translator therefore rejects the entire event before
-executing target DDL; its durable journal remains `translation_pending` and the
-checkpoint remains unchanged. The ordered events `ADD COLUMN c ...` followed by
-`ALTER COLUMN c SET DEFAULT ...` execute separately.
-
-This requires ordered-DDL replay that can split and prove the dependent source
-event; it is not a claim of full combination support. Real replay proves the
-ordered separate-event success and the same-event fail-closed preservation:
-`translation_pending` remains stable and no target DDL runs.
+MariaDB resolves the final default before backfilling rows. Therefore an admitted
+`ADD COLUMN` plus `ALTER COLUMN ... SET/DROP DEFAULT` event folds into one atomic
+MySQL `ADD COLUMN` whose definition carries the final default; it is not split
+into ordered target DDL. Native `/tmp/cdc-dependent-default-probe.log` and
+`/tmp/cdc-context-fold-harness3.log` prove source/target old rows and future
+inserts for TEXT, integer, NOT NULL VARCHAR default removal, and nullable
+defaults, including restart. MySQL direct `DROP DEFAULT` cannot express nullable
+default removal in this path, so ordinary scalar columns render `SET DEFAULT
+NULL`; MySQL error 1101 requires nullable TEXT removal to use the complete
+preserved-definition `MODIFY COLUMN` renderer. This is bounded to the admitted
+AST and literal/default forms; other combinations remain runtime barriers.
 
 The `TEXT`/`MEDIUMTEXT` `MODIFY COLUMN` rendering above is a temporary MySQL
 8.4 workaround for error 1101 from `ALTER COLUMN ... SET DEFAULT
