@@ -4,7 +4,7 @@ pub(super) fn parse_column_type(
     index: usize,
 ) -> Result<(String, String, usize), String> {
     let kind = unquoted_token(tokens, quoted, index)?.to_ascii_lowercase();
-    let (data_type, mut next) = match kind.as_str() {
+    let (data_type, next) = match kind.as_str() {
         "integer" => ("int", index + 1),
         "bool" | "boolean" => ("tinyint", index + 1),
         "numeric" => ("decimal", index + 1),
@@ -14,67 +14,7 @@ pub(super) fn parse_column_type(
         | "time" | "datetime" | "timestamp" | "year" | "json" => (kind.as_str(), index + 1),
         _ => return Err(format!("unsupported column type {kind}")),
     };
-    let mut column_type = data_type.to_string();
-    match data_type {
-        "tinyint" | "smallint" | "mediumint" | "int" | "bigint" => {
-            if matches!(kind.as_str(), "bool" | "boolean") {
-                reject_parameters(tokens, next, &kind)?;
-            } else {
-                if at(tokens, next, "(") {
-                    let (width, after) = parse_one_number(tokens, quoted, next, 255)?;
-                    if width == 0 {
-                        return Err("integer display width must be positive".into());
-                    }
-                    next = after;
-                }
-                let (unsigned, after) = parse_signedness(tokens, quoted, next)?;
-                next = after;
-                if unsigned {
-                    column_type.push_str(" unsigned");
-                }
-            }
-        }
-        "decimal" => {
-            let (precision, scale, after) = parse_decimal_size(tokens, quoted, next)?;
-            next = after;
-            column_type = format!("decimal({precision},{scale})");
-        }
-        "float" | "double" => {
-            if data_type == "double" && at(tokens, next, "PRECISION") {
-                unquoted_token(tokens, quoted, next)?;
-                next += 1;
-            }
-            reject_parameters(tokens, next, data_type)?;
-            if at(tokens, next, "UNSIGNED") {
-                unquoted_token(tokens, quoted, next)?;
-                column_type.push_str(" unsigned");
-                next += 1;
-            }
-        }
-        "char" | "varchar" | "binary" | "varbinary" => {
-            let maximum = if matches!(data_type, "char" | "binary") {
-                255
-            } else {
-                65535
-            };
-            let (length, after) = parse_one_number(tokens, quoted, next, maximum)?;
-            if length == 0 {
-                return Err("character or binary length must be positive".into());
-            }
-            column_type = format!("{data_type}({length})");
-            next = after;
-        }
-        "time" | "datetime" | "timestamp" => {
-            if at(tokens, next, "(") {
-                let (precision, after) = parse_one_number(tokens, quoted, next, 6)?;
-                next = after;
-                if precision != 0 {
-                    column_type = format!("{data_type}({precision})");
-                }
-            }
-        }
-        _ => reject_parameters(tokens, next, data_type)?,
-    }
+    let (column_type, next) = parse_type_details(tokens, quoted, &kind, data_type, next)?;
     if let Some(token) = tokens.get(next) {
         if ["UNSIGNED", "SIGNED", "ZEROFILL"]
             .iter()
@@ -84,6 +24,107 @@ pub(super) fn parse_column_type(
         }
     }
     Ok((column_type, data_type.into(), next))
+}
+
+fn parse_type_details(
+    tokens: &[String],
+    quoted: &[bool],
+    source_kind: &str,
+    data_type: &str,
+    index: usize,
+) -> Result<(String, usize), String> {
+    match data_type {
+        "tinyint" | "smallint" | "mediumint" | "int" | "bigint" => {
+            if matches!(source_kind, "bool" | "boolean") {
+                reject_parameters(tokens, index, source_kind)?;
+                return Ok(("tinyint".into(), index));
+            }
+            parse_integer_type(tokens, quoted, data_type, index)
+        }
+        "decimal" => {
+            let (precision, scale, next) = parse_decimal_size(tokens, quoted, index)?;
+            Ok((format!("decimal({precision},{scale})"), next))
+        }
+        "float" | "double" => parse_float_type(tokens, quoted, data_type, index),
+        "char" | "varchar" | "binary" | "varbinary" => {
+            parse_length_type(tokens, quoted, data_type, index)
+        }
+        "time" | "datetime" | "timestamp" => {
+            if !at(tokens, index, "(") {
+                return Ok((data_type.into(), index));
+            }
+            let (precision, next) = parse_one_number(tokens, quoted, index, 6)?;
+            let suffix = if precision == 0 {
+                String::new()
+            } else {
+                format!("({precision})")
+            };
+            Ok((format!("{data_type}{suffix}"), next))
+        }
+        _ => {
+            reject_parameters(tokens, index, data_type)?;
+            Ok((data_type.into(), index))
+        }
+    }
+}
+
+fn parse_integer_type(
+    tokens: &[String],
+    quoted: &[bool],
+    kind: &str,
+    index: usize,
+) -> Result<(String, usize), String> {
+    let next = if at(tokens, index, "(") {
+        let (width, next) = parse_one_number(tokens, quoted, index, 255)?;
+        if width == 0 {
+            return Err("integer display width must be positive".into());
+        }
+        next
+    } else {
+        index
+    };
+    let (unsigned, next) = parse_signedness(tokens, quoted, next)?;
+    let suffix = if unsigned { " unsigned" } else { "" };
+    Ok((format!("{kind}{suffix}"), next))
+}
+
+fn parse_float_type(
+    tokens: &[String],
+    quoted: &[bool],
+    kind: &str,
+    index: usize,
+) -> Result<(String, usize), String> {
+    let next = if kind == "double" && at(tokens, index, "PRECISION") {
+        unquoted_token(tokens, quoted, index)?;
+        index + 1
+    } else {
+        index
+    };
+    reject_parameters(tokens, next, kind)?;
+    let unsigned = at(tokens, next, "UNSIGNED");
+    if unsigned {
+        unquoted_token(tokens, quoted, next)?;
+    }
+    let suffix = if unsigned { " unsigned" } else { "" };
+    Ok((format!("{kind}{suffix}"), next + usize::from(unsigned)))
+}
+
+fn parse_length_type(
+    tokens: &[String],
+    quoted: &[bool],
+    kind: &str,
+    index: usize,
+) -> Result<(String, usize), String> {
+    let maximum = if matches!(kind, "char" | "binary") {
+        255
+    } else {
+        65535
+    };
+    let (length, next) = parse_one_number(tokens, quoted, index, maximum)?;
+    if length == 0 {
+        return Err("character or binary length must be positive".into());
+    }
+    Ok((format!("{kind}({length})"), next))
 }
 
 fn unquoted_token<'a>(
