@@ -279,7 +279,7 @@ fn normalize_float(unsigned: bool, literal: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-fn normalize_decimal(kind: &str, unsigned: bool, literal: &str) -> Result<String, String> {
+fn parse_decimal_dimensions(kind: &str) -> Result<(usize, usize), String> {
     let dimensions = kind
         .strip_prefix("decimal(")
         .and_then(|value| value.strip_suffix(')'))
@@ -296,6 +296,11 @@ fn normalize_decimal(kind: &str, unsigned: bool, literal: &str) -> Result<String
     if precision == 0 || precision > 65 || scale > 30 || scale > precision {
         return Err(format!("invalid decimal type {kind}"));
     }
+    Ok((precision, scale))
+}
+
+fn normalize_decimal(kind: &str, unsigned: bool, literal: &str) -> Result<String, String> {
+    let (precision, scale) = parse_decimal_dimensions(kind)?;
     let (negative, digits) = match literal.strip_prefix('-') {
         Some(digits) if !unsigned => (true, digits),
         Some(_) => return Err(format!("negative unsigned decimal default {literal}")),
