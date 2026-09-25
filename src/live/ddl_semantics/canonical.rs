@@ -192,7 +192,7 @@ pub fn build_semantic_evidence(
 }
 
 fn canonical_ast(operation: &DdlOperation) -> Result<String, String> {
-    serde_json::to_string(&json!({
+    let mut value = json!({
         "family": operation.family.as_str(),
         "object_kind": operation.object_kind.as_str(),
         "primary_object": operation.primary_object,
@@ -200,14 +200,21 @@ fn canonical_ast(operation: &DdlOperation) -> Result<String, String> {
         "parsed_index": operation.index_ast.as_ref().map(canonical_index_ast_value),
         "parsed_create_table": operation.create_table_ast.as_ref().map(canonical_create_table_ast_value),
         "parsed_alter_table": operation.alter_table_ast.as_ref().map(canonical_alter_table_ast_value),
-    }))
-    .map_err(|error| format!("failed to encode canonical DDL AST: {error}"))
+    });
+    if let Some(table_operation) = &operation.table_operation_ast {
+        value["parsed_table_operation"] = json!(table_operation);
+    }
+    serde_json::to_string(&value)
+        .map_err(|error| format!("failed to encode canonical DDL AST: {error}"))
 }
 
 fn canonical_pre_state(
     operation: &DdlOperation,
     target: &SemanticSchemaSnapshot,
 ) -> Result<String, String> {
+    if operation.table_operation_ast.is_some() {
+        return super::table_operations::observe(target, operation);
+    }
     match operation.family {
         DdlFamily::Rename => canonical_rename_observed_state(target, operation),
         DdlFamily::Truncate => canonical_table_state(target, &operation.primary_object),
@@ -222,6 +229,9 @@ fn canonical_post_state(
 ) -> Result<String, String> {
     if operation.alter_table_ast.is_some() {
         return translated_alter_table_post_state(target, operation);
+    }
+    if operation.table_operation_ast.is_some() {
+        return super::table_operations::expected(target, operation);
     }
     match operation.family {
         DdlFamily::Index => translated_index_post_state(target, operation),
@@ -1778,6 +1788,9 @@ pub fn observe_operation_state(
     snapshot: &SemanticSchemaSnapshot,
     operation: &DdlOperation,
 ) -> Result<String, String> {
+    if operation.table_operation_ast.is_some() {
+        return super::table_operations::observe(snapshot, operation);
+    }
     if operation.family == DdlFamily::Rename {
         return canonical_rename_observed_state(snapshot, operation);
     }
@@ -1802,9 +1815,10 @@ fn canonical_rename_observed_state(
 }
 
 pub fn supports_automatic_semantic_recovery(operation: &DdlOperation) -> bool {
-    (operation.family == DdlFamily::Index
-        && operation.object_kind == DdlObjectKind::Index
-        && operation.index_ast.is_some())
+    operation.table_operation_ast.is_some()
+        || (operation.family == DdlFamily::Index
+            && operation.object_kind == DdlObjectKind::Index
+            && operation.index_ast.is_some())
         || (operation.family == DdlFamily::Table && operation.create_table_ast.is_some())
 }
 

@@ -405,6 +405,9 @@ pub fn parse_ddl_operation(sql: &str) -> Result<DdlOperation, String> {
     if command == "ALTER" && operation.object_kind == DdlObjectKind::Table {
         operation.alter_table_ast = parse_production_alter_table_ast(sql).ok();
     }
+    if operation.object_kind == DdlObjectKind::Table {
+        operation.table_operation_ast = super::table_operations::parse(sql).ok();
+    }
     Ok(operation)
 }
 
@@ -430,6 +433,7 @@ fn parse_create_or_alter(
         index_ast: None,
         create_table_ast: None,
         alter_table_ast: None,
+        table_operation_ast: None,
     })
 }
 
@@ -488,6 +492,7 @@ fn parse_drop(tokens: &[String], keywords: &[String]) -> Result<DdlOperation, St
         index_ast: None,
         create_table_ast: None,
         alter_table_ast: None,
+        table_operation_ast: None,
     })
 }
 
@@ -525,6 +530,7 @@ fn parse_rename(tokens: &[String], keywords: &[String]) -> Result<DdlOperation, 
         index_ast: None,
         create_table_ast: None,
         alter_table_ast: None,
+        table_operation_ast: None,
     })
 }
 
@@ -542,6 +548,7 @@ fn parse_truncate(tokens: &[String], keywords: &[String]) -> Result<DdlOperation
         index_ast: None,
         create_table_ast: None,
         alter_table_ast: None,
+        table_operation_ast: None,
     })
 }
 

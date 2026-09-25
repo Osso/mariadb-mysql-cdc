@@ -6,6 +6,7 @@ mod column_operations;
 mod json_add;
 mod json_create;
 mod nullable_modify;
+mod table_operations;
 
 use super::model::ParsedAlterClause;
 use super::transform::{
@@ -33,6 +34,7 @@ fn assert_operation_cases(cases: &[(&str, DdlFamily, DdlObjectKind, &str, Option
                 index_ast: parse_simple_index_ddl(sql).ok(),
                 create_table_ast: parse_fixture_create_table(sql).ok(),
                 alter_table_ast: parse_production_alter_table_ast(sql).ok(),
+                table_operation_ast: None,
             },
             "{sql}",
         );
@@ -233,6 +235,7 @@ fn parser_ignores_comments_and_preserves_quoted_identifier_contents() {
             index_ast: None,
             create_table_ast: None,
             alter_table_ast: None,
+            table_operation_ast: None,
         }
     );
 }
@@ -991,6 +994,7 @@ fn assistant_reply_reports_create_requires_exact_source_target_structure() {
         index_ast: None,
         create_table_ast: None,
         alter_table_ast: None,
+        table_operation_ast: None,
     };
     let mut target = semantic_snapshot(7, Some(8));
     target.inventory.tables[0].name = "assistant_reply_reports".to_string();
@@ -1220,6 +1224,7 @@ fn source_only_release_move_procedure_create_requires_target_absence() {
         index_ast: None,
         create_table_ast: None,
         alter_table_ast: None,
+        table_operation_ast: None,
     };
 
     let error = build_source_only_procedure_create_evidence(&operation, &target)

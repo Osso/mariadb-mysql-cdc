@@ -223,6 +223,7 @@ pub struct DdlOperation {
     pub index_ast: Option<ParsedIndexAst>,
     pub create_table_ast: Option<ParsedCreateTableAst>,
     pub alter_table_ast: Option<ParsedAlterTableAst>,
+    pub table_operation_ast: Option<super::table_operations::TableOperation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

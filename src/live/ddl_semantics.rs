@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 mod canonical;
 mod model;
 mod parser;
+mod table_operations;
 #[cfg(test)]
 mod tests;
 mod tokenizer;
@@ -206,6 +207,11 @@ fn translate_ddl_with_provenance(
     if let Some(transformation) = translate_index_ddl(sql, provenance) {
         return transformation;
     }
+    if let Ok(operation) = parse_ddl_operation(sql)
+        && operation.table_operation_ast.is_some()
+    {
+        return table_operations::render(&operation);
+    }
     let target_objects = target_columns.iter().cloned().collect();
     if let Some(transformation) = translate_create_or_routine_ddl(sql, &target_objects) {
         return transformation;
@@ -285,6 +291,7 @@ fn parse_semantic_operation(sql: &str) -> Result<DdlOperation, String> {
             index_ast: None,
             create_table_ast: None,
             alter_table_ast: None,
+            table_operation_ast: None,
         });
     }
     if supports_source_only_release_move_procedure_create(sql) {
@@ -296,6 +303,7 @@ fn parse_semantic_operation(sql: &str) -> Result<DdlOperation, String> {
             index_ast: None,
             create_table_ast: None,
             alter_table_ast: None,
+            table_operation_ast: None,
         });
     }
     parse_ddl_operation(sql)
@@ -342,6 +350,7 @@ fn capture_early_evidence(
 fn requires_translated_evidence(sql: &str, operation: &DdlOperation) -> bool {
     operation.object_kind == DdlObjectKind::Index
         || operation.alter_table_ast.is_some()
+        || operation.table_operation_ast.is_some()
         || supports_drop_procedure(sql)
         || supports_drop_trigger_if_exists(sql)
 }

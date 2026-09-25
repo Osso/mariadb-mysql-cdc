@@ -789,6 +789,8 @@ fn supports_ddl_transformation(source_sql: &str, supports_source_only_procedure:
         || supports_drop_trigger_if_exists(source_sql)
         || supports_drop_columns_if_exists(source_sql)
         || supports_rename_columns_if_exists(source_sql)
+        || parse_ddl_operation(source_sql)
+            .is_ok_and(|operation| operation.table_operation_ast.is_some())
 }
 
 fn supports_automatic_ddl_operation(source_sql: &str) -> bool {

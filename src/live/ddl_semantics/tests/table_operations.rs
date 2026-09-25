@@ -1,0 +1,94 @@
+use super::*;
+
+#[test]
+fn table_operations_translate_complete_single_table_grammar() {
+    for (source, expected) in [
+        ("DROP TABLE accounts", "DROP TABLE `accounts`"),
+        (
+            "DROP TABLE IF EXISTS accounts;",
+            "DROP TABLE IF EXISTS `accounts`",
+        ),
+        (
+            "/* client */ RENAME TABLE `accounts` TO members",
+            "RENAME TABLE `accounts` TO `members`",
+        ),
+        ("TRUNCATE accounts", "TRUNCATE TABLE `accounts`"),
+    ] {
+        let translation = translate_ddl(source, &[]).expect("basic table translation");
+        assert_eq!(translation.target_sql.as_deref(), Some(expected));
+    }
+    for source in [
+        "DROP TABLE accounts, members",
+        "DROP TEMPORARY TABLE accounts",
+        "DROP TABLE accounts CASCADE",
+        "RENAME TABLE accounts TO members, other TO newer",
+        "TRUNCATE accounts garbage",
+        "DROP TABLE other_schema.accounts",
+        "DROP `TABLE` accounts",
+        "DROP TABLE accounts; DROP TABLE users",
+        "/*!50000 DROP TABLE accounts */",
+    ] {
+        assert!(translate_ddl(source, &[]).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn table_operations_rename_derives_complete_target_state_without_source_head() {
+    let target = semantic_snapshot(9, Some(42));
+    let mut expected = target.clone();
+    expected.inventory.tables[0].name = "members".into();
+    expected.inventory.indexes[0].table = "members".into();
+    for trigger in &mut expected.inventory.triggers {
+        if trigger.table == "accounts" {
+            trigger.table = "members".into();
+        }
+    }
+    let runtime = expected.table_runtime.remove("accounts").unwrap();
+    expected.table_runtime.insert("members".into(), runtime);
+    let operation = parse_ddl_operation("RENAME TABLE accounts TO members").unwrap();
+    let evidence = build_semantic_evidence(&operation, &target, &target).unwrap();
+    assert_eq!(
+        evidence.expected_post_state,
+        super::super::canonical::observe_operation_state(&expected, &operation).unwrap()
+    );
+    assert_ne!(evidence.pre_state, evidence.expected_post_state);
+}
+
+#[test]
+fn table_operations_drop_removes_rows_indexes_and_triggers_but_requires_existing_plain_target() {
+    let target = semantic_snapshot(9, Some(42));
+    let mut expected = target.clone();
+    expected.inventory.tables.clear();
+    expected.inventory.indexes.clear();
+    expected
+        .inventory
+        .triggers
+        .retain(|trigger| trigger.table != "accounts");
+    expected.table_runtime.clear();
+    let operation = parse_ddl_operation("DROP TABLE accounts").unwrap();
+    let evidence = build_semantic_evidence(&operation, &target, &target).unwrap();
+    assert_eq!(
+        evidence.expected_post_state,
+        super::super::canonical::observe_operation_state(&expected, &operation).unwrap()
+    );
+    assert!(build_semantic_evidence(&operation, &expected, &expected).is_err());
+    let guarded = parse_ddl_operation("DROP TABLE IF EXISTS accounts").unwrap();
+    let no_op = build_semantic_evidence(&guarded, &expected, &expected).unwrap();
+    assert_eq!(no_op.pre_state, no_op.expected_post_state);
+}
+
+#[test]
+fn table_operations_truncate_resets_rows_and_sequence_without_changing_schema() {
+    let target = semantic_snapshot(9, Some(42));
+    let mut expected = target.clone();
+    let runtime = expected.table_runtime.get_mut("accounts").unwrap();
+    runtime.row_count = 0;
+    runtime.auto_increment = Some(1);
+    let operation = parse_ddl_operation("TRUNCATE TABLE accounts").unwrap();
+    let evidence = build_semantic_evidence(&operation, &target, &target).unwrap();
+    assert_eq!(
+        evidence.expected_post_state,
+        super::super::canonical::observe_operation_state(&expected, &operation).unwrap()
+    );
+    assert!(supports_automatic_semantic_recovery(&operation));
+}
