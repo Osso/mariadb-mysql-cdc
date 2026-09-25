@@ -936,25 +936,52 @@ fn apply_rename_column(
         .ok_or_else(|| format!("RENAME source `{old_name}` is missing"))?;
     column.name = new_name.to_string();
     rename_column_references(&mut table.primary_key, old_name, new_name);
-    for index in &mut expected.inventory.indexes {
-        if index.table == table_name {
-            for part in &mut index.columns {
-                if part.name.eq_ignore_ascii_case(old_name) {
-                    part.name = new_name.to_string();
-                }
+    rename_column_in_indexes(
+        &mut expected.inventory.indexes,
+        table_name,
+        old_name,
+        new_name,
+    );
+    rename_column_in_foreign_keys(
+        &mut expected.inventory.foreign_keys,
+        &expected.inventory.schema,
+        table_name,
+        old_name,
+        new_name,
+    );
+    Ok(())
+}
+
+fn rename_column_in_indexes(
+    indexes: &mut [crate::inventory::IndexInventory],
+    table_name: &str,
+    old_name: &str,
+    new_name: &str,
+) {
+    for index in indexes.iter_mut().filter(|index| index.table == table_name) {
+        for part in &mut index.columns {
+            if part.name.eq_ignore_ascii_case(old_name) {
+                part.name = new_name.to_string();
             }
         }
     }
-    for key in &mut expected.inventory.foreign_keys {
+}
+
+fn rename_column_in_foreign_keys(
+    keys: &mut [crate::inventory::ForeignKeyInventory],
+    schema: &str,
+    table_name: &str,
+    old_name: &str,
+    new_name: &str,
+) {
+    for key in keys {
         if key.table == table_name {
             rename_column_references(&mut key.columns, old_name, new_name);
         }
-        if key.referenced_table == table_name && key.referenced_schema == expected.inventory.schema
-        {
+        if key.referenced_table == table_name && key.referenced_schema == schema {
             rename_column_references(&mut key.referenced_columns, old_name, new_name);
         }
     }
-    Ok(())
 }
 
 fn rename_column_references(names: &mut [String], old_name: &str, new_name: &str) {

@@ -2068,38 +2068,19 @@ fn parse_observed_column_options(
         if !seen.insert(key.to_string()) {
             return Err(format!("duplicate column option {key}"));
         }
-        match option.as_str() {
-            "NULL" => {
-                options.nullable = true;
-                index += 1;
-            }
-            "NOT" => {
-                require_unquoted_token(quoted, index + 1, "NOT NULL")?;
-                require_keyword(tokens, index + 1, "NULL")?;
-                options.nullable = false;
-                index += 2;
-            }
-            "DEFAULT" => {
-                require_unquoted_token(quoted, index + 1, "DEFAULT value")?;
-                explicit_null_default = tokens
-                    .get(index + 1)
-                    .is_some_and(|v| v.eq_ignore_ascii_case("NULL"));
-                let (value, next) =
-                    parse_basic_default(tokens, quoted, index + 1, literals, column_type)?;
-                options.default_value = value;
-                index = next;
-            }
-            "COMMENT" => {
-                require_keyword(tokens, index + 1, "<string>")?;
-                options.comment = literals.next().ok_or("missing COMMENT literal")?;
-                index += 2;
-            }
-            "AFTER" => {
-                options.after = Some(require_identifier(tokens, index + 1, "AFTER column")?);
-                index += 2;
-            }
-            _ => return Err(format!("unsupported column option {option}")),
+        if option == "DEFAULT" {
+            explicit_null_default = tokens
+                .get(index + 1)
+                .is_some_and(|value| value.eq_ignore_ascii_case("NULL"));
         }
+        index = parse_observed_column_option(
+            tokens,
+            quoted,
+            index,
+            literals,
+            column_type,
+            &mut options,
+        )?;
     }
     if !options.nullable && explicit_null_default {
         return Err("NOT NULL column cannot have DEFAULT NULL".into());
@@ -2109,6 +2090,46 @@ fn parse_observed_column_options(
     }
     options.next_index = index;
     Ok(options)
+}
+
+fn parse_observed_column_option(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+    column_type: &str,
+    options: &mut ParsedColumnOptions,
+) -> Result<usize, String> {
+    let option = tokens[index].to_ascii_uppercase();
+    match option.as_str() {
+        "NULL" => {
+            options.nullable = true;
+            Ok(index + 1)
+        }
+        "NOT" => {
+            require_unquoted_token(quoted, index + 1, "NOT NULL")?;
+            require_keyword(tokens, index + 1, "NULL")?;
+            options.nullable = false;
+            Ok(index + 2)
+        }
+        "DEFAULT" => {
+            require_unquoted_token(quoted, index + 1, "DEFAULT value")?;
+            let (value, next) =
+                parse_basic_default(tokens, quoted, index + 1, literals, column_type)?;
+            options.default_value = value;
+            Ok(next)
+        }
+        "COMMENT" => {
+            require_keyword(tokens, index + 1, "<string>")?;
+            options.comment = literals.next().ok_or("missing COMMENT literal")?;
+            Ok(index + 2)
+        }
+        "AFTER" => {
+            options.after = Some(require_identifier(tokens, index + 1, "AFTER column")?);
+            Ok(index + 2)
+        }
+        _ => Err(format!("unsupported column option {option}")),
+    }
 }
 
 fn parse_basic_default(
