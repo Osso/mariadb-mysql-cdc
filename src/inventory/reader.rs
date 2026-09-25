@@ -696,6 +696,11 @@ pub(crate) fn inventory_opts(config: &InventoryConfig) -> Result<Opts, String> {
         .user(Some(&config.user))
         .pass(Some(&config.password))
         .prefer_socket(false);
+    if config.endpoint_role == InventoryEndpointRole::Target {
+        // Cached I_S AUTO_INCREMENT survives TRUNCATE and process restart. DDL
+        // reconciliation needs current engine metadata, not the statistics cache.
+        builder = builder.init(vec!["SET SESSION information_schema_stats_expiry=0"]);
+    }
     if config.use_tls {
         let ca_file = config.tls_ca_file.as_deref().ok_or_else(|| {
             format!(

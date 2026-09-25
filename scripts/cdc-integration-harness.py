@@ -2471,9 +2471,11 @@ DELIMITER ;
             "priority\tint(11)\tNO\t7\t2\n"
             "title\tvarchar(32)\tNO\t<null>\t3\n"
             "id\tint(11)\tNO\t<null>\t4\n"
-            "note\tvarchar(16)\tYES\t<null>\t5"
+            "note\tvarchar(16)\tYES\tNULL\t5"
         )
-        expected_target = expected_source.replace("int(11)", "int")
+        expected_target = expected_source.replace("int(11)", "int").replace(
+            "\tYES\tNULL\t", "\tYES\t<null>\t"
+        )
         rows_query = f"SELECT amount,priority,title,id,COALESCE(note,'<null>') FROM {table} ORDER BY id;"
         expected_rows = (
             "4\t7\tkept\t1\tone\n5\t7\tchanged\t2\t<null>\n9\t7\tready\t3\tafter"
@@ -2490,7 +2492,7 @@ DELIMITER ;
             if (columns, rows, indexes) != (
                 expected_source if endpoint is self.source else expected_target,
                 expected_rows,
-                "PRIMARY\tid\nidx_label\ttitle",
+                "idx_label\ttitle\nPRIMARY\tid",
             ):
                 raise HarnessError(
                     f"column change/default mismatch at {endpoint.container}: "
