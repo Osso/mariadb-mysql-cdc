@@ -222,6 +222,20 @@ fn render_alter_table_with_target(
     for clause in &ast.clauses {
         let rendered = match clause {
             ParsedAlterClause::AlterColumnDefault { name, default } => {
+                let existed = target
+                    .inventory
+                    .tables
+                    .iter()
+                    .find(|table| table.name == ast.table)
+                    .is_some_and(|table| {
+                        table
+                            .columns
+                            .iter()
+                            .any(|column| column.name.eq_ignore_ascii_case(name))
+                    });
+                if !existed {
+                    return Err("default change on a column introduced in the same ALTER requires ordered DDL replay".into());
+                }
                 render_target_column_default(&state, &ast.table, name, default.as_ref())?
             }
             other => render_production_alter_clause(other),

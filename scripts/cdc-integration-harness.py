@@ -2535,9 +2535,12 @@ DELIMITER ;
             crash=True,
         )
         self.replay_common_ddl(
-            "ALTER TABLE column_text_defaults ADD COLUMN extra TEXT, "
-            "ALTER COLUMN extra SET DEFAULT 'payload'",
+            "ALTER TABLE column_text_defaults ADD COLUMN extra TEXT",
             "ADD COLUMN",
+        )
+        self.replay_common_ddl(
+            "ALTER TABLE column_text_defaults ALTER COLUMN extra SET DEFAULT 'payload'",
+            "ALTER COLUMN",
             following_sql="INSERT INTO column_text_defaults(id) VALUES(3);",
         )
         query = "SELECT id,COALESCE(body,'<null>'),COALESCE(extra,'<null>') FROM column_text_defaults ORDER BY id;"
@@ -2559,6 +2562,29 @@ DELIMITER ;
             ).strip()
             if actual != "1\t1":
                 raise HarnessError(f"TEXT DROP DEFAULT mismatch: {actual!r}")
+        combined = (
+            "ALTER TABLE column_text_defaults ADD COLUMN new_default TEXT, "
+            "ALTER COLUMN new_default SET DEFAULT 'pending'"
+        )
+        start, pending = self.prepare_pending_add_column("", combined)
+        blocked = self.run_stream(start, self.coordinate(), binary=self.binary)
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.columns WHERE TABLE_SCHEMA='globalcomix' AND TABLE_NAME='column_text_defaults' AND COLUMN_NAME='new_default';",
+        ).strip()
+        if (
+            blocked.returncode == 0
+            or "requires ordered DDL replay" not in blocked.stderr
+            or journal["status"] != "translation_pending"
+            or absent != "0"
+            or (checkpoint["source_file"], checkpoint["source_position"])
+            != (start.file, start.position)
+        ):
+            raise HarnessError(
+                f"combined default gap did not fail closed: {blocked!r} {journal!r} {checkpoint!r}"
+            )
 
     def run_table_lifecycle_pending_replay(self) -> None:
         assert self.source and self.target
@@ -2568,7 +2594,7 @@ DELIMITER ;
             "CREATE TABLE lifecycle_parent ("
             "id INT AUTO_INCREMENT PRIMARY KEY, lookup_id INT NOT NULL, "
             "ancestor_id INT NULL, label VARCHAR(24) NOT NULL, KEY idx_label (label), "
-            "CONSTRAINT fk_lifecycle_lookup FOREIGN KEY (lookup_id) REFERENCES lifecycle_lookup(id), "
+            "FOREIGN KEY (lookup_id) REFERENCES lifecycle_lookup(id), "
             "CONSTRAINT fk_lifecycle_self FOREIGN KEY (ancestor_id) REFERENCES lifecycle_parent(id)"
             ") ENGINE=InnoDB; "
             "INSERT INTO lifecycle_parent(id,lookup_id,ancestor_id,label) VALUES "
@@ -2657,11 +2683,11 @@ DELIMITER ;
                 tables != "lifecycle_renamed"
                 or rows != "1\t1\t<null>\tfollowing\n2\t1\t1\trenamed"
                 or keys
-                != "fk_lifecycle_lookup\tlifecycle_renamed\tlifecycle_lookup\n"
-                "fk_lifecycle_self\tlifecycle_renamed\tlifecycle_renamed"
+                != "fk_lifecycle_self\tlifecycle_renamed\tlifecycle_renamed\n"
+                "lifecycle_renamed_ibfk_1\tlifecycle_renamed\tlifecycle_lookup"
                 or indexes
-                != "PRIMARY\tid\nfk_lifecycle_lookup\tlookup_id\n"
-                "fk_lifecycle_self\tancestor_id\nidx_label\tlabel"
+                != "fk_lifecycle_self\tancestor_id\nidx_label\tlabel\n"
+                "lookup_id\tlookup_id\nPRIMARY\tid"
                 or trigger != "lifecycle_insert\tlifecycle_renamed"
             ):
                 raise HarnessError(
@@ -2676,8 +2702,8 @@ DELIMITER ;
             )
             self.admin_sql(
                 endpoint,
-                "INSERT INTO lifecycle_renamed(lookup_id,ancestor_id,label) "
-                "VALUES (1,1,'trigger-check');",
+                "INSERT INTO lifecycle_renamed(id,lookup_id,ancestor_id,label) "
+                "VALUES (3,1,1,'trigger-check');",
             )
             audit = self.admin_query(
                 endpoint, "SELECT parent_id FROM lifecycle_audit;"

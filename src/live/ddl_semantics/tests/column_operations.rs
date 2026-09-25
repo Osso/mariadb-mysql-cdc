@@ -310,28 +310,12 @@ fn text_default_uses_target_type_and_mysql_expression_sql() {
 }
 
 #[test]
-fn text_default_after_add_uses_same_statement_column_state() {
+fn default_on_new_column_requires_ordered_replay_before_execution() {
     let target = semantic_snapshot(7, Some(8));
     let sql = "ALTER TABLE accounts ADD COLUMN memo TEXT, ALTER COLUMN memo SET DEFAULT '{}'";
-    let rendered =
-        super::super::transform::transform_production_alter_table_with_target(sql, &target)
-            .expect("sequential transformation")
-            .target_sql
-            .unwrap();
-    assert_eq!(
-        rendered,
-        "ALTER TABLE `accounts` ADD COLUMN `memo` TEXT NULL DEFAULT NULL, MODIFY COLUMN `memo` TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT (_utf8mb4'{}')"
-    );
-    let (_, post, _) = altered(sql, &target);
-    assert_eq!(post["definition"]["columns"][2]["name"], "memo");
-    assert_eq!(
-        post["definition"]["columns"][2]["default_value"],
-        "_utf8mb4\\'{}\\'"
-    );
-    assert_eq!(
-        post["definition"]["columns"][2]["extra"],
-        "DEFAULT_GENERATED"
-    );
+    let error = super::super::transform::transform_production_alter_table_with_target(sql, &target)
+        .expect_err("MySQL cannot apply a default change to a newly added column in one ALTER");
+    assert!(error.contains("requires ordered DDL replay"));
 }
 
 #[test]
