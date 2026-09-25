@@ -19,9 +19,18 @@ fn json_add_preserves_alias_validation_and_position() {
 
 #[test]
 fn json_add_rejects_unmodeled_type_options() {
+    let required = JSON_ADD.replace("JSON DEFAULT NULL", "JSON NOT NULL");
+    assert_eq!(
+        super::super::transform::transform_production_alter_table(&required)
+            .expect("non-null JSON alias")
+            .target_sql
+            .as_deref(),
+        Some(
+            "ALTER TABLE `releases_pages` ADD COLUMN `source_layout` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL AFTER `comic_asset_id`, ADD CHECK (JSON_VALID(`source_layout`))"
+        )
+    );
     for options in [
         "JSON(10) DEFAULT NULL",
-        "JSON NOT NULL",
         "JSON DEFAULT '{}'",
         "JSON CHARACTER SET utf8mb3 COLLATE utf8mb3_bin DEFAULT NULL",
         "`JSON` DEFAULT NULL",

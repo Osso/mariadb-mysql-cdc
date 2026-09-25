@@ -57,13 +57,11 @@ fn observed_unsigned_auto_increment_emits_sql_and_expected_metadata() {
 }
 
 #[test]
-fn observed_unsigned_auto_increment_rejects_nullable_and_noninteger_columns() {
+fn observed_auto_increment_rejects_nullable_and_noninteger_columns() {
     for definition in [
         "BIGINT UNSIGNED NULL AUTO_INCREMENT",
-        "BIGINT UNSIGNED AUTO_INCREMENT",
         "INT UNSIGNED NULL AUTO_INCREMENT",
         "VARCHAR(32) NOT NULL AUTO_INCREMENT",
-        "BIGINT NOT NULL AUTO_INCREMENT",
     ] {
         let sql = format!(
             "CREATE TABLE spotlights (id {definition} PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"

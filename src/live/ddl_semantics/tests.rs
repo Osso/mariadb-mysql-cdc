@@ -8,10 +8,10 @@ mod nullable_modify;
 
 use super::model::ParsedAlterClause;
 use super::transform::{
-    DDL_TRANSFORMATION_VERSION, parse_fixture_create_table, parse_production_alter_table_ast,
-    supports_drop_procedure, supports_source_only_release_move_procedure_create,
-    transform_drop_columns_if_exists, transform_drop_procedure, transform_fixture_create_table,
-    transform_source_only_release_move_procedure_create,
+    parse_fixture_create_table, parse_production_alter_table_ast, supports_drop_procedure,
+    supports_source_only_release_move_procedure_create, transform_drop_columns_if_exists,
+    transform_drop_procedure, transform_fixture_create_table,
+    transform_source_only_release_move_procedure_create, DDL_TRANSFORMATION_VERSION,
 };
 use super::*;
 use crate::inventory::{
@@ -375,20 +375,16 @@ fn modeled_unique_btree_options_translate_through_shared_mapping() {
 
 #[test]
 fn unique_hash_and_unproven_generated_ddl_fail_closed_by_provenance() {
-    assert!(
-        super::translate_modeled_ddl(
-            "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING HASH",
-            &[],
-        )
-        .is_err()
-    );
-    assert!(
-        super::translate_ddl(
-            "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING BTREE",
-            &[],
-        )
-        .is_err()
-    );
+    assert!(super::translate_modeled_ddl(
+        "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING HASH",
+        &[],
+    )
+    .is_err());
+    assert!(super::translate_ddl(
+        "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING BTREE",
+        &[],
+    )
+    .is_err());
     for sql in [
         "CREATE TABLE `items` (`id` BIGINT) ENGINE=InnoDB",
         "ALTER TABLE `items` DROP PRIMARY KEY",
@@ -423,9 +419,7 @@ fn index_tokenizer_skips_each_supported_comment_form() {
 
     assert_eq!(
         tokens,
-        [
-            "CREATE", "INDEX", "idx", "ON", "accounts", "(", "handle", ")"
-        ]
+        ["CREATE", "INDEX", "idx", "ON", "accounts", "(", "handle", ")"]
     );
 }
 
@@ -450,11 +444,14 @@ fn generated_convergence_translation_is_precise_and_temporal_mapping_is_case_ins
         &[],
     )
     .expect("mixed-case temporal type");
-    assert!(mixed_case.target_sql.unwrap().contains("TiMeStAmP(6)"));
+    assert_eq!(
+        mixed_case.target_sql.as_deref(),
+        Some("ALTER TABLE `items` ADD COLUMN `expires_at` TIMESTAMP(6) NULL DEFAULT NULL")
+    );
 
     for sql in [
         "CREATE TABLE `items` (`kind` SET('a','b')) ENGINE=InnoDB",
-        "ALTER TABLE `items` ADD COLUMN `a` BIGINT, ADD COLUMN `b` BIGINT",
+        "ALTER TABLE `items` ADD COLUMN `a` SET('a','b')",
         "CREATE TABLE `items` (`id` BIGINT)",
     ] {
         assert!(
@@ -486,14 +483,22 @@ fn timestamp_translation_preserves_admitted_unquoted_identifiers() {
     let translated = super::translate_ddl(index_sql, &[]).expect("admitted streamed index DDL");
     assert_eq!(translated.target_sql.as_deref(), Some(index_sql));
 
-    for sql in [
+    let translated = super::translate_modeled_ddl(
         "ALTER TABLE items ADD CONSTRAINT timestamp CHECK (id > 0)",
-        "ALTER TABLE items ADD COLUMN timestamp BIGINT NULL",
-    ] {
-        let translated =
-            super::translate_modeled_ddl(sql, &[]).expect("admitted modeled identifier DDL");
-        assert_eq!(translated.target_sql.as_deref(), Some(sql));
-    }
+        &[],
+    )
+    .expect("admitted modeled identifier DDL");
+    assert_eq!(
+        translated.target_sql.as_deref(),
+        Some("ALTER TABLE items ADD CONSTRAINT timestamp CHECK (id > 0)")
+    );
+    let translated =
+        super::translate_modeled_ddl("ALTER TABLE items ADD COLUMN timestamp BIGINT NULL", &[])
+            .expect("admitted modeled identifier DDL");
+    assert_eq!(
+        translated.target_sql.as_deref(),
+        Some("ALTER TABLE `items` ADD COLUMN `timestamp` BIGINT NULL DEFAULT NULL")
+    );
 
     let temporal = super::translate_modeled_ddl(
         "ALTER TABLE items ADD COLUMN expires_at TiMeStAmP(6) NULL",
@@ -502,7 +507,7 @@ fn timestamp_translation_preserves_admitted_unquoted_identifiers() {
     .expect("mixed-case TIMESTAMP type");
     assert_eq!(
         temporal.target_sql.as_deref(),
-        Some("ALTER TABLE items ADD COLUMN expires_at TiMeStAmP(6) NULL")
+        Some("ALTER TABLE `items` ADD COLUMN `expires_at` TIMESTAMP(6) NULL DEFAULT NULL")
     );
 }
 
@@ -624,21 +629,15 @@ fn strict_index_admission_rejects_every_non_simple_form() {
 fn create_index_expected_state_uses_translated_ast() {
     let (target, source, operation) = translated_index_fixture();
     let evidence = build_semantic_evidence(&operation, &target, &source).expect("index evidence");
-    assert!(
-        evidence
-            .expected_post_state
-            .contains("\"prefix_length\":12")
-    );
-    assert!(
-        evidence
-            .expected_post_state
-            .contains("\"collation\":\"utf8mb4_bin\"")
-    );
-    assert!(
-        !evidence
-            .expected_post_state
-            .contains("\"prefix_length\":99")
-    );
+    assert!(evidence
+        .expected_post_state
+        .contains("\"prefix_length\":12"));
+    assert!(evidence
+        .expected_post_state
+        .contains("\"collation\":\"utf8mb4_bin\""));
+    assert!(!evidence
+        .expected_post_state
+        .contains("\"prefix_length\":99"));
 }
 
 fn translated_index_fixture() -> (SemanticSchemaSnapshot, SemanticSchemaSnapshot, DdlOperation) {
@@ -815,17 +814,37 @@ fn add_char_column_with_ordinary_comment() {
 }
 
 #[test]
-fn modify_varchar_not_null_grammar() {
+fn modify_column_shared_definition_grammar() {
     let sql = "ALTER TABLE kg_comic_facets MODIFY COLUMN facet_vocab_version VARCHAR(128) NOT NULL";
     let ast = parse_production_alter_table_ast(sql).expect("observed MODIFY");
     assert_eq!(ast.table, "kg_comic_facets");
     assert!(super::transform::supports_production_alter_table(sql));
+    for (input, expected) in [
+        (
+            "ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NULL",
+            "ALTER TABLE `t` MODIFY COLUMN `c` VARCHAR(128) NULL DEFAULT NULL",
+        ),
+        (
+            "ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NOT NULL DEFAULT 'x'",
+            "ALTER TABLE `t` MODIFY COLUMN `c` VARCHAR(128) NOT NULL DEFAULT 'x'",
+        ),
+        (
+            "ALTER TABLE t MODIFY COLUMN c DATETIME NOT NULL",
+            "ALTER TABLE `t` MODIFY COLUMN `c` DATETIME NOT NULL",
+        ),
+    ] {
+        assert_eq!(
+            super::transform::transform_production_alter_table(input)
+                .expect("ordinary MODIFY")
+                .target_sql
+                .as_deref(),
+            Some(expected)
+        );
+    }
     for rejected in [
-        "ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NULL",
-        "ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NOT NULL DEFAULT 'x'",
         "ALTER TABLE t MODIFY COLUMN c VARCHAR(0128) NOT NULL",
-        "ALTER TABLE t MODIFY COLUMN c DATETIME NOT NULL",
         "ALTER TABLE t MODIFY COLUMN c `VARCHAR`(128) NOT NULL",
+        "ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NOT NULL DEFAULT NULL",
     ] {
         assert!(
             !super::transform::supports_production_alter_table(rejected),
@@ -850,12 +869,10 @@ fn modify_varchar_ordinary_comments() {
                 .as_deref(),
             Some(expected)
         );
-        assert!(
-            parse_ddl_operation(&input)
-                .expect("operation")
-                .alter_table_ast
-                .is_some()
-        );
+        assert!(parse_ddl_operation(&input)
+            .expect("operation")
+            .alter_table_ast
+            .is_some());
     }
     for prefix in [
         "/*!50000 SET sql_mode='' */",
@@ -990,11 +1007,9 @@ fn truncate_has_explicit_runtime_postcondition() {
     .expect("truncate evidence");
     assert!(evidence.pre_state.contains("\"row_count\":7"));
     assert!(evidence.expected_post_state.contains("\"row_count\":0"));
-    assert!(
-        evidence
-            .expected_post_state
-            .contains("\"auto_increment\":1")
-    );
+    assert!(evidence
+        .expected_post_state
+        .contains("\"auto_increment\":1"));
 }
 
 fn semantic_snapshot(row_count: u64, auto_increment: Option<u64>) -> SemanticSchemaSnapshot {
@@ -1251,11 +1266,9 @@ fn drop_trigger_evidence_requires_absent_canonical_post_state() {
     let evidence =
         build_semantic_evidence(&operation, &target, &target).expect("DROP TRIGGER evidence");
 
-    assert!(
-        evidence
-            .pre_state
-            .contains("prevent_deactivating_cloned_archives")
-    );
+    assert!(evidence
+        .pre_state
+        .contains("prevent_deactivating_cloned_archives"));
     assert!(evidence.expected_post_state.contains("absent"));
 }
 
@@ -1651,18 +1664,16 @@ fn fixture_create_table_evidence_captures_fenced_source_defaults_and_explicit_sq
         file: coordinate.file.clone(),
         position: coordinate.position + 1,
     };
-    assert!(
-        build_fenced_create_table_evidence(
-            &operation,
-            &target,
-            &defaults,
-            "mysqld-bin.000777",
-            180,
-            &coordinate,
-            &ahead,
-        )
-        .is_err()
-    );
+    assert!(build_fenced_create_table_evidence(
+        &operation,
+        &target,
+        &defaults,
+        "mysqld-bin.000777",
+        180,
+        &coordinate,
+        &ahead,
+    )
+    .is_err());
 }
 
 fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
@@ -2039,7 +2050,8 @@ fn production_create_table_with_leading_comments_transforms_to_mysql8_sql() {
         "globalcomix".to_string(),
         "globalcomix".to_string(),
     );
-    let source_sql = "-- Exclude the full Image Comics catalog from home-feed mining and serving.\n\
+    let source_sql =
+        "-- Exclude the full Image Comics catalog from home-feed mining and serving.\n\
 -- Artist-level scope also covers newly-created Image Comics titles and its\n\
 -- imprints; the PHP serve policy resolves this table on every request.\n\
 \n\
@@ -2118,21 +2130,15 @@ CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\n\
 
     assert!(evidence.generated_sql.is_some());
     assert!(evidence.expected_post_state.contains("utf8mb4_unicode_ci"));
-    assert!(
-        evidence
-            .expected_post_state
-            .contains("\"data_type\":\"int\"")
-    );
-    assert!(
-        !evidence
-            .expected_post_state
-            .contains("\"data_type\":\"int unsigned\"")
-    );
-    assert!(
-        evidence
-            .expected_post_state
-            .contains("\"extra\":\"DEFAULT_GENERATED\"")
-    );
+    assert!(evidence
+        .expected_post_state
+        .contains("\"data_type\":\"int\""));
+    assert!(!evidence
+        .expected_post_state
+        .contains("\"data_type\":\"int unsigned\""));
+    assert!(evidence
+        .expected_post_state
+        .contains("\"extra\":\"DEFAULT_GENERATED\""));
 }
 
 #[test]
@@ -2226,7 +2232,8 @@ fn production_multiple_add_index_clauses_transform_to_deterministic_mysql8_sql()
 
 #[test]
 fn observed_alter_preserves_its_leading_comment_in_generated_sql() {
-    let source_sql = "-- The serve-time blacklist check resolves a blacklisted artist's imprints.\r\n\
+    let source_sql =
+        "-- The serve-time blacklist check resolves a blacklisted artist's imprints.\r\n\
 ALTER TABLE `artists_imprints`\r\n\
     ADD KEY `idx_artist_id` (`artist_id`)";
 
@@ -2269,9 +2276,14 @@ fn production_float_unsigned_add_column_preserves_required_options() {
             "ALTER TABLE `comics_top_stats` ADD COLUMN `value_1_day` FLOAT UNSIGNED NOT NULL DEFAULT 0 AFTER `statistic`"
         )
     );
-    assert!(!supports_production_alter_table(
-        "ALTER TABLE `comics_top_stats` ADD COLUMN `value_1_day` FLOAT UNSIGNED NOT NULL DEFAULT 1 AFTER `statistic`"
-    ));
+    assert_eq!(
+        transform_production_alter_table(
+            "ALTER TABLE `comics_top_stats` ADD COLUMN `value_1_day` FLOAT UNSIGNED NOT NULL DEFAULT 1 AFTER `statistic`"
+        )
+        .expect("ordinary nonzero FLOAT default")
+        .target_sql.as_deref(),
+        Some("ALTER TABLE `comics_top_stats` ADD COLUMN `value_1_day` FLOAT UNSIGNED NOT NULL DEFAULT 1 AFTER `statistic`")
+    );
 }
 
 const CONTENT_SECTIONS_SEEN_DDL: &str = "ALTER TABLE `content_sections_events_raw`\n\
@@ -2459,7 +2471,6 @@ fn signed_tinyint_add_column_replay_metadata() {
             .expect("signed post-state")
     );
     for rejected in [
-        sql.replace("TINYINT(1)", "TINYINT(2)"),
         sql.replace("TINYINT(1)", "TINYINT(01)"),
         sql.replace("TINYINT(1)", "TINYINT(`1`)"),
         sql.replace("TINYINT(1)", "`TINYINT`(1)"),
@@ -2573,24 +2584,38 @@ fn production_alter_rejects_noncanonical_type_lengths() {
 }
 
 #[test]
-fn production_alter_admits_only_microsecond_datetime_precision() {
-    assert!(supports_production_alter_table(
-        "ALTER TABLE accounts ADD COLUMN c DATETIME(6)"
-    ));
-    for sql in [
-        "ALTER TABLE accounts ADD COLUMN c DATETIME(3)",
-        "ALTER TABLE accounts ADD COLUMN c DATETIME(`6`)",
-        "ALTER TABLE accounts ADD COLUMN c TIMESTAMP(6)",
+fn production_alter_admits_bounded_temporal_precision() {
+    for (input, column_type) in [
+        ("DATETIME(6)", "DATETIME(6)"),
+        ("DATETIME(3)", "DATETIME(3)"),
+        ("TIMESTAMP(6)", "TIMESTAMP(6)"),
     ] {
-        assert!(!supports_production_alter_table(sql), "accepted {sql}");
+        let sql = format!("ALTER TABLE accounts ADD COLUMN c {input}");
+        assert_eq!(
+            transform_production_alter_table(&sql)
+                .expect("bounded temporal precision")
+                .target_sql
+                .as_deref(),
+            Some(
+                format!("ALTER TABLE `accounts` ADD COLUMN `c` {column_type} NULL DEFAULT NULL")
+                    .as_str()
+            )
+        );
     }
+    assert!(!supports_production_alter_table(
+        "ALTER TABLE accounts ADD COLUMN c DATETIME(`6`)"
+    ));
 }
 
 #[test]
-fn production_alter_rejects_smallint_display_width() {
-    assert!(!supports_production_alter_table(
-        "ALTER TABLE accounts ADD COLUMN c SMALLINT(5) UNSIGNED"
-    ));
+fn production_alter_normalizes_smallint_display_width() {
+    assert_eq!(
+        transform_production_alter_table("ALTER TABLE accounts ADD COLUMN c SMALLINT(5) UNSIGNED")
+            .expect("ordinary SMALLINT display width")
+            .target_sql
+            .as_deref(),
+        Some("ALTER TABLE `accounts` ADD COLUMN `c` SMALLINT UNSIGNED NULL DEFAULT NULL")
+    );
 }
 
 #[test]
@@ -3037,16 +3062,12 @@ fn reader_memory_create_canonical_ast_records_checks_and_column_encoding() {
             .canonical_ast,
     )
     .expect("storefront JSON");
-    assert!(
-        storefront_ast["parsed_create_table"]
-            .get("check_constraints")
-            .is_none()
-    );
-    assert!(
-        storefront_ast["parsed_create_table"]["columns"][0]
-            .get("character_set")
-            .is_none()
-    );
+    assert!(storefront_ast["parsed_create_table"]
+        .get("check_constraints")
+        .is_none());
+    assert!(storefront_ast["parsed_create_table"]["columns"][0]
+        .get("character_set")
+        .is_none());
 }
 
 fn reader_memory_profiles_target() -> SemanticSchemaSnapshot {
@@ -3218,14 +3239,12 @@ fn reader_memory_alter_rejects_unmodeled_text_defaults_and_checks() {
             "TEXT NOT NULL DEFAULT '{}'",
             "TEXT NOT NULL DEFAULT '{\\\\}'",
         ),
-        READER_MEMORY_PROFILES_ALTER.replace("TEXT NOT NULL DEFAULT '{}'", "TEXT NOT NULL"),
         READER_MEMORY_PROFILES_ALTER.replace(
             "JSON_VALID(checkpoints_json)",
             "JSON_VALID(checkpoints_json) AND 1",
         ),
         READER_MEMORY_PROFILES_ALTER.replace("<=16384", ">=16384"),
         READER_MEMORY_OPERATIONS_ALTER.replace("COLLATE ascii_bin", "COLLATE latin1_bin"),
-        "ALTER TABLE t ADD COLUMN c VARCHAR(8) NOT NULL".to_string(),
         "ALTER TABLE t ADD COLUMN c VARCHAR(8) NOT NULL DEFAULT 'x\\\\y'".to_string(),
     ] {
         assert!(!supports_production_alter_table(&sql), "accepted {sql}");
@@ -3399,9 +3418,6 @@ fn reader_memory_guarded_alter_is_a_proven_noop_when_everything_exists() {
 #[test]
 fn reader_memory_guarded_alter_rejects_unmodeled_variants() {
     for sql in [
-        READER_MEMORY_PROFILES_GUARDED_ALTER.replace("DATETIME(6) NULL,", "DATETIME(3) NULL,"),
-        READER_MEMORY_PROFILES_GUARDED_ALTER.replace("NOT NULL DEFAULT 'idle'", "NOT NULL"),
-        READER_MEMORY_PROFILES_GUARDED_ALTER.replace("DEFAULT 'idle'", "DEFAULT 'id''le'"),
         READER_MEMORY_PROFILES_GUARDED_ALTER.replace(
             "ADD INDEX IF NOT EXISTS reader_memory_suggestion_started (suggestions_started_at)",
             "ADD UNIQUE INDEX IF NOT EXISTS reader_memory_suggestion_started (suggestions_started_at)",

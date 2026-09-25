@@ -794,7 +794,7 @@ fn unsupported_create_table_stays_translation_pending_without_target_or_checkpoi
         sql_statement: "CREATE TABLE accounts (\
             id BIGINT NOT NULL PRIMARY KEY, \
             email VARCHAR(255) NOT NULL, \
-            payload VARCHAR(64) NOT NULL, \
+            payload SET('a','b') NOT NULL, \
             created_at DATETIME NOT NULL, \
             KEY idx_accounts_payload (payload)\
         ) ENGINE=InnoDB"
@@ -822,12 +822,10 @@ fn unsupported_create_table_stays_translation_pending_without_target_or_checkpoi
     )
     .expect_err("unsupported CREATE TABLE must remain translation-pending");
 
-    assert!(
-        error
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("translator unavailable")
-    );
+    assert!(error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("translator unavailable"));
     assert_eq!(
         *journal.status.borrow(),
         Some(DdlReplayStatus::TranslationPending)
@@ -917,7 +915,7 @@ fn unsupported_ddl_keeps_replicator_alive_at_unchanged_checkpoint() {
                 sql_statement: "CREATE TABLE accounts (\
                     id BIGINT NOT NULL PRIMARY KEY, \
                     email VARCHAR(255) NOT NULL, \
-                    payload VARCHAR(64) NOT NULL, \
+                    payload SET('a','b') NOT NULL, \
                     created_at DATETIME NOT NULL, \
                     KEY idx_accounts_payload (payload)\
                 ) ENGINE=InnoDB"
@@ -1035,26 +1033,22 @@ fn altered_assistant_reply_reports_create_remains_translation_pending() {
         sql_statement: "CREATE TABLE IF NOT EXISTS `assistant_reply_reports` (`id` int(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci".to_string(),
     });
 
-    assert!(
-        automatically_handled_ddl_event(
-            "globalcomix-prod-mariadb-2026-01",
-            "mysqld-bin.002768",
-            &event_header(3, 1019084595),
-            &event,
-            &state,
-        )
-        .is_none()
-    );
-    assert!(
-        manual_ddl_event(
-            "globalcomix-prod-mariadb-2026-01",
-            "mysqld-bin.002768",
-            &event_header(3, 1019084595),
-            &event,
-            &state,
-        )
-        .is_some()
-    );
+    assert!(automatically_handled_ddl_event(
+        "globalcomix-prod-mariadb-2026-01",
+        "mysqld-bin.002768",
+        &event_header(3, 1019084595),
+        &event,
+        &state,
+    )
+    .is_none());
+    assert!(manual_ddl_event(
+        "globalcomix-prod-mariadb-2026-01",
+        "mysqld-bin.002768",
+        &event_header(3, 1019084595),
+        &event,
+        &state,
+    )
+    .is_some());
 }
 
 #[test]
@@ -1244,11 +1238,9 @@ fn unsupported_ddl_persists_barrier_then_replays_after_translator_upgrade() {
     )
     .expect_err("missing translator must block the checkpoint");
 
-    assert!(
-        first_error
-            .to_string()
-            .contains("translator implementation unavailable")
-    );
+    assert!(first_error
+        .to_string()
+        .contains("translator implementation unavailable"));
     assert_eq!(
         *journal.status.borrow(),
         Some(DdlReplayStatus::TranslationPending)
@@ -1566,16 +1558,12 @@ fn prepared_restart_with_pre_state_blocks_without_replay_or_checkpoint() {
     )
     .expect_err("ambiguous prepared state must block");
 
-    assert!(
-        error
-            .to_string()
-            .contains("semantic reconciliation blocked")
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("neither immutable pre-state nor expected post-state")
-    );
+    assert!(error
+        .to_string()
+        .contains("semantic reconciliation blocked"));
+    assert!(error
+        .to_string()
+        .contains("neither immutable pre-state nor expected post-state"));
     assert_eq!(operations.borrow().as_slice(), &["BLOCKED"]);
 }
 
@@ -1689,11 +1677,9 @@ fn event_position_evidence_failure_persists_translation_pending_barrier() {
     )
     .expect_err("unfenced source inventory must block checkpoint advancement");
 
-    assert!(
-        error
-            .to_string()
-            .contains("DDL transformation evidence unavailable")
-    );
+    assert!(error
+        .to_string()
+        .contains("DDL transformation evidence unavailable"));
     assert_eq!(
         *journal.status.borrow(),
         Some(DdlReplayStatus::TranslationPending)

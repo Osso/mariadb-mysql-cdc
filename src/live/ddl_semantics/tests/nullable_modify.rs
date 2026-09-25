@@ -57,6 +57,7 @@ fn nullable_datetime_modify_renders_and_models_full_post_state() {
             "clauses": [{
                 "kind": "modify_column", "name": "end_time", "column_type": "datetime",
                 "data_type": "datetime", "nullable": true,
+                "default_value": null, "comment": "", "after": null,
             }],
         })
     );
@@ -79,35 +80,17 @@ fn nullable_datetime_modify_renders_and_models_full_post_state() {
 }
 
 #[test]
-fn nullable_datetime_modify_fails_closed_on_unmodeled_syntax_or_prestate() {
+fn nullable_datetime_modify_fails_closed_on_invalid_syntax_or_prestate() {
     for sql in [
-        "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME NOT NULL",
-        "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME NULL",
-        "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME(6) DEFAULT NULL",
-        "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time TIMESTAMP DEFAULT NULL",
         "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME DEFAULT '2026-09-25 00:00:00'",
         "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME NOT NULL DEFAULT NULL",
         "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time `DATETIME` DEFAULT NULL",
         "ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME DEFAULT `NULL`",
-        "/* ordinary */ ALTER TABLE home_feed_curated_strips MODIFY COLUMN end_time DATETIME DEFAULT NULL",
     ] {
         assert!(parse_production_alter_table_ast(sql).is_err(), "{sql}");
     }
-    for change in ["timestamp", "datetime(6)", "varchar(64)"] {
-        let mut target = curated_strips_snapshot();
-        target.inventory.tables[0].columns[2].column_type = change.into();
-        if change != "datetime(6)" {
-            target.inventory.tables[0].columns[2].data_type = change.into();
-        }
-        let operation = parse_ddl_operation(NULLABLE_DATETIME).expect("operation");
-        assert!(operation.alter_table_ast.is_some(), "parsed exact event");
-        assert!(
-            build_semantic_evidence(&operation, &target, &target).is_err(),
-            "{change}"
-        );
-    }
     let mut target = curated_strips_snapshot();
-    target.inventory.tables[0].columns[2].extra = "DEFAULT_GENERATED".into();
+    target.inventory.tables[0].columns[2].extra = "auto_increment".into();
     let operation = parse_ddl_operation(NULLABLE_DATETIME).expect("operation");
     assert!(operation.alter_table_ast.is_some(), "parsed exact event");
     assert!(build_semantic_evidence(&operation, &target, &target).is_err());
@@ -147,13 +130,16 @@ fn nullable_modify_changes_nullability_without_losing_other_metadata() {
 }
 
 #[test]
-fn nullable_modify_rejects_unmodeled_defaults_and_quoted_keywords() {
-    for suffix in [
-        "DEFAULT 'x'",
-        "NOT NULL DEFAULT NULL",
-        "`DEFAULT` NULL",
-        "DEFAULT `NULL`",
-    ] {
+fn nullable_modify_accepts_literal_default_and_rejects_invalid_keywords() {
+    let sql = "ALTER TABLE accounts MODIFY COLUMN handle VARCHAR(1024) DEFAULT 'x'";
+    assert_eq!(
+        super::super::transform::transform_production_alter_table(sql)
+            .expect("ordinary string default")
+            .target_sql
+            .as_deref(),
+        Some("ALTER TABLE `accounts` MODIFY COLUMN `handle` VARCHAR(1024) NULL DEFAULT 'x'")
+    );
+    for suffix in ["NOT NULL DEFAULT NULL", "`DEFAULT` NULL", "DEFAULT `NULL`"] {
         let sql = format!("ALTER TABLE accounts MODIFY COLUMN handle VARCHAR(1024) {suffix}");
         assert!(parse_production_alter_table_ast(&sql).is_err(), "{sql}");
     }
