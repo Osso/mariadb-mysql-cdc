@@ -402,6 +402,9 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         let Some(ast) = operation.create_table_ast.as_ref() else {
             return self.capture_evidence(sql, source_file, event_end_position);
         };
+        if ast.character_set.is_none() && ast.collation.is_none() {
+            return self.capture_database_default_create(&operation, status_variables);
+        }
         if ast.character_set.as_deref() != Some("utf8mb4") || ast.collation.is_some() {
             return self.capture_evidence(sql, source_file, event_end_position);
         }
@@ -466,6 +469,35 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
 }
 
 impl LiveDdlSemanticInventory {
+    fn capture_database_default_create(
+        &self,
+        operation: &DdlOperation,
+        status_variables: &[u8],
+    ) -> Result<DdlSemanticEvidence, String> {
+        let context = super::query_charset_context::decode_query_charset_context(status_variables)
+            .map_err(|error| format!("historical CREATE database context: {error}"))?;
+        let id = context
+            .database_collation
+            .ok_or("historical CREATE database collation is absent")?;
+        let mut defaults = self
+            .source
+            .read_collation_identity(id)
+            .map_err(|error| format!("historical database collation identity: {error}"))?;
+        let source_collation = defaults.collation.clone();
+        defaults.collation = crate::sync_schema::canonical_collation(&defaults.collation);
+        let before = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        let after = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        validate_target_snapshot_consistency(&before, &after)?;
+        let mut evidence =
+            canonical::build_resolved_create_table_evidence(operation, &before, &defaults)?;
+        let mut ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast)
+            .map_err(|error| format!("CREATE evidence JSON: {error}"))?;
+        ast["historical_database_collation"] =
+            serde_json::json!({"id": id, "source_collation": source_collation});
+        evidence.canonical_ast = serde_json::to_string(&ast).map_err(|error| error.to_string())?;
+        Ok(evidence)
+    }
+
     fn validate_observed_json_alias_checks(
         &self,
         ast: &model::ParsedAlterTableAst,
