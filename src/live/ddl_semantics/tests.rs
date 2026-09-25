@@ -8,10 +8,10 @@ mod nullable_modify;
 
 use super::model::ParsedAlterClause;
 use super::transform::{
-    parse_fixture_create_table, parse_production_alter_table_ast, supports_drop_procedure,
-    supports_source_only_release_move_procedure_create, transform_drop_columns_if_exists,
-    transform_drop_procedure, transform_fixture_create_table,
-    transform_source_only_release_move_procedure_create, DDL_TRANSFORMATION_VERSION,
+    DDL_TRANSFORMATION_VERSION, parse_fixture_create_table, parse_production_alter_table_ast,
+    supports_drop_procedure, supports_source_only_release_move_procedure_create,
+    transform_drop_columns_if_exists, transform_drop_procedure, transform_fixture_create_table,
+    transform_source_only_release_move_procedure_create,
 };
 use super::*;
 use crate::inventory::{
@@ -375,16 +375,20 @@ fn modeled_unique_btree_options_translate_through_shared_mapping() {
 
 #[test]
 fn unique_hash_and_unproven_generated_ddl_fail_closed_by_provenance() {
-    assert!(super::translate_modeled_ddl(
-        "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING HASH",
-        &[],
-    )
-    .is_err());
-    assert!(super::translate_ddl(
-        "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING BTREE",
-        &[],
-    )
-    .is_err());
+    assert!(
+        super::translate_modeled_ddl(
+            "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING HASH",
+            &[],
+        )
+        .is_err()
+    );
+    assert!(
+        super::translate_ddl(
+            "CREATE UNIQUE INDEX uq_handle ON accounts (handle) USING BTREE",
+            &[],
+        )
+        .is_err()
+    );
     for sql in [
         "CREATE TABLE `items` (`id` BIGINT) ENGINE=InnoDB",
         "ALTER TABLE `items` DROP PRIMARY KEY",
@@ -419,7 +423,9 @@ fn index_tokenizer_skips_each_supported_comment_form() {
 
     assert_eq!(
         tokens,
-        ["CREATE", "INDEX", "idx", "ON", "accounts", "(", "handle", ")"]
+        [
+            "CREATE", "INDEX", "idx", "ON", "accounts", "(", "handle", ")"
+        ]
     );
 }
 
@@ -629,15 +635,21 @@ fn strict_index_admission_rejects_every_non_simple_form() {
 fn create_index_expected_state_uses_translated_ast() {
     let (target, source, operation) = translated_index_fixture();
     let evidence = build_semantic_evidence(&operation, &target, &source).expect("index evidence");
-    assert!(evidence
-        .expected_post_state
-        .contains("\"prefix_length\":12"));
-    assert!(evidence
-        .expected_post_state
-        .contains("\"collation\":\"utf8mb4_bin\""));
-    assert!(!evidence
-        .expected_post_state
-        .contains("\"prefix_length\":99"));
+    assert!(
+        evidence
+            .expected_post_state
+            .contains("\"prefix_length\":12")
+    );
+    assert!(
+        evidence
+            .expected_post_state
+            .contains("\"collation\":\"utf8mb4_bin\"")
+    );
+    assert!(
+        !evidence
+            .expected_post_state
+            .contains("\"prefix_length\":99")
+    );
 }
 
 fn translated_index_fixture() -> (SemanticSchemaSnapshot, SemanticSchemaSnapshot, DdlOperation) {
@@ -869,10 +881,12 @@ fn modify_varchar_ordinary_comments() {
                 .as_deref(),
             Some(expected)
         );
-        assert!(parse_ddl_operation(&input)
-            .expect("operation")
-            .alter_table_ast
-            .is_some());
+        assert!(
+            parse_ddl_operation(&input)
+                .expect("operation")
+                .alter_table_ast
+                .is_some()
+        );
     }
     for prefix in [
         "/*!50000 SET sql_mode='' */",
@@ -1007,9 +1021,11 @@ fn truncate_has_explicit_runtime_postcondition() {
     .expect("truncate evidence");
     assert!(evidence.pre_state.contains("\"row_count\":7"));
     assert!(evidence.expected_post_state.contains("\"row_count\":0"));
-    assert!(evidence
-        .expected_post_state
-        .contains("\"auto_increment\":1"));
+    assert!(
+        evidence
+            .expected_post_state
+            .contains("\"auto_increment\":1")
+    );
 }
 
 fn semantic_snapshot(row_count: u64, auto_increment: Option<u64>) -> SemanticSchemaSnapshot {
@@ -1266,9 +1282,11 @@ fn drop_trigger_evidence_requires_absent_canonical_post_state() {
     let evidence =
         build_semantic_evidence(&operation, &target, &target).expect("DROP TRIGGER evidence");
 
-    assert!(evidence
-        .pre_state
-        .contains("prevent_deactivating_cloned_archives"));
+    assert!(
+        evidence
+            .pre_state
+            .contains("prevent_deactivating_cloned_archives")
+    );
     assert!(evidence.expected_post_state.contains("absent"));
 }
 
@@ -1664,16 +1682,18 @@ fn fixture_create_table_evidence_captures_fenced_source_defaults_and_explicit_sq
         file: coordinate.file.clone(),
         position: coordinate.position + 1,
     };
-    assert!(build_fenced_create_table_evidence(
-        &operation,
-        &target,
-        &defaults,
-        "mysqld-bin.000777",
-        180,
-        &coordinate,
-        &ahead,
-    )
-    .is_err());
+    assert!(
+        build_fenced_create_table_evidence(
+            &operation,
+            &target,
+            &defaults,
+            "mysqld-bin.000777",
+            180,
+            &coordinate,
+            &ahead,
+        )
+        .is_err()
+    );
 }
 
 fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
@@ -2050,8 +2070,7 @@ fn production_create_table_with_leading_comments_transforms_to_mysql8_sql() {
         "globalcomix".to_string(),
         "globalcomix".to_string(),
     );
-    let source_sql =
-        "-- Exclude the full Image Comics catalog from home-feed mining and serving.\n\
+    let source_sql = "-- Exclude the full Image Comics catalog from home-feed mining and serving.\n\
 -- Artist-level scope also covers newly-created Image Comics titles and its\n\
 -- imprints; the PHP serve policy resolves this table on every request.\n\
 \n\
@@ -2130,15 +2149,21 @@ CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\n\
 
     assert!(evidence.generated_sql.is_some());
     assert!(evidence.expected_post_state.contains("utf8mb4_unicode_ci"));
-    assert!(evidence
-        .expected_post_state
-        .contains("\"data_type\":\"int\""));
-    assert!(!evidence
-        .expected_post_state
-        .contains("\"data_type\":\"int unsigned\""));
-    assert!(evidence
-        .expected_post_state
-        .contains("\"extra\":\"DEFAULT_GENERATED\""));
+    assert!(
+        evidence
+            .expected_post_state
+            .contains("\"data_type\":\"int\"")
+    );
+    assert!(
+        !evidence
+            .expected_post_state
+            .contains("\"data_type\":\"int unsigned\"")
+    );
+    assert!(
+        evidence
+            .expected_post_state
+            .contains("\"extra\":\"DEFAULT_GENERATED\"")
+    );
 }
 
 #[test]
@@ -2232,8 +2257,7 @@ fn production_multiple_add_index_clauses_transform_to_deterministic_mysql8_sql()
 
 #[test]
 fn observed_alter_preserves_its_leading_comment_in_generated_sql() {
-    let source_sql =
-        "-- The serve-time blacklist check resolves a blacklisted artist's imprints.\r\n\
+    let source_sql = "-- The serve-time blacklist check resolves a blacklisted artist's imprints.\r\n\
 ALTER TABLE `artists_imprints`\r\n\
     ADD KEY `idx_artist_id` (`artist_id`)";
 
@@ -3062,12 +3086,16 @@ fn reader_memory_create_canonical_ast_records_checks_and_column_encoding() {
             .canonical_ast,
     )
     .expect("storefront JSON");
-    assert!(storefront_ast["parsed_create_table"]
-        .get("check_constraints")
-        .is_none());
-    assert!(storefront_ast["parsed_create_table"]["columns"][0]
-        .get("character_set")
-        .is_none());
+    assert!(
+        storefront_ast["parsed_create_table"]
+            .get("check_constraints")
+            .is_none()
+    );
+    assert!(
+        storefront_ast["parsed_create_table"]["columns"][0]
+            .get("character_set")
+            .is_none()
+    );
 }
 
 fn reader_memory_profiles_target() -> SemanticSchemaSnapshot {

@@ -46,8 +46,11 @@ fn quality_runs_create_drops_integer_display_widths_and_keeps_comments() {
     assert_eq!(column("summary").column_type, "longtext");
 
     let sql = translate_ddl(RUNS, &[]).unwrap().target_sql.unwrap();
-    assert!(sql
-        .contains("`status` VARCHAR(16) NOT NULL DEFAULT 'running' COMMENT 'running|done|error'"));
+    assert!(
+        sql.contains(
+            "`status` VARCHAR(16) NOT NULL DEFAULT 'running' COMMENT 'running|done|error'"
+        )
+    );
     assert!(sql.contains("`window_days` SMALLINT UNSIGNED NOT NULL, "));
     assert!(sql.contains(
         "`summary` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL DEFAULT NULL COMMENT 'aggregates: headline, strata, dims, tags, fbt'"
