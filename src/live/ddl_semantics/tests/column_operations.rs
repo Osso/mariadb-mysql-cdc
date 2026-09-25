@@ -180,9 +180,14 @@ fn alter_default_preserves_column_metadata_and_distinguishes_null_from_drop() {
             ast["parsed_alter_table"]["clauses"][0]["kind"],
             "alter_column_default"
         );
+        let target_suffix = if suffix == "DROP DEFAULT" {
+            "SET DEFAULT NULL"
+        } else {
+            suffix
+        };
         assert_eq!(
             rendered,
-            format!("ALTER TABLE `accounts` ALTER COLUMN `handle` {suffix}")
+            format!("ALTER TABLE `accounts` ALTER COLUMN `handle` {target_suffix}")
         );
         assert_eq!(
             ast["parsed_alter_table"]["clauses"][0]["default"],
@@ -357,6 +362,20 @@ fn escaped_defaults_require_sql_mode_context_instead_of_changing_value() {
     ] {
         assert!(parse_production_alter_table_ast(sql).is_err(), "{sql}");
     }
+}
+
+#[test]
+fn dropping_nullable_default_preserves_implicit_null_inserts() {
+    let mut target = semantic_snapshot(7, Some(8));
+    target.inventory.tables[0].columns[1].default_value = Some("old".into());
+    let (_, _, rendered) = altered(
+        "ALTER TABLE accounts ALTER COLUMN handle DROP DEFAULT",
+        &target,
+    );
+    assert_eq!(
+        rendered,
+        "ALTER TABLE `accounts` ALTER COLUMN `handle` SET DEFAULT NULL"
+    );
 }
 
 #[test]

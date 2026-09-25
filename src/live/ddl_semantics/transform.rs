@@ -369,6 +369,9 @@ fn render_target_column_default(
         return render_text_default_definition(column, value);
     }
     let action = match default {
+        // MariaDB retains implicit NULL for a nullable column after DROP DEFAULT.
+        // MySQL's DROP can forbid omitted values, so express that default explicitly.
+        None if column.is_nullable => "SET DEFAULT NULL".to_string(),
         None => "DROP DEFAULT".to_string(),
         Some(ParsedColumnDefault::Number(_)) => {
             format!(
