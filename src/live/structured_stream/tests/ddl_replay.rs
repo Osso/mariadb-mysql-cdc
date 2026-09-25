@@ -56,6 +56,41 @@ fn escaped_ddl_requires_captured_mode_for_automatic_admission_and_keeps_raw_sql(
 }
 
 #[test]
+fn no_backslash_ddl_admission_ignores_dotted_literal_but_not_qualified_table() {
+    let state = StructuredEventState::new(Some("fixture_cdc".into()));
+    let header = event_header(2, 180);
+    for (sql, admitted) in [
+        (
+            r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''other.table'",
+            true,
+        ),
+        (
+            r"ALTER TABLE other.table ADD COLUMN c VARCHAR(40) DEFAULT 'a\''other.table'",
+            false,
+        ),
+        (
+            r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'trail\' /*! , ADD COLUMN hidden INT */",
+            false,
+        ),
+    ] {
+        let event = BinlogEvent::QueryEvent(QueryEvent {
+            thread_id: 1,
+            duration: 0,
+            error_code: 0,
+            status_variables: [&[1][..], &(1_u64 << 20).to_le_bytes()].concat(),
+            database_name: "fixture_cdc".into(),
+            sql_statement: sql.into(),
+        });
+        assert_eq!(
+            automatically_handled_ddl_event("source", "bin.000001", &header, &event, &state)
+                .is_some(),
+            admitted,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn source_query_ddl_is_replayed_as_checkpointed_statement() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;

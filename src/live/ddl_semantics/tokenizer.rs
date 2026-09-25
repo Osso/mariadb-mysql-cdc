@@ -57,15 +57,21 @@ fn after_block_comment(sql: &str) -> Result<&str, String> {
 }
 
 pub(crate) fn ddl_contains_comments(sql: &str) -> bool {
-    let characters = sql.chars().collect::<Vec<_>>();
-    ddl_characters_contain_comments(&characters)
+    ddl_contains_comments_with_mode(sql, false)
 }
 
-fn ddl_characters_contain_comments(characters: &[char]) -> bool {
+pub(crate) fn ddl_contains_comments_with_mode(sql: &str, no_backslash_escapes: bool) -> bool {
+    let characters = sql.chars().collect::<Vec<_>>();
+    ddl_characters_contain_comments(&characters, no_backslash_escapes)
+}
+
+fn ddl_characters_contain_comments(characters: &[char], no_backslash_escapes: bool) -> bool {
     let mut quote = None;
     let mut index = 0;
     while index < characters.len() {
-        if let Some(next_index) = advance_quoted_ddl_scan(characters, index, &mut quote) {
+        if let Some(next_index) =
+            advance_quoted_ddl_scan(characters, index, &mut quote, no_backslash_escapes)
+        {
             index = next_index;
             continue;
         }
@@ -86,6 +92,7 @@ fn advance_quoted_ddl_scan(
     characters: &[char],
     index: usize,
     quote: &mut Option<char>,
+    no_backslash_escapes: bool,
 ) -> Option<usize> {
     let quote_character = (*quote)?;
     let character = characters[index];
@@ -96,7 +103,7 @@ fn advance_quoted_ddl_scan(
         *quote = None;
         return Some(index + 1);
     }
-    if character == '\\' && quote_character == '\'' {
+    if character == '\\' && quote_character == '\'' && !no_backslash_escapes {
         return Some(index + 2);
     }
     Some(index + 1)

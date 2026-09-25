@@ -29,6 +29,20 @@ fn detects_qualified_identifiers_across_mysql_quoting_forms() {
 }
 
 #[test]
+fn no_backslash_qualification_ignores_dotted_literal_but_rejects_objects() {
+    let literal = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''other.table'";
+    assert!(!query_contains_qualified_identifier_with_mode(
+        literal, true
+    ));
+    assert!(!query_references_schema_with_mode(literal, "other", true));
+    let qualified = r"ALTER TABLE other.table ADD COLUMN c VARCHAR(40) DEFAULT 'a\''other.table'";
+    assert!(query_contains_qualified_identifier_with_mode(
+        qualified, true
+    ));
+    assert!(query_references_schema_with_mode(qualified, "other", true));
+}
+
+#[test]
 fn qualified_query_dml_is_rejected_as_ambiguous() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;

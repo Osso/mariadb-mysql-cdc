@@ -5,7 +5,7 @@ use super::model::{
     ParsedStoredIfExpression,
 };
 use super::tokenizer::{
-    ddl_contains_comments, split_one_leading_mysql_line_comment,
+    ddl_contains_comments, ddl_contains_comments_with_mode, split_one_leading_mysql_line_comment,
     strip_leading_ordinary_ddl_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags,
     tokenize_ddl_with_quoted_flags_mode,
 };
@@ -1973,9 +1973,12 @@ pub fn parse_production_alter_table_ast_with_mode(
     mode: SourceSqlMode,
 ) -> Result<ParsedAlterTableAst, String> {
     let (_, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
-    let ordinary_comments = ddl_contains_comments(statement_sql);
-    let leading_comments_only =
-        !ddl_contains_comments(strip_leading_ordinary_ddl_comments(statement_sql)?);
+    let no_escapes = mode.0.is_some_and(|bits| bits & (1 << 20) != 0);
+    let ordinary_comments = ddl_contains_comments_with_mode(statement_sql, no_escapes);
+    let leading_comments_only = !ddl_contains_comments_with_mode(
+        strip_leading_ordinary_ddl_comments(statement_sql)?,
+        no_escapes,
+    );
     let stripped;
     let source_sql = if ordinary_comments {
         stripped = observed_create::remove_ordinary_comments_with_mode(source_sql, mode)?;
@@ -1983,7 +1986,6 @@ pub fn parse_production_alter_table_ast_with_mode(
     } else {
         statement_sql
     };
-    let no_escapes = mode.0.is_some_and(|bits| bits & (1 << 20) != 0);
     let (tokens, quoted_flags) = tokenize_ddl_with_quoted_flags_mode(source_sql, no_escapes)?;
     require_keyword(&tokens, 0, "ALTER")?;
     require_keyword(&tokens, 1, "TABLE")?;
@@ -1996,6 +1998,8 @@ pub fn parse_production_alter_table_ast_with_mode(
             || lock.is_some()
             || !clauses.iter().all(|clause| match clause {
                 ParsedAlterClause::ModifyColumn(_)
+                | ParsedAlterClause::ChangeColumn { .. }
+                | ParsedAlterClause::AlterColumnDefault { .. }
                 | ParsedAlterClause::AddColumn(_)
                 | ParsedAlterClause::RenameColumn { .. }
                 | ParsedAlterClause::DropIndex(_) => true,
@@ -2778,6 +2782,47 @@ mod sql_mode_literal_tests {
             super::super::parser::parse_ddl_operation_with_mode(sql, SourceSqlMode(Some(1 << 20)))
                 .unwrap();
         assert!(operation.alter_table_ast.is_some());
+    }
+
+    #[test]
+    fn no_backslash_comment_guard_rejects_active_comment_after_odd_slash() {
+        let mode = SourceSqlMode(Some(1 << 20));
+        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'trail\' /*! , ADD COLUMN hidden INT */";
+        assert!(parse_production_alter_table_ast_with_mode(sql, mode).is_err());
+    }
+
+    #[test]
+    fn no_backslash_comment_guard_preserves_literal_and_modeled_clauses() {
+        let mode = SourceSqlMode(Some(1 << 20));
+        for value in [r"'trail\'", r"'a\''other.table'"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT {value}");
+            let ast = parse_production_alter_table_ast_with_mode(&sql, mode).unwrap();
+            let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else {
+                panic!("expected ADD COLUMN");
+            };
+            assert_eq!(ast.clauses.len(), 1);
+            let expected = value[1..value.len() - 1].replace("''", "'");
+            assert_eq!(column.default_value.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn ordinary_leading_comments_admit_modeled_change_and_default() {
+        let mode = SourceSqlMode(Some(1 << 20));
+        for sql in [
+            "/* prose */ ALTER TABLE t CHANGE COLUMN old new INT",
+            "/* prose */ ALTER TABLE t ALTER COLUMN c SET DEFAULT 3",
+        ] {
+            let clean = sql.strip_prefix("/* prose */ ").unwrap();
+            assert_eq!(
+                parse_production_alter_table_ast_with_mode(sql, mode).unwrap(),
+                parse_production_alter_table_ast_with_mode(clean, mode).unwrap(),
+            );
+        }
+        for prefix in ["/*! SET @x=1 */", "/*+ BKA(t) */", "/*M! SET @x=1 */"] {
+            let sql = format!("{prefix} ALTER TABLE t ALTER COLUMN c SET DEFAULT 3");
+            assert!(parse_production_alter_table_ast_with_mode(&sql, mode).is_err());
+        }
     }
 
     #[test]

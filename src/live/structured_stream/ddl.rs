@@ -808,7 +808,17 @@ pub(super) fn automatically_handled_ddl_event_with_source_only_support<'a>(
             && source_mode
                 .is_some_and(|mode| supports_automatic_ddl_operation(&query.sql_statement, mode)));
     let contains_disallowed_qualification = !supports_source_only_procedure
-        && query_contains_qualified_identifier(&query.sql_statement);
+        && source_mode
+            .and_then(|mode| mode.no_backslash_escapes().ok())
+            .map_or_else(
+                || {
+                    query.sql_statement.contains('\\')
+                        || query_contains_qualified_identifier(&query.sql_statement)
+                },
+                |no_escapes| {
+                    query_contains_qualified_identifier_with_mode(&query.sql_statement, no_escapes)
+                },
+            );
     let can_handle_automatically = state.should_apply_schema(&query.database_name)
         && !contains_disallowed_qualification
         && supported_by_runtime;
@@ -868,9 +878,24 @@ pub(super) fn manual_ddl_event<'a>(
     if !crate::statement::is_schema_changing_statement(&query.sql_statement) {
         return None;
     }
+    let no_escapes =
+        super::super::query_charset_context::decode_query_charset_context(&query.status_variables)
+            .ok()
+            .and_then(|context| {
+                super::super::query_charset_context::SourceSqlMode(context.sql_mode)
+                    .no_backslash_escapes()
+                    .ok()
+            });
     let may_target_source_schema = state.should_apply_schema(&query.database_name)
         || query.database_name.is_empty()
-        || query_references_source_schema(state, &query.sql_statement);
+        || (no_escapes.is_none() && query.sql_statement.contains('\\'))
+        || state.source_database.as_deref().is_some_and(|schema| {
+            query_references_schema_with_mode(
+                &query.sql_statement,
+                schema,
+                no_escapes.unwrap_or(false),
+            )
+        });
     if !may_target_source_schema {
         return None;
     }

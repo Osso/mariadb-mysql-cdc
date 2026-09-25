@@ -8,34 +8,53 @@ pub(super) enum QueryToken {
 }
 
 pub(super) fn query_references_schema(sql: &str, schema: &str) -> bool {
-    query_tokens(sql).windows(2).any(|tokens| {
-        matches!(
-            tokens,
-            [QueryToken::Identifier(identifier), QueryToken::Dot]
-                if identifier.eq_ignore_ascii_case(schema)
-        )
-    })
+    query_references_schema_with_mode(sql, schema, false)
+}
+
+pub(super) fn query_references_schema_with_mode(
+    sql: &str,
+    schema: &str,
+    no_backslash_escapes: bool,
+) -> bool {
+    query_tokens_with_mode(sql, no_backslash_escapes)
+        .windows(2)
+        .any(|tokens| {
+            matches!(
+                tokens,
+                [QueryToken::Identifier(identifier), QueryToken::Dot]
+                    if identifier.eq_ignore_ascii_case(schema)
+            )
+        })
 }
 
 pub(super) fn query_contains_qualified_identifier(sql: &str) -> bool {
-    query_tokens(sql).windows(3).any(|tokens| {
-        matches!(
-            tokens,
-            [
-                QueryToken::Identifier(_),
-                QueryToken::Dot,
-                QueryToken::Identifier(_)
-            ]
-        )
-    })
+    query_contains_qualified_identifier_with_mode(sql, false)
 }
 
-pub(super) fn query_tokens(sql: &str) -> Vec<QueryToken> {
+pub(super) fn query_contains_qualified_identifier_with_mode(
+    sql: &str,
+    no_backslash_escapes: bool,
+) -> bool {
+    query_tokens_with_mode(sql, no_backslash_escapes)
+        .windows(3)
+        .any(|tokens| {
+            matches!(
+                tokens,
+                [
+                    QueryToken::Identifier(_),
+                    QueryToken::Dot,
+                    QueryToken::Identifier(_)
+                ]
+            )
+        })
+}
+
+fn query_tokens_with_mode(sql: &str, no_backslash_escapes: bool) -> Vec<QueryToken> {
     let characters = sql.chars().collect::<Vec<_>>();
     let mut tokens = Vec::new();
     let mut index = 0;
     while index < characters.len() {
-        let (token, next_index) = next_query_token(&characters, index);
+        let (token, next_index) = next_query_token(&characters, index, no_backslash_escapes);
         if let Some(token) = token {
             tokens.push(token);
         }
@@ -44,7 +63,11 @@ pub(super) fn query_tokens(sql: &str) -> Vec<QueryToken> {
     tokens
 }
 
-pub(super) fn next_query_token(characters: &[char], index: usize) -> (Option<QueryToken>, usize) {
+fn next_query_token(
+    characters: &[char],
+    index: usize,
+    no_backslash_escapes: bool,
+) -> (Option<QueryToken>, usize) {
     let character = characters[index];
     let next = characters.get(index + 1).copied();
     let next_next = characters.get(index + 2).copied();
@@ -67,7 +90,7 @@ pub(super) fn next_query_token(characters: &[char], index: usize) -> (Option<Que
     if character == '\'' {
         return (
             Some(QueryToken::String),
-            skip_query_string(characters, index),
+            skip_query_string(characters, index, no_backslash_escapes),
         );
     }
     if character == '.' {
@@ -166,14 +189,14 @@ pub(super) fn query_quoted_identifier(
     (value, characters.len())
 }
 
-pub(super) fn skip_query_string(characters: &[char], start: usize) -> usize {
+fn skip_query_string(characters: &[char], start: usize, no_backslash_escapes: bool) -> usize {
     let mut index = start + 1;
     let mut escaped = false;
     while index < characters.len() {
         let character = characters[index];
         if escaped {
             escaped = false;
-        } else if character == '\\' {
+        } else if character == '\\' && !no_backslash_escapes {
             escaped = true;
         } else if character == '\'' {
             if characters.get(index + 1) == Some(&'\'') {
