@@ -456,21 +456,25 @@ impl Parser {
             return self.numeric_default(column_type).map(Some);
         }
         if self.at("<string>") && is_character_type(column_type) {
-            self.keyword("<string>")?;
-            let value = self.literals.next().ok_or("missing DEFAULT literal")?;
-            if !value
-                .chars()
-                .all(|character| (' '..='~').contains(&character) && character != '\'')
-            {
-                return Err("unmodeled observed CREATE string default".into());
-            }
-            return Ok(Some(if is_text_type(kind) {
-                text_expression_default(&value)
-            } else {
-                quote_string_literal(&value)
-            }));
+            return self.string_default(kind).map(Some);
         }
         Err("unmodeled observed CREATE default".into())
+    }
+
+    fn string_default(&mut self, kind: &str) -> Result<String, String> {
+        self.keyword("<string>")?;
+        let value = self.literals.next().ok_or("missing DEFAULT literal")?;
+        let printable = value
+            .chars()
+            .all(|character| (' '..='~').contains(&character) && character != '\'');
+        if !printable {
+            return Err("unmodeled observed CREATE string default".into());
+        }
+        Ok(if is_text_type(kind) {
+            text_expression_default(&value)
+        } else {
+            quote_string_literal(&value)
+        })
     }
 
     fn numeric_default(&mut self, column_type: &str) -> Result<String, String> {
