@@ -37,20 +37,7 @@ pub(super) fn parse(sql: &str) -> Result<TableOperation, String> {
             require_names(&tokens, &[2, 4], 5)?;
             Ok(TableOperation::Rename)
         }
-        "TRUNCATE" => {
-            require_keywords(&tokens, &quoted, &[(0, "TRUNCATE")])?;
-            let name = if tokens
-                .get(1)
-                .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
-            {
-                require_keywords(&tokens, &quoted, &[(1, "TABLE")])?;
-                2
-            } else {
-                1
-            };
-            require_names(&tokens, &[name], name + 1)?;
-            Ok(TableOperation::Truncate)
-        }
+        "TRUNCATE" => parse_truncate(&tokens, &quoted),
         _ => Err("not a modeled table lifecycle operation".into()),
     }
 }
@@ -68,6 +55,21 @@ fn parse_drop(tokens: &[String], quoted: &[bool]) -> Result<TableOperation, Stri
     };
     require_names(tokens, &[name], name + 1)?;
     Ok(TableOperation::Drop { if_exists })
+}
+
+fn parse_truncate(tokens: &[String], quoted: &[bool]) -> Result<TableOperation, String> {
+    require_keywords(tokens, quoted, &[(0, "TRUNCATE")])?;
+    let name = if tokens
+        .get(1)
+        .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
+    {
+        require_keywords(tokens, quoted, &[(1, "TABLE")])?;
+        2
+    } else {
+        1
+    };
+    require_names(tokens, &[name], name + 1)?;
+    Ok(TableOperation::Truncate)
 }
 
 fn require_keywords(
@@ -113,11 +115,10 @@ pub(super) fn render(operation: &DdlOperation) -> Result<DdlTransformation, Stri
         .as_ref()
         .ok_or("missing table operation AST")?
     {
-        TableOperation::Drop { if_exists } => format!(
-            "DROP TABLE {} `{name}`",
-            if *if_exists { "IF EXISTS" } else { "" }
-        )
-        .replace("TABLE  ", "TABLE "),
+        TableOperation::Drop { if_exists } => {
+            let guard = if *if_exists { "IF EXISTS " } else { "" };
+            format!("DROP TABLE {guard}`{name}`")
+        }
         TableOperation::Rename => format!(
             "RENAME TABLE `{name}` TO `{}`",
             operation
@@ -140,20 +141,31 @@ pub(super) fn observe(
     let names = super::affected_tables(operation);
     let tables = names
         .iter()
-        .map(|name| {
-            let definition = snapshot
-                .inventory
-                .tables
-                .iter()
-                .find(|table| table.name == *name);
-            let runtime = snapshot.table_runtime.get(*name).map(|runtime| {
-                json!({
-                    "row_count":runtime.row_count, "auto_increment":runtime.auto_increment,
-                })
-            });
-            json!({"name":name, "definition":definition, "runtime":runtime})
-        })
+        .map(|name| table_definition_runtime(snapshot, name))
         .collect::<Vec<_>>();
+    let (indexes, keys, triggers) = related_metadata(snapshot, &names);
+    serde_json::to_string(
+        &json!({"tables":tables,"indexes":indexes,"foreign_keys":keys,"triggers":triggers}),
+    )
+    .map_err(|error| format!("table operation state: {error}"))
+}
+
+fn table_definition_runtime(snapshot: &SemanticSchemaSnapshot, name: &str) -> serde_json::Value {
+    let definition = snapshot
+        .inventory
+        .tables
+        .iter()
+        .find(|table| table.name == name);
+    let runtime = snapshot.table_runtime.get(name).map(
+        |runtime| json!({"row_count":runtime.row_count, "auto_increment":runtime.auto_increment}),
+    );
+    json!({"name":name, "definition":definition, "runtime":runtime})
+}
+
+fn related_metadata(
+    snapshot: &SemanticSchemaSnapshot,
+    names: &[&str],
+) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
     let mut indexes = snapshot
         .inventory
         .indexes
@@ -179,10 +191,7 @@ pub(super) fn observe(
         .filter(|trigger| names.contains(&trigger.table.as_str()))
         .collect::<Vec<_>>();
     triggers.sort_by_key(|trigger| (&trigger.table, &trigger.name));
-    serde_json::to_string(
-        &json!({"tables":tables,"indexes":indexes,"foreign_keys":keys,"triggers":triggers}),
-    )
-    .map_err(|error| format!("table operation state: {error}"))
+    (json!(indexes), json!(keys), json!(triggers))
 }
 
 pub(super) fn expected(
@@ -194,37 +203,57 @@ pub(super) fn expected(
         .as_ref()
         .ok_or("missing table operation AST")?;
     let name = &operation.primary_object;
-    let Some(table) = target
+    if !target
         .inventory
         .tables
         .iter()
-        .find(|table| table.name == *name)
-    else {
+        .any(|table| table.name == *name)
+    {
         return match ast {
             TableOperation::Drop { if_exists: true } => observe(target, operation),
             _ => Err(format!("table operation source `{name}` is missing")),
         };
-    };
+    }
+    validate_source_table(target, name)?;
+    let mut expected = target.clone();
+    apply_operation(&mut expected, operation, ast)?;
+    observe(&expected, operation)
+}
+
+fn validate_source_table(snapshot: &SemanticSchemaSnapshot, name: &str) -> Result<(), String> {
+    let table = snapshot
+        .inventory
+        .tables
+        .iter()
+        .find(|table| table.name == name)
+        .ok_or_else(|| format!("table operation source `{name}` is missing"))?;
     if table.table_type != "BASE TABLE" || table.engine.as_deref() != Some("InnoDB") {
         return Err("table lifecycle requires an InnoDB base table".into());
     }
-    if !target.table_runtime.contains_key(name) {
+    if !snapshot.table_runtime.contains_key(name) {
         return Err(format!("table `{name}` lacks exact runtime metadata"));
     }
-    let mut expected = target.clone();
+    Ok(())
+}
+
+fn apply_operation(
+    snapshot: &mut SemanticSchemaSnapshot,
+    operation: &DdlOperation,
+    ast: &TableOperation,
+) -> Result<(), String> {
+    let name = &operation.primary_object;
     match ast {
-        TableOperation::Drop { .. } => drop_table(&mut expected, name)?,
+        TableOperation::Drop { .. } => drop_table(snapshot, name),
         TableOperation::Rename => rename_table(
-            &mut expected,
+            snapshot,
             name,
             operation
                 .secondary_object
                 .as_deref()
                 .ok_or("missing rename destination")?,
-        )?,
-        TableOperation::Truncate => truncate_table(&mut expected, name)?,
+        ),
+        TableOperation::Truncate => truncate_table(snapshot, name),
     }
-    observe(&expected, operation)
 }
 
 fn ensure_no_external_references(
