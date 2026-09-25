@@ -7,13 +7,22 @@ use super::*;
 
 const TABLE_DEFINITION_KEYWORDS: [&str; 4] = ["PRIMARY", "UNIQUE", "KEY", "CONSTRAINT"];
 
-pub(super) fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
-    let sql = remove_ordinary_comments(sql)?;
-    let (tokens, quoted) = tokenize_ddl_with_quoted_flags(&sql)?;
+#[cfg(test)]
+fn parse(sql: &str) -> Result<ParsedCreateTableAst, String> {
+    parse_with_mode(sql, SourceSqlMode(None))
+}
+
+pub(super) fn parse_with_mode(
+    sql: &str,
+    mode: SourceSqlMode,
+) -> Result<ParsedCreateTableAst, String> {
+    let sql = remove_ordinary_comments_with_mode(sql, mode)?;
+    let no_escapes = mode.0.is_some_and(|bits| bits & (1 << 20) != 0);
+    let (tokens, quoted) = tokenize_ddl_with_quoted_flags_mode(&sql, no_escapes)?;
     let mut parser = Parser {
         tokens,
         quoted,
-        literals: extract_single_quoted_literals(&sql)?.into_iter(),
+        literals: extract_single_quoted_literals_with_mode(&sql, mode)?.into_iter(),
         position: 0,
     };
     parser.keyword("CREATE")?;
@@ -464,12 +473,6 @@ impl Parser {
     fn string_default(&mut self, kind: &str) -> Result<String, String> {
         self.keyword("<string>")?;
         let value = self.literals.next().ok_or("missing DEFAULT literal")?;
-        let printable = value
-            .chars()
-            .all(|character| (' '..='~').contains(&character) && character != '\'');
-        if !printable {
-            return Err("unmodeled observed CREATE string default".into());
-        }
         Ok(if is_text_type(kind) {
             text_expression_default(&value)
         } else {
@@ -634,7 +637,10 @@ pub(crate) fn current_timestamp_for(column_type: &str) -> String {
     }
 }
 
-pub(super) fn remove_ordinary_comments(sql: &str) -> Result<String, String> {
+pub(super) fn remove_ordinary_comments_with_mode(
+    sql: &str,
+    mode: SourceSqlMode,
+) -> Result<String, String> {
     let sql = strip_leading_ordinary_ddl_comments(sql)?;
     let chars = sql.chars().collect::<Vec<_>>();
     let mut result = String::new();
@@ -644,10 +650,25 @@ pub(super) fn remove_ordinary_comments(sql: &str) -> Result<String, String> {
         let ch = chars[position];
         if let Some(delimiter) = quote {
             if ch == '\\' && delimiter == '\'' {
-                return Err("escaped observed CREATE strings are unsupported".into());
+                let no_escapes = mode.no_backslash_escapes()?;
+                if !no_escapes {
+                    result.push(ch);
+                    position += 1;
+                    let escaped = chars
+                        .get(position)
+                        .ok_or("unterminated CREATE string escape")?;
+                    result.push(*escaped);
+                    position += 1;
+                    continue;
+                }
             }
             result.push(ch);
             if ch == delimiter {
+                if chars.get(position + 1) == Some(&delimiter) {
+                    result.push(delimiter);
+                    position += 2;
+                    continue;
+                }
                 quote = None;
             }
             position += 1;

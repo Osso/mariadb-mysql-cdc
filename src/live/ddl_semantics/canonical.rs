@@ -437,8 +437,8 @@ pub(crate) fn expected_create_table_post_state(
                     ),
                 };
                 let (default_value, generated_default) =
-                    expected_create_column_default(column.default_sql.as_deref());
-                crate::inventory::ColumnInventory {
+                    expected_create_column_default(column.default_sql.as_deref())?;
+                Ok::<_, String>(crate::inventory::ColumnInventory {
                     name: column.name.clone(),
                     ordinal_position: (index + 1) as u32,
                     column_type: if data_type == "enum" {
@@ -454,9 +454,9 @@ pub(crate) fn expected_create_table_post_state(
                     extra: expected_create_column_extra(column, generated_default),
                     comment: column.comment.clone(),
                     generated: None,
-                }
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, String>>()?,
     };
     let mut indexes = ast
         .indexes
@@ -511,32 +511,92 @@ pub(crate) fn expected_create_table_post_state(
 /// The `COLUMN_DEFAULT` MySQL 8 reports for a rendered CREATE default, and whether MySQL marks
 /// it `DEFAULT_GENERATED`: `CURRENT_TIMESTAMP[(6)]` and the TEXT expression default
 /// `(_utf8mb4'...')` are generated; quoted literals are reported bare.
-fn expected_create_column_default(default_sql: Option<&str>) -> (Option<String>, bool) {
+#[cfg(test)]
+mod source_string_default_tests {
+    use super::*;
+
+    #[test]
+    fn text_default_metadata_preserves_double_quote_and_pattern_slashes() {
+        let value = "A\"\\%\\_B";
+        let rendered = super::super::transform::text_expression_default(value);
+        assert_eq!(
+            expected_create_column_default(Some(&rendered)).unwrap(),
+            (Some("_utf8mb4\\'A\"\\\\\\\\%\\\\\\\\_B\\'".into()), true),
+        );
+        assert_eq!(
+            expected_added_column_default("text", Some(value)),
+            (
+                Some("_utf8mb4\\'A\"\\\\\\\\%\\\\\\\\_B\\'".into()),
+                "DEFAULT_GENERATED".into()
+            ),
+        );
+        assert_eq!(
+            expected_added_column_default("varchar(80)", Some(value)),
+            (Some(value.into()), String::new()),
+        );
+    }
+
+    #[test]
+    fn canonical_defaults_match_mysql_metadata_for_decoded_controls_and_quotes() {
+        let value = "A\0\n\r\t\u{0008}\u{001a}'\\B";
+        let rendered = super::super::transform::text_expression_default(value);
+        let metadata = "_utf8mb4\\'A\\\\0\\\\n\\\\r\t\u{0008}\\\\Z\\\\\\'\\\\\\\\B\\'";
+        assert_eq!(
+            expected_create_column_default(Some(&rendered)).unwrap(),
+            (Some(metadata.into()), true)
+        );
+        assert_eq!(
+            expected_added_column_default("text", Some(value)),
+            (Some(metadata.into()), "DEFAULT_GENERATED".into())
+        );
+        assert_eq!(
+            expected_create_column_default(Some("'A\\0\\n\\r\\t\\b\\Z''\\\\B'")).unwrap(),
+            (Some(value.into()), false)
+        );
+    }
+}
+
+fn expected_create_column_default(
+    default_sql: Option<&str>,
+) -> Result<(Option<String>, bool), String> {
     let Some(default_sql) = default_sql else {
-        return (None, false);
+        return Ok((None, false));
     };
     if default_sql.eq_ignore_ascii_case("NULL") {
-        return (None, false);
+        return Ok((None, false));
     }
     if default_sql
         .get(..17)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CURRENT_TIMESTAMP"))
     {
-        return (Some(default_sql.to_string()), true);
+        return Ok((Some(default_sql.to_string()), true));
     }
     if let Some(literal) = default_sql
         .strip_prefix("(_utf8mb4'")
         .and_then(|rest| rest.strip_suffix("')"))
     {
-        return (Some(format!("_utf8mb4\\'{literal}\\'")), true);
+        let value = super::transform::extract_single_quoted_literals_with_mode(
+            &format!("'{literal}'"),
+            super::super::query_charset_context::SourceSqlMode(Some(0)),
+        )?
+        .remove(0);
+        return Ok((
+            Some(super::transform::mysql_text_default_metadata(&value)),
+            true,
+        ));
     }
     if let Some(literal) = default_sql
         .strip_prefix('\'')
         .and_then(|rest| rest.strip_suffix('\''))
     {
-        return (Some(literal.replace("''", "'")), false);
+        let value = super::transform::extract_single_quoted_literals_with_mode(
+            &format!("'{literal}'"),
+            super::super::query_charset_context::SourceSqlMode(Some(0)),
+        )?
+        .remove(0);
+        return Ok((Some(value), false));
     }
-    (Some(default_sql.to_string()), false)
+    Ok((Some(default_sql.to_string()), false))
 }
 
 fn expected_create_column_extra(
@@ -562,7 +622,7 @@ fn expected_added_column_default(
 ) -> (Option<String>, String) {
     match default_value {
         Some(value) if super::transform::is_text_type(data_type) => (
-            Some(format!("_utf8mb4\\'{value}\\'")),
+            Some(super::transform::mysql_text_default_metadata(value)),
             "DEFAULT_GENERATED".to_string(),
         ),
         other => (other.map(str::to_string), String::new()),

@@ -14,6 +14,19 @@ pub struct QueryCharsetContext {
     /// None means the status variable was absent, not an empty/default mapping.
     /// Each pair is (source charset's primary collation ID, selected collation ID).
     pub character_set_collations: Option<Vec<(u16, u16)>>,
+    /// Q_SQL_MODE_CODE, preserved verbatim for immutable DDL interpretation.
+    pub sql_mode: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SourceSqlMode(pub Option<u64>);
+
+impl SourceSqlMode {
+    pub fn no_backslash_escapes(self) -> Result<bool, String> {
+        self.0
+            .map(|bits| bits & (1 << 20) != 0)
+            .ok_or_else(|| "backslash-bearing DDL requires QueryEvent SQL_MODE".to_string())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +121,10 @@ pub fn decode_query_charset_context(bytes: &[u8]) -> Result<QueryCharsetContext,
         }
         seen[usize::from(tag)] = true;
         match tag {
+            1 => {
+                let bytes = cursor.take(8)?;
+                context.sql_mode = Some(u64::from_le_bytes(bytes.try_into().unwrap()));
+            }
             4 => {
                 context.charset = Some(QueryCharsetIds {
                     client: cursor.u16()?,
@@ -129,7 +146,7 @@ fn skip_known_variable(cursor: &mut Cursor<'_>, tag: u8, offset: usize) -> Resul
         0 | 3 | 10 => {
             cursor.take(4)?;
         }
-        1 | 9 | 129 => {
+        9 | 129 => {
             cursor.take(8)?;
         }
         7 => {
@@ -180,6 +197,7 @@ mod tests {
             }),
             database_collation: Some(224),
             character_set_collations: Some(vec![(8, 8), (45, 2347)]),
+            sql_mode: None,
         };
         for bytes in [
             [mapping.as_slice(), &charset, &database].concat(),
@@ -187,6 +205,21 @@ mod tests {
         ] {
             assert_eq!(decode_query_charset_context(&bytes), Ok(expected.clone()));
         }
+    }
+
+    #[test]
+    fn captures_sql_mode_from_tag_one_in_either_field_order() {
+        let mode = 0x0000_0000_0010_0000_u64;
+        for bytes in [
+            [&[1][..], &mode.to_le_bytes(), &[8, 224, 0]].concat(),
+            [&[8, 224, 0][..], &[1], &mode.to_le_bytes()].concat(),
+        ] {
+            assert_eq!(
+                decode_query_charset_context(&bytes).unwrap().sql_mode,
+                Some(mode)
+            );
+        }
+        assert_eq!(decode_query_charset_context(&[]).unwrap().sql_mode, None);
     }
 
     #[test]

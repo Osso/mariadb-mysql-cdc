@@ -5,9 +5,9 @@ use super::ddl_replay_journal::{
     replay_action,
 };
 use super::ddl_semantics::{
-    DdlSemanticEvidence, DdlSemanticInventory, LiveDdlSemanticInventory, parse_ddl_operation,
+    DdlSemanticEvidence, DdlSemanticInventory, LiveDdlSemanticInventory,
     supports_assistant_reply_reports_create, supports_automatic_index_ddl,
-    supports_automatic_semantic_recovery, supports_production_alter_table,
+    supports_automatic_semantic_recovery,
 };
 use super::{
     ApplyBinlogConfig, ApplyBinlogError, QuarantineRecorder, RecordingQuarantine,

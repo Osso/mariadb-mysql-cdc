@@ -31,6 +31,31 @@ fn admitted_source_only_release_move_procedures_bypass_qualification_rejection()
 }
 
 #[test]
+fn escaped_ddl_requires_captured_mode_for_automatic_admission_and_keeps_raw_sql() {
+    let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n'";
+    let event_with_mode = |status_variables| {
+        BinlogEvent::QueryEvent(QueryEvent {
+            thread_id: 1,
+            duration: 0,
+            error_code: 0,
+            status_variables,
+            database_name: "fixture_cdc".into(),
+            sql_statement: sql.into(),
+        })
+    };
+    let state = StructuredEventState::new(Some("fixture_cdc".into()));
+    let header = event_header(2, 180);
+    let event = event_with_mode(Vec::new());
+    assert!(
+        automatically_handled_ddl_event("source", "bin.000001", &header, &event, &state).is_none()
+    );
+    let event = event_with_mode([&[1][..], &0_u64.to_le_bytes()].concat());
+    let (_, ddl) = automatically_handled_ddl_event("source", "bin.000001", &header, &event, &state)
+        .expect("captured mode admits decoded DDL");
+    assert_eq!(ddl.raw_sql, sql);
+}
+
+#[test]
 fn source_query_ddl_is_replayed_as_checkpointed_statement() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;

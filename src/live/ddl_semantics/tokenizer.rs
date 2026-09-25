@@ -123,11 +123,21 @@ pub(crate) fn tokenize_ddl(sql: &str) -> Result<Vec<String>, String> {
 pub(crate) fn tokenize_ddl_with_quoted_flags(
     sql: &str,
 ) -> Result<(Vec<String>, Vec<bool>), String> {
-    let characters = sql.chars().collect::<Vec<_>>();
-    tokenize_ddl_characters(&characters)
+    tokenize_ddl_with_quoted_flags_mode(sql, false)
 }
 
-fn tokenize_ddl_characters(characters: &[char]) -> Result<(Vec<String>, Vec<bool>), String> {
+pub(crate) fn tokenize_ddl_with_quoted_flags_mode(
+    sql: &str,
+    no_backslash_escapes: bool,
+) -> Result<(Vec<String>, Vec<bool>), String> {
+    let characters = sql.chars().collect::<Vec<_>>();
+    tokenize_ddl_characters(&characters, no_backslash_escapes)
+}
+
+fn tokenize_ddl_characters(
+    characters: &[char],
+    no_backslash_escapes: bool,
+) -> Result<(Vec<String>, Vec<bool>), String> {
     let mut tokens = Vec::new();
     let mut quoted_flags = Vec::new();
     let mut index = 0;
@@ -135,7 +145,7 @@ fn tokenize_ddl_characters(characters: &[char]) -> Result<(Vec<String>, Vec<bool
         let quoted = characters
             .get(index)
             .is_some_and(|character| matches!(character, '`' | '"'));
-        let (token, next_index) = tokenize_ddl_step(characters, index)?;
+        let (token, next_index) = tokenize_ddl_step(characters, index, no_backslash_escapes)?;
         if let Some(token) = token {
             tokens.push(token);
             quoted_flags.push(quoted);
@@ -145,7 +155,11 @@ fn tokenize_ddl_characters(characters: &[char]) -> Result<(Vec<String>, Vec<bool
     Ok((tokens, quoted_flags))
 }
 
-fn tokenize_ddl_step(characters: &[char], index: usize) -> Result<(Option<String>, usize), String> {
+fn tokenize_ddl_step(
+    characters: &[char],
+    index: usize,
+    no_backslash_escapes: bool,
+) -> Result<(Option<String>, usize), String> {
     let character = characters[index];
     if character.is_whitespace() {
         return Ok((None, index + 1));
@@ -153,7 +167,7 @@ fn tokenize_ddl_step(characters: &[char], index: usize) -> Result<(Option<String
     if let Some(next) = tokenize_comment(characters, index)? {
         return Ok((None, next));
     }
-    if let Some(token) = tokenize_quoted(characters, index)? {
+    if let Some(token) = tokenize_quoted(characters, index, no_backslash_escapes)? {
         return Ok((Some(token.0), token.1));
     }
     if let Some(token) = tokenize_punctuation_or_word(characters, index) {
@@ -175,7 +189,11 @@ fn tokenize_comment(characters: &[char], index: usize) -> Result<Option<usize>, 
     Ok(None)
 }
 
-fn tokenize_quoted(characters: &[char], index: usize) -> Result<Option<(String, usize)>, String> {
+fn tokenize_quoted(
+    characters: &[char],
+    index: usize,
+    no_backslash_escapes: bool,
+) -> Result<Option<(String, usize)>, String> {
     let character = characters[index];
     if matches!(character, '`' | '"') {
         return Ok(Some(quoted_token(characters, index, character)?));
@@ -183,7 +201,7 @@ fn tokenize_quoted(characters: &[char], index: usize) -> Result<Option<(String, 
     if character == '\'' {
         return Ok(Some((
             "<string>".to_string(),
-            skip_quoted_string(characters, index, character)?,
+            skip_quoted_string(characters, index, character, no_backslash_escapes)?,
         )));
     }
     Ok(None)
@@ -257,14 +275,19 @@ fn quoted_token(characters: &[char], start: usize, quote: char) -> Result<(Strin
     Err("unterminated quoted DDL identifier".to_string())
 }
 
-fn skip_quoted_string(characters: &[char], start: usize, quote: char) -> Result<usize, String> {
+fn skip_quoted_string(
+    characters: &[char],
+    start: usize,
+    quote: char,
+    no_backslash_escapes: bool,
+) -> Result<usize, String> {
     let mut index = start + 1;
     let mut escaped = false;
     while index < characters.len() {
         let character = characters[index];
         if escaped {
             escaped = false;
-        } else if character == '\\' {
+        } else if character == '\\' && !no_backslash_escapes {
             escaped = true;
         } else if character == quote {
             if characters.get(index + 1) == Some(&quote) {

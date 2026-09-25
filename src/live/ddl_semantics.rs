@@ -1,4 +1,5 @@
 use super::ddl_replay_journal::DdlFamily;
+use super::query_charset_context::{SourceSqlMode, decode_query_charset_context};
 use crate::inventory::{
     InventoryConfig, MariaDbInventoryReader, SourceMasterCoordinate, build_inventory,
 };
@@ -29,11 +30,14 @@ pub use model::{DdlObjectKind, DdlSemanticEvidence};
 use parser::parse_modeled_index_ddl;
 #[cfg(test)]
 pub(super) use parser::parse_simple_index_ddl;
-pub use parser::{parse_ddl_operation, supports_automatic_index_ddl};
+pub use parser::{
+    parse_ddl_operation, parse_ddl_operation_with_mode, supports_automatic_index_ddl,
+};
 #[cfg(test)]
 pub(super) use tokenizer::tokenize_ddl;
 pub use transform::{
-    DDL_TRANSFORMATION_VERSION, DdlTransformation, render_modeled_index_ddl,
+    DDL_TRANSFORMATION_VERSION, DdlTransformation, parse_fixture_create_table_with_mode,
+    parse_production_alter_table_ast_with_mode, render_modeled_index_ddl,
     supports_assistant_reply_reports_create, supports_drop_columns_if_exists,
     supports_drop_procedure, supports_drop_trigger_if_exists, supports_fixture_create_table,
     supports_production_alter_table, supports_rename_columns_if_exists,
@@ -45,6 +49,13 @@ pub use transform::{
 
 pub trait DdlSemanticInventory {
     fn transform_sql(&self, sql: &str) -> Result<DdlTransformation, String>;
+    fn transform_sql_with_query_context(
+        &self,
+        sql: &str,
+        _status_variables: &[u8],
+    ) -> Result<DdlTransformation, String> {
+        self.transform_sql(sql)
+    }
 
     fn capture_evidence(
         &self,
@@ -63,7 +74,21 @@ pub trait DdlSemanticInventory {
     }
 
     fn observe_target_state(&self, sql: &str) -> Result<String, String>;
+    fn observe_target_state_with_evidence(
+        &self,
+        sql: &str,
+        _evidence: &DdlSemanticEvidence,
+    ) -> Result<String, String> {
+        self.observe_target_state(sql)
+    }
     fn expected_target_state(&self, sql: &str) -> Result<String, String>;
+    fn expected_target_state_with_evidence(
+        &self,
+        sql: &str,
+        _evidence: &DdlSemanticEvidence,
+    ) -> Result<String, String> {
+        self.expected_target_state(sql)
+    }
 }
 
 pub struct LiveDdlSemanticInventory {
@@ -282,6 +307,13 @@ fn translate_alter_ddl(
 }
 
 fn parse_semantic_operation(sql: &str) -> Result<DdlOperation, String> {
+    parse_semantic_operation_with_mode(sql, SourceSqlMode(None))
+}
+
+fn parse_semantic_operation_with_mode(
+    sql: &str,
+    mode: SourceSqlMode,
+) -> Result<DdlOperation, String> {
     if supports_assistant_reply_reports_create(sql) {
         return Ok(DdlOperation {
             family: DdlFamily::Table,
@@ -306,7 +338,7 @@ fn parse_semantic_operation(sql: &str) -> Result<DdlOperation, String> {
             table_operation_ast: None,
         });
     }
-    parse_ddl_operation(sql)
+    parse_ddl_operation_with_mode(sql, mode)
 }
 
 fn capture_specialized_evidence(
@@ -357,18 +389,109 @@ fn requires_translated_evidence(sql: &str, operation: &DdlOperation) -> bool {
 
 impl DdlSemanticInventory for LiveDdlSemanticInventory {
     fn transform_sql(&self, sql: &str) -> Result<DdlTransformation, String> {
-        if supports_production_alter_table(sql) {
-            let ast = transform::parse_production_alter_table_ast(sql)?;
+        self.transform_sql_mode(sql, SourceSqlMode(None))
+    }
+
+    fn transform_sql_with_query_context(
+        &self,
+        sql: &str,
+        status_variables: &[u8],
+    ) -> Result<DdlTransformation, String> {
+        let mode = SourceSqlMode(
+            decode_query_charset_context(status_variables)
+                .map_err(|error| format!("DDL SQL mode context: {error}"))?
+                .sql_mode,
+        );
+        self.transform_sql_mode(sql, mode)
+    }
+
+    fn capture_evidence(
+        &self,
+        sql: &str,
+        source_file: &str,
+        event_end_position: u64,
+    ) -> Result<DdlSemanticEvidence, String> {
+        let operation = parse_semantic_operation(sql)?;
+        self.capture_evidence_for_operation(sql, source_file, event_end_position, &operation)
+    }
+
+    fn capture_evidence_with_query_context(
+        &self,
+        sql: &str,
+        source_file: &str,
+        event_end_position: u64,
+        status_variables: &[u8],
+    ) -> Result<DdlSemanticEvidence, String> {
+        let context = decode_query_charset_context(status_variables)
+            .map_err(|error| format!("DDL SQL mode context: {error}"))?;
+        let mode = SourceSqlMode(context.sql_mode);
+        let operation = parse_semantic_operation_with_mode(sql, mode)?;
+        let mut evidence =
+            self.capture_query_evidence(sql, source_file, event_end_position, &operation, context)?;
+        record_source_sql_mode(&mut evidence, mode)?;
+        Ok(evidence)
+    }
+
+    fn observe_target_state(&self, sql: &str) -> Result<String, String> {
+        let operation = parse_semantic_operation(sql)?;
+        self.observe_operation(&operation)
+    }
+
+    fn observe_target_state_with_evidence(
+        &self,
+        sql: &str,
+        evidence: &DdlSemanticEvidence,
+    ) -> Result<String, String> {
+        let mode = source_mode_from_evidence(evidence)?;
+        let operation = parse_semantic_operation_with_mode(sql, mode)?;
+        self.observe_operation(&operation)
+    }
+
+    fn expected_target_state(&self, sql: &str) -> Result<String, String> {
+        self.expected_create_state(&parse_semantic_operation(sql)?)
+    }
+
+    fn expected_target_state_with_evidence(
+        &self,
+        sql: &str,
+        evidence: &DdlSemanticEvidence,
+    ) -> Result<String, String> {
+        let mode = source_mode_from_evidence(evidence)?;
+        self.expected_create_state(&parse_semantic_operation_with_mode(sql, mode)?)
+    }
+}
+
+impl LiveDdlSemanticInventory {
+    fn expected_create_state(&self, operation: &DdlOperation) -> Result<String, String> {
+        let ast = operation
+            .create_table_ast
+            .as_ref()
+            .ok_or_else(|| "blocked recovery requires modeled CREATE TABLE".to_string())?;
+        let defaults = canonical::explicit_create_table_defaults(ast).ok_or_else(|| {
+            "blocked recovery requires explicit CREATE TABLE defaults".to_string()
+        })?;
+        canonical::expected_create_table_post_state(ast, &defaults, &self.target_schema)
+    }
+
+    fn transform_sql_mode(
+        &self,
+        sql: &str,
+        mode: SourceSqlMode,
+    ) -> Result<DdlTransformation, String> {
+        if let Ok(ast) = transform::parse_production_alter_table_ast_with_mode(sql, mode) {
             let alters_default = ast.clauses.iter().any(|clause| {
                 matches!(clause, model::ParsedAlterClause::AlterColumnDefault { .. })
             });
             if alters_default {
-                let operation = parse_semantic_operation(sql)?;
+                let operation = parse_semantic_operation_with_mode(sql, mode)?;
                 let before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
                 let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
                 validate_target_snapshot_consistency(&before, &after)?;
-                return transform::transform_production_alter_table_with_target(sql, &before);
+                return transform::transform_production_alter_table_with_target_mode(
+                    sql, &before, mode,
+                );
             }
+            return transform::transform_production_alter_table_with_mode(sql, mode);
         }
         let target_objects = if supports_drop_procedure(sql) {
             self.read_target_procedure_names()?
@@ -383,55 +506,63 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         translate_ddl(sql, &target_objects)
     }
 
-    fn capture_evidence(
+    fn capture_evidence_for_operation(
         &self,
         sql: &str,
         source_file: &str,
         event_end_position: u64,
+        operation: &DdlOperation,
     ) -> Result<DdlSemanticEvidence, String> {
-        let operation = parse_semantic_operation(sql)?;
-        let target_before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+        let target_before = Self::snapshot(&self.target, &self.target_schema, operation)?;
         if let Some(evidence) = capture_early_evidence(
             self,
             sql,
-            &operation,
+            operation,
             &target_before,
             source_file,
             event_end_position,
         ) {
             return evidence;
         }
-        if requires_translated_evidence(sql, &operation) {
-            return capture_translated_evidence(self, &operation, &target_before);
+        if requires_translated_evidence(sql, operation) {
+            return capture_translated_evidence(self, operation, &target_before);
         }
         capture_source_evidence(
             self,
-            &operation,
+            operation,
             &target_before,
             source_file,
             event_end_position,
         )
     }
 
-    fn capture_evidence_with_query_context(
+    fn capture_query_evidence(
         &self,
         sql: &str,
         source_file: &str,
         event_end_position: u64,
-        status_variables: &[u8],
+        operation: &DdlOperation,
+        context: super::query_charset_context::QueryCharsetContext,
     ) -> Result<DdlSemanticEvidence, String> {
-        let operation = parse_semantic_operation(sql)?;
         let Some(ast) = operation.create_table_ast.as_ref() else {
-            return self.capture_evidence(sql, source_file, event_end_position);
+            return self.capture_evidence_for_operation(
+                sql,
+                source_file,
+                event_end_position,
+                operation,
+            );
         };
         if ast.character_set.is_none() && ast.collation.is_none() {
             return self.capture_database_default_create(&operation);
         }
         if ast.character_set.as_deref() != Some("utf8mb4") || ast.collation.is_some() {
-            return self.capture_evidence(sql, source_file, event_end_position);
+            return self.capture_evidence_for_operation(
+                sql,
+                source_file,
+                event_end_position,
+                operation,
+            );
         }
-        let context = super::query_charset_context::decode_query_charset_context(status_variables)
-            .map_err(|error| format!("historical CREATE charset context: {error}"))?;
         let overrides = context
             .character_set_collations
             .ok_or_else(|| "historical CREATE charset override map is absent".to_string())?;
@@ -462,10 +593,9 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
         Ok(evidence)
     }
 
-    fn observe_target_state(&self, sql: &str) -> Result<String, String> {
-        let operation = parse_semantic_operation(sql)?;
-        let before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
-        let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+    fn observe_operation(&self, operation: &DdlOperation) -> Result<String, String> {
+        let before = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        let after = Self::snapshot(&self.target, &self.target_schema, operation)?;
         validate_target_snapshot_consistency(&before, &after)?;
         if let Some(ast) = operation.create_table_ast.as_ref() {
             self.validate_observed_create_foreign_keys(ast, &before)?;
@@ -474,19 +604,7 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
             self.validate_observed_json_alias_checks(ast, &before)?;
             self.validate_observed_alter_foreign_keys(ast)?;
         }
-        observe_operation_state(&before, &operation)
-    }
-
-    fn expected_target_state(&self, sql: &str) -> Result<String, String> {
-        let operation = parse_semantic_operation(sql)?;
-        let ast = operation
-            .create_table_ast
-            .as_ref()
-            .ok_or_else(|| "blocked recovery requires modeled CREATE TABLE".to_string())?;
-        let defaults = canonical::explicit_create_table_defaults(ast).ok_or_else(|| {
-            "blocked recovery requires explicit CREATE TABLE defaults".to_string()
-        })?;
-        canonical::expected_create_table_post_state(ast, &defaults, &self.target_schema)
+        observe_operation_state(&before, operation)
     }
 }
 
@@ -607,6 +725,87 @@ impl LiveDdlSemanticInventory {
         .map_err(|error| format!("failed to read CREATE foreign-key actions: {error}"))?;
         canonical::validate_create_foreign_keys(ast, &self.target_schema, &keys)
     }
+}
+
+#[cfg(test)]
+mod source_mode_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn evidence_keeps_immutable_mode_and_rejects_missing_or_malformed_mode() {
+        let mut evidence = DdlSemanticEvidence {
+            transformation_version: "v1".into(),
+            generated_sql: None,
+            canonical_ast: "{}".into(),
+            pre_state: "before".into(),
+            expected_post_state: "after".into(),
+        };
+        record_source_sql_mode(&mut evidence, SourceSqlMode(Some(1 << 20))).unwrap();
+        assert_eq!(
+            source_mode_from_evidence(&evidence).unwrap(),
+            SourceSqlMode(Some(1 << 20))
+        );
+        evidence.canonical_ast = "{}".into();
+        assert_eq!(
+            source_mode_from_evidence(&evidence).unwrap(),
+            SourceSqlMode(None)
+        );
+        evidence.canonical_ast = r#"{"source_sql_mode":"invalid"}"#.into();
+        assert!(source_mode_from_evidence(&evidence).is_err());
+        record_source_sql_mode(&mut evidence, SourceSqlMode(Some(0))).unwrap();
+        assert!(validate_replayed_source_mode(&evidence, &[1, 0, 0, 16, 0, 0, 0, 0, 0]).is_err());
+        assert!(validate_replayed_source_mode(&evidence, &[]).is_err());
+        assert!(validate_replayed_source_mode(&evidence, &[1, 0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
+    }
+}
+
+pub(crate) fn validate_replayed_source_mode(
+    evidence: &DdlSemanticEvidence,
+    status_variables: &[u8],
+) -> Result<(), String> {
+    let ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast)
+        .map_err(|error| format!("DDL evidence JSON: {error}"))?;
+    // Pre-SQL_MODE journal rows have no persisted mode. Their parser still rejects
+    // backslash-bearing literals without source context.
+    if ast.get("source_sql_mode").is_none() {
+        return Ok(());
+    }
+    let expected = source_mode_from_evidence(evidence)?;
+    let actual = SourceSqlMode(
+        decode_query_charset_context(status_variables)
+            .map_err(|error| format!("replayed DDL SQL_MODE: {error}"))?
+            .sql_mode,
+    );
+    if expected != actual {
+        return Err("replayed DDL source SQL_MODE differs from prepared evidence".into());
+    }
+    Ok(())
+}
+
+fn record_source_sql_mode(
+    evidence: &mut DdlSemanticEvidence,
+    mode: SourceSqlMode,
+) -> Result<(), String> {
+    let mut ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast)
+        .map_err(|error| format!("DDL evidence JSON: {error}"))?;
+    ast["source_sql_mode"] = serde_json::json!(mode.0);
+    evidence.canonical_ast =
+        serde_json::to_string(&ast).map_err(|error| format!("DDL evidence JSON: {error}"))?;
+    Ok(())
+}
+
+fn source_mode_from_evidence(evidence: &DdlSemanticEvidence) -> Result<SourceSqlMode, String> {
+    let ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast)
+        .map_err(|error| format!("DDL evidence JSON: {error}"))?;
+    let Some(mode) = ast.get("source_sql_mode") else {
+        return Ok(SourceSqlMode(None));
+    };
+    if mode.is_null() {
+        return Ok(SourceSqlMode(None));
+    }
+    mode.as_u64()
+        .map(|bits| SourceSqlMode(Some(bits)))
+        .ok_or_else(|| "DDL evidence has invalid source SQL_MODE".to_string())
 }
 
 fn record_query_charset_context(

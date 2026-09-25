@@ -1,8 +1,8 @@
 use super::*;
 use crate::live::ddl_semantics::{
     DDL_TRANSFORMATION_VERSION, DdlTransformation, supports_drop_columns_if_exists,
-    supports_drop_procedure, supports_drop_trigger_if_exists, supports_fixture_create_table,
-    supports_rename_columns_if_exists, supports_source_only_release_move_procedure_create,
+    supports_drop_procedure, supports_drop_trigger_if_exists, supports_rename_columns_if_exists,
+    supports_source_only_release_move_procedure_create,
 };
 use crate::target::SqlStatement;
 
@@ -230,8 +230,21 @@ where
         header: _,
         event,
     } = input;
-    let create_table_requires_evidence_sql = parse_ddl_operation(&ddl_event.raw_sql)
-        .is_ok_and(|operation| operation.create_table_ast.is_some());
+    let mode = match event {
+        BinlogEvent::QueryEvent(query) => {
+            super::super::query_charset_context::decode_query_charset_context(
+                &query.status_variables,
+            )
+            .map(|context| super::super::query_charset_context::SourceSqlMode(context.sql_mode))
+            .map_err(|error| {
+                ApplyBinlogError::DdlBlocked(format!("DDL SQL mode context: {error}"))
+            })?
+        }
+        _ => super::super::query_charset_context::SourceSqlMode(None),
+    };
+    let create_table_requires_evidence_sql =
+        super::super::ddl_semantics::parse_ddl_operation_with_mode(&ddl_event.raw_sql, mode)
+            .is_ok_and(|operation| operation.create_table_ast.is_some());
     let (transformation, mut evidence) = if create_table_requires_evidence_sql {
         let evidence =
             capture_automatic_ddl_evidence(semantic_inventory, journal, ddl_event, event)?;
@@ -248,7 +261,13 @@ where
             evidence,
         )
     } else {
-        let transformation = match semantic_inventory.transform_sql(&ddl_event.raw_sql) {
+        let status_variables = match event {
+            BinlogEvent::QueryEvent(query) => query.status_variables.as_slice(),
+            _ => &[],
+        };
+        let transformation = match semantic_inventory
+            .transform_sql_with_query_context(&ddl_event.raw_sql, status_variables)
+        {
             Ok(transformation) => transformation,
             Err(error) => {
                 ensure_translation_pending(journal, ddl_event)?;
@@ -369,7 +388,7 @@ where
     J: DdlReplayJournal,
 {
     let observed = semantic_inventory
-        .observe_target_state(&ddl_event.raw_sql)
+        .observe_target_state_with_evidence(&ddl_event.raw_sql, evidence)
         .map_err(ApplyBinlogError::Statement)?;
     if observed == evidence.expected_post_state {
         return Ok(());
@@ -418,7 +437,8 @@ where
     J: DdlReplayJournal,
     S: DdlSemanticInventory,
 {
-    let evidence = verified_blocked_recovery_evidence(journal, semantic_inventory, ddl_event)?;
+    let evidence =
+        verified_blocked_recovery_evidence(journal, semantic_inventory, ddl_event, event)?;
     journal
         .recover_blocked(ddl_event, &evidence)
         .map_err(ApplyBinlogError::Statement)?;
@@ -640,17 +660,19 @@ fn verified_blocked_recovery_evidence<J, S>(
     journal: &J,
     semantic_inventory: &S,
     ddl_event: &DdlEvent,
+    event: &BinlogEvent,
 ) -> Result<DdlSemanticEvidence, ApplyBinlogError>
 where
     J: DdlReplayJournal,
     S: DdlSemanticInventory,
 {
     let mut evidence = read_blocked_evidence(journal, ddl_event)?;
+    validate_source_mode_on_replay(&evidence, event)?;
     let expected = semantic_inventory
-        .expected_target_state(&ddl_event.raw_sql)
+        .expected_target_state_with_evidence(&ddl_event.raw_sql, &evidence)
         .map_err(ApplyBinlogError::Statement)?;
     let observed = semantic_inventory
-        .observe_target_state(&ddl_event.raw_sql)
+        .observe_target_state_with_evidence(&ddl_event.raw_sql, &evidence)
         .map_err(ApplyBinlogError::Statement)?;
     if observed != expected {
         return Err(ApplyBinlogError::DdlBlocked(format!(
@@ -660,6 +682,18 @@ where
     }
     evidence.expected_post_state = expected;
     Ok(evidence)
+}
+
+fn validate_source_mode_on_replay(
+    evidence: &DdlSemanticEvidence,
+    event: &BinlogEvent,
+) -> Result<(), ApplyBinlogError> {
+    let status = match event {
+        BinlogEvent::QueryEvent(query) => query.status_variables.as_slice(),
+        _ => &[],
+    };
+    super::super::ddl_semantics::validate_replayed_source_mode(evidence, status)
+        .map_err(ApplyBinlogError::DdlBlocked)
 }
 
 fn read_blocked_evidence(
@@ -700,8 +734,9 @@ where
                 ddl_event.binlog_file, ddl_event.event_start_position
             ))
         })?;
+    validate_source_mode_on_replay(&evidence, event)?;
     let observed = semantic_inventory
-        .observe_target_state(&ddl_event.raw_sql)
+        .observe_target_state_with_evidence(&ddl_event.raw_sql, &evidence)
         .map_err(ApplyBinlogError::Statement)?;
     match reconcile_prepared(&evidence, &observed) {
         PreparedReconciliation::ProvenApplied => {
@@ -761,11 +796,17 @@ pub(super) fn automatically_handled_ddl_event_with_source_only_support<'a>(
     let BinlogEvent::QueryEvent(query) = event else {
         return None;
     };
-    let supports_transformation =
-        supports_ddl_transformation(&query.sql_statement, supports_source_only_procedure);
+    let source_mode =
+        super::super::query_charset_context::decode_query_charset_context(&query.status_variables)
+            .ok()
+            .map(|context| super::super::query_charset_context::SourceSqlMode(context.sql_mode));
+    let supports_transformation = source_mode.is_some_and(|mode| {
+        supports_ddl_transformation(&query.sql_statement, supports_source_only_procedure, mode)
+    });
     let supported_by_runtime = supports_transformation
         || (crate::statement::is_automatically_handled_schema_change(&query.sql_statement)
-            && supports_automatic_ddl_operation(&query.sql_statement));
+            && source_mode
+                .is_some_and(|mode| supports_automatic_ddl_operation(&query.sql_statement, mode)));
     let contains_disallowed_qualification = !supports_source_only_procedure
         && query_contains_qualified_identifier(&query.sql_statement);
     let can_handle_automatically = state.should_apply_schema(&query.database_name)
@@ -780,21 +821,30 @@ pub(super) fn automatically_handled_ddl_event_with_source_only_support<'a>(
     ))
 }
 
-fn supports_ddl_transformation(source_sql: &str, supports_source_only_procedure: bool) -> bool {
+fn supports_ddl_transformation(
+    source_sql: &str,
+    supports_source_only_procedure: bool,
+    mode: super::super::query_charset_context::SourceSqlMode,
+) -> bool {
     supports_assistant_reply_reports_create(source_sql)
-        || supports_fixture_create_table(source_sql)
-        || supports_production_alter_table(source_sql)
+        || super::super::ddl_semantics::parse_fixture_create_table_with_mode(source_sql, mode)
+            .is_ok()
+        || super::super::ddl_semantics::parse_production_alter_table_ast_with_mode(source_sql, mode)
+            .is_ok()
         || supports_source_only_procedure
         || supports_drop_procedure(source_sql)
         || supports_drop_trigger_if_exists(source_sql)
         || supports_drop_columns_if_exists(source_sql)
         || supports_rename_columns_if_exists(source_sql)
-        || parse_ddl_operation(source_sql)
+        || super::super::ddl_semantics::parse_ddl_operation_with_mode(source_sql, mode)
             .is_ok_and(|operation| operation.table_operation_ast.is_some())
 }
 
-fn supports_automatic_ddl_operation(source_sql: &str) -> bool {
-    parse_ddl_operation(source_sql)
+fn supports_automatic_ddl_operation(
+    source_sql: &str,
+    mode: super::super::query_charset_context::SourceSqlMode,
+) -> bool {
+    super::super::ddl_semantics::parse_ddl_operation_with_mode(source_sql, mode)
         .ok()
         .is_some_and(|operation| {
             if operation.family == DdlFamily::Index {

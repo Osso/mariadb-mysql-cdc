@@ -7,7 +7,9 @@ use super::model::{
 use super::tokenizer::{
     ddl_contains_comments, split_one_leading_mysql_line_comment,
     strip_leading_ordinary_ddl_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags,
+    tokenize_ddl_with_quoted_flags_mode,
 };
+use crate::live::query_charset_context::SourceSqlMode;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -164,8 +166,15 @@ fn is_exact_seen_column(column: &ParsedAddColumnAst, name: &str, comment: &str) 
 }
 
 pub fn transform_production_alter_table(source_sql: &str) -> Result<DdlTransformation, String> {
+    transform_production_alter_table_with_mode(source_sql, SourceSqlMode(None))
+}
+
+pub fn transform_production_alter_table_with_mode(
+    source_sql: &str,
+    mode: SourceSqlMode,
+) -> Result<DdlTransformation, String> {
     let (leading_comment, _) = split_one_leading_mysql_line_comment(source_sql);
-    let ast = parse_production_alter_table_ast(source_sql)?;
+    let ast = parse_production_alter_table_ast_with_mode(source_sql, mode)?;
     if !supports_parsed_production_alter(&ast) {
         return Err("unsupported production ALTER TABLE shape".to_string());
     }
@@ -184,8 +193,16 @@ pub(crate) fn transform_production_alter_table_with_target(
     source_sql: &str,
     target: &super::model::SemanticSchemaSnapshot,
 ) -> Result<DdlTransformation, String> {
+    transform_production_alter_table_with_target_mode(source_sql, target, SourceSqlMode(None))
+}
+
+pub(crate) fn transform_production_alter_table_with_target_mode(
+    source_sql: &str,
+    target: &super::model::SemanticSchemaSnapshot,
+    mode: SourceSqlMode,
+) -> Result<DdlTransformation, String> {
     let (leading_comment, _) = split_one_leading_mysql_line_comment(source_sql);
-    let ast = parse_production_alter_table_ast(source_sql)?;
+    let ast = parse_production_alter_table_ast_with_mode(source_sql, mode)?;
     if !supports_parsed_production_alter(&ast) {
         return Err("unsupported production ALTER TABLE shape".to_string());
     }
@@ -384,7 +401,7 @@ pub(crate) fn normalize_alter_column_default(
         Some(ParsedColumnDefault::Null) if nullable => Ok((None, false)),
         Some(ParsedColumnDefault::Null) => Err("NOT NULL column cannot have DEFAULT NULL".into()),
         Some(ParsedColumnDefault::String(value)) if is_text_type(data_type) => {
-            Ok((Some(format!("_utf8mb4\\'{value}\\'")), true))
+            Ok((Some(mysql_text_default_metadata(value)), true))
         }
         Some(ParsedColumnDefault::String(value))
             if matches!(
@@ -499,7 +516,23 @@ fn render_add_key(index: &ParsedIndexAst) -> String {
 }
 
 fn quote_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        match character {
+            '\0' => quoted.push_str("\\0"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            '\u{0008}' => quoted.push_str("\\b"),
+            '\u{001a}' => quoted.push_str("\\Z"),
+            '\\' => quoted.push_str("\\\\"),
+            '\'' => quoted.push_str("''"),
+            '"' => quoted.push_str("\\\""),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn render_column_encoding(character_set: Option<&str>, collation: Option<&str>) -> String {
@@ -512,7 +545,14 @@ fn render_column_encoding(character_set: Option<&str>, collation: Option<&str>) 
 }
 
 pub fn parse_fixture_create_table(source_sql: &str) -> Result<ParsedCreateTableAst, String> {
-    let ast = observed_create::parse(source_sql)?;
+    parse_fixture_create_table_with_mode(source_sql, SourceSqlMode(None))
+}
+
+pub fn parse_fixture_create_table_with_mode(
+    source_sql: &str,
+    mode: SourceSqlMode,
+) -> Result<ParsedCreateTableAst, String> {
+    let ast = observed_create::parse_with_mode(source_sql, mode)?;
     // This legacy event still has a separate exact-hash evidence contract.
     if ast.name.eq_ignore_ascii_case("assistant_reply_reports") {
         return Err("assistant_reply_reports CREATE is admitted only by exact hash".into());
@@ -542,6 +582,23 @@ pub fn render_modeled_index_ddl(
         .key_parts
         .iter()
         .map(render_modeled_index_key_part)
+pub(crate) fn mysql_text_default_metadata(value: &str) -> String {
+    let mut metadata = String::from("_utf8mb4\\'");
+    for character in value.chars() {
+        match character {
+            '\0' => metadata.push_str("\\\\0"),
+            '\n' => metadata.push_str("\\\\n"),
+            '\r' => metadata.push_str("\\\\r"),
+            '\u{001a}' => metadata.push_str("\\\\Z"),
+            '\\' => metadata.push_str("\\\\\\\\"),
+            '\'' => metadata.push_str("\\\\\\'"),
+            other => metadata.push(other),
+        }
+    }
+    metadata.push_str("\\'");
+    metadata
+}
+
         .collect::<Vec<_>>()
         .join(",");
     let tokens = super::tokenizer::tokenize_ddl(source_sql)?;
@@ -1812,16 +1869,17 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
         !ddl_contains_comments(strip_leading_ordinary_ddl_comments(statement_sql)?);
     let stripped;
     let source_sql = if ordinary_comments {
-        stripped = observed_create::remove_ordinary_comments(source_sql)?;
+        stripped = observed_create::remove_ordinary_comments_with_mode(source_sql, mode)?;
         stripped.as_str()
     } else {
         statement_sql
     };
-    let (tokens, quoted_flags) = tokenize_ddl_with_quoted_flags(source_sql)?;
+    let no_escapes = mode.0.is_some_and(|bits| bits & (1 << 20) != 0);
+    let (tokens, quoted_flags) = tokenize_ddl_with_quoted_flags_mode(source_sql, no_escapes)?;
     require_keyword(&tokens, 0, "ALTER")?;
     require_keyword(&tokens, 1, "TABLE")?;
     let table = require_identifier(&tokens, 2, "ALTER TABLE name")?;
-    let literals = extract_single_quoted_literals(source_sql)?;
+    let literals = extract_single_quoted_literals_with_mode(source_sql, mode)?;
     let (clauses, algorithm, lock) =
         parse_production_alter_body(&tokens, &quoted_flags, &table, literals)?;
     if ordinary_comments
@@ -1850,6 +1908,13 @@ pub fn parse_production_alter_table_ast(source_sql: &str) -> Result<ParsedAlterT
 
 fn parse_production_alter_body(
     tokens: &[String],
+    parse_production_alter_table_ast_with_mode(source_sql, SourceSqlMode(None))
+}
+
+pub fn parse_production_alter_table_ast_with_mode(
+    source_sql: &str,
+    mode: SourceSqlMode,
+) -> Result<ParsedAlterTableAst, String> {
     quoted_flags: &[bool],
     table: &str,
     literals: Vec<String>,
@@ -2520,16 +2585,94 @@ fn parse_string_default_literal(
     let value = literals
         .next()
         .ok_or_else(|| "string DEFAULT literal is missing".to_string())?;
-    if !value
-        .chars()
-        .all(|character| (' '..='~').contains(&character) && !matches!(character, '\'' | '\\'))
-    {
-        return Err(format!("unmodeled string default literal {value:?}"));
-    }
     Ok(value)
 }
 
-fn extract_single_quoted_literals(source_sql: &str) -> Result<Vec<String>, String> {
+#[cfg(test)]
+mod sql_mode_literal_tests {
+    use super::*;
+    use crate::live::query_charset_context::SourceSqlMode;
+
+    #[test]
+    fn rejects_mixed_non_ascii_and_escaped_source_literal_without_charset_proof() {
+        assert!(extract_single_quoted_literals_with_mode(r"DEFAULT 'é\n'", SourceSqlMode(Some(0))).is_err());
+        assert!(extract_single_quoted_literals_with_mode("DEFAULT 'é'", SourceSqlMode(Some(0))).is_ok());
+    }
+
+    #[test]
+    fn decodes_mysql_escapes_and_preserves_pattern_escapes() {
+        let sql = r#"ALTER TABLE t ADD COLUMN c VARCHAR(80) DEFAULT 'a\0\n\r\t\b\Z\\\'\"\%\_\q''z'"#;
+        assert_eq!(
+            extract_single_quoted_literals_with_mode(sql, SourceSqlMode(Some(0))).unwrap(),
+            vec!["a\0\n\r\t\u{0008}\u{001a}\\'\"\\%\\_q'z"]
+        );
+    }
+
+    #[test]
+    fn create_ast_uses_source_mode_for_string_default() {
+        let sql = r"CREATE TABLE t (id INT PRIMARY KEY, label VARCHAR(40) DEFAULT 'a\n\q') ENGINE=InnoDB";
+        let escaped = parse_fixture_create_table_with_mode(sql, SourceSqlMode(Some(0))).unwrap();
+        let unescaped = parse_fixture_create_table_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        assert_eq!(escaped.columns[1].default_sql.as_deref(), Some("'a\\nq'"));
+        assert_eq!(unescaped.columns[1].default_sql.as_deref(), Some("'a\\\\n\\\\q'"));
+        assert!(parse_fixture_create_table(sql).is_err());
+    }
+
+    #[test]
+    fn rendered_literal_survives_target_backslash_mode() {
+        assert_eq!(
+            quote_string_literal("\0\n\r\t\u{0008}\u{001a}\\'\""),
+            r#"'\0\n\r\t\b\Z\\''\"'"#
+        );
+    }
+
+    #[test]
+    fn no_backslash_mode_preserves_quoted_default_through_ordinary_comments() {
+        let sql = r"/* note */ ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''b'";
+        let ast = parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else { panic!("expected ADD"); };
+        assert_eq!(column.default_value.as_deref(), Some("a\\'b"));
+    }
+
+    #[test]
+    fn no_backslash_mode_handles_slash_before_doubled_quote() {
+        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\''b'";
+        let ast = parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let ParsedAlterClause::AddColumn(column) = &ast.clauses[0] else { panic!("expected ADD"); };
+        assert_eq!(column.default_value.as_deref(), Some("a\\'b"));
+        let operation = super::super::parser::parse_ddl_operation_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        assert!(operation.alter_table_ast.is_some());
+    }
+
+    #[test]
+    fn alter_ast_decodes_source_mode_before_normalizing_default() {
+        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n\q'";
+        let escaped = parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(0))).unwrap();
+        let unescaped = parse_production_alter_table_ast_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap();
+        let default = |ast: ParsedAlterTableAst| match ast.clauses.into_iter().next().unwrap() {
+            ParsedAlterClause::AddColumn(column) => column.default_value.unwrap(),
+            other => panic!("unexpected clause: {other:?}"),
+        };
+        assert_eq!(default(escaped), "a\nq");
+        assert_eq!(default(unescaped), r"a\n\q");
+        assert!(parse_production_alter_table_ast(sql).is_err());
+    }
+
+    #[test]
+    fn no_backslash_mode_preserves_slashes_and_doubled_quotes() {
+        let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n\q b''c'";
+        assert_eq!(
+            extract_single_quoted_literals_with_mode(sql, SourceSqlMode(Some(1 << 20))).unwrap(),
+            vec![r"a\n\q b'c"]
+        );
+        assert!(extract_single_quoted_literals_with_mode(sql, SourceSqlMode(None)).is_err());
+    }
+}
+
+pub(crate) fn extract_single_quoted_literals_with_mode(
+    source_sql: &str,
+    mode: crate::live::query_charset_context::SourceSqlMode,
+) -> Result<Vec<String>, String> {
     let characters = source_sql.chars().collect::<Vec<_>>();
     let mut literals = Vec::new();
     let mut index = 0;
@@ -2554,7 +2697,32 @@ fn extract_single_quoted_literals(source_sql: &str) -> Result<Vec<String>, Strin
                 break;
             }
             if character == '\\' {
-                return Err("backslash-escaped DDL strings require SQL-mode-aware decoding".into());
+                has_source_escape = true;
+                let no_escapes = mode.no_backslash_escapes()?;
+                if no_escapes {
+                    literal.push('\\');
+                    index += 1;
+                    continue;
+                }
+                let escaped = *characters
+                    .get(index + 1)
+                    .ok_or_else(|| "unterminated DDL string escape".to_string())?;
+                match escaped {
+                    '0' => literal.push('\0'),
+                    'n' => literal.push('\n'),
+                    'r' => literal.push('\r'),
+                    't' => literal.push('\t'),
+                    'b' => literal.push('\u{0008}'),
+                    'Z' => literal.push('\u{001a}'),
+                    '\\' | '\'' | '"' => literal.push(escaped),
+                    '%' | '_' => {
+                        literal.push('\\');
+                        literal.push(escaped);
+                    }
+                    other => literal.push(other),
+                }
+                index += 2;
+                continue;
             }
             literal.push(character);
             index += 1;
@@ -2583,6 +2751,8 @@ fn parse_drop_column_clause(
     index: usize,
 ) -> Result<(ParsedAlterClause, usize), String> {
     require_keyword(tokens, index + 1, "COLUMN")?;
+        let mut has_source_escape = false;
+        let mut has_non_ascii = false;
     let if_exists = tokens
         .get(index + 2)
         .is_some_and(|token| token.eq_ignore_ascii_case("IF"));
@@ -2600,9 +2770,13 @@ fn parse_drop_column_clause(
 }
 
 fn parse_drop_index_clause(
+            has_non_ascii |= !character.is_ascii();
     tokens: &[String],
     index: usize,
 ) -> Result<(ParsedAlterClause, usize), String> {
+        if has_source_escape && has_non_ascii {
+            return Err("escaped non-ASCII source literal requires proven client charset".into());
+        }
     require_keyword(tokens, index + 1, "INDEX")?;
     let name = require_identifier(tokens, index + 2, "dropped index")?;
     Ok((

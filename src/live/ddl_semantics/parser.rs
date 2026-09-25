@@ -1,7 +1,10 @@
 use super::super::ddl_replay_journal::DdlFamily;
 use super::model::{DdlObjectKind, DdlOperation, ParsedIndexAst, ParsedIndexKeyPart};
-use super::tokenizer::{ddl_contains_comments, tokenize_ddl};
-use super::transform::{parse_fixture_create_table, parse_production_alter_table_ast};
+use super::tokenizer::{ddl_contains_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags_mode};
+use super::transform::{
+    parse_fixture_create_table_with_mode, parse_production_alter_table_ast_with_mode,
+};
+use crate::live::query_charset_context::SourceSqlMode;
 
 pub fn parse_simple_index_ddl(sql: &str) -> Result<ParsedIndexAst, String> {
     parse_index_ddl(sql, false)
@@ -379,7 +382,15 @@ fn strict_index_identifier(token: Option<&String>, kind: &str) -> Result<String,
 }
 
 pub fn parse_ddl_operation(sql: &str) -> Result<DdlOperation, String> {
-    let tokens = tokenize_ddl(sql)?;
+    parse_ddl_operation_with_mode(sql, SourceSqlMode(None))
+}
+
+pub fn parse_ddl_operation_with_mode(
+    sql: &str,
+    mode: SourceSqlMode,
+) -> Result<DdlOperation, String> {
+    let no_escapes = mode.0.is_some_and(|bits| bits & (1 << 20) != 0);
+    let (tokens, _) = tokenize_ddl_with_quoted_flags_mode(sql, no_escapes)?;
     let keywords = tokens
         .iter()
         .map(|token| token.to_ascii_uppercase())
@@ -400,10 +411,10 @@ pub fn parse_ddl_operation(sql: &str) -> Result<DdlOperation, String> {
         operation.index_ast = Some(parse_simple_index_ddl(sql)?);
     }
     if command == "CREATE" && operation.object_kind == DdlObjectKind::Table {
-        operation.create_table_ast = parse_fixture_create_table(sql).ok();
+        operation.create_table_ast = parse_fixture_create_table_with_mode(sql, mode).ok();
     }
     if command == "ALTER" && operation.object_kind == DdlObjectKind::Table {
-        operation.alter_table_ast = parse_production_alter_table_ast(sql).ok();
+        operation.alter_table_ast = parse_production_alter_table_ast_with_mode(sql, mode).ok();
     }
     if operation.object_kind == DdlObjectKind::Table {
         operation.table_operation_ast = super::table_operations::parse(sql).ok();
