@@ -403,7 +403,7 @@ impl DdlSemanticInventory for LiveDdlSemanticInventory {
             return self.capture_evidence(sql, source_file, event_end_position);
         };
         if ast.character_set.is_none() && ast.collation.is_none() {
-            return self.capture_database_default_create(&operation, status_variables);
+            return self.capture_database_default_create(&operation);
         }
         if ast.character_set.as_deref() != Some("utf8mb4") || ast.collation.is_some() {
             return self.capture_evidence(sql, source_file, event_end_position);
@@ -472,28 +472,30 @@ impl LiveDdlSemanticInventory {
     fn capture_database_default_create(
         &self,
         operation: &DdlOperation,
-        status_variables: &[u8],
     ) -> Result<DdlSemanticEvidence, String> {
-        let context = super::query_charset_context::decode_query_charset_context(status_variables)
-            .map_err(|error| format!("historical CREATE database context: {error}"))?;
-        let id = context
-            .database_collation
-            .ok_or("historical CREATE database collation is absent")?;
-        let mut defaults = self
-            .source
-            .read_collation_identity(id)
-            .map_err(|error| format!("historical database collation identity: {error}"))?;
-        let source_collation = defaults.collation.clone();
-        defaults.collation = crate::sync_schema::canonical_collation(&defaults.collation);
+        // MariaDB resolves omitted CREATE charset against the table's database, not
+        // Q_CHARSET.server or a later source-head schema. Replay uses the target pre-state.
         let before = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        let defaults = self
+            .target
+            .read_schema_defaults(&self.target_schema)
+            .map_err(|error| format!("read target CREATE database defaults: {error}"))?;
+        let repeated_defaults = self
+            .target
+            .read_schema_defaults(&self.target_schema)
+            .map_err(|error| format!("reread target CREATE database defaults: {error}"))?;
         let after = Self::snapshot(&self.target, &self.target_schema, operation)?;
         validate_target_snapshot_consistency(&before, &after)?;
+        if defaults != repeated_defaults {
+            return Err("target CREATE database defaults changed during evidence capture".into());
+        }
         let mut evidence =
             canonical::build_resolved_create_table_evidence(operation, &before, &defaults)?;
         let mut ast: serde_json::Value = serde_json::from_str(&evidence.canonical_ast)
             .map_err(|error| format!("CREATE evidence JSON: {error}"))?;
-        ast["historical_database_collation"] =
-            serde_json::json!({"id": id, "source_collation": source_collation});
+        ast["inherited_database_defaults"] = serde_json::json!({
+            "character_set": defaults.character_set, "collation": defaults.collation,
+        });
         evidence.canonical_ast = serde_json::to_string(&ast).map_err(|error| error.to_string())?;
         Ok(evidence)
     }
