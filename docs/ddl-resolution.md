@@ -5,10 +5,10 @@ The event handler uses one durable DDL control plane:
 
 Automatic admission, runtime barriers, and proof levels are maintained in the
 [DDL transformation matrix](specs/ddl-transformation.md#basic-common-ddl-expansion).
-The common-operation implementation was deployed on September 25, 2026. Real
-MariaDB/MySQL replay harnesses prove its bounded column and table-lifecycle
-slices, including crash/restart reconciliation. The matrix distinguishes that
-proof from unmodeled forms, which remain runtime barriers. Historical details
+Native MariaDB/MySQL replay harnesses prove bounded column and table-lifecycle
+slices, including crash/restart reconciliation. Deployment is not claimed:
+production remains on `2b4238d`. The matrix distinguishes that proof from
+unmodeled forms, which remain runtime barriers. Historical details
 below describe additional narrow slices, including
 strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
