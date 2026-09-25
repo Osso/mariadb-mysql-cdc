@@ -34,7 +34,7 @@ fn assert_operation_cases(cases: &[(&str, DdlFamily, DdlObjectKind, &str, Option
                 index_ast: parse_simple_index_ddl(sql).ok(),
                 create_table_ast: parse_fixture_create_table(sql).ok(),
                 alter_table_ast: parse_production_alter_table_ast(sql).ok(),
-                table_operation_ast: None,
+                table_operation_ast: super::table_operations::parse(sql).ok(),
             },
             "{sql}",
         );
@@ -272,18 +272,15 @@ fn canonical_evidence_covers_every_object_family() {
 }
 
 #[test]
-fn only_complete_index_inventory_is_currently_automatic() {
+fn only_modeled_operations_have_automatic_semantic_recovery() {
     for sql in [
         "CREATE TABLE accounts (id bigint primary key)",
         "ALTER TABLE accounts ADD COLUMN handle varchar(64)",
-        "DROP TABLE accounts",
         "CREATE VIEW active_accounts AS SELECT id FROM accounts",
         "CREATE PROCEDURE refresh_accounts() SELECT 1",
         "CREATE FUNCTION account_count() RETURNS INT RETURN 1",
         "CREATE EVENT expire_accounts ON SCHEDULE EVERY 1 DAY DO SELECT 1",
         "CREATE TRIGGER accounts_bi BEFORE INSERT ON accounts FOR EACH ROW SET NEW.id = NEW.id",
-        "RENAME TABLE accounts TO archived_accounts",
-        "TRUNCATE TABLE accounts",
     ] {
         let operation = parse_ddl_operation(sql).expect(sql);
         assert!(
@@ -294,6 +291,9 @@ fn only_complete_index_inventory_is_currently_automatic() {
     for sql in [
         "CREATE INDEX idx_handle ON accounts (handle)",
         "DROP INDEX idx_handle ON accounts",
+        "DROP TABLE accounts",
+        "RENAME TABLE accounts TO archived_accounts",
+        "TRUNCATE TABLE accounts",
     ] {
         let operation = parse_ddl_operation(sql).expect(sql);
         assert!(
@@ -967,7 +967,11 @@ fn drop_has_explicit_absent_postcondition() {
         &source,
     )
     .expect("drop evidence");
-    assert_eq!(evidence.expected_post_state, canonical_absent_state());
+    let post: serde_json::Value = serde_json::from_str(&evidence.expected_post_state).unwrap();
+    assert!(post["tables"][0]["definition"].is_null());
+    assert!(post["tables"][0]["runtime"].is_null());
+    assert_eq!(post["indexes"], serde_json::json!([]));
+    assert_eq!(post["triggers"], serde_json::json!([]));
 }
 
 #[test]
@@ -980,8 +984,11 @@ fn rename_has_explicit_destination_postcondition() {
         &source,
     )
     .expect("rename evidence");
-    assert!(evidence.expected_post_state.contains("archived_accounts"));
-    assert!(evidence.expected_post_state.contains("absent"));
+    let post: serde_json::Value = serde_json::from_str(&evidence.expected_post_state).unwrap();
+    assert!(post["tables"][0]["definition"].is_null());
+    assert_eq!(post["tables"][1]["definition"]["name"], "archived_accounts");
+    assert_eq!(post["tables"][1]["runtime"]["row_count"], 7);
+    assert_eq!(post["tables"][1]["runtime"]["auto_increment"], 8);
 }
 
 #[test]
