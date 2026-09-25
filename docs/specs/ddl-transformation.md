@@ -41,7 +41,7 @@ exception; their narrower type exclusions are superseded by this matrix.
 |---|---|---|
 | Shared column types (`CREATE TABLE`, `ADD COLUMN`) | Signed/unsigned `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`/`INTEGER`, `BIGINT`; `BOOL`/`BOOLEAN` as `TINYINT`; `DECIMAL`/`NUMERIC`; `FLOAT`; `DOUBLE`/`DOUBLE PRECISION`; `CHAR`, `VARCHAR`, `BINARY`, `VARBINARY`; `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT`; `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB`; `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `YEAR`, and `JSON`. | Type keywords and numeric parameters are unquoted; lengths/precisions are canonical and bounded by the parser. `REAL`, `ZEROFILL`, and other mode-dependent qualifiers remain blocked. |
 | Definitions and defaults | `NULL`/`NOT NULL`; `DEFAULT NULL`; bounded, range-checked numeric literals for numeric types; printable unescaped string defaults for character/text types, including `VARCHAR DEFAULT ''`; `COMMENT` and `AFTER` for ALTER column clauses; existing modeled character-set/collation handling. | Contradictory `NOT NULL DEFAULT NULL`, out-of-range/non-finite defaults, arbitrary expressions, and JSON literal defaults remain blocked. Text literal defaults retain their MySQL expression rendering. |
-| `CREATE TABLE` | Ordinary unqualified `CREATE TABLE` and `CREATE TABLE IF NOT EXISTS` using the shared basic types, subject to existing modeled table options, primary/ordinary/unique index forms, charset/collation evidence, and target-absent proof. | Existing target is not a converged no-op. Unmodeled table, index, constraint, comment, qualification, or option grammar remains pending. |
+| `CREATE TABLE` | Ordinary unqualified `CREATE TABLE` and `CREATE TABLE IF NOT EXISTS` use the shared observed grammar and basic types, subject to modeled table options, primary/ordinary/unique index forms, charset/collation evidence, and target-absent proof. When both table charset and collation are omitted, stable target-database defaults are inherited and recorded as `inherited_database_defaults`. | Existing target is not a converged no-op. The removed fixture/table-specific parser is not an alternate path; only the legacy exact-hash `assistant_reply_reports` no-op admission remains outside the shared grammar. Unmodeled table, index, constraint, comment, qualification, or option grammar remains pending. |
 | `ALTER TABLE` columns | `ADD COLUMN` and ordinary unguarded `MODIFY COLUMN` share the definitions above. `MODIFY` applies only to an existing ordinary non-JSON, non-generated, non-`AUTO_INCREMENT` column and preserves its target position/index references while replacing modeled attributes. Ordinary `RENAME COLUMN old TO new`, `DROP COLUMN`, and their existing conditional forms are admitted from fenced target evidence. | `CHANGE COLUMN`, `ALTER COLUMN SET/DROP DEFAULT`, `FIRST`, generated/JSON/`AUTO_INCREMENT` MODIFY, and unmodeled clause combinations remain blocked. Rename and drop fail closed on ambiguous target state. |
 | Indexes | Existing admitted named ordinary/unique key additions and strict standalone `CREATE INDEX`/`DROP INDEX` rules remain available; ordinary `DROP INDEX` in ALTER is derived from target evidence. | New index/constraint grammar, FK-dependent index changes, and unmodeled key parts/options remain blocked. |
 
@@ -149,8 +149,12 @@ broader DDL coverage and operational proof gaps listed below.
       `utf8mb4` collation through the source collation-ID catalog. The canonical
       AST records that context and target SQL renders an explicit MySQL-compatible
       collation. An absent, malformed, or unsupported context remains
-      `translation_pending`; current schema defaults and a source-coordinate fence
-      are not substitutes.
+      `translation_pending`. When both table charset and collation are omitted,
+      MariaDB's CREATE-in-database behavior is modeled by stable target-database
+      defaults, captured twice around the fenced target pre-state and recorded as
+      `inherited_database_defaults`; no source-head query or source-coordinate
+      charset/default fence is required. Source/target default drift is out of
+      scope.
 - [x] Parser/admission proof covers the observed `kg_comic_facets` CREATE at
       `mysqld-bin.002994:1005806835-1005808327`: 98 targeted tests and a real
       historical `VARCHAR(80)` crash/restart/row-replay harness passed. Production
@@ -255,11 +259,13 @@ The current slice is covered by:
       and exact `DROP TRIGGER IF EXISTS` SQL/no-op behavior, plus the exact-hash source-only
       `CREATE PROCEDURE apply_release_move_purchase_repair` form, target-absence
       evidence, and proven no-op behavior,
-      typed ALTER AST/post-state behavior and rename boundaries, plus the strict
-      fixture and observed CREATE TABLE grammars/typed AST/rendering, historical
-      QueryEvent charset-context decoding, fenced source-default evidence where
-      applicable, explicit charset/collation SQL, deterministic post-state with
-      sorted indexes, exact-grammar rejection, and runtime-admission contract.
+      typed ALTER AST/post-state behavior and rename boundaries, plus the shared
+      observed CREATE TABLE grammar/typed AST/rendering, historical QueryEvent
+      charset-context decoding where a table charset is explicit, inherited
+      target-database defaults recorded as `inherited_database_defaults` when
+      both table defaults are omitted, explicit charset/collation SQL,
+      deterministic post-state with sorted indexes, exact-grammar rejection, and
+      runtime-admission contract.
 - [x] `src/live/structured_stream/tests/ddl_replay.rs` — the stream executes
       generated SQL and preserves journal/checkpoint ordering for supported
       fixtures; the exact `content_sections_events_raw` barrier emits one unguarded
@@ -293,6 +299,18 @@ The current slice is covered by:
       final supported-event checkpoint; an unsupported
       unique-prefix option remains `translation_pending` with zero target
       execution and unchanged checkpoint.
+- [x] `scripts/cdc-integration-harness.py --scenario curated-strip-sale-alter-pending-replay` —
+      real MariaDB 11.4/MySQL 8 pending-row promotion with immutable identity,
+      crash/restart, schema order/default checks, JSON CHECK enforcement, and
+      following DML.
+- [x] `scripts/cdc-integration-harness.py --scenario basic-scalar-create-add-pending-replay` —
+      real MariaDB 11.4/MySQL 8 replay of 32 shared scalar definitions across
+      CREATE and ADD, with default/width/fractional-time/binary-text-blob metadata
+      and following DML.
+- [x] `scripts/cdc-integration-harness.py --scenario basic-column-operations-pending-replay` —
+      real MariaDB 11.4/MySQL 8 pending-row promotion through MODIFY, RENAME, and
+      DROP column/index operations, crash/restart, persisted journal evidence,
+      metadata/default/order/index checks, and following DML.
 - [x] `src/live/ddl_semantics/transform/observed_create.rs` tests and the
       `reader_memory_*` tests in `src/live/ddl_semantics/tests.rs` — typed AST for
       the three `reader_memory` CREATE fixtures (inline primary key, `BIGINT
@@ -332,16 +350,17 @@ The current slice is covered by:
       SQL/evidence, rejection of changed shape, and replay promotion from the
       durable pending row.
 
-Existing proof covers the earlier observed ALTER/CREATE slices and narrow DDL
-paths. The basic common DDL matrix has implementation and focused parser/semantic
-coverage on this branch, but its real MariaDB/MySQL replay, recovery, deployment,
-and live-stream proof remain open. It does not prove full `ALTER TABLE`, all
-`CREATE TABLE` syntax, a complete compatibility matrix, or deployment safety.
+Existing proof covers earlier observed ALTER/CREATE slices and narrow DDL paths.
+The basic common DDL matrix now has bounded real MariaDB 11.4/MySQL 8 replay and
+crash/restart proof for sale ALTER, 32 scalar CREATE/ADD definitions, and column
+operations. Deployment, final integration gating, and live-stream proof remain
+open. This does not prove full `ALTER TABLE`, all `CREATE TABLE` syntax, a
+complete compatibility matrix, or deployment safety.
 
 ## Known gaps (current cycle)
 
-- [ ] Complete disposable MariaDB/MySQL replay and recovery proof for the basic
-      common DDL matrix before treating it as deployment-ready.
+- [ ] Complete final integration and deployment gates for the basic common DDL
+      matrix before treating it as deployment-ready.
 - [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
       retired manual DDL ledger without restoring manual replay.
 - [ ] Restore the pre-existing `production-alter-table` harness path, then run

@@ -100,13 +100,10 @@ state narrower basic-column exclusions, the matrix supersedes them. Automatic
 DDL admission also covers an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
 when every key part/option is modeled and the operation is proven not to support
-or depend on a foreign key; a strict unqualified fixture `CREATE TABLE` grammar
-(the harness exercises `accounts`) whose identifiers match
-`[A-Za-z_][A-Za-z0-9_]*` after tokenization, with backtick quoting allowed,
-comments/double quotes/qualification rejected, one or more `BIGINT` or
-`VARCHAR(positive canonical decimal length)` `NOT NULL` columns with at least one
-inline `PRIMARY KEY`, zero or more one-column named ordinary `KEY` items, and
-`ENGINE=InnoDB` with an optional semicolon; production-observed source-only `CREATE PROCEDURE` form for the exact
+or depend on a foreign key; the shared observed `CREATE TABLE` grammar from the
+[basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion--implementation-in-progress),
+which replaced the fixture/table-specific parser; production-observed source-only
+`CREATE PROCEDURE` form for the exact
 unqualified routine identity `apply_release_move_purchase_repair`, admitted only
 by a private exact-hash allowlist. Public documentation intentionally omits raw
 production procedure bodies, `DEFINER` hosts, and event coordinates. Admission
@@ -150,12 +147,16 @@ unlisted DDL families. In particular, `FIRST`, `ALTER COLUMN SET/DROP DEFAULT`,
 mode-dependent `REAL`/`ZEROFILL`, arbitrary expressions, and unmodeled
 `ALGORITHM`/`LOCK` variants remain unsupported unless separately listed.
 
-For admitted `CREATE TABLE`, source schema charset/collation are read only between
-exact event-coordinate fences and persisted in immutable evidence; generated SQL
-renders them explicitly as `DEFAULT CHARACTER SET ... COLLATE ...`. The target
-must be absent before and after capture, and the exact observed post-state must
-match the deterministic expected post-state; canonical table evidence sorts
-indexes by index name. The admitted source-only procedure form is a target no-op: target evidence must
+For admitted `CREATE TABLE`, an explicit `DEFAULT CHARSET=utf8mb4` without
+`COLLATE` uses QueryEvent collation context. When both table defaults are omitted,
+MariaDB CREATE-in-database behavior resolves them from stable target-database
+defaults, captured twice around fenced target pre-state and recorded as
+`inherited_database_defaults`; no unfenced source-head query or source-coordinate
+charset/default fence is required. Source/target default drift remains out of
+scope. Generated SQL renders resolved defaults explicitly. The target must be
+absent before and after capture, and the exact observed post-state must match the
+deterministic expected post-state; canonical table evidence sorts indexes by
+index name. The admitted source-only procedure form is a target no-op: target evidence must
 prove `apply_release_move_purchase_repair` absent before and after capture,
 target SQL remains absent, and any data effects arrive through subsequent source
 ROW/FULL events in source order. An existing `translation_pending` row promotes

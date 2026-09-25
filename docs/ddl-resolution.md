@@ -53,31 +53,31 @@ The basic-matrix type/definition coverage is specified once in the
 This section records historical charset evidence and observed extensions; its
 narrower type exclusions do not reduce the matrix.
 
-The bounded observed `CREATE TABLE IF NOT EXISTS` grammar admits ordinary leading
-block comments and inline `--` comments; unsigned `MEDIUMINT`, `SMALLINT`, and
-`INT`, signed `TINYINT(1)`, canonical `VARCHAR(n)`, and restricted `ENUM`
-members; explicit `NULL`/`NOT NULL`, observed `DEFAULT NULL`, integer defaults,
-non-null `INT UNSIGNED AUTO_INCREMENT`, and nullable timestamp `ON UPDATE`
-forms. It admits primary, ordinary, and unique keys, InnoDB, and `DEFAULT
-CHARSET=utf8mb4`. Enum member spelling is preserved. Backslash-escaped enum
-strings and unmodeled defaults or options remain unsupported. It uses the event
-AST, so a historical `VARCHAR(80)` remains `VARCHAR(80)` even if the current
-source table is later `VARCHAR(128)`.
+The shared observed `CREATE TABLE` grammar is the sole generic CREATE parser;
+the former fixture/table-specific parser was deleted. The legacy exact-hash
+`assistant_reply_reports` no-op admission remains a separate bounded exception.
+The shared grammar admits the basic matrix and separately listed observed
+extensions. It uses the event AST, so a historical `VARCHAR(80)` remains
+`VARCHAR(80)` even if the current source table is later `VARCHAR(128)`.
 
-When such a CREATE omits `COLLATE`, runtime decodes MariaDB QueryEvent
-`Q_CHARACTER_SET_COLLATIONS` and resolves the historical utf8mb4 collation via
-the source collation-ID catalog before rendering explicit MySQL-compatible SQL.
-It records the resolved context in canonical evidence. Missing, malformed, or
-unsupported context fails closed; current source defaults and a source-coordinate
-fence cannot reconstruct it. The target table must be absent. An existing target
-`CREATE TABLE IF NOT EXISTS` is not a converged no-op in this slice.
+When a CREATE supplies `DEFAULT CHARSET=utf8mb4` but omits `COLLATE`, runtime
+decodes MariaDB QueryEvent `Q_CHARACTER_SET_COLLATIONS` and resolves the
+historical utf8mb4 collation through the source collation-ID catalog before
+rendering explicit MySQL-compatible SQL. Missing, malformed, or unsupported
+context fails closed. When both table charset and collation are omitted, MariaDB
+CREATE-in-database semantics resolve them from stable target-database defaults;
+runtime captures those defaults twice around the fenced target pre-state, rejects
+changes during capture, and records `inherited_database_defaults` in canonical
+evidence. It does not query an unfenced source head or require a source-coordinate
+charset/default fence. Source/target default drift remains out of scope. The
+target table must be absent. An existing target `CREATE TABLE IF NOT EXISTS` is
+not a converged no-op in this slice.
 
-Parser and semantic rendering tests cover earlier storefront CREATE additions.
-The common basic DDL matrix is still awaiting real-database replay and recovery
-proof; no deployment claim follows from its implementation. The historical
-context requirement and target-absent gate apply unchanged. Unsupported CREATE
-statements remain `translation_pending`; their journal row, coordinate, and
-checkpoint must not be edited manually.
+The basic common DDL matrix has bounded real MariaDB 11.4/MySQL 8 replay and
+crash/restart proof for sale ALTER, 32 scalar CREATE/ADD definitions, and column
+operations. Deployment and final integration gates remain pending. Unsupported
+CREATE statements remain `translation_pending`; their journal row, coordinate,
+and checkpoint must not be edited manually.
 
 ### Curated-strip persisted-pending replay harnesses
 
@@ -303,11 +303,13 @@ production `FLOAT UNSIGNED NOT NULL DEFAULT 0` form. A neighboring unique-prefix
 option remains `translation_pending` with no target index and no checkpoint
 advancement. Targeted unit and structured-stream tests also cover the exact
 `releases` `idx_downloads_sort` DROP/ADD rebuild with directional key parts and
-`ALGORITHM=INPLACE, LOCK=NONE`. Its disposable MariaDB/MySQL harness extension
-is blocked by a pre-existing `production-alter-table` scenario timeout. No
-integration, deployment, recovery, or live-stream success is claimed. This is implemented-slice proof only. The basic common DDL matrix remains
-in integration proof; neither this scenario nor focused tests establish full
-`ALTER TABLE`, a complete compatibility matrix, deployment, or live recovery.
+`ALGORITHM=INPLACE, LOCK=NONE`. The green `curated-strip-sale-alter-pending-replay`,
+`basic-scalar-create-add-pending-replay`, and
+`basic-column-operations-pending-replay` scenarios add bounded real
+MariaDB/MySQL pending-row promotion, crash/restart, metadata/defaults, and
+following-DML proof for the common matrix. Deployment and final integration gates
+remain pending; this does not establish full `ALTER TABLE`, a complete
+compatibility matrix, deployment, or live recovery.
 
 ## Transformation/evidence failure
 
