@@ -839,8 +839,7 @@ fn supports_ddl_transformation(
     supports_assistant_reply_reports_create(source_sql)
         || super::super::ddl_semantics::parse_fixture_create_table_with_mode(source_sql, mode)
             .is_ok()
-        || super::super::ddl_semantics::parse_production_alter_table_ast_with_mode(source_sql, mode)
-            .is_ok()
+        || super::super::ddl_semantics::supports_production_alter_table_with_mode(source_sql, mode)
         || supports_source_only_procedure
         || supports_drop_procedure(source_sql)
         || supports_drop_trigger_if_exists(source_sql)

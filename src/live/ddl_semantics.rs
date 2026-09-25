@@ -40,11 +40,12 @@ pub use transform::{
     parse_production_alter_table_ast_with_mode, render_modeled_index_ddl,
     supports_assistant_reply_reports_create, supports_drop_columns_if_exists,
     supports_drop_procedure, supports_drop_trigger_if_exists, supports_fixture_create_table,
-    supports_production_alter_table, supports_rename_columns_if_exists,
-    supports_source_only_release_move_procedure_create, transform_assistant_reply_reports_create,
-    transform_drop_columns_if_exists, transform_drop_procedure, transform_drop_trigger_if_exists,
-    transform_generated_schema_ddl, transform_production_alter_table,
-    transform_rename_columns_if_exists, transform_source_only_release_move_procedure_create,
+    supports_production_alter_table, supports_production_alter_table_with_mode,
+    supports_rename_columns_if_exists, supports_source_only_release_move_procedure_create,
+    transform_assistant_reply_reports_create, transform_drop_columns_if_exists,
+    transform_drop_procedure, transform_drop_trigger_if_exists, transform_generated_schema_ddl,
+    transform_production_alter_table, transform_rename_columns_if_exists,
+    transform_source_only_release_move_procedure_create,
 };
 
 pub trait DdlSemanticInventory {

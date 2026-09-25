@@ -46,7 +46,11 @@ struct RenameColumnClause {
 }
 
 pub fn supports_production_alter_table(source_sql: &str) -> bool {
-    parse_production_alter_table_ast(source_sql)
+    supports_production_alter_table_with_mode(source_sql, SourceSqlMode(None))
+}
+
+pub fn supports_production_alter_table_with_mode(source_sql: &str, mode: SourceSqlMode) -> bool {
+    parse_production_alter_table_ast_with_mode(source_sql, mode)
         .is_ok_and(|ast| supports_parsed_production_alter(&ast))
 }
 
