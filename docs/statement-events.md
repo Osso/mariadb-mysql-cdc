@@ -15,7 +15,12 @@ whitespace, trailing semicolons, line endings, and other source components;
 strip, skip, normalization, rejection, and process-lifecycle behavior is
 cataloged in the [query preservation audit](query-preservation-audit.md).
 
-Automatic DDL admission currently has these narrow slices:
+Automatic DDL admission has the bounded slices in the authoritative
+[DDL transformation matrix](specs/ddl-transformation.md#basic-common-ddl-expansion),
+including required `CHANGE [COLUMN]`, `FIRST`/`AFTER`, literal `ALTER COLUMN
+SET/DROP DEFAULT`, and strict single-table `DROP [IF EXISTS]`, one-pair `RENAME`,
+and `TRUNCATE [TABLE]` operations. The current implementation is not deployed;
+its disposable database harness is in progress. Additional historical slices:
 
 - explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE
   INDEX` or `DROP INDEX` whose key parts and options are completely modeled and
@@ -139,9 +144,9 @@ deployment, recovery, or live-stream proof. The rename translator removes
 `IF EXISTS`; absent old columns become a proven no-op,
 while old/new coexistence fails closed.
 
-Other table DDL and unsupported `ALTER TABLE` forms, views, other routine DDL,
-events, unsupported trigger DDL, `RENAME`, `TRUNCATE`, non-admitted `DROP` forms, database/schema DDL,
-all other procedure bodies or names, plain drops for other names,
+Unmodeled table DDL and unsupported `ALTER TABLE` forms, views, other routine
+DDL, events, unsupported trigger DDL, unmodeled rename/truncate/drop variants,
+database/schema DDL, all other procedure bodies or names, plain drops for other names,
 qualified/cross-schema references, quoted forms, comments outside the exact leading
 ordinary-comment CREATE and ALTER admissions, other definer/security clauses,
 MariaDB-only syntax, and multi-object or multi-statement forms are translation

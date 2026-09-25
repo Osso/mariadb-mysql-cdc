@@ -91,12 +91,11 @@ orphan limit. See [FK orphan repair](docs/specs/fk-orphan-repair.md).
 ## Current status
 
 The native stream applies row events and stores grouped row-event checkpoints in
-the target. The basic common DDL family has real MariaDB/MySQL replay proof and
-was deployed September 25, 2026. Accepted column types, statements, options,
-explicit exclusions and proof levels are in the authoritative
-[basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion).
-The historical details below record additional observed admissions; where they
-state narrower basic-column exclusions, the matrix supersedes them. Automatic
+the target. DDL capability, runtime barriers, and proof levels are maintained in
+the authoritative [basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion).
+The current common-operation implementation is not deployed; its disposable
+database harness is in progress. Historical detail below never narrows that
+matrix. Automatic
 DDL admission also covers an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
 when every key part/option is modeled and the operation is proven not to support
@@ -140,12 +139,12 @@ idx_downloads_sort`, then the observed eight-part replacement `ADD INDEX` with
 direction, and options; every variation remains `translation_pending`. Targeted
 unit and structured-stream tests pass. Disposable MariaDB/MySQL replay is
 currently blocked by a pre-existing `production-alter-table` harness timeout;
-no deployment or recovery success is claimed. The common basic column matrix is
-bounded: it does not claim full `ALTER TABLE`, all `CREATE TABLE` syntax, or
-unlisted DDL families. In particular, `FIRST`, `ALTER COLUMN SET/DROP DEFAULT`,
-`CHANGE COLUMN`, table rename/drop/truncate, new constraint grammars,
-mode-dependent `REAL`/`ZEROFILL`, arbitrary expressions, and unmodeled
-`ALGORITHM`/`LOCK` variants remain unsupported unless separately listed.
+no deployment or recovery success is claimed. The common matrix is bounded: it does not claim full `ALTER TABLE`, all
+`CREATE TABLE` syntax, or unlisted DDL families. `FIRST`, literal `ALTER COLUMN
+SET/DROP DEFAULT`, `CHANGE [COLUMN]`, and strict single-table rename/drop/truncate
+are required implemented operations; unmodeled variants remain runtime barriers.
+New constraint grammars, mode-dependent `REAL`/`ZEROFILL`, arbitrary expressions,
+and unmodeled `ALGORITHM`/`LOCK` variants remain unimplemented.
 
 For admitted `CREATE TABLE`, an explicit `DEFAULT CHARSET=utf8mb4` without
 `COLLATE` uses QueryEvent collation context. When both table defaults are omitted,
@@ -164,7 +163,7 @@ automatically after identity/header admission. Unsupported CREATE variants
 remain `translation_pending` with no target execution or checkpoint advance.
 
 Every other unsupported DDL form—other `CREATE TABLE` syntax, other `ALTER TABLE`, views, other routine DDL,
-events, unsupported trigger DDL, `RENAME`, `TRUNCATE`, non-admitted `DROP`, qualified or
+events, unsupported trigger DDL, unmodeled rename/truncate/drop variants, qualified or
 cross-schema references, comments, ambiguous quoting, incomplete syntax,
 other procedure bodies or names, other plain procedure drops, other definer/security
 clauses, MariaDB-only syntax, and multi-object/multi-statement forms—enters the same automatic journal

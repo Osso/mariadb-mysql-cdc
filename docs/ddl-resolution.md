@@ -3,9 +3,11 @@
 The event handler uses one durable DDL control plane:
 `cdc.ddl_replay_journal`. Unsupported DDL never routes through a manual ledger.
 
-Automatic admission includes the tested and deployed common basic DDL matrix in
-[DDL transformation](specs/ddl-transformation.md#basic-common-ddl-expansion).
-It remains bounded and does not admit all DDL. The historical details below describe additional narrow slices, including
+Automatic admission, runtime barriers, and proof levels are maintained in the
+[DDL transformation matrix](specs/ddl-transformation.md#basic-common-ddl-expansion).
+The current common-operation implementation is not deployed; its disposable
+database harness is in progress. Historical details below describe additional
+narrow slices, including
 strict named, unqualified, visible,
 non-unique secondary BTREE `CREATE INDEX`/`DROP INDEX` with complete parsed
 metadata and no FK dependency; the production-observed unqualified multi-clause
@@ -72,11 +74,9 @@ charset/default fence. Source/target default drift remains out of scope. The
 target table must be absent. An existing target `CREATE TABLE IF NOT EXISTS` is
 not a converged no-op in this slice.
 
-The basic common DDL matrix has bounded real MariaDB 11.4/MySQL 8 replay and
-crash/restart proof for sale ALTER, 32 scalar CREATE/ADD definitions, and column
-operations. Runtime revision `9dfb999` deployed September 25, 2026; its blocked
-sale ALTER replayed and the stream resumed. Unsupported CREATE statements remain `translation_pending`; their journal row, coordinate,
-and checkpoint must not be edited manually.
+The basic DDL matrix is the source of truth for current capability and proof.
+Unsupported CREATE statements remain `translation_pending`; their journal row,
+coordinate, and checkpoint must not be edited manually.
 
 ### Curated-strip persisted-pending replay harnesses
 

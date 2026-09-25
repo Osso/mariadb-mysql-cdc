@@ -36,26 +36,18 @@ approach for basic column DDL. It does **not** claim all DDL. Historical records
 below remain applicable where they add a narrower exception; their narrower type
 exclusions are superseded by this matrix.
 
-Runtime revision `9dfb999` deployed September 25, 2026. Verification passed 866
-Rust tests (18 ignored), six Python tests, and Clippy. Real MariaDB 11.4/MySQL 8
-proof covers:
+The basic family is a required capability, not an exclusion. It is implemented
+on this branch but is **not deployed**. New-operation proof is limited to seven
+column-operation and four table-operation semantic unit tests; disposable
+MariaDB/MySQL replay-harness coverage is in progress.
 
-| Behavior | Proof |
-|---|---|
-| Five-column integer/VARCHAR/JSON ALTER | Original pending event, unchanged journal identity, crash after target DDL, restart, JSON enforcement, column order/defaults and following DML. |
-| Basic scalar CREATE and ADD | 32 definitions in each path; signed/unsigned integer boundaries, decimal defaults, temporal precision, nullable binary/text/blob types and following DML. CREATE without charset uses stable target-database inheritance. |
-| MODIFY, indexed RENAME, DROP INDEX then DROP COLUMN | Persisted pending replay, crash/restart, row preservation, defaults/nullability, order/indexes and following DML. |
-
-Other accepted grammar has targeted parser/semantic tests; this matrix does not
-claim real-database proof of every possible combination.
-
-| Area | Accepted basic family | Safety boundary |
-|---|---|---|
-| Shared column types (`CREATE TABLE`, `ADD COLUMN`) | Signed/unsigned `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`/`INTEGER`, `BIGINT`; `BOOL`/`BOOLEAN` as `TINYINT`; `DECIMAL`/`NUMERIC`; `FLOAT`; `DOUBLE`/`DOUBLE PRECISION`; `CHAR`, `VARCHAR`, `BINARY`, `VARBINARY`; `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT`; `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB`; `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `YEAR`, and `JSON`. | Type keywords and numeric parameters are unquoted; lengths/precisions are canonical and bounded by the parser. `REAL`, `ZEROFILL`, and other mode-dependent qualifiers remain blocked. |
-| Definitions and defaults | `NULL`/`NOT NULL`; `DEFAULT NULL`; bounded, range-checked numeric literals for numeric types; printable unescaped string defaults for character/text types, including `VARCHAR DEFAULT ''`; `COMMENT` and `AFTER` for ALTER column clauses; existing modeled character-set/collation handling. | Contradictory `NOT NULL DEFAULT NULL`, out-of-range/non-finite defaults, arbitrary expressions, and JSON literal defaults remain blocked. Text literal defaults retain their MySQL expression rendering. |
-| `CREATE TABLE` | Ordinary unqualified `CREATE TABLE` and `CREATE TABLE IF NOT EXISTS` use the shared observed grammar and basic types, subject to modeled table options, primary/ordinary/unique index forms, charset/collation evidence, and target-absent proof. When both table charset and collation are omitted, stable target-database defaults are inherited and recorded as `inherited_database_defaults`. | Existing target is not a converged no-op. The removed fixture/table-specific parser is not an alternate path; only the legacy exact-hash `assistant_reply_reports` no-op admission remains outside the shared grammar. Unmodeled table, index, constraint, comment, qualification, or option grammar remains pending. |
-| `ALTER TABLE` columns | `ADD COLUMN` and ordinary unguarded `MODIFY COLUMN` share the definitions above. `MODIFY` applies only to an existing ordinary non-JSON, non-generated, non-`AUTO_INCREMENT` column and preserves its target position/index references while replacing modeled attributes. Ordinary `RENAME COLUMN old TO new`, `DROP COLUMN`, and their existing conditional forms are admitted from fenced target evidence. | `CHANGE COLUMN`, `ALTER COLUMN SET/DROP DEFAULT`, `FIRST`, generated/JSON/`AUTO_INCREMENT` MODIFY, and unmodeled clause combinations remain blocked. Rename and drop fail closed on ambiguous target state. |
-| Indexes | Existing admitted named ordinary/unique key additions and strict standalone `CREATE INDEX`/`DROP INDEX` rules remain available; ordinary `DROP INDEX` in ALTER is derived from target evidence. | New index/constraint grammar, FK-dependent index changes, and unmodeled key parts/options remain blocked. |
+| Area | Required basic family implemented now | Runtime safety boundary | Proof level |
+|---|---|---|---|
+| Shared column types (`CREATE TABLE`, `ADD COLUMN`) | Signed/unsigned `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`/`INTEGER`, `BIGINT`; `BOOL`/`BOOLEAN` as `TINYINT`; `DECIMAL`/`NUMERIC`; `FLOAT`; `DOUBLE`/`DOUBLE PRECISION`; `CHAR`, `VARCHAR`, `BINARY`, `VARBINARY`; text/blob families; `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `YEAR`, and `JSON`. | Parsed type parameters must be canonical and bounded. `REAL`, `ZEROFILL`, and other mode-dependent qualifiers remain runtime barriers until modeled. | Existing bounded coverage; not requalified here. |
+| Definitions and defaults | `NULL`/`NOT NULL`, modeled literal defaults, comments, character-set/collation handling; `ALTER COLUMN SET DEFAULT <literal>` and `DROP DEFAULT` derive compatibility from the existing target column. | Expressions, type-mismatched/out-of-range literals, and `NOT NULL SET DEFAULT NULL` block before target SQL. | Targeted semantic unit tests. |
+| `ALTER TABLE` columns | `ADD`, `MODIFY`, `CHANGE [COLUMN] old new definition`, `RENAME COLUMN`, `DROP COLUMN`; `FIRST` or `AFTER` positioning where modeled. `CHANGE` updates affected primary-key, index, and FK references in derived post-state. | Existing ordinary column and unambiguous fenced target state required; generated/JSON/`AUTO_INCREMENT` modification and unmodeled clause combinations remain runtime barriers. | Seven targeted semantic unit tests for change, position, and defaults; database harness in progress. |
+| Table lifecycle | Strict unqualified single-table `DROP TABLE [IF EXISTS]`, one-pair `RENAME TABLE old TO new`, and `TRUNCATE [TABLE] name`. Evidence includes affected table definitions, row count, auto-increment, indexes, FKs, and triggers; truncate derives row count zero and auto-increment reset when present. | InnoDB base table, complete runtime metadata, unoccupied rename destination, and no external same-schema FK reference required. Multi-table, qualified, temporary, cascade, or extra-token forms block. | Four targeted semantic unit tests; database harness in progress. |
+| Indexes | Existing admitted named ordinary/unique key additions and strict standalone `CREATE INDEX`/`DROP INDEX` rules; ordinary `DROP INDEX` in ALTER is target-derived. | New index/constraint grammar, FK-dependent index changes, and unmodeled key parts/options remain runtime barriers. | Existing bounded coverage; not requalified here. |
 
 
 - [x] Token-parse the production-observed unqualified multi-clause `ALTER TABLE` form with `ADD COLUMN`, named `ADD KEY`, MariaDB-syntax `ADD INDEX` normalized to the same AST, and named `ADD UNIQUE KEY` clauses; preserve clause order and render deterministic MySQL 8 SQL with source `ADD INDEX` emitted as target `ADD KEY`.
@@ -363,19 +355,16 @@ The current slice is covered by:
       durable pending row.
 
 Existing proof covers earlier observed ALTER/CREATE slices and narrow DDL paths.
-The basic common DDL matrix now has bounded real MariaDB 11.4/MySQL 8 replay and
-crash/restart proof for sale ALTER, 32 scalar CREATE/ADD definitions, and column
-operations. The September 25 deployment and live catch-up are proven for that
-implemented family. This does not prove full `ALTER TABLE`, all `CREATE TABLE`
-syntax, or every combination of supported attributes.
+The newly implemented common operations have semantic unit proof only. They do
+not yet have disposable-database replay, crash/restart, deployment, or live
+catch-up proof.
 
 ## Known gaps (current cycle)
 
-- [x] Complete integration, deployment and live catch-up proof for the September 25
-      basic common DDL matrix.
-- [ ] Implement required remaining basic operations: `CHANGE COLUMN`, `FIRST`,
+- [x] Implement required basic operations: `CHANGE [COLUMN]`, `FIRST`, literal
       `ALTER COLUMN SET/DROP DEFAULT`, and same-schema table rename/drop/truncate.
-      These are coverage gaps, not product exclusions.
+- [ ] Complete disposable MariaDB/MySQL replay and crash/restart proof for those
+      implemented operations. This is the current gate; no deployment is claimed.
 - [ ] Complete remaining column/constraint forms, type qualifiers, expression
       defaults and `ALGORITHM`/`LOCK` variants under the transformation contract.
       Current rejections must remain explicit until each form has semantic proof.
@@ -389,8 +378,8 @@ syntax, or every combination of supported attributes.
 - [ ] Build the broader production-derived DDL corpus and real MariaDB/MySQL 8
       parity matrix; the current five-event ALTER scenario plus one exact CREATE
       fixture crash/restart scenario remains only a slice proof.
-- [ ] Define transformation-version compatibility after the first production
-      deployment establishes a real schema upgrade boundary.
+- [ ] Define transformation-version compatibility for persisted journal entries
+      before production deployment establishes a schema upgrade boundary.
 - [ ] Extend beyond the basic matrix only with a bounded grammar and proof that
       unsupported variants remain `translation_pending`, execute no target SQL,
       leave the checkpoint unchanged, and cannot be overtaken.
