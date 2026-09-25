@@ -93,9 +93,10 @@ orphan limit. See [FK orphan repair](docs/specs/fk-orphan-repair.md).
 The native stream applies row events and stores grouped row-event checkpoints in
 the target. DDL capability, runtime barriers, and proof levels are maintained in
 the authoritative [basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion).
-The current common-operation implementation is not deployed; its disposable
-database harness is in progress. Historical detail below never narrows that
-matrix. Automatic
+The common-operation implementation was deployed on September 25, 2026.
+Real MariaDB/MySQL replay harnesses prove its bounded column and table-lifecycle
+slices; the matrix records their exact coverage and remaining required gaps.
+Historical detail below never narrows that matrix. Automatic
 DDL admission also covers an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
 when every key part/option is modeled and the operation is proven not to support
@@ -136,10 +137,10 @@ coexist. One exact `releases` index-rebuild ALTER is also admitted: `DROP INDEX
 idx_downloads_sort`, then the observed eight-part replacement `ADD INDEX` with
 `published_time DESC`, `comic_id ASC`, and `id ASC`, followed by
 `ALGORITHM=INPLACE, LOCK=NONE`. It preserves typed drop/add clauses, key-part
-direction, and options; every variation remains `translation_pending`. Targeted
-unit and structured-stream tests pass. Disposable MariaDB/MySQL replay is
-currently blocked by a pre-existing `production-alter-table` harness timeout;
-no deployment or recovery success is claimed. The common matrix is bounded: it does not claim full `ALTER TABLE`, all
+direction, and options; every variation remains `translation_pending`. Targeted unit and structured-stream tests pass. The common column and table-
+lifecycle replay harnesses pass, including restart recovery; this does not
+requalify the separate historical `production-alter-table` scenario. The common
+matrix is bounded: it does not claim full `ALTER TABLE`, all
 `CREATE TABLE` syntax, or unlisted DDL families. `FIRST`, literal `ALTER COLUMN
 SET/DROP DEFAULT`, `CHANGE [COLUMN]`, and strict single-table rename/drop/truncate
 are required implemented operations; unmodeled variants remain runtime barriers.

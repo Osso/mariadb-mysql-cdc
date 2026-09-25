@@ -19,8 +19,10 @@ Automatic DDL admission has the bounded slices in the authoritative
 [DDL transformation matrix](specs/ddl-transformation.md#basic-common-ddl-expansion),
 including required `CHANGE [COLUMN]`, `FIRST`/`AFTER`, literal `ALTER COLUMN
 SET/DROP DEFAULT`, and strict single-table `DROP [IF EXISTS]`, one-pair `RENAME`,
-and `TRUNCATE [TABLE]` operations. The current implementation is not deployed;
-its disposable database harness is in progress. Additional historical slices:
+and `TRUNCATE [TABLE]` operations. The implementation was deployed on
+September 25, 2026. Real MariaDB/MySQL replay harnesses prove the bounded column
+and table-lifecycle slices, including crash/restart reconciliation; unsupported
+forms remain runtime barriers. Additional historical slices:
 
 - explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE
   INDEX` or `DROP INDEX` whose key parts and options are completely modeled and
