@@ -774,6 +774,25 @@ fn mariadb_rename_column_if_exists_executes_generated_mysql8_sql() {
 
 #[test]
 fn unsupported_create_table_stays_translation_pending_without_target_or_checkpoint_execution() {
+    let sql = "CREATE TABLE accounts (\
+            id BIGINT NOT NULL PRIMARY KEY, \
+            email VARCHAR(255) NOT NULL, \
+            payload SET('a','b') NOT NULL, \
+            created_at DATETIME NOT NULL, \
+            KEY idx_accounts_payload (payload)\
+        ) ENGINE=InnoDB"
+        .to_string();
+    assert_translation_pending_without_execution(&sql);
+}
+
+#[test]
+fn escaped_default_stays_pending_without_target_or_checkpoint_execution() {
+    assert_translation_pending_without_execution(
+        r"ALTER TABLE accounts ALTER COLUMN handle SET DEFAULT 'line\nbreak'",
+    );
+}
+
+fn assert_translation_pending_without_execution(sql: &str) {
     let executor = TransactionRecordingExecutor::default();
     let mut applier = crate::row::RowApplier::new(executor);
     let journal = RecordingDdlReplayJournal::default();
@@ -791,14 +810,7 @@ fn unsupported_create_table_stays_translation_pending_without_target_or_checkpoi
         error_code: 0,
         status_variables: Vec::new(),
         database_name: "fixture_cdc".to_string(),
-        sql_statement: "CREATE TABLE accounts (\
-            id BIGINT NOT NULL PRIMARY KEY, \
-            email VARCHAR(255) NOT NULL, \
-            payload SET('a','b') NOT NULL, \
-            created_at DATETIME NOT NULL, \
-            KEY idx_accounts_payload (payload)\
-        ) ENGINE=InnoDB"
-            .to_string(),
+        sql_statement: sql.to_string(),
     });
     let mut context = StreamEventContext {
         schema_resolver: &resolver,
@@ -820,7 +832,7 @@ fn unsupported_create_table_stays_translation_pending_without_target_or_checkpoi
         &event_header(2, 180),
         &event,
     )
-    .expect_err("unsupported CREATE TABLE must remain translation-pending");
+    .expect_err("unsupported DDL must remain translation-pending");
 
     assert!(
         error
