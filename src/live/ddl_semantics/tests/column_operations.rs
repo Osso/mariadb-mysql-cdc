@@ -281,9 +281,13 @@ fn text_defaults_get_expression_metadata_and_drop_removes_only_default_marker() 
     );
     target.inventory.tables[0].columns[1].default_value = Some("_utf8mb4\\'{}\\'".into());
     target.inventory.tables[0].columns[1].extra = "DEFAULT_GENERATED".into();
-    let (_, post, _) = altered(
+    let (_, post, rendered) = altered(
         "ALTER TABLE accounts ALTER COLUMN handle DROP DEFAULT",
         &target,
+    );
+    assert_eq!(
+        rendered,
+        "ALTER TABLE `accounts` MODIFY COLUMN `handle` TEXT NULL DEFAULT NULL"
     );
     assert_eq!(
         post["definition"]["columns"][1]["default_value"],

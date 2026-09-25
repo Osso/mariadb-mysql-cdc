@@ -363,9 +363,14 @@ fn render_target_column_default(
         column.is_nullable,
         default,
     )?;
-    if let Some(ParsedColumnDefault::String(value)) = default
-        && is_text_type(&column.data_type)
-    {
+    if is_text_type(&column.data_type) {
+        let value = match default {
+            Some(ParsedColumnDefault::String(value)) => Some(value.as_str()),
+            None | Some(ParsedColumnDefault::Null) => None,
+            Some(ParsedColumnDefault::Number(_)) => {
+                return Err("TEXT defaults require a string or NULL".into());
+            }
+        };
         return render_text_default_definition(column, value);
     }
     let action = match default {
@@ -388,7 +393,7 @@ fn render_target_column_default(
 // that server path accepts them, MODIFY preserves the complete target definition.
 fn render_text_default_definition(
     column: &crate::inventory::ColumnInventory,
-    value: &str,
+    value: Option<&str>,
 ) -> Result<String, String> {
     if !matches!(column.extra.as_str(), "" | "DEFAULT_GENERATED") || column.generated.is_some() {
         return Err("TEXT default replacement cannot preserve unmodeled column attributes".into());
@@ -399,7 +404,7 @@ fn render_text_default_definition(
         column_type: column.column_type.clone(),
         data_type: column.data_type.clone(),
         nullable: column.is_nullable,
-        default_value: Some(value.to_string()),
+        default_value: value.map(str::to_string),
         comment: column.comment.clone(),
         after: None,
         first: false,
