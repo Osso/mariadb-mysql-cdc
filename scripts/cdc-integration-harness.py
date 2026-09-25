@@ -2374,7 +2374,18 @@ DELIMITER ;
                 raise HarnessError(
                     f"crash changed pending identity/checkpoint: {journal!r} {checkpoint!r}"
                 )
-        return self.replay_pending_add_column(start, pending)
+        try:
+            return self.replay_pending_add_column(start, pending)
+        except HarnessError:
+            journal = self.journal_full_row(int(pending["event_start_position"]))
+            print(f"common_ddl_failed_event={ddl!r} journal={journal!r}")
+            print(
+                self.admin_query(
+                    self.target,
+                    "SELECT TABLE_NAME,TABLE_ROWS,AUTO_INCREMENT FROM information_schema.tables WHERE TABLE_SCHEMA='globalcomix' AND TABLE_NAME LIKE 'lifecycle%';",
+                )
+            )
+            raise
 
     def run_column_change_position_default_pending_replay(self) -> None:
         assert self.source and self.target
@@ -2426,7 +2437,7 @@ DELIMITER ;
             actual = self.admin_query(endpoint, active_defaults).strip()
             expected = (
                 "amount\tint(11)\t9\ntitle\tvarchar(32)\t'ready'\n"
-                "note\tvarchar(16)\t<null>"
+                "note\tvarchar(16)\tNULL"
                 if endpoint is self.source
                 else "amount\tint\t9\ntitle\tvarchar(32)\tready\n"
                 "note\tvarchar(16)\t<null>"
@@ -2495,9 +2506,50 @@ DELIMITER ;
                 f"INSERT INTO {table}(id,title) VALUES (91,'missing');",
                 "default value",
             )
+        self.assert_text_default_replay()
         print(
             f"column_change_position_default_pending_replay_ok coordinate={stop.file}:{stop.position}"
         )
+
+    def assert_text_default_replay(self) -> None:
+        assert self.source and self.target
+        setup = (
+            "CREATE TABLE column_text_defaults (id INT PRIMARY KEY, body TEXT) ENGINE=InnoDB; "
+            "INSERT INTO column_text_defaults(id) VALUES(1);"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, setup)
+        self.replay_common_ddl(
+            "ALTER TABLE column_text_defaults ALTER COLUMN body SET DEFAULT '{}'",
+            "ALTER COLUMN",
+            following_sql="INSERT INTO column_text_defaults(id) VALUES(2);",
+            crash=True,
+        )
+        self.replay_common_ddl(
+            "ALTER TABLE column_text_defaults ADD COLUMN extra TEXT, "
+            "ALTER COLUMN extra SET DEFAULT 'payload'",
+            "ADD COLUMN",
+            following_sql="INSERT INTO column_text_defaults(id) VALUES(3);",
+        )
+        query = "SELECT id,COALESCE(body,'<null>'),COALESCE(extra,'<null>') FROM column_text_defaults ORDER BY id;"
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, query).strip()
+            expected = "1\t<null>\t<null>\n2\t{}\t<null>\n3\t{}\tpayload"
+            if actual != expected:
+                raise HarnessError(f"TEXT default replay mismatch: {actual!r}")
+        self.replay_common_ddl(
+            "ALTER TABLE column_text_defaults ALTER COLUMN body DROP DEFAULT, "
+            "ALTER COLUMN extra DROP DEFAULT",
+            "ALTER COLUMN",
+            following_sql="INSERT INTO column_text_defaults(id) VALUES(4);",
+        )
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(
+                endpoint,
+                "SELECT body IS NULL,extra IS NULL FROM column_text_defaults WHERE id=4;",
+            ).strip()
+            if actual != "1\t1":
+                raise HarnessError(f"TEXT DROP DEFAULT mismatch: {actual!r}")
 
     def run_table_lifecycle_pending_replay(self) -> None:
         assert self.source and self.target
