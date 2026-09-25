@@ -365,14 +365,20 @@ The current slice is covered by:
 Existing proof covers earlier observed ALTER/CREATE slices and narrow DDL paths.
 The basic common DDL matrix now has bounded real MariaDB 11.4/MySQL 8 replay and
 crash/restart proof for sale ALTER, 32 scalar CREATE/ADD definitions, and column
-operations. Deployment, final integration gating, and live-stream proof remain
-open. This does not prove full `ALTER TABLE`, all `CREATE TABLE` syntax, a
-complete compatibility matrix, or deployment safety.
+operations. The September 25 deployment and live catch-up are proven for that
+implemented family. This does not prove full `ALTER TABLE`, all `CREATE TABLE`
+syntax, or every combination of supported attributes.
 
 ## Known gaps (current cycle)
 
-- [ ] Complete final integration and deployment gates for the basic common DDL
-      matrix before treating it as deployment-ready.
+- [x] Complete integration, deployment and live catch-up proof for the September 25
+      basic common DDL matrix.
+- [ ] Implement required remaining basic operations: `CHANGE COLUMN`, `FIRST`,
+      `ALTER COLUMN SET/DROP DEFAULT`, and same-schema table rename/drop/truncate.
+      These are coverage gaps, not product exclusions.
+- [ ] Complete remaining column/constraint forms, type qualifiers, expression
+      defaults and `ALGORITHM`/`LOCK` variants under the transformation contract.
+      Current rejections must remain explicit until each form has semantic proof.
 - [x] Remove runtime/config/bootstrap/grant/harness/test dependencies on the
       retired manual DDL ledger without restoring manual replay.
 - [ ] Restore the pre-existing `production-alter-table` harness path, then run
@@ -389,17 +395,15 @@ complete compatibility matrix, or deployment safety.
       unsupported variants remain `translation_pending`, execute no target SQL,
       leave the checkpoint unchanged, and cannot be overtaken.
 
-## Out of scope
+## Product exclusions
+
+Implementation gaps belong in the coverage matrix and known gaps above. Missing
+basic DDL support must not be described as a product exclusion. An unsupported
+statement remains a runtime barrier until its semantics are implemented and
+verified; that safety behavior does not remove the requirement to support it.
 
 - Manual target-SQL authoring or operator resolution as a CDC fallback.
 - Index-only automatic replay as the target DDL architecture.
-- Full `ALTER TABLE` coverage beyond the basic matrix and separately listed
-  observed extensions.
-- `ALTER TABLE FIRST`, `ALTER COLUMN SET/DROP DEFAULT`, `CHANGE COLUMN`, table
-  rename/drop/truncate, and new constraint grammars unless separately listed in
-  the implemented slice.
-- Mode-dependent `REAL`/`ZEROFILL`, arbitrary expressions, and unmodeled
-  `ALGORITHM`/`LOCK` variants.
 - Silently dropping, weakening, or approximating parsed DDL clauses.
 - Cross-schema mutation outside the configured application schema.
 - Detecting or reconciling preexisting source/target schema differences,
