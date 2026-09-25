@@ -15,13 +15,12 @@ pub(super) fn parse_column_type(
         _ => return Err(format!("unsupported column type {kind}")),
     };
     let (column_type, next) = parse_type_details(tokens, quoted, &kind, data_type, next)?;
-    if let Some(token) = tokens.get(next) {
-        if ["UNSIGNED", "SIGNED", "ZEROFILL"]
+    if let Some(token) = tokens.get(next)
+        && ["UNSIGNED", "SIGNED", "ZEROFILL"]
             .iter()
             .any(|word| token.eq_ignore_ascii_case(word))
-        {
-            return Err(format!("unsupported column type qualifier {token}"));
-        }
+    {
+        return Err(format!("unsupported column type qualifier {token}"));
     }
     Ok((column_type, data_type.into(), next))
 }
