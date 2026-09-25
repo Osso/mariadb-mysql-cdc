@@ -264,7 +264,7 @@ fn text_defaults_get_expression_metadata_and_drop_removes_only_default_marker() 
     );
     assert_eq!(
         rendered,
-        "ALTER TABLE `accounts` ALTER COLUMN `handle` SET DEFAULT (_utf8mb4'{}')"
+        "ALTER TABLE `accounts` MODIFY COLUMN `handle` TEXT NULL DEFAULT (_utf8mb4'{}')"
     );
     assert_eq!(
         post["definition"]["columns"][1]["default_value"],
@@ -300,7 +300,7 @@ fn text_default_uses_target_type_and_mysql_expression_sql() {
             .unwrap();
     assert_eq!(
         rendered,
-        "ALTER TABLE `accounts` ALTER COLUMN `handle` SET DEFAULT (_utf8mb4'{}')"
+        "ALTER TABLE `accounts` MODIFY COLUMN `handle` TEXT NULL DEFAULT (_utf8mb4'{}')"
     );
     let (_, post, _) = altered(sql, &target);
     assert_eq!(
@@ -320,7 +320,7 @@ fn text_default_after_add_uses_same_statement_column_state() {
             .unwrap();
     assert_eq!(
         rendered,
-        "ALTER TABLE `accounts` ADD COLUMN `memo` TEXT NULL DEFAULT NULL, ALTER COLUMN `memo` SET DEFAULT (_utf8mb4'{}')"
+        "ALTER TABLE `accounts` ADD COLUMN `memo` TEXT NULL DEFAULT NULL, MODIFY COLUMN `memo` TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL DEFAULT (_utf8mb4'{}')"
     );
     let (_, post, _) = altered(sql, &target);
     assert_eq!(post["definition"]["columns"][2]["name"], "memo");

@@ -256,11 +256,13 @@ fn render_target_column_default(
         column.is_nullable,
         default,
     )?;
+    if let Some(ParsedColumnDefault::String(value)) = default
+        && is_text_type(&column.data_type)
+    {
+        return render_text_default_definition(column, value);
+    }
     let action = match default {
         None => "DROP DEFAULT".to_string(),
-        Some(ParsedColumnDefault::String(value)) if is_text_type(&column.data_type) => {
-            format!("SET DEFAULT {}", text_expression_default(value))
-        }
         Some(ParsedColumnDefault::Number(_)) => {
             format!(
                 "SET DEFAULT {}",
@@ -270,6 +272,34 @@ fn render_target_column_default(
         Some(value) => format!("SET DEFAULT {}", render_alter_default(value)),
     };
     Ok(format!("ALTER COLUMN {} {action}", quote_identifier(name)))
+}
+
+// MySQL 8.4 rejects TEXT SET DEFAULT expression literals with error 1101. Until
+// that server path accepts them, MODIFY preserves the complete target definition.
+fn render_text_default_definition(
+    column: &crate::inventory::ColumnInventory,
+    value: &str,
+) -> Result<String, String> {
+    if !matches!(column.extra.as_str(), "" | "DEFAULT_GENERATED") || column.generated.is_some() {
+        return Err("TEXT default replacement cannot preserve unmodeled column attributes".into());
+    }
+    let replacement = ParsedAddColumnAst {
+        name: column.name.clone(),
+        if_not_exists: false,
+        column_type: column.column_type.clone(),
+        data_type: column.data_type.clone(),
+        nullable: column.is_nullable,
+        default_value: Some(value.to_string()),
+        comment: column.comment.clone(),
+        after: None,
+        first: false,
+        character_set: column.character_set.clone(),
+        collation: column.collation.clone(),
+        generated: None,
+    };
+    Ok(render_production_alter_clause(
+        &ParsedAlterClause::ModifyColumn(replacement),
+    ))
 }
 
 fn render_alter_table_clauses(ast: &ParsedAlterTableAst, mut clauses: Vec<String>) -> String {

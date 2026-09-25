@@ -1886,7 +1886,14 @@ DELIMITER ;
             raise HarnessError(f"expected one {marker} event, got {events!r}")
         file, position, server_id, end_position, info = queries[0]
         info = info.rstrip("\n")
-        if info != f"use `{APP_SCHEMA}`; {ddl}":
+        prefix = f"use `{APP_SCHEMA}`; "
+        if not info.startswith(prefix):
+            raise HarnessError(f"unexpected QueryEvent schema context: {info!r}")
+        if marker == "DROP TABLE":
+            # MariaDB rewrites DROP quoting and appends a server-generated comment.
+            # Journal identity must use the actual binlogged SQL, not submitted text.
+            ddl = info[len(prefix) :]
+        elif info != prefix + ddl:
             raise HarnessError(f"source failed to preserve ordinary comment: {info!r}")
         identity = f"{SOURCE_IDENTITY}#server-id={server_id}"
         if old_binary is not None:

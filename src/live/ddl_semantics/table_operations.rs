@@ -1,7 +1,5 @@
 use super::model::{DdlOperation, SemanticSchemaSnapshot};
-use super::tokenizer::{
-    ddl_contains_comments, strip_leading_ordinary_ddl_comments, tokenize_ddl_with_quoted_flags,
-};
+use super::tokenizer::tokenize_ddl_with_quoted_flags;
 use super::transform::{DDL_TRANSFORMATION_VERSION, DdlTransformation};
 use serde::Serialize;
 use serde_json::json;
@@ -15,10 +13,12 @@ pub enum TableOperation {
 }
 
 pub(super) fn parse(sql: &str) -> Result<TableOperation, String> {
-    let sql = strip_leading_ordinary_ddl_comments(sql)?;
-    if ddl_contains_comments(sql) || sql.contains('"') {
+    let active_comment = ["/*!", "/*+", "/*M!", "/*m!"]
+        .iter()
+        .any(|marker| sql.contains(marker));
+    if active_comment || sql.contains('"') {
         return Err(
-            "table operation requires ordinary leading comments and backtick/unquoted names".into(),
+            "table operation requires ordinary comments and backtick/unquoted names".into(),
         );
     }
     let (mut tokens, mut quoted) = tokenize_ddl_with_quoted_flags(sql)?;
