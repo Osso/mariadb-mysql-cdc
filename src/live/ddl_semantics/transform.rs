@@ -5,9 +5,9 @@ use super::model::{
     ParsedStoredIfExpression,
 };
 use super::tokenizer::{
-    ddl_contains_comments, ddl_contains_comments_with_mode, split_one_leading_mysql_line_comment,
-    strip_leading_ordinary_ddl_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags,
-    tokenize_ddl_with_quoted_flags_mode,
+    ddl_contains_comments, ddl_contains_comments_with_mode, split_leading_mysql_line_comments,
+    split_one_leading_mysql_line_comment, strip_leading_ordinary_ddl_comments, tokenize_ddl,
+    tokenize_ddl_with_quoted_flags, tokenize_ddl_with_quoted_flags_mode,
 };
 use crate::live::query_charset_context::SourceSqlMode;
 use sha2::{Digest, Sha256};
@@ -55,14 +55,13 @@ pub fn supports_production_alter_table_with_mode(source_sql: &str, mode: SourceS
 }
 
 fn supports_parsed_production_alter(ast: &ParsedAlterTableAst) -> bool {
-    supports_existing_production_alter(ast)
-        || supports_content_sections_seen_columns_instant(ast)
-        || supports_releases_downloads_sort_rebuild(ast)
+    supports_existing_production_alter(ast) || supports_content_sections_seen_columns_instant(ast)
 }
 
 fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
-    ast.algorithm.is_none()
-        && ast.lock.is_none()
+    ((ast.algorithm.is_none() && ast.lock.is_none())
+        || (ast.algorithm == Some(ParsedAlterAlgorithm::Inplace)
+            && ast.lock == Some(ParsedAlterLock::None)))
         && ast.clauses.iter().all(|clause| match clause {
             ParsedAlterClause::AddColumn(_) => true,
             ParsedAlterClause::AddKey { .. }
@@ -102,55 +101,6 @@ fn supports_content_sections_seen_columns_instant(ast: &ParsedAlterTableAst) -> 
     )
 }
 
-fn supports_releases_downloads_sort_rebuild(ast: &ParsedAlterTableAst) -> bool {
-    let [
-        ParsedAlterClause::DropIndex(dropped),
-        ParsedAlterClause::AddKey {
-            index: added,
-            if_not_exists: false,
-        },
-    ] = ast.clauses.as_slice()
-    else {
-        return false;
-    };
-    ast.table == "releases"
-        && ast.algorithm == Some(ParsedAlterAlgorithm::Inplace)
-        && ast.lock == Some(ParsedAlterLock::None)
-        && dropped.name == "idx_downloads_sort"
-        && added == &releases_downloads_sort_index()
-}
-
-fn releases_downloads_sort_index() -> ParsedIndexAst {
-    let columns = [
-        ("is_deleted", "ASC"),
-        ("is_published", "ASC"),
-        ("is_visible", "ASC"),
-        ("comic_is_visible", "ASC"),
-        ("lang_id", "ASC"),
-        ("published_time", "DESC"),
-        ("comic_id", "ASC"),
-        ("id", "ASC"),
-    ];
-    ParsedIndexAst {
-        create: true,
-        name: "idx_downloads_sort".to_string(),
-        table: "releases".to_string(),
-        unique: false,
-        index_type: "BTREE".to_string(),
-        visible: true,
-        comment: None,
-        key_parts: columns
-            .into_iter()
-            .map(|(column, order)| ParsedIndexKeyPart {
-                column: column.to_string(),
-                prefix_length: None,
-                order: order.to_string(),
-                collation: Some(if order == "DESC" { "D" } else { "A" }.to_string()),
-            })
-            .collect(),
-    }
-}
-
 fn is_exact_seen_column(column: &ParsedAddColumnAst, name: &str, comment: &str) -> bool {
     column
         == &ParsedAddColumnAst {
@@ -177,7 +127,7 @@ pub fn transform_production_alter_table_with_mode(
     source_sql: &str,
     mode: SourceSqlMode,
 ) -> Result<DdlTransformation, String> {
-    let (leading_comment, _) = split_one_leading_mysql_line_comment(source_sql);
+    let (leading_comment, _) = split_leading_mysql_line_comments(source_sql);
     let ast = parse_production_alter_table_ast_with_mode(source_sql, mode)?;
     if !supports_parsed_production_alter(&ast) {
         return Err("unsupported production ALTER TABLE shape".to_string());
@@ -206,7 +156,7 @@ pub(crate) fn transform_production_alter_table_with_target_mode(
     target: &super::model::SemanticSchemaSnapshot,
     mode: SourceSqlMode,
 ) -> Result<DdlTransformation, String> {
-    let (leading_comment, _) = split_one_leading_mysql_line_comment(source_sql);
+    let (leading_comment, _) = split_leading_mysql_line_comments(source_sql);
     let ast = parse_production_alter_table_ast_with_mode(source_sql, mode)?;
     if !supports_parsed_production_alter(&ast) {
         return Err("unsupported production ALTER TABLE shape".to_string());
@@ -1976,7 +1926,7 @@ pub fn parse_production_alter_table_ast_with_mode(
     source_sql: &str,
     mode: SourceSqlMode,
 ) -> Result<ParsedAlterTableAst, String> {
-    let (_, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
+    let (_, statement_sql) = split_leading_mysql_line_comments(source_sql);
     let no_escapes = mode.0.is_some_and(|bits| bits & (1 << 20) != 0);
     let ordinary_comments = ddl_contains_comments_with_mode(statement_sql, no_escapes);
     let leading_comments_only = !ddl_contains_comments_with_mode(

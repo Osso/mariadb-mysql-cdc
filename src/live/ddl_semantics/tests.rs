@@ -2676,6 +2676,192 @@ fn production_alter_rejects_quoted_unsigned_keyword() {
     ));
 }
 
+const LLM_AUDIT_TURNS_DDL: &str =
+    include_str!("../../../fixtures/ddl/alter-llm-audit-log-turn-attribution.sql");
+
+#[test]
+fn production_llm_audit_turns_alter_preserves_options_and_comments() {
+    let mode = crate::live::query_charset_context::SourceSqlMode(Some(0));
+    let transformation =
+        super::transform::transform_production_alter_table_with_mode(LLM_AUDIT_TURNS_DDL, mode)
+            .expect("captured ALTER must translate without dropping its online DDL guarantees");
+
+    assert_eq!(
+        transformation.target_sql.as_deref(),
+        Some(concat!(
+            "-- Phase 1: exact tool-to-turn joins. Existing rows remain unattributed (NULL).\n",
+            "-- Apply before deploying the recorder changes. No backfill from timestamps.\n",
+            "ALTER TABLE `llm_audit_log` ",
+            "ADD COLUMN `turn_uuid` CHAR(36) NULL DEFAULT NULL COMMENT 'Exact assistant turn; NULL for historical or Capy rows' AFTER `conversation_uuid`, ",
+            "ADD COLUMN `step` SMALLINT UNSIGNED NULL DEFAULT NULL COMMENT 'Zero-based assistant model loop step' AFTER `turn_uuid`, ",
+            "MODIFY COLUMN `tool_use_id` VARCHAR(64) NULL DEFAULT NULL COMMENT 'Provider tool call ID (Capy or assistant)', ",
+            "ADD KEY `idx_turn_step` (`turn_uuid`, `step`), ALGORITHM=INPLACE, LOCK=NONE"
+        ))
+    );
+}
+
+fn llm_audit_turns_target() -> SemanticSchemaSnapshot {
+    let mut target = semantic_snapshot(0, None);
+    let table = &mut target.inventory.tables[0];
+    table.name = "llm_audit_log".to_string();
+    table.columns = ["conversation_uuid", "tool_use_id"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| ColumnInventory {
+            name: name.to_string(),
+            ordinal_position: (index + 1) as u32,
+            column_type: if index == 0 {
+                "char(36)"
+            } else {
+                "varchar(64)"
+            }
+            .to_string(),
+            data_type: if index == 0 { "char" } else { "varchar" }.to_string(),
+            is_nullable: true,
+            character_set: Some("utf8mb4".to_string()),
+            collation: Some("utf8mb4_unicode_ci".to_string()),
+            default_value: None,
+            extra: String::new(),
+            comment: String::new(),
+            generated: None,
+        })
+        .collect();
+    target.inventory.indexes.clear();
+    target.table_runtime.clear();
+    target
+}
+
+#[test]
+fn production_llm_audit_turns_alter_derives_column_position_modification_and_index() {
+    let mode = crate::live::query_charset_context::SourceSqlMode(Some(0));
+    let operation = super::parser::parse_ddl_operation_with_mode(LLM_AUDIT_TURNS_DDL, mode)
+        .expect("captured ALTER operation");
+    let target = llm_audit_turns_target();
+    let evidence = build_semantic_evidence(&operation, &target, &target).expect("ALTER evidence");
+    let post: serde_json::Value =
+        serde_json::from_str(&evidence.expected_post_state).expect("post-state JSON");
+    let table = &post;
+    assert_eq!(column(table, "turn_uuid")["ordinal_position"], 2);
+    assert_eq!(column(table, "turn_uuid")["column_type"], "char(36)");
+    assert_eq!(column(table, "step")["ordinal_position"], 3);
+    assert_eq!(column(table, "step")["column_type"], "smallint unsigned");
+    assert_eq!(column(table, "tool_use_id")["ordinal_position"], 4);
+    assert_eq!(
+        column(table, "tool_use_id")["comment"],
+        "Provider tool call ID (Capy or assistant)"
+    );
+    assert_eq!(table["indexes"][0]["name"], "idx_turn_step");
+    assert_eq!(table["indexes"][0]["columns"][0]["name"], "turn_uuid");
+    assert_eq!(table["indexes"][0]["columns"][1]["name"], "step");
+}
+
+#[test]
+fn production_llm_audit_turns_alter_blocks_partially_present_guarded_columns() {
+    let mode = crate::live::query_charset_context::SourceSqlMode(Some(0));
+    let operation = super::parser::parse_ddl_operation_with_mode(LLM_AUDIT_TURNS_DDL, mode)
+        .expect("captured ALTER operation");
+    let mut target = llm_audit_turns_target();
+    target.inventory.tables[0].columns.insert(
+        1,
+        ColumnInventory {
+            name: "turn_uuid".to_string(),
+            ordinal_position: 2,
+            column_type: "char(36)".to_string(),
+            data_type: "char".to_string(),
+            is_nullable: true,
+            character_set: Some("utf8mb4".to_string()),
+            collation: Some("utf8mb4_unicode_ci".to_string()),
+            default_value: None,
+            extra: String::new(),
+            comment: "Exact assistant turn; NULL for historical or Capy rows".to_string(),
+            generated: None,
+        },
+    );
+    target.inventory.tables[0].columns[2].ordinal_position = 3;
+
+    let error = build_semantic_evidence(&operation, &target, &target)
+        .expect_err("partial guarded ALTER must not generate MySQL DDL");
+    assert!(error.contains("partial pre-state"), "{error}");
+}
+
+#[test]
+fn production_llm_audit_turns_alter_does_not_noop_unfinished_modify() {
+    let mode = crate::live::query_charset_context::SourceSqlMode(Some(0));
+    let operation = super::parser::parse_ddl_operation_with_mode(LLM_AUDIT_TURNS_DDL, mode)
+        .expect("captured ALTER operation");
+    let mut target = llm_audit_turns_target();
+    let table = &mut target.inventory.tables[0];
+    table.columns.insert(
+        1,
+        ColumnInventory {
+            name: "turn_uuid".to_string(),
+            ordinal_position: 2,
+            column_type: "char(36)".to_string(),
+            data_type: "char".to_string(),
+            is_nullable: true,
+            character_set: Some("utf8mb4".to_string()),
+            collation: Some("utf8mb4_unicode_ci".to_string()),
+            default_value: None,
+            extra: String::new(),
+            comment: "Exact assistant turn; NULL for historical or Capy rows".to_string(),
+            generated: None,
+        },
+    );
+    table.columns.insert(
+        2,
+        ColumnInventory {
+            name: "step".to_string(),
+            ordinal_position: 3,
+            column_type: "smallint unsigned".to_string(),
+            data_type: "smallint".to_string(),
+            is_nullable: true,
+            character_set: None,
+            collation: None,
+            default_value: None,
+            extra: String::new(),
+            comment: "Zero-based assistant model loop step".to_string(),
+            generated: None,
+        },
+    );
+    table.columns[3].ordinal_position = 4;
+    target.inventory.indexes.push(IndexInventory {
+        table: "llm_audit_log".to_string(),
+        name: "idx_turn_step".to_string(),
+        unique: false,
+        index_type: "BTREE".to_string(),
+        visible: true,
+        comment: None,
+        columns: ["turn_uuid", "step"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| IndexColumnInventory {
+                name: name.to_string(),
+                sequence: (index + 1) as u32,
+                prefix_length: None,
+                collation: Some("A".to_string()),
+                order: "ASC".to_string(),
+            })
+            .collect(),
+    });
+
+    let evidence = build_semantic_evidence(&operation, &target, &target)
+        .expect("existing guards must not suppress a distinct MODIFY clause");
+    assert_ne!(evidence.pre_state, evidence.expected_post_state);
+}
+
+#[test]
+fn inplace_none_common_alter_rejects_other_options_and_unmodeled_clauses() {
+    let original = LLM_AUDIT_TURNS_DDL;
+    for sql in [
+        original.replace("LOCK=NONE", "LOCK=SHARED"),
+        original.replace("ALGORITHM=INPLACE", "ALGORITHM=INSTANT"),
+        original.replace("ALGORITHM=INPLACE", "ALGORITHM=COPY"),
+        original.replace("ADD INDEX IF NOT EXISTS", "ADD UNIQUE INDEX IF NOT EXISTS"),
+    ] {
+        assert!(!supports_production_alter_table(&sql), "accepted {sql}");
+    }
+}
+
 const RELEASES_DOWNLOADS_SORT_DDL: &str =
     include_str!("../../../fixtures/ddl/alter-releases-downloads-sort.sql");
 
@@ -2798,17 +2984,24 @@ fn releases_downloads_sort_target() -> SemanticSchemaSnapshot {
 }
 
 #[test]
-fn releases_downloads_sort_rebuild_near_misses_remain_unsupported() {
+fn modeled_rebuild_variants_use_common_inplace_none_admission() {
     for sql in [
         RELEASES_DOWNLOADS_SORT_DDL.replace("`releases`", "`releases_history`"),
-        RELEASES_DOWNLOADS_SORT_DDL.replace("LOCK=NONE", "LOCK=SHARED"),
-        RELEASES_DOWNLOADS_SORT_DDL.replace("ALGORITHM=INPLACE", "ALGORITHM=COPY"),
         RELEASES_DOWNLOADS_SORT_DDL.replace("`id` ASC", "`id` DESC"),
     ] {
+        let translated = transform_production_alter_table(&sql).expect("modeled rebuild");
         assert!(
-            !supports_production_alter_table(&sql),
-            "near-miss ALTER was admitted: {sql}"
+            translated
+                .target_sql
+                .unwrap()
+                .ends_with("ALGORITHM=INPLACE, LOCK=NONE")
         );
+    }
+    for sql in [
+        RELEASES_DOWNLOADS_SORT_DDL.replace("LOCK=NONE", "LOCK=SHARED"),
+        RELEASES_DOWNLOADS_SORT_DDL.replace("ALGORITHM=INPLACE", "ALGORITHM=COPY"),
+    ] {
+        assert!(!supports_production_alter_table(&sql), "accepted {sql}");
     }
 }
 

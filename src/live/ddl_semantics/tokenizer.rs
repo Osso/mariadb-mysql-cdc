@@ -9,6 +9,18 @@ pub(crate) fn split_one_leading_mysql_line_comment(sql: &str) -> (Option<&str>, 
     (Some(&sql[..prefix_length]), statement_sql)
 }
 
+pub(crate) fn split_leading_mysql_line_comments(sql: &str) -> (Option<&str>, &str) {
+    let (first, mut statement_sql) = split_one_leading_mysql_line_comment(sql);
+    if first.is_none() {
+        return (None, statement_sql);
+    }
+    while let (Some(_), rest) = split_one_leading_mysql_line_comment(statement_sql) {
+        statement_sql = rest;
+    }
+    let prefix_length = sql.len() - statement_sql.len();
+    (Some(&sql[..prefix_length]), statement_sql)
+}
+
 pub(crate) fn strip_leading_ordinary_ddl_comments(sql: &str) -> Result<&str, String> {
     let mut remaining = sql;
     loop {
