@@ -3459,7 +3459,7 @@ DELIMITER ;
             self.source,
             f"INSERT INTO {table}(id,user_id,conversation_uuid,turn_uuid,step,tool_use_id,"
             "tool_name,request_params,create_time) VALUES "
-            "(3,9,'conversation-new','turn-00000000-0000-0000-0000-000000000003',2,"
+            "(3,9,'conversation-new','00000000-0000-0000-0000-000000000003',2,"
             "'assistant-call-3','search','{\"query\":\"new\"}','2026-09-26 12:02:00'); "
             f"UPDATE {table} SET step=3 WHERE id=3;",
         )
@@ -3485,7 +3485,7 @@ DELIMITER ;
         expected_rows = (
             '1\t7\tconversation-old-1\t<null>\t<null>\tcapy-call-1\tsearch\t{"query":"old"}\n'
             "2\t8\tconversation-old-2\t<null>\t<null>\t<null>\tfetch\t{}\n"
-            "3\t9\tconversation-new\tturn-00000000-0000-0000-0000-000000000003\t3\t"
+            "3\t9\tconversation-new\t00000000-0000-0000-0000-000000000003\t3\t"
             'assistant-call-3\tsearch\t{"query":"new"}'
         )
         full_rows = f"SELECT * FROM {table} ORDER BY id;"
