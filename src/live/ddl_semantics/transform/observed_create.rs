@@ -352,12 +352,12 @@ impl Parser {
         } else {
             return Err(format!("unsupported CREATE collation {collation}"));
         };
-        if let Some(character_set) = character_set.as_deref() {
-            if character_set != collation_charset {
-                return Err(format!(
-                    "CREATE collation {collation} does not belong to {character_set}"
-                ));
-            }
+        if let Some(character_set) = character_set.as_deref()
+            && character_set != collation_charset
+        {
+            return Err(format!(
+                "CREATE collation {collation} does not belong to {character_set}"
+            ));
         }
         Ok((Some(collation_charset.into()), Some(collation)))
     }
