@@ -4494,7 +4494,8 @@ DELIMITER ;
         ddl_executions = (
             "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
             "AND command_type IN ('Query','Execute') "
-            f"AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%create table%{table}%';"
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'create table %' "
+            f"AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%{table}%';"
         )
         count = int(self.admin_query(self.target, ddl_executions).strip())
         if count != 1:
