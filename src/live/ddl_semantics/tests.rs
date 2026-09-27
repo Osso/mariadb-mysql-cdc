@@ -2707,7 +2707,7 @@ fn approved_llm_audit_turns_target_rendering_uses_copy_shared_without_changing_s
     let source = super::parser::parse_ddl_operation_with_mode(LLM_AUDIT_TURNS_DDL, mode)
         .expect("source operation");
     let transformed = super::transform::transform_production_alter_table_with_target_mode(
-        LLM_AUDIT_TURNS_DDL,
+        LLM_AUDIT_TURNS_DDL.trim_end(),
         &target,
         mode,
     )

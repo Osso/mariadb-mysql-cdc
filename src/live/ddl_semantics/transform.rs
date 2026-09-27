@@ -153,9 +153,10 @@ pub(crate) fn transform_production_alter_table_with_target(
 
 // MySQL 8.4 cannot run this captured ALTER INPLACE against the existing JSON_VALID
 // CHECK. The approved target-only table rebuild holds a SHARED write lock; retire
-// this exact-event exception once the migration is replayed and checkpointed.
+// this exception when native CHECK-preserving INPLACE replay is supported.
 pub(crate) fn is_approved_llm_audit_turns_alter(source_sql: &str) -> bool {
-    source_sql == include_str!("../../../fixtures/ddl/alter-llm-audit-log-turn-attribution.sql")
+    source_sql.trim_end()
+        == include_str!("../../../fixtures/ddl/alter-llm-audit-log-turn-attribution.sql").trim_end()
 }
 
 pub(crate) fn transform_production_alter_table_with_target_mode(
