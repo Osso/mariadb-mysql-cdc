@@ -4417,6 +4417,7 @@ DELIMITER ;
         assert self.source and self.target
         if self.old_binary is None or not self.old_binary.is_file():
             raise HarnessError("recsys rail CREATE replay requires --old-binary")
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
         table = "recsys_rail_experiments"
         ddl = (
             (self.repo / "fixtures/ddl/create-recsys-rail-experiments.sql")
@@ -4560,7 +4561,7 @@ DELIMITER ;
         query = (
             "SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE LIKE '%unsigned%',"
             "COALESCE(CHARACTER_MAXIMUM_LENGTH,0),IS_NULLABLE,"
-            "COALESCE(TRIM(BOTH CHAR(39) FROM LOWER(REPLACE(COLUMN_DEFAULT,'()',''))),'<null>'),"
+            "COALESCE(NULLIF(TRIM(BOTH CHAR(39) FROM LOWER(REPLACE(COLUMN_DEFAULT,'()',''))),'null'),'<null>'),"
             "COLUMN_COMMENT,ORDINAL_POSITION,COALESCE(CHARACTER_SET_NAME,''),"
             "COALESCE(COLLATION_NAME,''),EXTRA LIKE '%auto_increment%' "
             f"FROM information_schema.COLUMNS WHERE {where} ORDER BY ORDINAL_POSITION;"
