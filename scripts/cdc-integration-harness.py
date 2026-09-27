@@ -101,6 +101,7 @@ SCENARIOS = (
     ScenarioSpec("source-layout-json-pending-replay", True),
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("nullable-datetime-modify-pending-replay", True),
+    ScenarioSpec("audit-turn-attribution-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("assistant-quality-pending-replay", True),
@@ -189,6 +190,7 @@ def default_scenarios() -> list[str]:
             "curated-strip-slides-create-pending-replay",
             "sales-placements-create-pending-replay",
             "nullable-datetime-modify-pending-replay",
+            "audit-turn-attribution-pending-replay",
             "source-layout-json-pending-replay",
             "contributor-cards-check-collision-recovery",
         }
@@ -3368,6 +3370,204 @@ DELIMITER ;
             "spotlight_nullable_varchar_pending_replay_ok nullable=true historical_collation=true "
             "unaffected_metadata=true json_check=true existing_values=true post_ddl_rows=true "
             f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def run_audit_turn_attribution_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError(
+                "audit turn attribution replay requires --old-binary predating mixed ALTER support"
+            )
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
+        table = "llm_audit_log"
+        fixtures = self.repo / "fixtures/ddl"
+        schema = (
+            (fixtures / "create-llm-audit-log-pre-turn-attribution.sql")
+            .read_text()
+            .strip()
+        )
+        ddl = (
+            (fixtures / "alter-llm-audit-log-turn-attribution.sql").read_text().strip()
+        )
+        where = f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)}"
+        columns = (
+            "SELECT COLUMN_NAME,DATA_TYPE,IF(COLUMN_TYPE LIKE '%unsigned%','unsigned','signed'),"
+            "IS_NULLABLE,COALESCE(NULLIF(LOWER(COLUMN_DEFAULT),'null'),'<null>'),"
+            "ORDINAL_POSITION,COLUMN_COMMENT,CHARACTER_SET_NAME,COLLATION_NAME,"
+            "CHARACTER_MAXIMUM_LENGTH "
+            f"FROM information_schema.COLUMNS WHERE {where} ORDER BY ORDINAL_POSITION;"
+        )
+        indexes = (
+            "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME,SUB_PART,INDEX_TYPE "
+            f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;"
+        )
+        checks = (
+            "SELECT cc.CONSTRAINT_NAME,cc.CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS cc "
+            "JOIN information_schema.TABLE_CONSTRAINTS tc "
+            "ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME "
+            f"WHERE tc.TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND tc.TABLE_NAME={sql_literal(table)} "
+            "AND tc.CONSTRAINT_TYPE='CHECK';"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint, f"ALTER DATABASE {APP_SCHEMA} COLLATE utf8mb4_unicode_ci;"
+            )
+            self.admin_sql(endpoint, schema)
+            self.admin_sql(
+                endpoint,
+                f"INSERT INTO {table}(id,user_id,conversation_uuid,tool_use_id,tool_name,request_params,create_time) "
+                "VALUES (1,7,'conversation-old-1','capy-call-1','search','{\"query\":\"old\"}',"
+                "'2026-09-26 12:00:00'),"
+                "(2,8,'conversation-old-2',NULL,'fetch','{}','2026-09-26 12:01:00');",
+            )
+        original_columns_by_endpoint = {
+            endpoint.container: self.admin_query(endpoint, columns).strip().splitlines()
+            for endpoint in (self.source, self.target)
+        }
+        original_columns = original_columns_by_endpoint[self.target.container]
+        original_indexes = self.admin_query(self.target, indexes).strip().splitlines()
+        original_checks = self.admin_query(self.target, checks).strip()
+        if (
+            len(original_columns) != 20
+            or len(original_indexes) != 11
+            or "llm_audit_log_request_params" not in original_checks
+            or "json_valid" not in original_checks.lower()
+        ):
+            raise HarnessError(
+                "pre-turn attribution fixture lost original columns/indexes/JSON check"
+            )
+        self.reset_target_general_log()
+        start, pending = self.prepare_pending_add_column(
+            "",
+            ddl,
+            "ADD COLUMN",
+            prepared=True,
+            old_binary=self.old_binary,
+            source_sql_mode="STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION",
+        )
+        if (
+            self.admin_query(self.target, columns).strip().splitlines()
+            != original_columns
+            or self.admin_query(self.target, indexes).strip().splitlines()
+            != original_indexes
+            or self.admin_query(self.target, checks).strip() != original_checks
+        ):
+            raise HarnessError(
+                "old binary changed audit target schema before pending replay"
+            )
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table}(id,user_id,conversation_uuid,turn_uuid,step,tool_use_id,"
+            "tool_name,request_params,create_time) VALUES "
+            "(3,9,'conversation-new','turn-00000000-0000-0000-0000-000000000003',2,"
+            "'assistant-call-3','search','{\"query\":\"new\"}','2026-09-26 12:02:00'); "
+            f"UPDATE {table} SET step=3 WHERE id=3;",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_source_sql_mode_evidence(pending, False)
+        expected_new = [
+            "turn_uuid\tchar\tsigned\tYES\t<null>\t5\tExact assistant turn; NULL for historical or Capy rows\tutf8mb4\tutf8mb4_unicode_ci\t36",
+            "step\tsmallint\tunsigned\tYES\t<null>\t6\tZero-based assistant model loop step\tNULL\tNULL\tNULL",
+        ]
+        expected_tool = (
+            "tool_use_id\tvarchar\tsigned\tYES\t<null>\t7\t"
+            "Provider tool call ID (Capy or assistant)\tutf8mb4\tutf8mb4_unicode_ci\t64"
+        )
+        expected_indexes = original_indexes + [
+            "idx_turn_step\t1\t1\tturn_uuid\tNULL\tBTREE",
+            "idx_turn_step\t1\t2\tstep\tNULL\tBTREE",
+        ]
+        rows = (
+            f"SELECT id,user_id,conversation_uuid,COALESCE(turn_uuid,'<null>'),"
+            f"COALESCE(CAST(step AS CHAR),'<null>'),COALESCE(tool_use_id,'<null>'),"
+            f"tool_name,request_params FROM {table} ORDER BY id;"
+        )
+        expected_rows = (
+            '1\t7\tconversation-old-1\t<null>\t<null>\tcapy-call-1\tsearch\t{"query":"old"}\n'
+            "2\t8\tconversation-old-2\t<null>\t<null>\t<null>\tfetch\t{}\n"
+            "3\t9\tconversation-new\tturn-00000000-0000-0000-0000-000000000003\t3\t"
+            'assistant-call-3\tsearch\t{"query":"new"}'
+        )
+        full_rows = f"SELECT * FROM {table} ORDER BY id;"
+        for endpoint in (self.source, self.target):
+            actual_columns = self.admin_query(endpoint, columns).strip().splitlines()
+            baseline_columns = original_columns_by_endpoint[endpoint.container]
+            old_columns = [
+                line.split("\t")
+                for line in baseline_columns
+                if not line.startswith("tool_use_id\t")
+            ]
+            remaining_columns = [
+                line.split("\t")
+                for line in actual_columns
+                if line.split("\t", 1)[0] in {old[0] for old in old_columns}
+            ]
+            if (
+                len(actual_columns) != len(baseline_columns) + 2
+                or actual_columns[4:7] != expected_new + [expected_tool]
+                or [part[:5] + part[6:] for part in remaining_columns]
+                != [part[:5] + part[6:] for part in old_columns]
+            ):
+                raise HarnessError(
+                    f"audit column order, comments, nullability, or old metadata differ at "
+                    f"{endpoint.container}: {actual_columns!r}"
+                )
+            actual_indexes = self.admin_query(endpoint, indexes).strip().splitlines()
+            if sorted(actual_indexes) != sorted(expected_indexes):
+                raise HarnessError(
+                    f"audit index preservation/order differs at {endpoint.container}: {actual_indexes!r}"
+                )
+            actual_checks = self.admin_query(endpoint, checks).strip()
+            if (
+                "llm_audit_log_request_params" not in actual_checks
+                or "json_valid" not in actual_checks.lower()
+                or "request_params" not in actual_checks.lower()
+            ):
+                raise HarnessError(
+                    f"audit JSON check lost at {endpoint.container}: {actual_checks!r}"
+                )
+            actual_rows = self.admin_query(endpoint, rows).strip()
+            if actual_rows != expected_rows:
+                raise HarnessError(
+                    f"audit rows differ at {endpoint.container}: {actual_rows!r}"
+                )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"INSERT INTO {table}(id,user_id,tool_name,request_params) "
+                "VALUES(4,10,'invalid','not json');",
+                "Check constraint" if endpoint == self.target else "CONSTRAINT",
+            )
+        complete_rows = self.admin_query(self.source, full_rows).strip()
+        if self.admin_query(self.target, full_rows).strip() != complete_rows:
+            raise HarnessError("audit replay lost unchanged row fields")
+        ddl_executions = (
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
+            "AND command_type IN ('Query','Execute') "
+            f"AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%alter table%{table}%';"
+        )
+        count = int(self.admin_query(self.target, ddl_executions).strip())
+        if count == 0:
+            raise HarnessError("audit pending ALTER did not execute on target")
+        checkpoint = self.checkpoint()
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        require_success(self.run_stream(start, stop), "audit turn attribution restart")
+        if (
+            self.checkpoint() != checkpoint
+            or self.journal_full_row(int(pending["event_start_position"])) != journal
+            or int(self.admin_query(self.target, ddl_executions).strip()) != count
+            or self.admin_query(self.target, columns).strip().splitlines()
+            != actual_columns
+            or self.admin_query(self.target, indexes).strip().splitlines()
+            != actual_indexes
+            or self.admin_query(self.target, checks).strip() != actual_checks
+            or self.admin_query(self.target, rows).strip() != expected_rows
+            or self.admin_query(self.target, full_rows).strip() != complete_rows
+        ):
+            raise HarnessError(
+                "audit restart reapplied DDL or changed schema, checkpoint, or rows"
+            )
+        print(
+            f"audit_turn_attribution_pending_replay_ok coordinate={stop.file}:{stop.position}"
         )
 
     def run_nullable_datetime_modify_pending_replay(self) -> None:
@@ -9634,6 +9834,8 @@ DELIMITER ;
             self.run_spotlight_nullable_varchar_pending_replay()
         elif scenario == "nullable-datetime-modify-pending-replay":
             self.run_nullable_datetime_modify_pending_replay()
+        elif scenario == "audit-turn-attribution-pending-replay":
+            self.run_audit_turn_attribution_pending_replay()
         elif scenario == "storefront-create-pending-replay":
             self.run_storefront_create_pending_replay()
         elif scenario == "reader-memory-create-pending-replay":
