@@ -326,23 +326,40 @@ impl Parser {
             self.keyword("DEFAULT")?;
             self.keyword("CHARSET")?;
             self.keyword("=")?;
-            self.keyword("utf8mb4")?;
-            Some("utf8mb4".to_string())
+            let charset = if self.at("utf8mb3") {
+                "utf8mb3"
+            } else {
+                "utf8mb4"
+            };
+            self.keyword(charset)?;
+            Some(charset.to_string())
         } else {
             None
         };
         if !self.at("COLLATE") {
+            if character_set.as_deref() == Some("utf8mb3") {
+                return Err("utf8mb3 CREATE requires explicit table collation".into());
+            }
             return Ok((character_set, None));
         }
         self.keyword("COLLATE")?;
         self.keyword("=")?;
         let collation = self.identifier()?;
-        if !collation.starts_with("utf8mb4_") {
-            return Err(format!(
-                "CREATE collation {collation} requires utf8mb4 charset"
-            ));
+        let collation_charset = if collation == "utf8mb3_general_ci" {
+            "utf8mb3"
+        } else if collation.starts_with("utf8mb4_") {
+            "utf8mb4"
+        } else {
+            return Err(format!("unsupported CREATE collation {collation}"));
+        };
+        if let Some(character_set) = character_set.as_deref() {
+            if character_set != collation_charset {
+                return Err(format!(
+                    "CREATE collation {collation} does not belong to {character_set}"
+                ));
+            }
         }
-        Ok((Some("utf8mb4".into()), Some(collation)))
+        Ok((Some(collation_charset.into()), Some(collation)))
     }
 
     /// Parses one column definition; the flag reports an inline `PRIMARY KEY`.

@@ -3132,6 +3132,111 @@ fn absent_target() -> SemanticSchemaSnapshot {
     }
 }
 
+const RECSYS_RAIL_CREATE: &str =
+    include_str!("../../../fixtures/ddl/create-recsys-rail-experiments.sql");
+
+#[test]
+fn recsys_rail_create_preserves_table_encoding_and_independent_json_alias() {
+    let operation = parse_ddl_operation(RECSYS_RAIL_CREATE).expect("observed CREATE operation");
+    let coordinate = crate::inventory::SourceMasterCoordinate {
+        file: "mysqld-bin.003115".into(),
+        position: 1,
+    };
+    let evidence = build_fenced_create_table_evidence(
+        &operation,
+        &absent_target(),
+        &crate::inventory::SchemaDefaults {
+            character_set: "utf8mb4".into(),
+            collation: "utf8mb4_unicode_ci".into(),
+        },
+        "mysqld-bin.003115",
+        343946855,
+        &coordinate,
+        &coordinate,
+    )
+    .expect("explicit table encoding needs no historical default lookup");
+    let sql = evidence.generated_sql.expect("translated CREATE");
+    assert!(
+        sql.contains("`experiment_key` VARCHAR(100) NOT NULL"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(
+            "`recsys_params` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL DEFAULT NULL"
+        ),
+        "{sql}"
+    );
+    assert!(sql.contains("CHECK (JSON_VALID(`recsys_params`))"), "{sql}");
+    assert!(
+        sql.ends_with("ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb3 COLLATE=utf8mb3_general_ci"),
+        "{sql}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(&evidence.expected_post_state).unwrap();
+    assert_eq!(state["definition"]["collation"], "utf8mb3_general_ci");
+    let ordinary = column(&state, "experiment_key");
+    assert_eq!(ordinary["character_set"], "utf8mb3");
+    assert_eq!(ordinary["collation"], "utf8mb3_general_ci");
+    let json_alias = column(&state, "recsys_params");
+    assert_eq!(json_alias["column_type"], "longtext");
+    assert_eq!(json_alias["character_set"], "utf8mb4");
+    assert_eq!(json_alias["collation"], "utf8mb4_bin");
+    assert_eq!(
+        state["definition"]["primary_key"],
+        serde_json::json!(["id"])
+    );
+    assert_eq!(state["indexes"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn alternate_utf8mb3_create_preserves_encoding_without_table_name_exception() {
+    let source = "CREATE TABLE `alternate_encoding` (`id` INT PRIMARY KEY, `label` VARCHAR(12) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci";
+    let operation = parse_ddl_operation(source).expect("alternate CREATE operation");
+    let evidence = build_fenced_create_table_evidence(
+        &operation,
+        &absent_target(),
+        &crate::inventory::SchemaDefaults {
+            character_set: "utf8mb4".into(),
+            collation: "utf8mb4_unicode_ci".into(),
+        },
+        "mysqld-bin.003115",
+        343946855,
+        &crate::inventory::SourceMasterCoordinate {
+            file: "other".into(),
+            position: 1,
+        },
+        &crate::inventory::SourceMasterCoordinate {
+            file: "other".into(),
+            position: 1,
+        },
+    )
+    .expect("explicit alternate table encoding needs no historical default lookup");
+    let state: serde_json::Value = serde_json::from_str(&evidence.expected_post_state).unwrap();
+    assert_eq!(column(&state, "label")["character_set"], "utf8mb3");
+    assert_eq!(state["definition"]["collation"], "utf8mb3_general_ci");
+}
+
+#[test]
+fn create_rejects_mismatched_or_unmodeled_table_encoding() {
+    for tail in [
+        "DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb4_general_ci",
+        "DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb3_general_ci",
+        "DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci",
+        "DEFAULT CHARSET=utf8mb3",
+        "DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_unknown_ci",
+        "COLLATE=latin1_swedish_ci",
+    ] {
+        let sql = format!("CREATE TABLE t (id INT PRIMARY KEY) ENGINE=InnoDB {tail}");
+        assert!(
+            parse_ddl_operation(&sql)
+                .expect("unmodeled CREATE operation")
+                .create_table_ast
+                .is_none(),
+            "{sql}"
+        );
+    }
+}
+
 fn reader_memory_create_post_state(source_sql: &str) -> serde_json::Value {
     let operation = parse_ddl_operation(source_sql).expect("reader memory CREATE operation");
     assert!(
