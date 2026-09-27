@@ -2700,6 +2700,58 @@ fn production_llm_audit_turns_alter_preserves_options_and_comments() {
     );
 }
 
+#[test]
+fn approved_llm_audit_turns_target_rendering_uses_copy_shared_without_changing_source() {
+    let mode = crate::live::query_charset_context::SourceSqlMode(Some(0));
+    let target = llm_audit_turns_target();
+    let source = super::parser::parse_ddl_operation_with_mode(LLM_AUDIT_TURNS_DDL, mode)
+        .expect("source operation");
+    let transformed = super::transform::transform_production_alter_table_with_target_mode(
+        LLM_AUDIT_TURNS_DDL,
+        &target,
+        mode,
+    )
+    .expect("approved target rendering");
+    let sql = transformed.target_sql.expect("target SQL");
+    assert!(sql.starts_with("-- Phase 1: exact tool-to-turn joins. Existing rows remain unattributed (NULL).\n-- Apply before deploying the recorder changes. No backfill from timestamps.\nALTER TABLE `llm_audit_log` "), "{sql}");
+    assert!(sql.contains("ADD COLUMN `turn_uuid` CHAR(36) NULL DEFAULT NULL COMMENT 'Exact assistant turn; NULL for historical or Capy rows' AFTER `conversation_uuid`"), "{sql}");
+    assert!(sql.contains("ADD COLUMN `step` SMALLINT UNSIGNED NULL DEFAULT NULL COMMENT 'Zero-based assistant model loop step' AFTER `turn_uuid`"), "{sql}");
+    assert!(sql.contains("MODIFY COLUMN `tool_use_id` VARCHAR(64) NULL DEFAULT NULL COMMENT 'Provider tool call ID (Capy or assistant)'"), "{sql}");
+    assert!(
+        sql.ends_with("ADD KEY `idx_turn_step` (`turn_uuid`, `step`), ALGORITHM=COPY, LOCK=SHARED"),
+        "{sql}"
+    );
+    assert!(!sql.contains("DROP CHECK"));
+    assert!(!sql.contains("DROP CONSTRAINT"));
+    let source_ast = source.alter_table_ast.expect("source AST");
+    assert_eq!(
+        source_ast.algorithm,
+        Some(super::model::ParsedAlterAlgorithm::Inplace)
+    );
+    assert_eq!(source_ast.lock, Some(super::model::ParsedAlterLock::None));
+}
+
+#[test]
+fn near_miss_llm_audit_turns_target_rendering_keeps_inplace_none() {
+    let mode = crate::live::query_charset_context::SourceSqlMode(Some(0));
+    let target = llm_audit_turns_target();
+    for source in [
+        LLM_AUDIT_TURNS_DDL.replace(
+            "Zero-based assistant model loop step",
+            "One-based assistant model loop step",
+        ),
+        LLM_AUDIT_TURNS_DDL.replace("-- Phase 1:", "-- Phase 2:"),
+    ] {
+        let sql = super::transform::transform_production_alter_table_with_target_mode(
+            &source, &target, mode,
+        )
+        .expect("modeled near-miss")
+        .target_sql
+        .expect("target SQL");
+        assert!(sql.ends_with("ALGORITHM=INPLACE, LOCK=NONE"), "{sql}");
+    }
+}
+
 fn llm_audit_turns_target() -> SemanticSchemaSnapshot {
     let mut target = semantic_snapshot(0, None);
     let table = &mut target.inventory.tables[0];

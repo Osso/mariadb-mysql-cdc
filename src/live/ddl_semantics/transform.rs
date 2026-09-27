@@ -151,6 +151,13 @@ pub(crate) fn transform_production_alter_table_with_target(
     transform_production_alter_table_with_target_mode(source_sql, target, SourceSqlMode(None))
 }
 
+// MySQL 8.4 cannot run this captured ALTER INPLACE against the existing JSON_VALID
+// CHECK. The approved target-only table rebuild holds a SHARED write lock; retire
+// this exact-event exception once the migration is replayed and checkpointed.
+pub(crate) fn is_approved_llm_audit_turns_alter(source_sql: &str) -> bool {
+    source_sql == include_str!("../../../fixtures/ddl/alter-llm-audit-log-turn-attribution.sql")
+}
+
 pub(crate) fn transform_production_alter_table_with_target_mode(
     source_sql: &str,
     target: &super::model::SemanticSchemaSnapshot,
@@ -161,7 +168,11 @@ pub(crate) fn transform_production_alter_table_with_target_mode(
     if !supports_parsed_production_alter(&ast) {
         return Err("unsupported production ALTER TABLE shape".to_string());
     }
-    let rendered_sql = render_alter_table_with_target(&ast, target)?;
+    let rendered_sql = render_alter_table_with_target(
+        &ast,
+        target,
+        is_approved_llm_audit_turns_alter(source_sql),
+    )?;
     Ok(transformed_alter_sql(leading_comment, rendered_sql))
 }
 
@@ -188,6 +199,7 @@ fn render_production_alter_table(ast: &ParsedAlterTableAst) -> String {
 fn render_alter_table_with_target(
     ast: &ParsedAlterTableAst,
     target: &super::model::SemanticSchemaSnapshot,
+    approved_copy_shared: bool,
 ) -> Result<String, String> {
     let normalized = fold_new_column_defaults(ast, target)?;
     let mut state = target.clone();
@@ -202,7 +214,17 @@ fn render_alter_table_with_target(
         super::canonical::apply_alter_clause(&mut state, &normalized, clause)?;
         clauses.push(rendered);
     }
-    Ok(render_alter_table_clauses(&normalized, clauses))
+    if approved_copy_shared {
+        clauses.push("ALGORITHM=COPY".to_string());
+        clauses.push("LOCK=SHARED".to_string());
+        Ok(format!(
+            "ALTER TABLE {} {}",
+            quote_identifier(&normalized.table),
+            clauses.join(", ")
+        ))
+    } else {
+        Ok(render_alter_table_clauses(&normalized, clauses))
+    }
 }
 
 // MariaDB resolves these defaults before it backfills newly added columns. Keep

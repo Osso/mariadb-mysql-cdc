@@ -482,7 +482,7 @@ impl LiveDdlSemanticInventory {
             let alters_default = ast.clauses.iter().any(|clause| {
                 matches!(clause, model::ParsedAlterClause::AlterColumnDefault { .. })
             });
-            if alters_default {
+            if alters_default || transform::is_approved_llm_audit_turns_alter(sql) {
                 let operation = parse_semantic_operation_with_mode(sql, mode)?;
                 let before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
                 let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
