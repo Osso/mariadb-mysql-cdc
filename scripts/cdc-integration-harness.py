@@ -99,6 +99,7 @@ SCENARIOS = (
     ScenarioSpec("curated-strip-slides-create-pending-replay", True),
     ScenarioSpec("sales-placements-create-pending-replay", True),
     ScenarioSpec("source-layout-json-pending-replay", True),
+    ScenarioSpec("recsys-rail-create-pending-replay", True),
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("nullable-datetime-modify-pending-replay", True),
     ScenarioSpec("audit-turn-attribution-pending-replay", True),
@@ -192,6 +193,7 @@ def default_scenarios() -> list[str]:
             "nullable-datetime-modify-pending-replay",
             "audit-turn-attribution-pending-replay",
             "source-layout-json-pending-replay",
+            "recsys-rail-create-pending-replay",
             "contributor-cards-check-collision-recovery",
         }
     ]
@@ -4410,6 +4412,326 @@ DELIMITER ;
                 raise HarnessError(
                     f"curated slides FK metadata differs: {actual!r} != {expected!r}"
                 )
+
+    def run_recsys_rail_create_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError("recsys rail CREATE replay requires --old-binary")
+        table = "recsys_rail_experiments"
+        ddl = (
+            (self.repo / "fixtures/ddl/create-recsys-rail-experiments.sql")
+            .read_text()
+            .strip()
+        )
+        self.admin_sql(
+            self.target,
+            f"ALTER DATABASE {APP_SCHEMA} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+        )
+        self.reset_target_general_log()
+        start, pending = self.prepare_pending_add_column(
+            "",
+            ddl,
+            "CREATE TABLE",
+            old_binary=self.old_binary,
+            source_sql_mode="STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION",
+        )
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)};",
+        ).strip()
+        if absent != "0":
+            raise HarnessError(
+                "old binary created recsys rail table before pending replay"
+            )
+        json_text = '{ "rail": "😀", "items": [1, 2] }'
+        json_value = f"CONVERT(0x{json_text.encode('utf-8').hex()} USING utf8mb4)"
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table}(id,experiment_key,content_section_id,experiment_mode,"
+            "recsys_surface,recsys_params,salt,start_time,end_time,create_time) VALUES "
+            f"(1,'Rail_雪',42,'rerank','首页',{json_value},'盐',"
+            "'2026-09-01 01:02:03','2026-10-01 04:05:06','2026-08-01 00:00:00'); "
+            f"INSERT INTO {table}(id,experiment_key,content_section_id,experiment_mode,"
+            "recsys_surface,salt) VALUES (2,'next_雪',43,'source','推荐','乙');",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_recsys_rail_create_metadata()
+        self.assert_recsys_rail_rows(json_text, None)
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"INSERT INTO {table}(id,experiment_key,content_section_id,experiment_mode,"
+                "recsys_surface,salt) VALUES (90,'rAIL_雪',42,'source','首页','盐');",
+                "Duplicate entry",
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"INSERT INTO {table}(id,experiment_key,content_section_id,experiment_mode,"
+                "recsys_surface,recsys_params,salt) VALUES "
+                "(91,'invalid_雪',42,'source','首页','{invalid','盐');",
+                "CONSTRAINT" if endpoint == self.source else "Check constraint",
+            )
+            if (
+                self.admin_query(
+                    endpoint, f"SELECT COUNT(*) FROM {table} WHERE id IN (90,91);"
+                ).strip()
+                != "0"
+            ):
+                raise HarnessError("rejected recsys rail row persisted")
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET candidate_count=5,status='running',"
+            f"recsys_params={json_value},update_time='2026-09-02 03:04:05' WHERE id=2; "
+            f"INSERT INTO {table}(id,experiment_key,content_section_id,experiment_mode,"
+            "recsys_surface,recsys_params,salt) VALUES "
+            "(3,'null_雪',44,'rerank','漫','null','丙');",
+        )
+        end = self.coordinate()
+        require_success(self.run_stream(stop, end), "recsys rail following DML")
+        self.assert_recsys_rail_rows(json_text, json_text)
+        ddl_executions = (
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
+            "AND command_type IN ('Query','Execute') "
+            f"AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%create table%{table}%';"
+        )
+        count = int(self.admin_query(self.target, ddl_executions).strip())
+        if count != 1:
+            raise HarnessError(f"recsys rail CREATE executions differ: {count}")
+        checkpoint = self.checkpoint()
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        require_success(self.run_stream(start, end), "recsys rail restart")
+        if (
+            self.checkpoint() != checkpoint
+            or self.journal_full_row(int(pending["event_start_position"])) != journal
+            or int(self.admin_query(self.target, ddl_executions).strip()) != count
+        ):
+            raise HarnessError(
+                "recsys rail restart changed journal/checkpoint or reapplied CREATE"
+            )
+        self.assert_recsys_rail_create_metadata()
+        self.assert_recsys_rail_rows(json_text, json_text)
+        print(
+            f"recsys_rail_create_pending_replay_ok coordinate={end.file}:{end.position}"
+        )
+
+    def assert_recsys_rail_rows(self, first_json: str, second_json: str | None) -> None:
+        assert self.source and self.target
+        table = "recsys_rail_experiments"
+        query = (
+            "SELECT id,HEX(experiment_key),content_section_id,HEX(experiment_mode),"
+            "HEX(recsys_surface),recsys_params IS NULL,HEX(recsys_params),"
+            "candidate_count,min_items,treatment_pct,HEX(salt),HEX(status),"
+            "start_time,end_time,CASE WHEN id=1 THEN CAST(create_time AS CHAR) "
+            "ELSE CAST(create_time IS NOT NULL AS CHAR) END,update_time "
+            f"FROM {table} ORDER BY id;"
+        )
+
+        def hex_text(value: str) -> str:
+            return value.encode("utf-8").hex().upper()
+
+        expected = [
+            f"1\t{hex_text('Rail_雪')}\t42\t{hex_text('rerank')}\t{hex_text('首页')}\t0\t"
+            f"{hex_text(first_json)}\tNULL\t3\t0\t{hex_text('盐')}\t{hex_text('draft')}\t"
+            "2026-09-01 01:02:03\t2026-10-01 04:05:06\t2026-08-01 00:00:00\tNULL",
+            f"2\t{hex_text('next_雪')}\t43\t{hex_text('source')}\t{hex_text('推荐')}\t"
+            f"{int(second_json is None)}\t{hex_text(second_json) if second_json else 'NULL'}\t"
+            f"{5 if second_json else 'NULL'}\t3\t0\t{hex_text('乙')}\t"
+            f"{hex_text('running' if second_json else 'draft')}\tNULL\tNULL\t1\t"
+            f"{'2026-09-02 03:04:05' if second_json else 'NULL'}",
+        ]
+        if second_json:
+            expected.append(
+                f"3\t{hex_text('null_雪')}\t44\t{hex_text('rerank')}\t{hex_text('漫')}\t0\t"
+                f"{hex_text('null')}\tNULL\t3\t0\t{hex_text('丙')}\t{hex_text('draft')}\t"
+                "NULL\tNULL\t1\tNULL"
+            )
+        for endpoint in (self.source, self.target):
+            rows = self.admin_query(endpoint, query).strip().splitlines()
+            if rows != expected:
+                raise HarnessError(
+                    f"recsys rail rows differ at {endpoint.container}: {rows!r}"
+                )
+
+    def assert_recsys_rail_create_metadata(self) -> None:
+        assert self.source and self.target
+        table = "recsys_rail_experiments"
+        where = f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)}"
+        query = (
+            "SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE LIKE '%unsigned%',"
+            "COALESCE(CHARACTER_MAXIMUM_LENGTH,0),IS_NULLABLE,"
+            "COALESCE(TRIM(BOTH CHAR(39) FROM LOWER(REPLACE(COLUMN_DEFAULT,'()',''))),'<null>'),"
+            "COLUMN_COMMENT,ORDINAL_POSITION,COALESCE(CHARACTER_SET_NAME,''),"
+            "COALESCE(COLLATION_NAME,''),EXTRA LIKE '%auto_increment%' "
+            f"FROM information_schema.COLUMNS WHERE {where} ORDER BY ORDINAL_POSITION;"
+        )
+        expected = [
+            ("id", "int", 1, 0, "NO", "<null>", "", 1, "", "", 1),
+            (
+                "experiment_key",
+                "varchar",
+                0,
+                100,
+                "NO",
+                "<null>",
+                "",
+                2,
+                "utf8mb3",
+                "utf8mb3_general_ci",
+                0,
+            ),
+            ("content_section_id", "int", 1, 0, "NO", "<null>", "", 3, "", "", 0),
+            (
+                "experiment_mode",
+                "varchar",
+                0,
+                20,
+                "NO",
+                "<null>",
+                "rerank | source",
+                4,
+                "utf8mb3",
+                "utf8mb3_general_ci",
+                0,
+            ),
+            (
+                "recsys_surface",
+                "varchar",
+                0,
+                50,
+                "NO",
+                "<null>",
+                "",
+                5,
+                "utf8mb3",
+                "utf8mb3_general_ci",
+                0,
+            ),
+            (
+                "recsys_params",
+                "longtext",
+                0,
+                4294967295,
+                "YES",
+                "<null>",
+                "",
+                6,
+                "utf8mb4",
+                "utf8mb4_bin",
+                0,
+            ),
+            (
+                "candidate_count",
+                "smallint",
+                1,
+                0,
+                "YES",
+                "<null>",
+                "rerank only; NULL = section count",
+                7,
+                "",
+                "",
+                0,
+            ),
+            ("min_items", "smallint", 1, 0, "NO", "3", "", 8, "", "", 0),
+            ("treatment_pct", "tinyint", 1, 0, "NO", "0", "", 9, "", "", 0),
+            (
+                "salt",
+                "varchar",
+                0,
+                40,
+                "NO",
+                "<null>",
+                "",
+                10,
+                "utf8mb3",
+                "utf8mb3_general_ci",
+                0,
+            ),
+            (
+                "status",
+                "varchar",
+                0,
+                20,
+                "NO",
+                "draft",
+                "draft | running | stopped",
+                11,
+                "utf8mb3",
+                "utf8mb3_general_ci",
+                0,
+            ),
+            ("start_time", "datetime", 0, 0, "YES", "<null>", "", 12, "", "", 0),
+            ("end_time", "datetime", 0, 0, "YES", "<null>", "", 13, "", "", 0),
+            (
+                "create_time",
+                "timestamp",
+                0,
+                0,
+                "NO",
+                "current_timestamp",
+                "",
+                14,
+                "",
+                "",
+                0,
+            ),
+            ("update_time", "timestamp", 0, 0, "YES", "<null>", "", 15, "", "", 0),
+        ]
+        expected_columns = ["\t".join(map(str, row)) for row in expected]
+        indexes = (
+            "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME "
+            f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;"
+        )
+        expected_indexes = (
+            "idx_section_status\t1\t1\tcontent_section_id\n"
+            "idx_section_status\t1\t2\tstatus\n"
+            "PRIMARY\t0\t1\tid\n"
+            "uk_experiment_key\t0\t1\texperiment_key"
+        )
+        for endpoint in (self.source, self.target):
+            columns = self.admin_query(endpoint, query).strip().splitlines()
+            if columns != expected_columns:
+                raise HarnessError(
+                    f"recsys rail columns differ at {endpoint.container}: {columns!r}"
+                )
+            collation = self.admin_query(
+                endpoint,
+                f"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE {where};",
+            ).strip()
+            if collation != "utf8mb3_general_ci":
+                raise HarnessError(
+                    f"recsys rail table collation differs: {collation!r}"
+                )
+            actual_indexes = self.admin_query(endpoint, indexes).strip()
+            if actual_indexes != expected_indexes:
+                raise HarnessError(f"recsys rail indexes differ: {actual_indexes!r}")
+            table_filter = (
+                f"AND tc.TABLE_NAME={sql_literal(table)} "
+                if endpoint == self.source
+                else ""
+            )
+            enforced = "'YES'" if endpoint == self.source else "tc.ENFORCED"
+            checks = (
+                self.admin_query(
+                    endpoint,
+                    f"SELECT cc.CHECK_CLAUSE,{enforced} FROM information_schema.TABLE_CONSTRAINTS tc "
+                    "JOIN information_schema.CHECK_CONSTRAINTS cc "
+                    "ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME "
+                    f"WHERE tc.TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND tc.TABLE_NAME={sql_literal(table)} "
+                    f"{table_filter}AND tc.CONSTRAINT_TYPE='CHECK';",
+                )
+                .strip()
+                .splitlines()
+            )
+            if len(checks) != 1 or len(checks[0].split("\t")) != 2:
+                raise HarnessError(f"recsys rail JSON CHECK missing: {checks!r}")
+            clause, active = checks[0].split("\t")
+            if (
+                re.sub(r"[\s`()]+", "", clause).lower() != "json_validrecsys_params"
+                or active != "YES"
+            ):
+                raise HarnessError(f"recsys rail JSON CHECK differs: {checks!r}")
 
     def run_spotlight_create_pending_replay(self) -> None:
         assert self.source and self.target
@@ -9828,6 +10150,8 @@ DELIMITER ;
             self.run_sales_placements_create_pending_replay()
         elif scenario == "source-layout-json-pending-replay":
             self.run_source_layout_json_pending_replay()
+        elif scenario == "recsys-rail-create-pending-replay":
+            self.run_recsys_rail_create_pending_replay()
         elif scenario == "spotlight-create-pending-replay":
             self.run_spotlight_create_pending_replay()
         elif scenario == "spotlight-nullable-varchar-pending-replay":
