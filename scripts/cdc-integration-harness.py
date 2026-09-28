@@ -106,6 +106,7 @@ SCENARIOS = (
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("assistant-quality-pending-replay", True),
+    ScenarioSpec("assistant-rec-quality-create-pending-replay", True),
     ScenarioSpec("contributor-cards-check-collision-recovery", True),
     ScenarioSpec("commented-drop-column-present-pending-replay", True),
     ScenarioSpec("commented-drop-column-absent-pending-replay", True),
@@ -194,6 +195,7 @@ def default_scenarios() -> list[str]:
             "audit-turn-attribution-pending-replay",
             "source-layout-json-pending-replay",
             "recsys-rail-create-pending-replay",
+            "assistant-rec-quality-create-pending-replay",
             "contributor-cards-check-collision-recovery",
         }
     ]
@@ -4988,6 +4990,233 @@ DELIMITER ;
         "alter-assistant-quality-verdicts-conversation-key.sql",
         "alter-assistant-quality-verdicts-conversation-fk.sql",
     )
+
+    def run_assistant_rec_quality_create_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError("assistant rec quality CREATE replay requires --old-binary")
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
+        table = "assistant_rec_quality_runs"
+        ddl = (self.repo / "fixtures/ddl/create-assistant-rec-quality-runs.sql").read_text().strip()
+        self.reset_target_general_log()
+        start, pending = self.prepare_pending_add_column(
+            "", ddl, "CREATE TABLE", old_binary=self.old_binary
+        )
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)};",
+        ).strip()
+        if absent != "0":
+            raise HarnessError("old binary created assistant rec quality table")
+        # Explicit columns exclude the generated slot from every source row event.
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table} (id,uuid,window_days,readiness,summary,create_time) "
+            "VALUES (1,'rec-1',7,'{\"ready\": 2}','{\"state\": \"open\"}',"
+            "'2026-09-28 10:00:00'); "
+            f"INSERT INTO {table} (id,uuid,status,is_active,window_days,create_time) "
+            "VALUES (2,'rec-2','done',1,14,'2026-09-28 10:01:00'),"
+            "(3,'rec-3','running',0,21,'2026-09-28 10:02:00'),"
+            "(4,'rec-4','error',0,28,'2026-09-28 10:03:00');",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_assistant_rec_quality_metadata()
+        self.assert_assistant_rec_quality_rows(
+            "1\trec-1\trunning\tcron\t1\t1\t7\t0\t0\t2\topen\tNULL\t1\tNULL\t2026-09-28 10:00:00\tNULL\t1\n"
+            "2\trec-2\tdone\tcron\t1\t1\t14\t0\t0\tNULL\tNULL\tNULL\t1\tNULL\t2026-09-28 10:01:00\tNULL\tNULL\n"
+            "3\trec-3\trunning\tcron\t1\t1\t21\t0\t0\tNULL\tNULL\tNULL\t0\tNULL\t2026-09-28 10:02:00\tNULL\tNULL\n"
+            "4\trec-4\terror\tcron\t1\t1\t28\t0\t0\tNULL\tNULL\tNULL\t0\tNULL\t2026-09-28 10:03:00\tNULL\tNULL"
+        )
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"INSERT INTO {table} (id,uuid,window_days) VALUES (90,'rec-90',1);",
+                "Duplicate entry",
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"UPDATE {table} SET status='running',is_active=1 WHERE id=2;",
+                "Duplicate entry",
+            )
+            for column in ("readiness", "summary"):
+                self.assert_admin_sql_rejected(
+                    endpoint,
+                    f"INSERT INTO {table} (id,uuid,window_days,{column}) "
+                    f"VALUES (91,'invalid-{column}',1,'{{invalid');",
+                    "CONSTRAINT" if endpoint == self.source else "Check constraint",
+                )
+            if self.admin_query(endpoint, f"SELECT COUNT(*) FROM {table} WHERE id IN (90,91);").strip() != "0":
+                raise HarnessError("rejected assistant rec quality row persisted")
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET status='done',finish_time='2026-09-28 11:00:00' WHERE id=1; "
+            f"INSERT INTO {table} (id,uuid,window_days,unit_count,seen_unit_count,error,creator_id,"
+            "readiness,summary,create_time) VALUES "
+            "(5,'rec-5',3,8,5,'retry',42,'null','[1,2]','2026-09-28 11:01:00');",
+        )
+        after_done = self.coordinate()
+        require_success(self.run_stream(stop, after_done), "assistant rec quality slot release by status")
+        self.assert_assistant_rec_quality_rows(
+            "1\trec-1\tdone\tcron\t1\t1\t7\t0\t0\t2\topen\tNULL\t1\tNULL\t2026-09-28 10:00:00\t2026-09-28 11:00:00\tNULL\n"
+            "2\trec-2\tdone\tcron\t1\t1\t14\t0\t0\tNULL\tNULL\tNULL\t1\tNULL\t2026-09-28 10:01:00\tNULL\tNULL\n"
+            "3\trec-3\trunning\tcron\t1\t1\t21\t0\t0\tNULL\tNULL\tNULL\t0\tNULL\t2026-09-28 10:02:00\tNULL\tNULL\n"
+            "4\trec-4\terror\tcron\t1\t1\t28\t0\t0\tNULL\tNULL\tNULL\t0\tNULL\t2026-09-28 10:03:00\tNULL\tNULL\n"
+            "5\trec-5\trunning\tcron\t1\t1\t3\t8\t5\tnull\t[1,2]\tretry\t1\t42\t2026-09-28 11:01:00\tNULL\t1"
+        )
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"UPDATE {table} SET is_active=1 WHERE id=3;",
+                "Duplicate entry",
+            )
+        self.admin_sql(self.source, f"UPDATE {table} SET is_active=0 WHERE id=5;")
+        after_activity = self.coordinate()
+        require_success(self.run_stream(after_done, after_activity), "assistant rec quality slot release by activity")
+        for endpoint in (self.source, self.target):
+            locks = self.admin_query(
+                endpoint, f"SELECT id,in_flight_lock FROM {table} ORDER BY id;"
+            ).strip()
+            if locks != "1\tNULL\n2\tNULL\n3\tNULL\n4\tNULL\n5\tNULL":
+                raise HarnessError(f"activity release did not free slot at {endpoint.container}: {locks!r}")
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table} (id,uuid,window_days,create_time) "
+            "VALUES (6,'rec-6',1,'2026-09-28 11:02:00'); "
+            f"UPDATE {table} SET status='done' WHERE id=6; "
+            f"UPDATE {table} SET is_active=1 WHERE id=3;",
+        )
+        end = self.coordinate()
+        require_success(self.run_stream(after_activity, end), "assistant rec quality slot reacquisition")
+        expected = (
+            "1\trec-1\tdone\tcron\t1\t1\t7\t0\t0\t2\topen\tNULL\t1\tNULL\t2026-09-28 10:00:00\t2026-09-28 11:00:00\tNULL\n"
+            "2\trec-2\tdone\tcron\t1\t1\t14\t0\t0\tNULL\tNULL\tNULL\t1\tNULL\t2026-09-28 10:01:00\tNULL\tNULL\n"
+            "3\trec-3\trunning\tcron\t1\t1\t21\t0\t0\tNULL\tNULL\tNULL\t1\tNULL\t2026-09-28 10:02:00\tNULL\t1\n"
+            "4\trec-4\terror\tcron\t1\t1\t28\t0\t0\tNULL\tNULL\tNULL\t0\tNULL\t2026-09-28 10:03:00\tNULL\tNULL\n"
+            "5\trec-5\trunning\tcron\t1\t1\t3\t8\t5\tnull\t[1,2]\tretry\t0\t42\t2026-09-28 11:01:00\tNULL\tNULL\n"
+            "6\trec-6\tdone\tcron\t1\t1\t1\t0\t0\tNULL\tNULL\tNULL\t1\tNULL\t2026-09-28 11:02:00\tNULL\tNULL"
+        )
+        self.assert_assistant_rec_quality_rows(expected)
+        ddl_executions = (
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
+            "AND command_type IN ('Query','Execute') "
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'create table %' "
+            f"AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%{table}%';"
+        )
+        count = int(self.admin_query(self.target, ddl_executions).strip())
+        if count != 1:
+            raise HarnessError(f"assistant rec quality CREATE executions differ: {count}")
+        checkpoint = self.checkpoint()
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        require_success(self.run_stream(start, end), "assistant rec quality restart")
+        if (
+            self.checkpoint() != checkpoint
+            or self.journal_full_row(int(pending["event_start_position"])) != journal
+            or int(self.admin_query(self.target, ddl_executions).strip()) != count
+        ):
+            raise HarnessError("assistant rec quality restart changed checkpoint/journal or reapplied CREATE")
+        self.assert_assistant_rec_quality_metadata()
+        self.assert_assistant_rec_quality_rows(expected)
+        print(f"assistant_rec_quality_create_pending_replay_ok coordinate={end.file}:{end.position}")
+
+    def assert_assistant_rec_quality_rows(self, expected: str) -> None:
+        assert self.source and self.target
+        query = (
+            "SELECT id,uuid,status,trigger_source,metric_version,taxonomy_version,window_days,"
+            "unit_count,seen_unit_count,CASE WHEN JSON_TYPE(readiness)='NULL' THEN 'null' "
+            "ELSE JSON_UNQUOTE(JSON_EXTRACT(readiness,'$.ready')) END,"
+            "CASE WHEN JSON_TYPE(summary)='ARRAY' THEN "
+            "CONCAT('[',JSON_UNQUOTE(JSON_EXTRACT(summary,'$[0]')),',',"
+            "JSON_UNQUOTE(JSON_EXTRACT(summary,'$[1]')),']') "
+            "ELSE JSON_UNQUOTE(JSON_EXTRACT(summary,'$.state')) END,error,is_active,creator_id,"
+            "create_time,finish_time,in_flight_lock "
+            "FROM assistant_rec_quality_runs ORDER BY id;"
+        )
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, query).strip()
+            if actual != expected:
+                raise HarnessError(
+                    f"assistant rec quality rows differ at {endpoint.container}: {actual!r} != {expected!r}"
+                )
+
+    def assert_assistant_rec_quality_metadata(self) -> None:
+        assert self.source and self.target
+        table = "assistant_rec_quality_runs"
+        columns = (
+            "SELECT column_name,column_type,is_nullable,IFNULL(column_default,'NULL'),extra "
+            "FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)} "
+            "ORDER BY ordinal_position;"
+        )
+        expected = "\n".join(
+            (
+                "id\tint unsigned\tNO\tNULL\tauto_increment",
+                "uuid\tchar(36)\tNO\tNULL\t",
+                "status\tvarchar(16)\tNO\trunning\t",
+                "trigger_source\tvarchar(16)\tNO\tcron\t",
+                "metric_version\tsmallint unsigned\tNO\t1\t",
+                "taxonomy_version\tsmallint unsigned\tNO\t1\t",
+                "window_days\tsmallint unsigned\tNO\tNULL\t",
+                "unit_count\tint unsigned\tNO\t0\t",
+                "seen_unit_count\tint unsigned\tNO\t0\t",
+                "readiness\tlongtext\tYES\tNULL\t",
+                "summary\tlongtext\tYES\tNULL\t",
+                "error\tvarchar(255)\tYES\tNULL\t",
+                "is_active\ttinyint unsigned\tNO\t1\t",
+                "creator_id\tint unsigned\tYES\tNULL\t",
+                "create_time\ttimestamp\tNO\tCURRENT_TIMESTAMP\tDEFAULT_GENERATED",
+                "finish_time\ttimestamp\tYES\tNULL\t",
+                "in_flight_lock\ttinyint unsigned\tYES\tNULL\tSTORED GENERATED",
+            )
+        )
+        actual = self.admin_query(self.target, columns).strip()
+        if actual != expected:
+            raise HarnessError(f"assistant rec quality columns differ: {actual!r}")
+        expression = self.admin_query(
+            self.target,
+            "SELECT generation_expression FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)} "
+            "AND COLUMN_NAME='in_flight_lock';",
+        ).strip().lower()
+        if not all(token in expression for token in ("if(", "`status`", "running", "and", "`is_active`", "= 1", ",1,null)")):
+            raise HarnessError(f"assistant rec quality generation expression differs: {expression!r}")
+        indexes = (
+            "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME "
+            "FROM information_schema.STATISTICS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)} "
+            "ORDER BY INDEX_NAME,SEQ_IN_INDEX;"
+        )
+        expected_indexes = (
+            "idx_status_time\t1\t1\tstatus\n"
+            "idx_status_time\t1\t2\tcreate_time\n"
+            "PRIMARY\t0\t1\tid\n"
+            "uk_single_in_flight\t0\t1\tin_flight_lock\n"
+            "uk_uuid\t0\t1\tuuid"
+        )
+        actual_indexes = self.admin_query(self.target, indexes).strip()
+        if actual_indexes != expected_indexes:
+            raise HarnessError(f"assistant rec quality indexes differ: {actual_indexes!r}")
+        for endpoint in (self.source, self.target):
+            checks = self.admin_query(
+                endpoint,
+                "SELECT CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS "
+                f"WHERE CONSTRAINT_SCHEMA={sql_literal(APP_SCHEMA)} "
+                "AND CONSTRAINT_NAME IN (SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS "
+                f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)} "
+                "AND CONSTRAINT_TYPE='CHECK');",
+            ).lower().splitlines()
+            for name in ("readiness", "summary"):
+                if sum("json_valid" in clause and name in clause for clause in checks) != 1:
+                    raise HarnessError(f"assistant rec quality {name} JSON check missing: {checks!r}")
+            if len(checks) != 2:
+                raise HarnessError(f"assistant rec quality JSON check count differs: {checks!r}")
+        collation = self.admin_query(
+            self.target,
+            "SELECT TABLE_COLLATION FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)};",
+        ).strip()
+        if collation != "utf8mb4_unicode_ci":
+            raise HarnessError(f"assistant rec quality table collation differs: {collation!r}")
 
     def run_assistant_quality_pending_replay(self) -> None:
         """The mysqld-bin.003089 barrier: a pending assistant_quality_runs CREATE (integer
@@ -10170,6 +10399,8 @@ DELIMITER ;
             self.run_reader_memory_guarded_alter_pending_replay()
         elif scenario == "assistant-quality-pending-replay":
             self.run_assistant_quality_pending_replay()
+        elif scenario == "assistant-rec-quality-create-pending-replay":
+            self.run_assistant_rec_quality_create_pending_replay()
         elif scenario == "contributor-cards-check-collision-recovery":
             self.run_contributor_cards_check_collision_recovery()
         elif scenario == "commented-drop-column-present-pending-replay":
