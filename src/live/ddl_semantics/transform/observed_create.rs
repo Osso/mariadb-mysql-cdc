@@ -105,6 +105,7 @@ pub(super) fn parse_with_mode(
     if parser.position != parser.tokens.len() {
         return Err("unmodeled CREATE tail".into());
     }
+    bind_generated_create_references(&mut columns)?;
     validate_definitions(&columns, &primary_key, &indexes, &check_constraints)?;
     validate_foreign_keys(&foreign_keys, &columns, &primary_key, &indexes)?;
     for column in &mut columns {
@@ -174,7 +175,6 @@ fn validate_definitions(
             return Err("duplicate or unknown CREATE key column".into());
         }
     }
-    validate_generated_create_columns(columns)?;
     for constraint in check_constraints {
         for column in check_constraint::referenced_columns(constraint) {
             if !names.contains(&column.to_ascii_lowercase()) {
@@ -188,37 +188,38 @@ fn validate_definitions(
     Ok(())
 }
 
-fn validate_generated_create_columns(columns: &[ParsedCreateColumnAst]) -> Result<(), String> {
+fn bind_generated_create_references(columns: &mut [ParsedCreateColumnAst]) -> Result<(), String> {
+    if !columns.iter().any(|column| column.generated.is_some()) {
+        return Ok(());
+    }
+    let declarations = columns.to_vec();
     for column in columns {
-        let Some(expression) = &column.generated else {
+        let Some(expression) = &mut column.generated else {
             continue;
         };
-        for (reference, operand) in &expression.equalities {
-            validate_generated_create_reference(columns, column, reference, operand)?;
+        for (reference, operand) in &mut expression.equalities {
+            *reference =
+                bind_generated_create_reference(&declarations, &column.name, reference, operand)?;
         }
     }
     Ok(())
 }
 
-fn validate_generated_create_reference(
+fn bind_generated_create_reference(
     columns: &[ParsedCreateColumnAst],
-    generated: &ParsedCreateColumnAst,
+    generated_name: &str,
     reference: &str,
     operand: &super::super::model::GeneratedOperand,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let referenced = columns
         .iter()
-        .find(|column| column.name == reference)
+        .find(|column| column.name.eq_ignore_ascii_case(reference))
         .ok_or_else(|| {
-            format!(
-                "generated column {} references unknown column {reference}",
-                generated.name
-            )
+            format!("generated column {generated_name} references unknown column {reference}")
         })?;
     if referenced.generated.is_some() || referenced.auto_increment {
         return Err(format!(
-            "generated column {} references non-ordinary column {reference}",
-            generated.name
+            "generated column {generated_name} references non-ordinary column {reference}"
         ));
     }
     let compatible = match operand {
@@ -233,11 +234,10 @@ fn validate_generated_create_reference(
     };
     if !compatible {
         return Err(format!(
-            "generated column {} has incompatible reference {reference}",
-            generated.name
+            "generated column {generated_name} has incompatible reference {reference}"
         ));
     }
-    Ok(())
+    Ok(referenced.name.clone())
 }
 
 fn validate_foreign_keys(

@@ -141,6 +141,69 @@ fn rec_quality_create_preserves_stored_if_and_unique_nullable_slot() {
 }
 
 #[test]
+fn generated_create_binds_reference_case_to_declared_columns() {
+    let source = REC_RUNS.replace(
+        "IF(`status` = 'running' AND `is_active` = 1",
+        "IF(`STATUS` = 'running' AND `IS_ACTIVE` = 1",
+    );
+    assert_ne!(source, REC_RUNS);
+    let ast = parse_fixture_create_table(&source).expect("case-insensitive generated references");
+    let generated = ast
+        .columns
+        .iter()
+        .find(|column| column.name == "in_flight_lock")
+        .unwrap()
+        .generated
+        .as_ref()
+        .unwrap();
+    assert_eq!(generated.equalities[0].0, "status");
+    assert_eq!(generated.equalities[1].0, "is_active");
+    assert!(ast.columns.iter().any(|column| column.name == "status"));
+    assert_eq!(ast.indexes[2].name, "idx_status_time");
+    let sql = translate_ddl(&source, &[])
+        .expect("case-insensitive generated CREATE translation")
+        .target_sql
+        .unwrap();
+    assert!(sql.contains("IF(`status` = _utf8mb4'running' AND `is_active` = 1, 1, NULL)"));
+    assert!(sql.contains("KEY `idx_status_time` (`status`, `create_time`)"));
+
+    let operation = parse_ddl_operation(&source).unwrap();
+    let coordinate = crate::inventory::SourceMasterCoordinate {
+        file: "mysqld-bin.003119".into(),
+        position: 113833800,
+    };
+    let evidence = build_fenced_create_table_evidence(
+        &operation,
+        &absent_target(),
+        &crate::inventory::SchemaDefaults {
+            character_set: "utf8mb4".into(),
+            collation: "utf8mb4_unicode_ci".into(),
+        },
+        "mysqld-bin.003119",
+        113833800,
+        &coordinate,
+        &coordinate,
+    )
+    .expect("case-insensitive generated CREATE evidence");
+    let canonical: serde_json::Value = serde_json::from_str(&evidence.canonical_ast).unwrap();
+    let canonical_lock = canonical["parsed_create_table"]["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|column| column["name"] == "in_flight_lock")
+        .unwrap();
+    assert_eq!(
+        canonical_lock["generated"]["expression"],
+        "if(((`status` = _utf8mb4\\'running\\') and (`is_active` = 1)),1,NULL)"
+    );
+    let post: serde_json::Value = serde_json::from_str(&evidence.expected_post_state).unwrap();
+    assert_eq!(
+        post_state_column(&post, "in_flight_lock")["generated"],
+        canonical_lock["generated"]
+    );
+}
+
+#[test]
 fn rec_quality_generated_create_is_generic_and_rejects_unmodeled_forms() {
     let renamed = REC_RUNS
         .replace("assistant_rec_quality_runs", "another_run_table")
