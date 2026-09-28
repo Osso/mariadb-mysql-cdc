@@ -107,6 +107,7 @@ SCENARIOS = (
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("assistant-quality-pending-replay", True),
     ScenarioSpec("assistant-rec-quality-create-pending-replay", True),
+    ScenarioSpec("assistant-rec-quality-create-mixed-case-pending-replay", True),
     ScenarioSpec("contributor-cards-check-collision-recovery", True),
     ScenarioSpec("commented-drop-column-present-pending-replay", True),
     ScenarioSpec("commented-drop-column-absent-pending-replay", True),
@@ -196,6 +197,7 @@ def default_scenarios() -> list[str]:
             "source-layout-json-pending-replay",
             "recsys-rail-create-pending-replay",
             "assistant-rec-quality-create-pending-replay",
+            "assistant-rec-quality-create-mixed-case-pending-replay",
             "contributor-cards-check-collision-recovery",
         }
     ]
@@ -4991,13 +4993,18 @@ DELIMITER ;
         "alter-assistant-quality-verdicts-conversation-fk.sql",
     )
 
-    def run_assistant_rec_quality_create_pending_replay(self) -> None:
+    def run_assistant_rec_quality_create_pending_replay(self, *, mixed_case: bool = False) -> None:
         assert self.source and self.target
         if self.old_binary is None or not self.old_binary.is_file():
             raise HarnessError("assistant rec quality CREATE replay requires --old-binary")
         self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
         table = "assistant_rec_quality_runs"
         ddl = (self.repo / "fixtures/ddl/create-assistant-rec-quality-runs.sql").read_text().strip()
+        if mixed_case:
+            ddl = ddl.replace(
+                "IF(`status` = 'running' AND `is_active` = 1",
+                "IF(`STATUS` = 'running' AND `IS_ACTIVE` = 1",
+            )
         self.reset_target_general_log()
         start, pending = self.prepare_pending_add_column(
             "", ddl, "CREATE TABLE", old_binary=self.old_binary
@@ -5117,7 +5124,10 @@ DELIMITER ;
             raise HarnessError("assistant rec quality restart changed checkpoint/journal or reapplied CREATE")
         self.assert_assistant_rec_quality_metadata()
         self.assert_assistant_rec_quality_rows(expected)
-        print(f"assistant_rec_quality_create_pending_replay_ok coordinate={end.file}:{end.position}")
+        print(
+            "assistant_rec_quality_create_pending_replay_ok "
+            f"mixed_case={str(mixed_case).lower()} coordinate={end.file}:{end.position}"
+        )
 
     def assert_assistant_rec_quality_rows(self, expected: str) -> None:
         assert self.source and self.target
@@ -10401,6 +10411,8 @@ DELIMITER ;
             self.run_assistant_quality_pending_replay()
         elif scenario == "assistant-rec-quality-create-pending-replay":
             self.run_assistant_rec_quality_create_pending_replay()
+        elif scenario == "assistant-rec-quality-create-mixed-case-pending-replay":
+            self.run_assistant_rec_quality_create_pending_replay(mixed_case=True)
         elif scenario == "contributor-cards-check-collision-recovery":
             self.run_contributor_cards_check_collision_recovery()
         elif scenario == "commented-drop-column-present-pending-replay":
