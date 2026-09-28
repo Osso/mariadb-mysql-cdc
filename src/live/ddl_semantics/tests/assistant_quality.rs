@@ -1,6 +1,8 @@
 use super::*;
 
 const RUNS: &str = include_str!("../../../../fixtures/ddl/create-assistant-quality-runs.sql");
+const REC_RUNS: &str =
+    include_str!("../../../../fixtures/ddl/create-assistant-rec-quality-runs.sql");
 const VERDICTS: &str =
     include_str!("../../../../fixtures/ddl/create-assistant-quality-verdicts.sql");
 const CONVERSATION_FK: &str =
@@ -67,6 +69,112 @@ fn quality_runs_create_drops_integer_display_widths_and_keeps_comments() {
         post_state_column(&post, "sample_size")["column_type"],
         "smallint unsigned"
     );
+}
+
+#[test]
+fn rec_quality_create_preserves_stored_if_and_unique_nullable_slot() {
+    let ast = parse_fixture_create_table(REC_RUNS).expect("generated CREATE AST");
+    let lock = ast
+        .columns
+        .iter()
+        .find(|column| column.name == "in_flight_lock")
+        .unwrap();
+    assert_eq!(lock.column_type, "tinyint unsigned");
+    assert!(lock.nullable);
+    let sql = translate_ddl(REC_RUNS, &[])
+        .expect("generated CREATE translation")
+        .target_sql
+        .unwrap();
+    assert!(sql.contains("`in_flight_lock` TINYINT UNSIGNED GENERATED ALWAYS AS (IF(`status` = _utf8mb4'running' AND `is_active` = 1, 1, NULL)) STORED"));
+    assert!(sql.contains("UNIQUE KEY `uk_single_in_flight` (`in_flight_lock`)"));
+    assert!(
+        sql.contains(
+            "`status` VARCHAR(16) NOT NULL DEFAULT 'running' COMMENT 'running|done|error'"
+        )
+    );
+    assert!(sql.contains("CHECK (JSON_VALID(`summary`))"));
+
+    let operation = parse_ddl_operation(REC_RUNS).expect("generated CREATE operation");
+    let coordinate = crate::inventory::SourceMasterCoordinate {
+        file: "mysqld-bin.003119".into(),
+        position: 113833800,
+    };
+    let evidence = build_fenced_create_table_evidence(
+        &operation,
+        &absent_target(),
+        &crate::inventory::SchemaDefaults {
+            character_set: "utf8mb4".into(),
+            collation: "utf8mb4_unicode_ci".into(),
+        },
+        "mysqld-bin.003119",
+        113833800,
+        &coordinate,
+        &coordinate,
+    )
+    .expect("generated CREATE fenced evidence");
+    let canonical: serde_json::Value = serde_json::from_str(&evidence.canonical_ast).unwrap();
+    let canonical_lock = canonical["parsed_create_table"]["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|column| column["name"] == "in_flight_lock")
+        .unwrap();
+    assert_eq!(canonical_lock["generated"]["generation_kind"], "STORED");
+    assert_eq!(
+        canonical_lock["generated"]["expression"],
+        "if(((`status` = _utf8mb4\\'running\\') and (`is_active` = 1)),1,NULL)"
+    );
+    let post: serde_json::Value = serde_json::from_str(&evidence.expected_post_state).unwrap();
+    let lock = post_state_column(&post, "in_flight_lock");
+    assert_eq!(lock["ordinal_position"], 17);
+    assert_eq!(lock["extra"], "STORED GENERATED");
+    assert_eq!(lock["is_nullable"], true);
+    assert!(lock["default_value"].is_null());
+    assert_eq!(lock["generated"], canonical_lock["generated"]);
+    assert!(
+        post["indexes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|index| index["name"] == "uk_single_in_flight" && index["unique"] == true)
+    );
+}
+
+#[test]
+fn rec_quality_generated_create_is_generic_and_rejects_unmodeled_forms() {
+    let renamed = REC_RUNS
+        .replace("assistant_rec_quality_runs", "another_run_table")
+        .replace("in_flight_lock", "pending_slot")
+        .replace("status", "phase");
+    assert!(
+        translate_ddl(&renamed, &[])
+            .unwrap()
+            .target_sql
+            .unwrap()
+            .contains("UNIQUE KEY `uk_single_in_flight` (`pending_slot`)")
+    );
+    for (from, to) in [
+        ("PERSISTENT", "VIRTUAL"),
+        ("PERSISTENT", ""),
+        ("`is_active` = 1", "`is_active` > 1"),
+        ("AND", "OR"),
+        (", 1, NULL", ", 1, 0"),
+        ("IF(", "COALESCE("),
+        ("tinyint(1) UNSIGNED AS", "varchar(8) AS"),
+        ("`status` = 'running'", "`missing` = 'running'"),
+        ("`status` = 'running'", "`in_flight_lock` = 1"),
+        ("`status` = 'running'", "`id` = 'running'"),
+        ("`is_active` = 1", "`status` = 1"),
+        ("`is_active` = 1", "`id` = 1"),
+        ("PERSISTENT,", "PERSISTENT NOT NULL,"),
+        ("PERSISTENT,", "PERSISTENT DEFAULT NULL,"),
+    ] {
+        let rejected = REC_RUNS.replacen(from, to, 1);
+        assert!(
+            parse_fixture_create_table(&rejected).is_err(),
+            "accepted {rejected}"
+        );
+    }
 }
 
 #[test]

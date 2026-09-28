@@ -1725,6 +1725,7 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 character_set: None,
                 collation: None,
                 comment: String::new(),
+                generated: None,
             },
             ParsedCreateColumnAst {
                 name: "kind".into(),
@@ -1736,6 +1737,7 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 character_set: None,
                 collation: None,
                 comment: String::new(),
+                generated: None,
             },
             ParsedCreateColumnAst {
                 name: "updated_at".into(),
@@ -1747,6 +1749,7 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 character_set: None,
                 collation: None,
                 comment: String::new(),
+                generated: None,
             },
             ParsedCreateColumnAst {
                 name: "created_at".into(),
@@ -1758,6 +1761,7 @@ fn create_enum_timestamp_ast() -> super::model::ParsedCreateTableAst {
                 character_set: None,
                 collation: None,
                 comment: String::new(),
+                generated: None,
             },
         ],
         primary_key: vec!["id".into()],

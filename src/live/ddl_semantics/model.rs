@@ -61,6 +61,7 @@ pub struct ParsedCreateColumnAst {
     pub collation: Option<String>,
     /// Column `COMMENT` literal; empty when the source declares none.
     pub comment: String,
+    pub generated: Option<ParsedStoredIfExpression>,
 }
 
 /// One predicate of a bounded CHECK constraint; predicates are joined with `OR`.

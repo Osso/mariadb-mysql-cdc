@@ -1597,8 +1597,15 @@ fn render_create_column(column: &ParsedCreateColumnAst) -> String {
     } else {
         format!(" COMMENT {}", quote_string_literal(&column.comment))
     };
+    let attributes = match &column.generated {
+        Some(expression) => format!(
+            "GENERATED ALWAYS AS ({}) STORED",
+            generated_column::render_generation_sql(expression)
+        ),
+        None => format!("{nullability}{default}{on_update}{auto_increment}"),
+    };
     format!(
-        "{} {column_type}{encoding} {nullability}{default}{on_update}{auto_increment}{comment}",
+        "{} {column_type}{encoding} {attributes}{comment}",
         quote_identifier(&column.name),
     )
 }

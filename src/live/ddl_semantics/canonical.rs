@@ -453,7 +453,12 @@ pub(crate) fn expected_create_table_post_state(
                     default_value,
                     extra: expected_create_column_extra(column, generated_default),
                     comment: column.comment.clone(),
-                    generated: None,
+                    generated: column.generated.as_ref().map(|expression| {
+                        crate::inventory::GeneratedColumn {
+                            expression: super::transform::mysql_generation_expression(expression),
+                            generation_kind: "STORED".into(),
+                        }
+                    }),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -606,6 +611,9 @@ fn expected_create_column_extra(
     if column.auto_increment {
         return "auto_increment".to_string();
     }
+    if column.generated.is_some() {
+        return "STORED GENERATED".to_string();
+    }
     let on_update = super::transform::current_timestamp_for(&column.column_type);
     match (generated_default, column.on_update_current_timestamp) {
         (true, true) => format!("DEFAULT_GENERATED on update {on_update}"),
@@ -648,6 +656,12 @@ fn canonical_create_table_ast_value(ast: &ParsedCreateTableAst) -> serde_json::V
             }
             if !column.comment.is_empty() {
                 value["comment"] = json!(column.comment);
+            }
+            if let Some(expression) = &column.generated {
+                value["generated"] = json!({
+                    "expression": super::transform::mysql_generation_expression(expression),
+                    "generation_kind": "STORED",
+                });
             }
             value
         }).collect::<Vec<_>>(),

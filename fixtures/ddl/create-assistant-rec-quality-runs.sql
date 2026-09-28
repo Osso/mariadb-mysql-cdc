@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS `assistant_rec_quality_runs` (
+    `id`               int(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `uuid`             char(36) NOT NULL,
+    `status`           varchar(16) NOT NULL DEFAULT 'running' COMMENT 'running|done|error',
+    `trigger_source`   varchar(16) NOT NULL DEFAULT 'cron' COMMENT 'cron|manual',
+    `metric_version`   smallint(5) UNSIGNED NOT NULL DEFAULT 1,
+    `taxonomy_version` smallint(5) UNSIGNED NOT NULL DEFAULT 1,
+    `window_days`      smallint(5) UNSIGNED NOT NULL,
+    `unit_count`       int(11) UNSIGNED NOT NULL DEFAULT 0,
+    `seen_unit_count`  int(11) UNSIGNED NOT NULL DEFAULT 0,
+    `readiness`        json DEFAULT NULL COMMENT 'ingredient counts + join rates at run time',
+    `summary`          json DEFAULT NULL COMMENT '{settled:{...}, provisional:{...}}',
+    `error`            varchar(255) DEFAULT NULL,
+    `is_active`        tinyint(1) UNSIGNED NOT NULL DEFAULT 1,
+    `creator_id`       int(12) UNSIGNED DEFAULT NULL,
+    `create_time`      timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `finish_time`      timestamp NULL DEFAULT NULL,
+    `in_flight_lock`   tinyint(1) UNSIGNED AS (IF(`status` = 'running' AND `is_active` = 1, 1, NULL)) PERSISTENT,
+    UNIQUE KEY `uk_uuid` (`uuid`),
+    UNIQUE KEY `uk_single_in_flight` (`in_flight_lock`),
+    KEY `idx_status_time` (`status`, `create_time`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci

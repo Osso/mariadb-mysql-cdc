@@ -174,6 +174,7 @@ fn validate_definitions(
             return Err("duplicate or unknown CREATE key column".into());
         }
     }
+    validate_generated_create_columns(columns)?;
     for constraint in check_constraints {
         for column in check_constraint::referenced_columns(constraint) {
             if !names.contains(&column.to_ascii_lowercase()) {
@@ -183,6 +184,58 @@ fn validate_definitions(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_generated_create_columns(columns: &[ParsedCreateColumnAst]) -> Result<(), String> {
+    for column in columns {
+        let Some(expression) = &column.generated else {
+            continue;
+        };
+        for (reference, operand) in &expression.equalities {
+            validate_generated_create_reference(columns, column, reference, operand)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_generated_create_reference(
+    columns: &[ParsedCreateColumnAst],
+    generated: &ParsedCreateColumnAst,
+    reference: &str,
+    operand: &super::super::model::GeneratedOperand,
+) -> Result<(), String> {
+    let referenced = columns
+        .iter()
+        .find(|column| column.name == reference)
+        .ok_or_else(|| {
+            format!(
+                "generated column {} references unknown column {reference}",
+                generated.name
+            )
+        })?;
+    if referenced.generated.is_some() || referenced.auto_increment {
+        return Err(format!(
+            "generated column {} references non-ordinary column {reference}",
+            generated.name
+        ));
+    }
+    let compatible = match operand {
+        super::super::model::GeneratedOperand::String(_) => matches!(
+            referenced.column_type.split('(').next(),
+            Some("char" | "varchar")
+        ),
+        super::super::model::GeneratedOperand::Integer(_) => matches!(
+            referenced.column_type.split(' ').next(),
+            Some("tinyint" | "smallint" | "mediumint" | "int" | "bigint")
+        ),
+    };
+    if !compatible {
+        return Err(format!(
+            "generated column {} has incompatible reference {reference}",
+            generated.name
+        ));
     }
     Ok(())
 }
@@ -367,6 +420,14 @@ impl Parser {
         let name = self.identifier()?;
         let column_type = self.column_type()?;
         let (character_set, collation) = self.column_encoding(&column_type)?;
+        let (generated, next) = parse_optional_stored_generation(
+            &self.tokens,
+            &self.quoted,
+            self.position,
+            &mut self.literals,
+            &column_type,
+        )?;
+        self.position = next;
         let explicit_null = self.at("NULL");
         let mut nullable = self.nullability()?;
         let default_sql = self.column_default(&column_type, nullable)?;
@@ -386,6 +447,18 @@ impl Parser {
             self.keyword("KEY")?;
         }
         let comment = self.column_comment()?;
+        if generated.is_some()
+            && (!nullable
+                || explicit_null
+                || default_sql.is_some()
+                || auto_increment
+                || on_update_current_timestamp
+                || inline_primary)
+        {
+            return Err(
+                "generated CREATE column admits only nullable stored expression and comment".into(),
+            );
+        }
         Ok((
             ParsedCreateColumnAst {
                 name,
@@ -397,6 +470,7 @@ impl Parser {
                 character_set,
                 collation,
                 comment,
+                generated,
             },
             inline_primary,
         ))
