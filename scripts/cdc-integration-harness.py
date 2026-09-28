@@ -5009,7 +5009,7 @@ DELIMITER ;
         ).strip()
         if absent != "0":
             raise HarnessError("old binary created assistant rec quality table")
-        # Explicit columns exclude the generated slot from every source row event.
+        # INSERT omits the generated column; full row images still carry its value.
         self.admin_sql(
             self.source,
             f"INSERT INTO {table} (id,uuid,window_days,readiness,summary,create_time) "
@@ -5042,8 +5042,8 @@ DELIMITER ;
             for column in ("readiness", "summary"):
                 self.assert_admin_sql_rejected(
                     endpoint,
-                    f"INSERT INTO {table} (id,uuid,window_days,{column}) "
-                    f"VALUES (91,'invalid-{column}',1,'{{invalid');",
+                    f"INSERT INTO {table} (id,uuid,window_days,status,{column}) "
+                    f"VALUES (91,'invalid-{column}',1,'done','{{invalid');",
                     "CONSTRAINT" if endpoint == self.source else "Check constraint",
                 )
             if self.admin_query(endpoint, f"SELECT COUNT(*) FROM {table} WHERE id IN (90,91);").strip() != "0":
