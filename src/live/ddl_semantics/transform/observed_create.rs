@@ -954,8 +954,7 @@ mod tests {
     `updater_id`         int(12) UNSIGNED DEFAULT NULL,
     UNIQUE KEY `uk_experiment_key` (`experiment_key`),
     KEY `idx_status` (`status`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-"#;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"#;
 
     fn experiments_create_expected_state(ast: &ParsedCreateTableAst) -> serde_json::Value {
         let defaults = crate::inventory::SchemaDefaults {
