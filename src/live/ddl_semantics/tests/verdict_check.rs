@@ -43,12 +43,15 @@ fn verdict_check_compound_unguarded_alter_renders_and_canonicalizes() {
             }]
         })
     );
-    for name in ["sample_kind", "experiment_key"] {
-        let missing = alter(&EXPRESSION.replace(name, "absent_column"));
-        let operation = parse_ddl_operation(&missing).unwrap();
+    for expression in [
+        EXPRESSION.replace("sample_kind IN", "absent_column IN"),
+        EXPRESSION.replace("sample_kind='random'", "absent_column='random'"),
+        EXPRESSION.replace("experiment_key IS NULL", "absent_column IS NULL"),
+    ] {
+        let operation = parse_ddl_operation(&alter(&expression)).unwrap();
         assert!(
             build_semantic_evidence(&operation, &target, &target).is_err(),
-            "missing {name}"
+            "accepted missing column in {expression}"
         );
     }
 }
