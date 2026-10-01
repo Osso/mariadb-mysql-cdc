@@ -62,9 +62,15 @@ typed clause/type/expression shapes, not a table-name allowlist. This subsection
 supersedes earlier non-unique-only guards, OR-only CHECKs, IF-only stored
 expressions, and CHECK-excluded ALTER evidence **only for these bounded
 capabilities**. Earlier event history, native proofs, and all other exclusions
-remain intact. This slice is deployed; final acceptance and catch-up remain pending.
-Already-present guarded additions are validated independently of unguarded clauses;
-an unfinished `MODIFY` still derives and executes its distinct postcondition.
+remain intact. Correction `9b23035` is deployed; source acceptance, fresh-head
+catch-up, and continued progress are recorded in the proof ledger below.
+Its pure `is_guarded_addition` predicate selects `AddColumn.if_not_exists` and
+`AddKey`/`AddCheck` guard flags, returning false for other clauses. Final-present
+validation applies only those additions to a cloned snapshot and requires it to
+remain equal to target. Remaining clauses still derive their distinct effects;
+an unfinished unguarded `MODIFY` cannot become a guarded-addition no-op. Current
+mixed guarded-addition/unfinished-MODIFY proof is semantic/test-boundary evidence,
+not native execution at `9b23035`.
 
 Required source semantics: execute one atomic ALTER, retaining source clause
 order and every `AFTER` placement. The fixture adds `user_id`,
@@ -83,7 +89,7 @@ CHECK. Do not split the ALTER, execute raw source guards, or bypass dependencies
 | Stored empty-VARCHAR COALESCE | ALTER `ADD COLUMN [IF NOT EXISTS] name VARCHAR(n) [GENERATED ALWAYS] AS (COALESCE(column, '')) PERSISTENT|STORED`, with modeled COMMENT/AFTER. Bind case-insensitively to an ordinary non-AUTO_INCREMENT VARCHAR reference in fenced pre-state or an earlier same-ALTER addition; preserve declared spelling. Require identical VARCHAR length, charset, and collation. Render `GENERATED ALWAYS AS (COALESCE(..., _utf8mb4'')) STORED`; evidence retains nullable, no default, comment, encoding, position, and generation metadata. | `coalesce_generation`: 5 passing targeted tests; standalone verdict clauses, earlier reference, metadata, generic names, and rejection. Native exact-event proof covers generation metadata, existing-row backfill, NULL/empty values, and updates with the generated column in the middle of the column order. CREATE COALESCE, VIRTUAL, nonempty fallback, other types/functions/arity, later or generated references, explicit generated defaults/nullability remain excluded. Existing bounded IF support is unchanged. |
 | Compound typed CHECK | Existing atoms/OR plus bounded string equality, parenthesized AND/OR, and Boolean equality specifically `(column = '<bounded literal>') = (column IS NULL)`. Fixture: `(sample_kind IN ('random','experiment')) AND ((sample_kind = 'random') = (experiment_key IS NULL))`. Referenced columns must exist after preceding clauses. Retain literal case and Boolean grouping; emit an enforced named CHECK. | `verdict_check`: 5 passing targeted tests with subsequent focused missing-reference proof. Arbitrary comparisons, numeric equality, IS NOT NULL, Boolean inequality, arbitrary equality between predicates, malformed/unbounded literals remain rejected. Native exact-event proof exercises nine kind/key CHECK cases and NULL-kind rejection; this is not universal CHECK grammar. |
 | Affected CHECK evidence | Capture named `CHECK_CLAUSE` plus `ENFORCED` from joined `information_schema.TABLE_CONSTRAINTS`/`CHECK_CONSTRAINTS` in fenced target snapshots. Compare only affected names with structural normalization of modeled expressions, including MySQL `_utf8mb4` literal introducers, escaped quote delimiters, and inert keyword/identifier formatting; retain literal case and operator grouping. Quote-delimiter normalization is bounded to modeled literals containing no quotes, not general SQL unescaping. Expected/observed state must include enforcement. Operations without CHECK clauses retain their prior canonical state unchanged; unrelated CHECKs do not enter that state. | Targeted guard/CHECK tests prove structural equivalence, literal/grouping divergence, disabled/missing constraints, unchanged non-CHECK observation, and snapshot drift rejection. Native MySQL 8.4.8 exact-event proof includes server metadata equivalence across post-DDL/pre-applied crash reconciliation and restart. |
-| Exact event and operational completion | `scripts/cdc-integration-harness.py --scenario assistant-verdict-slot-pending-replay` is implemented to exercise old-binary pending promotion, one ALTER, post-DDL/pre-applied crash, metadata/FK preservation, old-row backfill, constraints, following DML, and restart without repeated ALTER. | **PASS:** native MySQL 8.4.8 exact event at `420380f`; historical `b732d1f` persists `translation_pending`, then the new binary resumes that barrier. One atomic 13-clause ALTER yields 26 columns, four CHECKs, and two preserved FKs. Deployment replay checkpointed the same barrier on October 1, 2026 at 18:47:29 UTC. **Pending:** independent final gate and catch-up/continued-progress proof. |
+| Exact event and operational completion | `scripts/cdc-integration-harness.py --scenario assistant-verdict-slot-pending-replay` is implemented to exercise old-binary pending promotion, one ALTER, post-DDL/pre-applied crash, metadata/FK preservation, old-row backfill, constraints, following DML, and restart without repeated ALTER. | **PASS:** retained native MySQL 8.4.8 exact event at `420380f` with runtime fix `9c8c8c6`; historical `b732d1f` persists `translation_pending`, then the new binary resumes that barrier. One atomic 13-clause ALTER yields 26 columns, four CHECKs, and two preserved FKs. Final `9b23035` source gate and deployment, fresh-head catch-up, and continued progress are recorded below; no native `9b23035` execution is claimed. |
 
 Proof ledger: `/tmp/cdc-verdict-coalesce-dev.log` records 5 COALESCE tests
 and 13 existing assistant-quality tests passing; `/tmp/cdc-verdict-check-dev.log`
@@ -104,11 +110,30 @@ universal CHECK grammar.
 
 Harness `--binary` is honored for failpoint runs too; supplied binaries must
 already be compiled with `integration-failpoints`. The default source-based
-build path is unchanged. `/tmp/cdc-verdict-slot-proof.md` records deployment of
-`420380f`, the same barrier checkpointed at 18:47:29 UTC, and all 26 columns
-matching in the stable `id <= 222` window (220 rows). This does not establish
-catch-up: independent final acceptance and fresh-head continued progress remain
-pending.
+build path is unchanged.
+
+- [x] Implement the bounded guarded atomic ALTER, stored COALESCE, compound CHECK,
+      and affected enforced-CHECK evidence in the capability matrix above.
+- [x] Prove exact-event atomic execution, constraints/backfill, following DML,
+      crash reconciliation, restart, and guarded rerun with retained native4 proof
+      at `420380f` / runtime `9c8c8c6`, not a native `9b23035` run.
+- [x] Preserve mixed guarded additions plus unfinished unguarded MODIFY with
+      current semantic/test-boundary proof at `9b23035`.
+- [x] Complete `9b23035` source acceptance: 941 Rust tests passed, 18 ignored;
+      fmt, check, and strict all-target/all-feature Clippy passed without warnings.
+      Python 6/6 proof at `420380f` is retained for unchanged harness/test files.
+- [x] Deploy `9b23035` and record fresh-head catch-up plus continued progress.
+
+Evidence: `/tmp/cdc-verdict-slot-final-report.md` records source gates and retained
+native/Python proof; its then-pending rollout is superseded by the later
+`/tmp/cdc-verdict-slot-proof.md` ledger. That ledger records correction deployment
+and stable `id <= 222` parity (220 rows, all 26 columns), not whole-live-table
+parity. `/tmp/cdc-verdict-slot-correction-head1.json` records fresh-head catch-up
+on October 1, 2026 at 21:20:36 UTC; `head2` at
+`/tmp/cdc-verdict-slot-correction-head2.json` records catch-up and advancement at
+21:24:13 UTC. These are recorded-time observations, not ongoing health guarantees.
+Original inherited maintainability observations are not runtime failures or
+additional implemented capabilities; adjacent redesign remains outside this slice.
 
 #### Approved `llm_audit_log` target rebuild
 
