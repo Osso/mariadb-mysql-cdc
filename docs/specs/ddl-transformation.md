@@ -54,15 +54,15 @@ clause combinations, full `ALTER TABLE`, or all `CREATE TABLE` syntax.
 | Indexes | Existing admitted named ordinary/unique key additions and strict standalone `CREATE INDEX`/`DROP INDEX` rules; ordinary `DROP INDEX` in ALTER is target-derived. | New index/constraint grammar, FK-dependent index changes, and unmodeled key parts/options remain runtime barriers. | Existing bounded coverage; not requalified here. |
 
 
-#### Guarded verdict sample-slot ALTER (targeted proof only)
+#### Guarded verdict sample-slot ALTER (native exact-event proof)
 
-Code baseline `4e2d2a8` adds the bounded shapes exercised by
+Code `420380f`, including runtime metadata fix `9c8c8c6`, implements the bounded shapes exercised by
 `fixtures/ddl/alter-assistant-quality-verdicts-sample-slot.sql`. Admission is by
 typed clause/type/expression shapes, not a table-name allowlist. This subsection
 supersedes earlier non-unique-only guards, OR-only CHECKs, IF-only stored
 expressions, and CHECK-excluded ALTER evidence **only for these bounded
 capabilities**. Earlier event history, native proofs, and all other exclusions
-remain intact; their deployed status does not establish deployment of this slice.
+remain intact. This slice is deployed; final acceptance and catch-up remain pending.
 
 Required source semantics: execute one atomic ALTER, retaining source clause
 order and every `AFTER` placement. The fixture adds `user_id`,
@@ -77,11 +77,11 @@ CHECK. Do not split the ALTER, execute raw source guards, or bypass dependencies
 
 | Capability | Exact supported shape and safety boundary | Proof / missing coverage |
 |---|---|---|
-| Guarded atomic ALTER | Modeled `ADD COLUMN IF NOT EXISTS`, named ordinary/unique `ADD KEY/INDEX IF NOT EXISTS`, `DROP KEY/INDEX IF EXISTS`, and `ADD CONSTRAINT IF NOT EXISTS ... CHECK`. Execute only with all guarded additions absent; omit an absent guarded drop. Final no-op requires all additions exactly present (including positions and enforced CHECK) **and the dropped old key absent**. Partial/divergent state, retained old key in final state, disabled CHECK, missing metadata, and unsupported dependencies reject before SQL. Unguarded additions still require absence; unguarded drops require presence. | `verdict_guards`: 11 passing targeted tests at `4e2d2a8`, including atomic rendering, modeled restart no-op, rejection, observation, and metadata drift. Not native process/crash proof. Exact fixture native replay remains pending. |
-| Stored empty-VARCHAR COALESCE | ALTER `ADD COLUMN [IF NOT EXISTS] name VARCHAR(n) [GENERATED ALWAYS] AS (COALESCE(column, '')) PERSISTENT|STORED`, with modeled COMMENT/AFTER. Bind case-insensitively to an ordinary non-AUTO_INCREMENT VARCHAR reference in fenced pre-state or an earlier same-ALTER addition; preserve declared spelling. Require identical VARCHAR length, charset, and collation. Render `GENERATED ALWAYS AS (COALESCE(..., _utf8mb4'')) STORED`; evidence retains nullable, no default, comment, encoding, position, and generation metadata. | `coalesce_generation`: 5 passing targeted tests; standalone verdict clauses, earlier reference, metadata, generic names, and rejection. Native MySQL generation-expression normalization/backfill remains unproven. CREATE COALESCE, VIRTUAL, nonempty fallback, other types/functions/arity, later or generated references, explicit generated defaults/nullability remain excluded. Existing bounded IF support is unchanged. |
-| Compound typed CHECK | Existing atoms/OR plus bounded string equality, parenthesized AND/OR, and Boolean equality specifically `(column = '<bounded literal>') = (column IS NULL)`. Fixture: `(sample_kind IN ('random','experiment')) AND ((sample_kind = 'random') = (experiment_key IS NULL))`. Referenced columns must exist after preceding clauses. Retain literal case and Boolean grouping; emit an enforced named CHECK. | `verdict_check`: 5 passing targeted tests with subsequent focused missing-reference proof. Arbitrary comparisons, numeric equality, IS NOT NULL, Boolean inequality, arbitrary equality between predicates, malformed/unbounded literals remain rejected. Not arbitrary SQL expressions or native enforcement proof. |
-| Affected CHECK evidence | Capture named `CHECK_CLAUSE` plus `ENFORCED` from joined `information_schema.TABLE_CONSTRAINTS`/`CHECK_CONSTRAINTS` in fenced target snapshots. Compare only affected names with structural normalization of modeled expressions, including MySQL `_utf8mb4` literal introducers and inert keyword/identifier formatting; retain literal case and grouping. Expected/observed state must include enforcement. Operations without CHECK clauses retain their prior canonical state unchanged; unrelated CHECKs do not enter that state. | Targeted guard/CHECK tests prove structural equivalence, literal/grouping divergence, disabled/missing constraints, unchanged non-CHECK observation, and snapshot drift rejection. Live inventory and server metadata equivalence still require native proof. |
-| Exact event and operational completion | `scripts/cdc-integration-harness.py --scenario assistant-verdict-slot-pending-replay` is implemented to exercise old-binary pending promotion, one ALTER, post-DDL/pre-applied crash, metadata/FK preservation, old-row backfill, constraints, following DML, and restart without repeated ALTER. | **Pending:** native exact-event harness, full gate, runtime image/deployment, production replay and catch-up. Harness implementation is not passing evidence. Main integration records native/deployed proofs later. |
+| Guarded atomic ALTER | Modeled `ADD COLUMN IF NOT EXISTS`, named ordinary/unique `ADD KEY/INDEX IF NOT EXISTS`, `DROP KEY/INDEX IF EXISTS`, and `ADD CONSTRAINT IF NOT EXISTS ... CHECK`. Execute only with all guarded additions absent; omit an absent guarded drop. Final no-op requires all additions exactly present (including positions and enforced CHECK) **and the dropped old key absent**. Partial/divergent state, retained old key in final state, disabled CHECK, missing metadata, and unsupported dependencies reject before SQL. Unguarded additions still require absence; unguarded drops require presence. | `verdict_guards`: 11 passing targeted tests at `4e2d2a8`, including atomic rendering, modeled restart no-op, rejection, observation, and metadata drift. Native MySQL 8.4.8 exact-event PASS at `420380f` proves persisted pending promotion, atomic execution, crash reconciliation, restart, and guarded final-state no-op. |
+| Stored empty-VARCHAR COALESCE | ALTER `ADD COLUMN [IF NOT EXISTS] name VARCHAR(n) [GENERATED ALWAYS] AS (COALESCE(column, '')) PERSISTENT|STORED`, with modeled COMMENT/AFTER. Bind case-insensitively to an ordinary non-AUTO_INCREMENT VARCHAR reference in fenced pre-state or an earlier same-ALTER addition; preserve declared spelling. Require identical VARCHAR length, charset, and collation. Render `GENERATED ALWAYS AS (COALESCE(..., _utf8mb4'')) STORED`; evidence retains nullable, no default, comment, encoding, position, and generation metadata. | `coalesce_generation`: 5 passing targeted tests; standalone verdict clauses, earlier reference, metadata, generic names, and rejection. Native exact-event proof covers generation metadata, existing-row backfill, NULL/empty values, and updates with the generated column in the middle of the column order. CREATE COALESCE, VIRTUAL, nonempty fallback, other types/functions/arity, later or generated references, explicit generated defaults/nullability remain excluded. Existing bounded IF support is unchanged. |
+| Compound typed CHECK | Existing atoms/OR plus bounded string equality, parenthesized AND/OR, and Boolean equality specifically `(column = '<bounded literal>') = (column IS NULL)`. Fixture: `(sample_kind IN ('random','experiment')) AND ((sample_kind = 'random') = (experiment_key IS NULL))`. Referenced columns must exist after preceding clauses. Retain literal case and Boolean grouping; emit an enforced named CHECK. | `verdict_check`: 5 passing targeted tests with subsequent focused missing-reference proof. Arbitrary comparisons, numeric equality, IS NOT NULL, Boolean inequality, arbitrary equality between predicates, malformed/unbounded literals remain rejected. Native exact-event proof exercises nine kind/key CHECK cases and NULL-kind rejection; this is not universal CHECK grammar. |
+| Affected CHECK evidence | Capture named `CHECK_CLAUSE` plus `ENFORCED` from joined `information_schema.TABLE_CONSTRAINTS`/`CHECK_CONSTRAINTS` in fenced target snapshots. Compare only affected names with structural normalization of modeled expressions, including MySQL `_utf8mb4` literal introducers, escaped quote delimiters, and inert keyword/identifier formatting; retain literal case and operator grouping. Quote-delimiter normalization is bounded to modeled literals containing no quotes, not general SQL unescaping. Expected/observed state must include enforcement. Operations without CHECK clauses retain their prior canonical state unchanged; unrelated CHECKs do not enter that state. | Targeted guard/CHECK tests prove structural equivalence, literal/grouping divergence, disabled/missing constraints, unchanged non-CHECK observation, and snapshot drift rejection. Native MySQL 8.4.8 exact-event proof includes server metadata equivalence across post-DDL/pre-applied crash reconciliation and restart. |
+| Exact event and operational completion | `scripts/cdc-integration-harness.py --scenario assistant-verdict-slot-pending-replay` is implemented to exercise old-binary pending promotion, one ALTER, post-DDL/pre-applied crash, metadata/FK preservation, old-row backfill, constraints, following DML, and restart without repeated ALTER. | **PASS:** native MySQL 8.4.8 exact event at `420380f`; historical `b732d1f` persists `translation_pending`, then the new binary resumes that barrier. One atomic 13-clause ALTER yields 26 columns, four CHECKs, and two preserved FKs. Deployment replay checkpointed the same barrier on October 1, 2026 at 18:47:29 UTC. **Pending:** independent final gate and catch-up/continued-progress proof. |
 
 Proof ledger: `/tmp/cdc-verdict-coalesce-dev.log` records 5 COALESCE tests
 and 13 existing assistant-quality tests passing; `/tmp/cdc-verdict-check-dev.log`
@@ -90,8 +90,23 @@ missing-reference test passing on their recorded component revisions;
 `/tmp/cdc-verdict-guards-dev.log` records 11 guard tests passing at `4e2d2a8`.
 These are targeted development proofs, not a full-suite result on this baseline.
 The guards log also contains a later `dddd845` exact-event test failure at the
-FK-dependent index boundary; it is not proof that this fixture passes. No native,
-deployed, or catch-up completion is claimed here.
+FK-dependent index boundary; it is not passing evidence. Superseding native
+proof: `/tmp/cdc-verdict-slot-native4.log` records exact-event PASS at `420380f`
+with runtime fix `9c8c8c6`: both unique keys, NULL/empty defaults and backfill,
+nine CHECK cases, preserved JSON CHECKs/FK actions, generated-middle-column
+updates, and queued DML after DDL while stopped at the post-DDL/pre-applied
+crash boundary. Resume, checkpointed restart, and guarded source rerun preserve
+state and execute exactly one target ALTER, counted without journal SQL literals.
+Native coverage is this exact event, not arbitrary clause combinations or
+universal CHECK grammar.
+
+Harness `--binary` is honored for failpoint runs too; supplied binaries must
+already be compiled with `integration-failpoints`. The default source-based
+build path is unchanged. `/tmp/cdc-verdict-slot-proof.md` records deployment of
+`420380f`, the same barrier checkpointed at 18:47:29 UTC, and all 26 columns
+matching in the stable `id <= 222` window (220 rows). This does not establish
+catch-up: independent final acceptance and fresh-head continued progress remain
+pending.
 
 #### Approved `llm_audit_log` target rebuild
 
