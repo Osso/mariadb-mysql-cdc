@@ -179,7 +179,7 @@ pub fn build_semantic_evidence(
     target: &SemanticSchemaSnapshot,
     source: &SemanticSchemaSnapshot,
 ) -> Result<DdlSemanticEvidence, String> {
-    let canonical_ast = canonical_ast(operation)?;
+    let canonical_ast = canonical_ast_with_target(operation, target)?;
     let pre_state = canonical_pre_state(operation, target)?;
     let expected_post_state = canonical_post_state(operation, target, source)?;
     Ok(DdlSemanticEvidence {
@@ -189,6 +189,39 @@ pub fn build_semantic_evidence(
         pre_state,
         expected_post_state,
     })
+}
+
+fn canonical_ast_with_target(
+    operation: &DdlOperation,
+    target: &SemanticSchemaSnapshot,
+) -> Result<String, String> {
+    let needs_binding = operation.alter_table_ast.as_ref().is_some_and(|ast| {
+        ast.clauses.iter().any(|clause| {
+            matches!(
+                clause,
+                ParsedAlterClause::AddColumn(ParsedAddColumnAst {
+                    generated: Some(super::model::ParsedStoredGeneration::CoalesceEmpty { .. }),
+                    ..
+                })
+            )
+        })
+    });
+    if !needs_binding {
+        return canonical_ast(operation);
+    }
+    let mut bound = operation.clone();
+    let ast = bound.alter_table_ast.as_mut().expect("COALESCE ALTER AST");
+    let original_ast = ast.clone();
+    let mut state = target.clone();
+    for clause in &mut ast.clauses {
+        if let ParsedAlterClause::AddColumn(column) = clause {
+            let table = find_table(&state, &ast.table)
+                .ok_or_else(|| format!("ALTER TABLE target `{}` is missing", ast.table))?;
+            *column = bind_generated_add_column(table, &ast.table, column)?;
+        }
+        apply_alter_clause(&mut state, &original_ast, clause)?;
+    }
+    canonical_ast(&bound)
 }
 
 fn canonical_ast(operation: &DdlOperation) -> Result<String, String> {
@@ -1187,7 +1220,8 @@ fn apply_add_column(
         .columns
         .iter()
         .position(|item| item.name == column.name);
-    validate_generated_references(table, table_name, column)?;
+    let bound_column = bind_generated_add_column(table, table_name, column)?;
+    let column = &bound_column;
     let insertion = add_column_insertion_index(table, table_name, column, existing_index)?;
     let expected_column = expected_added_column(table, table_name, column, insertion)?;
     if let Some(index) = existing_index {
@@ -1279,6 +1313,43 @@ fn expected_added_column(
                 generation_kind: "STORED".to_string(),
             }),
     })
+}
+
+/// Binds the bounded COALESCE reference using the state before this ADD clause.
+pub(super) fn bind_generated_add_column(
+    table: &crate::inventory::TableInventory,
+    table_name: &str,
+    column: &ParsedAddColumnAst,
+) -> Result<ParsedAddColumnAst, String> {
+    let mut bound = column.clone();
+    if let Some(super::model::ParsedStoredGeneration::CoalesceEmpty { column: reference }) =
+        &mut bound.generated
+    {
+        let referenced = table
+            .columns
+            .iter()
+            .find(|item| item.name.eq_ignore_ascii_case(reference))
+            .ok_or_else(|| {
+                format!(
+                    "generated column `{table_name}`.`{}` references missing column `{reference}`",
+                    column.name
+                )
+            })?;
+        let expected = expected_added_column(table, table_name, column, 0)?;
+        let compatible = referenced.data_type == "varchar"
+            && referenced.column_type == expected.column_type
+            && referenced.character_set == expected.character_set
+            && referenced.collation == expected.collation;
+        if !compatible {
+            return Err(format!(
+                "stored COALESCE `{}` requires the same VARCHAR type and encoding as `{reference}`",
+                column.name
+            ));
+        }
+        *reference = referenced.name.clone();
+    }
+    validate_generated_references(table, table_name, &bound)?;
+    Ok(bound)
 }
 
 /// MySQL rejects generation expressions over AUTO_INCREMENT columns and this grammar admits
