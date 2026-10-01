@@ -63,6 +63,8 @@ supersedes earlier non-unique-only guards, OR-only CHECKs, IF-only stored
 expressions, and CHECK-excluded ALTER evidence **only for these bounded
 capabilities**. Earlier event history, native proofs, and all other exclusions
 remain intact. This slice is deployed; final acceptance and catch-up remain pending.
+Already-present guarded additions are validated independently of unguarded clauses;
+an unfinished `MODIFY` still derives and executes its distinct postcondition.
 
 Required source semantics: execute one atomic ALTER, retaining source clause
 order and every `AFTER` placement. The fixture adds `user_id`,

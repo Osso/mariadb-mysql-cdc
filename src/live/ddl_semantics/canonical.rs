@@ -952,7 +952,11 @@ pub(super) fn validate_guarded_clause_pre_state(
     }
     if guarded > 0 && present == guarded {
         let mut final_state = target.clone();
-        for clause in &ast.clauses {
+        for clause in ast
+            .clauses
+            .iter()
+            .filter(|clause| is_guarded_addition(clause))
+        {
             apply_alter_clause(&mut final_state, ast, clause)?;
         }
         if final_state != *target {
@@ -967,6 +971,15 @@ pub(super) fn validate_guarded_clause_pre_state(
         "guarded ALTER TABLE target `{}` has partial pre-state",
         ast.table
     ))
+}
+
+fn is_guarded_addition(clause: &ParsedAlterClause) -> bool {
+    match clause {
+        ParsedAlterClause::AddColumn(column) => column.if_not_exists,
+        ParsedAlterClause::AddKey { if_not_exists, .. }
+        | ParsedAlterClause::AddCheck { if_not_exists, .. } => *if_not_exists,
+        _ => false,
+    }
 }
 
 pub(super) fn apply_alter_clause(
