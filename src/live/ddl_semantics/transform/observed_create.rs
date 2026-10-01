@@ -1007,7 +1007,7 @@ mod tests {
         assert_eq!(
             rendered.target_sql.as_deref(),
             Some(concat!(
-                "CREATE TABLE IF NOT EXISTS `assistant_rec_experiments` (",
+                "CREATE TABLE `assistant_rec_experiments` (",
                 "`id` INT UNSIGNED NOT NULL AUTO_INCREMENT, `experiment_key` VARCHAR(64) NOT NULL, ",
                 "`name` VARCHAR(255) NOT NULL, `description` TEXT NULL DEFAULT NULL, ",
                 "`control_variant` VARCHAR(32) NOT NULL, ",
@@ -1088,14 +1088,15 @@ mod tests {
     #[test]
     fn experiments_create_enum_defaults_reject_unmodeled_syntax() {
         for sql in [
+            EXPERIMENTS_CREATE.replace("DEFAULT 'draft'", "DEFAULT 'dräft'"),
             EXPERIMENTS_CREATE.replace("DEFAULT 'draft'", "DEFAULT 1"),
             EXPERIMENTS_CREATE.replace("DEFAULT 'draft'", "DEFAULT ('draft')"),
             EXPERIMENTS_CREATE.replace("DEFAULT 'draft'", "DEFAULT NULL"),
             EXPERIMENTS_CREATE.replace("enum('draft'", "enum('dr aft'"),
             EXPERIMENTS_CREATE.replace("enum('draft'", "enum('dräft'"),
             EXPERIMENTS_CREATE.replace(
-                "enum('draft'",
-                "enum('draft' CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+                "enum('draft','running','ended','archived') NOT NULL",
+                "enum('draft','running','ended','archived') CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL",
             ),
         ] {
             assert!(parse(&sql).is_err(), "{sql}");
