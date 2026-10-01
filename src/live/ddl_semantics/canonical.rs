@@ -1671,7 +1671,8 @@ fn apply_add_key(
             ast.table, ast.name
         ));
     }
-    validate_create_index(ast, table, &indexes, &expected.inventory.foreign_keys, true)?;
+    // Adding an index cannot remove existing foreign-key support.
+    validate_create_index(ast, table, &indexes, &[], true)?;
     expected
         .inventory
         .indexes
