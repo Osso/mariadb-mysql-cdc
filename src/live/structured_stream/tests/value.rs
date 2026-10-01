@@ -182,6 +182,18 @@ fn converts_enum_ordinals_to_metadata_strings() {
 }
 
 #[test]
+fn experiments_create_enum_ordinals_preserve_declared_status_values() {
+    let labels = ["Draft", "running", "ended", "archived"].map(str::to_string);
+    for (ordinal, expected) in [(1, "Draft"), (2, "running"), (3, "ended"), (4, "archived")] {
+        assert_eq!(
+            mysql_value_to_target_value(&Some(MySqlValue::Enum(ordinal)), false, Some(&labels))
+                .expect("declared experiment status"),
+            Value::Bytes(expected.as_bytes().to_vec())
+        );
+    }
+}
+
+#[test]
 fn converts_enum_zero_ordinal_to_mysql_empty_value() {
     let enum_values = vec!["1".to_string()];
 

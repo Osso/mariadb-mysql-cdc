@@ -555,7 +555,7 @@ impl Parser {
         if integer || kind == "decimal" || matches!(kind, "float" | "double") {
             return self.numeric_default(column_type).map(Some);
         }
-        if self.at("<string>") && is_character_type(column_type) {
+        if self.at("<string>") && (is_character_type(column_type) || kind == "enum") {
             return self.string_default(kind).map(Some);
         }
         Err("unmodeled observed CREATE default".into())
@@ -930,6 +930,175 @@ mod tests {
             source.replace("LONGTEXT NOT NULL", "LONGTEXT BINARY NOT NULL"),
         ] {
             assert!(parse_fixture_create_table(&unsupported).is_err());
+        }
+    }
+
+    const EXPERIMENTS_CREATE: &str = r#"CREATE TABLE IF NOT EXISTS `assistant_rec_experiments` (
+    `id`                 int(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `experiment_key`     varchar(64) NOT NULL,
+    `name`               varchar(255) NOT NULL,
+    `description`        text DEFAULT NULL,
+    `control_variant`    varchar(32) NOT NULL,
+    `allocation`         json NOT NULL COMMENT '{variant: percent}; integers summing to 100',
+    `primary_metric`     varchar(40) NOT NULL,
+    `guardrails`         json NOT NULL COMMENT '[{metric, tolerance}]',
+    `mde`                decimal(8,4) NOT NULL COMMENT 'primary metric units; points for rates',
+    `min_blocks_per_arm` int(11) UNSIGNED NOT NULL DEFAULT 30,
+    `start_date`         date NOT NULL,
+    `planned_end_date`   date NOT NULL,
+    `status`             enum('draft','running','ended','archived') NOT NULL DEFAULT 'draft',
+    `ended_time`         datetime DEFAULT NULL,
+    `create_time`        timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`        timestamp NULL DEFAULT NULL,
+    `creator_id`         int(12) UNSIGNED DEFAULT NULL,
+    `updater_id`         int(12) UNSIGNED DEFAULT NULL,
+    UNIQUE KEY `uk_experiment_key` (`experiment_key`),
+    KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"#;
+
+    fn experiments_create_expected_state(ast: &ParsedCreateTableAst) -> serde_json::Value {
+        let defaults = crate::inventory::SchemaDefaults {
+            character_set: "utf8mb4".into(),
+            collation: "utf8mb4_unicode_ci".into(),
+        };
+        serde_json::from_str(
+            &crate::live::ddl_semantics::canonical::expected_create_table_post_state(
+                ast,
+                &defaults,
+                "globalcomix",
+            )
+            .expect("expected experiment metadata"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn experiments_create_exact_event_preserves_ast_rendering_and_metadata() {
+        let ast = parse_fixture_create_table(EXPERIMENTS_CREATE).expect("exact experiment CREATE");
+        assert_eq!(ast.name, "assistant_rec_experiments");
+        assert!(ast.if_not_exists);
+        assert_eq!(ast.columns.len(), 18);
+        assert_eq!(ast.primary_key, ["id"]);
+        assert!(ast.columns[0].auto_increment);
+        assert_eq!(
+            ast.columns[12],
+            ParsedCreateColumnAst {
+                name: "status".into(),
+                column_type: "enum('draft','running','ended','archived')".into(),
+                nullable: false,
+                default_sql: Some("'draft'".into()),
+                auto_increment: false,
+                on_update_current_timestamp: false,
+                character_set: None,
+                collation: None,
+                comment: String::new(),
+                generated: None,
+            }
+        );
+        assert_eq!(ast.columns[5].column_type, "longtext");
+        assert_eq!(ast.columns[5].collation.as_deref(), Some("utf8mb4_bin"));
+        assert_eq!(ast.columns[8].column_type, "decimal(8,4)");
+        assert_eq!(ast.columns[9].default_sql.as_deref(), Some("30"));
+        assert_eq!(ast.indexes[0].name, "uk_experiment_key");
+        assert!(ast.indexes[0].unique);
+        assert_eq!(ast.indexes[1].key_parts[0].column, "status");
+        let rendered = transform_fixture_create_table(EXPERIMENTS_CREATE).unwrap();
+        assert_eq!(
+            rendered.target_sql.as_deref(),
+            Some(concat!(
+                "CREATE TABLE IF NOT EXISTS `assistant_rec_experiments` (",
+                "`id` INT UNSIGNED NOT NULL AUTO_INCREMENT, `experiment_key` VARCHAR(64) NOT NULL, ",
+                "`name` VARCHAR(255) NOT NULL, `description` TEXT NULL DEFAULT NULL, ",
+                "`control_variant` VARCHAR(32) NOT NULL, ",
+                "`allocation` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL COMMENT '{variant: percent}; integers summing to 100', ",
+                "`primary_metric` VARCHAR(40) NOT NULL, ",
+                "`guardrails` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL COMMENT '[{metric, tolerance}]', ",
+                "`mde` DECIMAL(8,4) NOT NULL COMMENT 'primary metric units; points for rates', ",
+                "`min_blocks_per_arm` INT UNSIGNED NOT NULL DEFAULT 30, `start_date` DATE NOT NULL, ",
+                "`planned_end_date` DATE NOT NULL, `status` ENUM('draft','running','ended','archived') NOT NULL DEFAULT 'draft', ",
+                "`ended_time` DATETIME NULL DEFAULT NULL, `create_time` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, ",
+                "`update_time` TIMESTAMP NULL DEFAULT NULL, `creator_id` INT UNSIGNED NULL DEFAULT NULL, ",
+                "`updater_id` INT UNSIGNED NULL DEFAULT NULL, PRIMARY KEY (`id`), ",
+                "UNIQUE KEY `uk_experiment_key` (`experiment_key`), KEY `idx_status` (`status`), ",
+                "CHECK (JSON_VALID(`allocation`)), CHECK (JSON_VALID(`guardrails`))) ",
+                "ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+            ))
+        );
+        let state = experiments_create_expected_state(&ast);
+        assert_eq!(
+            state["definition"]["columns"][12],
+            serde_json::json!({
+                "name": "status", "ordinal_position": 13,
+                "column_type": "enum('draft','running','ended','archived')", "data_type": "enum",
+                "is_nullable": false, "character_set": "utf8mb4", "collation": "utf8mb4_unicode_ci",
+                "default_value": "draft", "extra": "", "comment": "", "generated": null
+            })
+        );
+    }
+
+    #[test]
+    fn experiments_create_enum_defaults_preserve_literal_case_without_domain_checks() {
+        for (collation, literal, expected) in [
+            ("utf8mb4_unicode_ci", "Draft", "Draft"),
+            ("utf8mb4_unicode_ci", "dRaFt", "dRaFt"),
+            ("utf8mb3_general_ci", "DRAFT", "DRAFT"),
+            ("utf8mb4_bin", "Draft", "Draft"),
+        ] {
+            let charset = if collation.starts_with("utf8mb3") {
+                "utf8mb3"
+            } else {
+                "utf8mb4"
+            };
+            let sql = EXPERIMENTS_CREATE
+                .replace("enum('draft'", "enum('Draft'")
+                .replace("DEFAULT 'draft'", &format!("DEFAULT '{literal}'"))
+                .replace(
+                    "CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+                    &format!("CHARSET={charset} COLLATE={collation}"),
+                );
+            let ast = parse(&sql).expect(literal);
+            assert_eq!(ast.columns[12].default_sql, Some(format!("'{expected}'")));
+            assert_eq!(
+                ast.columns[12].column_type,
+                "enum('Draft','running','ended','archived')"
+            );
+            let rendered = transform_fixture_create_table(&sql)
+                .unwrap()
+                .target_sql
+                .unwrap();
+            assert!(rendered.contains(&format!(
+                "`status` ENUM('Draft','running','ended','archived') NOT NULL DEFAULT '{expected}'"
+            )));
+            let state = experiments_create_expected_state(&ast);
+            assert_eq!(
+                state["definition"]["columns"][12]["default_value"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn experiments_create_enum_string_domain_is_left_to_database() {
+        let sql = EXPERIMENTS_CREATE.replace("DEFAULT 'draft'", "DEFAULT 'unknown'");
+        let ast = parse(&sql).expect("domain validation belongs to database");
+        assert_eq!(ast.columns[12].default_sql.as_deref(), Some("'unknown'"));
+    }
+
+    #[test]
+    fn experiments_create_enum_defaults_reject_unmodeled_syntax() {
+        for sql in [
+            EXPERIMENTS_CREATE.replace("DEFAULT 'draft'", "DEFAULT 1"),
+            EXPERIMENTS_CREATE.replace("DEFAULT 'draft'", "DEFAULT ('draft')"),
+            EXPERIMENTS_CREATE.replace("DEFAULT 'draft'", "DEFAULT NULL"),
+            EXPERIMENTS_CREATE.replace("enum('draft'", "enum('dr aft'"),
+            EXPERIMENTS_CREATE.replace("enum('draft'", "enum('dräft'"),
+            EXPERIMENTS_CREATE.replace(
+                "enum('draft'",
+                "enum('draft' CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            ),
+        ] {
+            assert!(parse(&sql).is_err(), "{sql}");
         }
     }
 
