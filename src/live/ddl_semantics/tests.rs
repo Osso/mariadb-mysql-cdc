@@ -7,6 +7,7 @@ mod json_add;
 mod json_create;
 mod nullable_modify;
 mod table_operations;
+mod verdict_check;
 
 use super::model::ParsedAlterClause;
 use super::transform::{
