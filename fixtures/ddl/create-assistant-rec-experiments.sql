@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS `assistant_rec_experiments` (
+    `id`                 int(11) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `experiment_key`     varchar(64) NOT NULL,
+    `name`               varchar(255) NOT NULL,
+    `description`        text DEFAULT NULL,
+    `control_variant`    varchar(32) NOT NULL,
+    `allocation`         json NOT NULL COMMENT '{variant: percent}; integers summing to 100',
+    `primary_metric`     varchar(40) NOT NULL,
+    `guardrails`         json NOT NULL COMMENT '[{metric, tolerance}]',
+    `mde`                decimal(8,4) NOT NULL COMMENT 'primary metric units; points for rates',
+    `min_blocks_per_arm` int(11) UNSIGNED NOT NULL DEFAULT 30,
+    `start_date`         date NOT NULL,
+    `planned_end_date`   date NOT NULL,
+    `status`             enum('draft','running','ended','archived') NOT NULL DEFAULT 'draft',
+    `ended_time`         datetime DEFAULT NULL,
+    `create_time`        timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `update_time`        timestamp NULL DEFAULT NULL,
+    `creator_id`         int(12) UNSIGNED DEFAULT NULL,
+    `updater_id`         int(12) UNSIGNED DEFAULT NULL,
+    UNIQUE KEY `uk_experiment_key` (`experiment_key`),
+    KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci

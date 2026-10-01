@@ -106,6 +106,7 @@ SCENARIOS = (
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("assistant-quality-pending-replay", True),
+    ScenarioSpec("assistant-rec-experiments-create-pending-replay", True),
     ScenarioSpec("assistant-rec-quality-create-pending-replay", True),
     ScenarioSpec("assistant-rec-quality-create-mixed-case-pending-replay", True),
     ScenarioSpec("contributor-cards-check-collision-recovery", True),
@@ -196,6 +197,7 @@ def default_scenarios() -> list[str]:
             "audit-turn-attribution-pending-replay",
             "source-layout-json-pending-replay",
             "recsys-rail-create-pending-replay",
+            "assistant-rec-experiments-create-pending-replay",
             "assistant-rec-quality-create-pending-replay",
             "assistant-rec-quality-create-mixed-case-pending-replay",
             "contributor-cards-check-collision-recovery",
@@ -4992,6 +4994,233 @@ DELIMITER ;
         "alter-assistant-quality-verdicts-conversation-key.sql",
         "alter-assistant-quality-verdicts-conversation-fk.sql",
     )
+
+    def run_assistant_rec_experiments_create_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError(
+                "assistant rec experiments CREATE replay requires --old-binary"
+            )
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
+        table = "assistant_rec_experiments"
+        ddl = (
+            (self.repo / "fixtures/ddl/create-assistant-rec-experiments.sql")
+            .read_text()
+            .strip()
+        )
+        self.reset_target_general_log()
+        start, pending = self.prepare_pending_add_column(
+            "", ddl, "CREATE TABLE", old_binary=self.old_binary
+        )
+        absent = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)};",
+        ).strip()
+        if absent != "0":
+            raise HarnessError("old binary created assistant rec experiments table")
+        self.admin_sql(
+            self.source,
+            f"INSERT INTO {table} (id,experiment_key,name,control_variant,allocation,"
+            "primary_metric,guardrails,mde,start_date,planned_end_date,create_time) VALUES "
+            "(1,'exp-draft','Draft','control','{\"control\": 50, \"treatment\": 50}',"
+            '\'ctr\',\'[{"metric": "latency", "tolerance": 5}]\',0.0125,'
+            "'2026-10-01','2026-10-31','2026-10-01 10:00:00'); "
+            f"INSERT INTO {table} (id,experiment_key,name,description,control_variant,"
+            "allocation,primary_metric,guardrails,mde,min_blocks_per_arm,start_date,"
+            "planned_end_date,status,ended_time,create_time,update_time,creator_id,updater_id) VALUES "
+            "(2,'exp-running','Running','live experiment','control',"
+            "'{\"control\": 60, \"treatment\": 40}','reads','[]',12.3400,45,"
+            "'2026-09-15','2026-10-15','running',NULL,'2026-09-14 09:00:00',"
+            "'2026-10-01 09:30:00',42,43),"
+            "(3,'exp-ended','Ended',NULL,'control','{\"control\": 100, \"treatment\": 0}',"
+            "'ctr','[]',-0.2500,31,'2026-08-01','2026-08-31','ended',"
+            "'2026-08-30 18:00:00','2026-07-31 12:00:00',NULL,44,NULL),"
+            "(4,'exp-archived','Archived','old experiment','control',"
+            "'{\"control\": 25, \"treatment\": 75}','reads',"
+            '\'[{"metric": "latency", "tolerance": 2}]\',9999.9999,60,'
+            "'2026-07-01','2026-07-31','archived','2026-07-31 23:59:59',"
+            "'2026-06-30 08:00:00','2026-08-01 08:00:00',45,46);",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        self.assert_assistant_rec_experiments_metadata()
+        draft = (
+            "1\texp-draft\tDraft\tNULL\tcontrol\t50\t50\tctr\t1\tlatency\t5\t0.0125\t30\t"
+            "2026-10-01\t2026-10-31\tdraft\tNULL\t2026-10-01 10:00:00\tNULL\tNULL\tNULL"
+        )
+        running = (
+            "2\texp-running\tRunning\tlive experiment\tcontrol\t60\t40\treads\t0\tNULL\tNULL\t12.3400\t45\t"
+            "2026-09-15\t2026-10-15\trunning\tNULL\t2026-09-14 09:00:00\t2026-10-01 09:30:00\t42\t43"
+        )
+        ended = (
+            "3\texp-ended\tEnded\tNULL\tcontrol\t100\t0\tctr\t0\tNULL\tNULL\t-0.2500\t31\t"
+            "2026-08-01\t2026-08-31\tended\t2026-08-30 18:00:00\t2026-07-31 12:00:00\tNULL\t44\tNULL"
+        )
+        archived = (
+            "4\texp-archived\tArchived\told experiment\tcontrol\t25\t75\treads\t1\tlatency\t2\t9999.9999\t60\t"
+            "2026-07-01\t2026-07-31\tarchived\t2026-07-31 23:59:59\t2026-06-30 08:00:00\t2026-08-01 08:00:00\t45\t46"
+        )
+        self.assert_assistant_rec_experiments_rows(
+            "\n".join((draft, running, ended, archived))
+        )
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"UPDATE {table} SET experiment_key='exp-draft' WHERE id=2;",
+                "Duplicate entry",
+            )
+            for column in ("allocation", "guardrails"):
+                self.assert_admin_sql_rejected(
+                    endpoint,
+                    f"UPDATE {table} SET {column}='{{invalid' WHERE id=2;",
+                    "CONSTRAINT" if endpoint == self.source else "Check constraint",
+                )
+        self.assert_assistant_rec_experiments_rows(
+            "\n".join((draft, running, ended, archived))
+        )
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET status='ended',description=NULL,"
+            'allocation=\'{"control": 70, "treatment": 30}\','
+            'guardrails=\'[{"metric": "latency", "tolerance": 3}]\',mde=0.5000,'
+            "planned_end_date='2026-10-02',ended_time='2026-10-02 12:00:00',"
+            "update_time='2026-10-02 12:01:00',updater_id=NULL WHERE id=2; "
+            f"DELETE FROM {table} WHERE id=3;",
+        )
+        end = self.coordinate()
+        require_success(
+            self.run_stream(stop, end), "assistant rec experiments UPDATE/DELETE"
+        )
+        updated = (
+            "2\texp-running\tRunning\tNULL\tcontrol\t70\t30\treads\t1\tlatency\t3\t0.5000\t45\t"
+            "2026-09-15\t2026-10-02\tended\t2026-10-02 12:00:00\t2026-09-14 09:00:00\t2026-10-02 12:01:00\t42\tNULL"
+        )
+        expected = "\n".join((draft, updated, archived))
+        self.assert_assistant_rec_experiments_rows(expected)
+        ddl_executions = (
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
+            "AND command_type IN ('Query','Execute') "
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'create table %' "
+            f"AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%{table}%';"
+        )
+        count = int(self.admin_query(self.target, ddl_executions).strip())
+        if count != 1:
+            raise HarnessError(
+                f"assistant rec experiments CREATE executions differ: {count}"
+            )
+        checkpoint = self.checkpoint()
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        require_success(
+            self.run_stream(start, end), "assistant rec experiments restart"
+        )
+        if (
+            self.checkpoint() != checkpoint
+            or self.journal_full_row(int(pending["event_start_position"])) != journal
+            or int(self.admin_query(self.target, ddl_executions).strip()) != count
+        ):
+            raise HarnessError(
+                "assistant rec experiments restart changed checkpoint/journal or reapplied CREATE"
+            )
+        self.assert_assistant_rec_experiments_metadata()
+        self.assert_assistant_rec_experiments_rows(expected)
+        print(
+            f"assistant_rec_experiments_create_pending_replay_ok coordinate={end.file}:{end.position}"
+        )
+
+    def assert_assistant_rec_experiments_rows(self, expected: str) -> None:
+        assert self.source and self.target
+        query = (
+            "SELECT id,experiment_key,name,description,control_variant,"
+            "JSON_UNQUOTE(JSON_EXTRACT(allocation,'$.control')),"
+            "JSON_UNQUOTE(JSON_EXTRACT(allocation,'$.treatment')),primary_metric,"
+            "JSON_LENGTH(guardrails),JSON_UNQUOTE(JSON_EXTRACT(guardrails,'$[0].metric')),"
+            "JSON_UNQUOTE(JSON_EXTRACT(guardrails,'$[0].tolerance')),mde,min_blocks_per_arm,"
+            "start_date,planned_end_date,status,ended_time,create_time,update_time,creator_id,updater_id "
+            "FROM assistant_rec_experiments ORDER BY id;"
+        )
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, query).strip()
+            if actual != expected:
+                raise HarnessError(
+                    f"assistant rec experiments rows differ at {endpoint.container}: {actual!r} != {expected!r}"
+                )
+
+    def assert_assistant_rec_experiments_metadata(self) -> None:
+        assert self.source and self.target
+        table = "assistant_rec_experiments"
+        columns = (
+            "SELECT column_name,column_type,is_nullable,IFNULL(column_default,'NULL'),extra,column_comment "
+            "FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)} "
+            "ORDER BY ordinal_position;"
+        )
+        expected = "\n".join(
+            (
+                "id\tint unsigned\tNO\tNULL\tauto_increment\t",
+                "experiment_key\tvarchar(64)\tNO\tNULL\t\t",
+                "name\tvarchar(255)\tNO\tNULL\t\t",
+                "description\ttext\tYES\tNULL\t\t",
+                "control_variant\tvarchar(32)\tNO\tNULL\t\t",
+                "allocation\tlongtext\tNO\tNULL\t\t{variant: percent}; integers summing to 100",
+                "primary_metric\tvarchar(40)\tNO\tNULL\t\t",
+                "guardrails\tlongtext\tNO\tNULL\t\t[{metric, tolerance}]",
+                "mde\tdecimal(8,4)\tNO\tNULL\t\tprimary metric units; points for rates",
+                "min_blocks_per_arm\tint unsigned\tNO\t30\t\t",
+                "start_date\tdate\tNO\tNULL\t\t",
+                "planned_end_date\tdate\tNO\tNULL\t\t",
+                "status\tenum('draft','running','ended','archived')\tNO\tdraft\t\t",
+                "ended_time\tdatetime\tYES\tNULL\t\t",
+                "create_time\ttimestamp\tNO\tCURRENT_TIMESTAMP\tDEFAULT_GENERATED\t",
+                "update_time\ttimestamp\tYES\tNULL\t\t",
+                "creator_id\tint unsigned\tYES\tNULL\t\t",
+                "updater_id\tint unsigned\tYES\tNULL\t\t",
+            )
+        ).strip()
+        actual = self.admin_query(self.target, columns).strip()
+        if actual != expected:
+            raise HarnessError(f"assistant rec experiments columns differ: {actual!r}")
+        indexes = (
+            "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME "
+            "FROM information_schema.STATISTICS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)} "
+            "ORDER BY INDEX_NAME,SEQ_IN_INDEX;"
+        )
+        expected_indexes = "idx_status\t1\t1\tstatus\nPRIMARY\t0\t1\tid\nuk_experiment_key\t0\t1\texperiment_key"
+        for endpoint in (self.source, self.target):
+            actual_indexes = self.admin_query(endpoint, indexes).strip()
+            if actual_indexes != expected_indexes:
+                raise HarnessError(
+                    f"assistant rec experiments indexes differ at {endpoint.container}: {actual_indexes!r}"
+                )
+            generated = self.admin_query(
+                endpoint,
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)} "
+                "AND COALESCE(GENERATION_EXPRESSION,'') <> '';",
+            ).strip()
+            if generated != "0":
+                raise HarnessError(
+                    "assistant rec experiments unexpectedly has generated columns"
+                )
+            checks = (
+                self.admin_query(
+                    endpoint,
+                    "SELECT CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS "
+                    f"WHERE CONSTRAINT_SCHEMA={sql_literal(APP_SCHEMA)} "
+                    "AND CONSTRAINT_NAME IN (SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS "
+                    f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME={sql_literal(table)} "
+                    "AND CONSTRAINT_TYPE='CHECK');",
+                )
+                .lower()
+                .splitlines()
+            )
+            if len(checks) != 2 or any(
+                sum("json_valid" in clause and name in clause for clause in checks) != 1
+                for name in ("allocation", "guardrails")
+            ):
+                raise HarnessError(
+                    f"assistant rec experiments JSON checks differ at {endpoint.container}: {checks!r}"
+                )
 
     def run_assistant_rec_quality_create_pending_replay(self, *, mixed_case: bool = False) -> None:
         assert self.source and self.target
@@ -10409,6 +10638,8 @@ DELIMITER ;
             self.run_reader_memory_guarded_alter_pending_replay()
         elif scenario == "assistant-quality-pending-replay":
             self.run_assistant_quality_pending_replay()
+        elif scenario == "assistant-rec-experiments-create-pending-replay":
+            self.run_assistant_rec_experiments_create_pending_replay()
         elif scenario == "assistant-rec-quality-create-pending-replay":
             self.run_assistant_rec_quality_create_pending_replay()
         elif scenario == "assistant-rec-quality-create-mixed-case-pending-replay":
