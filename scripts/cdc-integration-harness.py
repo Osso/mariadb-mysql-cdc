@@ -5800,7 +5800,7 @@ DELIMITER ;
         original_fks = "fk_aqv_conversation\tconversation_id\tllm_conversations\tid\tRESTRICT\tCASCADE\nfk_aqv_run\trun_id\tassistant_quality_runs\tid\tRESTRICT\tRESTRICT"
         if before[self.target.container]["fks"] != original_fks:
             raise HarnessError("pre-schema does not reproduce captured FK actions")
-        ddl_count = "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' AND command_type IN ('Query','Execute') AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%alter table%assistant_quality_verdicts%';"
+        ddl_count = "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' AND command_type IN ('Query','Execute') AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'alter table %' AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%assistant_quality_verdicts%';"
         crashed = self.run_stream(
             start, self.coordinate(), integration_failpoint="post-ddl-pre-applied"
         )
