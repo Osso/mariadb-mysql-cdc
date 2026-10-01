@@ -1,3 +1,4 @@
+use super::super::canonical::observe_operation_state as canonical_observed_state;
 use super::*;
 
 const GUARDED: &str = "ALTER TABLE accounts ADD UNIQUE KEY IF NOT EXISTS uk_handle (handle), DROP KEY IF EXISTS obsolete, ADD CONSTRAINT IF NOT EXISTS chk_handle CHECK (handle IN ('Random','experiment'))";
