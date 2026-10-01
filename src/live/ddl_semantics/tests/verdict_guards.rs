@@ -238,6 +238,84 @@ fn verdict_guards_drop_only_absent_noop_and_unguarded_drop_required() {
 }
 
 #[test]
+fn verdict_guards_exact_event_semantic_roundtrip_and_restart() {
+    const SQL: &str =
+        include_str!("../../../../fixtures/ddl/alter-assistant-quality-verdicts-sample-slot.sql");
+    let create = parse_fixture_create_table(include_str!(
+        "../../../../fixtures/ddl/create-assistant-quality-verdicts.sql"
+    ))
+    .unwrap();
+    let encoded = canonical::expected_create_table_post_state(
+        &create,
+        &crate::inventory::SchemaDefaults {
+            character_set: "utf8mb4".into(),
+            collation: "utf8mb4_unicode_ci".into(),
+        },
+        "globalcomix",
+    )
+    .unwrap();
+    let initial: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    let mut target = absent_target();
+    target
+        .inventory
+        .tables
+        .push(serde_json::from_value(initial["definition"].clone()).unwrap());
+    target.inventory.indexes = serde_json::from_value(initial["indexes"].clone()).unwrap();
+    target.inventory.foreign_keys =
+        serde_json::from_value(initial["foreign_keys"].clone()).unwrap();
+    let old_checks = vec![
+        ("dimensions".into(), "json_valid(`dimensions`)".into(), true),
+        ("evidence".into(), "json_valid(`evidence`)".into(), true),
+        ("tags".into(), "json_valid(`tags`)".into(), true),
+    ];
+    target
+        .check_constraints
+        .insert(create.name.clone(), old_checks.clone());
+    let operation = parse_ddl_operation(SQL).unwrap();
+    let captured = build_semantic_evidence(&operation, &target, &target).unwrap();
+    let translated = transform::transform_production_alter_table_with_target(SQL, &target)
+        .unwrap()
+        .target_sql
+        .unwrap();
+    let expected_sql = "ALTER TABLE `assistant_quality_verdicts` ADD COLUMN `user_id` INT UNSIGNED NULL DEFAULT NULL AFTER `conversation_uuid`, ADD COLUMN `conversation_start` DATETIME NULL DEFAULT NULL COMMENT 'llm_conversations.create_time, UTC' AFTER `user_id`, ADD COLUMN `account_age_bucket` VARCHAR(24) NULL DEFAULT NULL COMMENT 'new_0_7d|new_7_30d|established_30d_plus|unknown' AFTER `conversation_start`, ADD COLUMN `gold_status` VARCHAR(12) NULL DEFAULT NULL COMMENT 'gold_paid|gold_trial|gold_grant|free|unknown' AFTER `account_age_bucket`, ADD COLUMN `sample_kind` VARCHAR(12) NOT NULL DEFAULT 'random' COMMENT 'random|experiment' AFTER `gold_status`, ADD COLUMN `experiment_key` VARCHAR(64) NULL DEFAULT NULL COMMENT 'NULL for the random sample' AFTER `sample_kind`, ADD COLUMN `variant` VARCHAR(32) NULL DEFAULT NULL COMMENT 'NULL for the random sample' AFTER `experiment_key`, ADD COLUMN `rubric_version` INT UNSIGNED NULL DEFAULT NULL COMMENT 'llm_prompts.id of the rubric that judged it' AFTER `variant`, ADD COLUMN `sample_slot` VARCHAR(64) GENERATED ALWAYS AS (COALESCE(`experiment_key`, _utf8mb4'')) STORED COMMENT 'per-run uniqueness slot: empty for the random sample, else the experiment key' AFTER `rubric_version`, ADD UNIQUE KEY `uk_run_slot_conversation` (`run_id`, `sample_slot`, `conversation_id`), ADD UNIQUE KEY `uk_experiment_conversation` (`experiment_key`, `conversation_id`), DROP INDEX `uk_run_conversation`, ADD CONSTRAINT `chk_aqv_sample_kind_experiment_key` CHECK ((`sample_kind` IN ('random','experiment')) AND ((`sample_kind` = 'random') = (`experiment_key` IS NULL)))";
+    assert_eq!(translated, expected_sql);
+    let post: serde_json::Value = serde_json::from_str(&captured.expected_post_state).unwrap();
+    assert_eq!(column(&post, "sample_slot")["ordinal_position"], 13);
+    assert_eq!(
+        column(&post, "sample_slot")["generated"]["expression"],
+        "coalesce(`experiment_key`,_utf8mb4\\'\\')"
+    );
+    let mut observed = target.clone();
+    observed.inventory.tables[0] = serde_json::from_value(post["definition"].clone()).unwrap();
+    observed.inventory.indexes = serde_json::from_value(post["indexes"].clone()).unwrap();
+    observed.check_constraints.get_mut(&create.name).unwrap().push(("chk_aqv_sample_kind_experiment_key".into(), "((`sample_kind` in (_utf8mb4'random',_utf8mb4'experiment')) and ((`sample_kind` = _utf8mb4'random') = (`experiment_key` is null)))".into(), true));
+    assert_eq!(
+        canonical_observed_state(&observed, &operation).unwrap(),
+        captured.expected_post_state
+    );
+    let restarted = build_semantic_evidence(&operation, &observed, &observed).unwrap();
+    assert_eq!(restarted.pre_state, restarted.expected_post_state);
+    assert_eq!(
+        transform::transform_production_alter_table_with_target(SQL, &observed)
+            .unwrap()
+            .target_sql,
+        None
+    );
+    assert_eq!(
+        &observed.check_constraints[&create.name][..3],
+        old_checks.as_slice()
+    );
+    observed
+        .check_constraints
+        .get_mut(&create.name)
+        .unwrap()
+        .last_mut()
+        .unwrap()
+        .2 = false;
+    assert!(build_semantic_evidence(&operation, &observed, &observed).is_err());
+}
+
+#[test]
 fn verdict_guards_cannot_strip_new_guards_without_target_evidence() {
     assert!(transform::transform_production_alter_table(GUARDED).is_err());
 }
