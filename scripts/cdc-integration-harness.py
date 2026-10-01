@@ -667,14 +667,12 @@ class Harness:
 
     def _stream_binary(self, integration_failpoint: str | None) -> Path:
         binary = self.binary or self.repo / "target/debug/mariadb-mysql-cdc"
-        if integration_failpoint is not None:
-            binary = self.repo / "target/debug/mariadb-mysql-cdc"
         build = ["cargo", "build"]
         if integration_failpoint is not None:
             build.extend(["--features", "integration-failpoints"])
         build.extend(["--bin", "mariadb-mysql-cdc"])
         source_based_binary = self.binary is None
-        if source_based_binary or integration_failpoint is not None:
+        if source_based_binary:
             run(build, cwd=self.repo)
         if not binary.is_file():
             raise HarnessError(f"CDC binary build did not produce {binary}")
