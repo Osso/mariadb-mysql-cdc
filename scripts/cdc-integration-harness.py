@@ -5521,6 +5521,8 @@ DELIMITER ;
             "IS_NULLABLE,COALESCE(COLUMN_DEFAULT,'<null>'),ORDINAL_POSITION,COLUMN_COMMENT,"
             "CHARACTER_MAXIMUM_LENGTH,CHARACTER_SET_NAME,COLLATION_NAME "
             f"FROM information_schema.COLUMNS WHERE {where} ORDER BY ORDINAL_POSITION;",
+            "generated": "SELECT COLUMN_NAME,EXTRA,GENERATION_EXPRESSION "
+            f"FROM information_schema.COLUMNS WHERE {where} ORDER BY ORDINAL_POSITION;",
             "indexes": "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME "
             f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;",
             "checks": "SELECT cc.CONSTRAINT_NAME,cc.CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS cc "
@@ -5663,7 +5665,7 @@ DELIMITER ;
             "uk_experiment_conversation\t0\t2\tconversation_id",
         ]
         if (
-            actual["indexes"].splitlines() != sorted(expected_indexes)
+            sorted(actual["indexes"].splitlines()) != sorted(expected_indexes)
             or actual["fks"] != before["fks"]
         ):
             raise HarnessError(
@@ -5829,6 +5831,20 @@ DELIMITER ;
             )
         for endpoint in (self.source, self.target):
             self.assert_verdict_slot_metadata(endpoint, before[endpoint.container])
+            original_names = [
+                line.split("\t", 1)[0]
+                for line in before[endpoint.container]["columns"].splitlines()
+            ]
+            original_rows = self.admin_query(
+                endpoint,
+                "SELECT "
+                + ",".join(f"`{name}`" for name in original_names)
+                + " FROM assistant_quality_verdicts ORDER BY id;",
+            ).strip()
+            if original_rows != before[endpoint.container]["rows"]:
+                raise HarnessError(
+                    f"ALTER changed preexisting verdict fields: {original_rows!r}"
+                )
             backfill = self.admin_query(
                 endpoint,
                 "SELECT id,sample_kind,IFNULL(experiment_key,'<null>'),CONCAT('slot=',sample_slot),"
@@ -5881,6 +5897,17 @@ DELIMITER ;
             != self.verdict_slot_snapshot(self.target)["rows"]
         ):
             raise HarnessError("verdict complete rows differ after DML")
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "UPDATE assistant_quality_verdicts SET sample_kind='random',experiment_key=NULL WHERE id=11;",
+                "uk_run_slot_conversation",
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "UPDATE assistant_quality_verdicts SET experiment_key='exp-a' WHERE id=12;",
+                "Duplicate",
+            )
         stable = self.verdict_slot_snapshot(self.target)
         journal = self.journal_full_row(int(pending["event_start_position"]))
         checkpoint = self.checkpoint()
