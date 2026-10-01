@@ -124,7 +124,36 @@ impl LiveDdlSemanticInventory {
         Ok(SemanticSchemaSnapshot {
             inventory,
             table_runtime,
+            check_constraints: Default::default(),
         })
+    }
+
+    fn target_snapshot(&self, operation: &DdlOperation) -> Result<SemanticSchemaSnapshot, String> {
+        let mut snapshot = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        if let Some(ast) = &operation.alter_table_ast {
+            let names = ast
+                .clauses
+                .iter()
+                .filter_map(|clause| match clause {
+                    model::ParsedAlterClause::AddCheck { constraint, .. } => Some(&constraint.name),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !names.is_empty() {
+                let checks = self
+                    .target
+                    .read_table_check_constraints(&self.target_schema, &ast.table)
+                    .map_err(|error| format!("read affected ALTER CHECK metadata: {error}"))?;
+                snapshot.check_constraints.insert(
+                    ast.table.clone(),
+                    checks
+                        .into_iter()
+                        .filter(|(name, _, _)| names.contains(&name))
+                        .collect(),
+                );
+            }
+        }
+        Ok(snapshot)
     }
 
     fn read_target_inventory(&self) -> Result<crate::inventory::SchemaInventory, String> {
@@ -482,10 +511,30 @@ impl LiveDdlSemanticInventory {
             let alters_default = ast.clauses.iter().any(|clause| {
                 matches!(clause, model::ParsedAlterClause::AlterColumnDefault { .. })
             });
-            if alters_default || transform::is_approved_llm_audit_turns_alter(sql) {
+            if alters_default
+                || ast.clauses.iter().any(|clause| {
+                    matches!(
+                        clause,
+                        model::ParsedAlterClause::AddCheck { .. }
+                            | model::ParsedAlterClause::DropIndex(model::ParsedDropIndexAst {
+                                if_exists: true,
+                                ..
+                            })
+                            | model::ParsedAlterClause::AddKey {
+                                if_not_exists: true,
+                                ..
+                            }
+                            | model::ParsedAlterClause::AddColumn(model::ParsedAddColumnAst {
+                                if_not_exists: true,
+                                ..
+                            })
+                    )
+                })
+                || transform::is_approved_llm_audit_turns_alter(sql)
+            {
                 let operation = parse_semantic_operation_with_mode(sql, mode)?;
-                let before = Self::snapshot(&self.target, &self.target_schema, &operation)?;
-                let after = Self::snapshot(&self.target, &self.target_schema, &operation)?;
+                let before = self.target_snapshot(&operation)?;
+                let after = self.target_snapshot(&operation)?;
                 validate_target_snapshot_consistency(&before, &after)?;
                 return transform::transform_production_alter_table_with_target_mode(
                     sql, &before, mode,
@@ -513,7 +562,7 @@ impl LiveDdlSemanticInventory {
         event_end_position: u64,
         operation: &DdlOperation,
     ) -> Result<DdlSemanticEvidence, String> {
-        let target_before = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        let target_before = self.target_snapshot(operation)?;
         if let Some(evidence) = capture_early_evidence(
             self,
             sql,
@@ -584,8 +633,8 @@ impl LiveDdlSemanticInventory {
         }
         let source_collation = defaults.collation.clone();
         defaults.collation = crate::sync_schema::canonical_collation(&defaults.collation);
-        let before = Self::snapshot(&self.target, &self.target_schema, operation)?;
-        let after = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        let before = self.target_snapshot(operation)?;
+        let after = self.target_snapshot(operation)?;
         validate_target_snapshot_consistency(&before, &after)?;
         let mut evidence =
             canonical::build_resolved_create_table_evidence(operation, &before, &defaults)?;
@@ -594,8 +643,8 @@ impl LiveDdlSemanticInventory {
     }
 
     fn observe_operation(&self, operation: &DdlOperation) -> Result<String, String> {
-        let before = Self::snapshot(&self.target, &self.target_schema, operation)?;
-        let after = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        let before = self.target_snapshot(operation)?;
+        let after = self.target_snapshot(operation)?;
         validate_target_snapshot_consistency(&before, &after)?;
         if let Some(ast) = operation.create_table_ast.as_ref() {
             self.validate_observed_create_foreign_keys(ast, &before)?;
@@ -615,7 +664,7 @@ impl LiveDdlSemanticInventory {
     ) -> Result<DdlSemanticEvidence, String> {
         // MariaDB resolves omitted CREATE charset against the table's database, not
         // Q_CHARSET.server or a later source-head schema. Replay uses the target pre-state.
-        let before = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        let before = self.target_snapshot(operation)?;
         let defaults = self
             .target
             .read_schema_defaults(&self.target_schema)
@@ -624,7 +673,7 @@ impl LiveDdlSemanticInventory {
             .target
             .read_schema_defaults(&self.target_schema)
             .map_err(|error| format!("reread target CREATE database defaults: {error}"))?;
-        let after = Self::snapshot(&self.target, &self.target_schema, operation)?;
+        let after = self.target_snapshot(operation)?;
         validate_target_snapshot_consistency(&before, &after)?;
         if defaults != repeated_defaults {
             return Err("target CREATE database defaults changed during evidence capture".into());
@@ -814,8 +863,7 @@ fn capture_assistant_reply_reports_create_evidence(
             "source schema changed during assistant_reply_reports convergence proof".to_string(),
         );
     }
-    let target_after =
-        LiveDdlSemanticInventory::snapshot(&inventory.target, &inventory.target_schema, operation)?;
+    let target_after = inventory.target_snapshot(operation)?;
     validate_target_snapshot_consistency(target_before, &target_after)?;
     validate_assistant_reply_reports_convergence(&source, target_before)?;
     build_assistant_reply_reports_create_evidence(operation, target_before)
@@ -908,8 +956,7 @@ fn capture_source_only_procedure_create_evidence(
     operation: &DdlOperation,
     target_before: &SemanticSchemaSnapshot,
 ) -> Result<DdlSemanticEvidence, String> {
-    let target_after =
-        LiveDdlSemanticInventory::snapshot(&inventory.target, &inventory.target_schema, operation)?;
+    let target_after = inventory.target_snapshot(operation)?;
     validate_target_snapshot_consistency(target_before, &target_after)?;
     canonical::build_source_only_procedure_create_evidence(operation, target_before)
 }
@@ -942,8 +989,7 @@ fn capture_fenced_create_table_evidence(
         .map_err(|error| {
             format!("failed to read source coordinate after schema defaults: {error}")
         })?;
-    let target_after =
-        LiveDdlSemanticInventory::snapshot(&inventory.target, &inventory.target_schema, operation)?;
+    let target_after = inventory.target_snapshot(operation)?;
     validate_target_snapshot_consistency(target_before, &target_after)?;
     canonical::build_fenced_create_table_evidence(
         operation,
@@ -961,8 +1007,7 @@ fn capture_translated_evidence(
     operation: &DdlOperation,
     target_before: &SemanticSchemaSnapshot,
 ) -> Result<DdlSemanticEvidence, String> {
-    let target_after =
-        LiveDdlSemanticInventory::snapshot(&inventory.target, &inventory.target_schema, operation)?;
+    let target_after = inventory.target_snapshot(operation)?;
     validate_target_snapshot_consistency(target_before, &target_after)?;
     build_semantic_evidence(operation, target_before, target_before)
 }
@@ -989,8 +1034,7 @@ fn capture_source_evidence(
             format!("failed to read source coordinate after semantic inventory: {error}")
         })?;
     validate_source_snapshot_coordinate(source_file, event_end_position, &before, &after)?;
-    let target_after =
-        LiveDdlSemanticInventory::snapshot(&inventory.target, &inventory.target_schema, operation)?;
+    let target_after = inventory.target_snapshot(operation)?;
     validate_target_snapshot_consistency(target_before, &target_after)?;
     build_semantic_evidence(operation, target_before, &source)
 }

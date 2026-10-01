@@ -1042,6 +1042,7 @@ fn truncate_has_explicit_runtime_postcondition() {
 
 fn semantic_snapshot(row_count: u64, auto_increment: Option<u64>) -> SemanticSchemaSnapshot {
     SemanticSchemaSnapshot {
+        check_constraints: Default::default(),
         inventory: fixture_inventory(row_count),
         table_runtime: fixture_runtime(row_count, auto_increment),
     }
@@ -1642,6 +1643,7 @@ fn fixture_create_table_evidence_captures_fenced_source_defaults_and_explicit_sq
     ) ENGINE=InnoDB";
     let operation = parse_ddl_operation(source_sql).expect("fixture CREATE TABLE operation");
     let target = SemanticSchemaSnapshot {
+        check_constraints: Default::default(),
         inventory: SchemaInventory {
             schema: "fixture_cdc".to_string(),
             tables: Vec::new(),
@@ -1852,6 +1854,7 @@ fn fixture_create_table_expected_post_state_matches_observed_inventory_exactly()
     ) ENGINE=InnoDB";
     let operation = parse_ddl_operation(source_sql).expect("fixture CREATE TABLE operation");
     let absent = SemanticSchemaSnapshot {
+        check_constraints: Default::default(),
         inventory: SchemaInventory {
             schema: "fixture_cdc".to_string(),
             tables: Vec::new(),
@@ -1883,6 +1886,7 @@ fn fixture_create_table_expected_post_state_matches_observed_inventory_exactly()
     )
     .expect("fixture CREATE TABLE evidence");
     let observed = SemanticSchemaSnapshot {
+        check_constraints: Default::default(),
         inventory: SchemaInventory {
             schema: "fixture_cdc".to_string(),
             tables: vec![TableInventory {
@@ -1980,6 +1984,7 @@ fn fixture_create_table_expected_indexes_use_observed_inventory_order() {
     ) ENGINE=InnoDB";
     let operation = parse_ddl_operation(sql).expect("multi-key CREATE TABLE operation");
     let absent = SemanticSchemaSnapshot {
+        check_constraints: Default::default(),
         inventory: SchemaInventory {
             schema: "fixture_cdc".to_string(),
             tables: Vec::new(),
@@ -2133,6 +2138,7 @@ CREATE TABLE IF NOT EXISTS `home_feed_artist_blacklist` (\n\
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
     let operation = parse_ddl_operation(source_sql).expect("production CREATE TABLE operation");
     let target = SemanticSchemaSnapshot {
+        check_constraints: Default::default(),
         inventory: SchemaInventory {
             schema: "globalcomix".to_string(),
             tables: Vec::new(),
@@ -3010,6 +3016,7 @@ fn releases_downloads_sort_target() -> SemanticSchemaSnapshot {
     })
     .collect();
     SemanticSchemaSnapshot {
+        check_constraints: Default::default(),
         inventory: SchemaInventory {
             schema: "globalcomix".to_string(),
             tables: vec![TableInventory {
@@ -3122,6 +3129,7 @@ fn globalcomix_inventory() -> LiveDdlSemanticInventory {
 
 fn absent_target() -> SemanticSchemaSnapshot {
     SemanticSchemaSnapshot {
+        check_constraints: Default::default(),
         inventory: SchemaInventory {
             schema: "globalcomix".to_string(),
             tables: Vec::new(),
@@ -3467,6 +3475,9 @@ fn reader_memory_create_canonical_ast_records_checks_and_column_encoding() {
 
 fn reader_memory_profiles_target() -> SemanticSchemaSnapshot {
     let mut target = absent_target();
+    target
+        .check_constraints
+        .insert("reader_memory_profiles".into(), Vec::new());
     target.inventory.tables.push(TableInventory {
         name: "reader_memory_profiles".to_string(),
         table_type: "BASE TABLE".to_string(),
@@ -3725,6 +3736,8 @@ fn reader_memory_profiles_with_suggestions_target() -> SemanticSchemaSnapshot {
     target
 }
 
+mod verdict_guards;
+
 #[test]
 fn reader_memory_guarded_alter_transforms_to_unguarded_mysql8_sql() {
     let transformation = globalcomix_inventory()
@@ -3812,16 +3825,10 @@ fn reader_memory_guarded_alter_is_a_proven_noop_when_everything_exists() {
 
 #[test]
 fn reader_memory_guarded_alter_rejects_unmodeled_variants() {
-    for sql in [
-        READER_MEMORY_PROFILES_GUARDED_ALTER.replace(
-            "ADD INDEX IF NOT EXISTS reader_memory_suggestion_started (suggestions_started_at)",
-            "ADD UNIQUE INDEX IF NOT EXISTS reader_memory_suggestion_started (suggestions_started_at)",
-        ),
-        READER_MEMORY_PROFILES_GUARDED_ALTER.replace(
-            "(suggestions_started_at)",
-            "(suggestions_started_at) USING HASH",
-        ),
-    ] {
+    for sql in [READER_MEMORY_PROFILES_GUARDED_ALTER.replace(
+        "(suggestions_started_at)",
+        "(suggestions_started_at) USING HASH",
+    )] {
         assert!(!supports_production_alter_table(&sql), "accepted {sql}");
     }
 }

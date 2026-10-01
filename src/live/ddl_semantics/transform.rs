@@ -19,6 +19,17 @@ mod generated_column;
 mod observed_create;
 
 pub(crate) use check_constraint::{canonical_check_constraint_value, referenced_columns};
+
+pub(crate) fn mysql_check_expression(
+    constraint: &super::model::ParsedCheckConstraintAst,
+) -> String {
+    let rendered = check_constraint::render_check_constraint(constraint);
+    rendered
+        .split_once(" CHECK ")
+        .expect("named CHECK renderer")
+        .1
+        .to_string()
+}
 pub(crate) use generated_column::{
     mysql_generation_expression, referenced_columns as generated_referenced_columns,
 };
@@ -65,7 +76,7 @@ fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
         && ast.clauses.iter().all(|clause| match clause {
             ParsedAlterClause::AddColumn(_) => true,
             ParsedAlterClause::AddKey { .. }
-            | ParsedAlterClause::AddCheck(_)
+            | ParsedAlterClause::AddCheck { .. }
             | ParsedAlterClause::AddForeignKey(_)
             | ParsedAlterClause::ModifyColumn(_)
             | ParsedAlterClause::ChangeColumn { .. }
@@ -139,6 +150,23 @@ pub fn transform_production_alter_table_with_mode(
     {
         return Err("ALTER COLUMN DEFAULT requires target column state".into());
     }
+    if ast.clauses.iter().any(|clause| {
+        matches!(
+            clause,
+            ParsedAlterClause::AddCheck {
+                if_not_exists: true,
+                ..
+            } | ParsedAlterClause::DropIndex(ParsedDropIndexAst {
+                if_exists: true,
+                ..
+            }) | ParsedAlterClause::AddKey {
+                index: ParsedIndexAst { unique: true, .. },
+                if_not_exists: true
+            }
+        )
+    }) {
+        return Err("guarded UNIQUE/CHECK/DROP requires target semantic state".into());
+    }
     let rendered_sql = render_production_alter_table(&ast);
     Ok(transformed_alter_sql(leading_comment, rendered_sql))
 }
@@ -178,6 +206,12 @@ pub(crate) fn transform_production_alter_table_with_target_mode(
 }
 
 fn transformed_alter_sql(leading_comment: Option<&str>, rendered_sql: String) -> DdlTransformation {
+    if rendered_sql.is_empty() {
+        return DdlTransformation {
+            version: DDL_TRANSFORMATION_VERSION,
+            target_sql: None,
+        };
+    }
     let target_sql = match leading_comment {
         Some(comment) => format!("{comment}{rendered_sql}"),
         None => rendered_sql,
@@ -202,10 +236,21 @@ fn render_alter_table_with_target(
     target: &super::model::SemanticSchemaSnapshot,
     approved_copy_shared: bool,
 ) -> Result<String, String> {
+    super::canonical::validate_guarded_clause_pre_state(target, ast)?;
     let normalized = fold_new_column_defaults(ast, target)?;
     let mut state = target.clone();
     let mut clauses = Vec::with_capacity(normalized.clauses.len());
     for clause in &normalized.clauses {
+        if let ParsedAlterClause::DropIndex(index) = clause
+            && index.if_exists
+            && !state
+                .inventory
+                .indexes
+                .iter()
+                .any(|item| item.table == ast.table && item.name == index.name)
+        {
+            continue;
+        }
         let rendered = match clause {
             ParsedAlterClause::AlterColumnDefault { name, default } => {
                 render_target_column_default(&state, &ast.table, name, default.as_ref())?
@@ -214,6 +259,28 @@ fn render_alter_table_with_target(
         };
         super::canonical::apply_alter_clause(&mut state, &normalized, clause)?;
         clauses.push(rendered);
+    }
+    if state == *target
+        && ast.clauses.iter().any(|clause| {
+            matches!(
+                clause,
+                ParsedAlterClause::AddColumn(super::model::ParsedAddColumnAst {
+                    if_not_exists: true,
+                    ..
+                }) | ParsedAlterClause::AddKey {
+                    if_not_exists: true,
+                    ..
+                } | ParsedAlterClause::AddCheck {
+                    if_not_exists: true,
+                    ..
+                } | ParsedAlterClause::DropIndex(ParsedDropIndexAst {
+                    if_exists: true,
+                    ..
+                })
+            )
+        })
+    {
+        return Ok(String::new());
     }
     if approved_copy_shared {
         clauses.push("ALGORITHM=COPY".to_string());
@@ -435,7 +502,7 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
             quote_identifier(new_name)
         ),
         ParsedAlterClause::AddKey { index, .. } => render_add_key(index),
-        ParsedAlterClause::AddCheck(constraint) => {
+        ParsedAlterClause::AddCheck { constraint, .. } => {
             format!(
                 "ADD {}",
                 check_constraint::render_check_constraint(constraint)
@@ -2241,9 +2308,31 @@ fn parse_production_add_clause(
             parse_add_foreign_key_clause(tokens, quoted_flags, index)
         }
         Some(kind) if kind == "CONSTRAINT" => {
-            let (constraint, next_index) =
-                check_constraint::parse_named_check(tokens, quoted_flags, index + 1, literals)?;
-            Ok((ParsedAlterClause::AddCheck(constraint), next_index))
+            let if_not_exists = tokens_match(tokens, index + 2, "IF") && !quoted_flags[index + 2];
+            let mut check_tokens = tokens.to_vec();
+            let mut check_quoted = quoted_flags.to_vec();
+            if if_not_exists {
+                require_keyword(tokens, index + 3, "NOT")?;
+                require_keyword(tokens, index + 4, "EXISTS")?;
+                if quoted_flags[index + 3] || quoted_flags[index + 4] {
+                    return Err("quoted CHECK guard keyword".into());
+                }
+                check_tokens.drain(index + 2..index + 5);
+                check_quoted.drain(index + 2..index + 5);
+            }
+            let (constraint, next_index) = check_constraint::parse_named_check(
+                &check_tokens,
+                &check_quoted,
+                index + 1,
+                literals,
+            )?;
+            Ok((
+                ParsedAlterClause::AddCheck {
+                    constraint,
+                    if_not_exists,
+                },
+                next_index + if if_not_exists { 3 } else { 0 },
+            ))
         }
         actual => Err(format!(
             "unsupported production ALTER TABLE clause {actual:?}"
@@ -2435,7 +2524,7 @@ fn parse_add_key_clause(
     unique: bool,
 ) -> Result<(ParsedAlterClause, usize), String> {
     let mut name_index = key_index + 1;
-    let if_not_exists = !unique && tokens_match(tokens, name_index, "IF");
+    let if_not_exists = tokens_match(tokens, name_index, "IF");
     if if_not_exists {
         require_keyword(tokens, name_index + 1, "NOT")?;
         require_keyword(tokens, name_index + 2, "EXISTS")?;
@@ -2806,10 +2895,17 @@ fn parse_drop_index_clause(
     index: usize,
 ) -> Result<(ParsedAlterClause, usize), String> {
     require_keyword(tokens, index + 1, "INDEX")?;
-    let name = require_identifier(tokens, index + 2, "dropped index")?;
+    let if_exists = tokens_match(tokens, index + 2, "IF");
+    let name_index = if if_exists {
+        require_keyword(tokens, index + 3, "EXISTS")?;
+        index + 4
+    } else {
+        index + 2
+    };
+    let name = require_identifier(tokens, name_index, "dropped index")?;
     Ok((
-        ParsedAlterClause::DropIndex(ParsedDropIndexAst { name }),
-        index + 3,
+        ParsedAlterClause::DropIndex(ParsedDropIndexAst { name, if_exists }),
+        name_index + 1,
     ))
 }
 

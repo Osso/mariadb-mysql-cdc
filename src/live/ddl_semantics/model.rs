@@ -144,6 +144,7 @@ pub struct ParsedDropColumnAst {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedDropIndexAst {
     pub name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,7 +202,10 @@ pub enum ParsedAlterClause {
         index: ParsedIndexAst,
         if_not_exists: bool,
     },
-    AddCheck(ParsedCheckConstraintAst),
+    AddCheck {
+        constraint: ParsedCheckConstraintAst,
+        if_not_exists: bool,
+    },
     AddForeignKey(ParsedCreateForeignKeyAst),
     DropColumn(ParsedDropColumnAst),
     DropIndex(ParsedDropIndexAst),
@@ -237,6 +241,8 @@ pub struct TableRuntimeState {
 pub struct SemanticSchemaSnapshot {
     pub inventory: SchemaInventory,
     pub table_runtime: BTreeMap<String, TableRuntimeState>,
+    /// Only affected named ALTER CHECKs; empty entries prove captured absence.
+    pub check_constraints: BTreeMap<String, Vec<(String, String, bool)>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

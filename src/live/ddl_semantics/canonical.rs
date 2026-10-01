@@ -247,7 +247,10 @@ fn canonical_operation_state(
 ) -> Result<String, String> {
     let name = &operation.primary_object;
     match operation.object_kind {
-        DdlObjectKind::Table => canonical_table_structure_state(snapshot, name),
+        DdlObjectKind::Table => match &operation.alter_table_ast {
+            Some(ast) => canonical_alter_structure_state(snapshot, ast),
+            None => canonical_table_structure_state(snapshot, name),
+        },
         DdlObjectKind::Index => canonical_index_state(snapshot, operation),
         DdlObjectKind::View => canonical_view_state(snapshot, name),
         DdlObjectKind::Procedure | DdlObjectKind::Function => {
@@ -320,6 +323,34 @@ fn canonical_table_structure_state(
         "foreign_keys": sorted_table_foreign_keys(snapshot, table_name),
     }))
     .map_err(|error| format!("failed to encode table structure: {error}"))
+}
+
+fn canonical_alter_structure_state(
+    snapshot: &SemanticSchemaSnapshot,
+    ast: &ParsedAlterTableAst,
+) -> Result<String, String> {
+    let base = canonical_table_structure_state(snapshot, &ast.table)?;
+    let names = ast
+        .clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            ParsedAlterClause::AddCheck { constraint, .. } => Some(&constraint.name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if names.is_empty() || find_table(snapshot, &ast.table).is_none() {
+        return Ok(base);
+    }
+    let checks = affected_checks(snapshot, &ast.table)?;
+    let mut checks = checks.iter().filter(|(name, _, _)| names.contains(&name))
+        .map(|(name, clause, enforced)| {
+            Ok(json!({"name": name, "expression": super::transform::canonical_check_expression(clause)?, "enforced": enforced}))
+        }).collect::<Result<Vec<_>, String>>()?;
+    checks.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&base).map_err(|error| error.to_string())?;
+    value["check_constraints"] = json!(checks);
+    serde_json::to_string(&value).map_err(|error| error.to_string())
 }
 
 fn find_table<'a>(
@@ -738,10 +769,19 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                 }
                 value
             }
-            ParsedAlterClause::AddCheck(constraint) => json!({
-                "kind": "add_check",
-                "constraint": super::transform::canonical_check_constraint_value(constraint),
-            }),
+            ParsedAlterClause::AddCheck {
+                constraint,
+                if_not_exists,
+            } => {
+                let mut value = json!({
+                    "kind": "add_check",
+                    "constraint": super::transform::canonical_check_constraint_value(constraint),
+                });
+                if *if_not_exists {
+                    value["if_not_exists"] = json!(true);
+                }
+                value
+            }
             ParsedAlterClause::AddForeignKey(key) => json!({
                 "kind": "add_foreign_key",
                 "name": key.name,
@@ -756,10 +796,13 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                 "name": column.name,
                 "if_exists": column.if_exists,
             }),
-            ParsedAlterClause::DropIndex(index) => json!({
-                "kind": "drop_index",
-                "name": index.name,
-            }),
+            ParsedAlterClause::DropIndex(index) => {
+                let mut value = json!({ "kind": "drop_index", "name": index.name });
+                if index.if_exists {
+                    value["if_exists"] = json!(true);
+                }
+                value
+            }
         })
         .collect::<Vec<_>>();
     let mut value = json!({
@@ -818,13 +861,13 @@ fn translated_alter_table_post_state(
     for clause in &ast.clauses {
         apply_alter_clause(&mut expected, ast, clause)?;
     }
-    canonical_table_structure_state(&expected, &ast.table)
+    canonical_alter_structure_state(&expected, ast)
 }
 
 /// MySQL 8 has no `IF NOT EXISTS` for ADD COLUMN/INDEX, so guarded clauses execute unguarded
 /// only when every guarded object is absent, or prove a no-op when every one already exists
 /// with its exact definition. Partial presence fails closed.
-fn validate_guarded_clause_pre_state(
+pub(super) fn validate_guarded_clause_pre_state(
     target: &SemanticSchemaSnapshot,
     ast: &ParsedAlterTableAst,
 ) -> Result<(), String> {
@@ -852,10 +895,39 @@ fn validate_guarded_clause_pre_state(
                     present += 1;
                 }
             }
+            ParsedAlterClause::AddCheck {
+                constraint,
+                if_not_exists: true,
+            } => {
+                guarded += 1;
+                let checks = affected_checks(target, &ast.table)?;
+                if checks.iter().any(|(name, _, _)| name == &constraint.name) {
+                    present += 1;
+                }
+            }
             _ => {}
         }
     }
-    if present == 0 || present == guarded {
+    if guarded > 0
+        && present == guarded
+        && ast.clauses.iter().any(|clause| {
+            matches!(clause, ParsedAlterClause::DropIndex(index) if index.if_exists
+            && table_indexes(target, &ast.table).iter().any(|item| item.name == index.name))
+        })
+    {
+        return Err("guarded ALTER final additions exist but dropped index remains".into());
+    }
+    if guarded > 0 && present == guarded {
+        let mut final_state = target.clone();
+        for clause in &ast.clauses {
+            apply_alter_clause(&mut final_state, ast, clause)?;
+        }
+        if final_state != *target {
+            return Err("guarded ALTER additions exist but final state is partial".into());
+        }
+        return Ok(());
+    }
+    if present == 0 {
         return Ok(());
     }
     Err(format!(
@@ -887,17 +959,57 @@ pub(super) fn apply_alter_clause(
             index,
             if_not_exists,
         } => apply_add_key(expected, index, *if_not_exists),
-        ParsedAlterClause::AddCheck(constraint) => {
-            validate_add_check(expected, &ast.table, constraint)
-        }
+        ParsedAlterClause::AddCheck {
+            constraint,
+            if_not_exists,
+        } => apply_add_check(expected, &ast.table, constraint, *if_not_exists),
         ParsedAlterClause::AddForeignKey(key) => apply_add_foreign_key(expected, &ast.table, key),
         ParsedAlterClause::DropColumn(column) => apply_drop_column(expected, &ast.table, column),
         ParsedAlterClause::DropIndex(index) => apply_drop_index(expected, &ast.table, index),
     }
 }
 
-/// CHECK constraints are outside the inventory the post-state compares, so the expected state
-/// only proves every referenced column exists once preceding clauses have applied.
+fn affected_checks<'a>(
+    snapshot: &'a SemanticSchemaSnapshot,
+    table: &str,
+) -> Result<&'a Vec<(String, String, bool)>, String> {
+    snapshot
+        .check_constraints
+        .get(table)
+        .ok_or_else(|| format!("affected CHECK metadata missing for `{table}`"))
+}
+
+fn apply_add_check(
+    expected: &mut SemanticSchemaSnapshot,
+    table_name: &str,
+    constraint: &super::model::ParsedCheckConstraintAst,
+    if_not_exists: bool,
+) -> Result<(), String> {
+    validate_add_check(expected, table_name, constraint)?;
+    let clause = super::transform::mysql_check_expression(constraint);
+    let wanted = super::transform::canonical_check_expression(&clause)?;
+    let checks = affected_checks(expected, table_name)?;
+    if let Some((_, actual, enforced)) = checks.iter().find(|(name, _, _)| name == &constraint.name)
+    {
+        if if_not_exists
+            && *enforced
+            && super::transform::canonical_check_expression(actual)? == wanted
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "ADD CHECK `{}` already exists with divergent or disabled definition",
+            constraint.name
+        ));
+    }
+    expected
+        .check_constraints
+        .get_mut(table_name)
+        .expect("validated CHECK metadata")
+        .push((constraint.name.clone(), clause, true));
+    Ok(())
+}
+
 fn validate_add_check(
     expected: &SemanticSchemaSnapshot,
     table_name: &str,
@@ -1464,7 +1576,7 @@ fn apply_drop_index(
         !target_index.table.eq_ignore_ascii_case(table_name)
             || !target_index.name.eq_ignore_ascii_case(&index.name)
     });
-    if expected.inventory.indexes.len() == before {
+    if expected.inventory.indexes.len() == before && !index.if_exists {
         return Err(format!(
             "DROP INDEX target `{table_name}` lacks `{}`",
             index.name

@@ -355,6 +355,7 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
                 Vec::new()
             };
             let target = super::super::ddl_semantics::SemanticSchemaSnapshot {
+                check_constraints: Default::default(),
                 inventory: crate::inventory::SchemaInventory {
                     schema: "fixture_cdc".to_string(),
                     tables,
