@@ -515,19 +515,16 @@ impl LiveDdlSemanticInventory {
                 || ast.clauses.iter().any(|clause| {
                     matches!(
                         clause,
-                        model::ParsedAlterClause::AddCheck { .. }
-                            | model::ParsedAlterClause::DropIndex(model::ParsedDropIndexAst {
-                                if_exists: true,
-                                ..
-                            })
-                            | model::ParsedAlterClause::AddKey {
-                                if_not_exists: true,
-                                ..
-                            }
-                            | model::ParsedAlterClause::AddColumn(model::ParsedAddColumnAst {
-                                if_not_exists: true,
-                                ..
-                            })
+                        model::ParsedAlterClause::AddCheck {
+                            if_not_exists: true,
+                            ..
+                        } | model::ParsedAlterClause::DropIndex(model::ParsedDropIndexAst {
+                            if_exists: true,
+                            ..
+                        }) | model::ParsedAlterClause::AddKey {
+                            index: model::ParsedIndexAst { unique: true, .. },
+                            if_not_exists: true,
+                        }
                     )
                 })
                 || transform::is_approved_llm_audit_turns_alter(sql)
