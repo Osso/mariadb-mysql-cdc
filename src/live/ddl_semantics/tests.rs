@@ -1,12 +1,14 @@
 mod assistant_quality;
 mod basic_ddl;
 mod bigint_auto_increment;
+mod coalesce_generation;
 mod column_operations;
 
 mod json_add;
 mod json_create;
 mod nullable_modify;
 mod table_operations;
+mod verdict_check;
 
 use super::model::ParsedAlterClause;
 use super::transform::{

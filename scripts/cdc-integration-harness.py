@@ -106,6 +106,7 @@ SCENARIOS = (
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
     ScenarioSpec("assistant-quality-pending-replay", True),
+    ScenarioSpec("assistant-verdict-slot-pending-replay", True),
     ScenarioSpec("assistant-rec-experiments-create-pending-replay", True),
     ScenarioSpec("assistant-rec-quality-create-pending-replay", True),
     ScenarioSpec("assistant-rec-quality-create-mixed-case-pending-replay", True),
@@ -198,6 +199,7 @@ def default_scenarios() -> list[str]:
             "source-layout-json-pending-replay",
             "recsys-rail-create-pending-replay",
             "assistant-rec-experiments-create-pending-replay",
+            "assistant-verdict-slot-pending-replay",
             "assistant-rec-quality-create-pending-replay",
             "assistant-rec-quality-create-mixed-case-pending-replay",
             "contributor-cards-check-collision-recovery",
@@ -5457,6 +5459,506 @@ DELIMITER ;
         if collation != "utf8mb4_unicode_ci":
             raise HarnessError(f"assistant rec quality table collation differs: {collation!r}")
 
+    def prepare_assistant_verdict_slot_schema(self) -> None:
+        """Reproduce captured pre-migration MariaDB and MySQL LONGTEXT+CHECK layouts."""
+        assert self.source and self.target
+        fixtures = self.repo / "fixtures/ddl"
+        names = (
+            "create-assistant-quality-runs.sql",
+            "create-assistant-quality-verdicts.sql",
+            "alter-assistant-quality-runs-in-flight-lock.sql",
+            "alter-assistant-quality-verdicts-conversation-key.sql",
+            "alter-assistant-quality-verdicts-conversation-fk.sql",
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(
+                endpoint, f"ALTER DATABASE {APP_SCHEMA} COLLATE utf8mb4_unicode_ci;"
+            )
+            self.admin_sql(
+                endpoint,
+                "CREATE TABLE llm_conversations(id INT UNSIGNED PRIMARY KEY,uuid CHAR(36) NOT NULL) "
+                "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci; "
+                "INSERT INTO llm_conversations VALUES(11,'c-11'),(12,'c-12'),(13,'c-13');",
+            )
+            for name in names:
+                ddl = (fixtures / name).read_text().strip()
+                if endpoint == self.target:
+                    # MySQL JSON is not production's MariaDB-compatible LONGTEXT contract.
+                    ddl = ddl.replace(" PERSISTENT", " STORED")
+                    json_columns = re.findall(r"`(\w+)`\s+json DEFAULT NULL", ddl)
+                    ddl = re.sub(
+                        r"\bjson DEFAULT NULL",
+                        "longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL",
+                        ddl,
+                    )
+                    if json_columns:
+                        checks = ",".join(
+                            f"CONSTRAINT `{column}` CHECK(JSON_VALID(`{column}`))"
+                            for column in json_columns
+                        )
+                        ddl = ddl.replace(
+                            ") ENGINE=InnoDB", f", {checks}) ENGINE=InnoDB"
+                        )
+                self.admin_sql(endpoint, ddl + ";")
+            self.admin_sql(
+                endpoint,
+                "INSERT INTO assistant_quality_runs(id,uuid,status,model,window_days,sample_size,create_time) "
+                "VALUES(1,'r-1','done','judge/m',7,50,'2026-09-30 10:00:00'),"
+                "(2,'r-2','done','judge/m',7,50,'2026-09-30 10:01:00'); "
+                "INSERT INTO assistant_quality_verdicts(id,run_id,conversation_id,conversation_uuid,stratum,"
+                "turns,verdict,dimensions,tags,evidence,create_time) VALUES"
+                "(1,1,11,'c-11','1_turn',1,'satisfying','{\"score\": 1}','[\"old\"]',NULL,'2026-09-30 10:02:00'),"
+                "(2,2,11,'c-11','2_turns',2,'partial',NULL,'[]','{\"quote\": \"old\"}','2026-09-30 10:03:00'),"
+                "(3,1,12,'c-12','3-4_turns',3,NULL,'null',NULL,'{}','2026-09-30 10:04:00');",
+            )
+
+    def verdict_slot_metadata_queries(self) -> dict[str, str]:
+        where = (
+            f"TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='assistant_quality_verdicts'"
+        )
+        return {
+            "columns": "SELECT COLUMN_NAME,DATA_TYPE,IF(COLUMN_TYPE LIKE '%unsigned%','unsigned','signed'),"
+            "IS_NULLABLE,COALESCE(COLUMN_DEFAULT,'<null>'),ORDINAL_POSITION,COLUMN_COMMENT,"
+            "CHARACTER_MAXIMUM_LENGTH,CHARACTER_SET_NAME,COLLATION_NAME "
+            f"FROM information_schema.COLUMNS WHERE {where} ORDER BY ORDINAL_POSITION;",
+            "generated": "SELECT COLUMN_NAME,EXTRA,GENERATION_EXPRESSION "
+            f"FROM information_schema.COLUMNS WHERE {where} ORDER BY ORDINAL_POSITION;",
+            "indexes": "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME "
+            f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;",
+            "checks": "SELECT cc.CONSTRAINT_NAME,cc.CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS cc "
+            "JOIN information_schema.TABLE_CONSTRAINTS tc ON tc.CONSTRAINT_SCHEMA=cc.CONSTRAINT_SCHEMA "
+            "AND tc.CONSTRAINT_NAME=cc.CONSTRAINT_NAME "
+            f"WHERE tc.TABLE_SCHEMA='{APP_SCHEMA}' AND tc.TABLE_NAME='assistant_quality_verdicts' "
+            "AND tc.CONSTRAINT_TYPE='CHECK' ORDER BY cc.CONSTRAINT_NAME;",
+            "fks": "SELECT k.CONSTRAINT_NAME,k.COLUMN_NAME,k.REFERENCED_TABLE_NAME,k.REFERENCED_COLUMN_NAME,"
+            "IF(r.UPDATE_RULE='NO ACTION','RESTRICT',r.UPDATE_RULE),"
+            "IF(r.DELETE_RULE='NO ACTION','RESTRICT',r.DELETE_RULE) "
+            "FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r "
+            "ON r.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME=k.CONSTRAINT_NAME "
+            "AND r.TABLE_NAME=k.TABLE_NAME "
+            f"WHERE k.TABLE_SCHEMA='{APP_SCHEMA}' AND k.TABLE_NAME='assistant_quality_verdicts' "
+            "ORDER BY k.CONSTRAINT_NAME;",
+        }
+
+    def verdict_slot_snapshot(self, endpoint: Endpoint) -> dict[str, str]:
+        queries = self.verdict_slot_metadata_queries()
+        queries["rows"] = "SELECT * FROM assistant_quality_verdicts ORDER BY id;"
+        return {
+            name: self.admin_query(endpoint, sql).strip()
+            for name, sql in queries.items()
+        }
+
+    def assert_verdict_slot_metadata(
+        self, endpoint: Endpoint, before: dict[str, str]
+    ) -> None:
+        actual = self.verdict_slot_snapshot(endpoint)
+        columns = [line.split("\t") for line in actual["columns"].splitlines()]
+        old = [line.split("\t") for line in before["columns"].splitlines()]
+        if len(columns) != 26 or [c[0] for c in columns[:4] + columns[13:]] != [
+            c[0] for c in old
+        ]:
+            raise HarnessError(f"verdict column count/order differs: {columns!r}")
+        for current, previous in zip(columns[:4] + columns[13:], old):
+            if current[:5] + current[6:] != previous[:5] + previous[6:]:
+                raise HarnessError(
+                    f"verdict original column changed: {current!r} != {previous!r}"
+                )
+        expected = (
+            ("user_id", "int", "unsigned", "YES", "<null>", "", "NULL"),
+            (
+                "conversation_start",
+                "datetime",
+                "signed",
+                "YES",
+                "<null>",
+                "llm_conversations.create_time, UTC",
+                "NULL",
+            ),
+            (
+                "account_age_bucket",
+                "varchar",
+                "signed",
+                "YES",
+                "<null>",
+                "new_0_7d|new_7_30d|established_30d_plus|unknown",
+                "24",
+            ),
+            (
+                "gold_status",
+                "varchar",
+                "signed",
+                "YES",
+                "<null>",
+                "gold_paid|gold_trial|gold_grant|free|unknown",
+                "12",
+            ),
+            (
+                "sample_kind",
+                "varchar",
+                "signed",
+                "NO",
+                "random",
+                "random|experiment",
+                "12",
+            ),
+            (
+                "experiment_key",
+                "varchar",
+                "signed",
+                "YES",
+                "<null>",
+                "NULL for the random sample",
+                "64",
+            ),
+            (
+                "variant",
+                "varchar",
+                "signed",
+                "YES",
+                "<null>",
+                "NULL for the random sample",
+                "32",
+            ),
+            (
+                "rubric_version",
+                "int",
+                "unsigned",
+                "YES",
+                "<null>",
+                "llm_prompts.id of the rubric that judged it",
+                "NULL",
+            ),
+            (
+                "sample_slot",
+                "varchar",
+                "signed",
+                "YES",
+                "<null>",
+                "per-run uniqueness slot: empty for the random sample, else the experiment key",
+                "64",
+            ),
+        )
+        for position, (column, wanted) in enumerate(zip(columns[4:13], expected), 5):
+            default = column[4].strip("'")
+            if default.lower() == "null":
+                default = "<null>"
+            observed = tuple(column[:4] + [default] + column[6:8])
+            if observed != wanted or column[5] != str(position):
+                raise HarnessError(
+                    f"new verdict metadata differs: {column!r}, expected {wanted!r}"
+                )
+            if column[1] == "varchar" and column[8:] != [
+                "utf8mb4",
+                "utf8mb4_unicode_ci",
+            ]:
+                raise HarnessError(f"new verdict collation differs: {column!r}")
+        expected_indexes = [
+            line
+            for line in before["indexes"].splitlines()
+            if not line.startswith("uk_run_conversation\t")
+        ]
+        expected_indexes += [
+            "uk_run_slot_conversation\t0\t1\trun_id",
+            "uk_run_slot_conversation\t0\t2\tsample_slot",
+            "uk_run_slot_conversation\t0\t3\tconversation_id",
+            "uk_experiment_conversation\t0\t1\texperiment_key",
+            "uk_experiment_conversation\t0\t2\tconversation_id",
+        ]
+        if (
+            sorted(actual["indexes"].splitlines()) != sorted(expected_indexes)
+            or actual["fks"] != before["fks"]
+        ):
+            raise HarnessError(
+                f"verdict indexes/FK actions changed incorrectly: {actual!r}"
+            )
+        checks = actual["checks"].splitlines()
+        originals = [
+            line
+            for line in checks
+            if not line.startswith("chk_aqv_sample_kind_experiment_key\t")
+        ]
+        if (
+            len(checks) != 4
+            or originals != before["checks"].splitlines()
+            or len(originals) != 3
+        ):
+            raise HarnessError(f"verdict original JSON/new CHECK differs: {checks!r}")
+        generated = self.admin_query(
+            endpoint,
+            "SELECT EXTRA FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA='{APP_SCHEMA}' AND TABLE_NAME='assistant_quality_verdicts' AND COLUMN_NAME='sample_slot';",
+        ).strip()
+        if "STORED GENERATED" not in generated.upper():
+            raise HarnessError(f"sample_slot is not stored generated: {generated!r}")
+
+    def assert_verdict_slot_constraints(self) -> None:
+        assert self.source and self.target
+        table = "assistant_quality_verdicts"
+        prefix = f"INSERT INTO {table}(id,run_id,conversation_id,conversation_uuid,stratum,sample_kind,experiment_key) "
+        for endpoint in (self.source, self.target):
+            check_error = (
+                "CONSTRAINT" if endpoint == self.source else "Check constraint"
+            )
+            for kind in ("random", "experiment", "other"):
+                for key in (None, "", "exp-matrix"):
+                    sql = (
+                        prefix
+                        + f"VALUES(900,1,13,'c-13','1_turn',{sql_literal(kind)},{'NULL' if key is None else sql_literal(key)});"
+                    )
+                    allowed = (kind == "random" and key is None) or (
+                        kind == "experiment" and key is not None
+                    )
+                    if allowed:
+                        slot = "" if key is None else key
+                        value = self.admin_query(
+                            endpoint,
+                            "START TRANSACTION; "
+                            + sql
+                            + f"SELECT CONCAT('slot=',sample_slot) FROM {table} WHERE id=900; ROLLBACK;",
+                        ).strip()
+                        if value != "slot=" + slot:
+                            raise HarnessError(
+                                f"generated slot matrix differs: {kind!r} {key!r} {value!r}"
+                            )
+                    else:
+                        self.assert_admin_sql_rejected(
+                            endpoint,
+                            "START TRANSACTION; " + sql + "ROLLBACK;",
+                            check_error,
+                        )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                prefix + "VALUES(900,1,13,'c-13','1_turn',NULL,NULL);",
+                "cannot be null",
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                prefix + "VALUES(900,1,11,'c-11','1_turn','random',NULL);",
+                "uk_run_slot_conversation",
+            )
+            duplicate = (
+                prefix + "VALUES(900,1,13,'c-13','1_turn','experiment','exp-unique'); "
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "START TRANSACTION; "
+                + duplicate
+                + prefix
+                + "VALUES(901,2,13,'c-13','1_turn','experiment','exp-unique'); ROLLBACK;",
+                "uk_experiment_conversation",
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                prefix + "VALUES(900,1,11,'c-11','1_turn','experiment','');",
+                "uk_run_slot_conversation",
+            )
+            for column in ("dimensions", "tags", "evidence"):
+                self.assert_admin_sql_rejected(
+                    endpoint,
+                    f"UPDATE {table} SET {column}='not json' WHERE id=1;",
+                    check_error,
+                )
+            self.assert_admin_sql_rejected(
+                endpoint, "DELETE FROM assistant_quality_runs WHERE id=1;", "fk_aqv_run"
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                f"UPDATE {table} SET conversation_id=999 WHERE id=1;",
+                "fk_aqv_conversation",
+            )
+            # Rollback preserves fixture while demonstrating both FK actions behaviorally.
+            cascaded = self.admin_query(
+                endpoint,
+                "START TRANSACTION; DELETE FROM llm_conversations WHERE id=11; "
+                f"SELECT COUNT(*) FROM {table} WHERE conversation_id=11; ROLLBACK;",
+            ).strip()
+            if cascaded != "0":
+                raise HarnessError(f"conversation FK did not cascade: {cascaded!r}")
+
+    def run_assistant_verdict_slot_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError("assistant verdict slot replay requires --old-binary")
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
+        self.prepare_assistant_verdict_slot_schema()
+        before = {
+            e.container: self.verdict_slot_snapshot(e)
+            for e in (self.source, self.target)
+        }
+        ddl = (
+            (
+                self.repo
+                / "fixtures/ddl/alter-assistant-quality-verdicts-sample-slot.sql"
+            )
+            .read_text()
+            .strip()
+        )
+        self.reset_target_general_log()
+        start, pending = self.prepare_pending_add_column(
+            "", ddl, prepared=True, old_binary=self.old_binary
+        )
+        if self.verdict_slot_snapshot(self.target) != before[self.target.container]:
+            raise HarnessError("old binary changed pre-ALTER verdict metadata/rows")
+        original_fks = "fk_aqv_conversation\tconversation_id\tllm_conversations\tid\tRESTRICT\tCASCADE\nfk_aqv_run\trun_id\tassistant_quality_runs\tid\tRESTRICT\tRESTRICT"
+        if before[self.target.container]["fks"] != original_fks:
+            raise HarnessError("pre-schema does not reproduce captured FK actions")
+        ddl_count = "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' AND command_type IN ('Query','Execute') AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%alter table%assistant_quality_verdicts%';"
+        crashed = self.run_stream(
+            start, self.coordinate(), integration_failpoint="post-ddl-pre-applied"
+        )
+        if (
+            crashed.returncode == 0
+            or "cdc_integration_failpoint" not in crashed.stdout + crashed.stderr
+        ):
+            raise HarnessError(f"post-DDL pre-applied crash did not fire: {crashed!r}")
+        prepared = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        if prepared["status"] != "prepared" or (
+            checkpoint["source_file"],
+            checkpoint["source_position"],
+        ) != (start.file, start.position):
+            raise HarnessError(
+                f"crash changed durable barrier: {prepared!r} {checkpoint!r}"
+            )
+        post_crash = self.verdict_slot_snapshot(self.target)
+        for endpoint in (self.source, self.target):
+            self.assert_verdict_slot_metadata(endpoint, before[endpoint.container])
+            original_names = [
+                line.split("\t", 1)[0]
+                for line in before[endpoint.container]["columns"].splitlines()
+            ]
+            original_rows = self.admin_query(
+                endpoint,
+                "SELECT "
+                + ",".join(f"`{name}`" for name in original_names)
+                + " FROM assistant_quality_verdicts ORDER BY id;",
+            ).strip()
+            if original_rows != before[endpoint.container]["rows"]:
+                raise HarnessError(
+                    f"ALTER changed preexisting verdict fields: {original_rows!r}"
+                )
+            backfill = self.admin_query(
+                endpoint,
+                "SELECT id,sample_kind,IFNULL(experiment_key,'<null>'),CONCAT('slot=',sample_slot),"
+                "IFNULL(user_id,'<null>'),IFNULL(conversation_start,'<null>'),IFNULL(account_age_bucket,'<null>'),"
+                "IFNULL(gold_status,'<null>'),IFNULL(variant,'<null>'),IFNULL(rubric_version,'<null>') "
+                "FROM assistant_quality_verdicts ORDER BY id;",
+            ).strip()
+            wanted = "\n".join(
+                f"{i}\trandom\t<null>\tslot=\t<null>\t<null>\t<null>\t<null>\t<null>\t<null>"
+                for i in (1, 2, 3)
+            )
+            if backfill != wanted:
+                raise HarnessError(f"existing rows were not backfilled: {backfill!r}")
+        self.assert_verdict_slot_constraints()
+        # Queue following DML while CDC is down at its prepared journal barrier.
+        self.admin_sql(
+            self.source,
+            "INSERT INTO assistant_quality_verdicts(id,run_id,conversation_id,conversation_uuid,stratum,create_time) "
+            "VALUES(10,1,13,'c-13','1_turn','2026-10-01 10:00:00'); "
+            "INSERT INTO assistant_quality_verdicts(id,run_id,conversation_id,conversation_uuid,stratum,sample_kind,experiment_key,"
+            "user_id,conversation_start,account_age_bucket,gold_status,variant,rubric_version,create_time) VALUES"
+            "(11,1,11,'c-11','1_turn','experiment','exp-a',42,'2026-09-30 09:00:00','new_0_7d','free','control',7,'2026-10-01 10:01:00'),"
+            "(12,1,11,'c-11','1_turn','experiment','exp-b',NULL,NULL,NULL,NULL,'treatment',8,'2026-10-01 10:02:00'); "
+            "UPDATE assistant_quality_verdicts SET sample_kind='experiment',experiment_key='exp-transition',note='to experiment' WHERE id=10; "
+            "UPDATE assistant_quality_verdicts SET experiment_key='',note='empty allowed' WHERE id=10; "
+            "UPDATE assistant_quality_verdicts SET sample_kind='random',experiment_key=NULL,note='back to random' WHERE id=10; "
+            "UPDATE assistant_quality_verdicts SET experiment_key='exp-b',dimensions='{\"score\": 2}',tags='[]',evidence='{}' WHERE id=12; "
+            "DELETE FROM assistant_quality_verdicts WHERE id=3;",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        after_replay = self.verdict_slot_snapshot(self.target)
+        if {key: value for key, value in after_replay.items() if key != "rows"} != {
+            key: value for key, value in post_crash.items() if key != "rows"
+        } or self.admin_query(self.target, ddl_count).strip() != "1":
+            raise HarnessError("crash reconciliation repeated or split atomic ALTER")
+        projection = "SELECT id,run_id,conversation_id,sample_kind,IFNULL(experiment_key,'<null>'),CONCAT('slot=',sample_slot),turns,user_frustration,had_canned_fallback,IFNULL(JSON_EXTRACT(dimensions,'$.score'),'<null>'),IFNULL(JSON_LENGTH(tags),'<null>'),IFNULL(JSON_EXTRACT(evidence,'$.quote'),'<null>'),DATE_FORMAT(create_time,'%Y-%m-%d %H:%i:%s'),IFNULL(note,'<null>') FROM assistant_quality_verdicts ORDER BY id;"
+        expected = (
+            "1\t1\t11\trandom\t<null>\tslot=\t1\t0\t0\t1\t1\t<null>\t2026-09-30 10:02:00\t<null>\n"
+            '2\t2\t11\trandom\t<null>\tslot=\t2\t0\t0\t<null>\t0\t"old"\t2026-09-30 10:03:00\t<null>\n'
+            "10\t1\t13\trandom\t<null>\tslot=\t0\t0\t0\t<null>\t<null>\t<null>\t2026-10-01 10:00:00\tback to random\n"
+            "11\t1\t11\texperiment\texp-a\tslot=exp-a\t0\t0\t0\t<null>\t<null>\t<null>\t2026-10-01 10:01:00\t<null>\n"
+            "12\t1\t11\texperiment\texp-b\tslot=exp-b\t0\t0\t0\t2\t0\t<null>\t2026-10-01 10:02:00\t<null>"
+        )
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, projection).strip()
+            if actual != expected:
+                raise HarnessError(
+                    f"verdict concrete projection differs at {endpoint.container}: {actual!r}"
+                )
+        if (
+            self.verdict_slot_snapshot(self.source)["rows"]
+            != self.verdict_slot_snapshot(self.target)["rows"]
+        ):
+            raise HarnessError("verdict complete rows differ after DML")
+        for endpoint in (self.source, self.target):
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "UPDATE assistant_quality_verdicts SET sample_kind='random',experiment_key=NULL WHERE id=11;",
+                "uk_run_slot_conversation",
+            )
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "UPDATE assistant_quality_verdicts SET experiment_key='exp-a' WHERE id=12;",
+                "Duplicate",
+            )
+        stable = self.verdict_slot_snapshot(self.target)
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        require_success(self.run_stream(start, stop), "verdict checkpointed restart")
+        if (
+            self.verdict_slot_snapshot(self.target) != stable
+            or self.journal_full_row(int(pending["event_start_position"])) != journal
+            or self.checkpoint() != checkpoint
+        ):
+            raise HarnessError("restart changed metadata/data/journal/checkpoint")
+        source_stable = self.verdict_slot_snapshot(self.source)
+        rerun_start = stop
+        self.source_sql_with_comments(
+            f"PREPARE harness_ddl FROM {sql_literal(ddl)}; EXECUTE harness_ddl; DEALLOCATE PREPARE harness_ddl;"
+        )
+        if self.verdict_slot_snapshot(self.source) != source_stable:
+            raise HarnessError("guarded exact source rerun changed metadata/data")
+        stop = self.coordinate()
+        require_success(
+            self.run_stream(rerun_start, stop), "verdict guarded final-state rerun"
+        )
+        if (
+            self.verdict_slot_snapshot(self.target) != stable
+            or self.admin_query(self.target, ddl_count).strip() != "1"
+        ):
+            raise HarnessError(
+                "guarded rerun emitted target ALTER or changed metadata/data"
+            )
+        events = self.admin_query(
+            self.target,
+            "SELECT status,raw_sql FROM cdc.ddl_replay_journal ORDER BY event_start_position;",
+        ).strip()
+        rows = self.admin_query(
+            self.target,
+            "SELECT COUNT(*),SUM(status='checkpointed'),SUM(raw_sql="
+            + sql_literal(ddl)
+            + ") FROM cdc.ddl_replay_journal;",
+        ).strip()
+        if (
+            rows != "2\t2\t2"
+            or self.journal_full_row(int(pending["event_start_position"])) != journal
+        ):
+            raise HarnessError(f"guarded rerun identity/journal differs: {events!r}")
+        final_checkpoint = self.checkpoint()
+        if (final_checkpoint["source_file"], final_checkpoint["source_position"]) != (
+            stop.file,
+            stop.position,
+        ):
+            raise HarnessError(
+                f"guarded rerun checkpoint differs: {final_checkpoint!r}"
+            )
+        print(
+            "assistant_verdict_slot_pending_replay_ok old_native_barrier=true atomic_alter=1 "
+            "crash_restart=true columns=26 checks=4 fks=2 check_matrix=9 null_kind_rejected=true "
+            "generated_updates=true following_dml=true guarded_rerun_noop=true production_grouping=true"
+        )
+
     def run_assistant_quality_pending_replay(self) -> None:
         """The mysqld-bin.003089 barrier: a pending assistant_quality_runs CREATE (integer
         display widths, column comments, JSON) followed by the verdicts CREATE with a RESTRICT
@@ -10638,6 +11140,8 @@ DELIMITER ;
             self.run_reader_memory_guarded_alter_pending_replay()
         elif scenario == "assistant-quality-pending-replay":
             self.run_assistant_quality_pending_replay()
+        elif scenario == "assistant-verdict-slot-pending-replay":
+            self.run_assistant_verdict_slot_pending_replay()
         elif scenario == "assistant-rec-experiments-create-pending-replay":
             self.run_assistant_rec_experiments_create_pending_replay()
         elif scenario == "assistant-rec-quality-create-pending-replay":

@@ -61,16 +61,43 @@ pub struct ParsedCreateColumnAst {
     pub collation: Option<String>,
     /// Column `COMMENT` literal; empty when the source declares none.
     pub comment: String,
-    pub generated: Option<ParsedStoredIfExpression>,
+    pub generated: Option<ParsedStoredGeneration>,
 }
 
-/// One predicate of a bounded CHECK constraint; predicates are joined with `OR`.
+/// A bounded CHECK predicate; legacy top-level disjunctions retain their list form.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CheckPredicate {
-    IsNull { column: String },
-    JsonValid { column: String },
-    OctetLengthAtMost { column: String, limit: u64 },
-    InStrings { column: String, values: Vec<String> },
+    IsNull {
+        column: String,
+    },
+    JsonValid {
+        column: String,
+    },
+    OctetLengthAtMost {
+        column: String,
+        limit: u64,
+    },
+    InStrings {
+        column: String,
+        values: Vec<String>,
+    },
+    StringEquals {
+        column: String,
+        value: String,
+    },
+    And {
+        left: Box<Self>,
+        right: Box<Self>,
+    },
+    Or {
+        left: Box<Self>,
+        right: Box<Self>,
+    },
+    /// Only equality between a string comparison and an IS NULL predicate is admitted.
+    BooleanEquals {
+        left: Box<Self>,
+        right: Box<Self>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,7 +146,7 @@ pub struct ParsedAddColumnAst {
     pub character_set: Option<String>,
     pub collation: Option<String>,
     /// Stored generation expression; `None` for an ordinary column.
-    pub generated: Option<ParsedStoredIfExpression>,
+    pub generated: Option<ParsedStoredGeneration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,6 +160,13 @@ pub enum GeneratedOperand {
 pub struct ParsedStoredIfExpression {
     pub equalities: Vec<(String, GeneratedOperand)>,
     pub then_value: u8,
+}
+
+/// Bounded stored expressions; never an arbitrary SQL expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsedStoredGeneration {
+    If(ParsedStoredIfExpression),
+    CoalesceEmpty { column: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

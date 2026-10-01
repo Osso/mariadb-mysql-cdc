@@ -2,7 +2,7 @@ use super::model::{
     ParsedAddColumnAst, ParsedAlterAlgorithm, ParsedAlterClause, ParsedAlterLock,
     ParsedAlterTableAst, ParsedColumnDefault, ParsedCreateColumnAst, ParsedCreateTableAst,
     ParsedDropColumnAst, ParsedDropIndexAst, ParsedIndexAst, ParsedIndexKeyPart,
-    ParsedStoredIfExpression,
+    ParsedStoredGeneration,
 };
 use super::tokenizer::{
     ddl_contains_comments, ddl_contains_comments_with_mode, split_leading_mysql_line_comments,
@@ -18,7 +18,9 @@ mod check_constraint;
 mod generated_column;
 mod observed_create;
 
-pub(crate) use check_constraint::{canonical_check_constraint_value, referenced_columns};
+pub(crate) use check_constraint::{
+    canonical_check_constraint_value, canonical_check_expression, referenced_columns,
+};
 
 pub(crate) fn mysql_check_expression(
     constraint: &super::model::ParsedCheckConstraintAst,
@@ -254,6 +256,16 @@ fn render_alter_table_with_target(
         let rendered = match clause {
             ParsedAlterClause::AlterColumnDefault { name, default } => {
                 render_target_column_default(&state, &ast.table, name, default.as_ref())?
+            }
+            ParsedAlterClause::AddColumn(column) if column.generated.is_some() => {
+                let table = state
+                    .inventory
+                    .tables
+                    .iter()
+                    .find(|table| table.name == ast.table)
+                    .ok_or_else(|| format!("ALTER TABLE target `{}` is missing", ast.table))?;
+                let bound = super::canonical::bind_generated_add_column(table, &ast.table, column)?;
+                render_production_alter_clause(&ParsedAlterClause::AddColumn(bound))
             }
             other => render_production_alter_clause(other),
         };
@@ -2476,17 +2488,21 @@ fn parse_optional_stored_generation(
     index: usize,
     literals: &mut impl Iterator<Item = String>,
     column_type: &str,
-) -> Result<(Option<ParsedStoredIfExpression>, usize), String> {
+) -> Result<(Option<ParsedStoredGeneration>, usize), String> {
     if !token_is_one_of(tokens, index, &["AS", "GENERATED"]) {
         return Ok((None, index));
     }
-    if column_type != "tinyint unsigned" {
-        return Err(format!(
-            "generated ADD COLUMN is unsupported for {column_type}"
-        ));
-    }
     let (expression, next) =
         generated_column::parse_stored_generation(tokens, quoted_flags, index, literals)?;
+    let compatible = match &expression {
+        ParsedStoredGeneration::If(_) => column_type == "tinyint unsigned",
+        ParsedStoredGeneration::CoalesceEmpty { .. } => column_type.starts_with("varchar("),
+    };
+    if !compatible {
+        return Err(format!(
+            "stored generation is unsupported for {column_type}"
+        ));
+    }
     Ok((Some(expression), next))
 }
 
