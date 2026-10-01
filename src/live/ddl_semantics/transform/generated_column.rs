@@ -2,8 +2,9 @@
 //
 // Admitted source form (MariaDB `PERSISTENT` or `STORED`, optional `GENERATED ALWAYS`):
 //   AS (IF(<column> = <operand> [AND <column> = <operand>]*, <0..255>, NULL)) PERSISTENT
-// Operands are canonical unsigned integers or string literals limited to [A-Za-z0-9_].
-use super::super::model::{GeneratedOperand, ParsedStoredIfExpression};
+//   VARCHAR(n) AS (COALESCE(<ordinary varchar column>, '')) PERSISTENT
+// IF operands are canonical unsigned integers or string literals limited to [A-Za-z0-9_].
+use super::super::model::{GeneratedOperand, ParsedStoredGeneration, ParsedStoredIfExpression};
 use super::{quote_identifier, require_identifier, tokens_match};
 
 /// Parses the generation clause starting at `index` and returns the index after
@@ -13,12 +14,62 @@ pub(super) fn parse_stored_generation(
     quoted: &[bool],
     mut index: usize,
     literals: &mut impl Iterator<Item = String>,
-) -> Result<(ParsedStoredIfExpression, usize), String> {
+) -> Result<(ParsedStoredGeneration, usize), String> {
     if is_keyword(tokens, quoted, index, "GENERATED") {
         require_keyword(tokens, quoted, index + 1, "ALWAYS")?;
         index += 2;
     }
-    for keyword in ["AS", "(", "IF", "("] {
+    for keyword in ["AS", "("] {
+        require_keyword(tokens, quoted, index, keyword)?;
+        index += 1;
+    }
+    let (expression, next) = if is_keyword(tokens, quoted, index, "COALESCE") {
+        parse_coalesce_empty(tokens, quoted, index, literals)?
+    } else {
+        parse_if(tokens, quoted, index, literals)?
+    };
+    require_keyword(tokens, quoted, next, ")")?;
+    let storage = next + 1;
+    if !is_keyword(tokens, quoted, storage, "PERSISTENT")
+        && !is_keyword(tokens, quoted, storage, "STORED")
+    {
+        return Err("generated column must be PERSISTENT or STORED".into());
+    }
+    Ok((expression, storage + 1))
+}
+
+fn parse_coalesce_empty(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(ParsedStoredGeneration, usize), String> {
+    for (offset, keyword) in [
+        (0, "COALESCE"),
+        (1, "("),
+        (3, ","),
+        (4, "<string>"),
+        (5, ")"),
+    ] {
+        require_keyword(tokens, quoted, index + offset, keyword)?;
+    }
+    let column = require_identifier(tokens, index + 2, "COALESCE column")?;
+    let literal = literals
+        .next()
+        .ok_or_else(|| "COALESCE literal is missing".to_string())?;
+    if !literal.is_empty() {
+        return Err("stored COALESCE admits only the empty literal".into());
+    }
+    Ok((ParsedStoredGeneration::CoalesceEmpty { column }, index + 6))
+}
+
+fn parse_if(
+    tokens: &[String],
+    quoted: &[bool],
+    mut index: usize,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(ParsedStoredGeneration, usize), String> {
+    for keyword in ["IF", "("] {
         require_keyword(tokens, quoted, index, keyword)?;
         index += 1;
     }
@@ -39,21 +90,16 @@ pub(super) fn parse_stored_generation(
     let then_value = u8::try_from(then_value)
         .map_err(|_| format!("generated IF value {then_value} exceeds TINYINT UNSIGNED"))?;
     index += 2;
-    for keyword in [",", "NULL", ")", ")"] {
+    for keyword in [",", "NULL", ")"] {
         require_keyword(tokens, quoted, index, keyword)?;
         index += 1;
     }
-    if !is_keyword(tokens, quoted, index, "PERSISTENT")
-        && !is_keyword(tokens, quoted, index, "STORED")
-    {
-        return Err("generated column must be PERSISTENT or STORED".into());
-    }
     Ok((
-        ParsedStoredIfExpression {
+        ParsedStoredGeneration::If(ParsedStoredIfExpression {
             equalities,
             then_value,
-        },
-        index + 1,
+        }),
+        index,
     ))
 }
 
@@ -97,7 +143,16 @@ fn parse_integer(tokens: &[String], quoted: &[bool], index: usize) -> Result<u64
 
 /// MySQL DDL for the expression; string literals carry an explicit `_utf8mb4` introducer so
 /// the stored expression does not depend on the connection character set.
-pub(super) fn render_generation_sql(expression: &ParsedStoredIfExpression) -> String {
+pub(super) fn render_generation_sql(expression: &ParsedStoredGeneration) -> String {
+    match expression {
+        ParsedStoredGeneration::If(expression) => render_if_sql(expression),
+        ParsedStoredGeneration::CoalesceEmpty { column } => {
+            format!("COALESCE({}, _utf8mb4'')", quote_identifier(column))
+        }
+    }
+}
+
+fn render_if_sql(expression: &ParsedStoredIfExpression) -> String {
     let condition = expression
         .equalities
         .iter()
@@ -113,8 +168,17 @@ pub(super) fn render_generation_sql(expression: &ParsedStoredIfExpression) -> St
     format!("IF({condition}, {}, NULL)", expression.then_value)
 }
 
-/// The `GENERATION_EXPRESSION` MySQL 8.4 reports for the rendered expression.
-pub(crate) fn mysql_generation_expression(expression: &ParsedStoredIfExpression) -> String {
+/// Modeled `GENERATION_EXPRESSION`; native COALESCE normalization needs server proof.
+pub(crate) fn mysql_generation_expression(expression: &ParsedStoredGeneration) -> String {
+    match expression {
+        ParsedStoredGeneration::If(expression) => mysql_if_expression(expression),
+        ParsedStoredGeneration::CoalesceEmpty { column } => {
+            format!("coalesce({},_utf8mb4\\'\\')", quote_identifier(column))
+        }
+    }
+}
+
+fn mysql_if_expression(expression: &ParsedStoredIfExpression) -> String {
     let predicates = expression
         .equalities
         .iter()
@@ -134,12 +198,15 @@ pub(crate) fn mysql_generation_expression(expression: &ParsedStoredIfExpression)
     format!("if({condition},{},NULL)", expression.then_value)
 }
 
-pub(crate) fn referenced_columns(expression: &ParsedStoredIfExpression) -> Vec<&str> {
-    expression
-        .equalities
-        .iter()
-        .map(|(column, _)| column.as_str())
-        .collect()
+pub(crate) fn referenced_columns(expression: &ParsedStoredGeneration) -> Vec<&str> {
+    match expression {
+        ParsedStoredGeneration::If(expression) => expression
+            .equalities
+            .iter()
+            .map(|(column, _)| column.as_str())
+            .collect(),
+        ParsedStoredGeneration::CoalesceEmpty { column } => vec![column.as_str()],
+    }
 }
 
 fn is_keyword(tokens: &[String], quoted: &[bool], index: usize, keyword: &str) -> bool {

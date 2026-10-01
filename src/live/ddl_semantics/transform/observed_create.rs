@@ -197,6 +197,9 @@ fn bind_generated_create_references(columns: &mut [ParsedCreateColumnAst]) -> Re
         let Some(expression) = &mut column.generated else {
             continue;
         };
+        let super::super::model::ParsedStoredGeneration::If(expression) = expression else {
+            return Err("stored COALESCE is modeled only for ALTER ADD COLUMN".into());
+        };
         for (reference, operand) in &mut expression.equalities {
             *reference =
                 bind_generated_create_reference(&declarations, &column.name, reference, operand)?;

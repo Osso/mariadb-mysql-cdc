@@ -156,6 +156,9 @@ fn generated_create_binds_reference_case_to_declared_columns() {
         .generated
         .as_ref()
         .unwrap();
+    let super::super::model::ParsedStoredGeneration::If(generated) = generated else {
+        panic!("expected stored IF expression");
+    };
     assert_eq!(generated.equalities[0].0, "status");
     assert_eq!(generated.equalities[1].0, "is_active");
     assert!(ast.columns.iter().any(|column| column.name == "status"));
