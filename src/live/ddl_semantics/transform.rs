@@ -2880,7 +2880,9 @@ fn parse_drop_alter_clause(
         Some(kind) if kind.eq_ignore_ascii_case("COLUMN") => {
             parse_drop_column_clause(tokens, index)
         }
-        Some(kind) if kind.eq_ignore_ascii_case("INDEX") => parse_drop_index_clause(tokens, index),
+        Some(kind) if kind.eq_ignore_ascii_case("INDEX") || kind.eq_ignore_ascii_case("KEY") => {
+            parse_drop_index_clause(tokens, index)
+        }
         actual => Err(format!("unsupported DROP ALTER TABLE clause {actual:?}")),
     }
 }
@@ -2910,7 +2912,9 @@ fn parse_drop_index_clause(
     tokens: &[String],
     index: usize,
 ) -> Result<(ParsedAlterClause, usize), String> {
-    require_keyword(tokens, index + 1, "INDEX")?;
+    if !token_is_one_of(tokens, index + 1, &["KEY", "INDEX"]) {
+        return Err("DROP key requires KEY or INDEX".into());
+    }
     let if_exists = tokens_match(tokens, index + 2, "IF");
     let name_index = if if_exists {
         require_keyword(tokens, index + 3, "EXISTS")?;
