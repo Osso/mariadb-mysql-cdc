@@ -194,9 +194,28 @@ fn parse_function_column(
     index: usize,
 ) -> Result<(String, usize), String> {
     require_unquoted_keyword(tokens, quoted, index + 1, "(")?;
-    let column = require_identifier(tokens, index + 2, "CHECK function column")?;
-    require_unquoted_keyword(tokens, quoted, index + 3, ")")?;
-    Ok((column, index + 4))
+    let (column, next) = parse_function_argument(tokens, quoted, index + 2)?;
+    require_unquoted_keyword(tokens, quoted, next, ")")?;
+    Ok((column, next + 1))
+}
+
+fn parse_function_argument(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+) -> Result<(String, usize), String> {
+    let mut position = index;
+    while tokens_match(tokens, position, "(") && !is_quoted(quoted, position) {
+        position += 1;
+    }
+    let column = require_identifier(tokens, position, "CHECK function column")?;
+    let parentheses = position - index;
+    position += 1;
+    for _ in 0..parentheses {
+        require_unquoted_keyword(tokens, quoted, position, ")")?;
+        position += 1;
+    }
+    Ok((column, position))
 }
 
 fn require_unquoted_keyword(
@@ -312,6 +331,50 @@ pub(crate) fn canonical_check_constraint_value(
         "name": constraint.name,
         "disjuncts": constraint.disjuncts.iter().map(canonical_predicate).collect::<Vec<_>>(),
     })
+}
+
+/// Structural CHECK metadata value, without its schema-wide constraint name.
+/// Redundant predicate parentheses do not change the value; operator grouping does.
+pub(crate) fn canonical_check_expression(clause: &str) -> Result<serde_json::Value, String> {
+    if super::ddl_contains_comments(clause) {
+        return Err("comments are unmodeled in CHECK metadata".to_string());
+    }
+    let sql = format!("CONSTRAINT metadata_check CHECK ({clause})");
+    let (tokens, quoted) = super::tokenize_ddl_with_quoted_flags(&sql)?;
+    let (tokens, quoted) = strip_metadata_introducers(&tokens, &quoted)?;
+    let mut literals = super::extract_single_quoted_literals_with_mode(
+        clause,
+        crate::live::query_charset_context::SourceSqlMode(Some(0)),
+    )?
+    .into_iter();
+    let (constraint, end) = parse_named_check(&tokens, &quoted, 0, &mut literals)?;
+    if end != tokens.len() || literals.next().is_some() {
+        return Err("unexpected trailing CHECK metadata".to_string());
+    }
+    let predicate = constraint
+        .disjuncts
+        .into_iter()
+        .reduce(|left, right| CheckPredicate::Or {
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+        .ok_or("empty CHECK metadata")?;
+    Ok(canonical_predicate(&predicate))
+}
+
+fn strip_metadata_introducers(
+    tokens: &[String],
+    quoted: &[bool],
+) -> Result<(Vec<String>, Vec<bool>), String> {
+    let mut retained = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if tokens_match(tokens, index, "_utf8mb4") && !is_quoted(quoted, index) {
+            require_unquoted_keyword(tokens, quoted, index + 1, "<string>")?;
+        } else {
+            retained.push((token.clone(), is_quoted(quoted, index)));
+        }
+    }
+    Ok(retained.into_iter().unzip())
 }
 
 fn canonical_predicate(predicate: &CheckPredicate) -> serde_json::Value {

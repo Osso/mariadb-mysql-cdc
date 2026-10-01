@@ -18,7 +18,9 @@ mod check_constraint;
 mod generated_column;
 mod observed_create;
 
-pub(crate) use check_constraint::{canonical_check_constraint_value, referenced_columns};
+pub(crate) use check_constraint::{
+    canonical_check_constraint_value, canonical_check_expression, referenced_columns,
+};
 pub(crate) use generated_column::{
     mysql_generation_expression, referenced_columns as generated_referenced_columns,
 };

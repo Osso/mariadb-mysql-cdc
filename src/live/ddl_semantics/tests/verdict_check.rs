@@ -115,3 +115,62 @@ fn verdict_check_rejects_unmodeled_and_malformed_expressions() {
         );
     }
 }
+
+#[test]
+fn verdict_check_metadata_equivalence_preserves_grouping_and_literal_case() {
+    use super::super::transform::canonical_check_expression;
+    let original = canonical_check_expression(EXPRESSION).unwrap();
+    let metadata = "((`sample_kind` in (_utf8mb4'random',_utf8mb4'experiment')) and ((`sample_kind` = _utf8mb4'random') = (`experiment_key` is null)))";
+    assert_eq!(canonical_check_expression(metadata).unwrap(), original);
+    assert_ne!(
+        canonical_check_expression(&metadata.replace("'random'", "'Random'")).unwrap(),
+        original
+    );
+    assert_ne!(
+        canonical_check_expression(&metadata.replace(" and ", " or ")).unwrap(),
+        original
+    );
+    assert_ne!(
+        canonical_check_expression(
+            "sample_kind='random' OR (sample_kind='experiment' AND experiment_key IS NULL)"
+        )
+        .unwrap(),
+        canonical_check_expression(
+            "(sample_kind='random' OR sample_kind='experiment') AND experiment_key IS NULL"
+        )
+        .unwrap()
+    );
+    for (sql, metadata) in [
+        ("JSON_VALID(payload)", "(((json_valid((`payload`)))))"),
+        (
+            "payload IS NULL OR JSON_VALID(payload)",
+            "((`payload` is null) or (json_valid(`payload`)))",
+        ),
+        (
+            "payload IS NULL OR OCTET_LENGTH(payload) <= 8192",
+            "((`payload` is null) or (octet_length(`payload`) <= 8192))",
+        ),
+        (
+            "status IN ('active','disabled')",
+            "((`status` in (_utf8mb4'active',_utf8mb4'disabled')))",
+        ),
+    ] {
+        assert_eq!(
+            canonical_check_expression(sql).unwrap(),
+            canonical_check_expression(metadata).unwrap(),
+            "{metadata}"
+        );
+    }
+    for metadata in [
+        "sample_kind = _latin1'random'",
+        "sample_kind = _utf8mb4 _utf8mb4'random'",
+        "sample_kind = 'random';",
+        "/* hidden */ sample_kind = 'random'",
+        "(sample_kind='random')=(experiment_key IS NULL) trailing",
+    ] {
+        assert!(
+            canonical_check_expression(metadata).is_err(),
+            "accepted {metadata}"
+        );
+    }
+}
