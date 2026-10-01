@@ -183,7 +183,9 @@ fn converts_enum_ordinals_to_metadata_strings() {
 
 #[test]
 fn experiments_create_enum_ordinals_preserve_declared_status_values() {
-    let labels = ["Draft", "running", "ended", "archived"].map(str::to_string);
+    let labels = ["Draft", "running", "ended", "archived"]
+        .map(str::to_string)
+        .to_vec();
     for (ordinal, expected) in [(1, "Draft"), (2, "running"), (3, "ended"), (4, "archived")] {
         assert_eq!(
             mysql_value_to_target_value(&Some(MySqlValue::Enum(ordinal)), false, Some(&labels))
