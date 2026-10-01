@@ -3827,10 +3827,9 @@ fn reader_memory_guarded_alter_is_a_proven_noop_when_everything_exists() {
 
 #[test]
 fn reader_memory_guarded_alter_rejects_unmodeled_variants() {
-    for sql in [READER_MEMORY_PROFILES_GUARDED_ALTER.replace(
+    let sql = READER_MEMORY_PROFILES_GUARDED_ALTER.replace(
         "(suggestions_started_at)",
         "(suggestions_started_at) USING HASH",
-    )] {
-        assert!(!supports_production_alter_table(&sql), "accepted {sql}");
-    }
+    );
+    assert!(!supports_production_alter_table(&sql), "accepted {sql}");
 }
