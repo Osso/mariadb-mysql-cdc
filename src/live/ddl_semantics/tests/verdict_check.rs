@@ -125,6 +125,11 @@ fn verdict_check_metadata_equivalence_preserves_grouping_and_literal_case() {
     let original = canonical_check_expression(EXPRESSION).unwrap();
     let metadata = "((`sample_kind` in (_utf8mb4'random',_utf8mb4'experiment')) and ((`sample_kind` = _utf8mb4'random') = (`experiment_key` is null)))";
     assert_eq!(canonical_check_expression(metadata).unwrap(), original);
+    let escaped_metadata = metadata.replace('\'', "\\'");
+    assert_eq!(
+        canonical_check_expression(&escaped_metadata).unwrap(),
+        original
+    );
     assert_ne!(
         canonical_check_expression(&metadata.replace("'random'", "'Random'")).unwrap(),
         original

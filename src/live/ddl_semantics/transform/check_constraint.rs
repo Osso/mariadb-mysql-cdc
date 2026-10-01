@@ -336,14 +336,16 @@ pub(crate) fn canonical_check_constraint_value(
 /// Structural CHECK metadata value, without its schema-wide constraint name.
 /// Redundant predicate parentheses do not change the value; operator grouping does.
 pub(crate) fn canonical_check_expression(clause: &str) -> Result<serde_json::Value, String> {
-    if super::ddl_contains_comments(clause) {
+    // MySQL CHECK_CLAUSE escapes quote delimiters; modeled literals contain no quotes.
+    let clause = clause.replace("\\'", "'");
+    if super::ddl_contains_comments(&clause) {
         return Err("comments are unmodeled in CHECK metadata".to_string());
     }
     let sql = format!("CONSTRAINT metadata_check CHECK ({clause})");
     let (tokens, quoted) = super::tokenize_ddl_with_quoted_flags(&sql)?;
     let (tokens, quoted) = strip_metadata_introducers(&tokens, &quoted)?;
     let mut literals = super::extract_single_quoted_literals_with_mode(
-        clause,
+        &clause,
         crate::live::query_charset_context::SourceSqlMode(Some(0)),
     )?
     .into_iter();
