@@ -5821,14 +5821,6 @@ DELIMITER ;
                 f"crash changed durable barrier: {prepared!r} {checkpoint!r}"
             )
         post_crash = self.verdict_slot_snapshot(self.target)
-        stop = self.replay_pending_add_column(start, pending)
-        if (
-            self.verdict_slot_snapshot(self.target) != post_crash
-            or self.admin_query(self.target, ddl_count).strip() != "1"
-        ):
-            raise HarnessError(
-                "crash reconciliation repeated or split atomic ALTER/data change"
-            )
         for endpoint in (self.source, self.target):
             self.assert_verdict_slot_metadata(endpoint, before[endpoint.container])
             original_names = [
@@ -5859,7 +5851,7 @@ DELIMITER ;
             if backfill != wanted:
                 raise HarnessError(f"existing rows were not backfilled: {backfill!r}")
         self.assert_verdict_slot_constraints()
-        dml_start = stop
+        # Queue following DML while CDC is down at its prepared journal barrier.
         self.admin_sql(
             self.source,
             "INSERT INTO assistant_quality_verdicts(id,run_id,conversation_id,conversation_uuid,stratum,create_time) "
@@ -5874,10 +5866,12 @@ DELIMITER ;
             "UPDATE assistant_quality_verdicts SET experiment_key='exp-b',dimensions='{\"score\": 2}',tags='[]',evidence='{}' WHERE id=12; "
             "DELETE FROM assistant_quality_verdicts WHERE id=3;",
         )
-        stop = self.coordinate()
-        require_success(
-            self.run_stream(dml_start, stop), "verdict following INSERT/UPDATE/DELETE"
-        )
+        stop = self.replay_pending_add_column(start, pending)
+        after_replay = self.verdict_slot_snapshot(self.target)
+        if {key: value for key, value in after_replay.items() if key != "rows"} != {
+            key: value for key, value in post_crash.items() if key != "rows"
+        } or self.admin_query(self.target, ddl_count).strip() != "1":
+            raise HarnessError("crash reconciliation repeated or split atomic ALTER")
         projection = "SELECT id,run_id,conversation_id,sample_kind,IFNULL(experiment_key,'<null>'),CONCAT('slot=',sample_slot),turns,user_frustration,had_canned_fallback,IFNULL(JSON_EXTRACT(dimensions,'$.score'),'<null>'),IFNULL(JSON_LENGTH(tags),'<null>'),IFNULL(JSON_EXTRACT(evidence,'$.quote'),'<null>'),DATE_FORMAT(create_time,'%Y-%m-%d %H:%i:%s'),IFNULL(note,'<null>') FROM assistant_quality_verdicts ORDER BY id;"
         expected = (
             "1\t1\t11\trandom\t<null>\tslot=\t1\t0\t0\t1\t1\t<null>\t2026-09-30 10:02:00\t<null>\n"
