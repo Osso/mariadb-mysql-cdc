@@ -159,6 +159,10 @@ fn verdict_check_metadata_equivalence_preserves_grouping_and_literal_case() {
             "((`payload` is null) or (octet_length(`payload`) <= 8192))",
         ),
         (
+            "payload IS NULL OR OCTET_LENGTH(payload) <= 1048576",
+            "((`payload` is null) or (length(`payload`) <= 1048576))",
+        ),
+        (
             "status IN ('active','disabled')",
             "((`status` in (_utf8mb4'active',_utf8mb4'disabled')))",
         ),
@@ -170,6 +174,7 @@ fn verdict_check_metadata_equivalence_preserves_grouping_and_literal_case() {
         );
     }
     for metadata in [
+        "CHAR_LENGTH(payload) <= 1048576",
         "sample_kind = _latin1'random'",
         "sample_kind = _utf8mb4 _utf8mb4'random'",
         "sample_kind = 'random';",

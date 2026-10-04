@@ -64,6 +64,8 @@ statement adds nullable `evaluation_context_json MEDIUMTEXT` and nullable
 CHECKs: payload IS NULL OR JSON_VALID(payload), and payload IS NULL OR
 OCTET_LENGTH(payload) <= 1048576. Preserve both columns, microsecond precision,
 index, nullable CHECK semantics, byte limit, and one atomic ALTER.
+MySQL CHECK metadata `LENGTH(column)` normalizes to the modeled byte-counting
+`OCTET_LENGTH(column)`; character-counting `CHAR_LENGTH` remains unsupported.
 
 Source options are typed `ParsedAlterAlgorithm::Copy` and
 `ParsedAlterLock::Shared`; canonical evidence retains `copy`/`shared`, and normal

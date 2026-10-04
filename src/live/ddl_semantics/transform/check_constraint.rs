@@ -343,7 +343,7 @@ pub(crate) fn canonical_check_expression(clause: &str) -> Result<serde_json::Val
     }
     let sql = format!("CONSTRAINT metadata_check CHECK ({clause})");
     let (tokens, quoted) = super::tokenize_ddl_with_quoted_flags(&sql)?;
-    let (tokens, quoted) = strip_metadata_introducers(&tokens, &quoted)?;
+    let (tokens, quoted) = normalize_metadata_tokens(&tokens, &quoted)?;
     let mut literals = super::extract_single_quoted_literals_with_mode(
         &clause,
         crate::live::query_charset_context::SourceSqlMode(Some(0)),
@@ -364,17 +364,27 @@ pub(crate) fn canonical_check_expression(clause: &str) -> Result<serde_json::Val
     Ok(canonical_predicate(&predicate))
 }
 
-fn strip_metadata_introducers(
+fn normalize_metadata_tokens(
     tokens: &[String],
     quoted: &[bool],
 ) -> Result<(Vec<String>, Vec<bool>), String> {
     let mut retained = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
-        if tokens_match(tokens, index, "_utf8mb4") && !is_quoted(quoted, index) {
+        let quoted_token = is_quoted(quoted, index);
+        if tokens_match(tokens, index, "_utf8mb4") && !quoted_token {
             require_unquoted_keyword(tokens, quoted, index + 1, "<string>")?;
-        } else {
-            retained.push((token.clone(), is_quoted(quoted, index)));
+            continue;
         }
+        // MySQL reports source OCTET_LENGTH as its byte-counting LENGTH alias.
+        let normalized = if !quoted_token
+            && token.eq_ignore_ascii_case("LENGTH")
+            && tokens_match(tokens, index + 1, "(")
+        {
+            "OCTET_LENGTH".to_string()
+        } else {
+            token.clone()
+        };
+        retained.push((normalized, quoted_token));
     }
     Ok(retained.into_iter().unzip())
 }
