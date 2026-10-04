@@ -72,11 +72,19 @@ fn supports_parsed_production_alter(ast: &ParsedAlterTableAst) -> bool {
 }
 
 fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
-    ((ast.algorithm.is_none() && ast.lock.is_none())
-        || (ast.algorithm == Some(ParsedAlterAlgorithm::Inplace)
-            && ast.lock == Some(ParsedAlterLock::None))
-        || (ast.algorithm == Some(ParsedAlterAlgorithm::Copy)
-            && ast.lock == Some(ParsedAlterLock::Shared)))
+    let supported_options = matches!(
+        (ast.algorithm, ast.lock),
+        (None, None)
+            | (
+                Some(ParsedAlterAlgorithm::Inplace),
+                Some(ParsedAlterLock::None)
+            )
+            | (
+                Some(ParsedAlterAlgorithm::Copy),
+                Some(ParsedAlterLock::Shared)
+            )
+    );
+    supported_options
         && ast.clauses.iter().all(|clause| match clause {
             ParsedAlterClause::AddColumn(_) => true,
             ParsedAlterClause::AddKey { .. }

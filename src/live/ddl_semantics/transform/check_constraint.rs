@@ -376,10 +376,9 @@ fn normalize_metadata_tokens(
             continue;
         }
         // MySQL reports source OCTET_LENGTH as its byte-counting LENGTH alias.
-        let normalized = if !quoted_token
-            && token.eq_ignore_ascii_case("LENGTH")
-            && tokens_match(tokens, index + 1, "(")
-        {
+        let is_length_function =
+            token.eq_ignore_ascii_case("LENGTH") && tokens_match(tokens, index + 1, "(");
+        let normalized = if !quoted_token && is_length_function {
             "OCTET_LENGTH".to_string()
         } else {
             token.clone()
