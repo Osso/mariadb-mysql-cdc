@@ -3,6 +3,7 @@ mod basic_ddl;
 mod bigint_auto_increment;
 mod coalesce_generation;
 mod column_operations;
+mod copy_shared;
 
 mod json_add;
 mod json_create;

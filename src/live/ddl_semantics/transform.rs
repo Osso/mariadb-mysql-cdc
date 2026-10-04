@@ -74,7 +74,9 @@ fn supports_parsed_production_alter(ast: &ParsedAlterTableAst) -> bool {
 fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
     ((ast.algorithm.is_none() && ast.lock.is_none())
         || (ast.algorithm == Some(ParsedAlterAlgorithm::Inplace)
-            && ast.lock == Some(ParsedAlterLock::None)))
+            && ast.lock == Some(ParsedAlterLock::None))
+        || (ast.algorithm == Some(ParsedAlterAlgorithm::Copy)
+            && ast.lock == Some(ParsedAlterLock::Shared)))
         && ast.clauses.iter().all(|clause| match clause {
             ParsedAlterClause::AddColumn(_) => true,
             ParsedAlterClause::AddKey { .. }
@@ -2119,6 +2121,7 @@ fn parse_alter_options(
     let algorithm = match tokens.get(index + 2).map(String::as_str) {
         Some(value) if value.eq_ignore_ascii_case("INSTANT") => ParsedAlterAlgorithm::Instant,
         Some(value) if value.eq_ignore_ascii_case("INPLACE") => ParsedAlterAlgorithm::Inplace,
+        Some(value) if value.eq_ignore_ascii_case("COPY") => ParsedAlterAlgorithm::Copy,
         actual => return Err(format!("unsupported ALTER TABLE algorithm {actual:?}")),
     };
     let next_index = index + 3;
@@ -2128,11 +2131,15 @@ fn parse_alter_options(
     require_keyword(tokens, next_index, ",")?;
     require_keyword(tokens, next_index + 1, "LOCK")?;
     require_keyword(tokens, next_index + 2, "=")?;
-    require_keyword(tokens, next_index + 3, "NONE")?;
+    let lock = match tokens.get(next_index + 3).map(String::as_str) {
+        Some(value) if value.eq_ignore_ascii_case("NONE") => ParsedAlterLock::None,
+        Some(value) if value.eq_ignore_ascii_case("SHARED") => ParsedAlterLock::Shared,
+        actual => return Err(format!("unsupported ALTER TABLE lock {actual:?}")),
+    };
     if next_index + 4 != tokens.len() {
         return Err("ALTER TABLE options must be final".to_string());
     }
-    Ok(Some((Some(algorithm), Some(ParsedAlterLock::None))))
+    Ok(Some((Some(algorithm), Some(lock))))
 }
 
 fn require_alter_clauses(

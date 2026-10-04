@@ -185,6 +185,7 @@ pub struct ParsedDropIndexAst {
 pub enum ParsedAlterAlgorithm {
     Inplace,
     Instant,
+    Copy,
 }
 
 impl ParsedAlterAlgorithm {
@@ -192,6 +193,7 @@ impl ParsedAlterAlgorithm {
         match self {
             Self::Inplace => "inplace",
             Self::Instant => "instant",
+            Self::Copy => "copy",
         }
     }
 }
@@ -199,12 +201,14 @@ impl ParsedAlterAlgorithm {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParsedAlterLock {
     None,
+    Shared,
 }
 
 impl ParsedAlterLock {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::Shared => "shared",
         }
     }
 }
