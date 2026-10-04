@@ -1,0 +1,23 @@
+CREATE TABLE `reader_memory_operations` (
+  `uuid` char(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `user_id` int(10) unsigned NOT NULL,
+  `source_message_id` bigint(20) unsigned NOT NULL,
+  `status` varchar(24) NOT NULL DEFAULT 'pending',
+  `attempts` smallint(5) unsigned NOT NULL DEFAULT 0,
+  `lease_token` char(36) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+  `lease_until` datetime(6) DEFAULT NULL,
+  `dispatch_after` datetime(6) DEFAULT NULL,
+  `started_at` datetime(6) DEFAULT NULL,
+  `expected_revision` bigint(20) unsigned DEFAULT NULL,
+  `expected_epoch` bigint(20) unsigned DEFAULT NULL,
+  `error_code` varchar(48) DEFAULT NULL,
+  `created_at` datetime(6) NOT NULL DEFAULT current_timestamp(6),
+  `updated_at` datetime(6) NOT NULL DEFAULT current_timestamp(6) ON UPDATE current_timestamp(6),
+  `batch_uuid` char(36) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+  PRIMARY KEY (`uuid`),
+  UNIQUE KEY `reader_memory_source` (`user_id`,`source_message_id`),
+  KEY `reader_memory_dispatch` (`status`,`lease_until`,`created_at`),
+  KEY `reader_memory_started` (`started_at`),
+  KEY `reader_memory_operations_owner` (`user_id`,`status`),
+  KEY `reader_memory_batch` (`batch_uuid`,`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

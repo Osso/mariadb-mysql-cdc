@@ -105,6 +105,7 @@ SCENARIOS = (
     ScenarioSpec("audit-turn-attribution-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
+    ScenarioSpec("reader-memory-evaluation-copy-shared-pending-replay", True),
     ScenarioSpec("assistant-quality-pending-replay", True),
     ScenarioSpec("assistant-verdict-slot-pending-replay", True),
     ScenarioSpec("assistant-rec-experiments-create-pending-replay", True),
@@ -200,6 +201,7 @@ def default_scenarios() -> list[str]:
             "recsys-rail-create-pending-replay",
             "assistant-rec-experiments-create-pending-replay",
             "assistant-verdict-slot-pending-replay",
+            "reader-memory-evaluation-copy-shared-pending-replay",
             "assistant-rec-quality-create-pending-replay",
             "assistant-rec-quality-create-mixed-case-pending-replay",
             "contributor-cards-check-collision-recovery",
@@ -5773,6 +5775,391 @@ DELIMITER ;
             if cascaded != "0":
                 raise HarnessError(f"conversation FK did not cascade: {cascaded!r}")
 
+    READER_EVALUATION_COLUMNS = (
+        "uuid",
+        "user_id",
+        "source_message_id",
+        "status",
+        "attempts",
+        "lease_token",
+        "lease_until",
+        "dispatch_after",
+        "started_at",
+        "expected_revision",
+        "expected_epoch",
+        "error_code",
+        "created_at",
+        "updated_at",
+        "batch_uuid",
+    )
+    READER_EVALUATION_UUIDS = tuple(
+        f"10000000-0000-4000-8000-{number:012d}" for number in range(1, 7)
+    )
+
+    def reader_evaluation_snapshot(self, endpoint: Endpoint) -> dict[str, str]:
+        table_filter = (
+            "TABLE_SCHEMA=DATABASE() AND TABLE_NAME='reader_memory_operations'"
+        )
+        queries = {
+            "columns": "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,IFNULL(COLUMN_DEFAULT,'<null>'),"
+            "EXTRA,IFNULL(CHARACTER_SET_NAME,''),IFNULL(COLLATION_NAME,''),"
+            "IFNULL(DATETIME_PRECISION,''),ORDINAL_POSITION FROM information_schema.COLUMNS "
+            f"WHERE {table_filter} ORDER BY ORDINAL_POSITION;",
+            "indexes": "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME,INDEX_TYPE "
+            f"FROM information_schema.STATISTICS WHERE {table_filter} ORDER BY INDEX_NAME,SEQ_IN_INDEX;",
+            "checks": "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS "
+            f"WHERE {table_filter} AND CONSTRAINT_TYPE='CHECK' ORDER BY CONSTRAINT_NAME;",
+            "create": "SHOW CREATE TABLE reader_memory_operations;",
+            "rows": "SELECT "
+            + ",".join(self.READER_EVALUATION_COLUMNS)
+            + " FROM reader_memory_operations ORDER BY uuid;",
+        }
+        return {
+            key: self.admin_query(endpoint, sql).strip() for key, sql in queries.items()
+        }
+
+    def prepare_reader_evaluation_schema(self) -> None:
+        assert self.source and self.target
+        first, second, third = self.READER_EVALUATION_UUIDS[:3]
+        seed = (
+            "INSERT INTO reader_memory_operations ("
+            + ",".join(self.READER_EVALUATION_COLUMNS)
+            + ") VALUES "
+            f"('{first}',41,901,'pending',0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,"
+            "'2026-10-01 10:01:02.123456','2026-10-01 11:02:03.654321',NULL),"
+            f"('{second}',42,902,'running',3,'20000000-0000-4000-8000-000000000002',"
+            "'2026-10-01 12:03:04.123456','2026-10-01 12:04:05.234567',"
+            "'2026-10-01 12:05:06.345678',17,23,'retry',"
+            "'2026-10-01 10:02:03.456789','2026-10-01 11:03:04.567890',"
+            "'30000000-0000-4000-8000-000000000002'),"
+            f"('{third}',43,903,'failed',2,NULL,NULL,'2026-10-01 13:06:07.987654',"
+            "NULL,0,NULL,'transient','2026-10-01 10:03:04.111111',"
+            "'2026-10-01 11:04:05.222222','30000000-0000-4000-8000-000000000003');"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql_file(
+                endpoint,
+                self.repo
+                / "fixtures/ddl/create-reader-memory-operations-evaluation-pre.sql",
+            )
+            self.admin_sql(endpoint, seed)
+            snapshot = self.reader_evaluation_snapshot(endpoint)
+            names = tuple(
+                line.split("\t")[0] for line in snapshot["columns"].splitlines()
+            )
+            if (
+                names != self.READER_EVALUATION_COLUMNS
+                or len(snapshot["rows"].splitlines()) != 3
+            ):
+                raise HarnessError(
+                    f"reader evaluation pre-schema/seed mismatch: {snapshot!r}"
+                )
+        if (
+            self.reader_evaluation_snapshot(self.source)["rows"]
+            != self.reader_evaluation_snapshot(self.target)["rows"]
+        ):
+            raise HarnessError("reader evaluation initial rows differ")
+
+    def assert_reader_evaluation_metadata(
+        self, endpoint: Endpoint, before: dict[str, str]
+    ) -> None:
+        after = self.reader_evaluation_snapshot(endpoint)
+        columns = after["columns"].splitlines()
+        if len(columns) != 17 or "\n".join(columns[:15]) != before["columns"]:
+            raise HarnessError(
+                f"reader evaluation changed old column metadata: {columns!r}"
+            )
+        wanted_new = (
+            "evaluation_context_json\tmediumtext\tYES\t",
+            "evaluation_context_expires_at\tdatetime(6)\tYES\t",
+        )
+        for actual, prefix in zip(columns[15:], wanted_new):
+            parts = actual.split("\t")
+            if (
+                not actual.startswith(prefix)
+                or parts[3] not in ("NULL", "<null>")
+                or parts[4] != ""
+                or (parts[0] == "evaluation_context_expires_at" and parts[7] != "6")
+            ):
+                raise HarnessError(f"reader evaluation new column metadata: {actual!r}")
+        indexes = after["indexes"].splitlines()
+        retention = "reader_memory_evaluation_retention\t1\t1\tevaluation_context_expires_at\tBTREE"
+        if (
+            retention not in indexes
+            or "\n".join(line for line in indexes if line != retention)
+            != before["indexes"]
+        ):
+            raise HarnessError(
+                f"reader evaluation changed indexes/unique identity: {indexes!r}"
+            )
+        expected_checks = "reader_memory_evaluation_context_json\nreader_memory_evaluation_context_size"
+        if after["checks"] != expected_checks:
+            raise HarnessError(
+                f"reader evaluation CHECK names differ: {after['checks']!r}"
+            )
+        if endpoint == self.target:
+            enforced = self.admin_query(
+                endpoint,
+                "SELECT CONSTRAINT_NAME,ENFORCED FROM information_schema.TABLE_CONSTRAINTS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='reader_memory_operations' "
+                "AND CONSTRAINT_TYPE='CHECK' ORDER BY CONSTRAINT_NAME;",
+            ).strip()
+            if enforced != expected_checks.replace("\n", "\tYES\n") + "\tYES":
+                raise HarnessError(
+                    f"reader evaluation target CHECKs not enforced: {enforced!r}"
+                )
+
+    def assert_reader_evaluation_boundaries(self, endpoint: Endpoint) -> None:
+        import hashlib
+
+        uuid = "90000000-0000-4000-8000-000000000001"
+        ascii_json = "CONCAT(CHAR(34),REPEAT('a',1048574),CHAR(34))"
+        emoji_json = "CONCAT(CHAR(34),REPEAT(CONVERT(0xF09F9880 USING utf8mb4),262143),'ab',CHAR(34))"
+        accepted = (
+            ("NULL", "NULL\tNULL\tNULL"),
+            ("'null'", "4\t4\t" + hashlib.sha256(b"null").hexdigest()),
+            (
+                ascii_json,
+                "1048576\t1048576\t"
+                + hashlib.sha256(('"' + "a" * 1048574 + '"').encode()).hexdigest(),
+            ),
+            (
+                emoji_json,
+                "1048576\t262147\t"
+                + hashlib.sha256(
+                    ('"' + "\U0001f600" * 262143 + 'ab"').encode()
+                ).hexdigest(),
+            ),
+        )
+        for expression, expected in accepted:
+            result = self.admin_query(
+                endpoint,
+                "SET NAMES utf8mb4; START TRANSACTION; "
+                "INSERT INTO reader_memory_operations(uuid,user_id,source_message_id,evaluation_context_json) "
+                f"VALUES('{uuid}',99,999,{expression}); "
+                "SELECT OCTET_LENGTH(evaluation_context_json),CHAR_LENGTH(evaluation_context_json),"
+                f"SHA2(evaluation_context_json,256) FROM reader_memory_operations WHERE uuid='{uuid}'; ROLLBACK;",
+            ).strip()
+            if result != expected:
+                raise HarnessError(
+                    f"reader evaluation boundary {expression}: {result!r} != {expected!r}"
+                )
+        rejected = (
+            ("'not-json'", "reader_memory_evaluation_context_json"),
+            (
+                "CONCAT(CHAR(34),REPEAT('a',1048575),CHAR(34))",
+                "reader_memory_evaluation_context_size",
+            ),
+            (
+                "CONCAT(CHAR(34),REPEAT(CONVERT(0xF09F9880 USING utf8mb4),262143),'abc',CHAR(34))",
+                "reader_memory_evaluation_context_size",
+            ),
+        )
+        for expression, constraint in rejected:
+            self.assert_admin_sql_rejected(
+                endpoint,
+                "SET NAMES utf8mb4; INSERT INTO reader_memory_operations"
+                f"(uuid,user_id,source_message_id,evaluation_context_json) VALUES('{uuid}',99,999,{expression});",
+                constraint,
+            )
+        self.assert_admin_sql_rejected(
+            endpoint,
+            f"INSERT INTO reader_memory_operations(uuid,user_id,source_message_id) VALUES('{uuid}',41,901);",
+            "reader_memory_source",
+        )
+        defaults = self.admin_query(
+            endpoint,
+            "START TRANSACTION; SET @before=NOW(6); "
+            "INSERT INTO reader_memory_operations(uuid,user_id,source_message_id) "
+            f"VALUES('{uuid}',99,999); "
+            "SELECT status,attempts,lease_token IS NULL,batch_uuid IS NULL,"
+            "evaluation_context_json IS NULL,evaluation_context_expires_at IS NULL,"
+            "created_at BETWEEN @before AND NOW(6),updated_at=created_at "
+            f"FROM reader_memory_operations WHERE uuid='{uuid}'; "
+            f"UPDATE reader_memory_operations SET attempts=1,updated_at='2000-01-01 00:00:00.123456' WHERE uuid='{uuid}'; "
+            f"UPDATE reader_memory_operations SET attempts=2 WHERE uuid='{uuid}'; "
+            "SELECT updated_at BETWEEN @before AND NOW(6) "
+            f"FROM reader_memory_operations WHERE uuid='{uuid}'; ROLLBACK;",
+        ).strip()
+        if defaults != "pending\t0\t1\t1\t1\t1\t1\t1\n1":
+            raise HarnessError(
+                f"reader evaluation defaults/on-update failed: {defaults!r}"
+            )
+
+    def run_reader_memory_evaluation_copy_shared_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError("reader memory evaluation replay requires --old-binary")
+        if self.binary is None or not self.binary.is_file():
+            raise HarnessError("reader memory evaluation replay requires --binary")
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
+        self.prepare_reader_evaluation_schema()
+        before = {
+            e.container: self.reader_evaluation_snapshot(e)
+            for e in (self.source, self.target)
+        }
+        ddl = (
+            (self.repo / "fixtures/ddl/alter-reader-memory-evaluation-context.sql")
+            .read_text()
+            .strip()
+        )
+        self.reset_target_general_log()
+        self.admin_sql(
+            self.source,
+            "SET GLOBAL general_log=OFF; TRUNCATE TABLE mysql.general_log; "
+            "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;",
+        )
+        self.write_checkpoint(self.coordinate())
+        initial_checkpoint = self.checkpoint()
+        start, pending = self.prepare_pending_add_column(
+            "", ddl, prepared=True, old_binary=self.old_binary
+        )
+        if self.checkpoint() != initial_checkpoint:
+            raise HarnessError("old binary changed reader evaluation checkpoint")
+        if (
+            self.reader_evaluation_snapshot(self.target)
+            != before[self.target.container]
+        ):
+            raise HarnessError(
+                "old binary changed reader evaluation target pre-schema/data"
+            )
+        alter_filter = (
+            "command_type IN ('Query','Execute') AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'alter table %' "
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%reader_memory_operations%'"
+        )
+        count_sql = (
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' AND "
+            + alter_filter
+            + ";"
+        )
+        source_execution = self.admin_query(
+            self.source,
+            "SELECT argument FROM mysql.general_log WHERE " + alter_filter + ";",
+        ).strip()
+        if source_execution != ddl:
+            raise HarnessError(
+                f"source did not execute exact explicit COPY/SHARED ALTER: {source_execution!r}"
+            )
+        if self.admin_query(self.target, count_sql).strip() != "0":
+            raise HarnessError("old binary executed a target ALTER")
+        crashed = self.run_stream(
+            start,
+            self.coordinate(),
+            integration_failpoint="post-ddl-pre-applied",
+            binary=self.binary,
+        )
+        if (
+            crashed.returncode == 0
+            or "cdc_integration_failpoint" not in crashed.stdout + crashed.stderr
+        ):
+            raise HarnessError(
+                f"reader evaluation post-DDL failpoint did not fire: {crashed!r}"
+            )
+        prepared = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        if prepared["status"] != "prepared" or (
+            checkpoint["source_file"],
+            checkpoint["source_position"],
+        ) != (start.file, start.position):
+            raise HarnessError(
+                f"reader evaluation crash lost barrier: {prepared!r} {checkpoint!r}"
+            )
+        for endpoint in (self.source, self.target):
+            self.assert_reader_evaluation_metadata(endpoint, before[endpoint.container])
+            if (
+                self.reader_evaluation_snapshot(endpoint)["rows"]
+                != before[endpoint.container]["rows"]
+            ):
+                raise HarnessError("reader evaluation ALTER changed old rows")
+            backfill = self.admin_query(
+                endpoint,
+                "SELECT COUNT(*) FROM reader_memory_operations WHERE evaluation_context_json IS NULL AND evaluation_context_expires_at IS NULL;",
+            ).strip()
+            if backfill != "3":
+                raise HarnessError(
+                    f"reader evaluation NULL backfill failed: {backfill!r}"
+                )
+            self.assert_reader_evaluation_boundaries(endpoint)
+        executions = self.admin_query(
+            self.target,
+            "SELECT argument FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' AND "
+            + alter_filter
+            + ";",
+        ).strip()
+        if (
+            self.admin_query(self.target, count_sql).strip() != "1"
+            or not re.search(r"ALGORITHM\s*=\s*COPY", executions, re.IGNORECASE)
+            or not re.search(r"LOCK\s*=\s*SHARED", executions, re.IGNORECASE)
+        ):
+            raise HarnessError(
+                f"target did not execute one explicit COPY/SHARED ALTER: {executions!r}"
+            )
+        first, second, third, fourth, fifth, sixth = self.READER_EVALUATION_UUIDS
+        self.admin_sql(
+            self.source,
+            "INSERT INTO reader_memory_operations(uuid,user_id,source_message_id,evaluation_context_json,evaluation_context_expires_at,created_at,updated_at) VALUES"
+            f"('{fourth}',44,904,NULL,NULL,'2026-10-02 10:11:12.123456','2026-10-02 11:12:13.234567'),"
+            f"('{fifth}',45,905,'null','2026-10-03 12:13:14.987654','2026-10-02 10:12:13.345678','2026-10-02 11:13:14.456789'); "
+            "INSERT INTO reader_memory_operations(uuid,user_id,source_message_id,evaluation_context_json,evaluation_context_expires_at,created_at,updated_at) VALUES"
+            f"('{sixth}',46,906,CONCAT(CHAR(34),REPEAT('a',1048574),CHAR(34)),'2026-10-04 12:14:15.654321','2026-10-02 10:13:14.567890','2026-10-02 11:14:15.678901'); "
+            "UPDATE reader_memory_operations SET evaluation_context_json='{\"score\":7}',"
+            "evaluation_context_expires_at='2026-10-05 13:14:15.123456',updated_at='2026-10-02 12:15:16.789012' "
+            f"WHERE uuid='{second}'; DELETE FROM reader_memory_operations WHERE uuid='{third}';",
+        )
+        stop = self.replay_pending_add_column(start, pending)
+        import hashlib
+
+        score_digest = hashlib.sha256(b'{"score":7}').hexdigest()
+        digest = hashlib.sha256(('"' + "a" * 1048574 + '"').encode()).hexdigest()
+        projection = (
+            "SELECT uuid,status,attempts,OCTET_LENGTH(evaluation_context_json),"
+            "SHA2(evaluation_context_json,256),evaluation_context_expires_at "
+            "FROM reader_memory_operations ORDER BY uuid;"
+        )
+        expected = "\n".join(
+            (
+                f"{first}\tpending\t0\tNULL\tNULL\tNULL",
+                f"{second}\trunning\t3\t11\t{score_digest}\t2026-10-05 13:14:15.123456",
+                f"{fourth}\tpending\t0\tNULL\tNULL\tNULL",
+                f"{fifth}\tpending\t0\t4\t{hashlib.sha256(b'null').hexdigest()}\t2026-10-03 12:13:14.987654",
+                f"{sixth}\tpending\t0\t1048576\t{digest}\t2026-10-04 12:14:15.654321",
+            )
+        )
+        for endpoint in (self.source, self.target):
+            self.assert_reader_evaluation_metadata(endpoint, before[endpoint.container])
+            actual = self.admin_query(endpoint, projection).strip()
+            if actual != expected:
+                raise HarnessError(
+                    f"reader evaluation queued DML differs at {endpoint.container}: {actual!r}"
+                )
+        final = self.reader_evaluation_snapshot(self.target)
+        if final["rows"] != self.reader_evaluation_snapshot(self.source)["rows"]:
+            raise HarnessError(
+                "reader evaluation complete old fields differ after queued DML"
+            )
+        old_rows = before[self.target.container]["rows"].splitlines()
+        expected_updated = old_rows[1].split("\t")
+        expected_updated[13] = "2026-10-02 12:15:16.789012"
+        if final["rows"].splitlines()[:2] != [old_rows[0], "\t".join(expected_updated)]:
+            raise HarnessError("reader evaluation changed unrelated original fields")
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        require_success(
+            self.run_stream(start, stop, binary=self.binary),
+            "reader evaluation checkpointed restart",
+        )
+        if (
+            self.reader_evaluation_snapshot(self.target) != final
+            or self.journal_full_row(int(pending["event_start_position"])) != journal
+            or self.checkpoint() != checkpoint
+            or self.admin_query(self.target, count_sql).strip() != "1"
+        ):
+            raise HarnessError(
+                "reader evaluation restart changed schema/data/journal/checkpoint or repeated ALTER"
+            )
+        print(
+            "reader_memory_evaluation_copy_shared_pending_replay_ok old_binary_pending=true columns=17 atomic_alter=1 explicit_copy_shared=true enforced_checks=2 original_metadata=true nullable_backfill=true byte_boundaries=true utf8_four_byte=true queued_1mb_row=true queued_insert_update_delete=true restart_noop=true production_grouping=100/200ms"
+        )
     def run_assistant_verdict_slot_pending_replay(self) -> None:
         assert self.source and self.target
         if self.old_binary is None or not self.old_binary.is_file():
@@ -11136,6 +11523,8 @@ DELIMITER ;
             self.run_reader_memory_create_pending_replay()
         elif scenario == "reader-memory-guarded-alter-pending-replay":
             self.run_reader_memory_guarded_alter_pending_replay()
+        elif scenario == "reader-memory-evaluation-copy-shared-pending-replay":
+            self.run_reader_memory_evaluation_copy_shared_pending_replay()
         elif scenario == "assistant-quality-pending-replay":
             self.run_assistant_quality_pending_replay()
         elif scenario == "assistant-verdict-slot-pending-replay":
