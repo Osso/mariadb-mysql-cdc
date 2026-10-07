@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 const SMALL_INT_BIT_PATTERN: u16 = 64_872;
 
@@ -214,4 +215,95 @@ fn rejects_enum_ordinals_outside_metadata() {
         .to_string();
 
     assert!(error.contains("enum ordinal 2 exceeds 1 metadata values"));
+}
+
+#[test]
+fn string_family_row_payloads_reach_target_without_byte_replacement() {
+    let payloads = [
+        Vec::new(),
+        vec![0xff],
+        vec![0xfe],
+        vec![0, 0xff, 0],
+        b"ascii\0padding\0".to_vec(),
+        "café 日本語".as_bytes().to_vec(),
+    ];
+    // STRING metadata encodes the actual type as well as the maximum length.
+    for (column_type, metadata, wide_length) in [
+        (254, 0xfeff, false),
+        (254, 0xee00, true),
+        (15, 255, false),
+        (15, 256, true),
+        (253, 255, false),
+        (253, 256, true),
+    ] {
+        let mut table = accounts_table_map_event(2);
+        table.column_types = vec![column_type, 1];
+        table.column_metadata = vec![metadata, 0];
+        let tables = HashMap::from([(table.table_id, table)]);
+        for payload in &payloads {
+            let mut encoded = vec![0]; // Both columns non-null.
+            if wide_length {
+                encoded.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            } else {
+                encoded.push(payload.len() as u8);
+            }
+            encoded.extend_from_slice(payload);
+            encoded.push(42); // A following column catches length/cursor errors.
+            let row = parse_binary_test_row(&tables, &encoded);
+            assert_eq!(
+                convert_mysql_value(&row.cells[0], false),
+                Value::Bytes(payload.clone()),
+                "wire type {column_type}, metadata {metadata}"
+            );
+            if std::str::from_utf8(payload).is_ok() {
+                assert!(matches!(&row.cells[0], Some(MySqlValue::String(_))));
+            } else {
+                assert!(matches!(&row.cells[0], Some(MySqlValue::Blob(_))));
+            }
+            assert_eq!(convert_mysql_value(&row.cells[1], false), Value::UInt(42));
+        }
+
+        // NULL consumes no string length or payload; an empty value above is not NULL.
+        let row = parse_binary_test_row(&tables, &[1, 42]);
+        assert_eq!(convert_mysql_value(&row.cells[0], false), Value::NULL);
+        assert_eq!(convert_mysql_value(&row.cells[1], false), Value::UInt(42));
+    }
+}
+
+#[test]
+fn long_varbinary_payload_reaches_target_unchanged() {
+    let payload: Vec<u8> = (0..=255).collect();
+    let mut table = accounts_table_map_event(1);
+    table.column_types = vec![15];
+    table.column_metadata = vec![256];
+    let mut encoded = vec![0, 0, 1]; // Non-null, 256-byte little-endian length.
+    encoded.extend_from_slice(&payload);
+    let tables = HashMap::from([(table.table_id, table)]);
+    let row = parse_binary_test_row(&tables, &encoded);
+    assert_eq!(
+        convert_mysql_value(&row.cells[0], false),
+        Value::Bytes(payload)
+    );
+}
+
+// Exercise the public row-event parser without exposing vendored internals.
+fn parse_binary_test_row(
+    tables: &HashMap<u64, MysqlCdcTableMapEvent>,
+    row_bytes: &[u8],
+) -> mysql_cdc::events::row_events::row_data::RowData {
+    use mysql_cdc::events::row_events::write_rows_event::WriteRowsEvent;
+    use std::io::Cursor;
+
+    let table = tables.values().next().unwrap();
+    let columns = table.column_types.len();
+    let mut encoded = table.table_id.to_le_bytes()[..6].to_vec();
+    encoded.extend_from_slice(&[0, 0]); // V1 flags.
+    encoded.push(columns as u8);
+    encoded.push((1_u8 << columns) - 1); // All columns present.
+    encoded.extend_from_slice(row_bytes);
+    let mut cursor = Cursor::new(encoded.as_slice());
+    let mut event = WriteRowsEvent::parse(&mut cursor, tables, 1).unwrap();
+    assert_eq!(cursor.position(), encoded.len() as u64);
+    assert_eq!(event.rows.len(), 1);
+    event.rows.remove(0)
 }
