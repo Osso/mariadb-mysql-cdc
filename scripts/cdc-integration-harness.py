@@ -8630,9 +8630,26 @@ DELIMITER ;
             "FROM cdc.sync_runs WHERE run_id='sync-progress-least-privilege' "
             "ORDER BY FIELD(stage,'prerequisite_schema','rows','final_constraints');",
         ).splitlines()
+        # The least-privilege identity must persist every phase cursor. Each
+        # phase scans the single source row (1-row page plus terminal empty
+        # page); the aggregate `rows` record sums the three phases.
+        phases = self.admin_query(
+            self.target,
+            "SELECT phase,complete,chunks,rows_scanned,inserts,updates,deletes "
+            "FROM cdc.sync_runs_phases "
+            "WHERE run_id='sync-progress-least-privilege' AND table_name='sync_accounts' "
+            "ORDER BY phase;",
+        ).splitlines()
+        expected_phases = [
+            "delete_extras	1	2	1	0	0	0",
+            "insert_missing	1	2	1	1	0	0",
+            "update_divergent	1	2	1	0	0	0",
+        ]
+        if phases != expected_phases:
+            raise HarnessError(f"unexpected unified sync phase progress: {phases!r}")
         expected_progress = [
             "prerequisite_schema	sync_accounts	0	0	complete",
-            "rows	sync_accounts	1	1	complete",
+            "rows	sync_accounts	3	1	complete",
             "final_constraints	sync_accounts	0	0	complete",
         ]
         if progress != expected_progress:
