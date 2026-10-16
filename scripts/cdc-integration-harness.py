@@ -3648,7 +3648,8 @@ DELIMITER ;
         count_sql = (
             "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
             "AND command_type IN ('Query','Execute') "
-            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%alter table%releases_top_stats%';"
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'alter table %' "
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%releases_top_stats%';"
         )
         if self.admin_query(self.target, count_sql).strip() != "1":
             raise HarnessError("ENUM target did not execute exactly one ALTER")
