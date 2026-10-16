@@ -674,27 +674,14 @@ impl Parser {
     }
 
     fn enum_type(&mut self) -> Result<String, String> {
-        self.keyword("ENUM")?;
-        self.keyword("(")?;
-        let mut members = Vec::new();
-        loop {
-            self.keyword("<string>")?;
-            let value = self.literals.next().ok_or("missing ENUM literal")?;
-            if value.is_empty()
-                || !value
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-            {
-                return Err("unmodeled ENUM member".into());
-            }
-            members.push(quote_string_literal(&value));
-            if !self.at(",") {
-                break;
-            }
-            self.keyword(",")?;
-        }
-        self.keyword(")")?;
-        Ok(format!("enum({})", members.join(",")))
+        let (column_type, next) = parse_enum_type(
+            &self.tokens,
+            &self.quoted,
+            self.position,
+            &mut self.literals,
+        )?;
+        self.position = next;
+        Ok(column_type)
     }
 
     fn column_type(&mut self) -> Result<String, String> {
@@ -706,6 +693,49 @@ impl Parser {
         self.position = next;
         Ok(column_type)
     }
+}
+
+/// Shared bounded ENUM grammar; labels retain source order and decoded case.
+pub(super) fn parse_enum_type(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+    literals: &mut impl Iterator<Item = String>,
+) -> Result<(String, usize), String> {
+    require_enum_token(tokens, quoted, index, "ENUM")?;
+    require_enum_token(tokens, quoted, index + 1, "(")?;
+    let mut position = index + 2;
+    let mut members = Vec::new();
+    loop {
+        require_enum_token(tokens, quoted, position, "<string>")?;
+        let value = literals.next().ok_or("missing ENUM literal")?;
+        if value.is_empty()
+            || !value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Err("unmodeled ENUM member".into());
+        }
+        members.push(quote_string_literal(&value));
+        position += 1;
+        if !tokens_match(tokens, position, ",") {
+            break;
+        }
+        require_enum_token(tokens, quoted, position, ",")?;
+        position += 1;
+    }
+    require_enum_token(tokens, quoted, position, ")")?;
+    Ok((format!("enum({})", members.join(",")), position + 1))
+}
+
+fn require_enum_token(
+    tokens: &[String],
+    quoted: &[bool],
+    index: usize,
+    keyword: &str,
+) -> Result<(), String> {
+    require_unquoted_token(quoted, index, "ENUM")?;
+    require_keyword(tokens, index, keyword)
 }
 
 pub(crate) fn is_character_type(column_type: &str) -> bool {

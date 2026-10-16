@@ -102,6 +102,7 @@ SCENARIOS = (
     ScenarioSpec("recsys-rail-create-pending-replay", True),
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("nullable-datetime-modify-pending-replay", True),
+    ScenarioSpec("statistic-enum-modify-pending-replay", True),
     ScenarioSpec("audit-turn-attribution-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
@@ -196,6 +197,7 @@ def default_scenarios() -> list[str]:
             "curated-strip-slides-create-pending-replay",
             "sales-placements-create-pending-replay",
             "nullable-datetime-modify-pending-replay",
+            "statistic-enum-modify-pending-replay",
             "audit-turn-attribution-pending-replay",
             "source-layout-json-pending-replay",
             "recsys-rail-create-pending-replay",
@@ -3579,6 +3581,99 @@ DELIMITER ;
         print(
             f"audit_turn_attribution_pending_replay_ok coordinate={stop.file}:{stop.position}"
         )
+
+    def statistic_enum_snapshot(self, endpoint: Endpoint) -> dict[str, str]:
+        where = f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='releases_top_stats'"
+        queries = {
+            "other_columns": "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,ORDINAL_POSITION,EXTRA,CHARACTER_SET_NAME,COLLATION_NAME FROM information_schema.COLUMNS "
+            f"WHERE {where} AND COLUMN_NAME<>'statistic' ORDER BY ORDINAL_POSITION;",
+            "indexes": "SELECT INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME,SUB_PART,INDEX_TYPE "
+            f"FROM information_schema.STATISTICS WHERE {where} ORDER BY INDEX_NAME,SEQ_IN_INDEX;",
+            "collation": f"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE {where};",
+        }
+        return {name: self.admin_query(endpoint, sql) for name, sql in queries.items()}
+
+    def run_statistic_enum_modify_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError("statistic ENUM replay requires --old-binary")
+        if self.binary is None or not self.binary.is_file():
+            raise HarnessError("statistic ENUM replay requires --binary with integration-failpoints")
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
+        schema = (self.repo / "fixtures/ddl/create-release-top-stats-pre-enum.sql").read_text()
+        ddl = (self.repo / "fixtures/ddl/modify-release-top-statistic-enum.sql").read_text().strip()
+        seed = (
+            "INSERT INTO releases_top_stats(release_id,statistic,value_1_day,update_time) VALUES "
+            "(1,'views',11,'2026-10-01 01:02:03'),(1,'popularity',12,NULL),"
+            "(1,'likes',13,'2026-10-02 02:03:04'),(1,'purchases',14,NULL);"
+        )
+        rows = "SELECT release_id,statistic,statistic+0,value_1_day,value_7_days,value_30_days,value_90_days,value_365_days,update_time FROM releases_top_stats ORDER BY release_id,statistic;"
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema + seed)
+        before = self.statistic_enum_snapshot(self.target)
+        initial_rows = self.admin_query(self.target, rows)
+        self.reset_target_general_log()
+        start, pending = self.prepare_pending_add_column(
+            "", ddl, "MODIFY", prepared=True, old_binary=self.old_binary
+        )
+        if self.statistic_enum_snapshot(self.target) != before or self.admin_query(self.target, rows) != initial_rows:
+            raise HarnessError("old binary changed ENUM pre-state")
+        # These transactions are already queued behind the durable DDL barrier.
+        self.admin_sql(
+            self.source,
+            "INSERT INTO releases_top_stats(release_id,statistic,value_1_day) VALUES (1,'revenue',21); "
+            "UPDATE releases_top_stats SET statistic='revenue',release_id=2,value_1_day=22 WHERE release_id=1 AND statistic='popularity'; "
+            "DELETE FROM releases_top_stats WHERE release_id=1 AND statistic='likes';",
+        )
+        stop = self.coordinate()
+        crashed = self.run_stream(start, stop, integration_failpoint="post-ddl-pre-applied", binary=self.binary)
+        if crashed.returncode == 0 or "cdc_integration_failpoint" not in crashed.stdout + crashed.stderr:
+            raise HarnessError(f"ENUM post-DDL crash did not fire: {crashed!r}")
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        if journal["status"] != "prepared" or (checkpoint["source_file"], checkpoint["source_position"]) != (start.file, start.position):
+            raise HarnessError(f"ENUM crash lost prepared journal/checkpoint: {journal!r} {checkpoint!r}")
+        if self.admin_query(self.target, rows) != initial_rows:
+            raise HarnessError("ENUM ALTER changed old labels, ordinals or rows before queued DML")
+        metadata = (
+            "SELECT COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,ORDINAL_POSITION,CHARACTER_SET_NAME,COLLATION_NAME "
+            f"FROM information_schema.COLUMNS WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} "
+            "AND TABLE_NAME='releases_top_stats' AND COLUMN_NAME='statistic';"
+        )
+        expected = "enum('views','popularity','likes','purchases','revenue')\tNO\tNULL\t2\tutf8mb3\tutf8mb3_general_ci"
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, metadata).strip()
+            if actual != expected:
+                raise HarnessError(f"ENUM metadata differs at {endpoint.container}: {actual!r}")
+        count_sql = (
+            "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' "
+            "AND command_type IN ('Query','Execute') "
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'alter table %' "
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%releases_top_stats%';"
+        )
+        if self.admin_query(self.target, count_sql).strip() != "1":
+            raise HarnessError("ENUM target did not execute exactly one ALTER")
+        self.replay_pending_add_column(start, pending)
+        expected_rows = (
+            "1\tviews\t1\t11\t0\t0\t0\t0\t2026-10-01 01:02:03\n"
+            "1\tpurchases\t4\t14\t0\t0\t0\t0\tNULL\n"
+            "1\trevenue\t5\t21\t0\t0\t0\t0\tNULL\n"
+            "2\trevenue\t5\t22\t0\t0\t0\t0\tNULL"
+        )
+        for endpoint in (self.source, self.target):
+            if self.admin_query(endpoint, rows).strip() != expected_rows:
+                raise HarnessError(f"ENUM queued DML differs at {endpoint.container}")
+            self.assert_admin_sql_rejected(endpoint, "INSERT INTO releases_top_stats(release_id,statistic) VALUES(1,'revenue');", "1062")
+            self.assert_admin_sql_rejected(endpoint, "INSERT INTO releases_top_stats(release_id,statistic) VALUES(3,'unknown');", "1265")
+            self.assert_admin_sql_rejected(endpoint, "INSERT INTO releases_top_stats(release_id,statistic) VALUES(3,NULL);", "1048")
+        if self.statistic_enum_snapshot(self.target) != before:
+            raise HarnessError("ENUM MODIFY changed unrelated metadata/indexes/collation")
+        checkpoint = self.checkpoint()
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        require_success(self.run_stream(start, stop, binary=self.binary), "ENUM checkpointed restart")
+        if self.checkpoint() != checkpoint or self.journal_full_row(int(pending["event_start_position"])) != journal or self.admin_query(self.target, count_sql).strip() != "1" or self.admin_query(self.target, rows).strip() != expected_rows:
+            raise HarnessError("ENUM restart changed data/checkpoint/journal or repeated ALTER")
+        print("statistic_enum_modify_pending_replay_ok old_binary_pending=true immutable_identity=true atomic_alter=1 enum_ordinals=true inherited_utf8mb3=true primary_secondary_indexes=true queued_insert_update_delete=true post_ddl_crash_restart=true checkpointed_restart_noop=true production_grouping=100/200ms")
 
     def run_nullable_datetime_modify_pending_replay(self) -> None:
         assert self.source and self.target
@@ -11515,6 +11610,8 @@ DELIMITER ;
             self.run_spotlight_nullable_varchar_pending_replay()
         elif scenario == "nullable-datetime-modify-pending-replay":
             self.run_nullable_datetime_modify_pending_replay()
+        elif scenario == "statistic-enum-modify-pending-replay":
+            self.run_statistic_enum_modify_pending_replay()
         elif scenario == "audit-turn-attribution-pending-replay":
             self.run_audit_turn_attribution_pending_replay()
         elif scenario == "storefront-create-pending-replay":

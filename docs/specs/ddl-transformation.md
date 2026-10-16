@@ -54,6 +54,32 @@ clause combinations, full `ALTER TABLE`, or all `CREATE TABLE` syntax.
 | Indexes | Existing admitted named ordinary/unique key additions and strict standalone `CREATE INDEX`/`DROP INDEX` rules; ordinary `DROP INDEX` in ALTER is target-derived. | New index/constraint grammar, FK-dependent index changes, and unmodeled key parts/options remain runtime barriers. | Existing bounded coverage; not requalified here. |
 
 
+#### Bounded ALTER ENUM definitions
+
+`ALTER TABLE` column definitions admit `ENUM` through the same bounded grammar
+as observed CREATE: one or more nonempty decoded ASCII alphanumeric/underscore
+labels. Preserve label order and case in typed AST, canonical evidence, expected
+metadata, and generated SQL. This qualifies generic MODIFY coverage above;
+it does not admit arbitrary ENUM syntax. The shared column-definition path also
+admits this grammar for ADD and CHANGE, subject to their existing semantic fences.
+Explicit `CHARACTER SET ... COLLATE ...` pairs retain existing validation and
+semantic evidence; omitted encoding uses the existing table-default derivation.
+Consume ENUM literals before subsequent COMMENT/default/clause literals.
+
+The exact fixture `fixtures/ddl/modify-release-top-statistic-enum.sql` adds
+`revenue` after `views`, `popularity`, `likes`, and `purchases` via typed MODIFY,
+with an inert leading DBeaver comment and NOT NULL. No raw SQL fallback or
+per-table exception is admitted. Empty, punctuation/whitespace/non-ASCII labels,
+unquoted members, malformed lists, SET, and unmodeled qualifiers remain barriers.
+ALTER ENUM string defaults remain unsupported; existing NULL handling is unchanged.
+
+| Capability | Boundary | Proof level |
+|---|---|---|
+| Exact ENUM MODIFY | Preserve typed labels and render one ALTER; derive expected post-state without changing unrelated metadata. | Targeted regression tests; native execution not claimed here. |
+| Case/order, encoding, literal consumption | Preserve mixed-case ordered labels, explicit encoding, COMMENT and later-column literals; reject unmodeled grammar. | Targeted parser/rendering/semantic-state tests. |
+| Composite-PK queued rows and restart | CREATE/TABLE_MAP evidence does not prove MODIFY-on-composite-PK recovery. | Native scenario `statistic-enum-modify-pending-replay` is separate; execution pending. |
+| Reorder/removal/conversion | No broader runtime compatibility claim from accepting bounded syntax. | Native data/recovery proof not established. |
+
 #### Explicit source COPY/SHARED ALTER (bounded native and deployment proof)
 
 The common modeled ALTER family admits the explicit final source pair
