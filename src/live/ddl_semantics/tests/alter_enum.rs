@@ -28,9 +28,13 @@ fn alter_enum_exact_event_has_typed_rendering_and_semantic_evidence() {
     column.name = "statistic".into();
     column.column_type = "enum('views','popularity','likes','purchases')".into();
     column.data_type = "enum".into();
+    column.character_set = Some("utf8mb4".into());
+    column.collation = Some("utf8mb4_unicode_ci".into());
     column.is_nullable = false;
     column.default_value = None;
     column.comment.clear();
+    table.primary_key.push("statistic".into());
+    target.inventory.indexes[0].columns[0].prefix_length = None;
     target.inventory.indexes[0].table = table.name.clone();
     target.inventory.indexes[0].columns[0].name = "statistic".into();
     let runtime = target.table_runtime.remove("accounts").unwrap();
