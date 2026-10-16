@@ -1,3 +1,4 @@
+mod alter_enum;
 mod assistant_quality;
 mod basic_ddl;
 mod bigint_auto_increment;
