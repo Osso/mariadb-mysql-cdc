@@ -641,7 +641,7 @@ fn render_add_column(column: &ParsedAddColumnAst) -> String {
     let mut sql = format!(
         "ADD COLUMN {} {}{} {attributes}",
         quote_identifier(&column.name),
-        column_type.to_ascii_uppercase(),
+        render_column_type(column_type),
         render_column_encoding(column.character_set.as_deref(), column.collation.as_deref()),
     );
     if !column.comment.is_empty() {
@@ -718,6 +718,13 @@ fn quote_string_literal(value: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+
+fn render_column_type(column_type: &str) -> String {
+    match column_type.strip_prefix("enum(") {
+        Some(labels) => format!("ENUM({labels}"),
+        None => column_type.to_ascii_uppercase(),
+    }
 }
 
 fn render_column_encoding(character_set: Option<&str>, collation: Option<&str>) -> String {
@@ -1675,10 +1682,7 @@ fn render_create_column(column: &ParsedCreateColumnAst) -> String {
     } else {
         String::new()
     };
-    let column_type = match column.column_type.strip_prefix("enum(") {
-        Some(labels) => format!("ENUM({labels}"),
-        None => column.column_type.to_ascii_uppercase(),
-    };
+    let column_type = render_column_type(&column.column_type);
     let encoding =
         render_column_encoding(column.character_set.as_deref(), column.collation.as_deref());
     let comment = if column.comment.is_empty() {
@@ -2450,7 +2454,7 @@ fn parse_column_definition_clause(
     }
     let name = require_identifier(tokens, name_index, "added column")?;
     let (column_type, data_type, encoding_start) =
-        parse_observed_column_type(tokens, quoted_flags, name_index + 1)?;
+        parse_observed_column_type(tokens, quoted_flags, name_index + 1, literals)?;
     let (character_set, collation, generation_start) =
         parse_column_encoding(tokens, quoted_flags, encoding_start, &data_type)?;
     let (generated, options_start) = parse_optional_stored_generation(
@@ -2531,7 +2535,7 @@ fn parse_column_encoding(
     if !tokens_match(tokens, index, "CHARACTER") {
         return Ok((None, None, index));
     }
-    if !matches!(data_type, "char" | "varchar") && !is_text_type(data_type) {
+    if !matches!(data_type, "char" | "varchar" | "enum") && !is_text_type(data_type) {
         return Err(format!("CHARACTER SET is unsupported for {data_type}"));
     }
     for (offset, keyword) in [(0, "CHARACTER"), (1, "SET"), (3, "COLLATE")] {
@@ -2617,7 +2621,13 @@ fn parse_observed_column_type(
     tokens: &[String],
     quoted_flags: &[bool],
     index: usize,
+    literals: &mut impl Iterator<Item = String>,
 ) -> Result<(String, String, usize), String> {
+    if tokens_match(tokens, index, "ENUM") {
+        let (column_type, next) =
+            observed_create::parse_enum_type(tokens, quoted_flags, index, literals)?;
+        return Ok((column_type, "enum".into(), next));
+    }
     basic_types::parse_column_type(tokens, quoted_flags, index)
 }
 
