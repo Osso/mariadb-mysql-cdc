@@ -80,6 +80,19 @@ ALTER ENUM string defaults remain unsupported; existing NULL handling is unchang
 | Composite-PK queued rows and restart | CREATE/TABLE_MAP evidence does not prove MODIFY-on-composite-PK recovery. | Native scenario `statistic-enum-modify-pending-replay` is separate; execution pending. |
 | Reorder/removal/conversion | No broader runtime compatibility claim from accepting bounded syntax. | Native data/recovery proof not established. |
 
+#### Zero-precision CURRENT_TIMESTAMP spellings
+
+Observed CREATE defaults and ON UPDATE clauses on zero-precision TIMESTAMP or
+DATETIME accept `CURRENT_TIMESTAMP`, `CURRENT_TIMESTAMP()` and
+`CURRENT_TIMESTAMP(0)` as the same typed value. Render and compare canonical
+`CURRENT_TIMESTAMP`; preserve the source statement as journal identity.
+Nonzero column precision still requires the matching explicit argument;
+empty parentheses on precision-six columns and mismatched/malformed arguments
+remain barriers. Exact commented `create-rank-snapshot-runs.sql` covers this
+CREATE with ENUM/composite primary key and unsigned integer display widths.
+Focused regression tests cover the spellings and rejection boundaries; native
+pending/crash/restart and operational catch-up proof remain pending.
+
 #### Explicit source COPY/SHARED ALTER (bounded native and deployment proof)
 
 The common modeled ALTER family admits the explicit final source pair
