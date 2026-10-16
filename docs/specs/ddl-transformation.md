@@ -93,10 +93,13 @@ writes as well as the actual ALTER. The harness-only statement-prefix correction
 changed no Rust code; the second native run passed. This proves only the exact
 append-only slice above, not reordering, removal, conversion, ENUM string defaults,
 or unmodeled labels. Parser support for ADD/CHANGE is not native recovery proof.
-Independent verification at `221b27a` passed 952 Rust tests (18 ignored), six
-Python tests, formatting, compilation, strict Clippy, and changed-line readability.
-That gate predates the zero-precision timestamp correction below and does not
-claim overall restoration or catch-up.
+Final independent verification at `e6df93a` passed 954 Rust tests (18 existing
+ignored), formatting, compilation, strict Clippy, and changed-line readability.
+Six Python tests retain their passing proof at `221b27a`: the deployment-script
+proof scope is unchanged. The ENUM native proof above remains scoped to Rust
+`3e59295` / harness `f861d19`; the subsequent timestamp correction does not
+invalidate that bounded proof. No later native execution is claimed. Capability
+proof does not establish overall restoration or live catch-up completion.
 
 #### Zero-precision CURRENT_TIMESTAMP spellings
 
@@ -113,8 +116,16 @@ MySQL 8.4.8 `rank-snapshot-create-pending-replay` passed at `03068fb` using the
 previously deployed `221b27a` binary: authentic pending promotion, one CREATE,
 composite ENUM primary key, omitted count/timestamp defaults, queued INSERT,
 UPDATE and DELETE, post-DDL/pre-applied crash recovery and checkpointed restart
-without repeated CREATE. Final independent and operational catch-up gates remain
-pending.
+without repeated CREATE. Final `e6df93a` has the same corresponding Rust,
+fixture, and harness trees as native-tested `03068fb`; native execution is not
+attributed to that later revision. Native proof covers the exact fixture's
+`CURRENT_TIMESTAMP()` default, not every admitted DEFAULT/ON UPDATE spelling
+combination. Final independent verification at `e6df93a` passed 954 Rust tests
+(18 existing ignored), formatting, compilation, strict Clippy, and changed-line
+readability; six Python tests retain their passing `221b27a` proof under unchanged
+deployment-script scope. Both exact native scenarios passed on MySQL 8.4.8.
+The final code gate is PASS; operational catch-up remains in progress, so neither
+bounded capability proof nor that gate claims whole-goal completion.
 
 #### Explicit source COPY/SHARED ALTER (bounded native and deployment proof)
 
