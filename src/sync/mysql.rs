@@ -21,8 +21,9 @@ use crate::mysql_client::{
 };
 use crate::mysql_config::MySqlConnectionConfig;
 use crate::target::SqlStatement;
+use mysql::consts::CapabilityFlags;
 use mysql::prelude::Queryable;
-use mysql::{Conn, Opts, Params};
+use mysql::{Conn, Opts, OptsBuilder, Params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -141,8 +142,11 @@ impl SyncChunkSource for MySqlSyncSource {
 
 impl MySqlSyncTargetSession {
     pub(crate) fn new(config: &TargetMySqlConfig, table: SyncTable) -> Result<Self, String> {
-        let opts = sync_target_opts(config)?;
-        let mut conn = open_sync_connection(opts)
+        // Found-rows makes UPDATE report matched rather than changed rows, so every
+        // strict mutation can prove it reached each intended primary key.
+        let opts = OptsBuilder::from_opts(sync_target_opts(config)?)
+            .additional_capabilities(CapabilityFlags::CLIENT_FOUND_ROWS);
+        let mut conn = open_sync_connection(opts.into())
             .map_err(|error| format!("failed to connect to target mysql: {error}"))?;
         initialize_target_session(&mut conn)?;
         Ok(Self {
@@ -249,7 +253,9 @@ impl MySqlSyncTargetSession {
             .conn
             .exec_drop(&statement.sql, Params::Positional(statement.params.clone()));
         let Err(error) = result else {
-            return Ok(());
+            return self
+                .require_matched_rows(rows.len())
+                .map_err(|message| (None, message));
         };
         let code = mysql_error_code(&error);
         if !repair_fk_prerequisites || !matches!(code, Some(1216 | 1452)) {
@@ -264,7 +270,20 @@ impl MySqlSyncTargetSession {
                     mysql_error_code(&error),
                     format!("target mysql statement failed: {error}"),
                 )
-            })
+            })?;
+        self.require_matched_rows(rows.len())
+            .map_err(|message| (None, message))
+    }
+
+    fn require_matched_rows(&self, expected: usize) -> Result<(), String> {
+        let matched = self.conn.affected_rows();
+        if matched == expected as u64 {
+            return Ok(());
+        }
+        Err(format!(
+            "target mysql mutation on `{}` matched {matched} of {expected} intended rows",
+            self.table.name
+        ))
     }
 
     fn load_unique_index(&mut self, error: &str) -> Result<SyncUniqueIndex, String> {
@@ -345,8 +364,11 @@ impl SyncChunkTargetSession for MySqlSyncTargetSession {
     }
 
     fn delete_rows(&mut self, primary_keys: &[Vec<String>]) -> Result<(), String> {
-        for statement in build_strict_delete_batches(&self.table, primary_keys)? {
+        let batches = build_strict_delete_batches(&self.table, primary_keys)?;
+        let batch_keys = primary_keys.chunks(strict_delete_batch_capacity(&self.table));
+        for (statement, keys) in batches.into_iter().zip(batch_keys) {
             self.execute_statement(statement)?;
+            self.require_matched_rows(keys.len())?;
         }
         Ok(())
     }

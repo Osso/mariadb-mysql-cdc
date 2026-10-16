@@ -475,17 +475,15 @@ fn primary_key_parameter_value(
     let Some(labels) = table.enum_columns.get(column) else {
         return parameter_value(table, column, value.to_string());
     };
-    let ordinal = labels
-        .iter()
-        .position(|label| label == value)
-        .map(|index| u64::try_from(index + 1).expect("ENUM label index fits u64"))
-        .ok_or_else(|| {
-            format!(
-                "ENUM primary-key column `{column}` in `{}` has undeclared label `{value}`",
-                table.name
-            )
-        })?;
-    Ok(Value::UInt(ordinal))
+    if !labels.iter().any(|label| label == value) {
+        return Err(format!(
+            "ENUM primary-key column `{column}` in `{}` has undeclared label `{value}`",
+            table.name
+        ));
+    }
+    // Key predicates bind the label: MySQL 8.4 matches no rows when a multi-row
+    // `(pk...) IN ((...), ...)` compares an ENUM column with integer indexes.
+    Ok(string_param(value.to_string()))
 }
 
 fn parameter_value(table: &SyncTable, column: &str, value: String) -> Result<Value, String> {

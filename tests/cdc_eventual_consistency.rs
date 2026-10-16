@@ -72,6 +72,12 @@ fn real_unified_sync_composite_enum_primary_key_uses_enum_order() {
 
 #[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
+fn real_unified_sync_enum_primary_key_batched_mutations_converge() {
+    run_harness_scenario("sync-enum-primary-key-batched-mutations");
+}
+
+#[test]
+#[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_unified_sync_fk_parent_insert_converges() {
     run_harness_scenario("sync-fk-parent-insert");
 }

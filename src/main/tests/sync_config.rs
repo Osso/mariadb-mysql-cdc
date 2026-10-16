@@ -227,7 +227,7 @@ fn sync_table_uses_declaration_order_for_numeric_enum_primary_key_pages() {
         build_exact_primary_key_select_statement(&table, &first_page[0].primary_key)
             .expect("numeric enum primary key")
             .params,
-        vec![Value::Bytes(b"7".to_vec()), Value::UInt(2)]
+        vec![Value::Bytes(b"7".to_vec()), Value::Bytes(b"2".to_vec())]
     );
 }
 
@@ -340,19 +340,22 @@ fn sync_table_conversion_projects_and_binds_enum_ordinals_and_mediumblob_bytes()
         update.params,
         vec![
             Value::Bytes(b"7".to_vec()),
-            Value::UInt(2),
+            Value::Bytes(b"live".to_vec()),
             Value::UInt(0),
             Value::Bytes(b"7".to_vec()),
-            Value::UInt(2),
+            Value::Bytes(b"live".to_vec()),
             Value::Bytes(vec![0, 255]),
             Value::Bytes(b"7".to_vec()),
-            Value::UInt(2),
+            Value::Bytes(b"live".to_vec()),
         ]
     );
 
     let exact = build_exact_primary_key_select_statement(&table, &decoded[0].primary_key)
         .expect("exact enum primary key");
-    assert_eq!(exact.params, vec![Value::Bytes(b"7".to_vec()), Value::UInt(2)]);
+    assert_eq!(
+        exact.params,
+        vec![Value::Bytes(b"7".to_vec()), Value::Bytes(b"live".to_vec())]
+    );
     assert!(exact.sql.starts_with("SELECT `id`, CAST(`state` AS UNSIGNED) AS `state`, CAST(`status` AS UNSIGNED) AS `status`, HEX(`args`) AS `args`"));
 
     let unique_owner = build_unique_owner_select_statement(

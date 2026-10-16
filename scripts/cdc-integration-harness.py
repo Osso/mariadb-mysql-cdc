@@ -52,6 +52,7 @@ SCENARIOS = (
     ScenarioSpec("strict-secondary-btree", True),
     ScenarioSpec("sync-tls", True),
     ScenarioSpec("sync-composite-enum-primary-key", True),
+    ScenarioSpec("sync-enum-primary-key-batched-mutations", True),
     ScenarioSpec("sync-enum-append", True),
     ScenarioSpec("sync-enum-incompatible", True),
     ScenarioSpec("sync-constraints-preserved", True),
@@ -8788,6 +8789,88 @@ DELIMITER ;
             "rows_scanned=3 inserts=1 updates=1 deletes=0"
         )
 
+    def run_sync_enum_primary_key_batched_mutations(self) -> None:
+        """Multi-row UPDATE and DELETE batches keyed by a composite ENUM primary key.
+
+        Mirrors production `releases_top_stats`, where the September 2026 recovery
+        reported thousands of applied updates while the target rows stayed stale.
+        """
+        assert self.source and self.target
+        create_table = (
+            "DROP TABLE IF EXISTS releases_top_stats; "
+            "CREATE TABLE releases_top_stats ("
+            "release_id INT UNSIGNED NOT NULL, "
+            "statistic ENUM('views','popularity','likes','purchases','revenue') NOT NULL, "
+            "value_1_day FLOAT UNSIGNED NOT NULL DEFAULT 0, "
+            "value_7_days FLOAT UNSIGNED NOT NULL DEFAULT 0, "
+            "value_30_days FLOAT UNSIGNED NOT NULL DEFAULT 0, "
+            "value_90_days FLOAT UNSIGNED NOT NULL DEFAULT 0, "
+            "value_365_days FLOAT UNSIGNED NOT NULL DEFAULT 0, "
+            "update_time TIMESTAMP NULL DEFAULT NULL, "
+            "PRIMARY KEY (release_id, statistic), "
+            "KEY idx_release_7_30_90 (value_7_days, value_30_days, value_90_days), "
+            "KEY idx_release_365 (value_365_days)"
+            ") ENGINE=InnoDB;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, create_table)
+        self.admin_sql(
+            self.source,
+            "INSERT INTO releases_top_stats VALUES "
+            "(212, 'views', 0, 0, 7, 12, 16, '2026-09-01 07:26:52'), "
+            "(212, 'popularity', 0, 0, 0, 0, 4.5, '2026-09-01 07:26:52'), "
+            "(296, 'views', 0, 0, 3, 9, 30, '2026-09-01 07:26:52'), "
+            "(296, 'popularity', 0, 0, 0, 5.25, 5.75, '2026-09-01 07:26:52'), "
+            "(298, 'views', 1, 2, 3, 4, 5, '2026-08-28 07:26:33'), "
+            "(298, 'popularity', 0, 0, 0, 4.25, 5.5, '2026-08-28 07:26:33');",
+        )
+        self.admin_sql(
+            self.target,
+            "INSERT INTO releases_top_stats VALUES "
+            "(212, 'views', 0, 0, 7, 12, 16, '2026-08-28 07:26:33'), "
+            "(212, 'popularity', 0, 0, 0, 4.125, 4.5, '2026-08-28 07:26:33'), "
+            "(296, 'views', 0, 1, 3, 9, 30, '2026-08-28 07:26:33'), "
+            "(296, 'popularity', 4.5, 4.75, 0, 5.25, 5.75, '2026-08-28 07:26:33'), "
+            "(298, 'views', 1, 2, 3, 4, 5, '2026-08-28 07:26:33'), "
+            "(298, 'popularity', 0, 0, 0, 4.25, 5.5, '2026-08-28 07:26:33'), "
+            "(299, 'views', 0, 0, 1, 1, 1, '2026-08-28 07:26:33'), "
+            "(299, 'popularity', 0, 0, 2.5, 2.5, 2.5, '2026-08-28 07:26:33');",
+        )
+        select_rows = (
+            "SELECT release_id,statistic,value_1_day,value_7_days,value_30_days,"
+            "value_90_days,value_365_days,update_time FROM releases_top_stats "
+            "ORDER BY release_id,statistic;"
+        )
+        source_rows = self.admin_query(self.source, select_rows).splitlines()
+        run_id = "sync-enum-primary-key-batched-mutations"
+        result = self.run_sync(
+            tables=["releases_top_stats"],
+            run_id=run_id,
+            chunk_size=100,
+        )
+        require_success(result, "sync ENUM primary-key batched mutations")
+        target_rows = self.admin_query(self.target, select_rows).splitlines()
+        if target_rows != source_rows:
+            raise HarnessError(
+                "batched ENUM primary-key mutations did not converge: "
+                f"source={source_rows!r} target={target_rows!r}"
+            )
+        if self.admin_query(self.source, select_rows).splitlines() != source_rows:
+            raise HarnessError("source rows changed during sync")
+        progress = self.admin_query(
+            self.target,
+            "SELECT status,inserts_applied,updates_applied,"
+            "deletes_applied FROM cdc.sync_runs "
+            f"WHERE run_id='{run_id}' AND stage='rows' "
+            "AND table_name='releases_top_stats';",
+        ).strip()
+        if progress != "complete	0	4	2":
+            raise HarnessError(f"batched ENUM progress is wrong: {progress!r}")
+        print(
+            "sync_enum_primary_key_batched_mutations_ok "
+            "rows=6 updates=4 deletes=2 source_unchanged=true"
+        )
+
     def run_sync_check_convergence(self, obsolete: bool) -> None:
         assert self.source and self.target
         source_check = (
@@ -11576,6 +11659,8 @@ DELIMITER ;
             self.run_sync_enum_incompatible()
         elif scenario == "sync-composite-enum-primary-key":
             self.run_sync_composite_enum_primary_key()
+        elif scenario == "sync-enum-primary-key-batched-mutations":
+            self.run_sync_enum_primary_key_batched_mutations()
         elif scenario == "sync-parent-only-constraints-preserved":
             self.run_sync_constraints_preserved(parent_only=True)
         elif scenario == "sync-legacy-column-valid-fk":
