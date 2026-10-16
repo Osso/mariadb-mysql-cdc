@@ -103,6 +103,7 @@ SCENARIOS = (
     ScenarioSpec("spotlight-nullable-varchar-pending-replay", True),
     ScenarioSpec("nullable-datetime-modify-pending-replay", True),
     ScenarioSpec("statistic-enum-modify-pending-replay", True),
+    ScenarioSpec("rank-snapshot-create-pending-replay", True),
     ScenarioSpec("audit-turn-attribution-pending-replay", True),
     ScenarioSpec("reader-memory-create-pending-replay", True),
     ScenarioSpec("reader-memory-guarded-alter-pending-replay", True),
@@ -198,6 +199,7 @@ def default_scenarios() -> list[str]:
             "sales-placements-create-pending-replay",
             "nullable-datetime-modify-pending-replay",
             "statistic-enum-modify-pending-replay",
+            "rank-snapshot-create-pending-replay",
             "audit-turn-attribution-pending-replay",
             "source-layout-json-pending-replay",
             "recsys-rail-create-pending-replay",
@@ -3581,6 +3583,62 @@ DELIMITER ;
         print(
             f"audit_turn_attribution_pending_replay_ok coordinate={stop.file}:{stop.position}"
         )
+
+    def run_rank_snapshot_create_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError("rank snapshot CREATE replay requires --old-binary")
+        if self.binary is None or not self.binary.is_file():
+            raise HarnessError("rank snapshot CREATE replay requires --binary with integration-failpoints")
+        self.stream_extra_args = tuple(self.PRODUCTION_GROUPING)
+        ddl = (self.repo / "fixtures/ddl/create-rank-snapshot-runs.sql").read_text().strip()
+        self.reset_target_general_log()
+        start, pending = self.prepare_pending_add_column("", ddl, "CREATE TABLE", prepared=True, old_binary=self.old_binary)
+        absent = self.admin_query(self.target, f"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='rank_snapshot_runs';").strip()
+        if absent != "0":
+            raise HarnessError("old binary created rank snapshot table")
+        self.admin_sql(self.source,
+            "SET timestamp=UNIX_TIMESTAMP('2026-10-16 12:00:00'); "
+            "INSERT INTO rank_snapshot_runs(scope,statistic,period,snapshot_date) VALUES ('comics','views',7,'2026-10-16'); "
+            "INSERT INTO rank_snapshot_runs(scope,statistic,period,snapshot_date,item_count) VALUES ('releases','revenue',30,'2026-10-16',123); "
+            "UPDATE rank_snapshot_runs SET item_count=8 WHERE scope='comics'; "
+            "DELETE FROM rank_snapshot_runs WHERE scope='releases'; "
+            "INSERT INTO rank_snapshot_runs(scope,statistic,period,snapshot_date) VALUES ('releases','likes',90,'2026-10-17');")
+        stop = self.coordinate()
+        crashed = self.run_stream(start, stop, integration_failpoint="post-ddl-pre-applied", binary=self.binary)
+        if crashed.returncode == 0 or "cdc_integration_failpoint" not in crashed.stdout + crashed.stderr:
+            raise HarnessError(f"rank snapshot post-DDL crash did not fire: {crashed!r}")
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        if journal["status"] != "prepared" or (checkpoint["source_file"], checkpoint["source_position"]) != (start.file, start.position):
+            raise HarnessError("rank snapshot CREATE crash advanced checkpoint or lost prepared journal")
+        if self.admin_query(self.target, "SELECT COUNT(*) FROM rank_snapshot_runs;").strip() != "0":
+            raise HarnessError("rank snapshot queued rows applied before DDL crash boundary")
+        self.replay_pending_add_column(start, pending)
+        rows = "SELECT * FROM rank_snapshot_runs ORDER BY scope,statistic,period,snapshot_date;"
+        expected = "comics\tviews\t7\t2026-10-16\t8\t2026-10-16 12:00:00\nreleases\tlikes\t90\t2026-10-17\t0\t2026-10-16 12:00:00"
+        for endpoint in (self.source, self.target):
+            if self.admin_query(endpoint, rows).strip() != expected:
+                raise HarnessError(f"rank snapshot queued rows/defaults differ at {endpoint.container}")
+            self.assert_admin_sql_rejected(endpoint, "INSERT INTO rank_snapshot_runs(scope,statistic,period,snapshot_date) VALUES('comics','views',7,'2026-10-16');", "1062")
+        columns = self.admin_query(self.target,
+            "SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='rank_snapshot_runs' ORDER BY ORDINAL_POSITION;").strip()
+        expected_columns = "scope\tenum('comics','releases')\tNO\tNULL\nstatistic\tvarchar(16)\tNO\tNULL\nperiod\tsmallint unsigned\tNO\tNULL\nsnapshot_date\tdate\tNO\tNULL\nitem_count\tmediumint unsigned\tNO\t0\ncreate_time\ttimestamp\tNO\tCURRENT_TIMESTAMP"
+        if columns != expected_columns:
+            raise HarnessError(f"rank snapshot metadata differs: {columns!r}")
+        keys = self.admin_query(self.target,
+            "SELECT INDEX_NAME,SEQ_IN_INDEX,COLUMN_NAME FROM information_schema.STATISTICS "
+            f"WHERE TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='rank_snapshot_runs' ORDER BY INDEX_NAME,SEQ_IN_INDEX;").strip()
+        if keys != "PRIMARY\t1\tscope\nPRIMARY\t2\tstatistic\nPRIMARY\t3\tperiod\nPRIMARY\t4\tsnapshot_date":
+            raise HarnessError(f"rank snapshot composite key differs: {keys!r}")
+        count_sql = "SELECT COUNT(*) FROM mysql.general_log WHERE user_host LIKE 'cdc_stream%' AND command_type IN ('Query','Execute') AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'create table %' AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%rank_snapshot_runs%';"
+        checkpoint = self.checkpoint()
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        require_success(self.run_stream(start, stop, binary=self.binary), "rank snapshot checkpointed restart")
+        if self.checkpoint() != checkpoint or self.journal_full_row(int(pending["event_start_position"])) != journal or self.admin_query(self.target, count_sql).strip() != "1" or self.admin_query(self.target, rows).strip() != expected:
+            raise HarnessError("rank snapshot restart changed data/checkpoint/journal or repeated CREATE")
+        print("rank_snapshot_create_pending_replay_ok old_binary_pending=true immutable_identity=true atomic_create=1 enum_composite_key=true zero_precision_default=true empty_run_default=true queued_insert_update_delete=true post_ddl_crash_restart=true checkpointed_restart_noop=true production_grouping=100/200ms")
 
     def statistic_enum_snapshot(self, endpoint: Endpoint) -> dict[str, str]:
         where = f"TABLE_SCHEMA={sql_literal(APP_SCHEMA)} AND TABLE_NAME='releases_top_stats'"
@@ -11612,6 +11670,8 @@ DELIMITER ;
             self.run_nullable_datetime_modify_pending_replay()
         elif scenario == "statistic-enum-modify-pending-replay":
             self.run_statistic_enum_modify_pending_replay()
+        elif scenario == "rank-snapshot-create-pending-replay":
+            self.run_rank_snapshot_create_pending_replay()
         elif scenario == "audit-turn-attribution-pending-replay":
             self.run_audit_turn_attribution_pending_replay()
         elif scenario == "storefront-create-pending-replay":
