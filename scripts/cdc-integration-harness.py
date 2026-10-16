@@ -10061,11 +10061,24 @@ DELIMITER ;
             "FROM cdc.sync_runs "
             f"WHERE run_id='{run_id}' AND stage='rows' AND table_name='wide_children';",
         ).strip()
+        phases = self.admin_query(
+            self.target,
+            "SELECT phase,complete,chunks,rows_scanned,updates FROM cdc.sync_runs_phases "
+            f"WHERE run_id='{run_id}' AND table_name='wide_children' ORDER BY phase;",
+        ).splitlines()
         if drift != "0":
             raise HarnessError(f"wide sync left divergent rows: {drift}")
-        if progress != 'complete	["129"]	129	2':
+        # Each phase scans one full 129-row page plus the terminal empty page;
+        # the aggregate Rows record sums the three phases.
+        if phases != [
+            "delete_extras\t1\t2\t129\t0",
+            "insert_missing\t1\t2\t129\t0",
+            "update_divergent\t1\t2\t129\t129",
+        ]:
+            raise HarnessError(f"wide sync phase progress mismatch: {phases!r}")
+        if progress != 'complete	["129"]	129	6':
             raise HarnessError(f"wide sync progress mismatch: {progress!r}")
-        print("sync_wide_update_ok rows=129 updates=129 chunks=2")
+        print("sync_wide_update_ok rows=129 updates=129 chunks=6")
 
     def run_sync_bit_values(self) -> None:
         assert self.source and self.target
