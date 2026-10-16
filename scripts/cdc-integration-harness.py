@@ -10208,14 +10208,18 @@ DELIMITER ;
         # Phases commit separately in order insert_missing, update_divergent,
         # delete_extras. insert_missing durably inserts id 4 before the update
         # chunk fails; that chunk rolls back and delete_extras never runs, so
-        # target-only id 2 survives.
+        # target-only id 2 survives. The trigger rejects only id 3, so id 1's
+        # update in the same chunk must also be rolled back.
         expected = sorted(
             before + source_four, key=lambda row: int(row.split("\t", 1)[0])
         )
         self.admin_sql(
             self.target,
+            "DELIMITER //\n"
             f"CREATE TRIGGER reject_bit_update BEFORE UPDATE ON {table} FOR EACH ROW "
-            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected BIT update rollback';",
+            "BEGIN IF OLD.id = 3 THEN "
+            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected BIT update rollback'; "
+            "END IF; END//\nDELIMITER ;\n",
         )
         try:
             failed = self.run_sync(tables=[table], run_id=run_id, chunk_size=3)
@@ -10453,6 +10457,19 @@ DELIMITER ;
             except HarnessError as error:
                 if "unknown thread id" not in str(error).lower():
                     raise
+        # KILL only flags the thread; wait until it is gone so releasing the
+        # lock holder cannot let the parked progress INSERT win the lock.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            remaining = self.admin_query(
+                self.target,
+                "SELECT COUNT(*) FROM performance_schema.threads "
+                f"WHERE PROCESSLIST_USER='{SYNC_TARGET_USER}';",
+            ).strip()
+            if remaining == "0":
+                return
+            time.sleep(0.05)
+        raise HarnessError("killed sync target connections did not exit")
 
     def schema_fixture_constraints(self) -> str:
         assert self.target
