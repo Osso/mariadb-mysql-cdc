@@ -1072,9 +1072,24 @@ class Harness:
             "SELECT stage,table_name,status,rows_scanned FROM cdc.sync_runs "
             "WHERE run_id='sync-tls' ORDER BY FIELD(stage,'prerequisite_schema','rows','final_constraints');",
         ).splitlines()
+        phases = self.admin_query(
+            self.target,
+            "SELECT phase,complete,chunks,rows_scanned,inserts,updates,deletes "
+            "FROM cdc.sync_runs_phases "
+            "WHERE run_id='sync-tls' AND table_name='accounts' ORDER BY phase;",
+        ).splitlines()
+        # Each phase scans all 4 source rows in 3 chunks (2 rows, 2 rows, terminal
+        # empty page); the aggregate `rows` record sums the three phases.
+        expected_phases = [
+            "delete_extras	1	3	4	0	0	0",
+            "insert_missing	1	3	4	4	0	0",
+            "update_divergent	1	3	4	0	0	0",
+        ]
+        if phases != expected_phases:
+            raise HarnessError(f"sync TLS phase progress mismatch: {phases!r}")
         expected_progress = [
             "prerequisite_schema	accounts	complete	0",
-            "rows	accounts	complete	4",
+            "rows	accounts	complete	12",
             "final_constraints	accounts	complete	0",
         ]
         if progress_rows != expected_progress:
