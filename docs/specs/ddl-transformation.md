@@ -124,8 +124,9 @@ combination. Final independent verification at `e6df93a` passed 954 Rust tests
 (18 existing ignored), formatting, compilation, strict Clippy, and changed-line
 readability; six Python tests retain their passing `221b27a` proof under unchanged
 deployment-script scope. Both exact native scenarios passed on MySQL 8.4.8.
-The final code gate is PASS; operational catch-up remains in progress, so neither
-bounded capability proof nor that gate claims whole-goal completion.
+The final code gate is PASS. Operational catch-up is a separate incident-history
+gate; neither bounded capability proof nor this code gate claims whole-goal
+completion.
 
 #### Explicit source COPY/SHARED ALTER (bounded native and deployment proof)
 
