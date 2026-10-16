@@ -8782,11 +8782,26 @@ DELIMITER ;
             "inserts_applied,updates_applied,deletes_applied FROM cdc.sync_runs "
             f"WHERE run_id='{run_id}' AND stage='rows' AND table_name='comics_top_stats';",
         ).strip()
-        if progress != 'complete	["13553","loved"]	3	3	1	1	0':
+        # Each mutation phase scans all 3 source rows in 3 chunks (2 rows, 1 row,
+        # terminal empty page); the legacy `rows` record aggregates the phases.
+        phases = self.admin_query(
+            self.target,
+            "SELECT phase,complete,chunks,rows_scanned,inserts,updates,deletes "
+            "FROM cdc.sync_runs_phases "
+            f"WHERE run_id='{run_id}' AND table_name='comics_top_stats' ORDER BY phase;",
+        ).splitlines()
+        expected_phases = [
+            "delete_extras	1	3	3	0	0	0",
+            "insert_missing	1	3	3	1	0	0",
+            "update_divergent	1	3	3	0	1	0",
+        ]
+        if phases != expected_phases:
+            raise HarnessError(f"composite ENUM phase progress is wrong: {phases!r}")
+        if progress != 'complete	["13553","loved"]	9	9	1	1	0':
             raise HarnessError(f"composite ENUM progress is wrong: {progress!r}")
         print(
             "sync_composite_enum_primary_key_ok "
-            "rows_scanned=3 inserts=1 updates=1 deletes=0"
+            "phase_rows_scanned=3x3 inserts=1 updates=1 deletes=0"
         )
 
     def run_sync_enum_primary_key_batched_mutations(self) -> None:
