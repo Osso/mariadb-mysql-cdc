@@ -10240,9 +10240,27 @@ DELIMITER ;
         return self.admin_query(
             self.target,
             "SELECT run_spec_json FROM cdc.sync_runs "
-            f"WHERE run_id={sql_literal(run_id)} AND stage='rows' "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='prerequisite_schema' "
             f"AND table_name={sql_literal(table)};",
         ).strip()
+
+    def sync_phase_progress(self, run_id: str, table: str) -> dict[str, dict[str, str]]:
+        assert self.target
+        output = self.admin_query(
+            self.target,
+            "SELECT phase,complete,chunks,inserts,updates,deletes,"
+            "IF(last_primary_key_json IS NULL,'<NULL>',last_primary_key_json) "
+            f"FROM cdc.sync_runs_phases WHERE run_id={sql_literal(run_id)} "
+            f"AND table_name={sql_literal(table)} ORDER BY phase;",
+        ).strip()
+        keys = ("complete", "chunks", "inserts", "updates", "deletes", "last_primary_key_json")
+        phases = {}
+        for line in output.splitlines():
+            fields = line.split("\t")
+            if len(fields) != 7:
+                raise HarnessError(f"unexpected phase progress for {table}: {output!r}")
+            phases[fields[0]] = dict(zip(keys, fields[1:]))
+        return phases
 
     def wait_for_schema_fixture(
         self, sql: str, expected: str, process: subprocess.Popen[str], log_path: Path
@@ -10300,6 +10318,70 @@ DELIMITER ;
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+
+    def start_user_lock_holder(self, lock_name: str) -> tuple[subprocess.Popen[str], int]:
+        assert self.target
+        sleeping_query = f"SELECT SLEEP(240),{sql_literal(lock_name + '_holder')}"
+        process = self.start_query(
+            self.target,
+            f"SELECT GET_LOCK({sql_literal(lock_name)},0); {sleeping_query};",
+            user="root",
+            password=ADMIN_PASSWORD,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            owner = self.admin_query(
+                self.target,
+                "SELECT t.PROCESSLIST_ID FROM performance_schema.threads t "
+                f"WHERE t.PROCESSLIST_INFO={sql_literal(sleeping_query)} "
+                f"AND t.PROCESSLIST_ID=IS_USED_LOCK({sql_literal(lock_name)});",
+            ).strip()
+            if owner:
+                return process, int(owner)
+            if process.poll() is not None:
+                break
+            time.sleep(0.1)
+        process.kill()
+        process.wait(timeout=10)
+        raise HarnessError(f"user lock holder did not acquire {lock_name}")
+
+    def wait_for_sync_user_lock_wait(
+        self, lock_name: str, process: subprocess.Popen[str], log_path: Path
+    ) -> None:
+        assert self.target
+        pending_sql = (
+            "SELECT t.PROCESSLIST_ID FROM performance_schema.metadata_locks m "
+            "JOIN performance_schema.threads t ON t.THREAD_ID=m.OWNER_THREAD_ID "
+            f"WHERE t.PROCESSLIST_USER='{SYNC_TARGET_USER}' "
+            "AND m.OBJECT_TYPE='USER LEVEL LOCK' "
+            f"AND m.OBJECT_NAME={sql_literal(lock_name)} AND m.LOCK_STATUS='PENDING';"
+        )
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise HarnessError(
+                    f"sync exited before reaching {lock_name}: {log_path.read_text()}"
+                )
+            if self.admin_query(self.target, pending_sql).strip():
+                return
+            time.sleep(0.05)
+        raise HarnessError(f"sync never waited on {lock_name}: {log_path.read_text()}")
+
+    def kill_sync_target_connections(self) -> None:
+        # Kill server threads too, so the parked progress INSERT cannot finish
+        # once the lock holder is released.
+        assert self.target
+        connections = self.admin_query(
+            self.target,
+            "SELECT PROCESSLIST_ID FROM performance_schema.threads "
+            f"WHERE PROCESSLIST_USER='{SYNC_TARGET_USER}';",
+        ).split()
+        for connection in connections:
+            try:
+                self.admin_sql(self.target, f"KILL CONNECTION {connection};")
+            except HarnessError as error:
+                if "unknown thread id" not in str(error).lower():
+                    raise
 
     def schema_fixture_constraints(self) -> str:
         assert self.target
@@ -11279,49 +11361,79 @@ DELIMITER ;
         self.admin_sql(self.source, f"INSERT INTO {complete_table} VALUES {complete_values};")
         self.admin_sql(self.source, f"INSERT INTO {running_table} VALUES {running_values};")
 
-        process, log_path = self.start_sync(
-            tables=tables,
-            run_id=run_id,
-            chunk_size=10,
-            parallelism=1,
+        # Since c93bf5d, mid-table cursors live only in cdc.sync_runs_phases;
+        # aggregate cdc.sync_runs rows-stage rows are written after every table
+        # finishes all phases. Park the running table's insert_missing cursor save
+        # for chunk 151 on a held user lock, then kill sync while provably mid-table.
+        pause_lock = "sync_resume_pause"
+        self.admin_sql(
+            self.target,
+            "DELIMITER //\n"
+            "CREATE TRIGGER cdc.pause_sync_resume BEFORE INSERT ON cdc.sync_runs_phases "
+            f"FOR EACH ROW BEGIN IF NEW.table_name={sql_literal(running_table)} "
+            "AND NEW.phase='insert_missing' AND NEW.chunks>150 THEN "
+            f"SET @cdc_sync_resume_pause=GET_LOCK({sql_literal(pause_lock)},240); "
+            "END IF; END//\nDELIMITER ;\n",
         )
-        deadline = time.monotonic() + 90
-        boundary = ""
+        holder = self.start_user_lock_holder(pause_lock)
+        process = None
         try:
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise HarnessError(
-                        f"sync resume exited before interruption: {log_path.read_text()}"
-                    )
-                boundary = self.admin_query(
-                    self.target,
-                    "SELECT table_name,status,chunks FROM cdc.sync_runs "
-                    f"WHERE run_id={sql_literal(run_id)} AND stage='rows' "
-                    "ORDER BY table_name;",
-                ).strip()
-                rows = [line.split("\t") for line in boundary.splitlines()]
-                progress = {
-                    fields[0]: (fields[1], int(fields[2]))
-                    for fields in rows
-                    if len(fields) == 3
-                }
-                complete = progress.get(complete_table)
-                running = progress.get(running_table)
-                if (
-                    complete is not None
-                    and complete[0] == "complete"
-                    and running is not None
-                    and running[0] == "running"
-                    and running[1] >= 150
-                ):
-                    break
-                time.sleep(0.05)
-            else:
-                raise HarnessError(
-                    f"sync resume did not reach complete/running boundary: {boundary!r}"
-                )
-        finally:
+            process, log_path = self.start_sync(
+                tables=tables,
+                run_id=run_id,
+                chunk_size=10,
+                parallelism=1,
+            )
+            self.wait_for_sync_user_lock_wait(pause_lock, process, log_path)
             self.stop_sync_process(process)
+            self.kill_sync_target_connections()
+        finally:
+            if process is not None:
+                self.stop_sync_process(process)
+            self.release_schema_metadata_blocker(holder)
+            self.admin_sql(self.target, "DROP TRIGGER cdc.pause_sync_resume;")
+
+        aggregate_rows = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM cdc.sync_runs "
+            f"WHERE run_id={sql_literal(run_id)} AND stage='rows';",
+        ).strip()
+        if aggregate_rows != "0":
+            raise HarnessError(
+                f"interrupted sync wrote aggregate rows progress early: {aggregate_rows}"
+            )
+        complete_before = self.sync_phase_progress(run_id, complete_table)
+        running_before = self.sync_phase_progress(run_id, running_table)
+        complete_insert = complete_before.get("insert_missing", {})
+        running_insert = running_before.get("insert_missing", {})
+        if (
+            list(complete_before) != ["insert_missing"]
+            or complete_insert["complete"] != "1"
+            or complete_insert["inserts"] != "30"
+        ):
+            raise HarnessError(f"completed table phase boundary mismatch: {complete_before!r}")
+        if (
+            list(running_before) != ["insert_missing"]
+            or running_insert["complete"] != "0"
+            or running_insert["chunks"] != "150"
+            or running_insert["inserts"] != "1500"
+            or json.loads(running_insert["last_primary_key_json"]) != ["1500"]
+        ):
+            raise HarnessError(f"running table did not stop at chunk 150: {running_before!r}")
+
+        source_before = {table: self.sync_table_state(self.source, table) for table in tables}
+        target_before = {table: self.sync_table_state(self.target, table) for table in tables}
+        if source_before[complete_table] != target_before[complete_table]:
+            raise HarnessError(
+                "completed table was not converged before resume: "
+                f"source={source_before[complete_table]} target={target_before[complete_table]}"
+            )
+        # Chunk 151 committed its rows before its cursor save was parked.
+        if target_before[running_table][:2] != (1510, 1510):
+            raise HarnessError(
+                "running table target did not hold exactly chunks 1-151 before resume: "
+                f"target={target_before[running_table]}"
+            )
 
         legacy_specs = {
             complete_table: '{"legacy":"completed-table"}',
@@ -11332,36 +11444,9 @@ DELIMITER ;
                 self.target,
                 "UPDATE cdc.sync_runs "
                 f"SET run_spec_json={sql_literal(value)} "
-                f"WHERE run_id={sql_literal(run_id)} AND stage='rows' "
+                f"WHERE run_id={sql_literal(run_id)} AND stage='prerequisite_schema' "
                 f"AND table_name={sql_literal(table)};",
             )
-
-        complete_before = self.sync_row_progress_evidence(run_id, complete_table)
-        running_before = self.sync_row_progress_evidence(run_id, running_table)
-        if complete_before["status"] != "complete" or running_before["status"] != "running":
-            raise HarnessError(
-                "interrupted sync did not retain exact complete/running boundary: "
-                f"complete={complete_before!r} running={running_before!r}"
-            )
-        if int(running_before["chunks"]) < 150:
-            raise HarnessError(f"running progress regressed before resume: {running_before!r}")
-
-        source_before = {table: self.sync_table_state(self.source, table) for table in tables}
-        target_before = {table: self.sync_table_state(self.target, table) for table in tables}
-        if source_before[complete_table] != target_before[complete_table]:
-            raise HarnessError(
-                "completed table was not converged before resume: "
-                f"source={source_before[complete_table]} target={target_before[complete_table]}"
-            )
-        running_source_count = source_before[running_table][0]
-        running_target_count, running_target_distinct, _ = target_before[running_table]
-        if not 0 < running_target_count < running_source_count:
-            raise HarnessError(
-                "running table target was not partially converged before resume: "
-                f"source={source_before[running_table]} target={target_before[running_table]}"
-            )
-        if running_target_count != running_target_distinct:
-            raise HarnessError(f"running table had duplicate target PKs: {target_before[running_table]}")
         legacy_before = {
             table: self.sync_legacy_run_spec(run_id, table) for table in tables
         }
@@ -11388,41 +11473,37 @@ DELIMITER ;
                 f"sync resume entered obsolete run-spec path: {forbidden_output!r}"
             )
 
-        complete_after = self.sync_row_progress_evidence(run_id, complete_table)
-        running_after = self.sync_row_progress_evidence(run_id, running_table)
-        if complete_after != complete_before:
+        complete_after = self.sync_phase_progress(run_id, complete_table)
+        running_after = self.sync_phase_progress(run_id, running_table)
+        if complete_after["insert_missing"] != complete_insert:
             raise HarnessError(
-                "completed table row progress changed during resume: "
-                f"before={complete_before!r} after={complete_after!r}"
+                "completed insert phase changed during resume: "
+                f"before={complete_insert!r} after={complete_after['insert_missing']!r}"
             )
-        if running_after["status"] != "complete":
-            raise HarnessError(f"running table did not complete: {running_after!r}")
-        for counter in (
-            "chunks",
-            "rows_scanned",
-            "inserts_applied",
-            "updates_applied",
-            "deletes_applied",
+        resumed_insert = running_after["insert_missing"]
+        # Resuming from the 150-chunk cursor accumulates onto 1500 inserts; the
+        # 10 rows of uncursored chunk 151 already exist and are not reinserted.
+        # Rows 1501-4000 at chunk size 37 take 68 chunks plus one empty tail.
+        if (
+            resumed_insert["complete"] != "1"
+            or resumed_insert["chunks"] != "219"
+            or json.loads(resumed_insert["last_primary_key_json"]) != ["4000"]
+            or resumed_insert["inserts"] != "3990"
         ):
-            if int(running_after[counter]) < int(running_before[counter]):
-                raise HarnessError(
-                    f"running table {counter} regressed: "
-                    f"before={running_before[counter]} after={running_after[counter]}"
-                )
-        if int(running_after["chunks"]) <= int(running_before["chunks"]):
             raise HarnessError(
-                "running table did not advance from persisted chunks: "
-                f"before={running_before!r} after={running_after!r}"
+                f"running insert phase did not resume from its cursor: {resumed_insert!r}"
             )
-        before_primary_key = int(json.loads(running_before["last_primary_key_json"])[0])
-        after_primary_key = int(json.loads(running_after["last_primary_key_json"])[0])
-        if after_primary_key <= before_primary_key:
-            raise HarnessError(
-                "running table did not advance from persisted cursor: "
-                f"before={before_primary_key} after={after_primary_key}"
-            )
-        if running_after["created_at"] != running_before["created_at"]:
-            raise HarnessError("running table progress was recreated instead of resumed")
+        for table, phases in ((complete_table, complete_after), (running_table, running_after)):
+            if sorted(phases) != ["delete_extras", "insert_missing", "update_divergent"] or any(
+                phase["complete"] != "1" for phase in phases.values()
+            ):
+                raise HarnessError(f"resume left incomplete phases for `{table}`: {phases!r}")
+        aggregate_inserts = {
+            table: self.sync_row_progress_evidence(run_id, table)["inserts_applied"]
+            for table in tables
+        }
+        if aggregate_inserts != {complete_table: "30", running_table: "3990"}:
+            raise HarnessError(f"aggregate rows progress mismatch: {aggregate_inserts!r}")
 
         legacy_after = {
             table: self.sync_legacy_run_spec(run_id, table) for table in tables
@@ -11479,14 +11560,9 @@ DELIMITER ;
         print(
             "sync_resume_ok same_run_id=true target_address_changed=true parallelism=16 "
             "completed_table_preserved=true running_table_resumed=true "
-            f"completed_chunks={complete_before['chunks']} "
-            f"completed_pk={complete_before['last_primary_key_json']} "
-            f"running_chunks_before={running_before['chunks']} "
-            f"running_rows_before={running_before['rows_scanned']} "
-            f"running_pk_before={running_before['last_primary_key_json']} "
-            f"running_chunks_after={running_after['chunks']} "
-            f"running_rows_after={running_after['rows_scanned']} "
-            f"running_pk_after={running_after['last_primary_key_json']} "
+            f"completed_insert_phase={complete_insert!r} "
+            f"running_insert_before={running_insert!r} "
+            f"running_insert_after={resumed_insert!r} "
             "legacy_specs_unchanged=true final_stage_rows=6"
         )
 
