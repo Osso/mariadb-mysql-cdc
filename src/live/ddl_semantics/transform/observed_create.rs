@@ -622,7 +622,7 @@ impl Parser {
         super::basic_types::normalize_numeric_default(column_type, &literal)
     }
 
-    /// Consumes `CURRENT_TIMESTAMP` or `CURRENT_TIMESTAMP(6)` matching the column precision.
+    /// Consumes CURRENT_TIMESTAMP with the column precision; empty parentheses mean zero.
     fn current_timestamp(&mut self, column_type: &str) -> Result<String, String> {
         self.keyword("CURRENT_TIMESTAMP")?;
         let expected = current_timestamp_for(column_type);
@@ -635,7 +635,11 @@ impl Parser {
             self.keyword(&precision)?;
             self.keyword(")")?;
         } else if self.at("(") {
-            return Err("CURRENT_TIMESTAMP precision does not match the column".into());
+            self.keyword("(")?;
+            if self.at("0") {
+                self.keyword("0")?;
+            }
+            self.keyword(")")?;
         }
         Ok(expected)
     }
@@ -838,6 +842,63 @@ pub(super) fn remove_ordinary_comments_with_mode(
 mod tests {
     use super::super::super::model::CheckPredicate;
     use super::*;
+
+    #[test]
+    fn rank_snapshot_create_accepts_empty_current_timestamp_precision() {
+        let sql = include_str!("../../../../fixtures/ddl/create-rank-snapshot-runs.sql");
+        let ast = parse(sql).expect("exact rank snapshot CREATE");
+        assert_eq!(ast.columns.len(), 6);
+        assert_eq!(ast.columns[0].column_type, "enum('comics','releases')");
+        assert_eq!(ast.columns[2].column_type, "smallint unsigned");
+        assert_eq!(ast.columns[4].column_type, "mediumint unsigned");
+        assert_eq!(ast.columns[4].default_sql.as_deref(), Some("0"));
+        assert_eq!(
+            ast.columns[5].default_sql.as_deref(),
+            Some("CURRENT_TIMESTAMP")
+        );
+        assert_eq!(
+            ast.primary_key,
+            ["scope", "statistic", "period", "snapshot_date"]
+        );
+        assert!(super::super::supports_fixture_create_table(sql));
+    }
+
+    #[test]
+    fn zero_precision_current_timestamp_spellings_preserve_default_and_on_update() {
+        for spelling in [
+            "CURRENT_TIMESTAMP",
+            "CURRENT_TIMESTAMP()",
+            "CURRENT_TIMESTAMP(0)",
+        ] {
+            let sql = format!(
+                "CREATE TABLE t (id INT PRIMARY KEY, created TIMESTAMP NOT NULL DEFAULT {spelling}, updated DATETIME NOT NULL DEFAULT {spelling} ON UPDATE {spelling}) ENGINE=InnoDB"
+            );
+            let ast = parse(&sql).expect("equivalent zero-precision default");
+            assert_eq!(
+                ast.columns[1].default_sql.as_deref(),
+                Some("CURRENT_TIMESTAMP")
+            );
+            assert_eq!(
+                ast.columns[2].default_sql.as_deref(),
+                Some("CURRENT_TIMESTAMP")
+            );
+            assert!(ast.columns[2].on_update_current_timestamp);
+        }
+        for definition in [
+            "TIMESTAMP DEFAULT CURRENT_TIMESTAMP(1)",
+            "TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP()",
+            "TIMESTAMP DEFAULT CURRENT_TIMESTAMP(0,0)",
+            "TIMESTAMP DEFAULT CURRENT_TIMESTAMP(foo)",
+        ] {
+            assert!(
+                parse(&format!(
+                    "CREATE TABLE t (id INT PRIMARY KEY, created {definition}) ENGINE=InnoDB"
+                ))
+                .is_err(),
+                "{definition}"
+            );
+        }
+    }
 
     #[test]
     fn ordinary_create_preserves_optional_clauses_and_nullable_defaults() {
