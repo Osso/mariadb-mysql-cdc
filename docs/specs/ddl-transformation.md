@@ -75,10 +75,28 @@ ALTER ENUM string defaults remain unsupported; existing NULL handling is unchang
 
 | Capability | Boundary | Proof level |
 |---|---|---|
-| Exact ENUM MODIFY | Preserve typed labels and render one ALTER; derive expected post-state without changing unrelated metadata. | Targeted regression tests; native execution not claimed here. |
+| Exact ENUM MODIFY | Preserve typed labels and render one atomic ALTER; derive expected post-state without changing unrelated metadata. | Targeted regression tests and native MySQL 8.4.8 PASS for the exact append-only fixture. |
 | Case/order, encoding, literal consumption | Preserve mixed-case ordered labels, explicit encoding, COMMENT and later-column literals; reject unmodeled grammar. | Targeted parser/rendering/semantic-state tests. |
-| Composite-PK queued rows and restart | CREATE/TABLE_MAP evidence does not prove MODIFY-on-composite-PK recovery. | Native scenario `statistic-enum-modify-pending-replay` is separate; execution pending. |
+| Composite-PK queued rows and restart | Exact append-only MODIFY preserves old labels, ordinals, data, inherited utf8mb3, composite primary key, and secondary indexes. | Native `statistic-enum-modify-pending-replay` PASS: queued INSERT, primary-key-changing UPDATE, DELETE; invalid ENUM, NULL, and duplicate rejection; post-DDL/pre-applied crash recovery and final checkpointed restart no-op. |
 | Reorder/removal/conversion | No broader runtime compatibility claim from accepting bounded syntax. | Native data/recovery proof not established. |
+
+Native execution used the binary built at `3e59295` and harness `f861d19`;
+deployed source `221b27a` has identical Rust and harness trees. This proof is not
+attributed to a later documentation revision. The scenario extracted the genuine
+previously deployed `48c775d` binary from its pinned image digest, reproduced its
+pending event, then upgraded while preserving the raw comment and the same durable
+journal identity and `created_at`. It observed exactly one atomic ALTER with
+production grouping of 100 rows / 200 ms.
+
+The first native attempt failed because the harness counter matched two journal
+writes as well as the actual ALTER. The harness-only statement-prefix correction
+changed no Rust code; the second native run passed. This proves only the exact
+append-only slice above, not reordering, removal, conversion, ENUM string defaults,
+or unmodeled labels. Parser support for ADD/CHANGE is not native recovery proof.
+Independent verification at `221b27a` passed 952 Rust tests (18 ignored), six
+Python tests, formatting, compilation, strict Clippy, and changed-line readability.
+That gate predates the zero-precision timestamp correction below and does not
+claim overall restoration or catch-up.
 
 #### Zero-precision CURRENT_TIMESTAMP spellings
 
@@ -90,8 +108,13 @@ Nonzero column precision still requires the matching explicit argument;
 empty parentheses on precision-six columns and mismatched/malformed arguments
 remain barriers. Exact commented `create-rank-snapshot-runs.sql` covers this
 CREATE with ENUM/composite primary key and unsigned integer display widths.
-Focused regression tests cover the spellings and rejection boundaries; native
-pending/crash/restart and operational catch-up proof remain pending.
+Focused regression tests cover the spellings and rejection boundaries. Native
+MySQL 8.4.8 `rank-snapshot-create-pending-replay` passed at `03068fb` using the
+previously deployed `221b27a` binary: authentic pending promotion, one CREATE,
+composite ENUM primary key, omitted count/timestamp defaults, queued INSERT,
+UPDATE and DELETE, post-DDL/pre-applied crash recovery and checkpointed restart
+without repeated CREATE. Final independent and operational catch-up gates remain
+pending.
 
 #### Explicit source COPY/SHARED ALTER (bounded native and deployment proof)
 
