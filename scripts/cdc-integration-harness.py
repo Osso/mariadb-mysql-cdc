@@ -3664,6 +3664,7 @@ DELIMITER ;
                 raise HarnessError(f"ENUM queued DML differs at {endpoint.container}")
             self.assert_admin_sql_rejected(endpoint, "INSERT INTO releases_top_stats(release_id,statistic) VALUES(1,'revenue');", "1062")
             self.assert_admin_sql_rejected(endpoint, "INSERT INTO releases_top_stats(release_id,statistic) VALUES(3,'unknown');", "1265")
+            self.assert_admin_sql_rejected(endpoint, "INSERT INTO releases_top_stats(release_id,statistic) VALUES(3,NULL);", "1048")
         if self.statistic_enum_snapshot(self.target) != before:
             raise HarnessError("ENUM MODIFY changed unrelated metadata/indexes/collation")
         checkpoint = self.checkpoint()
