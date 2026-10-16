@@ -10174,14 +10174,44 @@ DELIMITER ;
             f"WHERE run_id={sql_literal(run_id)} AND stage='rows' "
             f"AND table_name={sql_literal(table)};",
         ).strip()
-        if progress != 'complete\t["6"]\t3\t5\t1\t4\t1':
+        # Each phase scans 5 source keys in two 3-row pages plus the terminal
+        # empty page; the aggregate Rows record sums the three phases.
+        phases = self.sync_phase_rows(run_id, table)
+        if phases != [
+            'delete_extras\t["6"]\t1\t3\t5\t0\t0\t1',
+            'insert_missing\t["6"]\t1\t3\t5\t1\t0\t0',
+            'update_divergent\t["6"]\t1\t3\t5\t0\t4\t0',
+        ]:
+            raise HarnessError(f"sync BIT values phase progress mismatch: {phases!r}")
+        if progress != 'complete\t["6"]\t9\t15\t1\t4\t1':
             raise HarnessError(f"sync BIT values progress mismatch: {progress!r}")
         print(
-            "sync_bit_values_ok rows=5 updates=4 inserts=1 deletes=1 chunks=3 rollback=true"
+            "sync_bit_values_ok rows=5 updates=4 inserts=1 deletes=1 chunks=9 rollback=true"
         )
 
+    def sync_phase_rows(self, run_id: str, table: str) -> list[str]:
+        return self.admin_query(
+            self.target,
+            "SELECT phase,COALESCE(last_primary_key_json,'NULL'),complete,chunks,"
+            "rows_scanned,inserts,updates,deletes FROM cdc.sync_runs_phases "
+            f"WHERE run_id={sql_literal(run_id)} AND table_name={sql_literal(table)} "
+            "ORDER BY phase;",
+        ).splitlines()
+
     def assert_sync_bit_rollback(self, table: str, run_id: str, select: str) -> None:
-        before = self.admin_query(self.target, select)
+        before = self.admin_query(self.target, select).splitlines()
+        source_four = [
+            row
+            for row in self.admin_query(self.source, select).splitlines()
+            if row.split("\t", 1)[0] == "4"
+        ]
+        # Phases commit separately in order insert_missing, update_divergent,
+        # delete_extras. insert_missing durably inserts id 4 before the update
+        # chunk fails; that chunk rolls back and delete_extras never runs, so
+        # target-only id 2 survives.
+        expected = sorted(
+            before + source_four, key=lambda row: int(row.split("\t", 1)[0])
+        )
         self.admin_sql(
             self.target,
             f"CREATE TRIGGER reject_bit_update BEFORE UPDATE ON {table} FOR EACH ROW "
@@ -10194,9 +10224,18 @@ DELIMITER ;
                 raise HarnessError(
                     f"BIT rollback fixture did not reach its update failure: {error}"
                 )
-            if self.admin_query(self.target, select) != before:
+            after = self.admin_query(self.target, select).splitlines()
+            if len(source_four) != 1 or after != expected:
                 raise HarnessError(
-                    "failed BIT update did not roll back preceding target-only deletion"
+                    "failed BIT update changed target beyond committed insert_missing: "
+                    f"expected={expected!r} after={after!r}"
+                )
+            phases = self.sync_phase_rows(run_id, table)
+            if phases != [
+                'insert_missing\t["6"]\t1\t3\t5\t1\t0\t0',
+            ]:
+                raise HarnessError(
+                    f"failed BIT update phase cursors mismatch: {phases!r}"
                 )
             advanced = self.admin_query(
                 self.target,
