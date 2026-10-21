@@ -40,6 +40,7 @@ pub enum MySqlValue {
     Bit(Vec<bool>),
     Enum(u32),
     Set(u64),
+    /// Raw bytes, including string-family payloads that are not valid UTF-8.
     Blob(Vec<u8>),
     Year(u16),
     Date(Date),
