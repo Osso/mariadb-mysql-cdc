@@ -135,6 +135,10 @@ fn query_event_precheck(
         state.clear_query_context();
         return Ok(Some(EventPolicy::Ignore));
     }
+    if crate::statement::is_skipped_administrative_statement(&query.sql_statement) {
+        state.clear_query_context();
+        return Ok(Some(EventPolicy::CommitTransaction));
+    }
     Ok(None)
 }
 

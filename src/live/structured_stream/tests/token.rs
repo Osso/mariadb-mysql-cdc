@@ -127,6 +127,42 @@ fn transaction_control_query_is_ignored_without_source_database_filter() {
 }
 
 #[test]
+fn qualified_source_grant_is_skipped_without_target_mutation() {
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("globalcomix".to_string()));
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: Vec::new(),
+        database_name: "globalcomix".to_string(),
+        sql_statement: "GRANT DELETE ON globalcomix.comics_releases_views TO 'bigquery_sync'@'%'"
+            .to_string(),
+    });
+
+    let outcome = handle_structured_event(
+        &mut applier,
+        &resolver,
+        &mut state,
+        "mysqld-bin.003369",
+        &event_header(99, 944970810),
+        &event,
+    )
+    .expect("administrative GRANT should be skipped");
+
+    assert_eq!(outcome.policy, EventPolicy::CommitTransaction);
+    assert!(
+        applier
+            .executor()
+            .statements
+            .borrow()
+            .iter()
+            .all(|statement| !statement.sql.contains("GRANT"))
+    );
+}
+
+#[test]
 fn non_source_query_and_rows_query_events_do_not_execute_sql_text() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;

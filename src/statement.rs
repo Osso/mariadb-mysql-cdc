@@ -547,6 +547,10 @@ fn is_skipped_administrative_ddl(sql: &str) -> bool {
     starts_with_any_ci(sql, SKIPPED_ADMINISTRATIVE_DDL_PREFIXES)
 }
 
+pub(crate) fn is_skipped_administrative_statement(sql: &str) -> bool {
+    is_skipped_administrative_ddl(&normalize_statement(sql))
+}
+
 fn starts_with_any_ci(sql: &str, prefixes: &[&str]) -> bool {
     let upper = sql.to_ascii_uppercase();
     prefixes.iter().any(|prefix| upper.starts_with(prefix))
