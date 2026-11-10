@@ -612,6 +612,7 @@ fn render_add_column(column: &ParsedAddColumnAst) -> String {
                 data_type,
                 "char"
                     | "varchar"
+                    | "enum"
                     | "binary"
                     | "varbinary"
                     | "date"
@@ -2753,7 +2754,7 @@ fn parse_basic_default(
         return Ok((None, index + 1));
     }
     let kind = column_type.split(['(', ' ']).next().unwrap_or(column_type);
-    if is_text_type(kind) || matches!(kind, "char" | "varchar") {
+    if is_text_type(kind) || matches!(kind, "char" | "varchar" | "enum") {
         require_keyword(tokens, index, "<string>")?;
         return Ok((Some(parse_string_default_literal(literals)?), index + 1));
     }
@@ -2798,7 +2799,7 @@ fn numeric_default_literal(
 }
 
 /// The literal a string `DEFAULT '...'` carries; TEXT columns receive it as a MySQL 8
-/// expression default, CHAR/VARCHAR columns as a quoted literal.
+/// expression default, CHAR/VARCHAR/ENUM columns as a quoted literal.
 fn parse_string_default_literal(
     literals: &mut impl Iterator<Item = String>,
 ) -> Result<String, String> {

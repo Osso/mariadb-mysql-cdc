@@ -89,6 +89,18 @@ fn alter_enum_preserves_case_order_encoding_and_literal_consumption() {
 }
 
 #[test]
+fn alter_enum_preserves_string_default_from_blocked_event() {
+    let sql = "ALTER TABLE comics MODIFY preview_context ENUM('releases','pages','percent') NOT NULL DEFAULT 'pages'";
+    let translated = super::super::transform::transform_production_alter_table(sql).unwrap();
+    assert_eq!(
+        translated.target_sql.as_deref(),
+        Some(
+            "ALTER TABLE `comics` MODIFY COLUMN `preview_context` ENUM('releases','pages','percent') NOT NULL DEFAULT 'pages'"
+        )
+    );
+}
+
+#[test]
 fn alter_enum_rejects_unmodeled_labels_and_syntax() {
     for definition in [
         "ENUM()",

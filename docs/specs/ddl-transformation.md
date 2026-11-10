@@ -71,7 +71,7 @@ The exact fixture `fixtures/ddl/modify-release-top-statistic-enum.sql` adds
 with an inert leading DBeaver comment and NOT NULL. No raw SQL fallback or
 per-table exception is admitted. Empty, punctuation/whitespace/non-ASCII labels,
 unquoted members, malformed lists, SET, and unmodeled qualifiers remain barriers.
-ALTER ENUM string defaults remain unsupported; existing NULL handling is unchanged.
+ALTER ENUM column definitions admit quoted ASCII string defaults; existing NULL handling is unchanged. The November 10 `comics.preview_context` event has a targeted translation regression test; native replay proof is pending.
 
 | Capability | Boundary | Proof level |
 |---|---|---|
