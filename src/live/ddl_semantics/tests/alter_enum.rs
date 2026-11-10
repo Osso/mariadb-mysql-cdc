@@ -105,6 +105,8 @@ fn alter_enum_preserves_string_default_from_blocked_event() {
     column.name = "preview_context".into();
     column.column_type = "enum('releases','pages')".into();
     column.data_type = "enum".into();
+    column.character_set = Some("utf8mb4".into());
+    column.collation = Some("utf8mb4_unicode_ci".into());
     column.is_nullable = false;
     column.default_value = Some("pages".into());
     target.inventory.indexes[0].table = table.name.clone();
