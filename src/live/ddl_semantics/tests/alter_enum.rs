@@ -98,6 +98,28 @@ fn alter_enum_preserves_string_default_from_blocked_event() {
             "ALTER TABLE `comics` MODIFY COLUMN `preview_context` ENUM('releases','pages','percent') NOT NULL DEFAULT 'pages'"
         )
     );
+    let mut target = semantic_snapshot(6, None);
+    let table = &mut target.inventory.tables[0];
+    table.name = "comics".into();
+    let column = &mut table.columns[1];
+    column.name = "preview_context".into();
+    column.column_type = "enum('releases','pages')".into();
+    column.data_type = "enum".into();
+    column.is_nullable = false;
+    column.default_value = Some("pages".into());
+    target.inventory.indexes[0].table = table.name.clone();
+    target.inventory.indexes[0].columns[0].name = "preview_context".into();
+    let runtime = target.table_runtime.remove("accounts").unwrap();
+    target.table_runtime.insert(table.name.clone(), runtime);
+    let operation = parse_ddl_operation(sql).unwrap();
+    let evidence = build_semantic_evidence(&operation, &target, &target).unwrap();
+    let mut expected = target.clone();
+    expected.inventory.tables[0].columns[1].column_type =
+        "enum('releases','pages','percent')".into();
+    assert_eq!(
+        evidence.expected_post_state,
+        super::super::canonical::observe_operation_state(&expected, &operation).unwrap()
+    );
 }
 
 #[test]

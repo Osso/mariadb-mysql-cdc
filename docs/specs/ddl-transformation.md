@@ -71,12 +71,12 @@ The exact fixture `fixtures/ddl/modify-release-top-statistic-enum.sql` adds
 with an inert leading DBeaver comment and NOT NULL. No raw SQL fallback or
 per-table exception is admitted. Empty, punctuation/whitespace/non-ASCII labels,
 unquoted members, malformed lists, SET, and unmodeled qualifiers remain barriers.
-ALTER ENUM column definitions admit quoted ASCII string defaults; existing NULL handling is unchanged. The November 10 `comics.preview_context` event has a targeted translation regression test; native replay proof is pending.
+ALTER ENUM column definitions admit quoted ASCII string defaults; existing NULL handling is unchanged. On November 10, the `comics.preview_context` event replayed in production and reached `checkpointed`; the target retained its `pages` default.
 
 | Capability | Boundary | Proof level |
 |---|---|---|
 | Exact ENUM MODIFY | Preserve typed labels and render one atomic ALTER; derive expected post-state without changing unrelated metadata. | Targeted regression tests and native MySQL 8.4.8 PASS for the exact append-only fixture. |
-| ENUM string default | Quoted ASCII default in a bounded ENUM column definition. | Exact `comics.preview_context` MODIFY translation regression; semantic post-state and native replay not yet proven. |
+| ENUM string default | Quoted ASCII default in a bounded ENUM column definition. | Exact `comics.preview_context` MODIFY translation and semantic-state regression; production journal and target metadata verify replay. Dedicated native harness replay is not yet proven. |
 | Case/order, encoding, literal consumption | Preserve mixed-case ordered labels, explicit encoding, COMMENT and later-column literals; reject unmodeled grammar. | Targeted parser/rendering/semantic-state tests. |
 | Composite-PK queued rows and restart | Exact append-only MODIFY preserves old labels, ordinals, data, inherited utf8mb3, composite primary key, and secondary indexes. | Native `statistic-enum-modify-pending-replay` PASS: queued INSERT, primary-key-changing UPDATE, DELETE; invalid ENUM, NULL, and duplicate rejection; post-DDL/pre-applied crash recovery and final checkpointed restart no-op. |
 | Reorder/removal/conversion | No broader runtime compatibility claim from accepting bounded syntax. | Native data/recovery proof not established. |
