@@ -31,6 +31,11 @@ replay-mismatched required context blocks. Admitted same-event `ADD COLUMN` plus
 `ALTER COLUMN SET/DROP DEFAULT` folds into one atomic target ADD with MariaDB's
 final default. These claims are limited to current source SQL-mode literal
 features and admitted AST forms; unsupported forms remain runtime barriers.
+The intended atomic unqualified multi-pair `RENAME TABLE` contract is described
+in the [multi-pair matrix](specs/ddl-transformation.md#atomic-multi-pair-table-rename-contract).
+Its implementation, tests, and deployment are not established by the historical
+single-pair proof above. Other unsupported forms remain blocked.
+
 Additional historical slices:
 
 - explicitly named, unqualified, visible, non-unique secondary BTREE `CREATE

@@ -27,6 +27,19 @@ allowlist.
       generated MySQL SQL, transformation version, source coordinate, pre-state,
       expected post-state, and observed post-state.
 
+### Atomic multi-pair table rename contract
+
+The following is intended support, not a claim of implementation, passing tests,
+production replay, or deployment. The observed production event contains two
+independent renames and an ordinary client comment.
+
+| Feature | Required boundary | Proof state |
+|---|---|---|
+| Parsing and representation | [ ] Accept unqualified ordered `RENAME TABLE old TO new [, old TO new ...]` pairs and ordinary inert comments. `DdlOperation.primary_object` and `secondary_object` identify the first pair; `TableOperation::Rename` carries all pairs in order. Reject malformed or qualified names, multiple statements, and executable comments. Other unsupported grammar remains blocked. | Unverified for multi-pair support. |
+| Atomic execution | [ ] Execute all pairs in one target SQL statement. Do not split them into separate statements. | Unverified for multi-pair support. |
+| State and safety | [ ] Snapshot every old and new name. Derive expected metadata left to right from target pre-state. Each source must be an InnoDB base table with exact runtime metadata. Missing origins or collisions at any step block without changes. | Unverified for multi-pair support. |
+| Recovery | [ ] Use normal journal and checkpoint reconciliation; do not manually skip checkpoints or override journal state. No migration fallback is permitted. | Unverified for multi-pair support. |
+
 ### Current implemented slice
 
 #### Basic common DDL expansion
