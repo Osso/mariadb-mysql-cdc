@@ -85,6 +85,7 @@ SCENARIOS = (
     ScenarioSpec("writable-column-generated-metadata", True),
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("add-char-column-pending-replay", True),
+    ScenarioSpec("commented-add-key-crash-replay", True),
     ScenarioSpec("add-signed-tinyint-pending-replay", True),
     ScenarioSpec("curated-strip-sale-alter-pending-replay", True),
     ScenarioSpec("basic-scalar-create-add-pending-replay", True),
@@ -2058,6 +2059,87 @@ DELIMITER ;
                 raise HarnessError(
                     f"post-DDL rows differ at {endpoint.container}: {rows!r}"
                 )
+
+    def run_commented_add_key_crash_replay(self) -> None:
+        assert self.source and self.target
+        table = "comics_contributors"
+        schema = (
+            f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY, "
+            "name VARCHAR(255) NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3; "
+            f"INSERT INTO {table} VALUES (1,'Ada Lovelace'),(2,NULL);"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, schema)
+
+        ddl = (
+            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ "
+            "ALTER TABLE comics_contributors ADD KEY idx_name (name)"
+        )
+        start, pending = self.prepare_pending_add_column("", ddl, "ADD KEY")
+        if pending["raw_sql"] != ddl:
+            raise HarnessError(f"source comment identity changed: {pending!r}")
+
+        crash = self.run_stream(
+            start,
+            self.coordinate(),
+            integration_failpoint="post-ddl-pre-applied",
+            binary=self.binary,
+        )
+        if crash.returncode != 70 or "cdc_integration_failpoint" not in (
+            crash.stdout + crash.stderr
+        ):
+            raise HarnessError(f"ADD KEY did not crash after application: {crash!r}")
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        if journal["status"] != "prepared" or journal["raw_sql"] != ddl:
+            raise HarnessError(f"crash did not preserve raw DDL journal: {journal!r}")
+        if (checkpoint["source_file"], checkpoint["source_position"]) != (
+            start.file,
+            start.position,
+        ):
+            raise HarnessError(f"crash advanced durable checkpoint: {checkpoint!r}")
+
+        stop = self.replay_pending_add_column(start, pending)
+        promoted = self.journal_full_row(int(pending["event_start_position"]))
+        if promoted["raw_sql"] != ddl or promoted["status"] != "checkpointed":
+            raise HarnessError(f"replay changed source DDL identity: {promoted!r}")
+        index = self.admin_query(
+            self.target,
+            "SELECT index_name,non_unique,seq_in_index,column_name,collation,"
+            "sub_part,nullable,index_type "
+            "FROM information_schema.statistics "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} "
+            f"AND table_name={sql_literal(table)} AND index_name='idx_name';",
+        ).strip()
+        if index != "idx_name\t1\t1\tname\tA\tNULL\tYES\tBTREE":
+            raise HarnessError(f"target ADD KEY metadata mismatch: {index!r}")
+        self.assert_post_ddl_rows(table, "1\tAda Lovelace\n2\tNULL")
+
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET name='Grace Hopper' WHERE id=1; "
+            f"INSERT INTO {table} VALUES (3,'Katherine Johnson');",
+        )
+        dml_stop = self.coordinate()
+        result = self.run_stream(stop, dml_stop, binary=self.binary)
+        require_success(result, "commented ADD KEY subsequent DML")
+        checkpoint = self.checkpoint()
+        if (checkpoint["source_file"], checkpoint["source_position"]) != (
+            dml_stop.file,
+            dml_stop.position,
+        ):
+            raise HarnessError(
+                f"subsequent DML checkpoint did not advance: {checkpoint!r}"
+            )
+        self.assert_post_ddl_rows(
+            table,
+            "1\tGrace Hopper\n2\tNULL\n3\tKatherine Johnson",
+        )
+        print(
+            "commented_add_key_crash_replay_ok raw_sql_preserved=true "
+            "durable_checkpoint=true index_metadata=true rows=true subsequent_dml=true "
+            f"coordinate={dml_stop.file}:{dml_stop.position}"
+        )
 
     def run_add_char_column_pending_replay(self) -> None:
         assert self.source
@@ -12062,6 +12144,8 @@ DELIMITER ;
             self.run_production_alter_table()
         elif scenario == "add-char-column-pending-replay":
             self.run_add_char_column_pending_replay()
+        elif scenario == "commented-add-key-crash-replay":
+            self.run_commented_add_key_crash_replay()
         elif scenario == "add-signed-tinyint-pending-replay":
             self.run_add_signed_tinyint_pending_replay()
         elif scenario == "curated-strip-sale-alter-pending-replay":
