@@ -3106,14 +3106,14 @@ DELIMITER ;
             f"INSERT INTO {occupied} VALUES (3);",
         )
         stop = self.coordinate()
-        replay = self.run_stream(start, stop)
+        replay = self.run_stream(start, stop, max_reconnects=1)
         if replay.returncode == 0:
             raise HarnessError(
                 "conflicting second destination did not block CDC replay"
             )
         journal = self.journal_full_row(int(pending["event_start_position"]))
         checkpoint = self.checkpoint()
-        if journal["status"] != "blocked" or (
+        if journal["status"] != "translation_pending" or (
             checkpoint["source_file"],
             checkpoint["source_position"],
         ) != (start.file, start.position):
@@ -3130,7 +3130,7 @@ DELIMITER ;
             ") AS rows_by_table GROUP BY table_name ORDER BY table_name;",
         ).strip()
         expected_failure_state = (
-            f"{occupied}\t3\n{failure_first}\t1\n{failure_second}\t2"
+            f"{failure_first}\t1\n{failure_second}\t2\n{occupied}\t3"
         )
         if names_and_rows != expected_failure_state:
             raise HarnessError(
