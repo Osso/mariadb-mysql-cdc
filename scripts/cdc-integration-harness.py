@@ -2179,13 +2179,20 @@ DELIMITER ;
                 "DROP TRIGGER",
             ),
             (
-                prefix + f"ALTER TABLE {table} RENAME COLUMN IF EXISTS old_value TO new_value",
+                prefix
+                + f"ALTER TABLE {table} RENAME COLUMN IF EXISTS old_value TO new_value",
                 "RENAME COLUMN IF EXISTS",
             ),
         )
         for ddl, marker in operations:
-            self.replay_common_ddl(ddl, marker, crash=True)
-            promoted = self.journal_full_row()
+            stop = self.replay_common_ddl(ddl, marker, crash=True)
+            event_start = self.admin_query(
+                self.target,
+                "SELECT event_start_position FROM cdc.ddl_replay_journal "
+                f"WHERE binlog_file={sql_literal(stop.file)} AND raw_sql={sql_literal(ddl)} "
+                "ORDER BY event_start_position DESC LIMIT 1;",
+            ).strip()
+            promoted = self.journal_full_row(int(event_start))
             if promoted["raw_sql"] != ddl or promoted["status"] != "checkpointed":
                 raise HarnessError(
                     f"leading-comment replay changed source identity: {promoted!r}"
@@ -2219,7 +2226,9 @@ DELIMITER ;
             "ORDER BY ordinal_position;",
         ).strip()
         expected_indexes = "PRIMARY\t0\t1\tid"
-        expected_columns = "id\tint\t1\nnew_value\tvarchar(32)\t2\npayload\tvarchar(64)\t3"
+        expected_columns = (
+            "id\tint\t1\nnew_value\tvarchar(32)\t2\npayload\tvarchar(64)\t3"
+        )
         self.assert_post_ddl_rows(table, "1\tbefore\tkept\n2\tsecond\talso kept")
         if (
             indexes != expected_indexes
