@@ -2070,14 +2070,16 @@ pub fn parse_production_alter_table_ast_with_mode(
     if ordinary_comments
         && (algorithm.is_some()
             || lock.is_some()
-            || !clauses.iter().all(|clause| match clause {
-                ParsedAlterClause::ModifyColumn(_)
-                | ParsedAlterClause::ChangeColumn { .. }
-                | ParsedAlterClause::AlterColumnDefault { .. }
-                | ParsedAlterClause::AddColumn(_)
-                | ParsedAlterClause::RenameColumn { .. }
-                | ParsedAlterClause::DropIndex(_) => true,
-                _ => false,
+            || !clauses.iter().all(|clause| {
+                matches!(
+                    clause,
+                    ParsedAlterClause::ModifyColumn(_)
+                        | ParsedAlterClause::ChangeColumn { .. }
+                        | ParsedAlterClause::AlterColumnDefault { .. }
+                        | ParsedAlterClause::AddColumn(_)
+                        | ParsedAlterClause::RenameColumn { .. }
+                        | ParsedAlterClause::DropIndex(_)
+                )
             }))
     {
         return Err(
