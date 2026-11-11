@@ -40,6 +40,14 @@ scenario passed. These claims describe test coverage, not current deployment sta
 | State and safety | [x] Snapshot every old and new name. Derive expected metadata left to right from target pre-state. Each source must be an InnoDB base table with exact runtime metadata. Missing origins or collisions at any step block without changes. | VERIFIED: concrete semantic snapshots, ordered temporary-name swap, and native collision rejection preserving rows, indexes and sequence. |
 | Recovery | [x] Use normal journal and checkpoint reconciliation; do not manually skip checkpoints or override journal state. No migration fallback is permitted. | VERIFIED: native crash/restart replay; conflicting destination retains `translation_pending` and the prior checkpoint. |
 
+### Statement execution protocol
+
+Statements without bound parameters use MySQL's text protocol; statements with
+parameters use the prepared-statement protocol. Selection occurs before execution,
+not as an error-triggered fallback. This lets admitted `DROP PROCEDURE` execute on
+MySQL, which rejects that command through the prepared-statement protocol. DDL
+admission, generated SQL, semantic verification and checkpoint ordering do not change.
+
 ### Current implemented slice
 
 #### Basic common DDL expansion

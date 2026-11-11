@@ -563,6 +563,9 @@ impl PersistentTargetExecutor {
     }
 
     fn execute_statement(&self, statement: &SqlStatement) -> Result<(), TargetExecuteError> {
+        if statement.params.is_empty() {
+            return self.execute_raw_sql(&statement.sql);
+        }
         let params = statement.params.clone();
         self.with_connection(|conn| {
             conn.exec_drop(&statement.sql, Params::Positional(params))
