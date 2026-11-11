@@ -92,6 +92,7 @@ SCENARIOS = (
     ScenarioSpec("column-change-position-default-pending-replay", True),
     ScenarioSpec("source-sql-mode-defaults-pending-replay", True),
     ScenarioSpec("table-lifecycle-pending-replay", True),
+    ScenarioSpec("atomic-multi-table-rename", True),
     ScenarioSpec("create-table-crash-restart", True),
     ScenarioSpec("create-facets-historical-crash-restart", True),
     ScenarioSpec("storefront-create-pending-replay", True),
@@ -3006,6 +3007,139 @@ DELIMITER ;
                 )
         print(
             f"table_lifecycle_pending_replay_ok coordinate={stop.file}:{stop.position}"
+        )
+
+    def run_atomic_multi_table_rename(self) -> None:
+        assert self.source and self.target
+        first = "comic_allowlist"
+        second = "comic_denylist"
+        first_renamed = "comic_allowlist_deprecated"
+        second_renamed = "comic_denylist_deprecated"
+        setup = (
+            f"CREATE TABLE {first} (comic_id INT NOT NULL PRIMARY KEY, "
+            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB; "
+            f"INSERT INTO {first} VALUES (11,'2026-01-02 03:04:05'); "
+            f"CREATE TABLE {second} (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+            "comic_id INT NOT NULL, UNIQUE KEY uq_comic_id (comic_id)) ENGINE=InnoDB; "
+            f"INSERT INTO {second}(id,comic_id) VALUES (5,21);"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, setup)
+
+        ddl = (
+            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ "
+            f"RENAME TABLE {first} TO {first_renamed}, "
+            f"{second} TO {second_renamed}"
+        )
+        stop = self.replay_common_ddl(
+            ddl,
+            "RENAME TABLE",
+            following_sql=f"INSERT INTO {second_renamed}(comic_id) VALUES (22);",
+            crash=True,
+        )
+        tables_query = (
+            "SELECT table_name FROM information_schema.tables "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} "
+            f"AND table_name IN ('{first}','{second}','{first_renamed}','{second_renamed}') "
+            "ORDER BY table_name;"
+        )
+        first_rows_query = (
+            f"SELECT comic_id,DATE_FORMAT(updated_at,'%Y-%m-%d %H:%i:%s') "
+            f"FROM {first_renamed} ORDER BY comic_id;"
+        )
+        second_rows_query = f"SELECT id,comic_id FROM {second_renamed} ORDER BY id;"
+        indexes_query = (
+            "SELECT table_name,index_name,non_unique,seq_in_index,column_name "
+            "FROM information_schema.statistics "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} "
+            f"AND table_name IN ('{first_renamed}','{second_renamed}') "
+            "ORDER BY table_name,index_name,seq_in_index;"
+        )
+        for endpoint in (self.source, self.target):
+            tables = self.admin_query(endpoint, tables_query).strip()
+            first_rows = self.admin_query(endpoint, first_rows_query).strip()
+            second_rows = self.admin_query(endpoint, second_rows_query).strip()
+            indexes = self.admin_query(endpoint, indexes_query).strip()
+            next_id = self.admin_query(
+                endpoint,
+                "SELECT auto_increment FROM information_schema.tables "
+                f"WHERE table_schema={sql_literal(APP_SCHEMA)} "
+                f"AND table_name='{second_renamed}';",
+            ).strip()
+            if (
+                tables != f"{first_renamed}\n{second_renamed}"
+                or first_rows != "11\t2026-01-02 03:04:05"
+                or second_rows != "5\t21\n6\t22"
+                or indexes
+                != f"{first_renamed}\tPRIMARY\t0\t1\tcomic_id\n"
+                f"{second_renamed}\tPRIMARY\t0\t1\tid\n"
+                f"{second_renamed}\tuq_comic_id\t0\t1\tcomic_id"
+                or next_id != "7"
+            ):
+                raise HarnessError(
+                    f"atomic rename post-state differs at {endpoint.container}: "
+                    f"tables={tables!r} first_rows={first_rows!r} "
+                    f"second_rows={second_rows!r} indexes={indexes!r} "
+                    f"next_id={next_id!r}"
+                )
+
+        failure_first = "atomic_rename_first"
+        failure_second = "atomic_rename_second"
+        occupied = "atomic_rename_second_deprecated"
+        failure_setup = (
+            f"CREATE TABLE {failure_first} (id INT PRIMARY KEY) ENGINE=InnoDB; "
+            f"INSERT INTO {failure_first} VALUES (1); "
+            f"CREATE TABLE {failure_second} (id INT PRIMARY KEY) ENGINE=InnoDB; "
+            f"INSERT INTO {failure_second} VALUES (2);"
+        )
+        failure_ddl = (
+            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ "
+            f"RENAME TABLE {failure_first} TO atomic_rename_first_deprecated, "
+            f"{failure_second} TO {occupied}"
+        )
+        start, pending = self.prepare_pending_add_column(
+            failure_setup, failure_ddl, "RENAME TABLE"
+        )
+        self.admin_sql(
+            self.target,
+            f"CREATE TABLE {occupied} (id INT PRIMARY KEY) ENGINE=InnoDB; "
+            f"INSERT INTO {occupied} VALUES (3);",
+        )
+        stop = self.coordinate()
+        replay = self.run_stream(start, stop)
+        if replay.returncode == 0:
+            raise HarnessError(
+                "conflicting second destination did not block CDC replay"
+            )
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        if journal["status"] != "blocked" or (
+            checkpoint["source_file"],
+            checkpoint["source_position"],
+        ) != (start.file, start.position):
+            raise HarnessError(
+                f"failed atomic rename lost journal/checkpoint evidence: "
+                f"{journal!r} {checkpoint!r}"
+            )
+        names_and_rows = self.admin_query(
+            self.target,
+            "SELECT table_name,group_concat(id ORDER BY id) FROM ("
+            "SELECT 'atomic_rename_first' AS table_name,id FROM atomic_rename_first "
+            "UNION ALL SELECT 'atomic_rename_second',id FROM atomic_rename_second "
+            f"UNION ALL SELECT '{occupied}',id FROM {occupied}"
+            ") AS rows_by_table GROUP BY table_name ORDER BY table_name;",
+        ).strip()
+        expected_failure_state = (
+            f"{occupied}\t3\n{failure_first}\t1\n{failure_second}\t2"
+        )
+        if names_and_rows != expected_failure_state:
+            raise HarnessError(
+                f"failed atomic rename partially changed target: {names_and_rows!r}"
+            )
+        print(
+            "atomic_multi_table_rename_ok one_statement=true failed_second_no_partial=true "
+            "rows_indexes_sequence=true persisted_journal=true "
+            f"coordinate={stop.file}:{stop.position}"
         )
 
     def run_basic_scalar_create_add_pending_replay(self) -> None:
@@ -11927,6 +12061,8 @@ DELIMITER ;
             self.run_source_sql_mode_defaults_pending_replay()
         elif scenario == "table-lifecycle-pending-replay":
             self.run_table_lifecycle_pending_replay()
+        elif scenario == "atomic-multi-table-rename":
+            self.run_atomic_multi_table_rename()
         elif scenario == "create-facets-historical-crash-restart":
             self.run_create_facets_historical_crash_restart()
         elif scenario == "curated-strip-create-pending-replay":
