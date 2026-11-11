@@ -905,15 +905,59 @@ fn modify_varchar_ordinary_comments() {
             &format!("{prefix} {sql}")
         ));
     }
+    assert!(super::transform::supports_production_alter_table(
+        "/* ordinary */ ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NOT NULL, ADD KEY idx(c)"
+    ));
     for input in [
-        "/* ordinary */ ALTER TABLE t MODIFY COLUMN c VARCHAR(128) NOT NULL, ADD KEY idx(c)",
         "/* ordinary */ ALTER TABLE t MODIFY COLUMN c VARCHAR(128) /*! NOT NULL */",
+        "ALTER TABLE t ADD KEY idx(c) -- interior\n, ALGORITHM=INPLACE, LOCK=NONE",
     ] {
         assert!(
             !super::transform::supports_production_alter_table(input),
             "{input}"
         );
     }
+}
+
+#[test]
+fn alter_leading_comments_preserve_add_key_translation_and_literal_binding() {
+    let statement = "ALTER TABLE comics_contributors ADD KEY idx_name (name)";
+    for prefix in [
+        "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ ",
+        "/* client's edit */ ",
+        "/* client */ -- ordinary line\n",
+    ] {
+        let translated =
+            super::transform::transform_production_alter_table(&format!("{prefix}{statement}"))
+                .expect("inert leading comments");
+        assert_eq!(
+            translated.target_sql.as_deref(),
+            Some("ALTER TABLE `comics_contributors` ADD KEY `idx_name` (`name`)")
+        );
+    }
+    let translated = super::transform::transform_production_alter_table(
+        "/* client's 'ignored' text */ ALTER TABLE accounts ADD COLUMN note VARCHAR(32) DEFAULT 'kept'",
+    ).expect("only statement literals bind defaults");
+    assert_eq!(
+        translated.target_sql.as_deref(),
+        Some("ALTER TABLE `accounts` ADD COLUMN `note` VARCHAR(32) NULL DEFAULT 'kept'")
+    );
+    let target = semantic_snapshot(7, Some(8));
+    let bare = parse_ddl_operation("ALTER TABLE accounts ADD KEY idx_handle (handle)").unwrap();
+    let commented =
+        parse_ddl_operation("/* client's edit */ ALTER TABLE accounts ADD KEY idx_handle (handle)")
+            .unwrap();
+    let bare_evidence = build_semantic_evidence(&bare, &target, &target).unwrap();
+    let commented_evidence = build_semantic_evidence(&commented, &target, &target).unwrap();
+    assert_eq!(commented_evidence.pre_state, bare_evidence.pre_state);
+    assert_eq!(
+        commented_evidence.expected_post_state,
+        bare_evidence.expected_post_state
+    );
+    assert_ne!(
+        commented_evidence.pre_state,
+        commented_evidence.expected_post_state
+    );
 }
 
 #[test]

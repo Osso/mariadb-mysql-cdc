@@ -2050,16 +2050,12 @@ pub fn parse_production_alter_table_ast_with_mode(
     source_sql: &str,
     mode: SourceSqlMode,
 ) -> Result<ParsedAlterTableAst, String> {
-    let (_, statement_sql) = split_leading_mysql_line_comments(source_sql);
+    let statement_sql = strip_leading_ordinary_ddl_comments(source_sql)?;
     let no_escapes = mode.0.is_some_and(|bits| bits & (1 << 20) != 0);
     let ordinary_comments = ddl_contains_comments_with_mode(statement_sql, no_escapes);
-    let leading_comments_only = !ddl_contains_comments_with_mode(
-        strip_leading_ordinary_ddl_comments(statement_sql)?,
-        no_escapes,
-    );
     let stripped;
     let source_sql = if ordinary_comments {
-        stripped = observed_create::remove_ordinary_comments_with_mode(source_sql, mode)?;
+        stripped = observed_create::remove_ordinary_comments_with_mode(statement_sql, mode)?;
         stripped.as_str()
     } else {
         statement_sql
@@ -2081,12 +2077,11 @@ pub fn parse_production_alter_table_ast_with_mode(
                 | ParsedAlterClause::AddColumn(_)
                 | ParsedAlterClause::RenameColumn { .. }
                 | ParsedAlterClause::DropIndex(_) => true,
-                ParsedAlterClause::DropColumn(_) => leading_comments_only,
                 _ => false,
             }))
     {
         return Err(
-            "ordinary ALTER comments require modeled ADD COLUMN or MODIFY clauses, or leading-only comments for DROP COLUMN IF EXISTS".to_string(),
+            "interior ALTER comments are unsupported for these clauses or options".to_string(),
         );
     }
     Ok(ParsedAlterTableAst {

@@ -31,6 +31,31 @@ fn admitted_source_only_release_move_procedures_bypass_qualification_rejection()
 }
 
 #[test]
+fn commented_add_key_is_automatically_admitted_with_raw_source_identity() {
+    let sql = "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ ALTER TABLE comics_contributors ADD KEY idx_name (name)";
+    let event = BinlogEvent::QueryEvent(QueryEvent {
+        thread_id: 1,
+        duration: 0,
+        error_code: 0,
+        status_variables: [&[1][..], &0_u64.to_le_bytes()].concat(),
+        database_name: "fixture_cdc".into(),
+        sql_statement: sql.into(),
+    });
+    let state = StructuredEventState::new(Some("fixture_cdc".into()));
+    let (_, ddl) = automatically_handled_ddl_event(
+        "source",
+        "bin.000001",
+        &event_header(2, 180),
+        &event,
+        &state,
+    )
+    .expect("observed commented index addition enters normal replay");
+    assert_eq!(ddl.raw_sql, sql);
+    assert_eq!(ddl.binlog_file, "bin.000001");
+    assert_eq!(ddl.event_end_position, 180);
+}
+
+#[test]
 fn escaped_ddl_requires_captured_mode_for_automatic_admission_and_keeps_raw_sql() {
     let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n'";
     let event_with_mode = |status_variables| {
