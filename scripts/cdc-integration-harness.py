@@ -3106,11 +3106,26 @@ DELIMITER ;
             f"INSERT INTO {occupied} VALUES (3);",
         )
         stop = self.coordinate()
-        replay = self.run_stream(start, stop, max_reconnects=1)
-        if replay.returncode == 0:
-            raise HarnessError(
-                "conflicting second destination did not block CDC replay"
-            )
+        process, log_path = self.start_stream(
+            start, stop, label="atomic-rename-collision"
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                output = log_path.read_text()
+                if "rename_destination_" in output and occupied in output:
+                    break
+                if process.poll() is not None:
+                    raise HarnessError(
+                        f"collision stream exited before blocking: {output}"
+                    )
+                time.sleep(0.1)
+            else:
+                raise HarnessError(
+                    f"collision stream did not report blocked replay: {output}"
+                )
+        finally:
+            self.stop_sync_process(process)
         journal = self.journal_full_row(int(pending["event_start_position"]))
         checkpoint = self.checkpoint()
         if journal["status"] != "translation_pending" or (
