@@ -575,6 +575,70 @@ fn generated_schema_column_definitions_are_explicitly_modeled() {
 }
 
 #[test]
+fn shared_leading_comments_preserve_supported_ddl_and_literal_meaning() {
+    let statements = [
+        "CREATE INDEX idx_new ON accounts (handle)",
+        "CREATE INDEX idx_new ON accounts (handle) COMMENT 'planner''s index'",
+        "DROP INDEX idx_new ON accounts",
+        "DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair",
+        "DROP PROCEDURE apply_release_move_purchase_repair",
+        "DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives",
+    ];
+    let prefixes = [
+        "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ ",
+        "/* client's 'ignored' dotted.name */ -- first line\n-- second line\n# context\n",
+    ];
+    for statement in statements {
+        let expected = translate_ddl(statement, &[]).unwrap();
+        for prefix in prefixes {
+            let translated = translate_ddl(&format!("{prefix}{statement}"), &[]).unwrap();
+            assert_eq!(translated.target_sql, expected.target_sql, "{statement}");
+        }
+    }
+    let columns = ["old_name".to_string()].into_iter().collect();
+    for prefix in prefixes {
+        let translated = transform_rename_columns_if_exists(
+            &format!("{prefix}ALTER TABLE accounts RENAME COLUMN IF EXISTS old_name TO new_name"),
+            &columns,
+        )
+        .unwrap();
+        assert_eq!(
+            translated.target_sql.as_deref(),
+            Some("ALTER TABLE `accounts` RENAME COLUMN `old_name` TO `new_name`")
+        );
+    }
+}
+
+#[test]
+fn shared_leading_comments_do_not_expand_ddl_allowlists() {
+    for statement in [
+        "CREATE UNIQUE INDEX idx_new ON accounts (handle)",
+        "CREATE INDEX idx_new ON other_db.accounts (handle)",
+        "DROP PROCEDURE another_release_move_procedure",
+        "DROP PROCEDURE IF EXISTS `apply_release_move_purchase_repair`",
+        "DROP TRIGGER IF EXISTS another_trigger",
+        "DROP TRIGGER IF EXISTS `prevent_deactivating_cloned_archives`",
+    ] {
+        assert!(
+            translate_ddl(&format!("/* client */ {statement}"), &[]).is_err(),
+            "{statement}"
+        );
+    }
+    for prefix in ["/*!50000 ", "/*M! ", "/*+ "] {
+        for statement in [
+            "CREATE INDEX idx_new ON accounts (handle)",
+            "DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair",
+            "DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives",
+        ] {
+            assert!(
+                translate_ddl(&format!("{prefix}*/ {statement}"), &[]).is_err(),
+                "{statement}"
+            );
+        }
+    }
+}
+
+#[test]
 fn quoted_comment_markers_do_not_reclassify_index_ddl() {
     assert!(supports_automatic_index_ddl(
         "CREATE INDEX `idx--name` ON `accounts` (`handle/*name`)",
@@ -630,7 +694,7 @@ fn strict_index_admission_rejects_every_non_simple_form() {
         "CREATE INDEX idx_handle ON accounts (handle",
         "DROP INDEX IF EXISTS idx_handle ON accounts",
         "DROP INDEX accounts.idx_handle ON accounts",
-        "/* migration */ CREATE INDEX idx_handle ON accounts (handle)",
+        "CREATE /* migration */ INDEX idx_handle ON accounts (handle)",
     ] {
         let accepted = parse_ddl_operation(sql)
             .ok()
@@ -1310,10 +1374,11 @@ fn exact_drop_trigger_allowlist_transforms_present_and_absent_targets() {
 }
 
 #[test]
-fn exact_drop_trigger_allowlist_rejects_comments_quoting_qualification_extra_tokens_and_names() {
+fn exact_drop_trigger_allowlist_rejects_active_comments_quoting_qualification_extra_tokens_and_names()
+ {
     let rejected = [
-        "-- comment\nDROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives",
-        "/* comment */ DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives",
+        "/*!50000 DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives */",
+        "DROP TRIGGER /* comment */ IF EXISTS prevent_deactivating_cloned_archives",
         "DROP TRIGGER prevent_deactivating_cloned_archives",
         "DROP TRIGGER IF EXISTS `prevent_deactivating_cloned_archives`",
         "DROP TRIGGER IF EXISTS \"prevent_deactivating_cloned_archives\"",
@@ -1407,7 +1472,7 @@ fn drop_procedure_admission_is_limited_to_supported_forms() {
         "DROP PROCEDURE another_release_move_procedure",
         "DROP PROCEDURE IF EXISTS globalcomix.apply_release_move_purchase_repair",
         "DROP PROCEDURE IF EXISTS `apply_release_move_purchase_repair`",
-        "/* migration */ DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair",
+        "DROP PROCEDURE /* migration */ IF EXISTS apply_release_move_purchase_repair",
         "DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair, another_procedure",
     ] {
         assert!(!supports_drop_procedure(sql), "accepted {sql}");

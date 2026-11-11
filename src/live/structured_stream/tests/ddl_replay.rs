@@ -56,6 +56,38 @@ fn commented_add_key_is_automatically_admitted_with_raw_source_identity() {
 }
 
 #[test]
+fn shared_leading_comments_admit_supported_ddl_without_changing_raw_identity() {
+    let state = StructuredEventState::new(Some("fixture_cdc".into()));
+    for statement in [
+        "CREATE INDEX idx_new ON accounts (handle)",
+        "DROP INDEX idx_new ON accounts",
+        "DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair",
+        "DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives",
+        "ALTER TABLE accounts RENAME COLUMN IF EXISTS old_name TO new_name",
+    ] {
+        let sql = format!("/* client's 'context' dotted.name */ -- line\n# context\n{statement}");
+        let event = BinlogEvent::QueryEvent(QueryEvent {
+            thread_id: 1,
+            duration: 0,
+            error_code: 0,
+            status_variables: [&[1][..], &0_u64.to_le_bytes()].concat(),
+            database_name: "fixture_cdc".into(),
+            sql_statement: sql.clone(),
+        });
+        let (_, ddl) = automatically_handled_ddl_event(
+            "source",
+            "bin.000001",
+            &event_header(2, 180),
+            &event,
+            &state,
+        )
+        .unwrap_or_else(|| panic!("supported statement rejected: {statement}"));
+        assert_eq!(ddl.raw_sql, sql);
+        assert_eq!(ddl.event_end_position, 180);
+    }
+}
+
+#[test]
 fn escaped_ddl_requires_captured_mode_for_automatic_admission_and_keeps_raw_sql() {
     let sql = r"ALTER TABLE t ADD COLUMN c VARCHAR(40) DEFAULT 'a\n'";
     let event_with_mode = |status_variables| {

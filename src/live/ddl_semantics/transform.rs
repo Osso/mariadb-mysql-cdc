@@ -6,8 +6,8 @@ use super::model::{
 };
 use super::tokenizer::{
     ddl_contains_comments, ddl_contains_comments_with_mode, split_leading_mysql_line_comments,
-    split_one_leading_mysql_line_comment, strip_leading_ordinary_ddl_comments, tokenize_ddl,
-    tokenize_ddl_with_quoted_flags, tokenize_ddl_with_quoted_flags_mode,
+    strip_leading_ordinary_ddl_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags,
+    tokenize_ddl_with_quoted_flags_mode,
 };
 use crate::live::query_charset_context::SourceSqlMode;
 use sha2::{Digest, Sha256};
@@ -1855,6 +1855,7 @@ pub fn transform_drop_trigger_if_exists(
 }
 
 fn parse_supported_drop_trigger_if_exists(source_sql: &str) -> Result<String, String> {
+    let source_sql = strip_leading_ordinary_ddl_comments(source_sql)?;
     if ddl_contains_comments(source_sql) {
         return Err("DROP TRIGGER comments are not supported".to_string());
     }
@@ -1908,6 +1909,7 @@ pub fn transform_drop_procedure(
 }
 
 fn parse_supported_drop_procedure(source_sql: &str) -> Result<String, String> {
+    let source_sql = strip_leading_ordinary_ddl_comments(source_sql)?;
     if ddl_contains_comments(source_sql) {
         return Err("DROP PROCEDURE comments are not supported".to_string());
     }
@@ -2035,7 +2037,8 @@ pub fn transform_rename_columns_if_exists(
 }
 
 fn rename_columns_if_exists_sql(source_sql: &str) -> Result<(Option<&str>, &str), String> {
-    let (leading_comment, statement_sql) = split_one_leading_mysql_line_comment(source_sql);
+    let (leading_comment, _) = split_leading_mysql_line_comments(source_sql);
+    let statement_sql = strip_leading_ordinary_ddl_comments(source_sql)?;
     if ddl_contains_comments(statement_sql) {
         return Err("RENAME COLUMN IF EXISTS comments are not supported".to_string());
     }

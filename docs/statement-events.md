@@ -81,7 +81,7 @@ Additional historical slices:
   MySQL `-- ` line comment. The renderer strips that comment for parsing and
   prepends its exact source prefix, including the source line ending, to the
   generated SQL. Embedded comments, executable/version comments, optimizer
-  hints, and all other leading comment forms remain rejected; and
+  hints, and unsupported interior comment forms remain rejected; and
 - the bounded observed `CREATE TABLE IF NOT EXISTS` grammar with ordinary
   leading block comments and inline `--` comments; `MEDIUMINT`, `SMALLINT`, and
   `TINYINT UNSIGNED`; canonical `VARCHAR(n)`; exactly `DECIMAL(4,3)` with
@@ -113,9 +113,9 @@ Additional historical slices:
 - the production-observed unqualified multi-clause `ALTER TABLE ... RENAME
   COLUMN IF EXISTS ...` form, which is token-parsed and transformed from target
   column pre-state into deterministic MySQL 8 SQL. Exactly one leading ordinary
-  MySQL `-- ` line comment is preserved verbatim, including its source prefix
-  and line ending, when executable generated SQL is emitted. Any remaining or
-  embedded comment form is rejected into the durable DDL block path. Absent
+  MySQL `-- ` line comment retains its existing generated-SQL prefix and line
+  ending. Ordinary leading `--`, `#`, and `/* ... */` comments are inert;
+  interior and active comments remain rejected into the durable DDL block path. Absent
   rename clauses remain proven no-ops and emit no target SQL;
 - the exact production-observed unqualified `CREATE TABLE IF NOT EXISTS
   home_feed_artist_blacklist` form, including its modeled columns, inline
@@ -129,24 +129,31 @@ Additional historical slices:
   qualified-identifier rejection because the admitted statements contain
   qualified tokens. It requires
   target absence, executes no target SQL, and relies on subsequent source ROW/FULL
-  events for data effects in source order;
+  events for data effects in source order. This exact raw-digest allowlist is
+  excluded from leading-comment normalization; prefix variants are not admitted;
 - the generic exact unqualified, unquoted `DROP PROCEDURE IF EXISTS <identifier>`
   form; and
 - the additional exact unqualified, unquoted plain
   `DROP PROCEDURE apply_release_move_purchase_repair` form. Both use target-local
   routine existence evidence: an existing target routine is dropped with
   deterministic quoted MySQL SQL, while an absent routine is a proven no-op; and
-- the exact raw, unqualified, unquoted, comment-free
+- the exact unqualified, unquoted
   `DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives` form, with an
   optional trailing semicolon. The source trigger name is admitted only in that
   exact spelling. Stable target trigger evidence matches the name
   case-insensitively; a present target emits deterministic quoted MySQL `DROP
   TRIGGER`, while an absent target persists `generated_sql = NULL` as a proven
   no-op and follows the normal journal/checkpoint sequence. Qualified, quoted,
-  commented, differently named, extra-token, and other trigger forms remain
-  unsupported.
+  interior or active-commented, differently named, extra-token, and other trigger
+  forms remain unsupported.
 
-The index parser rejects comments, ambiguous/incomplete syntax, double-quoted
+Supported standalone index, procedure DROP, and trigger DROP forms accept inert
+ordinary leading `--`, `#`, and `/* ... */` comments without changing their
+existing grammar or name allowlists. Raw journal SQL and its identity/digests
+remain unchanged. Regression, native replay, and new deployment proof for this
+normalization are pending.
+
+The index parser rejects interior and active comments, ambiguous/incomplete syntax, double-quoted
 identifiers when ANSI_QUOTES mode is not captured, qualified names (including
 backtick-qualified names), generated names, `IF EXISTS`, unique/fulltext/spatial/
 invisible forms, and unmodeled options. Unqualified backtick identifiers are
@@ -175,14 +182,13 @@ or harness dependency.
 
 Qualifier handling is fail-closed outside the identity-scoped source-only
 procedure CREATE form and the exact production blacklist CREATE form. The
-blacklist CREATE path strips only leading ordinary `--`, `#`, and `/* ... */`
-comments before exact admission. The exact production ALTER path strips only one
-leading ordinary MySQL `-- ` line comment for parsing, then preserves that exact
-source prefix when rendering generated SQL. Executable/version comments,
-optimizer hints, embedded comments, and other leading comment forms remain
-rejected.
+blacklist CREATE path strips leading ordinary `--`, `#`, and `/* ... */`
+comments before exact admission. Supported ALTER paths use ordinary leading
+comment normalization; the existing generated `-- ` prefix contract remains.
+Executable/version comments and optimizer hints remain rejected, as do interior
+comments where the relevant grammar does not already support them.
 Tokenization removes comments from syntax but preserves identifier/dot/identifier
-detection across inline comments; index parsing rejects any comment outright. Backticks and ANSI_QUOTES double-quoted
+detection across inline comments; index parsing rejects interior and active comments. Backticks and ANSI_QUOTES double-quoted
 identifiers are not admitted when their mode is unavailable, except for the
 private exact-hash source-only procedure admission. Trigger `ON` and index `ON`
 references are

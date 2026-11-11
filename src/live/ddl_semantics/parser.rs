@@ -1,6 +1,9 @@
 use super::super::ddl_replay_journal::DdlFamily;
 use super::model::{DdlObjectKind, DdlOperation, ParsedIndexAst, ParsedIndexKeyPart};
-use super::tokenizer::{ddl_contains_comments, tokenize_ddl, tokenize_ddl_with_quoted_flags_mode};
+use super::tokenizer::{
+    ddl_contains_comments, strip_leading_ordinary_ddl_comments, tokenize_ddl,
+    tokenize_ddl_with_quoted_flags_mode,
+};
 use super::transform::{
     parse_fixture_create_table_with_mode, parse_production_alter_table_ast_with_mode,
 };
@@ -15,6 +18,7 @@ pub fn parse_modeled_index_ddl(sql: &str) -> Result<ParsedIndexAst, String> {
 }
 
 fn parse_index_ddl(sql: &str, allow_unique: bool) -> Result<ParsedIndexAst, String> {
+    let sql = strip_leading_ordinary_ddl_comments(sql)?;
     if ddl_contains_comments(sql) {
         return Err("index DDL comments are not automatic".to_string());
     }
