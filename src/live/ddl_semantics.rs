@@ -295,10 +295,12 @@ fn translate_index_ddl(
     if provenance == DdlTranslationProvenance::ModeledPlanner && index.unique {
         return Some(render_modeled_index_ddl(&index, sql));
     }
-    Some(Ok(DdlTransformation {
-        version: transform::DDL_TRANSFORMATION_VERSION,
-        target_sql: Some(sql.trim().trim_end_matches(';').trim().to_string()),
-    }))
+    Some(
+        tokenizer::strip_leading_ordinary_ddl_comments(sql).map(|statement| DdlTransformation {
+            version: transform::DDL_TRANSFORMATION_VERSION,
+            target_sql: Some(statement.trim().trim_end_matches(';').trim().to_string()),
+        }),
+    )
 }
 
 fn translate_create_or_routine_ddl(
