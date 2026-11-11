@@ -235,6 +235,7 @@ pub enum ParsedAlterClause {
     RenameColumn {
         old_name: String,
         new_name: String,
+        if_exists: bool,
     },
     AddKey {
         index: ParsedIndexAst,

@@ -40,6 +40,17 @@ scenario passed. These claims describe test coverage, not current deployment sta
 | State and safety | [x] Snapshot every old and new name. Derive expected metadata left to right from target pre-state. Each source must be an InnoDB base table with exact runtime metadata. Missing origins or collisions at any step block without changes. | VERIFIED: concrete semantic snapshots, ordered temporary-name swap, and native collision rejection preserving rows, indexes and sequence. |
 | Recovery | [x] Use normal journal and checkpoint reconciliation; do not manually skip checkpoints or override journal state. No migration fallback is permitted. | VERIFIED: native crash/restart replay; conflicting destination retains `translation_pending` and the prior checkpoint. |
 
+### Conditional column rename evidence
+
+`RENAME COLUMN IF EXISTS` retains its existing pure-rename grammar and target-column
+selection. Its typed clauses retain the conditional flag. Expected metadata derives
+from the fenced target pre-state, not the current MariaDB source: preserve target
+types, encoding, collation and column position, and update modeled key references.
+A missing source column is a no-op; an occupied destination or generated-column
+dependency still blocks. Source/target type or default-collation differences are not
+rewritten as part of a rename. Crash recovery compares the observed target with the
+same immutable pre-state and expected post-state.
+
 ### Statement execution protocol
 
 Statements without bound parameters use MySQL's text protocol; statements with

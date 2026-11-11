@@ -418,7 +418,11 @@ pub fn parse_ddl_operation_with_mode(
         operation.create_table_ast = parse_fixture_create_table_with_mode(sql, mode).ok();
     }
     if command == "ALTER" && operation.object_kind == DdlObjectKind::Table {
-        operation.alter_table_ast = parse_production_alter_table_ast_with_mode(sql, mode).ok();
+        operation.alter_table_ast = if super::transform::supports_rename_columns_if_exists(sql) {
+            Some(super::transform::parse_conditional_rename_ast(sql)?)
+        } else {
+            parse_production_alter_table_ast_with_mode(sql, mode).ok()
+        };
     }
     if operation.object_kind == DdlObjectKind::Table {
         operation.table_operation_ast = super::table_operations::parse(sql).ok();

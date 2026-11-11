@@ -1650,6 +1650,53 @@ fn transforms_mariadb_multi_clause_rename_column_if_exists_for_mysql8() {
 }
 
 #[test]
+fn conditional_rename_uses_target_metadata_instead_of_source_defaults() {
+    let target = semantic_snapshot(7, Some(8));
+    let mut source = target.clone();
+    source.inventory.tables[0].columns[0].column_type = "int(11)".into();
+    source.inventory.tables[0].collation = Some("utf8mb4_uca1400_ai_ci".into());
+    source.inventory.tables[0].columns[1].collation = Some("utf8mb4_uca1400_ai_ci".into());
+    let operation = parse_ddl_operation(
+        "/* client */ ALTER TABLE accounts RENAME COLUMN IF EXISTS handle TO renamed_handle",
+    )
+    .unwrap();
+    let evidence = build_semantic_evidence(&operation, &target, &source).unwrap();
+    let mut expected = target.clone();
+    expected.inventory.tables[0].columns[1].name = "renamed_handle".into();
+    expected.inventory.indexes[0].columns[0].name = "renamed_handle".into();
+    assert_eq!(
+        evidence.expected_post_state,
+        super::canonical::observe_operation_state(&expected, &operation).unwrap()
+    );
+    assert_ne!(evidence.pre_state, evidence.expected_post_state);
+    let chained = parse_ddl_operation(
+        "ALTER TABLE accounts RENAME COLUMN IF EXISTS handle TO interim, RENAME COLUMN IF EXISTS interim TO renamed_handle",
+    ).unwrap();
+    assert_eq!(
+        build_semantic_evidence(&chained, &target, &source)
+            .unwrap()
+            .expected_post_state,
+        evidence.expected_post_state
+    );
+    let absent =
+        parse_ddl_operation("ALTER TABLE accounts RENAME COLUMN IF EXISTS missing TO id").unwrap();
+    let absent_evidence = build_semantic_evidence(&absent, &target, &source).unwrap();
+    assert_eq!(
+        absent_evidence.pre_state,
+        absent_evidence.expected_post_state
+    );
+    let collision =
+        parse_ddl_operation("ALTER TABLE accounts RENAME COLUMN IF EXISTS handle TO id").unwrap();
+    assert!(build_semantic_evidence(&collision, &target, &source).is_err());
+    let mut generated = target.clone();
+    generated.inventory.tables[0].columns[1].generated = Some(crate::inventory::GeneratedColumn {
+        expression: "lower(id)".into(),
+        generation_kind: "VIRTUAL".into(),
+    });
+    assert!(build_semantic_evidence(&operation, &generated, &source).is_err());
+}
+
+#[test]
 fn rename_column_if_exists_comments_preserve_leading_prefix() {
     let columns = ["arc_start_order"]
         .into_iter()

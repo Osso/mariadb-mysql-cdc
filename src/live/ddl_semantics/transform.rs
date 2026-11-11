@@ -518,7 +518,9 @@ fn render_production_alter_clause(clause: &ParsedAlterClause) -> String {
             };
             format!("ALTER COLUMN {} {action}", quote_identifier(name))
         }
-        ParsedAlterClause::RenameColumn { old_name, new_name } => format!(
+        ParsedAlterClause::RenameColumn {
+            old_name, new_name, ..
+        } => format!(
             "RENAME COLUMN {} TO {}",
             quote_identifier(old_name),
             quote_identifier(new_name)
@@ -2009,6 +2011,27 @@ pub fn transform_drop_columns_if_exists(
     })
 }
 
+pub(super) fn parse_conditional_rename_ast(
+    source_sql: &str,
+) -> Result<ParsedAlterTableAst, String> {
+    let (_, statement_sql) = rename_columns_if_exists_sql(source_sql)?;
+    let tokens = tokenize_ddl(statement_sql)?;
+    let (table, clauses) = parse_rename_columns_if_exists(&tokens)?;
+    Ok(ParsedAlterTableAst {
+        table,
+        clauses: clauses
+            .into_iter()
+            .map(|clause| ParsedAlterClause::RenameColumn {
+                old_name: clause.old_name,
+                new_name: clause.new_name,
+                if_exists: true,
+            })
+            .collect(),
+        algorithm: None,
+        lock: None,
+    })
+}
+
 pub fn supports_rename_columns_if_exists(source_sql: &str) -> bool {
     rename_columns_if_exists_sql(source_sql)
         .ok()
@@ -2305,7 +2328,11 @@ fn parse_rename_column_clause(
     let old_name = require_identifier(tokens, index + 2, "renamed column")?;
     let new_name = require_identifier(tokens, index + 4, "new column name")?;
     Ok((
-        ParsedAlterClause::RenameColumn { old_name, new_name },
+        ParsedAlterClause::RenameColumn {
+            old_name,
+            new_name,
+            if_exists: false,
+        },
         index + 5,
     ))
 }

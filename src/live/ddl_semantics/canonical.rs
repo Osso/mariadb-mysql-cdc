@@ -786,9 +786,19 @@ fn canonical_alter_table_ast_value(ast: &ParsedAlterTableAst) -> serde_json::Val
                     ParsedColumnDefault::Null => json!({"null": true}),
                 }),
             }),
-            ParsedAlterClause::RenameColumn { old_name, new_name } => json!({
-                "kind": "rename_column", "old_name": old_name, "new_name": new_name,
-            }),
+            ParsedAlterClause::RenameColumn {
+                old_name,
+                new_name,
+                if_exists,
+            } => {
+                let mut value = json!({
+                    "kind": "rename_column", "old_name": old_name, "new_name": new_name,
+                });
+                if *if_exists {
+                    value["if_exists"] = json!(true);
+                }
+                value
+            }
             ParsedAlterClause::AddKey {
                 index,
                 if_not_exists,
@@ -998,7 +1008,20 @@ pub(super) fn apply_alter_clause(
         ParsedAlterClause::AlterColumnDefault { name, default } => {
             apply_alter_column_default(expected, &ast.table, name, default.as_ref())
         }
-        ParsedAlterClause::RenameColumn { old_name, new_name } => {
+        ParsedAlterClause::RenameColumn {
+            old_name,
+            new_name,
+            if_exists,
+        } => {
+            let table = find_table(expected, &ast.table)
+                .ok_or_else(|| format!("RENAME table `{}` is missing", ast.table))?;
+            let source_exists = table
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(old_name));
+            if *if_exists && !source_exists {
+                return Ok(());
+            }
             apply_rename_column(expected, &ast.table, old_name, new_name)
         }
         ParsedAlterClause::AddKey {
