@@ -86,6 +86,7 @@ SCENARIOS = (
     ScenarioSpec("production-alter-table", True),
     ScenarioSpec("add-char-column-pending-replay", True),
     ScenarioSpec("commented-add-key-crash-replay", True),
+    ScenarioSpec("shared-leading-comments-replay", True),
     ScenarioSpec("add-signed-tinyint-pending-replay", True),
     ScenarioSpec("curated-strip-sale-alter-pending-replay", True),
     ScenarioSpec("basic-scalar-create-add-pending-replay", True),
@@ -2139,6 +2140,100 @@ DELIMITER ;
             "commented_add_key_crash_replay_ok raw_sql_preserved=true "
             "durable_checkpoint=true index_metadata=true rows=true subsequent_dml=true "
             f"coordinate={dml_stop.file}:{dml_stop.position}"
+        )
+
+    def run_shared_leading_comments_replay(self) -> None:
+        assert self.source and self.target
+        table = "shared_leading_comments"
+        setup = (
+            f"CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY, "
+            "old_value VARCHAR(32) NOT NULL, payload VARCHAR(64) NOT NULL) ENGINE=InnoDB; "
+            f"INSERT INTO {table} VALUES (1,'before','kept'),(2,'second','also kept'); "
+            "CREATE PROCEDURE apply_release_move_purchase_repair() SELECT 1; "
+            "CREATE TRIGGER prevent_deactivating_cloned_archives BEFORE UPDATE ON "
+            f"{table} FOR EACH ROW SET NEW.payload=NEW.payload;"
+        )
+        for endpoint in (self.source, self.target):
+            self.admin_sql(endpoint, setup)
+
+        prefix = (
+            "/* ordinary leading block comment */\n"
+            "-- ordinary leading dash comment\n"
+            "# ordinary leading hash comment\n"
+        )
+        operations = (
+            (
+                prefix + f"CREATE INDEX idx_shared_leading ON {table} (old_value)",
+                "CREATE INDEX",
+            ),
+            (
+                prefix + f"DROP INDEX idx_shared_leading ON {table}",
+                "DROP INDEX",
+            ),
+            (
+                prefix + "DROP PROCEDURE IF EXISTS apply_release_move_purchase_repair",
+                "DROP PROCEDURE",
+            ),
+            (
+                prefix + "DROP TRIGGER IF EXISTS prevent_deactivating_cloned_archives",
+                "DROP TRIGGER",
+            ),
+            (
+                prefix + f"ALTER TABLE {table} RENAME COLUMN IF EXISTS old_value TO new_value",
+                "RENAME COLUMN IF EXISTS",
+            ),
+        )
+        for ddl, marker in operations:
+            self.replay_common_ddl(ddl, marker, crash=True)
+            promoted = self.journal_full_row()
+            if promoted["raw_sql"] != ddl or promoted["status"] != "checkpointed":
+                raise HarnessError(
+                    f"leading-comment replay changed source identity: {promoted!r}"
+                )
+
+        assert self.target
+        indexes = self.admin_query(
+            self.target,
+            "SELECT index_name,non_unique,seq_in_index,column_name "
+            "FROM information_schema.statistics "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name='{table}' "
+            "ORDER BY index_name,seq_in_index;",
+        ).strip()
+        procedures = self.admin_query(
+            self.target,
+            "SELECT routine_name FROM information_schema.routines "
+            f"WHERE routine_schema={sql_literal(APP_SCHEMA)} "
+            "AND routine_name='apply_release_move_purchase_repair';",
+        ).strip()
+        triggers = self.admin_query(
+            self.target,
+            "SELECT trigger_name FROM information_schema.triggers "
+            f"WHERE trigger_schema={sql_literal(APP_SCHEMA)} "
+            "AND trigger_name='prevent_deactivating_cloned_archives';",
+        ).strip()
+        columns = self.admin_query(
+            self.target,
+            "SELECT column_name,column_type,ordinal_position "
+            "FROM information_schema.columns "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} AND table_name='{table}' "
+            "ORDER BY ordinal_position;",
+        ).strip()
+        expected_indexes = "PRIMARY\t0\t1\tid"
+        expected_columns = "id\tint\t1\nnew_value\tvarchar(32)\t2\npayload\tvarchar(64)\t3"
+        self.assert_post_ddl_rows(table, "1\tbefore\tkept\n2\tsecond\talso kept")
+        if (
+            indexes != expected_indexes
+            or procedures
+            or triggers
+            or columns != expected_columns
+        ):
+            raise HarnessError(
+                "leading-comment DDL metadata mismatch: "
+                f"{indexes!r} {procedures!r} {triggers!r} {columns!r}"
+            )
+        print(
+            "shared_leading_comments_replay_ok raw_sql_preserved=true "
+            "crash_restart=true durable_checkpoint=true metadata=true rows=true"
         )
 
     def run_add_char_column_pending_replay(self) -> None:
@@ -12146,6 +12241,8 @@ DELIMITER ;
             self.run_add_char_column_pending_replay()
         elif scenario == "commented-add-key-crash-replay":
             self.run_commented_add_key_crash_replay()
+        elif scenario == "shared-leading-comments-replay":
+            self.run_shared_leading_comments_replay()
         elif scenario == "add-signed-tinyint-pending-replay":
             self.run_add_signed_tinyint_pending_replay()
         elif scenario == "curated-strip-sale-alter-pending-replay":
