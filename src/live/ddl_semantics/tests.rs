@@ -943,10 +943,12 @@ fn alter_leading_comments_preserve_add_key_translation_and_literal_binding() {
         Some("ALTER TABLE `accounts` ADD COLUMN `note` VARCHAR(32) NULL DEFAULT 'kept'")
     );
     let target = semantic_snapshot(7, Some(8));
-    let bare = parse_ddl_operation("ALTER TABLE accounts ADD KEY idx_handle (handle)").unwrap();
-    let commented =
-        parse_ddl_operation("/* client's edit */ ALTER TABLE accounts ADD KEY idx_handle (handle)")
-            .unwrap();
+    let bare =
+        parse_ddl_operation("ALTER TABLE accounts ADD KEY idx_handle_comment (handle)").unwrap();
+    let commented = parse_ddl_operation(
+        "/* client's edit */ ALTER TABLE accounts ADD KEY idx_handle_comment (handle)",
+    )
+    .unwrap();
     let bare_evidence = build_semantic_evidence(&bare, &target, &target).unwrap();
     let commented_evidence = build_semantic_evidence(&commented, &target, &target).unwrap();
     assert_eq!(commented_evidence.pre_state, bare_evidence.pre_state);
