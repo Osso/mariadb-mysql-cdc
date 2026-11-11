@@ -1038,10 +1038,19 @@ fn capture_source_evidence(
 
 fn affected_tables(operation: &DdlOperation) -> Vec<&str> {
     match operation.family {
-        DdlFamily::Rename => vec![
-            operation.primary_object.as_str(),
-            operation.secondary_object.as_deref().unwrap_or_default(),
-        ],
+        DdlFamily::Rename => {
+            let Some(table_operations::TableOperation::Rename { pairs }) =
+                &operation.table_operation_ast
+            else {
+                return Vec::new();
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            pairs
+                .iter()
+                .flat_map(|(old, new)| [old.as_str(), new.as_str()])
+                .filter(|name| seen.insert(*name))
+                .collect()
+        }
         DdlFamily::Index => operation.secondary_object.as_deref().into_iter().collect(),
         _ if operation.object_kind == DdlObjectKind::Table => {
             vec![operation.primary_object.as_str()]

@@ -403,7 +403,7 @@ pub fn parse_ddl_operation_with_mode(
         "CREATE" => parse_create_or_alter(&tokens, &keywords, true),
         "ALTER" => parse_create_or_alter(&tokens, &keywords, false),
         "DROP" => parse_drop(&tokens, &keywords),
-        "RENAME" => parse_rename(&tokens, &keywords),
+        "RENAME" => parse_rename(sql),
         "TRUNCATE" => parse_truncate(&tokens, &keywords),
         _ => Err(format!("unsupported automatic DDL command `{command}`")),
     }?;
@@ -527,12 +527,14 @@ fn parse_drop_secondary(
     let on_index = keyword_position(keywords, "ON", name_index + 1)?;
     Ok(Some(object_name(tokens, on_index + 1)?))
 }
-fn parse_rename(tokens: &[String], keywords: &[String]) -> Result<DdlOperation, String> {
-    require_keyword(keywords, 1, "TABLE")?;
-    let from = object_name(tokens, 2)?;
-    require_keyword(keywords, 3, "TO")?;
-    let to = object_name(tokens, 4)?;
-    reject_list_separator(tokens, 5)?;
+fn parse_rename(sql: &str) -> Result<DdlOperation, String> {
+    let ast = super::table_operations::parse(sql)?;
+    let super::table_operations::TableOperation::Rename { pairs } = &ast else {
+        return Err("expected RENAME TABLE operation".into());
+    };
+    let (from, to) = pairs.first().ok_or("missing rename pairs")?;
+    let from = from.clone();
+    let to = to.clone();
     Ok(DdlOperation {
         family: DdlFamily::Rename,
         object_kind: DdlObjectKind::Table,
@@ -541,7 +543,7 @@ fn parse_rename(tokens: &[String], keywords: &[String]) -> Result<DdlOperation, 
         index_ast: None,
         create_table_ast: None,
         alter_table_ast: None,
-        table_operation_ast: None,
+        table_operation_ast: Some(ast),
     })
 }
 

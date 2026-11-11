@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn table_operations_translate_complete_single_table_grammar() {
+fn table_operations_translate_complete_table_lifecycle_grammar() {
     for (source, expected) in [
         ("DROP TABLE accounts", "DROP TABLE `accounts`"),
         (
@@ -16,6 +16,10 @@ fn table_operations_translate_complete_single_table_grammar() {
             "/* client */ RENAME TABLE `accounts` TO members",
             "RENAME TABLE `accounts` TO `members`",
         ),
+        (
+            "/* ApplicationName=DBeaver 26.2.0 - SQLEditor <Script.sql> */ RENAME TABLE\n `accounts` TO `accounts_deprecated_20261111`,\n `denied_accounts` TO `denied_accounts_deprecated_20261111`",
+            "RENAME TABLE `accounts` TO `accounts_deprecated_20261111`, `denied_accounts` TO `denied_accounts_deprecated_20261111`",
+        ),
         ("TRUNCATE accounts", "TRUNCATE TABLE `accounts`"),
     ] {
         let translation = translate_ddl(source, &[]).expect("basic table translation");
@@ -25,7 +29,12 @@ fn table_operations_translate_complete_single_table_grammar() {
         "DROP TABLE accounts, members",
         "DROP TEMPORARY TABLE accounts",
         "DROP TABLE accounts CASCADE",
-        "RENAME TABLE accounts TO members, other TO newer",
+        "RENAME TABLE accounts TO members, other TO",
+        "RENAME TABLE accounts TO members,",
+        "RENAME TABLE accounts TO members other TO newer",
+        "RENAME TABLE accounts TO members, other TO remote.newer",
+        "RENAME TABLE accounts TO members, other `TO` newer",
+        "RENAME TABLE accounts TO members; RENAME TABLE other TO newer",
         "TRUNCATE accounts garbage",
         "DROP TABLE other_schema.accounts",
         "DROP `TABLE` accounts",
@@ -56,6 +65,98 @@ fn table_operations_rename_derives_complete_target_state_without_source_head() {
         super::super::canonical::observe_operation_state(&expected, &operation).unwrap()
     );
     assert_ne!(evidence.pre_state, evidence.expected_post_state);
+}
+
+fn two_table_rename_snapshot() -> SemanticSchemaSnapshot {
+    let mut snapshot = semantic_snapshot(9, Some(42));
+    let mut second = snapshot.inventory.tables[0].clone();
+    second.name = "denied_accounts".into();
+    snapshot.inventory.tables.push(second);
+    let mut index = snapshot.inventory.indexes[0].clone();
+    index.table = "denied_accounts".into();
+    snapshot.inventory.indexes.push(index);
+    snapshot.table_runtime.insert(
+        "denied_accounts".into(),
+        TableRuntimeState {
+            row_count: 3,
+            auto_increment: Some(17),
+        },
+    );
+    snapshot
+}
+
+#[test]
+fn table_operations_multi_rename_derives_both_tables_from_target_without_source_head() {
+    let target = two_table_rename_snapshot();
+    let operation = parse_ddl_operation(
+        "RENAME TABLE accounts TO archived_accounts, denied_accounts TO archived_denied_accounts",
+    )
+    .unwrap();
+    let mut expected = target.clone();
+    for table in &mut expected.inventory.tables {
+        table.name = format!("archived_{}", table.name);
+    }
+    for index in &mut expected.inventory.indexes {
+        index.table = format!("archived_{}", index.table);
+    }
+    for trigger in &mut expected.inventory.triggers {
+        if trigger.table == "accounts" {
+            trigger.table = "archived_accounts".into();
+        }
+    }
+    expected.table_runtime = target
+        .table_runtime
+        .iter()
+        .map(|(name, runtime)| (format!("archived_{name}"), runtime.clone()))
+        .collect();
+    let source_head = semantic_snapshot(777, Some(999));
+    let evidence = build_semantic_evidence(&operation, &target, &source_head).unwrap();
+    assert_eq!(
+        evidence.expected_post_state,
+        super::super::canonical::observe_operation_state(&expected, &operation).unwrap()
+    );
+    assert_ne!(evidence.pre_state, evidence.expected_post_state);
+    assert!(supports_automatic_semantic_recovery(&operation));
+}
+
+#[test]
+fn table_operations_multi_rename_blocks_missing_or_colliding_later_pair() {
+    let target = two_table_rename_snapshot();
+    for sql in [
+        "RENAME TABLE accounts TO archived_accounts, missing TO archived_denied_accounts",
+        "RENAME TABLE accounts TO archived_accounts, denied_accounts TO archived_accounts",
+        "RENAME TABLE accounts TO denied_accounts, denied_accounts TO archived_denied_accounts",
+    ] {
+        let operation = parse_ddl_operation(sql).unwrap();
+        assert!(
+            build_semantic_evidence(&operation, &target, &target).is_err(),
+            "{sql}"
+        );
+    }
+    let mut non_innodb = target.clone();
+    non_innodb.inventory.tables[1].engine = Some("MyISAM".into());
+    let operation = parse_ddl_operation(
+        "RENAME TABLE accounts TO archived_accounts, denied_accounts TO archived_denied_accounts",
+    )
+    .unwrap();
+    assert!(build_semantic_evidence(&operation, &non_innodb, &target).is_err());
+}
+
+#[test]
+fn table_operations_multi_rename_applies_ordered_temporary_name_swap() {
+    let target = two_table_rename_snapshot();
+    let operation = parse_ddl_operation(
+        "RENAME TABLE accounts TO temporary_accounts, denied_accounts TO accounts, temporary_accounts TO denied_accounts",
+    ).unwrap();
+    let evidence = build_semantic_evidence(&operation, &target, &target).unwrap();
+    let state: serde_json::Value = serde_json::from_str(&evidence.expected_post_state).unwrap();
+    let tables = state["tables"].as_array().unwrap();
+    let table = |name: &str| tables.iter().find(|table| table["name"] == name).unwrap();
+    assert_eq!(table("accounts")["runtime"]["row_count"], 3);
+    assert_eq!(table("accounts")["runtime"]["auto_increment"], 17);
+    assert_eq!(table("denied_accounts")["runtime"]["row_count"], 9);
+    assert_eq!(table("denied_accounts")["runtime"]["auto_increment"], 42);
+    assert!(table("temporary_accounts")["definition"].is_null());
 }
 
 #[test]

@@ -245,10 +245,10 @@ fn parser_ignores_comments_and_preserves_quoted_identifier_contents() {
 }
 
 #[test]
-fn parser_rejects_qualified_and_multi_object_ddl() {
+fn parser_rejects_qualified_objects_and_multi_table_drop() {
     for sql in [
         "ALTER TABLE other_db.accounts ADD COLUMN handle varchar(64)",
-        "RENAME TABLE accounts TO archived_accounts, users TO archived_users",
+        "RENAME TABLE accounts TO archived_accounts, users TO other_db.archived_users",
         "DROP TABLE accounts, users",
     ] {
         assert!(parse_ddl_operation(sql).is_err(), "accepted {sql}");

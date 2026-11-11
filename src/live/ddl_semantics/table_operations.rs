@@ -8,7 +8,7 @@ use serde_json::json;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TableOperation {
     Drop { if_exists: bool },
-    Rename,
+    Rename { pairs: Vec<(String, String)> },
     Truncate,
 }
 
@@ -32,14 +32,33 @@ pub(super) fn parse(sql: &str) -> Result<TableOperation, String> {
         .ok_or("empty table DDL")?;
     match kind.as_str() {
         "DROP" => parse_drop(&tokens, &quoted),
-        "RENAME" => {
-            require_keywords(&tokens, &quoted, &[(0, "RENAME"), (1, "TABLE"), (3, "TO")])?;
-            require_names(&tokens, &[2, 4], 5)?;
-            Ok(TableOperation::Rename)
-        }
+        "RENAME" => parse_rename(&tokens, &quoted),
         "TRUNCATE" => parse_truncate(&tokens, &quoted),
         _ => Err("not a modeled table lifecycle operation".into()),
     }
+}
+
+fn parse_rename(tokens: &[String], quoted: &[bool]) -> Result<TableOperation, String> {
+    require_keywords(tokens, quoted, &[(0, "RENAME"), (1, "TABLE")])?;
+    let body = tokens.get(2..).ok_or("missing rename pairs")?;
+    if body.len() % 4 != 3 {
+        return Err("rename requires complete source TO destination pairs".into());
+    }
+    let pairs = body
+        .chunks(4)
+        .enumerate()
+        .map(|(index, pair)| parse_rename_pair(pair, &quoted[2 + index * 4..]))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(TableOperation::Rename { pairs })
+}
+
+fn parse_rename_pair(tokens: &[String], quoted: &[bool]) -> Result<(String, String), String> {
+    require_keywords(tokens, quoted, &[(1, "TO")])?;
+    require_names(&tokens[..3], &[0, 2], 3)?;
+    if tokens.len() == 4 && (tokens[3] != "," || quoted[3]) {
+        return Err("rename pairs require an unquoted comma separator".into());
+    }
+    Ok((tokens[0].clone(), tokens[2].clone()))
 }
 
 fn parse_drop(tokens: &[String], quoted: &[bool]) -> Result<TableOperation, String> {
@@ -119,13 +138,13 @@ pub(super) fn render(operation: &DdlOperation) -> Result<DdlTransformation, Stri
             let guard = if *if_exists { "IF EXISTS " } else { "" };
             format!("DROP TABLE {guard}`{name}`")
         }
-        TableOperation::Rename => format!(
-            "RENAME TABLE `{name}` TO `{}`",
-            operation
-                .secondary_object
-                .as_deref()
-                .ok_or("missing rename destination")?
-        ),
+        TableOperation::Rename { pairs } => {
+            let clauses = pairs
+                .iter()
+                .map(|(old, new)| format!("`{old}` TO `{new}`"))
+                .collect::<Vec<_>>();
+            format!("RENAME TABLE {}", clauses.join(", "))
+        }
         TableOperation::Truncate => format!("TRUNCATE TABLE `{name}`"),
     };
     Ok(DdlTransformation {
@@ -214,7 +233,6 @@ pub(super) fn expected(
             _ => Err(format!("table operation source `{name}` is missing")),
         };
     }
-    validate_source_table(target, name)?;
     let mut expected = target.clone();
     apply_operation(&mut expected, operation, ast)?;
     observe(&expected, operation)
@@ -243,16 +261,18 @@ fn apply_operation(
 ) -> Result<(), String> {
     let name = &operation.primary_object;
     match ast {
-        TableOperation::Drop { .. } => drop_table(snapshot, name),
-        TableOperation::Rename => rename_table(
-            snapshot,
-            name,
-            operation
-                .secondary_object
-                .as_deref()
-                .ok_or("missing rename destination")?,
-        ),
-        TableOperation::Truncate => truncate_table(snapshot, name),
+        TableOperation::Drop { .. } => {
+            validate_source_table(snapshot, name)?;
+            drop_table(snapshot, name)
+        }
+        TableOperation::Rename { pairs } => pairs.iter().try_for_each(|(old, new)| {
+            validate_source_table(snapshot, old)?;
+            rename_table(snapshot, old, new)
+        }),
+        TableOperation::Truncate => {
+            validate_source_table(snapshot, name)?;
+            truncate_table(snapshot, name)
+        }
     }
 }
 
