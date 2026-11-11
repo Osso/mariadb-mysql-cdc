@@ -2153,8 +2153,11 @@ DELIMITER ;
             "CREATE TRIGGER prevent_deactivating_cloned_archives BEFORE UPDATE ON "
             f"{table} FOR EACH ROW SET NEW.payload=NEW.payload;"
         )
-        for endpoint in (self.source, self.target):
-            self.admin_sql(endpoint, setup)
+        self.admin_sql(self.source, setup)
+        target_setup = setup.replace(
+            "CREATE PROCEDURE", f"CREATE DEFINER='{LIVE_TARGET_USER}'@'%' PROCEDURE"
+        ).replace("CREATE TRIGGER", f"CREATE DEFINER='{LIVE_TARGET_USER}'@'%' TRIGGER")
+        self.admin_sql(self.target, target_setup)
 
         prefix = (
             "/* ordinary leading block comment */\n"
@@ -2240,9 +2243,23 @@ DELIMITER ;
                 "leading-comment DDL metadata mismatch: "
                 f"{indexes!r} {procedures!r} {triggers!r} {columns!r}"
             )
+        dml_start = self.coordinate()
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET payload='updated' WHERE id=1; "
+            f"INSERT INTO {table} VALUES (3,'third','inserted');",
+        )
+        dml_stop = self.coordinate()
+        require_success(
+            self.run_stream(dml_start, dml_stop), "post-DDL parameterized DML"
+        )
+        self.assert_post_ddl_rows(
+            table, "1\tbefore\tupdated\n2\tsecond\talso kept\n3\tthird\tinserted"
+        )
         print(
             "shared_leading_comments_replay_ok raw_sql_preserved=true "
-            "crash_restart=true durable_checkpoint=true metadata=true rows=true"
+            "crash_restart=true durable_checkpoint=true metadata=true rows=true "
+            "following_parameterized_dml=true"
         )
 
     def run_add_char_column_pending_replay(self) -> None:
