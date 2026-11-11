@@ -31,7 +31,7 @@ allowlist.
 
 The observed event contains two independent renames and an ordinary client
 comment. Targeted semantic tests and the native `atomic-multi-table-rename`
-scenario passed. Production replay and deployment are not yet established.
+scenario passed. These claims describe test coverage, not current deployment state.
 
 | Feature | Required boundary | Proof state |
 |---|---|---|
