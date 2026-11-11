@@ -18,10 +18,10 @@ cataloged in the [query preservation audit](query-preservation-audit.md).
 Automatic DDL admission has the bounded slices in the authoritative
 [DDL transformation matrix](specs/ddl-transformation.md#basic-common-ddl-expansion),
 including required `CHANGE [COLUMN]`, `FIRST`/`AFTER`, literal `ALTER COLUMN
-SET/DROP DEFAULT`, and strict single-table `DROP [IF EXISTS]`, one-pair `RENAME`,
+SET/DROP DEFAULT`, strict single-table `DROP [IF EXISTS]`, atomic ordered-pair `RENAME`,
 and `TRUNCATE [TABLE]` operations. Native MariaDB/MySQL replay harnesses prove
 bounded column and table-lifecycle slices, including crash/restart
-reconciliation. Code `81fde02` is deployed after the runtime image gate (11
+reconciliation. The historical `81fde02` deployment followed the runtime image gate (11
 findings, zero HIGH/CRITICAL scan findings) and Flux rollout confirmation; the
 live sample passed with no pod restarts or quarantines. Source literals use
 immutable tag-1 `SQL_MODE` context for
@@ -163,9 +163,9 @@ while old/new coexistence fails closed.
 Unmodeled table DDL and unsupported `ALTER TABLE` forms, views, other routine
 DDL, events, unsupported trigger DDL, unmodeled rename/truncate/drop variants,
 database/schema DDL, all other procedure bodies or names, plain drops for other names,
-qualified/cross-schema references, quoted forms, comments outside the exact leading
-ordinary-comment CREATE and ALTER admissions, other definer/security clauses,
-MariaDB-only syntax, and multi-object or multi-statement forms are translation
+qualified/cross-schema references, unmodeled quoted forms or comments,
+other definer/security clauses, MariaDB-only syntax, unsupported multi-object
+forms other than the admitted table renames, and multi-statement forms are translation
 boundaries in the stream event path. The intended behavior flushes earlier DML,
 records exact SQL/coordinates in `cdc.ddl_replay_journal` as `translation_pending`,
 leaves the checkpoint unchanged, and retries that same source coordinate
