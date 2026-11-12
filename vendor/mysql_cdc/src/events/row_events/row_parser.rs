@@ -1,8 +1,8 @@
 use crate::constants::column_type::ColumnType;
 use crate::errors::Error;
 use crate::events::row_events::col_parser::{
-    parse_bit, parse_blob, parse_date, parse_date_time, parse_date_time2, parse_string, parse_time,
-    parse_time2, parse_timestamp, parse_timestamp2, parse_year,
+    parse_bit, parse_blob, parse_date, parse_date_time, parse_date_time2, parse_string_bytes,
+    parse_time, parse_time2, parse_timestamp, parse_timestamp2, parse_year,
 };
 use crate::events::row_events::mysql_value::MySqlValue;
 use crate::events::row_events::row_data::{RowData, UpdateRowData};
@@ -143,9 +143,14 @@ fn parse_cell(
         ColumnType::Double => MySqlValue::Double(cursor.read_f64::<LittleEndian>()?),
         ColumnType::NewDecimal => MySqlValue::Decimal(parse_decimal(cursor, metadata)?),
         /* String types, includes varchar, varbinary & fixed char, binary */
-        ColumnType::String => MySqlValue::String(parse_string(cursor, metadata)?),
-        ColumnType::VarChar => MySqlValue::String(parse_string(cursor, metadata)?),
-        ColumnType::VarString => MySqlValue::String(parse_string(cursor, metadata)?),
+        ColumnType::String | ColumnType::VarChar | ColumnType::VarString => {
+            // The wire type alone cannot distinguish text from binary. UTF-8 strings
+            // round-trip exactly; retain all other payloads in the existing byte variant.
+            match String::from_utf8(parse_string_bytes(cursor, metadata)?) {
+                Ok(value) => MySqlValue::String(value),
+                Err(error) => MySqlValue::Blob(error.into_bytes()),
+            }
+        }
         /* BIT, ENUM, SET types */
         ColumnType::Bit => MySqlValue::Bit(parse_bit(cursor, metadata)?),
         ColumnType::Enum => {
@@ -186,4 +191,36 @@ fn parse_cell(
 /// Gets number of bits set in a bitmap.
 fn get_bits_number(bitmap: &Vec<bool>) -> usize {
     bitmap.iter().filter(|&x| *x == true).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_wire_types_preserve_invalid_utf8_as_bytes() {
+        for column_type in [
+            ColumnType::String,
+            ColumnType::VarChar,
+            ColumnType::VarString,
+        ] {
+            let code = column_type as u8;
+            for metadata in [255, 256] {
+                for payload in [vec![0xff], vec![0xfe], vec![0, 0xff, 0]] {
+                    let mut encoded = if metadata < 256 {
+                        vec![payload.len() as u8]
+                    } else {
+                        (payload.len() as u16).to_le_bytes().to_vec()
+                    };
+                    encoded.extend_from_slice(&payload);
+                    let mut cursor = Cursor::new(encoded.as_slice());
+                    match parse_cell(&mut cursor, code, metadata).unwrap() {
+                        MySqlValue::Blob(bytes) => assert_eq!(bytes, payload),
+                        value => panic!("expected lossless byte value, got {:?}", value),
+                    }
+                    assert_eq!(cursor.position(), encoded.len() as u64);
+                }
+            }
+        }
+    }
 }

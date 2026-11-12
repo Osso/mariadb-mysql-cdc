@@ -4,7 +4,15 @@ use crate::extensions::read_bitmap_big_endian;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 
+/// Parses UTF-8 text without silently replacing invalid bytes.
+/// Row events must use `parse_string_bytes`: these wire types also encode binary data.
 pub fn parse_string(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<String, Error> {
+    String::from_utf8(parse_string_bytes(cursor, metadata)?)
+        .map_err(|error| Error::String(format!("Invalid UTF-8 string: {}", error)))
+}
+
+/// Reads the byte-length-prefixed payload shared by CHAR/BINARY and VARCHAR/VARBINARY.
+pub fn parse_string_bytes(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<Vec<u8>, Error> {
     let length = if metadata < 256 {
         cursor.read_u8()? as usize
     } else {
@@ -12,7 +20,7 @@ pub fn parse_string(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<String,
     };
     let mut bytes = vec![0; length];
     cursor.read_exact(&mut bytes)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }
 
 pub fn parse_bit(cursor: &mut Cursor<&[u8]>, metadata: u16) -> Result<Vec<bool>, Error> {
@@ -34,17 +42,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_string_preserves_non_utf8_bytes_lossily() {
-        let bytes = [
-            32, 162, 115, 146, 171, 116, 13, 97, 107, 102, 172, 93, 36, 187, 4, 11, 70, 81, 244,
-            255, 170, 85, 181, 120, 171, 186, 118, 3, 196, 183, 63, 234, 164,
-        ];
-        let mut cursor = Cursor::new(bytes.as_slice());
+    fn parse_string_rejects_invalid_utf8_without_replacement() {
+        let mut cursor = Cursor::new([1, 0xff].as_slice());
+        assert!(parse_string(&mut cursor, 255).is_err());
+    }
 
-        let value = parse_string(&mut cursor, 255).expect("lossy string parse");
+    #[test]
+    fn parse_string_keeps_utf8_text() {
+        let mut cursor = Cursor::new([3, b'a', 0xc3, 0xa9].as_slice());
+        assert_eq!(parse_string(&mut cursor, 255).unwrap(), "aé");
+    }
 
-        assert!(value.contains('�'));
-        assert!(value.contains("akf"));
+    #[test]
+    fn parse_string_bytes_preserves_payload_and_cursor_position() {
+        for maximum_length in [255, 256] {
+            for payload in [vec![], vec![0xff], vec![0xfe], vec![0, 0xff, 0]] {
+                let mut encoded = if maximum_length < 256 {
+                    vec![payload.len() as u8]
+                } else {
+                    (payload.len() as u16).to_le_bytes().to_vec()
+                };
+                encoded.extend_from_slice(&payload);
+                let end = encoded.len() as u64;
+                encoded.push(0x42);
+                let mut cursor = Cursor::new(encoded.as_slice());
+                assert_eq!(
+                    parse_string_bytes(&mut cursor, maximum_length).unwrap(),
+                    payload
+                );
+                assert_eq!(cursor.position(), end);
+                assert_eq!(cursor.read_u8().unwrap(), 0x42);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_string_bytes_rejects_truncated_prefix_and_payload() {
+        for (encoded, maximum_length) in [
+            (vec![], 255),
+            (vec![1], 256),
+            (vec![2, 0xff], 255),
+            (vec![2, 0, 0xff], 256),
+        ] {
+            let mut cursor = Cursor::new(encoded.as_slice());
+            assert!(parse_string_bytes(&mut cursor, maximum_length).is_err());
+        }
     }
 }
 
