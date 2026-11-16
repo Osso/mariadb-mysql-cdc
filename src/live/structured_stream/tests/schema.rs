@@ -247,6 +247,55 @@ fn fixture_row_events_apply_through_row_applier_with_schema_resolver() {
 }
 
 #[test]
+fn minimal_row_image_delete_applies_by_primary_key_but_minimal_update_is_rejected() {
+    // Captured from MariaDB 11.8.8 with a session binlog_row_image=MINIMAL DELETE and UPDATE.
+    let events = fixture_events("fixtures/minimal-delete-binlog/mysql-bin.000001");
+    let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
+    let resolver = FixtureSchemaResolver;
+    let mut state = StructuredEventState::new(Some("fixture_cdc".to_string()));
+    let mut update_error = None;
+
+    for (header, event) in &events {
+        if matches!(event, BinlogEvent::QueryEvent(_)) {
+            continue;
+        }
+        let outcome = handle_structured_event(
+            &mut applier,
+            &resolver,
+            &mut state,
+            "mysql-bin.000001",
+            header,
+            event,
+        );
+        match (event, outcome) {
+            (BinlogEvent::UpdateRowsEvent(_), Err(error)) => update_error = Some(error.to_string()),
+            (_, outcome) => {
+                outcome.expect("handle fixture event");
+            }
+        }
+    }
+
+    let statements = applier.executor().statements.borrow();
+    let deletes = statements
+        .iter()
+        .filter(|statement| statement.sql.starts_with("DELETE"))
+        .collect::<Vec<_>>();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].sql, "DELETE FROM `accounts` WHERE `id` = ?");
+    assert_eq!(deletes[0].params, vec![Value::UInt(2)]);
+    assert!(
+        !statements
+            .iter()
+            .any(|statement| statement.sql.starts_with("UPDATE"))
+    );
+    assert!(
+        update_error
+            .expect("MINIMAL update must be rejected")
+            .contains("without FULL binlog row image")
+    );
+}
+
+#[test]
 fn non_source_schema_table_maps_and_rows_are_ignored_without_target_apply() {
     let mut applier = crate::row::RowApplier::new(RecordingExecutor::default());
     let resolver = FixtureSchemaResolver;

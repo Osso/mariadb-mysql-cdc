@@ -96,11 +96,15 @@ where
         return Ok(EventPolicy::Ignore);
     }
     let table = row_event_table_map(applier, rows.table_id, coordinate)?;
-    require_full_row_image(&rows.columns_present, &table, "delete")?;
+    require_primary_key_row_image(&rows.columns_present, &table, "delete")?;
     let event = DeleteRowsEvent {
         coordinate: coordinate.clone(),
         table_id: rows.table_id,
-        rows: map_row_data_list(&rows.rows, &table)?,
+        rows: rows
+            .rows
+            .iter()
+            .map(|row| map_present_row_data(row, &rows.columns_present, &table))
+            .collect::<Result<_, _>>()?,
     };
     applier
         .apply_delete_rows(&event)
@@ -139,6 +143,21 @@ pub(super) fn map_row_data_list(
     table: &RowTableMap,
 ) -> Result<Vec<RowImage>, ApplyBinlogError> {
     rows.iter().map(|row| map_row_data(row, table)).collect()
+}
+
+/// Maps only the columns the binlog image carries; a MINIMAL delete image holds just the key.
+pub(super) fn map_present_row_data(
+    row: &RowData,
+    columns_present: &[bool],
+    table: &RowTableMap,
+) -> Result<RowImage, ApplyBinlogError> {
+    let mut image = map_row_data(row, table)?;
+    for (column, present) in table.columns.iter().zip(columns_present) {
+        if !present {
+            image.remove(column);
+        }
+    }
+    Ok(image)
 }
 
 pub(super) fn map_row_data(

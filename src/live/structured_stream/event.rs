@@ -259,6 +259,31 @@ pub(super) fn require_full_row_image(
     )))
 }
 
+/// MariaDB MINIMAL images carry only the primary key in a DELETE before-image. The target
+/// delete is keyed on the primary key, so that is sufficient for deletes.
+pub(super) fn require_primary_key_row_image(
+    columns_present: &[bool],
+    table: &RowTableMap,
+    operation: &str,
+) -> Result<(), ApplyBinlogError> {
+    let has_primary_key = columns_present.len() == table.columns.len()
+        && !table.primary_key.is_empty()
+        && table.primary_key.iter().all(|key| {
+            table
+                .columns
+                .iter()
+                .position(|column| column == key)
+                .is_some_and(|index| columns_present[index])
+        });
+    if has_primary_key {
+        return Ok(());
+    }
+
+    Err(mapping_error(format!(
+        "cannot apply {operation} row event without every primary-key column in the row image"
+    )))
+}
+
 pub(super) fn event_coordinate(
     current_file: &str,
     header: &EventHeader,
