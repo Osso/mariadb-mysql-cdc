@@ -2428,7 +2428,9 @@ DELIMITER ;
             json.loads(promoted["canonical_ast"]), sort_keys=True
         ).lower()
         if (
-            "algorithm" not in canonical_ast
+            promoted["schema_name"] != APP_SCHEMA
+            or APP_SCHEMA not in canonical_ast
+            or "algorithm" not in canonical_ast
             or "instant" not in canonical_ast
             or table not in canonical_ast
             or "free_read_start" not in canonical_ast
