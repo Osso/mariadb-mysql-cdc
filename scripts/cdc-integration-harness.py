@@ -88,6 +88,7 @@ SCENARIOS = (
     ScenarioSpec("commented-add-key-crash-replay", True),
     ScenarioSpec("shared-leading-comments-replay", True),
     ScenarioSpec("add-signed-tinyint-pending-replay", True),
+    ScenarioSpec("instant-add-columns-pending-replay", True),
     ScenarioSpec("curated-strip-sale-alter-pending-replay", True),
     ScenarioSpec("basic-scalar-create-add-pending-replay", True),
     ScenarioSpec("basic-column-operations-pending-replay", True),
@@ -2342,6 +2343,147 @@ DELIMITER ;
             "add_signed_tinyint_pending_replay_ok pending_promoted=true immutable_identity=true "
             "signed_range=true nullability=true default=true order=true post_ddl_rows=true "
             f"coordinate={stop.file}:{stop.position}"
+        )
+
+    def run_instant_add_columns_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError("instant ADD COLUMN replay requires --old-binary")
+        table = "synthetic_table"
+        schema = (
+            f"CREATE TABLE {table} ("
+            "id INT NOT NULL PRIMARY KEY, payload VARCHAR(32) NOT NULL"
+            ") ENGINE=InnoDB; "
+            f"INSERT INTO {table} VALUES (1,'before-one'),(2,'before-two');"
+        )
+        ddl = (
+            "/* inert client comment */ ALTER TABLE synthetic_table "
+            "ADD COLUMN free_read_start DATETIME NULL DEFAULT NULL, "
+            "ADD COLUMN free_read_end DATETIME NULL DEFAULT NULL, "
+            "ALGORITHM=INSTANT"
+        )
+        start, pending = self.prepare_pending_add_column(
+            schema, ddl, prepared=True, old_binary=self.old_binary
+        )
+        if pending["raw_sql"] != ddl or pending["status"] != "translation_pending":
+            raise HarnessError(f"instant ADD COLUMN was not durably pending: {pending!r}")
+
+        old_rows = self.admin_query(
+            self.source,
+            f"SELECT id,free_read_start IS NULL,free_read_end IS NULL "
+            f"FROM {table} ORDER BY id;",
+        ).strip()
+        if old_rows != "1\t1\t1\n2\t1\t1":
+            raise HarnessError(f"instant ADD COLUMN old rows were not NULL: {old_rows!r}")
+
+        self.admin_sql(
+            self.target,
+            "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=ON;",
+        )
+        self.admin_sql(
+            self.source,
+            f"UPDATE {table} SET free_read_start='2026-11-17 10:11:12', "
+            "free_read_end='2026-11-17 10:21:22' WHERE id=1; "
+            f"INSERT INTO {table} VALUES "
+            "(3,'inserted','2026-11-17 11:12:13','2026-11-17 11:22:23');",
+        )
+        stop = self.coordinate()
+        crashed = self.run_stream(
+            start, stop, integration_failpoint="post-ddl-pre-applied"
+        )
+        if crashed.returncode != 70 or "cdc_integration_failpoint" not in (
+            crashed.stdout + crashed.stderr
+        ):
+            raise HarnessError(
+                f"instant ADD COLUMN did not crash after target DDL: {crashed!r}"
+            )
+
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        checkpoint = self.checkpoint()
+        if (
+            journal["status"] != "prepared"
+            or journal["raw_sql"] != pending["raw_sql"]
+            or journal["source_identity"] != pending["source_identity"]
+            or (checkpoint["source_file"], checkpoint["source_position"])
+            != (start.file, start.position)
+        ):
+            raise HarnessError(
+                f"instant ADD COLUMN crash lost journal identity/checkpoint: "
+                f"{journal!r} {checkpoint!r}"
+            )
+        target_old_rows = self.admin_query(
+            self.target,
+            f"SELECT id,free_read_start IS NULL,free_read_end IS NULL "
+            f"FROM {table} ORDER BY id;",
+        ).strip()
+        if target_old_rows != "1\t1\t1\n2\t1\t1":
+            raise HarnessError(
+                f"instant ADD COLUMN crash changed old row defaults: {target_old_rows!r}"
+            )
+
+        self.replay_pending_add_column(start, pending)
+        promoted = self.journal_full_row(int(pending["event_start_position"]))
+        generated_sql = promoted["generated_sql"].lower()
+        canonical_ast = json.dumps(
+            json.loads(promoted["canonical_ast"]), sort_keys=True
+        ).lower()
+        if (
+            "algorithm" not in canonical_ast
+            or "instant" not in canonical_ast
+            or table not in canonical_ast
+            or "free_read_start" not in canonical_ast
+            or "free_read_end" not in canonical_ast
+            or "algorithm" not in generated_sql
+            or "instant" not in generated_sql
+            or f"alter table `{table}`" not in generated_sql
+        ):
+            raise HarnessError(
+                "instant ADD COLUMN translated schema or AST algorithm was not retained: "
+                f"{promoted!r}"
+            )
+        expected_rows = (
+            "1\tbefore-one\t2026-11-17 10:11:12\t2026-11-17 10:21:22\n"
+            "2\tbefore-two\tNULL\tNULL\n"
+            "3\tinserted\t2026-11-17 11:12:13\t2026-11-17 11:22:23"
+        )
+        self.assert_post_ddl_rows(table, expected_rows)
+        metadata = self.admin_query(
+            self.target,
+            "SELECT column_name,column_type,is_nullable,column_default,ordinal_position "
+            "FROM information_schema.columns "
+            f"WHERE table_schema={sql_literal(APP_SCHEMA)} "
+            f"AND table_name={sql_literal(table)} "
+            "AND column_name IN ('free_read_start','free_read_end') "
+            "ORDER BY ordinal_position;",
+        ).strip()
+        if metadata != (
+            "free_read_start\tdatetime\tYES\tNULL\t3\n"
+            "free_read_end\tdatetime\tYES\tNULL\t4"
+        ):
+            raise HarnessError(f"instant ADD COLUMN metadata differs: {metadata!r}")
+
+        ddl_count_query = (
+            "SELECT COUNT(*) FROM mysql.general_log "
+            "WHERE user_host LIKE 'cdc_stream%' AND command_type IN ('Query','Execute') "
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'alter table%' "
+            "AND LOWER(CONVERT(argument USING utf8mb4)) LIKE '%synthetic_table%';"
+        )
+        ddl_count = self.admin_query(self.target, ddl_count_query).strip()
+        if ddl_count != "1":
+            raise HarnessError(f"instant ADD COLUMN target DDL ran {ddl_count} times")
+        checkpoint_after_replay = self.checkpoint()
+        replayed = self.run_stream(start, stop)
+        require_success(replayed, "instant ADD COLUMN checkpointed restart")
+        if self.checkpoint() != checkpoint_after_replay:
+            raise HarnessError(
+                "instant ADD COLUMN checkpointed restart skipped or changed the checkpoint"
+            )
+        if self.admin_query(self.target, ddl_count_query).strip() != "1":
+            raise HarnessError("instant ADD COLUMN checkpointed restart ran DDL again")
+        print(
+            "instant_add_columns_pending_replay_ok pending=true immutable_identity=true "
+            "ast_algorithm=true old_rows_null=true following_dml=true crash_restart=true "
+            f"ddl_once=true checkpoint={stop.file}:{stop.position}"
         )
 
     def run_curated_strip_sale_alter_pending_replay(self) -> None:
@@ -12271,6 +12413,8 @@ DELIMITER ;
             self.run_shared_leading_comments_replay()
         elif scenario == "add-signed-tinyint-pending-replay":
             self.run_add_signed_tinyint_pending_replay()
+        elif scenario == "instant-add-columns-pending-replay":
+            self.run_instant_add_columns_pending_replay()
         elif scenario == "curated-strip-sale-alter-pending-replay":
             self.run_curated_strip_sale_alter_pending_replay()
         elif scenario == "basic-scalar-create-add-pending-replay":
