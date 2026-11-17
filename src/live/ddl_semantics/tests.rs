@@ -6,6 +6,7 @@ mod coalesce_generation;
 mod column_operations;
 mod copy_shared;
 
+mod instant_add;
 mod json_add;
 mod json_create;
 mod nullable_modify;
@@ -2519,27 +2520,48 @@ fn content_sections_seen_columns_strip_source_guards_from_mysql8_sql() {
 }
 
 #[test]
-fn content_sections_seen_columns_near_misses_remain_unsupported() {
-    let near_misses = [
-        CONTENT_SECTIONS_SEEN_DDL.replace(
-            "content_sections_events_raw",
-            "content_sections_events",
+fn instant_add_column_admission_does_not_depend_on_observed_table_or_column_names() {
+    let expected = transform_production_alter_table(CONTENT_SECTIONS_SEEN_DDL)
+        .expect("observed INSTANT ADD")
+        .target_sql
+        .expect("observed target SQL");
+    let variants = [
+        (
+            CONTENT_SECTIONS_SEEN_DDL.replace(
+                "content_sections_events_raw",
+                "content_sections_events",
+            ),
+            expected.replace("content_sections_events_raw", "content_sections_events"),
         ),
-        CONTENT_SECTIONS_SEEN_DDL.replace("direct_seen_at", "direct_seen"),
-        CONTENT_SECTIONS_SEEN_DDL.replace("direct write", "direct-write"),
-        CONTENT_SECTIONS_SEEN_DDL.replace(
-            "ADD COLUMN IF NOT EXISTS `direct_seen_at` timestamp NULL DEFAULT NULL\nCOMMENT 'When CmsEventsBufferManager (direct write) first saw this event',\nADD COLUMN IF NOT EXISTS `sync_seen_at` timestamp NULL DEFAULT NULL\nCOMMENT 'When ContentSectionsEventSyncService (Mixpanel Export) first saw it'",
-            "ADD COLUMN IF NOT EXISTS `sync_seen_at` timestamp NULL DEFAULT NULL\nCOMMENT 'When ContentSectionsEventSyncService (Mixpanel Export) first saw it',\nADD COLUMN IF NOT EXISTS `direct_seen_at` timestamp NULL DEFAULT NULL\nCOMMENT 'When CmsEventsBufferManager (direct write) first saw this event'",
+        (
+            CONTENT_SECTIONS_SEEN_DDL.replace("direct_seen_at", "direct_seen"),
+            expected.replace("direct_seen_at", "direct_seen"),
         ),
-        CONTENT_SECTIONS_SEEN_DDL.replace("ALGORITHM=INSTANT", "ALGORITHM=INPLACE"),
+        (
+            CONTENT_SECTIONS_SEEN_DDL.replace("direct write", "direct-write"),
+            expected.replace("direct write", "direct-write"),
+        ),
+        (
+            "ALTER TABLE content_sections_events_raw ADD COLUMN IF NOT EXISTS sync_seen_at TIMESTAMP NULL DEFAULT NULL COMMENT 'sync event', ADD COLUMN IF NOT EXISTS direct_seen_at TIMESTAMP NULL DEFAULT NULL COMMENT 'direct event', ALGORITHM=INSTANT".to_string(),
+            "ALTER TABLE `content_sections_events_raw` ADD COLUMN `sync_seen_at` TIMESTAMP NULL DEFAULT NULL COMMENT 'sync event', ADD COLUMN `direct_seen_at` TIMESTAMP NULL DEFAULT NULL COMMENT 'direct event', ALGORITHM=INSTANT".to_string(),
+        ),
     ];
 
-    for sql in near_misses {
-        assert!(
-            !supports_production_alter_table(&sql),
-            "near-miss ALTER was admitted: {sql}"
+    for (sql, expected_sql) in variants {
+        let transformation = transform_production_alter_table(&sql)
+            .unwrap_or_else(|error| panic!("generic INSTANT ADD was rejected: {error}: {sql}"));
+        assert_eq!(
+            transformation.target_sql.as_deref(),
+            Some(expected_sql.as_str())
         );
     }
+
+    assert!(
+        !supports_production_alter_table(
+            &CONTENT_SECTIONS_SEEN_DDL.replace("ALGORITHM=INSTANT", "ALGORITHM=INPLACE")
+        ),
+        "INPLACE remains outside the INSTANT admission"
+    );
 }
 
 #[test]
