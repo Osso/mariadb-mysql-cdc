@@ -2429,7 +2429,6 @@ DELIMITER ;
         ).lower()
         if (
             promoted["schema_name"] != APP_SCHEMA
-            or APP_SCHEMA not in canonical_ast
             or "algorithm" not in canonical_ast
             or "instant" not in canonical_ast
             or table not in canonical_ast
