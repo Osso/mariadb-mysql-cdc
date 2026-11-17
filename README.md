@@ -94,11 +94,7 @@ The native stream applies row events and stores grouped row-event checkpoints in
 the target. DDL capability, runtime barriers, and proof levels are maintained in
 the authoritative [basic DDL matrix](docs/specs/ddl-transformation.md#basic-common-ddl-expansion).
 Native MariaDB/MySQL replay harnesses prove bounded column and table-lifecycle
-slices. The planned, not deployed, `ALGORITHM=INSTANT` expansion admits only nonempty fully modeled `ADD COLUMN` lists without `LOCK`; mixed operations, any `LOCK`, and unmodeled syntax remain blocked. Existing source SQL-mode and default checks, semantic fences, journal identity, and checkpoint ordering remain unchanged. The planned `instant-add-columns-pending-replay` native scenario covers two nullable DATETIME additions, an inert leading comment, old NULL rows, new DML, pending promotion, crash/restart, and checkpoint. Code `81fde02` is deployed after the runtime image gate (11 findings,
-zero HIGH/CRITICAL scan findings) and Flux rollout confirmation; the live sample
-passed with no pod restarts or quarantines. Independent verifier 53 is still
-running, so this is deployment evidence, not its final verdict. The matrix
-records exact coverage, current required work, and runtime barriers.
+slices. `ALGORITHM=INSTANT` admits only nonempty, fully modeled `ADD COLUMN` lists without `LOCK`; mixed operations, any `LOCK`, and unmodeled syntax remain blocked. Source SQL-mode and default checks, semantic fences, journal identity, and checkpoint ordering remain in force. At source revision `1242692`, five focused tests passed. Native `instant-add-columns-pending-replay` proved promotion of an actual barrier created by the old `289` binary, immutable identity, the instant AST, old NULL rows, following DML, post-DDL crash/restart, one DDL execution, and checkpoint advancement. The normal deployment gates passed the project tests, six Python tests, formatting, Clippy, 11 image checks, and the security scan. GitOps commit `8fabf4cd7` records desired image `1242692` at digest `sha256:56ff74910dfff230fddca04de2117b51b818a82cfa30a1ae41c96979ab573955`; rollout smoke tests remain pending, and this is not evidence of live stream recovery. The matrix records exact coverage and runtime barriers.
 Historical detail below never narrows that matrix. Automatic
 DDL admission also covers an explicitly named,
 unqualified, visible, non-unique secondary BTREE `CREATE INDEX` or `DROP INDEX`
