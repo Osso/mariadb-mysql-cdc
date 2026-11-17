@@ -68,7 +68,7 @@ pub fn supports_production_alter_table_with_mode(source_sql: &str, mode: SourceS
 }
 
 fn supports_parsed_production_alter(ast: &ParsedAlterTableAst) -> bool {
-    supports_existing_production_alter(ast) || supports_content_sections_seen_columns_instant(ast)
+    supports_existing_production_alter(ast) || supports_instant_add_columns(ast)
 }
 
 fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
@@ -99,47 +99,14 @@ fn supports_existing_production_alter(ast: &ParsedAlterTableAst) -> bool {
         })
 }
 
-fn supports_content_sections_seen_columns_instant(ast: &ParsedAlterTableAst) -> bool {
-    if ast.table != "content_sections_events_raw"
-        || ast.algorithm != Some(ParsedAlterAlgorithm::Instant)
-        || ast.lock.is_some()
-    {
-        return false;
-    }
-    let [
-        ParsedAlterClause::AddColumn(direct_seen),
-        ParsedAlterClause::AddColumn(sync_seen),
-    ] = ast.clauses.as_slice()
-    else {
-        return false;
-    };
-    is_exact_seen_column(
-        direct_seen,
-        "direct_seen_at",
-        "When CmsEventsBufferManager (direct write) first saw this event",
-    ) && is_exact_seen_column(
-        sync_seen,
-        "sync_seen_at",
-        "When ContentSectionsEventSyncService (Mixpanel Export) first saw it",
-    )
-}
-
-fn is_exact_seen_column(column: &ParsedAddColumnAst, name: &str, comment: &str) -> bool {
-    column
-        == &ParsedAddColumnAst {
-            name: name.to_string(),
-            if_not_exists: true,
-            column_type: "timestamp".to_string(),
-            data_type: "timestamp".to_string(),
-            nullable: true,
-            default_value: None,
-            comment: comment.to_string(),
-            after: None,
-            first: false,
-            character_set: None,
-            collation: None,
-            generated: None,
-        }
+fn supports_instant_add_columns(ast: &ParsedAlterTableAst) -> bool {
+    ast.algorithm == Some(ParsedAlterAlgorithm::Instant)
+        && ast.lock.is_none()
+        && !ast.clauses.is_empty()
+        && ast
+            .clauses
+            .iter()
+            .all(|clause| matches!(clause, ParsedAlterClause::AddColumn(_)))
 }
 
 pub fn transform_production_alter_table(source_sql: &str) -> Result<DdlTransformation, String> {
