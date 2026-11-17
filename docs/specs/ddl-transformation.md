@@ -53,14 +53,19 @@ same immutable pre-state and expected post-state.
 
 ### Instant ADD COLUMN proof and deployment record
 
-Source revision `1242692` includes the five-commit fix. The normal deployment
+Source revision `1242692` contains the bounded admission change and tests. The normal deployment
 gates passed the full project test path (including six Python tests), formatting,
 Clippy, 11 runtime image checks, and the security scan. GitOps commit `8fabf4cd7`
 records desired image `1242692` with digest
 `sha256:56ff74910dfff230fddca04de2117b51b818a82cfa30a1ae41c96979ab573955`.
-Rollout smoke tests remain pending; this record does not establish current health
-or live stream recovery. The capability and native replay proof are bounded as
-described below.
+VERIFIED on November 17, 2026: rollout generation 334 completed, the original
+journal event reached `checkpointed` with its raw identity unchanged, both added
+nullable DATETIME columns existed, and the durable checkpoint advanced beyond the
+event. A later 10-minute sample through 07:26 UTC continued to advance with zero
+reported quarantines or reconnect errors. The stream was still behind a fixed
+source-head snapshot; catch-up and full source-target parity are not established.
+The operator incident record owns private coordinates and current monitoring.
+The capability and native replay proof are bounded as described below.
 
 ### Statement execution protocol
 
