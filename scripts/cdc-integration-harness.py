@@ -5917,7 +5917,11 @@ DELIMITER ;
         added_grants = set(after_grants) - set(before_grants)
         removed_grants = set(before_grants) - set(after_grants)
         expected_added_grant = f"GRANT CREATE USER ON *.* TO {LIVE_TARGET_USER}@%"
-        if added_grants != {expected_added_grant} or removed_grants:
+        expected_removed_grant = f"GRANT USAGE ON *.* TO {LIVE_TARGET_USER}@%"
+        if added_grants != {expected_added_grant} or removed_grants not in (
+            set(),
+            {expected_removed_grant},
+        ):
             raise HarnessError(
                 "fixture CDC grant change was not limited to CREATE USER: "
                 f"added={sorted(added_grants)!r} removed={sorted(removed_grants)!r}"
