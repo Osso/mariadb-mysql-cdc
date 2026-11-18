@@ -212,14 +212,14 @@ mod tests {
     #[test]
     fn translates_supported_form_preserving_account_verifier_and_terminator() {
         let source = format!(
-            "CREATE USER 'User.Name'@'%.Example' IDENTIFIED VIA mysql_native_password USING '{VERIFIER}' REQUIRE SSL ACCOUNT LOCK;"
+            "CREATE USER 'User_Name'@'%.Example' IDENTIFIED VIA mysql_native_password USING '{VERIFIER}' REQUIRE SSL ACCOUNT LOCK;"
         );
         let translated = translate_create_user(&source)
             .unwrap_or_else(|_| panic!("supported statement rejected"));
         assert_eq!(
             translated.as_sql(),
             format!(
-                "CREATE USER 'User.Name'@'%.Example' IDENTIFIED WITH mysql_native_password AS '{VERIFIER}' REQUIRE SSL ACCOUNT LOCK;"
+                "CREATE USER 'User_Name'@'%.Example' IDENTIFIED WITH mysql_native_password AS '{VERIFIER}' REQUIRE SSL ACCOUNT LOCK;"
             )
         );
     }
