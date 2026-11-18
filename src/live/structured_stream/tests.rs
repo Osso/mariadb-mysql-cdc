@@ -410,6 +410,7 @@ impl super::super::ddl_semantics::DdlSemanticInventory for RecordingSemanticInve
 
 #[derive(Default)]
 struct RecordingDdlReplayJournal {
+    fail_mark_applied_once: std::cell::Cell<bool>,
     status: RefCell<Option<DdlReplayStatus>>,
     evidence: RefCell<Option<super::super::ddl_semantics::DdlSemanticEvidence>>,
     operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
@@ -418,6 +419,7 @@ struct RecordingDdlReplayJournal {
 impl RecordingDdlReplayJournal {
     fn with_operations(operations: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>) -> Self {
         Self {
+            fail_mark_applied_once: std::cell::Cell::new(false),
             status: RefCell::new(None),
             evidence: RefCell::new(None),
             operations,
@@ -482,6 +484,9 @@ impl DdlReplayJournal for RecordingDdlReplayJournal {
     }
 
     fn mark_applied(&self, _event: &DdlEvent) -> Result<(), String> {
+        if self.fail_mark_applied_once.replace(false) {
+            return Err("fixture journal write failed".into());
+        }
         self.operations.borrow_mut().push("APPLIED");
         *self.status.borrow_mut() = Some(DdlReplayStatus::Applied);
         Ok(())

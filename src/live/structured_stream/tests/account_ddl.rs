@@ -144,9 +144,13 @@ impl crate::target::TransactionalTargetExecutor for AccountTarget {
 const UNLOCK_SQL: &str = "ALTER USER 'fixture'@'127.0.0.%' ACCOUNT UNLOCK";
 
 fn unlock_event_key(sql: &str, file: &str, event_start: u64) -> String {
+    unlock_event_key_for_source("production-source#server-id=1", sql, file, event_start)
+}
+
+fn unlock_event_key_for_source(source: &str, sql: &str, file: &str, event_start: u64) -> String {
     use sha2::{Digest, Sha256};
 
-    let identity_digest = Sha256::digest(b"production-source#server-id=1");
+    let identity_digest = Sha256::digest(source);
     let digest = Sha256::digest(sql.as_bytes());
     format!("{identity_digest:x}:{file}:{event_start}:{digest:x}")
 }
@@ -347,6 +351,13 @@ fn account_unlock_requires_exact_source_event_approval_before_any_target_effect(
     let correct_key = unlock_event_key(UNLOCK_SQL, "mysqld-bin.000777", 161);
     for approval in [
         None,
+        Some(unlock_event_key_for_source(
+            "production-source#server-id=2",
+            UNLOCK_SQL,
+            "mysqld-bin.000777",
+            161,
+        )),
+        Some(unlock_event_key(UNLOCK_SQL, "mysqld-bin.000778", 161)),
         Some(unlock_event_key(UNLOCK_SQL, "mysqld-bin.000777", 162)),
         Some(unlock_event_key(
             "ALTER USER 'fixture'@'127.0.0.%' ACCOUNT LOCK",
@@ -416,21 +427,24 @@ fn approved_legacy_translation_pending_unlock_is_applied_and_checkpointed() {
 }
 
 #[test]
-fn uncertain_unlock_result_retries_prepared_event_then_checkpoints() {
+fn unlock_retries_prepared_event_after_target_or_journal_acknowledgment_failure() {
+    for target_ack_lost in [true, false] {
+        assert_prepared_unlock_retry(target_ack_lost);
+    }
+}
+
+fn assert_prepared_unlock_retry(target_ack_lost: bool) {
     let operations = Rc::new(RefCell::new(Vec::new()));
     let target = AccountTarget::new(operations.clone());
-    target.fail_unlock_once.set(true);
+    target.fail_unlock_once.set(target_ack_lost);
     let journal = RecordingDdlReplayJournal::with_operations(operations.clone());
+    journal.fail_mark_applied_once.set(!target_ack_lost);
     *journal.status.borrow_mut() = Some(DdlReplayStatus::TranslationPending);
     let approval = Some(unlock_event_key(UNLOCK_SQL, "mysqld-bin.000777", 161));
 
     let error = run_account_unlock(&target, &journal, approval.clone())
-        .expect_err("uncertain target acknowledgment must leave checkpoint blocked");
-    assert!(
-        error
-            .to_string()
-            .contains("target unlock was not confirmed")
-    );
+        .expect_err("unconfirmed progress must leave the checkpoint blocked");
+    assert!(matches!(error, ApplyBinlogError::DdlBlocked(_)));
     assert!(!target.locked_account.get());
     assert_eq!(*journal.status.borrow(), Some(DdlReplayStatus::Prepared));
     assert!(target.saved_positions.borrow().is_empty());
