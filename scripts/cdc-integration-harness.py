@@ -5901,11 +5901,9 @@ DELIMITER ;
 
         self.setup_accounts_table()
         self._assert_target_grants()
-        before_grants = set(
-            normalize_grants(
-                self.admin_query(
-                    self.target, f"SHOW GRANTS FOR '{LIVE_TARGET_USER}'@'%';"
-                )
+        before_grants = normalize_grants(
+            self.admin_query(
+                self.target, f"SHOW GRANTS FOR '{LIVE_TARGET_USER}'@'%';"
             )
         )
         self.admin_sql(
@@ -5916,8 +5914,16 @@ DELIMITER ;
             self.target, f"SHOW GRANTS FOR '{LIVE_TARGET_USER}'@'%';"
         )
         after_grants = normalize_grants(grant_text)
-        expected_grants = before_grants | {(frozenset({"CREATE USER"}), "*.*")}
-        assert_exact_grants(after_grants, expected_grants, LIVE_TARGET_USER)
+        added_grants = set(after_grants) - set(before_grants)
+        removed_grants = set(before_grants) - set(after_grants)
+        expected_added_grant = f"GRANT CREATE USER ON *.* TO {LIVE_TARGET_USER}@%"
+        if added_grants != {expected_added_grant} or removed_grants:
+            raise HarnessError("fixture CDC grant change was not limited to CREATE USER")
+        assert_exact_grants(
+            [expected_added_grant],
+            {(frozenset({"CREATE USER"}), "*.*")},
+            LIVE_TARGET_USER,
+        )
         if "WITH GRANT OPTION" in grant_text.upper():
             raise HarnessError("CREATE USER fixture grant unexpectedly has GRANT OPTION")
 
