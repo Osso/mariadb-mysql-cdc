@@ -5901,8 +5901,12 @@ DELIMITER ;
 
         self.setup_accounts_table()
         self._assert_target_grants()
-        before_grants = normalize_grants(
-            self.admin_query(self.target, f"SHOW GRANTS FOR '{LIVE_TARGET_USER}'@'%';")
+        before_grants = set(
+            normalize_grants(
+                self.admin_query(
+                    self.target, f"SHOW GRANTS FOR '{LIVE_TARGET_USER}'@'%';"
+                )
+            )
         )
         self.admin_sql(
             self.target,
