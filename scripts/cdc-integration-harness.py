@@ -237,6 +237,7 @@ class Harness:
         self.old_binary = old_binary
         self.failed_binary = failed_binary
         self.keep = keep
+        self.target_image = TARGET_IMAGE
         self.tempdir = Path(tempfile.mkdtemp(prefix="mariadb-mysql-cdc-harness-"))
         self.containers: list[str] = []
         self.source: Endpoint | None = None
@@ -262,7 +263,7 @@ class Harness:
             require_command(command)
         self._generate_tls_material()
         self.source = self._start_database("source", SOURCE_IMAGE, 101)
-        self.target = self._start_database("target", TARGET_IMAGE, 102)
+        self.target = self._start_database("target", self.target_image, 102)
         wait_for_sql(self.source, self.ca_file)
         wait_for_sql(self.target, self.ca_file)
         self._bootstrap_endpoints()
@@ -12494,6 +12495,8 @@ DELIMITER ;
         spec = SCENARIO_BY_NAME[scenario]
         if not spec.executable:
             raise HarnessSkip(spec.prerequisite)
+        if scenario == "locked-tls-create-user-pending-replay":
+            self.target_image = os.environ.get("CDC_HARNESS_MYSQL84_IMAGE", "mysql:8.4")
         self.prepare()
         if scenario == "strict-secondary-btree":
             self.run_strict_secondary_btree()
