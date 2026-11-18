@@ -65,30 +65,36 @@ The approved `CREATE USER` privilege does not include grant option.
 
 ### One authorized account unlock
 
-- [ ] Accept only the exact plain, single-account `ALTER USER 'account'@'host'
+- [x] Accept only the exact plain, single-account `ALTER USER 'account'@'host'
       ACCOUNT UNLOCK` grammar. Reject additional clauses, multiple accounts or
       statements, and all other account mutations without applying them.
-- [ ] Require `CDC_APPROVED_ACCOUNT_UNLOCK` in the format
+- [x] Require `CDC_APPROVED_ACCOUNT_UNLOCK` in the format
       `<source-identity-sha256>:<binlog-file>:<event-start>:<sql-sha256>`.
       Hashes are lowercase hexadecimal SHA-256 of the journal's fully qualified
       source identity and original SQL bytes. A different source, coordinate or
       SQL must fail closed. Verify the target grant before setting the approval
       and remove the approval after the event is durably checkpointed.
-- [ ] Replay the authorized event through the normal ordered journal and checkpoint
+- [x] Replay the authorized event through the normal ordered journal and checkpoint
       flow. Do not manually skip the event or advance its checkpoint independently.
-- [ ] A Prepared retry of the unchanged authorized event must be idempotent. An
+- [x] A Prepared retry of the unchanged authorized event must be idempotent. An
       applied event must finalize through the normal journal/checkpoint flow without
       re-execution. Ambiguous or mismatched event identity must fail closed.
-- [ ] The target account's `SELECT` grant on the configured application schema is
+- [x] The target account's `SELECT` grant on the configured application schema is
       administered separately. The CDC worker must not replay `GRANT`, obtain
       grant option, or use new target worker credentials. Verify the schema grant
       at runtime if possible; runtime grant verification is optional, not a
       substitute for separate administration.
-- [ ] Do not output credentials or production account details in diagnostics,
-      fixtures, or evidence. Examples must use public synthetic accounts only.
-- [ ] Independently prove exact grammar and rejection boundaries, event-bound
-      authorization, ordered replay, Prepared retry, and checkpoint finalization
-      before marking these requirements tested.
+- [x] Do not output credentials or production account details in diagnostics,
+      fixtures, or new journal evidence. Existing pending rows retain their
+      original event identity. Examples must use public synthetic accounts only.
+
+| Boundary | Proof |
+|---|---|
+| Exact plain unlock; extra clauses, accounts or trailing statements rejected | Focused parser tests. |
+| Missing approval; wrong source, file, offset or SQL hash | Replay tests: the account remains locked and the checkpoint does not advance. |
+| Existing pending event; target acknowledgment loss; journal write failure | Replay tests: the matching event checkpoints after confirmed execution, including an idempotent Prepared retry. |
+| Native MySQL 8.4.11 | A synthetic worker with `CREATE USER` and no grant option can repeat the approved SQL. TLS and grants remain unchanged; non-TLS login and writes are denied. |
+| Production | Image `d1e0029` replayed the approved event. Direct readback showed `checkpointed`, the approved TLS-only account state and continued checkpoint progress after approval removal. |
 
 Other account mutations, `GRANT` replay, manual skips, new target worker
 credentials, and archival changes are out of scope.
