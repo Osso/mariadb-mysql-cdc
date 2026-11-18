@@ -27,6 +27,27 @@ allowlist.
       generated MySQL SQL, transformation version, source coordinate, pre-state,
       expected post-state, and observed post-state.
 
+### Bounded CREATE USER translation
+
+- [ ] A pure translator accepts exactly one MariaDB account in the form
+      `CREATE USER 'account'@'host' IDENTIFIED VIA mysql_native_password USING
+      '<native verifier>' REQUIRE SSL ACCOUNT LOCK` and deterministically emits
+      MySQL 8.4 `CREATE USER` with `IDENTIFIED WITH mysql_native_password AS`,
+      preserving the account, host, verifier, `REQUIRE SSL`, and `ACCOUNT LOCK`
+      exactly in meaning.
+- [ ] Reject malformed or unsupported verifiers, account syntax, authentication
+      plugins, clauses, multiple accounts or statements, and any input whose
+      meaning cannot be preserved. Do not silently discard or approximate input.
+- [ ] Diagnostics and fixtures must not contain credentials, except explicitly
+      public synthetic samples. No production principals, credentials, or
+      hostnames belong in examples or tests.
+- [ ] Live dispatch remains blocked until separate least-privilege execution and
+      journal evidence are proven and approved. Pure translation alone does not
+      authorize target account operations or credential-bearing journal records.
+
+This slice excludes `GRANT`, `ALTER USER`, live account operations, privilege
+expansion, manual skips, and archival `DELETE` changes.
+
 ### Atomic multi-pair table rename contract
 
 The observed event contains two independent renames and an ordinary client
