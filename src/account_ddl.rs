@@ -11,201 +11,97 @@ impl TranslatedCreateUser {
     }
 }
 
-/// Translate the one verified MariaDB account statement form to MySQL 8.4 syntax.
-///
-/// This function does not retain or format the input, which contains a credential verifier.
+/// Translate the supported single-account MariaDB form to MySQL 8.4.
 pub fn translate_create_user(sql: &str) -> Result<TranslatedCreateUser, TranslationError> {
-    let tokens = tokenize(sql)?;
-    let mut parser = Parser {
-        tokens: &tokens,
-        index: 0,
-    };
-
-    parser.keyword("CREATE")?;
-    parser.keyword("USER")?;
-    let user = parser.account_part()?;
-    parser.symbol(TokenKind::At)?;
-    let host = parser.account_part()?;
-    if !user
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        || !host.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'%' | b'_' | b'-')
-        })
-    {
-        return Err(TranslationError);
-    }
-    parser.keyword("IDENTIFIED")?;
-    parser.keyword("VIA")?;
-    parser.keyword("MYSQL_NATIVE_PASSWORD")?;
-    parser.keyword("USING")?;
-    let verifier = parser.verifier()?;
-    parser.keyword("REQUIRE")?;
-    parser.keyword("SSL")?;
-    parser.keyword("ACCOUNT")?;
-    parser.keyword("LOCK")?;
-    let semicolon = parser.optional_semicolon()?;
-    parser.finish()?;
+    let mut input = AccountStatement(sql);
+    input.keywords(&["CREATE", "USER"])?;
+    let user = input.quoted(is_user_name)?;
+    input.consume('@')?;
+    let host = input.quoted(is_host_pattern)?;
+    input.keywords(&["IDENTIFIED", "VIA", "MYSQL_NATIVE_PASSWORD", "USING"])?;
+    let verifier = input.quoted(is_native_verifier)?;
+    input.keywords(&["REQUIRE", "SSL", "ACCOUNT", "LOCK"])?;
+    let terminator = input.finish()?;
 
     Ok(TranslatedCreateUser(format!(
-        "CREATE USER '{user}'@'{host}' IDENTIFIED WITH mysql_native_password AS '{verifier}' REQUIRE SSL ACCOUNT LOCK{}",
-        if semicolon { ";" } else { "" }
+        "CREATE USER '{user}'@'{host}' IDENTIFIED WITH mysql_native_password AS '{verifier}' REQUIRE SSL ACCOUNT LOCK{terminator}"
     )))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TokenKind {
-    Word,
-    Quoted,
-    At,
-    Semicolon,
+fn is_user_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-struct Token<'a> {
-    kind: TokenKind,
-    value: &'a str,
+fn is_host_pattern(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'%' | b'_' | b'-')
+        })
 }
 
-fn tokenize(sql: &str) -> Result<Vec<Token<'_>>, TranslationError> {
-    let bytes = sql.as_bytes();
-    let mut tokens = Vec::new();
-    let mut cursor = 0;
-
-    while cursor < bytes.len() {
-        if bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-            continue;
-        }
-
-        match bytes[cursor] {
-            b'\'' => {
-                let start = cursor + 1;
-                cursor = start;
-                while cursor < bytes.len() && bytes[cursor] != b'\'' {
-                    if !bytes[cursor].is_ascii_graphic() || bytes[cursor] == b'\\' {
-                        return Err(TranslationError);
-                    }
-                    cursor += 1;
-                }
-                if cursor == bytes.len() {
-                    return Err(TranslationError);
-                }
-                tokens.push(Token {
-                    kind: TokenKind::Quoted,
-                    value: &sql[start..cursor],
-                });
-                cursor += 1;
-            }
-            b'@' => {
-                tokens.push(Token {
-                    kind: TokenKind::At,
-                    value: "@",
-                });
-                cursor += 1;
-            }
-            b';' => {
-                tokens.push(Token {
-                    kind: TokenKind::Semicolon,
-                    value: ";",
-                });
-                cursor += 1;
-            }
-            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
-                let start = cursor;
-                cursor += 1;
-                while cursor < bytes.len()
-                    && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
-                {
-                    cursor += 1;
-                }
-                tokens.push(Token {
-                    kind: TokenKind::Word,
-                    value: &sql[start..cursor],
-                });
-            }
-            _ => return Err(TranslationError),
-        }
-    }
-
-    Ok(tokens)
+fn is_native_verifier(value: &str) -> bool {
+    value
+        .strip_prefix('*')
+        .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-struct Parser<'a> {
-    tokens: &'a [Token<'a>],
-    index: usize,
-}
+struct AccountStatement<'a>(&'a str);
 
-impl Parser<'_> {
-    fn keyword(&mut self, expected: &str) -> Result<(), TranslationError> {
-        let token = self.next()?;
-        if token.kind == TokenKind::Word && token.value.eq_ignore_ascii_case(expected) {
-            Ok(())
+impl<'a> AccountStatement<'a> {
+    fn keywords(&mut self, expected: &[&str]) -> Result<(), TranslationError> {
+        for keyword in expected {
+            let input = self.remaining();
+            let end = input.find(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+            let (word, tail) = input.split_at(end.unwrap_or(input.len()));
+            if !word.eq_ignore_ascii_case(keyword) {
+                return Err(TranslationError);
+            }
+            self.0 = tail;
+        }
+        Ok(())
+    }
+
+    fn quoted(&mut self, accepts: fn(&str) -> bool) -> Result<&'a str, TranslationError> {
+        self.consume('\'')?;
+        let (value, tail) = self.0.split_once('\'').ok_or(TranslationError)?;
+        if !accepts(value) {
+            return Err(TranslationError);
+        }
+        self.0 = tail;
+        Ok(value)
+    }
+
+    fn consume(&mut self, character: char) -> Result<(), TranslationError> {
+        self.0 = self
+            .remaining()
+            .strip_prefix(character)
+            .ok_or(TranslationError)?;
+        Ok(())
+    }
+
+    fn remaining(&self) -> &'a str {
+        self.0.trim_start_matches(|c: char| c.is_ascii_whitespace())
+    }
+
+    fn finish(mut self) -> Result<&'static str, TranslationError> {
+        if self.remaining().is_empty() {
+            return Ok("");
+        }
+        self.consume(';')?;
+        if self.remaining().is_empty() {
+            Ok(";")
         } else {
             Err(TranslationError)
         }
-    }
-
-    fn account_part(&mut self) -> Result<String, TranslationError> {
-        let token = self.next()?;
-        if token.kind == TokenKind::Quoted && !token.value.is_empty() {
-            Ok(token.value.to_string())
-        } else {
-            Err(TranslationError)
-        }
-    }
-
-    fn verifier(&mut self) -> Result<String, TranslationError> {
-        let value = self.account_part()?;
-        let bytes = value.as_bytes();
-        if bytes.len() == 41
-            && bytes[0] == b'*'
-            && bytes[1..].iter().all(|byte| byte.is_ascii_hexdigit())
-        {
-            Ok(value)
-        } else {
-            Err(TranslationError)
-        }
-    }
-
-    fn symbol(&mut self, expected: TokenKind) -> Result<(), TranslationError> {
-        if self.next()?.kind == expected {
-            Ok(())
-        } else {
-            Err(TranslationError)
-        }
-    }
-
-    fn optional_semicolon(&mut self) -> Result<bool, TranslationError> {
-        if self
-            .tokens
-            .get(self.index)
-            .is_some_and(|token| token.kind == TokenKind::Semicolon)
-        {
-            self.index += 1;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn finish(&self) -> Result<(), TranslationError> {
-        if self.index == self.tokens.len() {
-            Ok(())
-        } else {
-            Err(TranslationError)
-        }
-    }
-
-    fn next(&mut self) -> Result<&Token<'_>, TranslationError> {
-        let token = self.tokens.get(self.index).ok_or(TranslationError)?;
-        self.index += 1;
-        Ok(token)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{translate_create_user, TranslationError};
+    use super::{TranslationError, translate_create_user};
 
     const VERIFIER: &str = "*0123456789ABCDEF0123456789ABCDEF01234567";
 
