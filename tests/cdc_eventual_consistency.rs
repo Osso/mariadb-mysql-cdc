@@ -155,6 +155,27 @@ fn real_create_table_crash_restart_harness_smoke() {
 }
 
 #[test]
+#[ignore = "requires disposable MariaDB/MySQL Docker containers and CDC_HARNESS_OLD_BINARY"]
+fn real_locked_tls_create_user_pending_replay_creates_account_and_applies_following_row() {
+    let old_binary = std::env::var_os("CDC_HARNESS_OLD_BINARY")
+        .expect("set CDC_HARNESS_OLD_BINARY to deployed 1242692 or runtime-equivalent binary");
+    let output = Command::new("python3")
+        .arg(harness_script())
+        .arg("--scenario")
+        .arg("locked-tls-create-user-pending-replay")
+        .arg("--old-binary")
+        .arg(old_binary)
+        .output()
+        .expect("run locked TLS CREATE USER integration harness");
+    assert!(
+        output.status.success(),
+        "integration harness failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 #[ignore = "starts MariaDB 11.4 and MySQL 8 Docker containers"]
 fn real_reader_memory_create_pending_replay_promotes_and_replays_following_ddl() {
     run_harness_scenario("reader-memory-create-pending-replay");
@@ -467,6 +488,7 @@ fn harness_scenario_listing_has_behavior_or_explicit_prerequisite() {
         "checkpoint-transaction",
         "source-connection-loss",
         "target-connection-loss",
+        "locked-tls-create-user-pending-replay",
     ] {
         assert!(
             listed

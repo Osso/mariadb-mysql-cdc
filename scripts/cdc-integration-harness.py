@@ -118,6 +118,7 @@ SCENARIOS = (
     ScenarioSpec("assistant-rec-experiments-create-pending-replay", True),
     ScenarioSpec("assistant-rec-quality-create-pending-replay", True),
     ScenarioSpec("assistant-rec-quality-create-mixed-case-pending-replay", True),
+    ScenarioSpec("locked-tls-create-user-pending-replay", True),
     ScenarioSpec("contributor-cards-check-collision-recovery", True),
     ScenarioSpec("commented-drop-column-present-pending-replay", True),
     ScenarioSpec("commented-drop-column-absent-pending-replay", True),
@@ -213,6 +214,7 @@ def default_scenarios() -> list[str]:
             "reader-memory-evaluation-copy-shared-pending-replay",
             "assistant-rec-quality-create-pending-replay",
             "assistant-rec-quality-create-mixed-case-pending-replay",
+            "locked-tls-create-user-pending-replay",
             "contributor-cards-check-collision-recovery",
         }
     ]
@@ -5887,6 +5889,163 @@ DELIMITER ;
                 raise HarnessError(
                     f"assistant rec experiments JSON checks differ at {endpoint.container}: {checks!r}"
                 )
+
+    def run_locked_tls_create_user_pending_replay(self) -> None:
+        assert self.source and self.target
+        if self.old_binary is None or not self.old_binary.is_file():
+            raise HarnessError(
+                "locked TLS CREATE USER replay requires --old-binary built from deployed "
+                "1242692 or a runtime-equivalent pre-handler revision"
+            )
+
+        self.setup_accounts_table()
+        self._assert_target_grants()
+        before_grants = normalize_grants(
+            self.admin_query(self.target, f"SHOW GRANTS FOR '{LIVE_TARGET_USER}'@'%';")
+        )
+        self.admin_sql(
+            self.target,
+            f"GRANT CREATE USER ON *.* TO '{LIVE_TARGET_USER}'@'%';",
+        )
+        grant_text = self.admin_query(
+            self.target, f"SHOW GRANTS FOR '{LIVE_TARGET_USER}'@'%';"
+        )
+        after_grants = normalize_grants(grant_text)
+        expected_grants = before_grants | {(frozenset({"CREATE USER"}), "*.*")}
+        assert_exact_grants(after_grants, expected_grants, LIVE_TARGET_USER)
+        if "WITH GRANT OPTION" in grant_text.upper():
+            raise HarnessError("CREATE USER fixture grant unexpectedly has GRANT OPTION")
+
+        account = "cdc_harness_locked_tls"
+        host = "127.0.0.%"
+        verifier = "*AB0347385E7793A014B4D9C33308736D4362FB3C"
+        ddl = (
+            f"CREATE USER '{account}'@'{host}' IDENTIFIED VIA mysql_native_password "
+            f"USING '{verifier}' REQUIRE SSL ACCOUNT LOCK"
+        )
+        try:
+            start, pending = self.prepare_pending_add_column(
+                "", ddl, "CREATE USER", old_binary=self.old_binary
+            )
+        except HarnessError as error:
+            message = str(error).replace(verifier, "[synthetic verifier redacted]")
+            raise HarnessError(message) from error
+        if pending["status"] != "translation_pending" or pending["raw_sql"] != ddl:
+            raise HarnessError("old binary did not persist the exact CREATE USER barrier")
+        if pending["generated_sql"] != "NULL":
+            raise HarnessError("old binary pending CREATE USER unexpectedly has generated SQL")
+
+        source_account = self.admin_query(
+            self.source,
+            "SELECT COUNT(*) FROM mysql.user "
+            f"WHERE User={sql_literal(account)} AND Host={sql_literal(host)};",
+        ).strip()
+        target_account = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM mysql.user "
+            f"WHERE User={sql_literal(account)} AND Host={sql_literal(host)};",
+        ).strip()
+        if source_account != "1" or target_account != "0":
+            raise HarnessError("CREATE USER fixture state before replay is not isolated")
+
+        self.admin_sql(
+            self.source,
+            "INSERT INTO accounts (id,email,payload) "
+            "VALUES (73001,'cdc-create-user-fixture@example.invalid','after-create-user');",
+        )
+        self.reset_target_general_log()
+        stop = self.coordinate()
+        try:
+            result = self.run_stream(start, stop)
+            require_success(result, "locked TLS CREATE USER pending replay")
+        except HarnessError as error:
+            message = str(error).replace(verifier, "[synthetic verifier redacted]")
+            raise HarnessError(message) from error
+
+        journal = self.journal_full_row(int(pending["event_start_position"]))
+        if journal["status"] != "checkpointed" or journal["generated_sql"] != "NULL":
+            raise HarnessError("CREATE USER replay did not checkpoint without generated SQL")
+        if journal["raw_sql"] != ddl:
+            raise HarnessError("CREATE USER replay changed immutable source SQL")
+        for field in (
+            "source_identity",
+            "source_server_id",
+            "binlog_file",
+            "event_start_position",
+            "event_end_position",
+        ):
+            if journal[field] != pending[field]:
+                raise HarnessError(f"CREATE USER replay changed immutable {field}")
+
+        account_state_query = (
+            "SELECT COUNT(*),MAX(plugin),MAX(ssl_type),MAX(account_locked) "
+            "FROM mysql.user "
+            f"WHERE User={sql_literal(account)} AND Host={sql_literal(host)};"
+        )
+        expected_account_state = "1\tmysql_native_password\tANY\tY"
+        stored_verifier = (
+            "SELECT authentication_string FROM mysql.user "
+            f"WHERE User={sql_literal(account)} AND Host={sql_literal(host)};"
+        )
+        for endpoint in (self.source, self.target):
+            actual = self.admin_query(endpoint, account_state_query).strip()
+            if actual != expected_account_state:
+                raise HarnessError(
+                    f"locked TLS account state differs at {endpoint.container}: "
+                    f"{actual!r}"
+                )
+            if self.admin_query(endpoint, stored_verifier).strip() != verifier:
+                raise HarnessError(
+                    f"synthetic verifier was not preserved at {endpoint.container}"
+                )
+        row = self.admin_query(
+            self.target,
+            "SELECT id,email,payload FROM accounts WHERE id=73001;",
+        ).strip()
+        expected_row = (
+            "73001\tcdc-create-user-fixture@example.invalid\tafter-create-user"
+        )
+        if row != expected_row:
+            raise HarnessError("following application row was not applied after CREATE USER")
+        checkpoint = self.checkpoint()
+        if (
+            checkpoint["source_file"] != stop.file
+            or int(checkpoint["source_position"]) != stop.position
+        ):
+            raise HarnessError("following application row checkpoint did not advance")
+        account_ddl_count = self.admin_query(
+            self.target,
+            "SELECT COUNT(*) FROM mysql.general_log "
+            "WHERE user_host LIKE 'cdc_stream%' AND command_type IN ('Query','Execute') "
+            f"AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'create user %{account}%';",
+        ).strip()
+        if account_ddl_count != "1":
+            raise HarnessError("target did not execute exactly one strict CREATE USER")
+        try:
+            require_success(
+                self.run_stream(start, stop), "checkpointed CREATE USER restart"
+            )
+        except HarnessError as error:
+            message = str(error).replace(verifier, "[synthetic verifier redacted]")
+            raise HarnessError(message) from error
+        if (
+            self.checkpoint() != checkpoint
+            or self.journal_full_row(int(pending["event_start_position"])) != journal
+            or self.admin_query(
+                self.target,
+                "SELECT COUNT(*) FROM mysql.general_log "
+                "WHERE user_host LIKE 'cdc_stream%' AND command_type IN ('Query','Execute') "
+                f"AND LOWER(CONVERT(argument USING utf8mb4)) LIKE 'create user %{account}%';",
+            ).strip()
+            != account_ddl_count
+        ):
+            raise HarnessError("checkpointed restart changed state or repeated account creation")
+
+        print(
+            "locked_tls_create_user_pending_replay_ok old_binary_pending=true "
+            "create_user_privilege_only=true grant_option=false generated_sql=false "
+            "locked_tls_account=true following_row=true checkpointed=true"
+        )
 
     def run_assistant_rec_quality_create_pending_replay(self, *, mixed_case: bool = False) -> None:
         assert self.source and self.target
@@ -12470,6 +12629,8 @@ DELIMITER ;
             self.run_assistant_rec_experiments_create_pending_replay()
         elif scenario == "assistant-rec-quality-create-pending-replay":
             self.run_assistant_rec_quality_create_pending_replay()
+        elif scenario == "locked-tls-create-user-pending-replay":
+            self.run_locked_tls_create_user_pending_replay()
         elif scenario == "assistant-rec-quality-create-mixed-case-pending-replay":
             self.run_assistant_rec_quality_create_pending_replay(mixed_case=True)
         elif scenario == "contributor-cards-check-collision-recovery":
