@@ -238,6 +238,7 @@ class Harness:
         self.failed_binary = failed_binary
         self.keep = keep
         self.target_image = TARGET_IMAGE
+        self.enable_native_password = False
         self.tempdir = Path(tempfile.mkdtemp(prefix="mariadb-mysql-cdc-harness-"))
         self.containers: list[str] = []
         self.source: Endpoint | None = None
@@ -404,6 +405,8 @@ class Harness:
             "--ssl-cert=/etc/cdc-tls/server-cert.pem",
             "--ssl-key=/etc/cdc-tls/server-key.pem",
         ]
+        if role == "target" and self.enable_native_password:
+            args.append("--mysql-native-password=ON")
         run(args)
         return Endpoint(name, port)
 
@@ -12514,6 +12517,7 @@ DELIMITER ;
             raise HarnessSkip(spec.prerequisite)
         if scenario == "locked-tls-create-user-pending-replay":
             self.target_image = os.environ.get("CDC_HARNESS_MYSQL84_IMAGE", "mysql:8.4")
+            self.enable_native_password = True
         self.prepare()
         if scenario == "strict-secondary-btree":
             self.run_strict_secondary_btree()
