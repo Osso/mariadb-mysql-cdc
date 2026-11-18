@@ -61,9 +61,34 @@ The focused tests in `src/account_ddl.rs` cover exact translation and rejection.
 the host, lock, TLS requirement, and credential still work as intended, and the
 new account has only `USAGE`.
 
-This slice excludes account grants, unlock, drop, wider SQL grammar, manual
-skips, and archival changes. The approved `CREATE USER` privilege does not include
-grant option.
+The approved `CREATE USER` privilege does not include grant option.
+
+### One authorized account unlock
+
+- [ ] Accept only the exact plain, single-account `ALTER USER 'account'@'host'
+      ACCOUNT UNLOCK` grammar. Reject additional clauses, multiple accounts or
+      statements, and all other account mutations without applying them.
+- [ ] Require operator authorization bound to one source event's fingerprint and
+      coordinate. Authorization for that event must not authorize another event,
+      even if its SQL is identical; an altered event must fail closed.
+- [ ] Replay the authorized event through the normal ordered journal and checkpoint
+      flow. Do not manually skip the event or advance its checkpoint independently.
+- [ ] A Prepared retry of the unchanged authorized event must be idempotent. An
+      applied event must finalize through the normal journal/checkpoint flow without
+      re-execution. Ambiguous or mismatched event identity must fail closed.
+- [ ] The target account's `SELECT` grant on the configured application schema is
+      administered separately. The CDC worker must not replay `GRANT`, obtain
+      grant option, or use new target worker credentials. Verify the schema grant
+      at runtime if possible; runtime grant verification is optional, not a
+      substitute for separate administration.
+- [ ] Do not output credentials or production account details in diagnostics,
+      fixtures, or evidence. Examples must use public synthetic accounts only.
+- [ ] Independently prove exact grammar and rejection boundaries, event-bound
+      authorization, ordered replay, Prepared retry, and checkpoint finalization
+      before marking these requirements tested.
+
+Other account mutations, `GRANT` replay, manual skips, new target worker
+credentials, and archival changes are out of scope.
 
 ### Atomic multi-pair table rename contract
 
