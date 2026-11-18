@@ -11,6 +11,30 @@ impl TranslatedCreateUser {
     }
 }
 
+/// A translated account-unlock statement with borrowed account identity.
+pub struct TranslatedUnlockUser<'a> {
+    user: &'a str,
+    host: &'a str,
+    sql: String,
+}
+
+impl TranslatedUnlockUser<'_> {
+    /// Return the account user name.
+    pub fn user(&self) -> &str {
+        self.user
+    }
+
+    /// Return the account host pattern.
+    pub fn host(&self) -> &str {
+        self.host
+    }
+
+    /// Borrow the normalized SQL statement.
+    pub fn as_sql(&self) -> &str {
+        &self.sql
+    }
+}
+
 /// Translate the supported single-account MariaDB form to MySQL 8.4.
 pub fn translate_create_user(sql: &str) -> Result<TranslatedCreateUser, TranslationError> {
     let mut input = AccountStatement(sql);
@@ -26,6 +50,23 @@ pub fn translate_create_user(sql: &str) -> Result<TranslatedCreateUser, Translat
     Ok(TranslatedCreateUser(format!(
         "CREATE USER '{user}'@'{host}' IDENTIFIED WITH mysql_native_password AS '{verifier}' REQUIRE SSL ACCOUNT LOCK{terminator}"
     )))
+}
+
+/// Translate an exact single-account `ALTER USER ... ACCOUNT UNLOCK` statement.
+pub fn translate_unlock_user(sql: &str) -> Result<TranslatedUnlockUser<'_>, TranslationError> {
+    let mut input = AccountStatement(sql);
+    input.keywords(&["ALTER", "USER"])?;
+    let user = input.quoted(is_user_name)?;
+    input.consume('@')?;
+    let host = input.quoted(is_host_pattern)?;
+    input.keywords(&["ACCOUNT", "UNLOCK"])?;
+    let terminator = input.finish()?;
+
+    Ok(TranslatedUnlockUser {
+        user,
+        host,
+        sql: format!("ALTER USER '{user}'@'{host}' ACCOUNT UNLOCK{terminator}"),
+    })
 }
 
 fn is_user_name(value: &str) -> bool {
@@ -101,7 +142,7 @@ impl<'a> AccountStatement<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TranslationError, translate_create_user};
+    use super::{TranslationError, translate_create_user, translate_unlock_user};
 
     const VERIFIER: &str = "*0123456789ABCDEF0123456789ABCDEF01234567";
 
@@ -133,6 +174,55 @@ mod tests {
                 "CREATE USER 'User'@'HoSt.%' IDENTIFIED WITH mysql_native_password AS '{VERIFIER}' REQUIRE SSL ACCOUNT LOCK"
             )
         );
+    }
+
+    #[test]
+    fn translates_account_unlock_preserving_identity_and_terminator() {
+        let translated =
+            translate_unlock_user("ALTER USER 'User_Name'@'%.Example' ACCOUNT UNLOCK;")
+                .unwrap_or_else(|_| panic!("supported statement rejected"));
+
+        assert_eq!(translated.user(), "User_Name");
+        assert_eq!(translated.host(), "%.Example");
+        assert_eq!(
+            translated.as_sql(),
+            "ALTER USER 'User_Name'@'%.Example' ACCOUNT UNLOCK;"
+        );
+    }
+
+    #[test]
+    fn accepts_case_variation_whitespace_and_no_terminator_for_unlock() {
+        let translated = translate_unlock_user(" alTeR\tUsEr 'User' @ 'Host.%'\nAcCoUnT UnLoCk ")
+            .unwrap_or_else(|_| panic!("supported statement rejected"));
+
+        assert_eq!(translated.user(), "User");
+        assert_eq!(translated.host(), "Host.%");
+        assert_eq!(
+            translated.as_sql(),
+            "ALTER USER 'User'@'Host.%' ACCOUNT UNLOCK"
+        );
+    }
+
+    #[test]
+    fn rejects_other_alter_user_forms_accounts_and_statements() {
+        let negatives = [
+            "ALTER USER 'user'@'host' ACCOUNT LOCK",
+            "ALTER USER 'user'@'host' IDENTIFIED BY 'password' ACCOUNT UNLOCK",
+            "ALTER USER 'user'@'host' ACCOUNT UNLOCK, 'other'@'host' ACCOUNT UNLOCK",
+            "ALTER USER 'user'@'host', 'other'@'host' ACCOUNT UNLOCK",
+            "ALTER USER 'user' ACCOUNT UNLOCK",
+            "ALTER USER 'user.name'@'host' ACCOUNT UNLOCK",
+            "ALTER USER 'user'@'host/name' ACCOUNT UNLOCK",
+            "ALTER USER 'user'@'host' ACCOUNT UNLOCK; DROP USER 'user'@'host'",
+            "ALTER USER 'user'@'host' ACCOUNT UNLOCK;;",
+        ];
+
+        for sql in negatives {
+            assert!(
+                translate_unlock_user(sql).is_err(),
+                "unexpectedly accepted input"
+            );
+        }
     }
 
     #[test]
