@@ -1,3 +1,4 @@
+use super::account_ddl::{UNLOCK_APPROVAL_ENV, handle_account_ddl};
 use super::*;
 use crate::live::ddl_semantics::{
     DDL_TRANSFORMATION_VERSION, DdlTransformation, supports_drop_columns_if_exists,
@@ -22,7 +23,7 @@ where
     J: DdlReplayJournal,
     S: DdlSemanticInventory,
 {
-    if let Some(outcome) = super::account_ddl::handle_create_user(
+    if let Some(outcome) = handle_account_ddl(
         applier.executor(),
         journal,
         source_identity,
@@ -31,6 +32,7 @@ where
             header,
             event,
         },
+        || std::env::var(UNLOCK_APPROVAL_ENV).ok(),
     )? {
         return Ok(Some(outcome));
     }
