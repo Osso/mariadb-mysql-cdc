@@ -29,13 +29,13 @@ allowlist.
 
 ### Bounded CREATE USER translation
 
-- [ ] A pure translator accepts exactly one MariaDB account in the form
+- [x] A pure translator accepts exactly one MariaDB account in the form
       `CREATE USER 'account'@'host' IDENTIFIED VIA mysql_native_password USING
       '<native verifier>' REQUIRE SSL ACCOUNT LOCK` and deterministically emits
       MySQL 8.4 `CREATE USER` with `IDENTIFIED WITH mysql_native_password AS`,
       preserving the account, host, verifier, `REQUIRE SSL`, and `ACCOUNT LOCK`
       exactly in meaning.
-- [ ] Reject malformed or unsupported verifiers, account syntax, authentication
+- [x] Reject malformed or unsupported verifiers, account syntax, authentication
       plugins, clauses, multiple accounts or statements, and any input whose
       meaning cannot be preserved. Do not silently discard or approximate input.
 - [ ] Diagnostics and fixtures must not contain credentials, except explicitly
@@ -44,6 +44,11 @@ allowlist.
 - [ ] Live dispatch remains blocked until separate least-privilege execution and
       journal evidence are proven and approved. Pure translation alone does not
       authorize target account operations or credential-bearing journal records.
+
+The focused tests in `src/account_ddl.rs` cover exact translation and rejection.
+`tests/account_ddl_native.rs` verifies the translated account on MySQL 8.4.11:
+the host, lock, TLS requirement, and credential still work as intended, and the
+new account has only `USAGE`.
 
 This slice excludes `GRANT`, `ALTER USER`, live account operations, privilege
 expansion, manual skips, and archival `DELETE` changes.
