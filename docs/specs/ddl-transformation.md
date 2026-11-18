@@ -23,9 +23,9 @@ allowlist.
 - [ ] Preserve object qualification and dependency relationships without
       allowing writes outside the configured application schema.
 - [ ] Produce deterministic MySQL 8 SQL from the parsed source statement.
-- [ ] Make transformations observable by persisting source SQL, canonical input,
-      generated MySQL SQL, transformation version, source coordinate, pre-state,
-      expected post-state, and observed post-state.
+- [ ] Make transformations observable through journal evidence appropriate to
+      the statement; credential-bearing CREATE USER uses the restricted evidence
+      and recovery contract below.
 
 ### Bounded CREATE USER translation
 
@@ -41,17 +41,29 @@ allowlist.
 - [ ] Diagnostics and fixtures must not contain credentials, except explicitly
       public synthetic samples. No production principals, credentials, or
       hostnames belong in examples or tests.
-- [ ] Live dispatch remains blocked until separate least-privilege execution and
-      journal evidence are proven and approved. Pure translation alone does not
-      authorize target account operations or credential-bearing journal records.
+- [ ] Dispatch this exact supported form as ordered automatic DDL, not a no-op.
+      The approved operational guard now permits global `CREATE USER` on the CDC
+      worker without grant option; production privilege readback was verified.
+- [ ] Do not persist generated credential-bearing SQL in the journal. For newly
+      supported events, store a safe SHA-256 source-identity fingerprint in the
+      journal payload. Retain and validate a legacy pending row on replay.
+- [ ] Execute strict target `CREATE USER`: never use `IF NOT EXISTS` or overwrite
+      an account. Only acknowledged success can mark the event applied. Prepared
+      replay may retry strict creation, but duplicate or unknown outcomes must
+      fail closed rather than treat an existing account as equivalent. An applied
+      event uses existing journal/checkpoint finalization without re-execution.
+- [ ] Verify live dispatch, restricted journal evidence, legacy pending replay,
+      strict duplicate/unknown handling, and applied-state finalization before
+      marking these requirements tested.
 
 The focused tests in `src/account_ddl.rs` cover exact translation and rejection.
 `tests/account_ddl_native.rs` verifies the translated account on MySQL 8.4.11:
 the host, lock, TLS requirement, and credential still work as intended, and the
 new account has only `USAGE`.
 
-This slice excludes `GRANT`, `ALTER USER`, live account operations, privilege
-expansion, manual skips, and archival `DELETE` changes.
+This slice excludes account grants, unlock, drop, wider SQL grammar, manual
+skips, and archival changes. The approved `CREATE USER` privilege does not include
+grant option.
 
 ### Atomic multi-pair table rename contract
 

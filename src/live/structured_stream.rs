@@ -53,6 +53,7 @@ const MYSQL_COLUMN_TYPE_SET: u8 = 248;
 const MYSQL_COLUMN_TYPE_STRING: u8 = 254;
 const MICROS_PER_SECOND: u64 = 1_000_000;
 const SECONDS_PER_DAY: i64 = 86_400;
+mod account_ddl;
 mod ddl;
 mod event;
 mod init;

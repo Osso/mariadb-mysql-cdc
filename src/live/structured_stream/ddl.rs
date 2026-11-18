@@ -22,6 +22,18 @@ where
     J: DdlReplayJournal,
     S: DdlSemanticInventory,
 {
+    if let Some(outcome) = super::account_ddl::handle_create_user(
+        applier.executor(),
+        journal,
+        source_identity,
+        AutomaticDdlInput {
+            context,
+            header,
+            event,
+        },
+    )? {
+        return Ok(Some(outcome));
+    }
     if let Some(outcome) = handle_automatic_ddl_event(
         applier,
         AutomaticDdlDependencies {

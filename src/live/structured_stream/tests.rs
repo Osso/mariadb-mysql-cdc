@@ -12,6 +12,7 @@ use mysql_cdc::events::xid_event::XidEvent;
 use mysql_cdc::starting_strategy::StartingStrategy;
 use std::fs::File;
 
+mod account_ddl;
 mod ddl_checkpoint;
 mod ddl_replay;
 mod event;
@@ -438,6 +439,17 @@ impl DdlReplayJournal for RecordingDdlReplayJournal {
 
     fn read_status(&self, _event: &DdlEvent) -> Result<Option<DdlReplayStatus>, String> {
         Ok(*self.status.borrow())
+    }
+
+    fn account_event_identity(
+        &self,
+        mut event: DdlEvent,
+        fingerprint: &str,
+    ) -> Result<DdlEvent, String> {
+        if self.status.borrow().is_none() {
+            event.raw_sql = fingerprint.to_owned();
+        }
+        Ok(event)
     }
 
     fn read_evidence(

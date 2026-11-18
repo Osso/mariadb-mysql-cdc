@@ -15,6 +15,11 @@ pub trait DdlReplayJournal {
     fn ensure(&self) -> Result<(), String>;
     fn earliest_barrier(&self, source_identity: &str) -> Result<Option<JournalBarrier>, String>;
     fn read_status(&self, event: &DdlEvent) -> Result<Option<DdlReplayStatus>, String>;
+    fn account_event_identity(
+        &self,
+        event: DdlEvent,
+        fingerprint: &str,
+    ) -> Result<DdlEvent, String>;
     fn read_evidence(&self, event: &DdlEvent) -> Result<Option<DdlSemanticEvidence>, String>;
     fn record_translation_pending(&self, event: &DdlEvent) -> Result<(), String>;
     fn prepare(&self, event: &DdlEvent, evidence: &DdlSemanticEvidence) -> Result<(), String>;
@@ -122,6 +127,28 @@ impl DdlReplayJournal for MySqlDdlReplayJournal {
         };
         validate_journal_event_identity(event, &row, "status")?;
         parse_status(&row.1).map(Some)
+    }
+
+    fn account_event_identity(
+        &self,
+        mut event: DdlEvent,
+        fingerprint: &str,
+    ) -> Result<DdlEvent, String> {
+        let row = self
+            .connect()?
+            .query_first::<JournalRow, _>(build_status_select_sql(&self.table, &event))
+            .map_err(mysql_error)?;
+        if let Some(row) = row {
+            if row.2 == event.raw_sql {
+                validate_journal_event_identity(&event, &row, "account identity")?;
+                return Ok(event);
+            }
+            event.raw_sql = fingerprint.to_owned();
+            validate_journal_event_identity(&event, &row, "account identity")?;
+        } else {
+            event.raw_sql = fingerprint.to_owned();
+        }
+        Ok(event)
     }
 
     fn read_evidence(&self, event: &DdlEvent) -> Result<Option<DdlSemanticEvidence>, String> {
