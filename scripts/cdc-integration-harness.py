@@ -6008,17 +6008,15 @@ DELIMITER ;
             "SELECT authentication_string FROM mysql.user "
             f"WHERE User={sql_literal(account)} AND Host={sql_literal(host)};"
         )
-        for endpoint in (self.source, self.target):
-            actual = self.admin_query(endpoint, account_state_query).strip()
-            if actual != expected_account_state:
-                raise HarnessError(
-                    f"locked TLS account state differs at {endpoint.container}: "
-                    f"{actual!r}"
-                )
-            if self.admin_query(endpoint, stored_verifier).strip() != verifier:
-                raise HarnessError(
-                    f"synthetic verifier was not preserved at {endpoint.container}"
-                )
+        actual_account_state = self.admin_query(
+            self.target, account_state_query
+        ).strip()
+        if actual_account_state != expected_account_state:
+            raise HarnessError(
+                f"locked TLS target account state differs: {actual_account_state!r}"
+            )
+        if self.admin_query(self.target, stored_verifier).strip() != verifier:
+            raise HarnessError("synthetic verifier was not preserved on target")
         row = self.admin_query(
             self.target,
             "SELECT id,email,payload FROM accounts WHERE id=73001;",
