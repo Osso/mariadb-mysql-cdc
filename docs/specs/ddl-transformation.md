@@ -68,9 +68,12 @@ The approved `CREATE USER` privilege does not include grant option.
 - [ ] Accept only the exact plain, single-account `ALTER USER 'account'@'host'
       ACCOUNT UNLOCK` grammar. Reject additional clauses, multiple accounts or
       statements, and all other account mutations without applying them.
-- [ ] Require operator authorization bound to one source event's fingerprint and
-      coordinate. Authorization for that event must not authorize another event,
-      even if its SQL is identical; an altered event must fail closed.
+- [ ] Require `CDC_APPROVED_ACCOUNT_UNLOCK` in the format
+      `<source-identity-sha256>:<binlog-file>:<event-start>:<sql-sha256>`.
+      Hashes are lowercase hexadecimal SHA-256 of the journal's fully qualified
+      source identity and original SQL bytes. A different source, coordinate or
+      SQL must fail closed. Verify the target grant before setting the approval
+      and remove the approval after the event is durably checkpointed.
 - [ ] Replay the authorized event through the normal ordered journal and checkpoint
       flow. Do not manually skip the event or advance its checkpoint independently.
 - [ ] A Prepared retry of the unchanged authorized event must be idempotent. An

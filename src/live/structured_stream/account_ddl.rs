@@ -49,8 +49,9 @@ where
     let source_event = ddl_event(source_identity, context.current_file, header, query);
     let digest = Sha256::digest(&source_event.raw_sql);
     if matches!(operation, AccountOperation::Unlock(_)) {
+        let source_digest = Sha256::digest(&source_event.source_identity);
         let event_key = format!(
-            "{}:{}:{digest:x}",
+            "{source_digest:x}:{}:{}:{digest:x}",
             source_event.binlog_file, source_event.event_start_position
         );
         if unlock_approval().as_deref() != Some(event_key.as_str()) {
