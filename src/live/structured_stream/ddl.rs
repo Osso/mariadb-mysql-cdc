@@ -23,6 +23,18 @@ where
     J: DdlReplayJournal,
     S: DdlSemanticInventory,
 {
+    if header.next_event_position == 0
+        && let Some(query) = source_schema_ddl_query(context.state, event)
+    {
+        let end = context.state.recovered_query_end.ok_or_else(|| {
+            ApplyBinlogError::DdlBlocked(format!(
+                "missing physical DDL position in {}; checkpoint remains blocked",
+                context.current_file
+            ))
+        })?;
+        let pending = ddl_event_with_end(source_identity, context.current_file, header, query, end);
+        return park_untranslated_ddl(applier.executor(), journal, context, &pending);
+    }
     if let Some(outcome) = handle_account_ddl(
         applier.executor(),
         journal,
@@ -84,11 +96,24 @@ where
     ) else {
         return Ok(None);
     };
+    park_untranslated_ddl(executor, journal, context, &ddl_event)
+}
+
+fn park_untranslated_ddl<E, R, C>(
+    executor: &E,
+    journal: &impl DdlReplayJournal,
+    context: &mut StreamEventContext<'_, R, C>,
+    event: &DdlEvent,
+) -> Result<Option<StructuredEventOutcome>, ApplyBinlogError>
+where
+    E: TransactionalTargetExecutor,
+    C: StreamCheckpointStore,
+{
     flush_grouped_transaction(executor, context)?;
-    ensure_translation_pending(journal, &ddl_event)?;
+    ensure_translation_pending(journal, event)?;
     Err(ApplyBinlogError::DdlBlocked(format!(
         "DDL translator unavailable at {}:{}; checkpoint remains blocked",
-        ddl_event.binlog_file, ddl_event.event_start_position
+        event.binlog_file, event.event_start_position
     )))
 }
 
@@ -885,6 +910,22 @@ pub(super) fn manual_ddl_event<'a>(
     event: &'a BinlogEvent,
     state: &StructuredEventState,
 ) -> Option<(&'a mysql_cdc::events::query_event::QueryEvent, DdlEvent)> {
+    let query = source_schema_ddl_query(state, event)?;
+    if automatically_handled_ddl_event(source_identity, current_file, header, event, state)
+        .is_some()
+    {
+        return None;
+    }
+    Some((
+        query,
+        ddl_event(source_identity, current_file, header, query),
+    ))
+}
+
+fn source_schema_ddl_query<'a>(
+    state: &StructuredEventState,
+    event: &'a BinlogEvent,
+) -> Option<&'a mysql_cdc::events::query_event::QueryEvent> {
     let BinlogEvent::QueryEvent(query) = event else {
         return None;
     };
@@ -909,18 +950,7 @@ pub(super) fn manual_ddl_event<'a>(
                 no_escapes.unwrap_or(false),
             )
         });
-    if !may_target_source_schema {
-        return None;
-    }
-    if automatically_handled_ddl_event(source_identity, current_file, header, event, state)
-        .is_some()
-    {
-        return None;
-    }
-    Some((
-        query,
-        ddl_event(source_identity, current_file, header, query),
-    ))
+    may_target_source_schema.then_some(query)
 }
 
 pub(super) fn resolved_ddl_outcome(event: DdlEvent) -> StructuredEventOutcome {
@@ -939,7 +969,23 @@ pub(super) fn ddl_event(
     header: &EventHeader,
     query: &mysql_cdc::events::query_event::QueryEvent,
 ) -> DdlEvent {
-    let event_end_position = u64::from(header.next_event_position);
+    ddl_event_with_end(
+        source_identity,
+        current_file,
+        header,
+        query,
+        header.next_event_position,
+    )
+}
+
+fn ddl_event_with_end(
+    source_identity: &str,
+    current_file: &str,
+    header: &EventHeader,
+    query: &mysql_cdc::events::query_event::QueryEvent,
+    end: u32,
+) -> DdlEvent {
+    let event_end_position = u64::from(end);
     let event_start_position = event_end_position.saturating_sub(u64::from(header.event_length));
     DdlEvent {
         source_identity: format!("{source_identity}#server-id={}", header.server_id),

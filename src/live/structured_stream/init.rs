@@ -1,3 +1,4 @@
+use super::zero_query_position::ZeroQueryPosition;
 use super::*;
 mod completion;
 pub(super) use completion::*;
@@ -72,7 +73,7 @@ pub(super) fn stream_once(
 
     let mut runtime = StreamRuntime::initialize(config)?;
     while let Ok(result) = runtime.event_receiver.recv() {
-        let (header, event, source_position) = match result {
+        let (header, event, position) = match result {
             Ok(event) => event,
             Err(error) => {
                 rollback_stream_transaction(&mut runtime)?;
@@ -90,7 +91,7 @@ pub(super) fn stream_once(
             SourceStreamEvent {
                 header: &header,
                 event: &event,
-                source_position,
+                position,
             },
         )?;
         if stop_decision == StopPositionDecision::DispatchAndStop {
@@ -227,7 +228,7 @@ pub(super) struct StreamCheckpointContext<'a, C> {
 pub(super) struct SourceStreamEvent<'a> {
     pub(super) header: &'a EventHeader,
     pub(super) event: &'a BinlogEvent,
-    pub(super) source_position: u64,
+    pub(super) position: StreamEventPosition,
 }
 
 pub(super) fn process_stream_event<C>(
@@ -295,7 +296,7 @@ where
         SourceStreamEvent<'_>,
     ) -> Result<StructuredEventOutcome, ApplyBinlogError>,
 {
-    state.record_event_position(input.source_position);
+    state.record_event_position(input.position.start, input.position.recovered_query_end);
     let outcome = dispatch(state, input)?;
     log_stream_progress(progress, &outcome);
     update_source_row_transaction_state(source_row_transaction_open, input.event);
@@ -367,7 +368,13 @@ where
     }
 }
 
-type BinlogEventResult = Result<(EventHeader, BinlogEvent, u64), MysqlCdcError>;
+#[derive(Clone, Copy)]
+pub(super) struct StreamEventPosition {
+    start: u64,
+    recovered_query_end: Option<u32>,
+}
+
+type BinlogEventResult = Result<(EventHeader, BinlogEvent, StreamEventPosition), MysqlCdcError>;
 
 pub(super) fn spawn_read_ahead_reader(
     mut client: BinlogClient,
@@ -377,10 +384,14 @@ pub(super) fn spawn_read_ahead_reader(
     let (sender, receiver) = std::sync::mpsc::sync_channel(READ_AHEAD_EVENT_BUFFER);
     thread::spawn(move || {
         let mut source_position = initial_position;
+        let mut zero_query_position = ZeroQueryPosition::default();
         for result in &mut events {
             let stop_after_send = result.is_err();
             let result = result.map(|(header, event)| {
-                let event_position = source_position;
+                let event_position = StreamEventPosition {
+                    start: source_position,
+                    recovered_query_end: zero_query_position.observe(&header, &event),
+                };
                 source_position = next_source_position(source_position, &header, &event);
                 client.commit(&header, &event);
                 (header, event, event_position)

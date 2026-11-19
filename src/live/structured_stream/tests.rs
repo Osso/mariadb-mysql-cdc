@@ -21,6 +21,7 @@ mod schema;
 mod token;
 mod transaction;
 mod value;
+mod zero_ddl_position;
 
 fn convert_mysql_value(value: &Option<MySqlValue>, signed: bool) -> Value {
     mysql_value_to_target_value(value, signed, None).expect("convert mysql value")

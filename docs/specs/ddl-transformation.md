@@ -27,6 +27,11 @@ allowlist.
       the statement; credential-bearing CREATE USER uses the restricted evidence
       and recovery contract below.
 
+### Missing MariaDB Query end position
+
+- [x] For a zero-ended Query, recover the physical range only from an immediately preceding real MariaDB GTID with a valid nonzero end position and the same server ID. Stop without creating a journal record if that range cannot be proven.
+- [x] Journal a zero-ended schema change at the recovered range without executing it as standalone DDL or checkpointing within its source group. Preserve the immutable identity of any previously persisted malformed row.
+
 ### Bounded CREATE USER translation
 
 - [x] A pure translator accepts exactly one MariaDB account in the form

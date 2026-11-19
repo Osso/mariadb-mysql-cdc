@@ -62,6 +62,7 @@ mod schema;
 mod token;
 mod transaction;
 mod value;
+mod zero_query_position;
 
 use ddl::*;
 use event::*;
@@ -107,6 +108,7 @@ pub(crate) struct StructuredEventState {
     source_database: Option<String>,
     ignored_table_ids: BTreeSet<u64>,
     current_event_position: Option<u64>,
+    recovered_query_end: Option<u32>,
     pending_intvars: Vec<PendingIntVar>,
     pending_uservars: Vec<String>,
 }
@@ -123,6 +125,7 @@ impl StructuredEventState {
             source_database,
             ignored_table_ids: BTreeSet::new(),
             current_event_position: None,
+            recovered_query_end: None,
             pending_intvars: Vec::new(),
             pending_uservars: Vec::new(),
         }
@@ -134,8 +137,9 @@ impl StructuredEventState {
             .is_none_or(|source_database| source_database == schema)
     }
 
-    fn record_event_position(&mut self, position: u64) {
+    fn record_event_position(&mut self, position: u64, recovered_query_end: Option<u32>) {
         self.current_event_position = Some(position);
+        self.recovered_query_end = recovered_query_end;
     }
 
     fn ignore_table_id(&mut self, table_id: u64) {

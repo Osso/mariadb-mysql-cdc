@@ -51,6 +51,20 @@ comment or changing any body text changes the hash and remains rejected.
 Every other DDL form enters the same journal as `translation_pending`; no operator-authored
 target SQL is accepted as a resolution path.
 
+### MariaDB Query events without an end position
+
+For a zero-ended Query immediately following a physical MariaDB GTID from the
+same server, the GTID's nonzero end is the Query's start. Add the Query's event
+length with checked arithmetic. Never use a fake Rotate, a resent Format
+Description, or lengths inferred from omitted row annotations as an anchor.
+If the position is not proven, stop before writing a journal row.
+
+A zero-ended schema change remains `translation_pending` at the recovered
+range. A position does not prove that a Query is standalone DDL: a grouped
+CREATE can be followed by row events and an XID. Do not execute the CREATE as
+ordinary DDL or checkpoint at its end. Previously persisted `0:0` rows remain
+immutable and continue to block startup until an audited repair.
+
 ### Current common-operation constraints
 
 For source `ALTER TABLE t ALTER COLUMN body SET DEFAULT '{}'` on `TEXT` or
