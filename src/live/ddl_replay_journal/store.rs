@@ -276,6 +276,8 @@ type JournalRow = (
     String,
     String,
     String,
+    String,
+    String,
 );
 
 fn validate_journal_event_identity(
@@ -309,6 +311,12 @@ fn identity_mismatches(event: &DdlEvent, row: &JournalRow) -> Vec<&'static str> 
     }
     if row.3 != event.event_end_position {
         mismatches.push("event_end_position");
+    }
+    if row.10 != event.source_identity {
+        mismatches.push("source_identity");
+    }
+    if row.11 != event.binlog_file {
+        mismatches.push("binlog_file");
     }
     mismatches
 }
@@ -417,7 +425,7 @@ pub fn build_barrier_select_sql(
 
 pub fn build_status_select_sql(table: &str, event: &DdlEvent) -> String {
     format!(
-        "SELECT source_server_id,status,raw_sql,event_end_position,schema_name,transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state FROM {} WHERE source_identity={} AND binlog_file={} AND event_start_position={} LIMIT 1",
+        "SELECT source_server_id,status,raw_sql,event_end_position,schema_name,transformation_version,generated_sql,canonical_ast,pre_state,expected_post_state,source_identity,binlog_file FROM {} WHERE source_identity={} AND binlog_file={} AND event_start_position={} LIMIT 1",
         quote_identifier_path(table),
         quote_sql_literal(&event.source_identity),
         quote_sql_literal(&event.binlog_file),
