@@ -615,9 +615,7 @@ fn zero_end_create_as_select_persists_exact_barrier_and_survives_restart() {
         .expect("transaction XID after CREATE Query");
     let xid_start: u64 = xid[1].parse().expect("XID start position");
 
-    let journal_query = format!(
-        "SELECT source_identity,binlog_file,event_start_position,event_end_position,status,raw_sql FROM cdc.ddl_replay_journal;"
-    );
+    let journal_query = "SELECT source_identity,binlog_file,event_start_position,event_end_position,status,raw_sql FROM cdc.ddl_replay_journal;";
     let first = run_stream(
         source_port,
         target_port,
@@ -627,7 +625,7 @@ fn zero_end_create_as_select_persists_exact_barrier_and_survives_restart() {
         None,
     );
     let (journal, first_output) =
-        wait_for_pending_and_stop(first, &target, &journal_query, "first stream-binlog run");
+        wait_for_pending_and_stop(first, &target, journal_query, "first stream-binlog run");
     let first_log = format!(
         "{}{}",
         String::from_utf8_lossy(&first_output.stdout),
@@ -720,7 +718,7 @@ fn zero_end_create_as_select_persists_exact_barrier_and_survives_restart() {
         restart_log.contains("DDL_blocked"),
         "restart did not reach the same barrier: {restart_log}"
     );
-    assert_eq!(target.sql("root", ROOT_PASSWORD, &journal_query), journal);
+    assert_eq!(target.sql("root", ROOT_PASSWORD, journal_query), journal);
     assert_eq!(
         target.sql("root", ROOT_PASSWORD, &checkpoint_query),
         checkpoint_state
@@ -807,9 +805,7 @@ fn zero_end_create_as_select_persists_exact_barrier_and_survives_restart() {
     let statement_hash = target.sql(
         "root",
         ROOT_PASSWORD,
-        &format!(
-            "SELECT SHA2(raw_sql,256) FROM cdc.ddl_replay_journal WHERE event_start_position=0 AND event_end_position=0;"
-        ),
+        "SELECT SHA2(raw_sql,256) FROM cdc.ddl_replay_journal WHERE event_start_position=0 AND event_end_position=0;",
     );
     let statement_hash = statement_hash.trim();
     assert_eq!(
