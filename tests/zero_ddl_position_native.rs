@@ -286,6 +286,26 @@ fn run_stream(
     start_position: u64,
     approval: Option<&str>,
 ) -> Child {
+    run_stream_with_source_only_approval(
+        source_port,
+        target_port,
+        ca_file,
+        start_file,
+        start_position,
+        approval,
+        None,
+    )
+}
+
+fn run_stream_with_source_only_approval(
+    source_port: u16,
+    target_port: u16,
+    ca_file: &Path,
+    start_file: &str,
+    start_position: u64,
+    position_approval: Option<&str>,
+    source_only_approval: Option<&str>,
+) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mariadb-mysql-cdc"));
     command
         .args([
@@ -323,9 +343,13 @@ fn run_stream(
         ])
         .env("ZERO_DDL_SOURCE_PASSWORD", SOURCE_PASSWORD)
         .env("ZERO_DDL_TARGET_PASSWORD", TARGET_PASSWORD)
-        .env_remove("CDC_APPROVED_DDL_POSITION_REPAIR");
-    if let Some(approval) = approval {
+        .env_remove("CDC_APPROVED_DDL_POSITION_REPAIR")
+        .env_remove("CDC_APPROVED_SOURCE_ONLY_CREATE_GROUP");
+    if let Some(approval) = position_approval {
         command.env("CDC_APPROVED_DDL_POSITION_REPAIR", approval);
+    }
+    if let Some(approval) = source_only_approval {
+        command.env("CDC_APPROVED_SOURCE_ONLY_CREATE_GROUP", approval);
     }
     command
         .stdout(Stdio::piped())
@@ -439,6 +463,78 @@ fn journal_rows(target: &Container) -> String {
         ROOT_PASSWORD,
         "SELECT source_identity,source_server_id,binlog_file,event_start_position,event_end_position,schema_name,raw_sql,transformation_version,COALESCE(generated_sql,'<null>'),canonical_ast,pre_state,expected_post_state,status FROM cdc.ddl_replay_journal ORDER BY event_start_position;",
     )
+}
+
+fn source_only_approval(
+    position: &str,
+    table: &str,
+    write_events: usize,
+    annotation_bytes: u64,
+    xid_end: u64,
+) -> String {
+    format!(
+        r#"{{"position":"{position}","table":"{table}","write_events":{write_events},"annotation_bytes":{annotation_bytes},"xid_end":{xid_end}}}"#
+    )
+}
+
+fn wait_for_source_only_group_and_stop(
+    mut child: Child,
+    target: &Container,
+    binlog_file: &str,
+    xid_end: u64,
+    context: &str,
+) -> Output {
+    let checkpoint_query = format!(
+        "SELECT JSON_UNQUOTE(JSON_EXTRACT(checkpoint_json,'$.source_file')), JSON_EXTRACT(checkpoint_json,'$.source_position') FROM cdc.stream_checkpoint WHERE checkpoint_name='{CHECKPOINT_NAME}';"
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let checkpoint = target.sql("root", ROOT_PASSWORD, &checkpoint_query);
+        let checkpoint_fields: Vec<&str> = checkpoint.trim().split('\t').collect();
+        let checkpoint_position = checkpoint_fields
+            .get(1)
+            .and_then(|position| position.parse::<u64>().ok())
+            .unwrap_or_default();
+        let checkpointed_rows = target.sql(
+            "root",
+            ROOT_PASSWORD,
+            "SELECT COUNT(*) FROM cdc.ddl_replay_journal WHERE status='checkpointed' AND generated_sql IS NULL AND transformation_version='approved-source-only-create-group-v1';",
+        );
+        let later_rows = target.sql(
+            "root",
+            ROOT_PASSWORD,
+            "SELECT COUNT(*) FROM zero_ddl_fixture.later_rows;",
+        );
+        if checkpoint_fields.first() == Some(&binlog_file)
+            && checkpoint_position > xid_end
+            && checkpointed_rows.trim() == "2"
+            && later_rows.trim() == "1"
+        {
+            return stop_running_stream(child, Duration::from_millis(500), context);
+        }
+        if let Some(status) = child.try_wait().expect("poll stream-binlog") {
+            let output = child
+                .wait_with_output()
+                .expect("collect exited stream-binlog output");
+            panic!(
+                "{context} exited before source-only checkpoint and later row; status {status}; checkpoint: {checkpoint}; journal rows: {}; later rows: {}; stdout: {}; stderr: {}",
+                checkpointed_rows.trim(),
+                later_rows.trim(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    child.kill().expect("stop source-only stream after timeout");
+    let output = child
+        .wait_with_output()
+        .expect("collect timed-out source-only stream");
+    panic!(
+        "{context} did not checkpoint the approved group and later row; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn install_legacy_zero_position(target: &Container, start: u64) -> String {
@@ -614,6 +710,40 @@ fn zero_end_create_as_select_persists_exact_barrier_and_survives_restart() {
         .find(|row| row.len() > 4 && row[2] == "Xid")
         .expect("transaction XID after CREATE Query");
     let xid_start: u64 = xid[1].parse().expect("XID start position");
+    let xid_end: u64 = xid[4].parse().expect("XID end position");
+    let table_map = event_rows
+        .iter()
+        .skip(create_index + 1)
+        .find(|row| row.len() > 2 && row[2] == "Table_map")
+        .expect("table map event after CREATE Query");
+    assert!(
+        table_map
+            .get(5)
+            .is_some_and(|info| info.contains("zero_ddl_fixture.created_from_select")),
+        "table map does not identify the expected backup table: {table_map:?}"
+    );
+    let table_map_start: u64 = table_map[1].parse().expect("table map start position");
+    let annotation_bytes = table_map_start
+        .checked_sub(next_event_start)
+        .expect("table map follows the annotated DDL event");
+    let write_events = event_rows
+        .iter()
+        .skip(create_index + 1)
+        .take_while(|row| row.len() > 2 && row[2] != "Xid")
+        .filter(|row| row.len() > 2 && row[2].starts_with("Write_rows"))
+        .count();
+    assert!(
+        write_events > 0,
+        "SHOW BINLOG EVENTS has no Write_rows event: {events}"
+    );
+    assert!(
+        annotation_bytes > 0,
+        "SHOW BINLOG EVENTS has no annotation gap: {events}"
+    );
+    assert!(
+        xid_end > xid_start,
+        "XID end must follow the transaction start"
+    );
 
     let journal_query = "SELECT source_identity,binlog_file,event_start_position,event_end_position,status,raw_sql FROM cdc.ddl_replay_journal;";
     let first = run_stream(
@@ -876,4 +1006,233 @@ fn zero_end_create_as_select_persists_exact_barrier_and_survives_restart() {
     );
     assert_eq!(journal_rows(&target), repaired_journal);
     assert_fixture_has_no_side_effects(&target, &checkpoint_state);
+
+    let no_group_approval = run_stream(
+        source_port,
+        target_port,
+        &ca_file,
+        binlog_file,
+        initial_position,
+        Some(&approval),
+    );
+    let no_group_output = wait_for_process_exit(
+        no_group_approval,
+        Duration::from_secs(8),
+        "stream without source-only group approval",
+    );
+    assert!(!no_group_output.status.success());
+    assert_eq!(journal_rows(&target), repaired_journal);
+    assert_fixture_has_no_side_effects(&target, &checkpoint_state);
+
+    for (label, invalid_group_approval) in [
+        (
+            "wrong table",
+            source_only_approval(
+                &approval,
+                "wrong_backup_table",
+                write_events,
+                annotation_bytes,
+                xid_end,
+            ),
+        ),
+        (
+            "wrong write count",
+            source_only_approval(
+                &approval,
+                "created_from_select",
+                write_events + 1,
+                annotation_bytes,
+                xid_end,
+            ),
+        ),
+        (
+            "wrong annotation length",
+            source_only_approval(
+                &approval,
+                "created_from_select",
+                write_events,
+                annotation_bytes + 1,
+                xid_end,
+            ),
+        ),
+        (
+            "wrong XID end",
+            source_only_approval(
+                &approval,
+                "created_from_select",
+                write_events,
+                annotation_bytes,
+                xid_end + 1,
+            ),
+        ),
+    ] {
+        let rejected = run_stream_with_source_only_approval(
+            source_port,
+            target_port,
+            &ca_file,
+            binlog_file,
+            initial_position,
+            Some(&approval),
+            Some(&invalid_group_approval),
+        );
+        let rejected_output = wait_for_process_exit(
+            rejected,
+            Duration::from_secs(8),
+            &format!("stream with {label} source-only approval"),
+        );
+        let rejected_log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&rejected_output.stdout),
+            String::from_utf8_lossy(&rejected_output.stderr)
+        );
+        assert!(
+            !rejected_output.status.success(),
+            "{label} source-only approval unexpectedly succeeded: {rejected_log}"
+        );
+        assert!(
+            rejected_log.contains("approved source-only CREATE group rejected")
+                || rejected_log.contains("approved source-only group rejected"),
+            "{label} source-only approval failed for an unexpected reason: {rejected_log}"
+        );
+        assert_eq!(journal_rows(&target), repaired_journal);
+        assert_fixture_has_no_side_effects(&target, &checkpoint_state);
+    }
+
+    let group_approval = source_only_approval(
+        &approval,
+        "created_from_select",
+        write_events,
+        annotation_bytes,
+        xid_end,
+    );
+    target.sql(
+        "root",
+        ROOT_PASSWORD,
+        "CREATE TRIGGER cdc.reject_source_only_checkpoint BEFORE UPDATE ON cdc.stream_checkpoint FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='native fixture rejects checkpoint update';",
+    );
+    let rollback_probe = run_stream_with_source_only_approval(
+        source_port,
+        target_port,
+        &ca_file,
+        binlog_file,
+        initial_position,
+        Some(&approval),
+        Some(&group_approval),
+    );
+    let rollback_output = wait_for_process_exit(
+        rollback_probe,
+        Duration::from_secs(8),
+        "stream with checkpoint-rejecting trigger",
+    );
+    assert!(!rollback_output.status.success());
+    assert_eq!(journal_rows(&target), repaired_journal);
+    assert_fixture_has_no_side_effects(&target, &checkpoint_state);
+    target.sql(
+        "root",
+        ROOT_PASSWORD,
+        "DROP TRIGGER cdc.reject_source_only_checkpoint;",
+    );
+
+    let approved = run_stream_with_source_only_approval(
+        source_port,
+        target_port,
+        &ca_file,
+        binlog_file,
+        initial_position,
+        Some(&approval),
+        Some(&group_approval),
+    );
+    let approved_output = wait_for_source_only_group_and_stop(
+        approved,
+        &target,
+        binlog_file,
+        xid_end,
+        "stream with exact source-only group approval",
+    );
+    let approved_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&approved_output.stdout),
+        String::from_utf8_lossy(&approved_output.stderr)
+    );
+    assert!(
+        approved_log.contains("cdc_source_only_create_group_checkpointed"),
+        "approved group did not report checkpoint completion: {approved_log}"
+    );
+    let checkpoint_after_group = target.sql("root", ROOT_PASSWORD, &checkpoint_query);
+    let checkpoint_after_group_fields: Vec<&str> =
+        checkpoint_after_group.trim().split('\t').collect();
+    assert_eq!(checkpoint_after_group_fields[0], binlog_file);
+    assert!(
+        checkpoint_after_group_fields[1]
+            .parse::<u64>()
+            .expect("approved checkpoint position")
+            > xid_end,
+        "checkpoint did not advance beyond the approved XID: {checkpoint_after_group}"
+    );
+    assert_eq!(
+        target.sql(
+            "root",
+            ROOT_PASSWORD,
+            "SHOW TABLES FROM zero_ddl_fixture LIKE 'created_from_select';"
+        ),
+        ""
+    );
+    let source_only_journal = journal_rows(&target);
+    let source_only_rows: Vec<Vec<&str>> = source_only_journal
+        .lines()
+        .map(|row| row.split('\t').collect())
+        .collect();
+    assert_eq!(source_only_rows.len(), 2);
+    for row in source_only_rows {
+        assert_eq!(row[7], "approved-source-only-create-group-v1");
+        assert_eq!(row[8], "<null>");
+        assert!(row[9].contains("source_only_create_group"));
+        assert_eq!(row[12], "checkpointed");
+    }
+    assert_eq!(
+        target
+            .sql(
+                "root",
+                ROOT_PASSWORD,
+                "SELECT COUNT(*) FROM zero_ddl_fixture.later_rows;"
+            )
+            .trim(),
+        "1"
+    );
+
+    let resumed = run_stream_with_source_only_approval(
+        source_port,
+        target_port,
+        &ca_file,
+        binlog_file,
+        initial_position,
+        Some(&approval),
+        Some(&group_approval),
+    );
+    let resumed_output = stop_running_stream(
+        resumed,
+        Duration::from_secs(2),
+        "restart with consumed source-only approval",
+    );
+    assert_eq!(journal_rows(&target), source_only_journal);
+    assert_eq!(
+        target.sql("root", ROOT_PASSWORD, &checkpoint_query),
+        checkpoint_after_group
+    );
+    assert_eq!(
+        target
+            .sql(
+                "root",
+                ROOT_PASSWORD,
+                "SELECT COUNT(*) FROM zero_ddl_fixture.later_rows;"
+            )
+            .trim(),
+        "1"
+    );
+    assert!(
+        !String::from_utf8_lossy(&resumed_output.stderr)
+            .contains("cdc_source_only_create_group_checkpointed"),
+        "consumed approval replayed the source-only group: {}",
+        String::from_utf8_lossy(&resumed_output.stderr)
+    );
 }
