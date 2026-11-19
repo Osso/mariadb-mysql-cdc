@@ -30,7 +30,7 @@ allowlist.
 ### Missing MariaDB Query end position
 
 - [x] For a zero-ended Query, recover the physical range only from an immediately preceding real MariaDB GTID with a valid nonzero end position and the same server ID. Stop without creating a journal record if that range cannot be proven.
-- [x] Journal a zero-ended change that may affect the configured source schema at the recovered range without executing it as standalone DDL or checkpointing within its source group. Preserve the immutable identity of any previously persisted malformed row.
+- [x] Journal a zero-ended `CREATE TABLE` that may affect the configured source schema at the recovered range without executing it as standalone DDL or checkpointing within its source group. Block other zero-ended DDL without persisting the statement. Preserve the immutable identity of any previously persisted malformed row.
 
 ### Bounded CREATE USER translation
 

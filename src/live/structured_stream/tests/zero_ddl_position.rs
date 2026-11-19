@@ -3,10 +3,11 @@ use crate::live::structured_stream::zero_query_position::ZeroQueryPosition;
 use mysql_cdc::providers::mariadb::{events::gtid_event::GtidEvent, gtid::gtid::Gtid};
 
 const BINLOG_FILE: &str = "fixture-bin.000005";
+const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS old_stock (id INT NOT NULL)";
 
 #[test]
 fn zero_ended_ddl_uses_the_adjacent_mariadb_gtid_without_executing_or_checkpointing() {
-    let (error, journal, target_operations) = dispatch_zero_ended_ddl(Some(561));
+    let (error, journal, target_operations) = dispatch_zero_ended_ddl(Some(561), CREATE_TABLE);
 
     assert!(matches!(error, ApplyBinlogError::DdlBlocked(_)));
     assert!(error.to_string().contains("fixture-bin.000005:427"));
@@ -16,10 +17,21 @@ fn zero_ended_ddl_uses_the_adjacent_mariadb_gtid_without_executing_or_checkpoint
 
 #[test]
 fn zero_ended_ddl_without_a_trusted_anchor_does_not_write_a_journal_row() {
-    let (error, journal, target_operations) = dispatch_zero_ended_ddl(None);
+    let (error, journal, target_operations) = dispatch_zero_ended_ddl(None, CREATE_TABLE);
 
     assert!(matches!(error, ApplyBinlogError::DdlBlocked(_)));
     assert!(error.to_string().contains("missing physical DDL position"));
+    assert!(journal.is_empty());
+    assert!(target_operations.is_empty());
+}
+
+#[test]
+fn zero_ended_account_ddl_never_persists_the_statement() {
+    let statement = "CREATE USER 'fixture'@'localhost' IDENTIFIED BY 'fixture-only-password'";
+    let (error, journal, target_operations) = dispatch_zero_ended_ddl(Some(561), statement);
+
+    assert!(matches!(error, ApplyBinlogError::DdlBlocked(_)));
+    assert!(!error.to_string().contains("fixture-only-password"));
     assert!(journal.is_empty());
     assert!(target_operations.is_empty());
 }
@@ -62,13 +74,15 @@ fn zero_query_end_requires_an_immediate_physical_gtid_on_the_same_server() {
             });
             position.observe(&wire_header(0, 47), &rotate);
         }
-        assert_eq!(position.observe(&query_header, &zero_ended_ddl()), expected);
-        assert_eq!(position.observe(&query_header, &zero_ended_ddl()), None);
+        let query = zero_ended_ddl(CREATE_TABLE);
+        assert_eq!(position.observe(&query_header, &query), expected);
+        assert_eq!(position.observe(&query_header, &query), None);
     }
 }
 
 fn dispatch_zero_ended_ddl(
     recovered_query_end: Option<u32>,
+    statement: &str,
 ) -> (ApplyBinlogError, Vec<&'static str>, Vec<&'static str>) {
     let mut applier = RowApplier::new(TransactionRecordingExecutor::default());
     let journal = RecordingDdlReplayJournal::default();
@@ -92,7 +106,7 @@ fn dispatch_zero_ended_ddl(
         "synthetic-source",
         &mut context,
         &wire_header(0, 134),
-        &zero_ended_ddl(),
+        &zero_ended_ddl(statement),
     )
     .expect_err("zero-ended DDL must not enter automatic replay");
     let journal_operations = journal.operations.borrow().to_vec();
@@ -118,13 +132,13 @@ fn maria_gtid() -> BinlogEvent {
     })
 }
 
-fn zero_ended_ddl() -> BinlogEvent {
+fn zero_ended_ddl(statement: &str) -> BinlogEvent {
     BinlogEvent::QueryEvent(QueryEvent {
         thread_id: 1,
         duration: 0,
         error_code: 0,
         status_variables: Vec::new(),
         database_name: "fixture_cdc".into(),
-        sql_statement: "CREATE TABLE IF NOT EXISTS old_stock (id INT NOT NULL)".into(),
+        sql_statement: statement.into(),
     })
 }

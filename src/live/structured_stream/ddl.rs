@@ -26,6 +26,12 @@ where
     if header.next_event_position == 0
         && let Some(query) = source_schema_ddl_query(context.state, event)
     {
+        if !crate::statement::is_create_table_statement(&query.sql_statement) {
+            return Err(ApplyBinlogError::DdlBlocked(format!(
+                "unsupported zero-ended DDL in {}; checkpoint remains blocked",
+                context.current_file
+            )));
+        }
         let end = context.state.recovered_query_end.ok_or_else(|| {
             ApplyBinlogError::DdlBlocked(format!(
                 "missing physical DDL position in {}; checkpoint remains blocked",

@@ -570,6 +570,16 @@ pub fn is_schema_changing_statement(sql: &str) -> bool {
     )
 }
 
+pub(crate) fn is_create_table_statement(sql: &str) -> bool {
+    let mut words = strip_leading_comments(sql).split_ascii_whitespace();
+    words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+        && words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
+}
+
 pub(crate) fn is_automatically_handled_schema_change(sql: &str) -> bool {
     if !is_schema_changing_statement(sql) {
         return false;

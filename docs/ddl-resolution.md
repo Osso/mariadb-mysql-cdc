@@ -61,9 +61,9 @@ arithmetic. Never use a fake Rotate, a resent Format Description, or lengths
 inferred from omitted row annotations as an anchor.
 If the position is not proven, stop before writing a journal row.
 
-A zero-ended change that may affect the configured source schema remains
-`translation_pending` at the recovered
-range. A position does not prove that a Query is standalone DDL: a grouped
+A zero-ended `CREATE TABLE` that may affect the configured source schema
+remains `translation_pending` at the recovered range. Other zero-ended DDL
+blocks without writing a journal row. A position does not prove that a Query is standalone DDL: a grouped
 CREATE can be followed by row events and an XID. Do not execute the CREATE as
 ordinary DDL or checkpoint at its end. Previously persisted `0:0` rows remain
 immutable and continue to block startup until an audited repair.
