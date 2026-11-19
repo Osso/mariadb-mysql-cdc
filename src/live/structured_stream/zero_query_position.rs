@@ -1,6 +1,6 @@
-use mysql_cdc::constants::EVENT_HEADER_SIZE;
 use mysql_cdc::events::{binlog_event::BinlogEvent, event_header::EventHeader};
 
+const EVENT_HEADER_SIZE: u32 = 19;
 const FIRST_BINLOG_EVENT: u32 = 4;
 const ARTIFICIAL_EVENT: u16 = 0x20;
 
@@ -34,5 +34,5 @@ impl ZeroQueryPosition {
 fn physical_event(header: &EventHeader) -> bool {
     header.timestamp != 0
         && header.event_flags & ARTIFICIAL_EVENT == 0
-        && header.event_length >= EVENT_HEADER_SIZE as u32
+        && header.event_length >= EVENT_HEADER_SIZE
 }

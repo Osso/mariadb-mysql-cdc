@@ -54,12 +54,15 @@ target SQL is accepted as a resolution path.
 ### MariaDB Query events without an end position
 
 For a zero-ended Query immediately following a physical MariaDB GTID from the
-same server, the GTID's nonzero end is the Query's start. Add the Query's event
-length with checked arithmetic. Never use a fake Rotate, a resent Format
-Description, or lengths inferred from omitted row annotations as an anchor.
+same server, the GTID's nonzero end is the Query's start. Both events must
+have nonzero timestamps, no artificial flag, and a length of at least 19 bytes.
+The GTID must start at or after byte 4. Add the Query's length with checked
+arithmetic. Never use a fake Rotate, a resent Format Description, or lengths
+inferred from omitted row annotations as an anchor.
 If the position is not proven, stop before writing a journal row.
 
-A zero-ended schema change remains `translation_pending` at the recovered
+A zero-ended change that may affect the configured source schema remains
+`translation_pending` at the recovered
 range. A position does not prove that a Query is standalone DDL: a grouped
 CREATE can be followed by row events and an XID. Do not execute the CREATE as
 ordinary DDL or checkpoint at its end. Previously persisted `0:0` rows remain
