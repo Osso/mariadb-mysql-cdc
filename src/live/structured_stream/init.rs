@@ -1,3 +1,4 @@
+use super::position_repair::{APPROVAL_ENV, reanchor_pending_position};
 use super::zero_query_position::ZeroQueryPosition;
 use super::*;
 mod completion;
@@ -183,6 +184,14 @@ fn validate_ddl_replay_barrier(
     let barrier = journal
         .earliest_barrier(&config.source_identity)
         .map_err(ApplyBinlogError::Statement)?;
+    let position_repair_needed = barrier.as_ref().is_some_and(|pending| {
+        pending.binlog_file == config.source.binlog_file
+            && pending.event_start_position == 0
+            && pending.status == DdlReplayStatus::TranslationPending
+    });
+    if position_repair_needed && let Ok(approval) = std::env::var(APPROVAL_ENV) {
+        return reanchor_pending_position(config, journal, &approval);
+    }
     crate::live::ddl_replay_journal::enforce_no_overtake(
         barrier.as_ref(),
         &config.source.binlog_file,

@@ -65,8 +65,18 @@ A zero-ended `CREATE TABLE` that may affect the configured source schema
 remains `translation_pending` at the recovered range. Other zero-ended DDL
 blocks without writing a journal row. A position does not prove that a Query is standalone DDL: a grouped
 CREATE can be followed by row events and an XID. Do not execute the CREATE as
-ordinary DDL or checkpoint at its end. Previously persisted `0:0` rows remain
-immutable and continue to block startup until an audited repair.
+ordinary DDL or checkpoint at its end.
+
+For an existing `0:0` pending row, `CDC_APPROVED_DDL_POSITION_REPAIR` permits a
+position-only startup attempt. Its value is
+`<sha256(journal source identity)>:<file>:<checkpoint>:<start>:<end>:<sha256(raw Query)>`.
+The journal source identity includes `#server-id=<id>`. Under the ordinary stream
+lease, read only the startup Rotate, resent Format Description, checkpoint GTID,
+and immediately following Query. Compare the real range and exact statement with
+both the approval and the immutable legacy journal row. Insert or confirm one
+`translation_pending` row at the correct range and stop. The original row stays
+unchanged; neither row authorizes table replay or checkpoint advancement. An
+absent or mismatched approval does not change journal state.
 
 ### Current common-operation constraints
 

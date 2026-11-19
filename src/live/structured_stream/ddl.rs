@@ -123,7 +123,7 @@ where
     )))
 }
 
-fn ensure_translation_pending(
+pub(super) fn ensure_translation_pending(
     journal: &impl DdlReplayJournal,
     event: &DdlEvent,
 ) -> Result<(), ApplyBinlogError> {
@@ -984,7 +984,7 @@ pub(super) fn ddl_event(
     )
 }
 
-fn ddl_event_with_end(
+pub(super) fn ddl_event_with_end(
     source_identity: &str,
     current_file: &str,
     header: &EventHeader,

@@ -57,6 +57,7 @@ mod account_ddl;
 mod ddl;
 mod event;
 mod init;
+mod position_repair;
 mod rows;
 mod schema;
 mod token;
