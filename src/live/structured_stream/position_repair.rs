@@ -1,5 +1,6 @@
 use super::zero_query_position::ZeroQueryPosition;
 use super::*;
+use crate::stream_checkpoint::MySqlStreamCheckpointStore;
 use sha2::{Digest, Sha256};
 
 pub(super) const APPROVAL_ENV: &str = "CDC_APPROVED_DDL_POSITION_REPAIR";
@@ -11,13 +12,37 @@ pub(super) fn reanchor_pending_position(
 ) -> Result<(), ApplyBinlogError> {
     let options = replica_options_from_source(&config.source)?;
     let mut client = BinlogClient::new(options);
-    let mut events = client.replicate().map_err(source_error)?;
+    let mut events = client
+        .replicate()
+        .map_err(|_| repair_rejected("could not open the source stream"))?;
     let corrected = read_adjacent_ddl(config, &mut events)?;
+    verify_durable_checkpoint(config)?;
     record_corrected_position(config, journal, approval, &corrected)?;
     Err(ApplyBinlogError::Statement(format!(
         "automatic DDL position verified at {}:{}-{}; legacy row preserved, DDL and checkpoint remain blocked",
         corrected.binlog_file, corrected.event_start_position, corrected.event_end_position
     )))
+}
+
+fn verify_durable_checkpoint(config: &ApplyBinlogConfig) -> Result<(), ApplyBinlogError> {
+    let store = MySqlStreamCheckpointStore::new(
+        config.target.clone(),
+        config.checkpoint_table.clone(),
+        &config.source_identity,
+    );
+    let checkpoint = store
+        .load_checkpoint()
+        .map_err(|_| repair_rejected("could not re-read the durable checkpoint"))?;
+    let matches = checkpoint.is_some_and(|checkpoint| {
+        checkpoint.source_file == config.source.binlog_file
+            && checkpoint.source_position == config.source.start_position
+    });
+    if !matches {
+        return Err(repair_rejected(
+            "durable checkpoint changed before position repair",
+        ));
+    }
+    Ok(())
 }
 
 fn read_adjacent_ddl(
