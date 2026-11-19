@@ -33,6 +33,11 @@ allowlist.
 - [x] Journal a zero-ended `CREATE TABLE` that may affect the configured source schema at the recovered range without executing it as standalone DDL or checkpointing within its source group. Block other zero-ended DDL without persisting the statement. Preserve the immutable identity of any previously persisted malformed row.
 - [x] An exact position-only approval permits recording the corrected pending range for a matching legacy `0:0` row under the existing stream lease. Prove the range from the source at the durable checkpoint. Stop before processing or checkpointing the group; preserve the original barrier and reject mismatches without journal writes.
 
+### One approved source-only CREATE group
+
+- [x] An exact approval binds the source identity, predecessor checkpoint, physical DDL range, statement hash, schema/table, omitted annotation size, insert packet count and XID. Require a zero-ended `CREATE TABLE`, exactly one matching table map, only inserts for that map, and the exact real XID. Reject unexpected packets, positions or flags before target writes.
+- [x] Under the stream lease and a target transaction, lock the exact predecessor checkpoint and require only the original `0:0` and corrected pending rows before the XID. Keep the target backup absent. Resolve both journal rows with source-only evidence and the XID checkpoint in the same commit, with no generated target SQL. Only then resume normal replication. Do not make this an ongoing table-name exclusion.
+
 ### Bounded CREATE USER translation
 
 - [x] A pure translator accepts exactly one MariaDB account in the form

@@ -56,6 +56,41 @@ impl MySqlDdlReplayJournal {
         Ok(connection)
     }
 
+    pub(crate) fn source_only_pending_transitions(
+        &self,
+        event: &DdlEvent,
+        evidence: &DdlSemanticEvidence,
+    ) -> [String; 3] {
+        let prepare = build_promote_translation_sql(&self.table, event, evidence);
+        let apply = build_transition_sql(
+            &self.table,
+            event,
+            DdlReplayStatus::Prepared,
+            DdlReplayStatus::Applied,
+        );
+        let checkpoint = build_transition_sql(
+            &self.table,
+            event,
+            DdlReplayStatus::Applied,
+            DdlReplayStatus::Checkpointed,
+        );
+        [prepare, apply, checkpoint]
+    }
+
+    pub(crate) fn source_only_barriers_for_update(
+        &self,
+        source_identity: &str,
+        file: &str,
+        xid_end: u64,
+    ) -> String {
+        let journal = quote_identifier_path(&self.table);
+        let active = active_barrier_predicate(RECOVERY_TABLE, source_identity);
+        let file = quote_sql_literal(file);
+        format!(
+            "SELECT journal.source_identity,journal.binlog_file,journal.event_start_position,journal.event_end_position,journal.status FROM {journal} journal WHERE {active} AND (journal.binlog_file<{file} OR (journal.binlog_file={file} AND journal.event_start_position<{xid_end})) ORDER BY journal.binlog_file,journal.event_start_position FOR UPDATE"
+        )
+    }
+
     fn ensure_recovery_table(&self, connection: &mut Conn) -> Result<(), String> {
         let sql = format!(
             "SELECT recovery_id FROM {} LIMIT 0",
@@ -410,14 +445,21 @@ pub fn build_barrier_select_sql(
     recovery_table: &str,
     source_identity: &str,
 ) -> String {
+    let journal = quote_identifier_path(journal_table);
+    let active = active_barrier_predicate(recovery_table, source_identity);
+    format!(
+        "SELECT journal.binlog_file,journal.event_start_position,journal.status FROM {journal} journal WHERE {active} ORDER BY journal.binlog_file,journal.event_start_position LIMIT 1"
+    )
+}
+
+fn active_barrier_predicate(recovery_table: &str, source_identity: &str) -> String {
     let escaped_identity = source_identity
         .replace('=', "==")
         .replace('%', "=%")
         .replace('_', "=_");
     let pattern = format!("{escaped_identity}#server-id==%");
     format!(
-        "SELECT journal.binlog_file,journal.event_start_position,journal.status FROM {} journal WHERE journal.source_identity LIKE {} ESCAPE '=' AND journal.status IN ('translation_pending','prepared','blocked') AND NOT EXISTS (SELECT 1 FROM {} recovery WHERE recovery.status IN ('committed','verified') AND recovery.old_barrier_source_identity = journal.source_identity AND recovery.old_barrier_file = journal.binlog_file AND recovery.old_barrier_start_position = journal.event_start_position AND recovery.old_barrier_end_position = journal.event_end_position AND recovery.old_barrier_raw_sql_sha256 = SHA2(journal.raw_sql, 256)) ORDER BY journal.binlog_file,journal.event_start_position LIMIT 1",
-        quote_identifier_path(journal_table),
+        "journal.source_identity LIKE {} ESCAPE '=' AND journal.status IN ('translation_pending','prepared','blocked') AND NOT EXISTS (SELECT 1 FROM {} recovery WHERE recovery.status IN ('committed','verified') AND recovery.old_barrier_source_identity = journal.source_identity AND recovery.old_barrier_file = journal.binlog_file AND recovery.old_barrier_start_position = journal.event_start_position AND recovery.old_barrier_end_position = journal.event_end_position AND recovery.old_barrier_raw_sql_sha256 = SHA2(journal.raw_sql, 256))",
         quote_sql_literal(&pattern),
         quote_identifier_path(recovery_table),
     )

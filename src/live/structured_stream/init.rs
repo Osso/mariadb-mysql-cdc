@@ -1,4 +1,7 @@
 use super::position_repair::{APPROVAL_ENV, reanchor_pending_position};
+use super::source_only_create_group::{
+    SOURCE_ONLY_CREATE_APPROVAL_ENV, finish_approved_source_only_group,
+};
 use super::zero_query_position::ZeroQueryPosition;
 use super::*;
 mod completion;
@@ -131,10 +134,11 @@ pub(super) struct StreamRuntime {
 
 impl StreamRuntime {
     pub(super) fn initialize(config: &ApplyBinlogConfig) -> Result<Self, ApplyBinlogError> {
-        let (applier, ddl_replay_journal) = initialize_target_services(config)?;
-        let semantic_inventory = initialize_semantic_inventory(config)?;
-        let schema_resolver = TargetInventorySchemaResolver::new(config);
-        let (event_receiver, current_file) = start_binlog_receiver(config)?;
+        let mut config = config.clone();
+        let (applier, ddl_replay_journal) = initialize_target_services(&mut config)?;
+        let semantic_inventory = initialize_semantic_inventory(&config)?;
+        let schema_resolver = TargetInventorySchemaResolver::new(&config);
+        let (event_receiver, current_file) = start_binlog_receiver(&config)?;
         let start_coordinate = BinlogCoordinate {
             file: config.source.binlog_file.clone(),
             position: config.source.start_position,
@@ -149,7 +153,7 @@ impl StreamRuntime {
             state: StructuredEventState::new(config.source.database.clone()),
             progress: StreamProgress::new(start_coordinate),
             target_transaction: TargetTransaction::default(),
-            group_config: TargetTransactionGroupConfig::from_apply_config(config),
+            group_config: TargetTransactionGroupConfig::from_apply_config(&config),
             source_identity: config.source_identity.clone(),
             source_row_transaction_open: false,
         })
@@ -157,7 +161,7 @@ impl StreamRuntime {
 }
 
 fn initialize_target_services(
-    config: &ApplyBinlogConfig,
+    config: &mut ApplyBinlogConfig,
 ) -> Result<
     (
         RowApplier<crate::mysql_client::PersistentTargetExecutor>,
@@ -173,15 +177,16 @@ fn initialize_target_services(
     let applier = RowApplier::new(executor);
     let ddl_replay_journal =
         MySqlDdlReplayJournal::new(&config.target, "cdc.ddl_replay_journal".to_string());
-    validate_ddl_replay_barrier(&ddl_replay_journal, config)?;
+    validate_ddl_replay_barrier(applier.executor(), &ddl_replay_journal, config)?;
     Ok((applier, ddl_replay_journal))
 }
 
 fn validate_ddl_replay_barrier(
+    executor: &crate::mysql_client::PersistentTargetExecutor,
     journal: &MySqlDdlReplayJournal,
-    config: &ApplyBinlogConfig,
+    config: &mut ApplyBinlogConfig,
 ) -> Result<(), ApplyBinlogError> {
-    let barrier = journal
+    let mut barrier = journal
         .earliest_barrier(&config.source_identity)
         .map_err(ApplyBinlogError::Statement)?;
     let position_repair_needed = barrier.as_ref().is_some_and(|pending| {
@@ -189,8 +194,16 @@ fn validate_ddl_replay_barrier(
             && pending.event_start_position == 0
             && pending.status == DdlReplayStatus::TranslationPending
     });
-    if position_repair_needed && let Ok(approval) = std::env::var(APPROVAL_ENV) {
-        return reanchor_pending_position(config, journal, &approval);
+    if position_repair_needed {
+        if let Ok(approval) = std::env::var(SOURCE_ONLY_CREATE_APPROVAL_ENV) {
+            config.source.start_position =
+                finish_approved_source_only_group(executor, journal, config, &approval)?;
+            barrier = journal
+                .earliest_barrier(&config.source_identity)
+                .map_err(ApplyBinlogError::Statement)?;
+        } else if let Ok(approval) = std::env::var(APPROVAL_ENV) {
+            return reanchor_pending_position(config, journal, &approval);
+        }
     }
     crate::live::ddl_replay_journal::enforce_no_overtake(
         barrier.as_ref(),

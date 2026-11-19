@@ -342,6 +342,16 @@ impl PersistentTargetExecutor {
     pub(crate) fn execute_raw_sql(&self, sql: &str) -> Result<(), TargetExecuteError> {
         self.with_connection(|conn| conn.query_drop(sql).map_err(target_query_error))
     }
+
+    pub(crate) fn update_exactly_one_row(&self, sql: &str) -> Result<(), TargetExecuteError> {
+        self.with_connection(|conn| {
+            conn.query_drop(sql).map_err(target_query_error)?;
+            if conn.affected_rows() != 1 {
+                return Err(TargetExecuteError::new("expected exactly one updated row"));
+            }
+            Ok(())
+        })
+    }
 }
 
 fn users_update_duplicate_diagnostic(

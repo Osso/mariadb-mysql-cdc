@@ -45,7 +45,7 @@ fn verify_durable_checkpoint(config: &ApplyBinlogConfig) -> Result<(), ApplyBinl
     Ok(())
 }
 
-fn read_adjacent_ddl(
+pub(super) fn read_adjacent_ddl(
     config: &ApplyBinlogConfig,
     events: &mut impl Iterator<Item = Result<(EventHeader, BinlogEvent), MysqlCdcError>>,
 ) -> Result<DdlEvent, ApplyBinlogError> {
@@ -141,7 +141,7 @@ fn record_corrected_position(
         .map_err(|_| repair_rejected("could not confirm the corrected pending record"))
 }
 
-fn position_approval(checkpoint: u64, event: &DdlEvent) -> String {
+pub(super) fn position_approval(checkpoint: u64, event: &DdlEvent) -> String {
     let source = Sha256::digest(&event.source_identity);
     let statement = Sha256::digest(&event.raw_sql);
     format!(

@@ -78,6 +78,24 @@ both the approval and the immutable legacy journal row. Insert or confirm one
 unchanged; neither row authorizes table replay or checkpoint advancement. An
 absent or mismatched approval does not change journal state.
 
+### Approved source-only CREATE group
+
+`CDC_APPROVED_SOURCE_ONLY_CREATE_GROUP` is an operator-approved JSON object
+with `position` (the original exact position approval string), `table`,
+`write_events`, `annotation_bytes`, and `xid_end`. Derive `annotation_bytes`
+from the source file's `Annotate_rows` and next physical event, not a guess from
+the wire: current dump flags omit this annotation. The checked physical lengths
+and real XID header must agree with the approved end. A second table, unexpected
+packet, wrong number of writes, or bad boundary blocks without changing the target.
+
+The stream holds its normal lease. It requires the original and corrected
+pending barriers and no other unresolved barrier before the XID. It writes no
+backup DDL or data. Both journal records retain source-only evidence with no
+generated SQL and transition atomically with the XID checkpoint. Normal replay
+then starts from that durable XID; a restart does not repeat the finished group.
+Remove the approval after verified production replay. It does not exclude other
+transactions for this or any other table.
+
 ### Current common-operation constraints
 
 For source `ALTER TABLE t ALTER COLUMN body SET DEFAULT '{}'` on `TEXT` or
